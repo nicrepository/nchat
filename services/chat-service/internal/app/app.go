@@ -54,6 +54,8 @@ type App struct {
 	presenceDirectory *ws.ValkeyPresenceDirectory
 	mentionCache      *storage.ValkeyMentionLabelCache
 	reactionLimiter   *ws.ValkeyReactionLimiter
+	typingLimiter     *ws.ValkeyReactionLimiter
+	typingStore       *ws.ValkeyTypingStore
 	callWorkerCancel  context.CancelFunc
 	callWorkerWG      *sync.WaitGroup
 	linkScanCancel    context.CancelFunc
@@ -95,6 +97,12 @@ func (a *App) Shutdown(ctx context.Context) error {
 		}
 		if a.reactionLimiter != nil {
 			a.reactionLimiter.Close()
+		}
+		if a.typingLimiter != nil {
+			a.typingLimiter.Close()
+		}
+		if a.typingStore != nil {
+			a.typingStore.Close()
 		}
 		// Close the DB pool only after the hub has drained connections that
 		// may still be issuing queries.
@@ -143,6 +151,7 @@ func New(cfg config.Config) (*App, error) {
 	var messageSvc *service.MessageService
 	var mentionSvc *service.MentionService
 	var workspaceStore *storage.PGXWorkspaceStore
+	var userDisplayNameStore *storage.PGXUserDisplayNameStore
 	var sessionValidator storage.SessionValidator
 	var channelStore *storage.PGXChannelStore
 	var memberStore *storage.PGXMemberStore
@@ -158,6 +167,7 @@ func New(cfg config.Config) (*App, error) {
 	var memberSvc *service.MemberService
 	var callSvc *service.CallService
 	var linkScanSvc *service.LinkScanService
+	var linkReconcileSvc *service.LinkReconcileService
 
 	var closeDB func()
 	databaseReady := false
@@ -179,6 +189,7 @@ func New(cfg config.Config) (*App, error) {
 		if validator != nil {
 			sessionValidator = storage.NewPGXSessionValidator(pool)
 			workspaceStore = storage.NewPGXWorkspaceStore(pool)
+			userDisplayNameStore = storage.NewPGXUserDisplayNameStore(pool)
 			channelStore = storage.NewPGXChannelStore(pool)
 			memberStore = storage.NewPGXMemberStore(pool)
 			dmStore = storage.NewPGXDMStore(pool)
@@ -203,12 +214,13 @@ func New(cfg config.Config) (*App, error) {
 			//
 			// The publisher is attached later (the hub does not exist yet), so
 			// the worker is built here and given it below.
-			linkScanSvc, err = wireLinkSafety(cfg, messageSvc, messages, nil, obsMetrics, logger)
-			if err != nil {
+			linkSafety, wireErr := wireLinkSafety(cfg, messageSvc, messages, nil, obsMetrics, logger)
+			if wireErr != nil {
 				closeDB()
 				_ = shutdown(context.Background())
-				return nil, err
+				return nil, wireErr
 			}
+			linkScanSvc, linkReconcileSvc = linkSafety.Scan, linkSafety.Reconcile
 			mentionCache = wireMentionLabelCache(cfg.ValkeyURL, cfg.MentionLabelCacheTTLSeconds, messageSvc, logger)
 			// One MemberService instance for both consumers: mention autocomplete
 			// reads channel members through it, and issue #398 writes them. Two
@@ -233,6 +245,7 @@ func New(cfg config.Config) (*App, error) {
 	presence := ws.NewPresenceTracker(defaultPresenceAwayTimeout)
 	var authorizer ws.SubscriptionAuthorizer = ws.NopAuthorizer{}
 	var wsWorkspaces ws.WorkspaceResolver
+	var wsDisplayNames ws.UserDisplayNameResolver
 	// Held concretely as well: the same adapter is the canonical workspace
 	// resolver for the RF-19 guard, so WebSocket sessions and HTTP sends bind to
 	// the same workspace by construction rather than by two similar lookups.
@@ -241,6 +254,7 @@ func New(cfg config.Config) (*App, error) {
 		authorizer = ws.NewServiceAuthorizer(channelStore, dmStore)
 		canonicalWorkspaces = &appWSWorkspaceResolver{store: workspaceStore}
 		wsWorkspaces = canonicalWorkspaces
+		wsDisplayNames = userDisplayNameStore
 	}
 	// Two identities, because they answer two different questions.
 	//
@@ -301,6 +315,30 @@ func New(cfg config.Config) (*App, error) {
 			}
 		}
 	}
+	// Typing indicator: independent of the reaction feature (reactionSvc may be
+	// nil while typing still works), so it gets its own Valkey-backed limiter
+	// and TTL backstop, each dialed from the same VALKEY_URL — the established
+	// pattern in this package, where every ws subsystem (bus, presence
+	// directory, reaction limiter) owns its own client rather than sharing one.
+	// Absent VALKEY_URL, typing.start is refused (ErrTypingFeatureDisabled,
+	// fail-closed per SECURITY.md's WS rate-limit requirement) and the TTL
+	// backstop is simply absent — delivery itself does not depend on Valkey.
+	var typingLimiter *ws.ValkeyReactionLimiter
+	if limiter, limiterErr := ws.NewValkeyReactionLimiter(
+		cfg.ValkeyURL, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds,
+	); limiterErr != nil {
+		logger.Warn("typing indicator rate limiting disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingLimiter = limiter
+		options = append(options, ws.WithTypingLimiter(limiter, cfg.TypingRateLimitMaxActions, cfg.TypingRateLimitWindowSeconds))
+	}
+	var typingStore *ws.ValkeyTypingStore
+	if store, storeErr := ws.NewValkeyTypingStore(cfg.ValkeyURL); storeErr != nil {
+		logger.Warn("typing ttl backstop disabled", "reason", "invalid_valkey_config")
+	} else {
+		typingStore = store
+		options = append(options, ws.WithTypingStore(store))
+	}
 	// RF-19 (issue #419): the configurable per-workspace send limit. It reuses
 	// the same Lua/Valkey limiter as reactions and edits — no second rate
 	// limiting mechanism — so it exists only when that limiter does. When it is
@@ -342,7 +380,7 @@ func New(cfg config.Config) (*App, error) {
 		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
 	}
 	hub := ws.NewHub(authorizer, logger, bus, instanceID, options...)
-	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator))
+	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator, wsDisplayNames))
 
 	var callWorkerCancel context.CancelFunc
 	var callWorkerWG *sync.WaitGroup
@@ -382,6 +420,29 @@ func New(cfg config.Config) (*App, error) {
 			defer linkScanWorkerWG.Done()
 			service.RunLinkScanWorker(workerCtx, linkScanSvc, service.LinkScanPollInterval, logger)
 		}()
+		// The recovery pass (issue #135) shares that lifecycle rather than
+		// inventing a third one, but runs on its own, much slower ticker: it
+		// corrects messages that were already delivered, so nobody is waiting on a
+		// pass. It is search-then-read at the provider and can never submit.
+		if linkReconcileSvc != nil {
+			linkReconcileSvc.SetPublisher(&hubBroadcaster{hub: hub})
+			linkScanWorkerWG.Add(1)
+			go func() {
+				defer linkScanWorkerWG.Done()
+				service.RunLinkReconcileWorker(
+					workerCtx, linkReconcileSvc, service.LinkReconcileInterval, logger)
+			}()
+		}
+	}
+	// The reader-driven half of the same recovery. Wired after the hub, because a
+	// verdict it obtains has to be announced to everyone holding the message.
+	//
+	// The limiter is the shared Valkey one every other user-action budget already
+	// uses (issue #135, CQ-005). Without it the route stays 503: this is the only
+	// user-triggered path that reaches a paid third party, and an unlimited one —
+	// or one limited per replica — is not an acceptable degradation.
+	if linkReconcileSvc != nil && reactionLimiter != nil {
+		messageHandler = messageHandler.WithLinkReconcile(linkReconcileSvc, reactionLimiter)
 	}
 
 	// Pins broadcast over the same hub; wired after the hub exists (RF-05).
@@ -431,6 +492,8 @@ func New(cfg config.Config) (*App, error) {
 		presenceDirectory: presenceDirectory,
 		mentionCache:      mentionCache,
 		reactionLimiter:   reactionLimiter,
+		typingLimiter:     typingLimiter,
+		typingStore:       typingStore,
 		callWorkerCancel:  callWorkerCancel,
 		callWorkerWG:      callWorkerWG,
 		linkScanCancel:    linkScanWorkerCancel,
@@ -467,18 +530,35 @@ func New(cfg config.Config) (*App, error) {
 type linkSafetyStore interface {
 	service.URLSafetyChecker
 	service.LinkScanQueue
+	service.LinkReconcileQueue
+}
+
+// linkSafetyWiring is the pair of workers RF-21 runs.
+//
+// Two, not one, and they are deliberately separate objects with separate provider
+// interfaces. The scan worker may submit; the reconcile worker may not, and its
+// dependency (service.LinkVerdictReconciler) has no method that could. Returning
+// them together keeps the bootstrap to one call while leaving that separation
+// visible in the types.
+type linkSafetyWiring struct {
+	// Scan drains the queue of URLs awaiting a first verdict.
+	Scan *service.LinkScanService
+	// Reconcile re-reads scans that finished without one. Nil when the feature is
+	// off, which is a working deployment: an inconclusive link stays inconclusive
+	// and the server still never fetches it.
+	Reconcile *service.LinkReconcileService
 }
 
 func wireLinkSafety(
 	cfg config.Config, messageSvc *service.MessageService,
 	store linkSafetyStore, publisher service.MessageEventPublisher,
 	metrics *observability.Metrics, logger *slog.Logger,
-) (*service.LinkScanService, error) {
+) (linkSafetyWiring, error) {
 	if !cfg.LinkSafetyEnabled {
-		return nil, nil
+		return linkSafetyWiring{}, nil
 	}
 	if messageSvc == nil || store == nil {
-		return nil, errLinkSafetyUnwired
+		return linkSafetyWiring{}, errLinkSafetyUnwired
 	}
 	_ = publisher // attached after the hub exists; see SetPublisher below.
 	scanner, err := urlsafety.NewCloudflareScanner(
@@ -488,7 +568,7 @@ func wireLinkSafety(
 		// The constructor's message names no value, but it is not repeated
 		// either: this returns a fixed error so nothing about the credentials
 		// can reach a log through it.
-		return nil, errLinkSafetyUnwired
+		return linkSafetyWiring{}, errLinkSafetyUnwired
 	}
 	// The shared counter, registered on this service's own registry so
 	// chat-service reports verdict outcomes exactly as file-service does. Its
@@ -519,7 +599,20 @@ func wireLinkSafety(
 		ProviderSubmitWindow: time.Duration(cfg.LinkSafetyProviderSubmitWindowSeconds) * time.Second,
 		UncertainTimeout:     time.Duration(cfg.LinkSafetySubmitUncertainTimeoutSeconds) * time.Second,
 	})
-	return worker, nil
+
+	// The recovery half (issue #135). It shares the provider client, and therefore
+	// the same strict verdict rules and the same in-process verdict cache, but it
+	// is handed to a narrower interface: LinkVerdictReconciler has exactly one
+	// method and no way to submit. That is the structural guarantee that no
+	// inconclusive scan can ever turn into a second billed Cloudflare scan.
+	//
+	// It shares the pipeline metrics reporter for the same reason the worker does:
+	// one registry, one set of series, and no risk of a duplicate registration
+	// silently disabling both.
+	reconcile := service.NewLinkReconcileService(store, safety, logger)
+	reconcile.SetMetrics(pipeline)
+
+	return linkSafetyWiring{Scan: worker, Reconcile: reconcile}, nil
 }
 
 // errLinkSafetyUnwired stops the bootstrap when RF-21 is switched on and the
@@ -553,7 +646,7 @@ func wireMentionLabelCache(valkeyURL string, ttlSeconds int, messageSvc *service
 // connection can be re-checked against it. When no session store is configured
 // the field stays nil and connections keep upgrade-time validation only, which
 // is the same degradation the HTTP routes already have.
-func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator) ws.HandlerConfig {
+func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator, displayNames ws.UserDisplayNameResolver) ws.HandlerConfig {
 	handlerCfg := ws.HandlerConfig{
 		MaxConnectionsPerUser:    cfg.WSMaxConnectionsPerUser,
 		InboundMessagesPerMinute: cfg.WSInboundMessagesPerMinute,
@@ -563,6 +656,9 @@ func wsHandlerConfig(cfg config.Config, sessions storage.SessionValidator) ws.Ha
 	}
 	if sessions != nil {
 		handlerCfg.Sessions = sessions
+	}
+	if displayNames != nil {
+		handlerCfg.DisplayNames = displayNames
 	}
 	return handlerCfg
 }
@@ -643,8 +739,8 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 // targetID is the recipient's user id: the outbox row for a blocked message
 // records the sender as the audience, which is what keeps the announcement off
 // the conversation.
-func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
-	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID)
+func (b *hubBroadcaster) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID, reason string) {
+	b.hub.PublishMessageBlocked(ctx, workspaceID, recipientUserID, messageID, reason)
 }
 
 func (b *hubBroadcaster) PublishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
@@ -669,7 +765,7 @@ func domainMessageToWSUpdatedPayload(msg domain.Message) ws.MessageUpdatedPayloa
 	}
 	return ws.MessageUpdatedPayload{
 		MessageID: msg.ID, ChannelID: msg.ChannelID, DMID: msg.DMConversationID,
-		Body: body, BodyFormat: string(msg.BodyFormat), EditedAt: msg.EditedAt,
+		Body: body, BodyFormat: string(msg.BodyFormat), LinkSafetyState: string(msg.LinkSafety), EditedAt: msg.EditedAt,
 		EditCount: msg.EditCount, IsEdited: msg.EditCount > 0,
 		Status: string(msg.Status), IsRemoved: removed, DeletedAt: deletedAt, UpdatedAt: msg.UpdatedAt,
 	}
@@ -684,6 +780,16 @@ func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, tar
 // converting the string targetType so the HTTP layer keeps no ws import.
 func (b *hubBroadcaster) PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int) {
 	b.hub.PublishMembersAdded(ctx, workspaceID, ws.TargetType(targetType), targetID, actorUserID, addedCount, memberCount)
+}
+
+// PublishMessageLinkSafetyChanged adapts the hub for the issue #135 link-safety
+// correction, converting the string targetType so the service layer keeps no ws
+// import.
+func (b *hubBroadcaster) PublishMessageLinkSafetyChanged(
+	ctx context.Context, workspaceID, targetType, targetID, messageID, state string, updatedAt time.Time,
+) {
+	b.hub.PublishMessageLinkSafetyChanged(
+		ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, state, updatedAt)
 }
 
 // PublishConversationAvailable adapts the hub's user-scoped signal (issue #398).
@@ -719,6 +825,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		BodyText:          body,
 		BodyFormat:        string(msg.BodyFormat),
 		Status:            string(msg.Status),
+		LinkSafetyState:   string(msg.LinkSafety),
 		IsRemoved:         removed,
 		CreatedAt:         msg.CreatedAt,
 		UpdatedAt:         msg.UpdatedAt,
@@ -756,12 +863,14 @@ func domainQuoteToWSPayload(q *domain.QuotedMessage) *ws.QuotePayload {
 		deletedAt = &t
 	}
 	payload := &ws.QuotePayload{
-		ID:         q.ID,
-		AuthorID:   q.AuthorID,
-		BodyFormat: string(q.BodyFormat),
-		IsRemoved:  q.Status == domain.MessageStatusDeleted || deletedAt != nil,
-		DeletedAt:  deletedAt,
-		CreatedAt:  q.CreatedAt,
+		ID:              q.ID,
+		AuthorID:        q.AuthorID,
+		BodyFormat:      string(q.BodyFormat),
+		LinkSafetyState: string(q.LinkSafety),
+		IsRemoved:       q.Status == domain.MessageStatusDeleted || deletedAt != nil,
+		DeletedAt:       deletedAt,
+		CreatedAt:       q.CreatedAt,
+		UpdatedAt:       q.UpdatedAt,
 	}
 	if !payload.IsRemoved {
 		payload.Body = q.BodyText

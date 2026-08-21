@@ -2,6 +2,7 @@ import Mention from "@tiptap/extension-mention";
 import { ReactRenderer } from "@tiptap/react";
 import { fetchMentionCandidates } from "./chatApi";
 import type { MentionCandidate } from "./chatTypes";
+import { ALL_MENTION_ID } from "./richTextMarkers";
 import MentionList from "./MentionList";
 import type { MentionListRef } from "./MentionList";
 
@@ -13,6 +14,16 @@ const viewportMargin = 8;
 // (e.g. "joao") issues one request instead of one per keystroke — reduces
 // load and keeps well under the 30/min rate limit on the mentions endpoint.
 const mentionFetchDebounceMs = 150;
+
+// Synthetic — never fetched from the server, unlike every other candidate.
+// Prepended client-side so @all is discoverable the same way a person is:
+// typing "@" and narrowing by name.
+const ALL_CANDIDATE: MentionCandidate = { mentionType: "all", id: ALL_MENTION_ID, label: "all" };
+
+function withAllCandidate(query: string, candidates: MentionCandidate[]): MentionCandidate[] {
+  const matches = ALL_CANDIDATE.label.startsWith(query.toLowerCase());
+  return matches ? [ALL_CANDIDATE, ...candidates] : candidates;
+}
 
 function positionPopup(element: HTMLElement, clientRect?: (() => DOMRect | null) | null) {
   const rect = clientRect?.();
@@ -79,7 +90,7 @@ export function createMentionExtension() {
         const controller = new AbortController();
         activeAbort = controller;
         fetchMentionCandidates(channelId, query, controller.signal)
-          .then(flushPending)
+          .then((candidates) => flushPending(withAllCandidate(query, candidates)))
           .catch((err: unknown) => {
             if (err instanceof Error && err.name === "AbortError") return;
             flushPending([]);

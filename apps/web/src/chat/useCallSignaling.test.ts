@@ -16,8 +16,10 @@ import { clearTokens, setTokens } from "../lib/authSession";
 import { _resetChatSocket, MAX_CONSECUTIVE_FAILURES, RECONNECT_BASE_DELAY_MS } from "./chatSocket";
 import { issueCallToken } from "./callApi";
 import { requestMediaPermission } from "./mediaPermission";
+import { useCallMedia } from "./useCallMedia";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useCallSignaling } from "./useCallSignaling";
+import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
 
 vi.mock("./callApi", () => ({
   issueCallToken: vi.fn(),
@@ -58,6 +60,38 @@ class FakeWebSocket {
 
   send(data: string) {
     this.sentMessages.push(data);
+    const message = JSON.parse(data) as Record<string, unknown>;
+    // Auto-acks call.leave the way chat-service does: a direct reply to the
+    // sender alone (see call_protocol.go's sendCallToClient), carrying the
+    // resource call's post-leave state. The RF-23 x RF-24 handoff harness
+    // below drives useResourceCallSession.leave() for real (issue #569) and
+    // needs this to settle for the handoff to ever proceed; its exact
+    // status is irrelevant to those tests, only that leave() resolves.
+    if (message.type === "call.leave" && typeof message.call_id === "string") {
+      const callID = message.call_id;
+      queueMicrotask(() => {
+        this.simulateMessage({
+          type: "call.ended",
+          event_id: `call-leave-ack-${callID}`,
+          target_type: "channel",
+          target_id: "00000000-0000-4000-8000-000000000710",
+          call: {
+            call_id: callID,
+            request_id: "00000000-0000-4000-8000-000000000712",
+            caller_id: baseCall.caller_id,
+            callee_id: "",
+            target_type: "channel",
+            target_id: "00000000-0000-4000-8000-000000000710",
+            call_type: "audio",
+            status: "ended",
+            version: 1,
+            created_at: "2026-07-30T12:00:00Z",
+            occurred_at: "2026-07-30T12:00:00Z",
+            expires_at: "2026-07-30T12:00:30Z",
+          },
+        });
+      });
+    }
   }
 
   close() {
@@ -248,17 +282,61 @@ describe("useCallSignaling", () => {
     expect(callCommands(socket)).toHaveLength(1);
   });
 
-  it.each([
-    ["call.accept", "call_not_found"],
-    ["call.sync", "call_unavailable"],
-  ])("keeps %s/%s as an actionable error", (operation, code) => {
+  it("keeps a correlated call.accept rejection as an actionable error", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.error).toBe("Não foi possível concluir a ação da chamada.");
+  });
+
+  it("ignores an uncorrelated call.accept rejection when nothing is pending", () => {
     const { result } = renderHook(() => useCallSignaling());
     const socket = FakeWebSocket.instances[0];
     act(() => socket.simulateOpen());
 
-    act(() => socket.simulateMessage({ type: "call.error", operation, code }));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_not_found",
+      }),
+    );
 
-    expect(result.current.error).toBe("Não foi possível concluir a ação da chamada.");
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("ignores a call.sync error with no reconciliation in flight", () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_unavailable",
+      }),
+    );
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.pending).toBe(false);
   });
 
   it("does not alter an active call for an empty call.sync response", async () => {
@@ -475,7 +553,34 @@ describe("useCallSignaling", () => {
     expect(media.stop).toHaveBeenCalledOnce();
   });
 
-  it("releases pending for a correlated call.error", async () => {
+  it("clearTerminal stops media and empties a terminal call, but leaves an active call untouched", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 3);
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+
+    act(() => {
+      result.current.clearTerminal();
+    });
+    expect(result.current.call?.status).toBe("active");
+    expect(media.stop).not.toHaveBeenCalled();
+
+    await act(async () => socket.simulateMessage(endedEvent(4)));
+    expect(result.current.call?.status).toBe("ended");
+    await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
+    vi.mocked(media.stop).mockClear();
+
+    act(() => {
+      result.current.clearTerminal();
+    });
+
+    expect(result.current.call).toBeNull();
+    expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  it("defers pending release for a correlated call_invalid_state until call.sync reconciles it", async () => {
     const { result } = renderHook(() => useCallSignaling());
     const socket = FakeWebSocket.instances[0];
     act(() => socket.simulateOpen());
@@ -494,8 +599,166 @@ describe("useCallSignaling", () => {
       }),
     );
 
+    // The server disputes the local end(): the client no longer finalizes a
+    // generic error immediately, it waits on the call.sync it just sent.
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(callCommands(socket)).toEqual([{ type: "call.end", call_id: baseCall.call_id }]);
+  });
+
+  it("ignores a stale call.error that does not match the pending direct-call command", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: "00000000-0000-4000-8000-000000000999",
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("ignores a stale direct-call error when no command is pending", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
     expect(result.current.pending).toBe(false);
-    expect(result.current.error).toBe("A chamada já mudou de estado.");
+    expect(result.current.error).toBeNull();
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    // No local command was ever sent for this call_id/operation, so a
+    // call_invalid_state stale reply has nothing to reconcile against —
+    // it must not start a call.sync of its own either.
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.call?.status).toBe("active");
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore,
+    );
+  });
+
+  it("reconciles a correlated call_invalid_state through call.sync", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(activeEvent(3)));
+    await waitFor(() => expect(result.current.call?.status).toBe("active"));
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() => {
+      expect(result.current.end()).toBe(true);
+    });
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.end",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore + 1,
+    );
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.sync",
+        code: "call_not_found",
+      }),
+    );
+
+    expect(result.current.call).toBeNull();
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("reconciles a correlated call.accept rejection through call.sync without granting media authorization", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(1)));
+    act(() => {
+      expect(result.current.accept()).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    const syncCountBefore = sentMessages(socket).filter(
+      (message) => message.type === "call.sync",
+    ).length;
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.accept",
+        call_id: baseCall.call_id,
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(sentMessages(socket).filter((message) => message.type === "call.sync")).toHaveLength(
+      syncCountBefore + 1,
+    );
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    act(() => socket.simulateMessage(activeEvent(2)));
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBeNull();
+    expect(result.current.call?.status).toBe("active");
+
+    // Reconciled through call.sync, not this hook's own call.accept
+    // completing: per RF-23 only accept()/start() completing their own
+    // pending command grants local media authorization, never a snapshot
+    // arriving through reconciliation — so this active call still requires
+    // an explicit activateMedia() and never auto-connects.
+    expect(result.current.mediaActivationRequired).toBe(true);
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
   });
 
   it("does not let a delayed event from a stale connection overwrite newer state", () => {
@@ -1408,8 +1671,16 @@ describe("useCallSignaling", () => {
       }),
     );
 
+    // The rejected end() defers to call.sync reconciliation instead of
+    // finalizing an error immediately.
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(media.connect).not.toHaveBeenCalled();
+
+    act(() => socket.simulateMessage(activeEvent(2)));
+
     expect(result.current.pending).toBe(false);
-    expect(result.current.error).toBe("A chamada já mudou de estado.");
+    expect(result.current.call?.status).toBe("active");
     expect(media.connect).not.toHaveBeenCalled();
 
     await act(async () => result.current.retryMedia());
@@ -1491,6 +1762,23 @@ describe("useCallSignaling", () => {
     expect(media.connect).toHaveBeenCalledTimes(2);
     expect(media.stop).toHaveBeenCalledOnce();
     expect(issueCallToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a recoverable error when retryMedia's own cleanup fails, without requesting a fresh token", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+    await waitFor(() => expect(result.current.mediaReady).toBe(true));
+    vi.mocked(media.stop).mockRejectedValueOnce(new Error("stop failed"));
+
+    await act(async () => result.current.retryMedia());
+
+    expect(result.current.error).toBe(
+      "Não foi possível liberar a mídia da chamada anterior. Tente novamente.",
+    );
+    expect(issueCallToken).toHaveBeenCalledOnce();
   });
 
   it("completes a failed token retry and allows another retry with a fresh token", async () => {
@@ -2347,5 +2635,282 @@ describe("useCallSignaling restored call activation", () => {
     await act(async () => result.current.activateMedia());
 
     expect(media.connect).toHaveBeenCalledOnce();
+  });
+});
+
+// ── RF-23 × RF-24: ownership handoff runs before the token request ───────────
+
+describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
+  it("calls onBeforeDirectMedia once the call is confirmed active, before requesting a token", async () => {
+    const media = mediaBridge();
+    const handoff = deferredValue<void>();
+    const onBeforeDirectMedia = vi.fn(() => handoff.promise);
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() =>
+      expect(onBeforeDirectMedia).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ call_id: baseCall.call_id, status: "active" }),
+      ),
+    );
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
+
+    await act(async () => {
+      handoff.resolve();
+      await handoff.promise;
+    });
+
+    await waitFor(() => expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(baseCall.call_id));
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+  });
+
+  it("never calls onBeforeDirectMedia when accept never reaches an active call", async () => {
+    const media = mediaBridge();
+    const onBeforeDirectMedia = vi.fn(async () => undefined);
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    act(() => socket.simulateMessage(ringingEvent(0)));
+    act(() => {
+      result.current.accept();
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    act(() =>
+      socket.simulateMessage({
+        ...endedEvent(2),
+        type: "call.cancelled",
+        call: { ...endedEvent(2).call, status: "cancelled" },
+      }),
+    );
+
+    expect(result.current.call?.status).toBe("cancelled");
+    expect(onBeforeDirectMedia).not.toHaveBeenCalled();
+    expect(issueCallToken).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an onBeforeDirectMedia rejection as the standard media error, without requesting a token", async () => {
+    const media = mediaBridge();
+    const onBeforeDirectMedia = vi.fn().mockRejectedValueOnce(new Error("cleanup failed"));
+    const { result } = renderHook(() => useCallSignaling(media, true, onBeforeDirectMedia));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() =>
+      expect(result.current.error).toBe(
+        "Não foi possível preparar a mídia da chamada. Tente novamente.",
+      ),
+    );
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
+  });
+
+  it("unlocks audio again after connect, independent of the accept-time gesture unlock", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media, true, async () => undefined));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+    await authorizeActiveCall(result, socket, 2);
+
+    await waitFor(() => expect(media.connect).toHaveBeenCalledOnce());
+    await waitFor(() => expect(media.startAudio).toHaveBeenCalledTimes(2));
+  });
+
+  // ── Real useCallMedia + real useResourceCallSession, wired exactly like
+  // ChatShell, with a fake LiveKit factory that produces distinguishable
+  // Room instances. Proves audio ownership actually transfers from Room A
+  // to a genuinely different Room B, and that a real disconnect() failure
+  // on Room A blocks the handoff instead of just satisfying a mock. ───────
+  describe("Room A / Room B audio ownership proof (RF-24 quarta correção)", () => {
+    interface FakeCallbacks {
+      onLocalElement(element: HTMLMediaElement): void;
+      onRemoteElement(element: HTMLMediaElement): void;
+      onElementRemoved(element: HTMLMediaElement): void;
+      onDisconnected(): void;
+      onReconnecting(): void;
+      onReconnected(): void;
+      onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
+      onMicrophoneStateChanged(enabled: boolean): void;
+      onParticipantConnected(identity: string): void;
+      onParticipantDisconnected(identity: string): void;
+      onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+    }
+
+    class FakeRoomSession {
+      readonly label: string;
+      readonly callbacks: FakeCallbacks;
+      readonly connect = vi.fn(async (): Promise<void> => undefined);
+      readonly enableCamera = vi.fn(async (): Promise<void> => undefined);
+      readonly enableMicrophone = vi.fn(async (): Promise<void> => undefined);
+      readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
+      readonly setMicrophoneEnabled = vi.fn(async (): Promise<void> => undefined);
+      readonly startAudio = vi.fn(async (): Promise<void> => undefined);
+      readonly disconnect = vi.fn(async (): Promise<void> => undefined);
+
+      constructor(label: string, callbacks: FakeCallbacks) {
+        this.label = label;
+        this.callbacks = callbacks;
+      }
+    }
+
+    const roomLabels = ["Room A", "Room B", "Room C"];
+
+    function resourceCallHarness(onRoomCreated?: (room: FakeRoomSession, index: number) => void) {
+      const rooms: FakeRoomSession[] = [];
+      const factory = vi.fn((callbacks: FakeCallbacks) => {
+        const index = rooms.length;
+        const room = new FakeRoomSession(roomLabels[index] ?? `Room ${index}`, callbacks);
+        rooms.push(room);
+        onRoomCreated?.(room, index);
+        return room;
+      });
+      const loader = vi.fn(async () => factory as unknown as Parameters<typeof useCallMedia>[0]);
+
+      const view = renderHook(() => {
+        const media = useCallMedia(loader as unknown as Parameters<typeof useCallMedia>[0]);
+        const resourceCall = useResourceCallSession(media);
+        const directCallMedia: CallMediaBridge = {
+          startAudio: media.startAudio,
+          connect: media.connect,
+          stop: async () => {
+            if (resourceCall.active) return;
+            await media.stop();
+          },
+        };
+        const onBeforeDirectMedia = async () => {
+          if (resourceCall.active) await resourceCall.leave();
+        };
+        const calls = useCallSignaling(directCallMedia, true, onBeforeDirectMedia);
+        return { media, resourceCall, calls };
+      });
+
+      return { view, rooms };
+    }
+
+    const channelTarget: ResourceCallTarget = {
+      kind: "channel",
+      id: "00000000-0000-4000-8000-000000000710",
+      name: "geral",
+      callId: "00000000-0000-4000-8000-000000000711",
+    };
+
+    async function driveCallToActive(
+      view: { result: { current: { calls: ReturnType<typeof useCallSignaling> } } },
+      socket: FakeWebSocket,
+    ) {
+      act(() => socket.simulateMessage(ringingEvent(0)));
+      act(() => {
+        view.result.current.calls.accept();
+      });
+      await waitFor(() =>
+        expect(
+          sentMessages(socket).filter((message) => message.type === "call.accept"),
+        ).toHaveLength(1),
+      );
+      act(() => socket.simulateMessage(activeEvent(1)));
+    }
+
+    it("hands audio ownership from Room A to a genuinely distinct Room B, with Room B's startAudio only after its own connect", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      // Primes the LiveKit factory, mirroring how a real gesture (e.g. the
+      // browser tab already loaded it for an earlier action) ensures the
+      // resource room's own startAudio() call actually reaches the Room
+      // instead of only queuing the import.
+      await act(() => view.result.current.media.prepare());
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      expect(rooms).toHaveLength(1);
+      const roomA = rooms[0];
+      expect(roomA.connect).toHaveBeenCalledOnce();
+      expect(roomA.startAudio).toHaveBeenCalledOnce();
+
+      await driveCallToActive(view, socket);
+
+      await waitFor(() => expect(rooms).toHaveLength(2));
+      const roomB = rooms[1];
+      expect(roomB).not.toBe(roomA);
+      await waitFor(() => expect(roomB.startAudio).toHaveBeenCalled());
+
+      expect(roomA.disconnect).toHaveBeenCalledOnce();
+      expect(roomB.connect).toHaveBeenCalledOnce();
+      expect(roomB.connect.mock.invocationCallOrder[0]).toBeLessThan(
+        roomB.startAudio.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("keeps Room B's audio recovery available when its post-handoff startAudio is blocked by the browser", async () => {
+      const { view, rooms } = resourceCallHarness((room, index) => {
+        if (index === 1) {
+          room.startAudio.mockRejectedValueOnce(new DOMException("blocked", "NotAllowedError"));
+        }
+      });
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+
+      await driveCallToActive(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(2));
+
+      await waitFor(() => expect(view.result.current.media.audioActivationRequired).toBe(true));
+      expect(view.result.current.media.error).toBe(
+        "O navegador bloqueou o áudio. Ative o áudio novamente.",
+      );
+    });
+
+    it("blocks the handoff when Room A's real disconnect() rejects: issueCallToken never advances and Room B never connects", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      const roomA = rooms[0];
+      vi.mocked(issueCallToken).mockClear();
+      roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+      await driveCallToActive(view, socket);
+
+      await waitFor(() =>
+        expect(view.result.current.calls.error).toBe(
+          "Não foi possível preparar a mídia da chamada. Tente novamente.",
+        ),
+      );
+      expect(issueCallToken).not.toHaveBeenCalled();
+      expect(rooms).toHaveLength(1);
+      expect(view.result.current.resourceCall.status).toBe("error");
+      expect(view.result.current.resourceCall.errorOperation).toBe("leave");
+      expect(view.result.current.resourceCall.active).toEqual(channelTarget);
+      // RF-23 stays visible/active in signaling regardless of RF-24's own
+      // cleanup failure — CallPanel's precedence keeps showing it.
+      expect(view.result.current.calls.call?.status).toBe("active");
+    });
+
+    it("a retried leave() that finally disconnects Room A for real clears the resource room, unblocking the shared Room for RF-23", async () => {
+      const { view, rooms } = resourceCallHarness();
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+
+      await act(() => view.result.current.resourceCall.join(channelTarget));
+      const roomA = rooms[0];
+      roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+      await driveCallToActive(view, socket);
+      await waitFor(() => expect(view.result.current.resourceCall.errorOperation).toBe("leave"));
+      expect(roomA.disconnect).toHaveBeenCalledOnce();
+
+      // The retry affordance (CallPanel's "Tentar sair novamente") replays
+      // leave() itself, never join(): this time Room A's disconnect resolves.
+      await act(() => view.result.current.resourceCall.leave());
+
+      expect(roomA.disconnect).toHaveBeenCalledTimes(2);
+      expect(view.result.current.resourceCall.status).toBe("idle");
+      expect(view.result.current.resourceCall.active).toBeNull();
+      expect(rooms).toHaveLength(1);
+    });
   });
 });

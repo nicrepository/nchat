@@ -10,6 +10,7 @@ const liveKitMock = vi.hoisted(() => {
   const events = {
     TrackSubscribed: "trackSubscribed",
     TrackUnsubscribed: "trackUnsubscribed",
+    ParticipantConnected: "participantConnected",
     ParticipantDisconnected: "participantDisconnected",
     Disconnected: "disconnected",
     Reconnecting: "reconnecting",
@@ -17,18 +18,44 @@ const liveKitMock = vi.hoisted(() => {
     AudioPlaybackStatusChanged: "audioPlaybackChanged",
     TrackMuted: "trackMuted",
     TrackUnmuted: "trackUnmuted",
+    ActiveSpeakersChanged: "activeSpeakersChanged",
+    LocalTrackUnpublished: "localTrackUnpublished",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
-  const sources = { Camera: "camera", Microphone: "microphone" } as const;
+  const sources = {
+    Camera: "camera",
+    Microphone: "microphone",
+    ScreenShare: "screen_share",
+  } as const;
   const permissionDenied = "permission-denied";
   const rooms: MockRoom[] = [];
+
+  interface MockPublication {
+    source: string;
+    isMuted: boolean;
+    isSubscribed: boolean;
+  }
+
+  interface MockRemoteParticipant {
+    identity: string;
+    name?: string;
+    getTrackPublication: (source: string) => MockPublication | undefined;
+  }
 
   class MockRoom {
     readonly options: unknown;
     readonly listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+    readonly remoteParticipants = new Map<string, MockRemoteParticipant>();
+    // Once a participant instance has been disconnected, a stale/queued
+    // TrackSubscribed replay for that exact instance must never resurrect it
+    // — only a genuinely new instance (real SDK reentry) may occupy the
+    // identity slot again. Tracked by object identity, not the identity
+    // string, so a legitimate reentry is unaffected.
+    private readonly disconnectedInstances = new WeakSet<object>();
     readonly localParticipant = {
       setCameraEnabled: vi.fn(async (): Promise<unknown> => undefined),
       setMicrophoneEnabled: vi.fn(async (): Promise<unknown> => undefined),
+      setScreenShareEnabled: vi.fn(async (): Promise<unknown> => undefined),
       getTrackPublication: vi.fn((): unknown => undefined),
     };
     readonly connect = vi.fn(async (): Promise<unknown> => undefined);
@@ -54,6 +81,29 @@ const liveKitMock = vi.hoisted(() => {
     }
 
     emit(event: string, ...args: unknown[]): void {
+      // Mirrors the real Room: remoteParticipants always holds whichever
+      // instance is current for an identity. Auto-syncing it here (instead
+      // of every test call site managing it by hand) is what lets the
+      // adapter's isCurrentParticipant() reference check work the same way
+      // it does against the real SDK.
+      if (event === events.TrackSubscribed) {
+        const participant = args[2] as { identity: string } | undefined;
+        if (
+          participant &&
+          !this.disconnectedInstances.has(participant) &&
+          !this.remoteParticipants.has(participant.identity)
+        ) {
+          this.remoteParticipants.set(participant.identity, participant as MockRemoteParticipant);
+        }
+      } else if (event === events.ParticipantDisconnected) {
+        const participant = args[0] as { identity: string } | undefined;
+        if (participant) {
+          this.disconnectedInstances.add(participant);
+          if (this.remoteParticipants.get(participant.identity) === participant) {
+            this.remoteParticipants.delete(participant.identity);
+          }
+        }
+      }
       for (const callback of this.listeners.get(event) ?? []) callback(...args);
     }
   }
@@ -93,11 +143,41 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onReconnected: vi.fn(),
     onAudioPlaybackChanged: vi.fn(),
     onMicrophoneStateChanged: vi.fn(),
+    onParticipantConnected: vi.fn(),
+    onParticipantDisconnected: vi.fn(),
+    onRemoteVideoAvailabilityChanged: vi.fn(),
+    onActiveSpeakersChanged: vi.fn(),
+    onScreenShareChanged: vi.fn(),
+    onRemoteScreenShareChanged: vi.fn(),
   };
 }
 
 function micPublication(isMuted: boolean) {
   return { isMuted, source: liveKitMock.sources.Microphone };
+}
+
+function cameraPublication(isMuted: boolean, isSubscribed = true) {
+  return { isMuted, isSubscribed, source: liveKitMock.sources.Camera };
+}
+
+/** A remote participant known to the Room but not necessarily seen via a TrackSubscribed event. */
+function fakeRemoteParticipant(
+  identity: string,
+  camera?: { isMuted: boolean; isSubscribed?: boolean },
+  name?: string,
+) {
+  return {
+    identity,
+    name,
+    getTrackPublication: (source: string) =>
+      source === liveKitMock.sources.Camera && camera
+        ? {
+            source: liveKitMock.sources.Camera,
+            isMuted: camera.isMuted,
+            isSubscribed: camera.isSubscribed ?? true,
+          }
+        : undefined,
+  };
 }
 
 function createTrack(
@@ -179,6 +259,49 @@ describe("createLiveKitSpikeSession", () => {
     expect(handlers.onElementRemoved).toHaveBeenCalledWith(localVideo);
   });
 
+  it("forwards active speakers and controls screen share explicitly", async () => {
+    const { handlers, room, session } = setup();
+
+    room.emit(liveKitMock.events.ActiveSpeakersChanged, [
+      { identity: "identity-a" },
+      { identity: "identity-b" },
+    ]);
+    await session.setScreenShareEnabled(true);
+    await session.setScreenShareEnabled(false);
+
+    expect(handlers.onActiveSpeakersChanged).toHaveBeenCalledWith(["identity-a", "identity-b"]);
+    expect(room.localParticipant.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(1, true);
+    expect(handlers.onScreenShareChanged).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it("reports native screen-share termination", () => {
+    const { handlers, room } = setup();
+
+    room.emit(
+      liveKitMock.events.LocalTrackUnpublished,
+      { source: liveKitMock.sources.ScreenShare },
+      room.localParticipant,
+    );
+
+    expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
+  });
+
+  it("keeps remote screen share separate from participant camera video", () => {
+    const { handlers, room } = setup();
+    const participant = { sid: "participant-a", identity: "identity-a" };
+    const element = document.createElement("video");
+    const track = createTrack("video", element);
+    const publication = { source: liveKitMock.sources.ScreenShare };
+
+    room.emit(liveKitMock.events.TrackSubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenCalledWith("identity-a", element);
+    expect(handlers.onRemoteElement).not.toHaveBeenCalled();
+
+    room.emit(liveKitMock.events.TrackUnsubscribed, track, publication, participant);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith("identity-a", null);
+  });
+
   it("attaches remote video and audio once per track", async () => {
     const { handlers, room } = setup();
     const participant = { sid: "participant-a" };
@@ -199,6 +322,71 @@ describe("createLiveKitSpikeSession", () => {
     expect(handlers.onRemoteElement).toHaveBeenCalledTimes(2);
     expect(handlers.onRemoteElement).toHaveBeenCalledWith(video);
     expect(handlers.onRemoteElement).toHaveBeenCalledWith(audio);
+  });
+
+  it("tags every remote element with the participant identity, never the internal sid", async () => {
+    const { room } = setup();
+    const participant = {
+      sid: "participant-a-sid",
+      identity: "11111111-1111-4111-8111-111111111111",
+    };
+    const video = document.createElement("video");
+    const videoTrack = createTrack("video", video);
+
+    room.emit(liveKitMock.events.TrackSubscribed, videoTrack, {}, participant);
+
+    expect(video.dataset.participantIdentity).toBe(participant.identity);
+  });
+
+  it("reports participants already in the room once connect() completes, with their display name", async () => {
+    const { handlers, room, session } = setup();
+    room.remoteParticipants.set(
+      "a",
+      fakeRemoteParticipant("identity-a", undefined, "Pedro Almeida"),
+    );
+    room.remoteParticipants.set("b", fakeRemoteParticipant("identity-b", undefined, "Maria Silva"));
+
+    await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-a", "Pedro Almeida");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledWith("identity-b", "Maria Silva");
+    expect(handlers.onParticipantConnected).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports an existing participant with no name as an empty display name, never the identity", async () => {
+    const { handlers, room, session } = setup();
+    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
+
+    await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith("identity-a", "");
+  });
+
+  it("reports a participant joining after connect (with display name) and one leaving", () => {
+    const { handlers, room } = setup();
+
+    room.emit(liveKitMock.events.ParticipantConnected, {
+      sid: "c-sid",
+      identity: "identity-c",
+      name: "Ana Lima",
+    });
+    expect(handlers.onParticipantConnected).toHaveBeenCalledExactlyOnceWith(
+      "identity-c",
+      "Ana Lima",
+    );
+
+    room.emit(liveKitMock.events.ParticipantDisconnected, { sid: "c-sid", identity: "identity-c" });
+    expect(handlers.onParticipantDisconnected).toHaveBeenCalledExactlyOnceWith("identity-c");
+  });
+
+  it("does not report existing participants when connect() completes after disposal", async () => {
+    const { handlers, room, session } = setup();
+    room.remoteParticipants.set("a", fakeRemoteParticipant("identity-a"));
+    const connecting = session.connect("ws://127.0.0.1:7880", "participant-token");
+    await session.disconnect();
+    await connecting;
+
+    expect(handlers.onParticipantConnected).not.toHaveBeenCalled();
   });
 
   it("reports rejected remote audio playback without dropping the element", async () => {
@@ -252,8 +440,8 @@ describe("createLiveKitSpikeSession", () => {
 
   it("removes every track for the disconnected participant and preserves others", () => {
     const { handlers, room } = setup();
-    const participantA = { sid: "participant-a" };
-    const participantB = { sid: "participant-b" };
+    const participantA = { sid: "participant-a", identity: "identity-a" };
+    const participantB = { sid: "participant-b", identity: "identity-b" };
     const videoA = document.createElement("video");
     const audioA = document.createElement("audio");
     const videoB = document.createElement("video");
@@ -551,6 +739,46 @@ describe("createLiveKitSpikeSession", () => {
     }
   });
 
+  describe("disconnect() retry after a rejected attempt (RF-24 quinta correção)", () => {
+    it("dedupes two concurrent disconnect() calls onto the same pending attempt", async () => {
+      const { room, session } = setup();
+      const attempt = deferredValue<undefined>();
+      room.disconnect.mockReturnValueOnce(attempt.promise);
+
+      const first = session.disconnect();
+      const second = session.disconnect();
+      expect(room.disconnect).toHaveBeenCalledOnce();
+
+      attempt.resolve(undefined);
+      await Promise.all([first, second]);
+
+      expect(room.disconnect).toHaveBeenCalledOnce();
+    });
+
+    it("calls room.disconnect(true) a second time for real after the first attempt rejects, and the retry can succeed", async () => {
+      const { room, session } = setup();
+      room.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+      await expect(session.disconnect()).rejects.toThrow("disconnect failed");
+      expect(room.disconnect).toHaveBeenCalledTimes(1);
+
+      await expect(session.disconnect()).resolves.toBeUndefined();
+      expect(room.disconnect).toHaveBeenCalledTimes(2);
+    });
+
+    it("stays idempotent after a successful disconnect: no further room.disconnect(true) calls", async () => {
+      const { room, session } = setup();
+
+      await session.disconnect();
+      expect(room.disconnect).toHaveBeenCalledOnce();
+
+      await session.disconnect();
+      await session.disconnect();
+
+      expect(room.disconnect).toHaveBeenCalledOnce();
+    });
+  });
+
   describe("local microphone state", () => {
     it("enableMicrophone reports the confirmed local state", async () => {
       const { handlers, room, session } = setup();
@@ -627,8 +855,303 @@ describe("createLiveKitSpikeSession", () => {
       room.emit(liveKitMock.events.TrackUnmuted, cameraPublication, room.localParticipant as never);
 
       expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+      // The local camera going in and out of mute is not a remote participant
+      // event either — attachLocalVideo()/setCameraEnabled() alone drive it.
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
     });
 
+    it("reports a remote camera mute as unavailable without touching microphone state", () => {
+      const { handlers, room } = setup();
+      const participant = { sid: "participant-a-sid", identity: "identity-a" };
+      const cameraPublication = { isMuted: true, source: liveKitMock.sources.Camera };
+
+      room.emit(liveKitMock.events.TrackMuted, cameraPublication, participant as never);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-a",
+        false,
+      );
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+      expect(handlers.onElementRemoved).not.toHaveBeenCalled();
+    });
+
+    it("reports a remote camera unmute as available again", () => {
+      const { handlers, room } = setup();
+      const participant = { sid: "participant-a-sid", identity: "identity-a" };
+      const cameraPublication = { isMuted: false, source: liveKitMock.sources.Camera };
+
+      room.emit(liveKitMock.events.TrackUnmuted, cameraPublication, participant as never);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-a",
+        true,
+      );
+      expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+    });
+
+    it("ignores a remote microphone mute/unmute for onRemoteVideoAvailabilityChanged", () => {
+      const { handlers, room } = setup();
+      const participant = { sid: "participant-a-sid", identity: "identity-a" };
+      const micPub = { isMuted: true, source: liveKitMock.sources.Microphone };
+
+      room.emit(liveKitMock.events.TrackMuted, micPub, participant as never);
+      room.emit(liveKitMock.events.TrackUnmuted, micPub, participant as never);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+    });
+
+    it("ignores camera mute/unmute emitted after disposal", async () => {
+      const { handlers, room, session } = setup();
+      await session.disconnect();
+      vi.clearAllMocks();
+      const participant = { sid: "participant-a-sid", identity: "identity-a" };
+      const cameraPublication = { isMuted: true, source: liveKitMock.sources.Camera };
+
+      room.emit(liveKitMock.events.TrackMuted, cameraPublication, participant as never);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("late join reads publication.isMuted (RF-24 code review round 2, achado 2)", () => {
+    it("A: a remote participant already present with a muted camera shows hasVideo=false to a late joiner", async () => {
+      const { handlers, room, session } = setup();
+      // Not yet subscribed at connect() time — this is the ordering LiveKit
+      // does not guarantee: TrackSubscribed for this pre-existing publication
+      // arrives after connect() resolves, so the per-event check (not the
+      // post-connect resync) is what must catch the already-muted state. The
+      // Room always hands the adapter the same participant instance it
+      // already has on file — the late event reuses that instance, not a
+      // fresh literal, matching how the real SDK behaves.
+      const participant = fakeRemoteParticipant("identity-b", {
+        isMuted: true,
+        isSubscribed: false,
+      });
+      room.remoteParticipants.set("identity-b", participant);
+      const video = document.createElement("video");
+      const videoTrack = createTrack("video", video);
+
+      await session.connect("ws://127.0.0.1:7880", "participant-token");
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        videoTrack,
+        cameraPublication(true),
+        participant,
+      );
+
+      expect(handlers.onRemoteElement).toHaveBeenCalledWith(video);
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-b",
+        false,
+      );
+    });
+
+    it("A2: a camera publication already muted at subscribe time (participant joining normally) never reports available", () => {
+      const { handlers, room } = setup();
+      const video = document.createElement("video");
+      const videoTrack = createTrack("video", video);
+
+      room.emit(liveKitMock.events.TrackSubscribed, videoTrack, cameraPublication(true), {
+        sid: "participant-a-sid",
+        identity: "identity-a",
+      });
+
+      expect(handlers.onRemoteElement).toHaveBeenCalledWith(video);
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-a",
+        false,
+      );
+    });
+
+    it("B: an unmuted camera publication at subscribe time never reports unavailable", () => {
+      const { handlers, room } = setup();
+      const video = document.createElement("video");
+      const videoTrack = createTrack("video", video);
+
+      room.emit(liveKitMock.events.TrackSubscribed, videoTrack, cameraPublication(false), {
+        sid: "participant-a-sid",
+        identity: "identity-a",
+      });
+
+      expect(handlers.onRemoteElement).toHaveBeenCalledWith(video);
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+    });
+
+    it("C: reconnect resyncs to muted when the publication went muted during the interruption", () => {
+      const { handlers, room } = setup();
+      room.remoteParticipants.set(
+        "participant-a",
+        fakeRemoteParticipant("identity-a", { isMuted: true }),
+      );
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledWith("identity-a", false);
+    });
+
+    it("D: reconnect resyncs to available when the publication came back unmuted", () => {
+      const { handlers, room } = setup();
+      room.remoteParticipants.set(
+        "participant-a",
+        fakeRemoteParticipant("identity-a", { isMuted: false }),
+      );
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledWith("identity-a", true);
+    });
+
+    it("E: reconnect resync never reports for a microphone publication", () => {
+      const { handlers, room } = setup();
+      room.remoteParticipants.set("participant-a", {
+        identity: "identity-a",
+        getTrackPublication: (source: string) =>
+          source === liveKitMock.sources.Microphone
+            ? { source: liveKitMock.sources.Microphone, isMuted: true, isSubscribed: true }
+            : undefined,
+      });
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+    });
+
+    it("resync after connect() only reports subscribed camera publications, never an unsubscribed one", async () => {
+      const { handlers, room, session } = setup();
+      room.remoteParticipants.set(
+        "participant-a",
+        fakeRemoteParticipant("identity-a", { isMuted: true, isSubscribed: false }),
+      );
+
+      await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+    });
+
+    it("resync after connect() reports every remote participant's current camera state", async () => {
+      const { handlers, room, session } = setup();
+      room.remoteParticipants.set(
+        "participant-a",
+        fakeRemoteParticipant("identity-a", { isMuted: true }),
+      );
+      room.remoteParticipants.set(
+        "participant-b",
+        fakeRemoteParticipant("identity-b", { isMuted: false }),
+      );
+
+      await session.connect("ws://127.0.0.1:7880", "participant-token");
+
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledWith("identity-a", false);
+      expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledWith("identity-b", true);
+    });
+  });
+
+  describe("stale track events from a participant that no longer holds that identity slot", () => {
+    it("ignores a track subscription that arrives after its participant already disconnected", () => {
+      const { handlers, room } = setup();
+      const participant = { sid: "participant-a-sid", identity: "identity-a" };
+      const firstTrack = createTrack("video", document.createElement("video"));
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        firstTrack,
+        cameraPublication(false),
+        participant,
+      );
+      expect(handlers.onRemoteElement).toHaveBeenCalledTimes(1);
+
+      room.emit(liveKitMock.events.ParticipantDisconnected, participant);
+      vi.mocked(handlers.onRemoteElement).mockClear();
+
+      const lateTrack = createTrack("video", document.createElement("video"));
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        lateTrack,
+        cameraPublication(false),
+        participant,
+      );
+
+      expect(lateTrack.attach).not.toHaveBeenCalled();
+      expect(handlers.onRemoteElement).not.toHaveBeenCalled();
+    });
+
+    it("accepts a legitimate reentry under the same identity with a new participant instance", () => {
+      const { handlers, room } = setup();
+      const oldParticipant = { sid: "sid-old", identity: "user-x" };
+      const newParticipant = { sid: "sid-new", identity: "user-x" };
+      const oldTrack = createTrack("video", document.createElement("video"));
+      const newVideo = document.createElement("video");
+      const newTrack = createTrack("video", newVideo);
+
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        oldTrack,
+        cameraPublication(false),
+        oldParticipant,
+      );
+      room.emit(liveKitMock.events.ParticipantDisconnected, oldParticipant);
+      vi.mocked(handlers.onRemoteElement).mockClear();
+
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        newTrack,
+        cameraPublication(false),
+        newParticipant,
+      );
+
+      expect(handlers.onRemoteElement).toHaveBeenCalledExactlyOnceWith(newVideo);
+    });
+
+    it("keeps ignoring the old SID's late event after a same-identity reentry, without duplicating or evicting the new tile", () => {
+      const { handlers, room } = setup();
+      const oldParticipant = { sid: "sid-old", identity: "user-x" };
+      const newParticipant = { sid: "sid-new", identity: "user-x" };
+      const oldTrack = createTrack("video", document.createElement("video"));
+      const newVideo = document.createElement("video");
+      const newTrack = createTrack("video", newVideo);
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        oldTrack,
+        cameraPublication(false),
+        oldParticipant,
+      );
+      room.emit(liveKitMock.events.ParticipantDisconnected, oldParticipant);
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        newTrack,
+        cameraPublication(false),
+        newParticipant,
+      );
+      vi.mocked(handlers.onRemoteElement).mockClear();
+      vi.mocked(handlers.onElementRemoved).mockClear();
+
+      // A retransmitted/queued TrackSubscribed for the old SID, arriving
+      // after the same identity already reconnected as a new instance.
+      const staleLateTrack = createTrack("video", document.createElement("video"));
+      room.emit(
+        liveKitMock.events.TrackSubscribed,
+        staleLateTrack,
+        cameraPublication(false),
+        oldParticipant,
+      );
+
+      expect(staleLateTrack.attach).not.toHaveBeenCalled();
+      expect(handlers.onRemoteElement).not.toHaveBeenCalled();
+      expect(handlers.onElementRemoved).not.toHaveBeenCalled();
+
+      // The new tile is unaffected and still owns its element.
+      room.emit(
+        liveKitMock.events.TrackUnsubscribed,
+        newTrack,
+        cameraPublication(false),
+        newParticipant,
+      );
+      expect(handlers.onElementRemoved).toHaveBeenCalledExactlyOnceWith(newVideo);
+    });
+  });
+
+  describe("authoritative microphone state (unaffected legacy suite continuation)", () => {
     it("preserves the mute/unmute sequence across five consecutive cycles", async () => {
       const { handlers, room, session } = setup();
       const expected: boolean[] = [];

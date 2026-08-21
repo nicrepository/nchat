@@ -19,10 +19,17 @@ export const LEGACY_INLINE_RE = /(\*\*[^*\n]+\*\*|\*[^*\n]+\*|`[^`\n]+`)/;
 
 export type InlineMarkerType = (typeof INLINE_MARKERS)[number]["type"];
 export type ListType = "ul" | "ol";
-export type MentionType = "user" | "channel";
+export type MentionType = "user" | "channel" | "all";
 
 export const MENTION_TOKEN_RE =
-  /^@\[((?:\\.|[^\]])+)]\(mention:(user|channel):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)/i;
+  /^@\[((?:\\.|[^\]])+)]\(mention:(user|channel|all):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)/i;
+
+/**
+ * "@all" has no real entity to point at, so it uses this reserved nil UUID as
+ * its id — keeping the token's id shape identical for every mention type
+ * rather than relaxing MENTION_TOKEN_RE to accept a non-UUID id for one case.
+ */
+export const ALL_MENTION_ID = "00000000-0000-0000-0000-000000000000";
 
 const ESCAPABLE = new Set(["\\", "*", "_", "`", "-"]);
 const V3_ESCAPABLE = new Set([...ESCAPABLE, "@", "[", "]", "(", ")"]);

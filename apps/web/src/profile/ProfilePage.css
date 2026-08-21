@@ -27,6 +27,54 @@
   text-decoration: underline;
 }
 
+.profile-page__name-card,
+.profile-page__details-card {
+  padding: 24px;
+  margin-bottom: 20px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+}
+
+.profile-page__field-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.profile-page__input {
+  display: block;
+  width: 100%;
+  max-width: 360px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  background: #fff;
+  font: inherit;
+  font-size: 14px;
+}
+.profile-page__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.profile-page__input[aria-invalid="true"] {
+  border-color: #dc2626;
+}
+
+.profile-page__textarea {
+  min-height: 96px;
+  max-width: 100%;
+  resize: vertical;
+}
+
+.profile-page__select {
+  cursor: pointer;
+}
+.profile-page__select:disabled {
+  cursor: not-allowed;
+}
+
 .profile-page__avatar-card {
   display: flex;
   gap: 24px;
@@ -130,14 +178,44 @@
   font-size: 14px;
 }
 .profile-page__error {
-  color: #dc2626;
+  color: #b91c1c;
 }
 .profile-page__ok {
   color: #16a34a;
 }
 
+.profile-page__notifications-card {
+  margin-top: 16px;
+  padding: 24px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+}
+.profile-page__sound-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.profile-page__sound-modes-legend {
+  font-size: 14px;
+  font-weight: 600;
+  padding: 0;
+  margin-bottom: 4px;
+}
+.profile-page__checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
 @media (prefers-color-scheme: dark) {
-  .profile-page__avatar-card {
+  .profile-page__avatar-card,
+  .profile-page__name-card,
+  .profile-page__details-card {
     border-color: rgba(255, 255, 255, 0.12);
   }
   .profile-page__btn {
@@ -148,5 +226,10 @@
   .profile-page__btn--primary {
     background: #7b43e8;
     color: #fff;
+  }
+  .profile-page__input {
+    background: transparent;
+    border-color: rgba(255, 255, 255, 0.2);
+    color: inherit;
   }
 }

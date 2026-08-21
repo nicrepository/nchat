@@ -1,0 +1,6 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-same-namespace-ingress
+  namespace: nchat
+$patch: delete

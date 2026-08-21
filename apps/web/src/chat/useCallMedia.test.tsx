@@ -20,6 +20,24 @@ interface SessionCallbacks {
   onReconnected(): void;
   onAudioPlaybackChanged(canPlaybackAudio: boolean): void;
   onMicrophoneStateChanged(enabled: boolean): void;
+  onParticipantConnected(identity: string, displayName: string): void;
+  onParticipantDisconnected(identity: string): void;
+  onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  onActiveSpeakersChanged(identities: string[]): void;
+  onScreenShareChanged(enabled: boolean): void;
+  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
+}
+
+function remoteVideoFor(identity: string): HTMLVideoElement {
+  const element = document.createElement("video");
+  element.dataset.participantIdentity = identity;
+  return element;
+}
+
+function remoteAudioFor(identity: string): HTMLAudioElement {
+  const element = document.createElement("audio");
+  element.dataset.participantIdentity = identity;
+  return element;
 }
 
 class FakeSession {
@@ -36,6 +54,9 @@ class FakeSession {
   readonly setCameraEnabled = vi.fn(async (): Promise<void> => undefined);
   readonly setMicrophoneEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
     this.callbacks.onMicrophoneStateChanged(enabled);
+  });
+  readonly setScreenShareEnabled = vi.fn(async (enabled: boolean): Promise<void> => {
+    this.callbacks.onScreenShareChanged(enabled);
   });
   readonly disconnect = vi.fn(async (): Promise<void> => undefined);
 
@@ -142,6 +163,53 @@ describe("useCallMedia", () => {
     expect(view.result.current.cameraEnabled).toBe(false);
   });
 
+  it("never starts screen share on connect and toggles only from explicit intent", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    expect(session.setScreenShareEnabled).not.toHaveBeenCalled();
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(true);
+    await act(() => view.result.current.toggleScreenShare());
+    expect(view.result.current.screenShareEnabled).toBe(false);
+    expect(session.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it("stabilizes the active speaker before updating the presentation", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onActiveSpeakersChanged(["identity-a"]));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(399));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    expect(view.result.current.activeSpeakerId).toBe("identity-a");
+
+    view.unmount();
+    vi.useRealTimers();
+  });
+
+  it("binds remote screen share separately from participant camera media", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const element = remoteVideoFor("identity-a");
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", element));
+    expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+    render(
+      <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+    );
+    expect(screen.getByTestId("screen-share")).toContainElement(element);
+
+    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", null));
+    expect(view.result.current.remoteScreenShare).toBeNull();
+  });
+
   it("attaches and removes local and remote media without storing SDK objects in React state", async () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
@@ -233,6 +301,59 @@ describe("useCallMedia", () => {
     expect(failure).toMatchObject({ kind: "camera_denied" });
     expect(view.result.current.status).toBe("permission-denied");
     expect(view.result.current.error).toBe("Permissão de câmera negada pelo navegador.");
+  });
+
+  it("reports microphone permission denial during connect", async () => {
+    const view = setup();
+    await act(() => view.result.current.prepare());
+    await act(() => view.result.current.startAudio());
+    view.getSession().enableMicrophone.mockRejectedValueOnce({ kind: "microphone_denied" });
+
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await view.result.current.connect(
+          { ...videoCall, call_type: "audio" },
+          "participant-token",
+        );
+      } catch (error) {
+        failure = error;
+      }
+    });
+
+    expect(failure).toMatchObject({ kind: "microphone_denied" });
+    expect(view.result.current.status).toBe("permission-denied");
+    expect(view.result.current.error).toBe("Permissão de microfone negada pelo navegador.");
+  });
+
+  it("reports an unavailable camera when the camera toggle fails", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    view.getSession().setCameraEnabled.mockRejectedValueOnce({ kind: "camera_unavailable" });
+
+    await act(() => view.result.current.toggleCamera());
+
+    expect(view.result.current.error).toBe("Não foi possível acessar ou alterar a câmera.");
+  });
+
+  it("reports a generic connect failure without an SDK error kind", async () => {
+    const view = setup();
+    await act(() => view.result.current.prepare());
+    await act(() => view.result.current.startAudio());
+    view.getSession().enableMicrophone.mockRejectedValueOnce(new Error("network down"));
+
+    let failure: unknown;
+    await act(async () => {
+      try {
+        await view.result.current.connect(videoCall, "participant-token");
+      } catch (error) {
+        failure = error;
+      }
+    });
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(view.result.current.status).toBe("error");
+    expect(view.result.current.error).toBe("Não foi possível conectar a mídia da chamada.");
   });
 
   it("keeps active controls available after a camera toggle fails", async () => {
@@ -984,5 +1105,690 @@ describe("useCallMedia", () => {
       });
       expect(view.result.current.microphoneEnabled).toBe(true);
     });
+  });
+});
+
+describe("useCallMedia participants (RF-24)", () => {
+  it("tracks a participant present before connect completes, without a track", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+  });
+
+  it("falls back to a generic label when the SDK reports no participant name", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", ""));
+
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      displayName: "Participante",
+    });
+  });
+
+  it("adds video and audio for a participant already known and removes them independently", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+    const audio = remoteAudioFor("identity-a");
+
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(video);
+      session.callbacks.onRemoteElement(audio);
+    });
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: true,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+
+    act(() => session.callbacks.onElementRemoved(video));
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: true,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+
+    act(() => session.callbacks.onElementRemoved(audio));
+    expect(view.result.current.participants[0]).toMatchObject({ hasVideo: false, hasAudio: false });
+  });
+
+  it("upserts the participant from a track arriving before ParticipantConnected, then fills in the real name once it arrives (HIGH: late displayName)", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+
+    act(() => session.callbacks.onRemoteElement(video));
+
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Participante",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+    const bindVideoBeforeName = view.result.current.participants[0].bindVideo;
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    // Same identity, same media state, same bindVideo reference — only the
+    // name changed. Never a second entry, never a reset of hasVideo.
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+    expect(view.result.current.participants[0].bindVideo).toBe(bindVideoBeforeName);
+
+    render(
+      <div ref={view.result.current.participants[0].bindVideo} data-testid="tile-late-name" />,
+    );
+    expect(screen.getByTestId("tile-late-name")).toContainElement(video);
+  });
+
+  it("never lets an empty or blank name regress an already-known real name (HIGH fix)", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", ""));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "   "));
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+
+    expect(view.result.current.participants).toHaveLength(1);
+  });
+
+  it("trims whitespace around a real name instead of treating it as a different name", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onParticipantConnected("identity-a", "  Pedro Almeida  "));
+
+    expect(view.result.current.participants[0].displayName).toBe("Pedro Almeida");
+    expect(view.result.current.participants).toHaveLength(1);
+  });
+
+  it("preserves participant identity and display name across a reconnect, without duplicating the entry", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    act(() => session.callbacks.onReconnecting());
+    act(() => session.callbacks.onReconnected());
+
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: false,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+  });
+
+  // RF-25 "ponto crítico": on a LiveKit full reconnect, the SDK itself
+  // unwinds every remote participant (firing ParticipantDisconnected for
+  // each) before repopulating from the server's fresh join response (firing
+  // ParticipantConnected for whoever is actually still there) — see
+  // livekit-client Room.handleRestarting/handleSignalRestarted. A participant
+  // who left during the outage and one who joined during it are exactly what
+  // that unwind-then-repopulate models; this asserts our identity-keyed map
+  // reflects the post-reconnect roster with no stale entry and no duplicate,
+  // without any additional client-side snapshot/polling reconciliation.
+  it("reconciles the roster via ParticipantConnected/Disconnected alone when membership changes during a reconnect", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-b", "Maria Silva");
+    });
+
+    act(() => session.callbacks.onReconnecting());
+    // The SDK's own full-reconnect unwind: every remote participant known
+    // before the outage is disconnected first...
+    act(() => {
+      session.callbacks.onParticipantDisconnected("identity-a");
+      session.callbacks.onParticipantDisconnected("identity-b");
+    });
+    // ...then repopulated from the server's fresh, authoritative list: B left
+    // for real during the outage, C joined during it, A is still there.
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-c", "Ana Lima");
+    });
+    act(() => session.callbacks.onReconnected());
+
+    expect(view.result.current.participants.map((p) => p.identity)).toEqual([
+      "identity-a",
+      "identity-c",
+    ]);
+    expect(view.result.current.status).toBe("connected");
+  });
+
+  it("removes a participant on disconnect and keeps the others", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onParticipantConnected("identity-b", "Maria Silva");
+      session.callbacks.onParticipantDisconnected("identity-a");
+    });
+
+    expect(view.result.current.participants.map((p) => p.identity)).toEqual(["identity-b"]);
+  });
+
+  it("mounts a participant's video element into its own tile container, never into the flat remote container", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(video);
+    });
+
+    render(<div ref={view.result.current.participants[0].bindVideo} data-testid="tile-a" />);
+
+    expect(screen.getByTestId("tile-a")).toContainElement(video);
+  });
+
+  it("mounts remote audio into bindRemoteAudio independent of bindRemoteMedia", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const audio = remoteAudioFor("identity-a");
+
+    act(() => session.callbacks.onRemoteElement(audio));
+    render(<div ref={view.result.current.bindRemoteAudio} data-testid="audio-sink" />);
+
+    expect(screen.getByTestId("audio-sink")).toContainElement(audio);
+  });
+
+  it("clears every participant on stop()", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+    expect(view.result.current.participants).toHaveLength(1);
+
+    await act(() => view.result.current.stop());
+
+    expect(view.result.current.participants).toEqual([]);
+  });
+});
+
+describe("useCallMedia remote camera mute/unmute (RF-24 code review achado 1)", () => {
+  it("keeps the tile but flips hasVideo=false on a remote camera TrackMuted, and restores it on TrackUnmuted", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(video);
+    });
+    expect(view.result.current.participants).toEqual([
+      {
+        identity: "identity-a",
+        displayName: "Pedro Almeida",
+        hasVideo: true,
+        hasAudio: false,
+        bindVideo: expect.any(Function),
+      },
+    ]);
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", false));
+
+    expect(view.result.current.participants).toHaveLength(1);
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      hasVideo: false,
+    });
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", true));
+
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      hasVideo: true,
+    });
+  });
+
+  it("mute clears the tile's mounted element so no frozen frame shows behind the fallback", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(video);
+    });
+    render(<div ref={view.result.current.participants[0].bindVideo} data-testid="tile-a" />);
+    expect(screen.getByTestId("tile-a")).toContainElement(video);
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", false));
+    expect(screen.getByTestId("tile-a")).toBeEmptyDOMElement();
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", true));
+    expect(screen.getByTestId("tile-a")).toContainElement(video);
+  });
+
+  it("does not fabricate hasVideo=true on unmute when no video element was ever attached", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    act(() => session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("identity-a", true));
+
+    expect(view.result.current.participants[0]).toMatchObject({ hasVideo: false });
+  });
+
+  it("a remote microphone mute/unmute never touches hasVideo", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const video = remoteVideoFor("identity-a");
+    const audio = remoteAudioFor("identity-a");
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(video);
+      session.callbacks.onRemoteElement(audio);
+    });
+
+    // Local mic mute callback: distinct channel from the new one, must not
+    // be confused with a remote camera event.
+    act(() => session.callbacks.onMicrophoneStateChanged(false));
+
+    expect(view.result.current.participants[0]).toMatchObject({ hasVideo: true, hasAudio: true });
+  });
+
+  it("ignores a camera-availability event for a participant that never connected", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => session.callbacks.onRemoteVideoAvailabilityChanged("ghost", false));
+
+    expect(view.result.current.participants).toEqual([]);
+  });
+});
+
+describe("useCallMedia session serialization (RF-24 code review achado 4)", () => {
+  it("disconnected terminal invalidates the session so a retry with the same call_id reconnects for real", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const firstSession = view.getSession();
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    act(() => firstSession.callbacks.onDisconnected());
+    expect(view.result.current.status).toBe("error");
+
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+
+    expect(view.factory).toHaveBeenCalledTimes(2);
+    const secondSession = view.getSession();
+    expect(secondSession).not.toBe(firstSession);
+    expect(secondSession.connect).toHaveBeenCalledOnce();
+    expect(view.result.current.status).toBe("connected");
+  });
+
+  it("clears participants on a terminal disconnect and does not carry them into the rejoin", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const firstSession = view.getSession();
+    act(() => firstSession.callbacks.onParticipantConnected("identity-a", "Pedro Almeida"));
+    expect(view.result.current.participants).toHaveLength(1);
+
+    act(() => firstSession.callbacks.onDisconnected());
+    expect(view.result.current.participants).toEqual([]);
+
+    await act(() =>
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000809" },
+        "fresh-token",
+      ),
+    );
+    const secondSession = view.getSession();
+    act(() => secondSession.callbacks.onParticipantConnected("identity-b", "Maria Silva"));
+
+    expect(view.result.current.participants.map((p) => p.identity)).toEqual(["identity-b"]);
+  });
+
+  it("a stale callback from a session invalidated by a terminal disconnect never changes the new session's state", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const firstSession = view.getSession();
+    act(() => firstSession.callbacks.onDisconnected());
+
+    await act(() =>
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000810" },
+        "fresh-token",
+      ),
+    );
+    expect(view.result.current.status).toBe("connected");
+    // connect() itself confirms the mic on for the new (second) session.
+    expect(view.result.current.microphoneEnabled).toBe(true);
+
+    // Late events from the dead Room object (e.g. a queued microtask that ran
+    // after invalidation): must be ignored by the generation guard, so an
+    // opposite value from the stale session must not flip the new session's
+    // confirmed state, and a stale participant must not reappear.
+    act(() => firstSession.callbacks.onMicrophoneStateChanged(false));
+    act(() => firstSession.callbacks.onParticipantConnected("ghost-from-old-room", "Ghost"));
+
+    expect(view.result.current.microphoneEnabled).toBe(true);
+    expect(view.result.current.participants).toEqual([]);
+  });
+
+  it("never starts a new Room before the previous one's disconnect has actually resolved", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const firstSession = view.getSession();
+    let resolveDisconnect!: () => void;
+    firstSession.disconnect.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDisconnect = resolve;
+        }),
+    );
+
+    const stopping = view.result.current.stop();
+    let connectResolved = false;
+    const connecting = view.result.current
+      .connect({ ...videoCall, call_id: "00000000-0000-4000-8000-000000000811" }, "fresh-token")
+      .then(() => {
+        connectResolved = true;
+      });
+
+    // Give pending microtasks a chance to run; the second Room must not be
+    // constructed yet because the first one's disconnect() has not resolved.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(view.factory).toHaveBeenCalledOnce();
+    expect(connectResolved).toBe(false);
+
+    await act(async () => {
+      resolveDisconnect();
+      await stopping;
+      await connecting;
+    });
+
+    expect(view.factory).toHaveBeenCalledTimes(2);
+    expect(connectResolved).toBe(true);
+  });
+});
+
+describe("useCallMedia stop() real disconnect failure (RF-24 quarta correção)", () => {
+  it("rejects stop() when LiveKitSession.disconnect() itself rejects, instead of resolving", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    session.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await expect(view.result.current.stop()).rejects.toThrow("disconnect failed");
+
+    expect(session.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("clears refs/state synchronously even when the underlying disconnect rejects", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    session.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await act(async () => {
+      await view.result.current.stop().catch(() => undefined);
+    });
+
+    expect(view.result.current.status).toBe("idle");
+    expect(view.result.current.participants).toEqual([]);
+  });
+
+  it("does not leave disconnectPromiseRef stuck: a retried stop() calls disconnect() again on the same Room and can succeed", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    session.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await expect(view.result.current.stop()).rejects.toThrow("disconnect failed");
+    await expect(view.result.current.stop()).resolves.toBeUndefined();
+
+    expect(session.disconnect).toHaveBeenCalledTimes(2);
+  });
+
+  it("never starts a new Room while a rejected disconnect's cleanup is still pending", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const firstSession = view.getSession();
+    let rejectDisconnect!: (error: unknown) => void;
+    firstSession.disconnect.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectDisconnect = reject;
+        }),
+    );
+
+    const stopping = view.result.current.stop().catch(() => undefined);
+    const connecting = view.result.current.connect(
+      { ...videoCall, call_id: "00000000-0000-4000-8000-000000000812" },
+      "fresh-token",
+    );
+    connecting.catch(() => undefined);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      rejectDisconnect(new Error("disconnect failed"));
+      await stopping;
+    });
+
+    // The rejection has now fully settled, but cleanup was never confirmed:
+    // a second Room must still not exist.
+    expect(view.factory).toHaveBeenCalledOnce();
+  });
+
+  it("does not produce an unhandled rejection when stop() rejects during unmount", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    view.getSession().disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    view.unmount();
+    await act(async () => undefined);
+  });
+
+  // ── HIGH (quinta correção): a Room whose cleanup rejected must permanently
+  // block a new Room — across connect(), startAudio(), and ensureSession() —
+  // until an explicit stop()/leave() retries the disconnect and it succeeds.
+  it("Cenário 1 — connect() rejects and never creates Room B while Room A's cleanup is unconfirmed", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const roomA = view.getSession();
+    roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await view.result.current.stop().catch(() => undefined);
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    await expect(
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000813" },
+        "fresh-token",
+      ),
+    ).rejects.toThrow();
+
+    expect(view.factory).toHaveBeenCalledOnce();
+    expect(view.sessions).toHaveLength(1);
+  });
+
+  it("Cenário 2 — startAudio() does not create Room B while Room A's cleanup is unconfirmed", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const roomA = view.getSession();
+    roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await view.result.current.stop().catch(() => undefined);
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    await act(() => view.result.current.startAudio());
+
+    expect(view.factory).toHaveBeenCalledOnce();
+    expect(view.sessions).toHaveLength(1);
+  });
+
+  it("Cenário 3 — a successful retry of the failed disconnect releases the block so Room B can be created", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const roomA = view.getSession();
+    roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await view.result.current.stop().catch(() => undefined);
+    await expect(
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000814" },
+        "fresh-token",
+      ),
+    ).rejects.toThrow();
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    // Explicit retry: the second stop() call must hit the SAME Room A
+    // instance again, and this time it resolves.
+    await view.result.current.stop();
+    expect(roomA.disconnect).toHaveBeenCalledTimes(2);
+
+    await act(() =>
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000815" },
+        "fresh-token",
+      ),
+    );
+
+    expect(view.factory).toHaveBeenCalledTimes(2);
+    expect(view.sessions).toHaveLength(2);
+    expect(view.sessions[1]).not.toBe(roomA);
+    expect(view.result.current.status).toBe("connected");
+  });
+});
+
+describe("useCallMedia connect() failure cleanup (Security Review pós-Code Quality)", () => {
+  // Camera already reached LiveKit before microphone failed, so Room A is a
+  // genuinely sensitive session — not "connect never touched media" — when
+  // its own cleanup attempt then also rejects.
+  async function setupPartialConnectFailure() {
+    const view = setup();
+    await act(() => view.result.current.prepare());
+    await act(() => view.result.current.startAudio());
+    const roomA = view.getSession();
+    roomA.enableMicrophone.mockRejectedValueOnce(new Error("microphone unavailable"));
+    roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
+
+    await act(async () => {
+      await expect(view.result.current.connect(videoCall, "participant-token")).rejects.toThrow();
+    });
+
+    expect(roomA.enableCamera).toHaveBeenCalledOnce();
+    expect(roomA.enableMicrophone).toHaveBeenCalledOnce();
+    expect(roomA.disconnect).toHaveBeenCalledOnce();
+    return { view, roomA };
+  }
+
+  it("does not create another Room when cleanup after a partial connect failure (camera on, microphone denied) is rejected", async () => {
+    const { view, roomA } = await setupPartialConnectFailure();
+
+    await expect(
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000820" },
+        "token-b",
+      ),
+    ).rejects.toThrow();
+
+    expect(view.factory).toHaveBeenCalledOnce();
+    expect(view.sessions).toHaveLength(1);
+    expect(view.sessions[0]).toBe(roomA);
+  });
+
+  it("lets a resolved retry of Room A's cleanup create Room B, without leaking Room A's state or elements into it", async () => {
+    const { view, roomA } = await setupPartialConnectFailure();
+    await view.result.current
+      .connect({ ...videoCall, call_id: "00000000-0000-4000-8000-000000000821" }, "token-b")
+      .catch(() => undefined);
+    expect(view.factory).toHaveBeenCalledOnce();
+
+    // Explicit retry (the only way to release the block): stop() must call
+    // disconnect() again on the very same Room A instance.
+    await view.result.current.stop();
+    expect(roomA.disconnect).toHaveBeenCalledTimes(2);
+
+    await act(() =>
+      view.result.current.connect(
+        { ...videoCall, call_id: "00000000-0000-4000-8000-000000000822" },
+        "fresh-token",
+      ),
+    );
+
+    expect(view.factory).toHaveBeenCalledTimes(2);
+    expect(view.sessions).toHaveLength(2);
+    const roomB = view.sessions[1];
+    expect(roomB).not.toBe(roomA);
+    // No stale target/state carried over from A into B.
+    expect(view.result.current.status).toBe("connected");
+    expect(view.result.current.participants).toEqual([]);
+    expect(roomB.connect).toHaveBeenCalledWith(liveKitServerUrl, "fresh-token");
+    expect(roomA.connect).not.toHaveBeenCalledWith(liveKitServerUrl, "fresh-token");
+  });
+
+  it("does not expose LiveKit internals (token, server URL, room/session identifiers) in the surfaced error", async () => {
+    const { view } = await setupPartialConnectFailure();
+
+    expect(view.result.current.error).toBe("Não foi possível conectar a mídia da chamada.");
+    expect(view.result.current.error).not.toContain("participant-token");
+    expect(view.result.current.error).not.toContain(liveKitServerUrl);
   });
 });

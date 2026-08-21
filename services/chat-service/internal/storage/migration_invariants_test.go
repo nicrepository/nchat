@@ -445,6 +445,25 @@ func TestChatMigration_AddsV3MentionsAndDirectedOutbox(t *testing.T) {
 	}
 }
 
+func TestChatLinkScanInconclusiveMigrationKeepsTTLIndexVerdictOnly(t *testing.T) {
+	up := readChatMigration(t, "000026_link_scan_inconclusive.up.sql")
+	if !strings.Contains(up, "WHERE status IN ('safe', 'malicious')") {
+		t.Fatal("the verdict TTL index must exclude inconclusive scans")
+	}
+}
+
+func TestChatLinkScanInconclusiveDownMigrationNeverRequeuesTerminalRows(t *testing.T) {
+	down := readChatMigration(t, "000026_link_scan_inconclusive.down.sql")
+	if strings.Contains(down, "SET status = 'pending'") || strings.Contains(down, "scan_uuid = NULL") {
+		t.Fatal("rollback must not turn inconclusive scans back into provider work")
+	}
+	for _, expected := range []string{"RAISE EXCEPTION", "WHERE status = 'inconclusive'"} {
+		if !strings.Contains(down, expected) {
+			t.Fatalf("safe inconclusive rollback must contain %q", expected)
+		}
+	}
+}
+
 func TestChatMigration_AddsMessageReactionsWithRollback(t *testing.T) {
 	migration := readChatMigration(t, "000008_message_reactions.up.sql")
 	for _, expected := range []string{
@@ -690,6 +709,155 @@ func TestChatMigration_DownDemotesModeratorsAndRestoresThePreviousPolicy(t *test
 	// which is only correct because it is the pre-RF-74 policy.
 	if !strings.Contains(down, "c.is_general = true OR c.type = 'public' OR cm.user_id IS NOT NULL") {
 		t.Fatal("rollback must restore the exact pre-RF-74 visibility body")
+	}
+}
+
+// RF-15 (issue #123, TASK-94): search_vector must only ever be computed for
+// active channel messages, gated on the *current* channel type and status
+// read from chat.channels — never a copy of DM/private/archived logic baked
+// into a generated column, which could not see a channel's type or status at
+// all. The channel row is read with FOR SHARE so this decision serializes
+// against a concurrent channel type/status change (post-Code Quality Review
+// fix: closes the race where an in-flight message insert and an in-flight
+// channel privacy/archive change could each miss the other).
+func TestChatMigration_MessageSearchVectorOnlyCoversActivePublicChannelMessages(t *testing.T) {
+	migration := readChatMigration(t, "000027_message_search_vector_index.up.sql")
+
+	for _, fragment := range []string{
+		"ALTER TABLE chat.messages",
+		"ADD COLUMN search_vector tsvector",
+		"CREATE OR REPLACE FUNCTION chat.messages_search_vector_sync()",
+		"IF NEW.channel_id IS NULL OR NEW.status <> 'active' THEN",
+		"NEW.search_vector := NULL;",
+		"SELECT (type = 'public' AND status = 'active') INTO channel_is_searchable",
+		"FOR SHARE;",
+		"to_tsvector('portuguese', COALESCE(NEW.body_text, ''))",
+		"CREATE TRIGGER messages_search_vector_sync",
+		"BEFORE INSERT OR UPDATE OF body_text, status ON chat.messages",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("search vector sync migration missing %q", fragment)
+		}
+	}
+	// GENERATED ALWAYS AS was rejected in design review: it cannot read
+	// chat.channels.type/status, so it would have to either index
+	// DMs/private/archived channels or never index anything at all.
+	if strings.Contains(migration, "GENERATED ALWAYS AS") {
+		t.Fatal("search_vector must not be a generated column: it cannot see chat.channels.type/status")
+	}
+	// FOR SHARE is the weakest lock that still serializes against a writer;
+	// a stronger lock (FOR UPDATE) would needlessly conflict with other
+	// concurrent readers of the same channel row.
+	if strings.Contains(migration, "FOR UPDATE") {
+		t.Fatal("message search vector sync must use FOR SHARE, not a stronger lock")
+	}
+}
+
+// chat.channels.type and status can both change (chat-service's channel
+// update flow allows public <-> private, and ArchiveChannel flips active ->
+// archived), so a trigger scoped to chat.messages alone would leave stale
+// search_vector values behind a privacy or archive change. This asserts the
+// resync trigger exists, reacts to either column changing, and only when the
+// value actually changed.
+func TestChatMigration_ChannelTypeOrStatusChangeResyncsMessageSearchVectors(t *testing.T) {
+	migration := readChatMigration(t, "000027_message_search_vector_index.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE OR REPLACE FUNCTION chat.channel_messages_search_vector_resync()",
+		"WHERE channel_id = NEW.id",
+		"AND status = 'active'",
+		"WHEN NEW.type = 'public' AND NEW.status = 'active'",
+		"THEN to_tsvector('portuguese', COALESCE(body_text, ''))",
+		"ELSE NULL",
+		"CREATE TRIGGER channels_search_vector_resync",
+		"AFTER UPDATE OF type, status ON chat.channels",
+		"WHEN (OLD.type IS DISTINCT FROM NEW.type OR OLD.status IS DISTINCT FROM NEW.status)",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("channel type/status resync migration missing %q", fragment)
+		}
+	}
+}
+
+// The backfill must apply the same public+active channel gate as the
+// trigger, or a message in an archived channel created before this migration
+// would end up indexed by the backfill and only cleaned up on the next
+// unrelated channel or message write.
+func TestChatMigration_MessageSearchVectorBackfillExcludesArchivedChannels(t *testing.T) {
+	migration := readChatMigration(t, "000027_message_search_vector_index.up.sql")
+
+	for _, fragment := range []string{
+		"UPDATE chat.messages m",
+		"SET search_vector = to_tsvector('portuguese', COALESCE(m.body_text, ''))",
+		"FROM chat.channels c",
+		"WHERE c.id = m.channel_id",
+		"AND c.type = 'public'",
+		"AND c.status = 'active'",
+		"AND m.status = 'active';",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("search vector backfill missing %q", fragment)
+		}
+	}
+}
+
+// The GIN index must be partial: only rows where search_vector IS NOT NULL,
+// so DMs, private-channel messages and soft-deleted messages are structurally
+// excluded rather than merely conventionally excluded.
+func TestChatMigration_MessageSearchVectorIndexIsPartialAndUsesGIN(t *testing.T) {
+	migration := readChatMigration(t, "000027_message_search_vector_index.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE INDEX idx_messages_search_vector",
+		"ON chat.messages USING GIN (search_vector)",
+		"WHERE search_vector IS NOT NULL",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("search vector index migration missing %q", fragment)
+		}
+	}
+}
+
+// The ranking helper must combine ts_rank (relevance, the primary component)
+// with a bounded recency multiplier — never let recency alone decide, and
+// never leave the boost unbounded so a material relevance gap survives it.
+func TestChatMigration_MessageSearchRankCombinesRelevanceAndBoundedRecency(t *testing.T) {
+	migration := readChatMigration(t, "000027_message_search_vector_index.up.sql")
+
+	for _, fragment := range []string{
+		"CREATE OR REPLACE FUNCTION chat.message_search_rank(",
+		"SELECT ts_rank(p_search_vector, p_query)",
+		"GREATEST(0.0, LEAST(1.0,",
+	} {
+		if !strings.Contains(migration, fragment) {
+			t.Fatalf("ranking function migration missing %q", fragment)
+		}
+	}
+}
+
+func TestChatMigration_MessageSearchVectorDownRemovesEverythingItAddedAndNothingElse(t *testing.T) {
+	down := readChatMigration(t, "000027_message_search_vector_index.down.sql")
+
+	for _, fragment := range []string{
+		"DROP FUNCTION IF EXISTS chat.message_search_rank(tsvector, tsquery, timestamptz)",
+		"DROP INDEX IF EXISTS chat.idx_messages_search_vector",
+		"DROP TRIGGER IF EXISTS channels_search_vector_resync ON chat.channels",
+		"DROP FUNCTION IF EXISTS chat.channel_messages_search_vector_resync()",
+		"DROP TRIGGER IF EXISTS messages_search_vector_sync ON chat.messages",
+		"DROP FUNCTION IF EXISTS chat.messages_search_vector_sync()",
+		"DROP COLUMN IF EXISTS search_vector",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Fatalf("search vector rollback missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"DROP TABLE", "DELETE FROM", "TRUNCATE"} {
+		if strings.Contains(down, forbidden) {
+			t.Fatalf("search vector rollback must not contain %q", forbidden)
+		}
+	}
+	if strings.Contains(strings.ToUpper(down), "DROP SCHEMA") || strings.Contains(strings.ToUpper(down), "CASCADE") {
+		t.Fatal("search vector rollback must not drop the schema or cascade")
 	}
 }
 

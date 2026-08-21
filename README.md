@@ -97,6 +97,17 @@ Rodar o frontend:
 make dev-web
 ```
 
+Rodar o console administrativo (aplicacao separada, issue #578):
+
+```bash
+make dev-admin-web
+```
+
+O console e servido em `https://admin.nchat.local` pelo gateway local — host
+proprio, bundle proprio e CSP propria, para exercitar localmente a mesma
+fronteira que existe em producao. Ver
+`docs/runbooks/task-admin-console-foundation.md`.
+
 Validacao:
 
 ```bash
@@ -301,6 +312,7 @@ Adicione no `/etc/hosts`:
 
 ```text
 127.0.0.1 nchat.local
+127.0.0.1 admin.nchat.local
 ```
 
 Rotas locais:
@@ -310,9 +322,10 @@ Rotas locais:
 - `http://nchat.local:8080/api/chat/healthz`
 - `http://nchat.local:8080/api/files/healthz`
 - `http://nchat.local:8080/api/notifications/healthz`
-- `http://nchat.local:8080/api/admin/healthz`
 - `http://nchat.local:8080/api/search/healthz`
 - `http://nchat.local:8080/api/media/healthz`
+- Console administrativo: `http://admin.nchat.local:8080/`
+- Admin API: `http://admin.nchat.local:8080/api/admin/healthz`
 - Dashboard: `http://localhost:8090/dashboard/`
 
 Avisos:
@@ -516,6 +529,7 @@ Auth-service implements RF-44 with Keycloak as the first OIDC provider. The flow
 - Frontend exchange: `POST /auth/oidc/keycloak/exchange`
 - Web route: `/oidc-callback`
 - User linking: existing `(external_provider, external_subject)` users log in; new verified emails are auto-provisioned when enabled; manual same-email accounts are not silently linked.
+- Provisioning is just-in-time: the NChat account is created on the user's first successful SSO login. Creating a user in Keycloak does not by itself create an NChat account, and it does not grant workspace membership — see the runbook.
 - Required provider values use secret refs in Kubernetes. `OIDC_ENABLED=false` by default.
 - Runbook: [docs/runbooks/task-auth-oidc-keycloak.md](docs/runbooks/task-auth-oidc-keycloak.md)
 - Migration: `migrations/auth/000007_oidc_keycloak_provider.{up,down}.sql`

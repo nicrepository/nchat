@@ -56,6 +56,8 @@ type fakeQueue struct {
 	pruneErr        error
 	backlogErr      error
 	outboxErr       error
+	refreshBatches  [][]storage.MessageLinkSafetyChange
+	refreshCalls    int
 
 	begun            []string
 	beginConflict    bool
@@ -192,6 +194,20 @@ func (q *fakeQueue) ResolveDecidedMessages(_ context.Context) (storage.ResolveSu
 	return summary, nil
 }
 
+func (q *fakeQueue) RefreshMessageLinkSafety(
+	_ context.Context, _ string,
+) ([]storage.MessageLinkSafetyChange, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.refreshCalls++
+	if len(q.refreshBatches) == 0 {
+		return nil, nil
+	}
+	changes := q.refreshBatches[0]
+	q.refreshBatches = q.refreshBatches[1:]
+	return changes, nil
+}
+
 // ClaimPublishEvents hands out the outbox rows once. A second pass finds
 // nothing, which is what "delivered" looks like from the worker's side.
 func (q *fakeQueue) ClaimPublishEvents(_ context.Context, _ int) ([]storage.PublishEvent, error) {
@@ -321,6 +337,29 @@ func worker(queue service.LinkScanQueue, provider service.LinkScanProvider, publ
 	return service.NewLinkScanService(queue, provider, publisher, nil)
 }
 
+type linkAwarePublisher struct {
+	fakePublisher
+	mu          sync.Mutex
+	linkChanges []storage.MessageLinkSafetyChange
+}
+
+func (p *linkAwarePublisher) PublishMessageLinkSafetyChanged(
+	_ context.Context, workspaceID, targetType, targetID, messageID, state string, updatedAt time.Time,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.linkChanges = append(p.linkChanges, storage.MessageLinkSafetyChange{
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID: messageID, State: domain.MessageLinkSafety(state), UpdatedAt: updatedAt,
+	})
+}
+
+func (p *linkAwarePublisher) linkChangeSnapshot() []storage.MessageLinkSafetyChange {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]storage.MessageLinkSafetyChange(nil), p.linkChanges...)
+}
+
 // A URL that has never been submitted is submitted, and its id stored — losing
 // the id would mean the scan still runs but nobody ever reads it.
 func TestUnsubmittedURLIsSubmittedAndItsIDStored(t *testing.T) {
@@ -361,6 +400,34 @@ func TestSubmittedURLIsPolled(t *testing.T) {
 	_, verdicts := queue.snapshot()
 	if verdicts["https://example.com/x"] != urlsafety.VerdictSafe {
 		t.Fatalf("verdicts: %v", verdicts)
+	}
+}
+
+func TestOrdinaryFinalVerdictConvergesAlreadyActiveMessages(t *testing.T) {
+	updatedAt := time.Unix(1_700_000_000, 0)
+	want := storage.MessageLinkSafetyChange{
+		WorkspaceID: "ws-1", TargetType: "channel", TargetID: "ch-1",
+		MessageID: "active-1", State: domain.MessageLinkSafetyMalicious, UpdatedAt: updatedAt,
+	}
+	queue := newFakeQueue(storage.LinkScanJob{
+		CanonicalURL: "https://example.com/x", ScanUUID: "scan-9",
+	})
+	queue.refreshBatches = [][]storage.MessageLinkSafetyChange{{want}, nil}
+	publisher := &linkAwarePublisher{}
+
+	if _, err := worker(queue,
+		&fakeProvider{verdict: urlsafety.VerdictMalicious}, publisher,
+	).ProcessDue(context.Background()); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	queue.mu.Lock()
+	refreshCalls := queue.refreshCalls
+	queue.mu.Unlock()
+	if refreshCalls != 2 {
+		t.Fatalf("refresh calls=%d, want the active-message drain to reach empty", refreshCalls)
+	}
+	if got := publisher.linkChangeSnapshot(); len(got) != 1 || got[0] != want {
+		t.Fatalf("link-safety changes=%+v, want %+v", got, want)
 	}
 }
 
@@ -708,12 +775,12 @@ type fakeBlockedPublisher struct {
 	calls []blockedCall
 }
 
-type blockedCall struct{ workspaceID, recipientUserID, messageID string }
+type blockedCall struct{ workspaceID, recipientUserID, messageID, reason string }
 
-func (p *fakeBlockedPublisher) PublishMessageBlocked(_ context.Context, workspaceID, recipientUserID, messageID string) {
+func (p *fakeBlockedPublisher) PublishMessageBlocked(_ context.Context, workspaceID, recipientUserID, messageID, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.calls = append(p.calls, blockedCall{workspaceID, recipientUserID, messageID})
+	p.calls = append(p.calls, blockedCall{workspaceID, recipientUserID, messageID, reason})
 }
 
 func (p *fakeBlockedPublisher) snapshot() []blockedCall {
@@ -954,7 +1021,7 @@ type droppingBlockedPublisher struct {
 	calls int
 }
 
-func (p *droppingBlockedPublisher) PublishMessageBlocked(_ context.Context, _, _, _ string) {
+func (p *droppingBlockedPublisher) PublishMessageBlocked(_ context.Context, _, _, _, _ string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
@@ -1428,5 +1495,134 @@ func TestAnAmbiguousSubmitFailureLeavesTheAttemptOutstanding(t *testing.T) {
 				t.Fatalf("a second submission was begun: %v", queue.begun)
 			}
 		})
+	}
+}
+
+// ── The RF-21 incident: inconclusive as a terminal, fail-closed state ─────────
+//
+// Cloudflare answering HTTP 200, task.status=finished, task.success=false,
+// hasVerdicts=false used to surface as ErrUnavailable, which the worker retries
+// forever — the finished scan was polled on every pass and messages sharing that
+// URL never left pending_link_scan. ErrScanInconclusive is what the provider
+// layer now reports for that exact answer; these assert the worker's side of the
+// fix: settle it once, refuse the message the same way a malicious link is
+// refused, and never treat it as a clearance.
+
+// A poll answering ErrScanInconclusive is recorded as urlsafety.VerdictInconclusive
+// — a distinct outcome from every final verdict, not folded into "safe" or
+// dropped like a non-final answer.
+func TestInconclusivePollIsRecordedAsItsOwnVerdict(t *testing.T) {
+	queue := newFakeQueue(storage.LinkScanJob{
+		CanonicalURL: "https://example.com/x", ScanUUID: "scan-9",
+	})
+	provider := &fakeProvider{pollErr: urlsafety.ErrScanInconclusive}
+
+	if _, err := worker(queue, provider, nil).ProcessDue(context.Background()); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	_, verdicts := queue.snapshot()
+	if verdicts["https://example.com/x"] != urlsafety.VerdictInconclusive {
+		t.Fatalf("verdicts: %v, want the inconclusive answer recorded", verdicts)
+	}
+}
+
+// A message blocked for an inconclusive scan is announced to its author alone,
+// carrying the reason that distinguishes it from a malicious-link refusal — and
+// is retired once delivered, exactly like any other refusal.
+func TestBlockedMessageForInconclusiveReasonReachesOnlyItsAuthor(t *testing.T) {
+	const inconclusiveReason = "link_check_inconclusive" // ws.MessageBlockedReasonLinkCheckInconclusive
+	queue := newFakeQueue()
+	queue.events = []storage.PublishEvent{{
+		MessageID: "msg-1", WorkspaceID: "ws-1",
+		EventType:  storage.EventMessageBlocked,
+		TargetType: storage.TargetSender, TargetID: "user-author",
+		Reason: inconclusiveReason,
+	}}
+	blocked := &fakeBlockedPublisher{}
+
+	if _, err := workerWithBlocked(queue, blocked).ProcessDue(context.Background()); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	calls := blocked.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("announced %d times", len(calls))
+	}
+	if calls[0].recipientUserID != "user-author" || calls[0].reason != inconclusiveReason {
+		t.Fatalf("announced %+v, want the inconclusive reason addressed to the author alone", calls[0])
+	}
+	if delivered := queue.deliveredEvents(); len(delivered) != 1 {
+		t.Fatalf("the refusal was not retired: %v", delivered)
+	}
+}
+
+// The backend delivery contract is at-least-once. A repeated inconclusive
+// delivery therefore may announce twice, but both announcements must carry the
+// same recipient and reason so the client can converge idempotently.
+func TestInconclusiveRefusalRepeatedDeliveryKeepsPayloadStable(t *testing.T) {
+	const inconclusiveReason = "link_check_inconclusive"
+	event := storage.PublishEvent{
+		MessageID: "msg-1", WorkspaceID: "ws-1",
+		EventType:  storage.EventMessageBlocked,
+		TargetType: storage.TargetSender, TargetID: "user-author",
+		Reason: inconclusiveReason,
+	}
+	queue := newFakeQueue()
+	queue.events = []storage.PublishEvent{event}
+	blocked := &fakeBlockedPublisher{}
+	svc := workerWithBlocked(queue, blocked)
+
+	if _, err := svc.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if len(blocked.snapshot()) != 1 {
+		t.Fatal("the refusal was not announced on the first pass")
+	}
+	if delivered := queue.deliveredEvents(); len(delivered) != 1 {
+		t.Fatalf("the event was not retired: %v", delivered)
+	}
+
+	// The event is claimed once by ClaimPublishEvents in the real store — a
+	// delivered row is not handed out again. Simulate a second dispatcher pass
+	// finding it re-queued only if delivery genuinely repeats (e.g. a retry
+	// before the mark landed), by resubmitting the same event once more.
+	queue.events = []storage.PublishEvent{event}
+	if _, err := svc.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	calls := blocked.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("announced %d times across two independent deliveries, want exactly one per delivery", len(calls))
+	}
+	// Both announcements carry identical content and no new business state: the
+	// message was already decided before either delivery, and delivering an
+	// already-decided refusal again does not re-decide it or fork its reason.
+	if calls[0] != calls[1] {
+		t.Fatalf("repeated delivery announced different content: %+v vs %+v", calls[0], calls[1])
+	}
+	if queue.resolves != 2 {
+		t.Fatalf("resolves = %d, want one ResolveDecidedMessages call per ProcessDue pass", queue.resolves)
+	}
+}
+
+// No message.created event is ever produced for an inconclusive-blocked
+// message: the promoted publisher is never called when the outbox holds only a
+// blocked event.
+func TestNoMessageCreatedEventForInconclusiveBlock(t *testing.T) {
+	queue := newFakeQueue()
+	queue.events = []storage.PublishEvent{{
+		MessageID: "msg-1", WorkspaceID: "ws-1",
+		EventType:  storage.EventMessageBlocked,
+		TargetType: storage.TargetSender, TargetID: "user-author",
+		Reason: "link_check_inconclusive",
+	}}
+	publisher := &fakePublisher{}
+	svc := service.NewLinkScanService(queue, &fakeProvider{}, publisher, nil)
+	svc.SetBlockedPublisher(&fakeBlockedPublisher{})
+
+	if _, err := svc.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("ProcessDue: %v", err)
+	}
+	if len(publisher.snapshot()) != 0 {
+		t.Fatal("a message.created event was emitted for a blocked message")
 	}
 }

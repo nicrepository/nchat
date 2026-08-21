@@ -1,0 +1,351 @@
+/*
+ * Console administrativo — folha de estilo única.
+ *
+ * Regras que existem por acessibilidade, não por estética:
+ *   - foco sempre visível (o console é operado por teclado com frequência);
+ *   - nenhum estado depende apenas de cor: resultado de auditoria, seção
+ *     indisponível e ambiente são também texto;
+ *   - unidades relativas em todo lugar, para sobreviver a zoom de 200%;
+ *   - a sidebar vira uma faixa horizontal em telas estreitas em vez de sumir.
+ */
+
+:root {
+  color-scheme: light dark;
+  --admin-bg: #0f1115;
+  --admin-surface: #171a21;
+  --admin-border: #2a2f3a;
+  --admin-text: #e8eaee;
+  --admin-muted: #a2a9b6;
+  --admin-accent: #4c8dff;
+  --admin-danger: #ff6b6b;
+  --admin-warn: #ffb454;
+  --admin-ok: #4ec9a2;
+  --admin-radius: 0.5rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--admin-bg);
+  color: var(--admin-text);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--admin-accent);
+}
+
+:focus-visible {
+  outline: 3px solid var(--admin-accent);
+  outline-offset: 2px;
+}
+
+.admin-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.admin-skip-link {
+  position: absolute;
+  left: -999rem;
+  top: 0.5rem;
+  z-index: 10;
+  padding: 0.5rem 0.75rem;
+  background: var(--admin-surface);
+  border-radius: var(--admin-radius);
+}
+
+.admin-skip-link:focus {
+  left: 0.5rem;
+}
+
+.admin-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.admin-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.25rem;
+  background: var(--admin-surface);
+  border-bottom: 1px solid var(--admin-border);
+}
+
+.admin-header__brand {
+  display: flex;
+  flex-direction: column;
+}
+
+.admin-header__title {
+  font-weight: 700;
+}
+
+.admin-header__subtitle,
+.admin-header__email {
+  color: var(--admin-muted);
+  font-size: 0.85rem;
+}
+
+.admin-header__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+}
+
+.admin-header__identity {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+
+.admin-env {
+  padding: 0.2rem 0.6rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.admin-env--development {
+  color: var(--admin-ok);
+}
+
+.admin-env--staging {
+  color: var(--admin-warn);
+}
+
+.admin-env--production {
+  color: var(--admin-danger);
+}
+
+.admin-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.admin-sidebar {
+  flex: 0 0 15rem;
+  padding: 1rem 0.75rem;
+  background: var(--admin-surface);
+  border-right: 1px solid var(--admin-border);
+}
+
+.admin-sidebar__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.admin-sidebar__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--admin-radius);
+  color: inherit;
+  text-decoration: none;
+}
+
+.admin-sidebar__item--active {
+  background: var(--admin-border);
+  font-weight: 600;
+}
+
+.admin-sidebar__item--unavailable {
+  color: var(--admin-muted);
+  cursor: not-allowed;
+}
+
+.admin-sidebar__tag {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.admin-main {
+  flex: 1;
+  min-width: 0;
+  padding: 1.5rem;
+}
+
+.admin-main:focus {
+  outline: none;
+}
+
+.admin-footer {
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--admin-border);
+  color: var(--admin-muted);
+  font-size: 0.8rem;
+}
+
+.admin-lead {
+  color: var(--admin-muted);
+}
+
+.admin-definitions {
+  display: grid;
+  grid-template-columns: minmax(12rem, max-content) 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0 0 1.5rem;
+}
+
+.admin-definitions dt {
+  color: var(--admin-muted);
+}
+
+.admin-definitions dd {
+  margin: 0;
+}
+
+.admin-capability-list {
+  list-style: none;
+  margin: 0 0 1.5rem;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.admin-capability-list code {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.admin-table-scroll {
+  overflow-x: auto;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.admin-table th,
+.admin-table td {
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid var(--admin-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.admin-result--success {
+  color: var(--admin-ok);
+}
+
+.admin-result--denied {
+  color: var(--admin-warn);
+}
+
+.admin-result--error {
+  color: var(--admin-danger);
+}
+
+.admin-button {
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-accent);
+  color: #0b0d11;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.admin-button[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.admin-alert {
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--admin-danger);
+  border-radius: var(--admin-radius);
+  color: var(--admin-danger);
+}
+
+.admin-login {
+  max-width: 26rem;
+  margin: 0 auto;
+  padding: 3rem 1.25rem;
+}
+
+.admin-login form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.admin-login label {
+  margin-top: 0.75rem;
+  font-weight: 600;
+}
+
+.admin-login input {
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+  color: inherit;
+  font: inherit;
+}
+
+.admin-login .admin-button {
+  margin-top: 1rem;
+}
+
+.admin-login__sso {
+  margin-top: 1.25rem;
+}
+
+/* Notebook e tablet continuam com a sidebar lateral; abaixo disso ela vira uma
+   faixa rolável no topo, em vez de desaparecer. */
+@media (max-width: 48rem) {
+  .admin-body {
+    flex-direction: column;
+  }
+
+  .admin-sidebar {
+    flex: none;
+    border-right: none;
+    border-bottom: 1px solid var(--admin-border);
+    overflow-x: auto;
+  }
+
+  .admin-sidebar__list {
+    flex-direction: row;
+    flex-wrap: nowrap;
+  }
+
+  .admin-sidebar__item {
+    white-space: nowrap;
+  }
+}

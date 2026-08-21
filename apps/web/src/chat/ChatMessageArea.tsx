@@ -36,6 +36,8 @@ import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
 import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
 import { useMessages, type LastMutation, type SendResult } from "./useMessages";
+import { useTypingIndicator } from "./useTypingIndicator";
+import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetails } from "./useConversationDetails";
@@ -62,6 +64,22 @@ const reactionMenuLeaveDelayMs = 150;
 
 function recentReactionsKey(userID: string): string {
   return `nchat_recent_reactions:${userID}`;
+}
+
+/**
+ * "Fulano está digitando…" for one or two people, an aggregate count beyond
+ * that — never one line per typist, which is what would make the area jump
+ * around under a busy channel. `null` means nothing to show.
+ */
+function typingIndicatorText(
+  userIds: readonly string[],
+  namesByUserId: ReadonlyMap<string, string>,
+): string | null {
+  if (userIds.length === 0) return null;
+  const label = (id: string) => namesByUserId.get(id) ?? "Alguém";
+  if (userIds.length === 1) return `${label(userIds[0])} está digitando…`;
+  if (userIds.length === 2) return `${label(userIds[0])} e ${label(userIds[1])} estão digitando…`;
+  return `${userIds.length} pessoas estão digitando…`;
 }
 
 function allowedRecentReactions(
@@ -242,18 +260,60 @@ const DetailsToggle = forwardRef<HTMLButtonElement, DetailsToggleProps>(function
   );
 });
 
+interface DirectCallActionsProps {
+  onAudio: () => void;
+  onVideo: () => void;
+}
+
+/** RF-23 direct 1:1 call entry: audio and video remain distinct call types. */
+function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
+  return (
+    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+      <button type="button" aria-label="Iniciar chamada de áudio" onClick={onAudio}>
+        Áudio
+      </button>
+      <button type="button" aria-label="Iniciar chamada de vídeo" onClick={onVideo}>
+        Vídeo
+      </button>
+    </div>
+  );
+}
+
+interface ResourceCallActionProps {
+  onCall: () => void;
+}
+
+/**
+ * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
+ * multiparty call, never separate "audio" and "video" rooms, so there is a
+ * single action instead of RF-23's two — camera and microphone are controls
+ * within the call, chosen once inside ResourceCallPanel.
+ */
+function ResourceCallAction({ onCall }: ResourceCallActionProps) {
+  return (
+    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
+      <button type="button" aria-label="Iniciar chamada" onClick={onCall}>
+        Chamada
+      </button>
+    </div>
+  );
+}
+
 interface HeaderChannelProps {
   name: string;
   detailsToggle?: React.ReactNode;
+  /** RF-24: joins the channel's shared call room; absent while unavailable. */
+  onJoinCall?: () => void;
 }
 
-function HeaderChannel({ name, detailsToggle }: HeaderChannelProps) {
+export function HeaderChannel({ name, detailsToggle, onJoinCall }: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
         <IconHash />
       </span>
       <h1 className="chat-msg-area__header-title">{name}</h1>
+      {onJoinCall && <ResourceCallAction onCall={onJoinCall} />}
       {detailsToggle}
     </header>
   );
@@ -264,6 +324,8 @@ interface HeaderDMProps {
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
+  /** RF-24: joins a group's shared call room. Never used for a 1:1 (counterpart set). */
+  onJoinGroupCall?: () => void;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
   /** The conversation being read; presence is resolved within it (RF-58). */
@@ -274,6 +336,7 @@ export function HeaderDM({
   name,
   counterpart,
   onStartCall,
+  onJoinGroupCall,
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
@@ -329,23 +392,12 @@ export function HeaderDM({
         </span>
       )}
       {counterpart && onStartCall && (
-        <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
-          <button
-            type="button"
-            aria-label="Iniciar chamada de áudio"
-            onClick={() => onStartCall(counterpart.userId, "audio")}
-          >
-            Áudio
-          </button>
-          <button
-            type="button"
-            aria-label="Iniciar chamada de vídeo"
-            onClick={() => onStartCall(counterpart.userId, "video")}
-          >
-            Vídeo
-          </button>
-        </div>
+        <DirectCallActions
+          onAudio={() => onStartCall(counterpart.userId, "audio")}
+          onVideo={() => onStartCall(counterpart.userId, "video")}
+        />
       )}
+      {!counterpart && onJoinGroupCall && <ResourceCallAction onCall={onJoinGroupCall} />}
       {detailsToggle}
     </header>
   );
@@ -430,6 +482,8 @@ interface MessageListProps {
   onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /** RF-21 "Verificar novamente" (issue #135); see MessageBubbleProps. */
+  onReconcileLinkSafety?: MessageBubbleProps["onReconcileLinkSafety"];
   onEditMessage: MessageBubbleProps["onEditMessage"];
   onEditForbidden: MessageBubbleProps["onEditForbidden"];
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
@@ -459,6 +513,7 @@ function MessageList({
   onForwardMessage,
   onReferenceJump,
   onToggleFavorite,
+  onReconcileLinkSafety,
   onEditMessage,
   onEditForbidden,
   onDeleteMessage,
@@ -689,6 +744,7 @@ function MessageList({
             onReferenceMessage={onReferenceMessage}
             onForwardMessage={onForwardMessage}
             onToggleFavorite={onToggleFavorite}
+            onReconcileLinkSafety={onReconcileLinkSafety}
             onEditMessage={onEditMessage}
             onEditForbidden={onEditForbidden}
             onDeleteMessage={onDeleteMessage}
@@ -1005,6 +1061,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, []);
   const toggleDetails = useCallback(() => setDetailsOpen((open) => !open), []);
 
+  // Typing indicator: useTypingIndicator needs sendTyping, which useMessages
+  // only produces once called, but useMessages needs an onTypingUpdated
+  // callback to hand inbound events to useTypingIndicator. Breaking that
+  // cycle is the one job of this ref — a stable callback handed to
+  // useMessages that indirects to whatever useTypingIndicator currently
+  // returns, kept current by the layout effect below (same "ref holds the
+  // latest callback" shape as every onXRef in useMessages itself).
+  const typingHandleRemoteEventRef = useRef<(event: WSTypingUpdatedEvent) => void>(() => {});
+  const handleTypingUpdatedFromMessages = useCallback((event: WSTypingUpdatedEvent) => {
+    typingHandleRemoteEventRef.current(event);
+  }, []);
+
   const {
     state,
     sendMessage,
@@ -1013,7 +1081,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     selectReply,
     cancelReply,
     toggleReaction,
+    sendTyping,
     toggleFavorite,
+    reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,
   } = useMessages({
@@ -1023,6 +1093,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
     onPinUpdated: reloadPins,
+    onTypingUpdated: handleTypingUpdatedFromMessages,
     // Someone added participants to the open conversation (issue #398). The
     // event names nobody, so the only correct response is to refetch — which is
     // also the same call the local add makes, so the two converge instead of
@@ -1046,6 +1117,62 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onAttachmentStatus: reloadOpenDetails,
     onMessageRemoved: reloadPins,
   });
+
+  const typing = useTypingIndicator({
+    kind,
+    targetId,
+    currentUserId: ctx.currentUserId,
+    sendTyping,
+    // Never start a typing session while the composer itself would refuse
+    // one — matches the disabled prop ChatComposer already receives below.
+    disabled: state.status !== "ready",
+  });
+  useLayoutEffect(() => {
+    typingHandleRemoteEventRef.current = typing.handleRemoteEvent;
+  });
+
+  // Destructured so useCallback/useEffect below can depend on these specific,
+  // stable functions rather than the whole `typing` object, whose identity
+  // changes every render.
+  const { notifyActivity: typingNotifyActivity, stop: typingStop } = typing;
+
+  // A content-changing edit starts/renews typing; the composer being emptied
+  // stops it immediately rather than waiting out the inactivity timer.
+  const handleComposerActivity = useCallback(
+    (hasContent: boolean) => {
+      if (hasContent) typingNotifyActivity();
+      else typingStop();
+    },
+    [typingNotifyActivity, typingStop],
+  );
+
+  // Second-tier fallback only: the server now resolves and sends the
+  // authoritative name on the typing event itself
+  // (typing.typingDisplayNameByUserId, see useTypingIndicator). This
+  // heuristic — DM roster, else the name most recently seen on that user's
+  // own message — only fires when the server's resolution was empty (lookup
+  // failure, no display name on file), and "Alguém" (inside
+  // typingIndicatorText) is the last resort after that.
+  const typingNameByUserId = useMemo(() => {
+    const names = new Map<string, string>();
+    if (kind === "dm" && activeDM) {
+      for (const participant of activeDM.participants) {
+        names.set(participant.id, participant.displayName);
+      }
+    }
+    for (const message of state.messages) {
+      if (!names.has(message.senderId)) names.set(message.senderId, message.senderDisplayName);
+    }
+    return names;
+  }, [kind, activeDM, state.messages]);
+
+  const typingIndicatorLabel = useMemo(() => {
+    const names = new Map(typingNameByUserId); // heuristic, tier 2
+    for (const [userId, name] of typing.typingDisplayNameByUserId) {
+      if (name) names.set(userId, name); // server-authoritative, wins
+    }
+    return typingIndicatorText(typing.typingUserIds, names);
+  }, [typing.typingUserIds, typing.typingDisplayNameByUserId, typingNameByUserId]);
 
   useEffect(() => {
     if (!pendingReference) return;
@@ -1098,11 +1225,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
       const result = await sendMessage(body, pendingReferenceId || undefined, attachmentIds);
       if (result.status === "sent") {
+        // Sending is itself the clearest possible "stopped typing" signal —
+        // do not wait for the composer-cleared activity event or the
+        // inactivity timeout to catch up.
+        typingStop();
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
-    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage],
+    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage, typingStop],
   );
 
   const selectReferenceDestination = useCallback(
@@ -1197,6 +1328,19 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         : "Abrir perfil da conversa"
       : "Detalhes do grupo";
 
+  // RF-24: join buttons resolve to a resource room only for a channel or a
+  // group DM — a 1:1 (detailsKind === "direct") keeps using RF-23's
+  // onStartCall above. ctx.joinResourceCall is undefined while a call of
+  // either kind is already in progress (ChatShell owns that guard).
+  const joinChannelCall =
+    kind === "channel" && targetId && ctx.joinResourceCall
+      ? () => ctx.joinResourceCall!({ kind: "channel", id: targetId, name: resolvedName })
+      : undefined;
+  const joinGroupCall =
+    kind === "dm" && detailsKind === "group" && targetId && ctx.joinResourceCall
+      ? () => ctx.joinResourceCall!({ kind: "dm", id: targetId, name: resolvedName })
+      : undefined;
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1212,6 +1356,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         {kind === "channel" ? (
           <HeaderChannel
             name={resolvedName}
+            onJoinCall={joinChannelCall}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle
@@ -1229,6 +1374,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             counterpart={activeDM?.counterpart}
             presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
             onStartCall={ctx.startCall}
+            onJoinGroupCall={joinGroupCall}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle
@@ -1266,6 +1412,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
             onReferenceJump={jumpToReference}
             onToggleFavorite={toggleFavorite}
+            onReconcileLinkSafety={reconcileLinkSafety}
             onEditMessage={editMessageLocal}
             onEditForbidden={handleEditForbidden}
             onDeleteMessage={deleteMessageLocal}
@@ -1305,6 +1452,21 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           </div>
         )}
 
+        {typingIndicatorLabel && (
+          <div
+            className="chat-msg-area__typing-indicator"
+            role="status"
+            data-testid="chat-typing-indicator"
+          >
+            <span className="chat-msg-area__typing-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+            {typingIndicatorLabel}
+          </div>
+        )}
+
         {/*
         The composer is keyed by the conversation identity so switching targets
         destroys the TipTap instance and mounts an empty one. The editor body is
@@ -1333,6 +1495,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
           }
           onSend={handleSend}
+          onActivity={handleComposerActivity}
           // RF-32 (issue #458): the same composer serves channels and DMs, so
           // one target prop covers both. It is the route's own kind and id —
           // the very pair the composer is keyed by — so an attachment can never

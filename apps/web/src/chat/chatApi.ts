@@ -15,6 +15,7 @@ import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
   normalizeBodyFormat,
+  normalizeLinkSafety,
   parseDMConversationType,
   parseMessageAttachments,
   type AddMembersResult,
@@ -28,6 +29,7 @@ import {
   type DirectDetails,
   type DirectDMResult,
   type MessageBodyFormat,
+  type LinkSafetyRecheck,
   type MentionCandidate,
   type DMConversation,
   type FavoriteItem,
@@ -35,6 +37,7 @@ import {
   type Message,
   type MessageEditHistoryEntry,
   type MessagePage,
+  type MessageSecuritySnapshot,
   type PinnedItem,
 } from "./chatTypes";
 
@@ -612,6 +615,8 @@ interface MessageResponse {
   body_format?: string;
   is_removed?: boolean;
   status: string;
+  /** RF-21 link safety (issue #135). Absent on a pre-#135 server. */
+  link_safety_state?: unknown;
   deleted_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -636,6 +641,8 @@ interface QuoteResponse {
   is_removed?: boolean;
   deleted_at?: string;
   created_at: string;
+  updated_at?: string;
+  link_safety_state?: string;
 }
 
 interface ReferenceResponse {
@@ -648,11 +655,31 @@ interface ReferenceResponse {
   body?: string;
   body_format?: MessageBodyFormat;
   created_at?: string;
+  updated_at?: string;
+  link_safety_state?: string;
 }
 
 interface MessageReferenceResolutionsEnvelope {
   data: {
     references: Array<{ message_id: string; reference: ReferenceResponse }>;
+  };
+}
+
+interface MessageSecuritySnapshotsEnvelope {
+  data: {
+    snapshots?: Array<{
+      message_id?: unknown;
+      available?: unknown;
+      status?: unknown;
+      link_safety_state?: unknown;
+      updated_at?: unknown;
+      quoted?: {
+        message_id?: unknown;
+        status?: unknown;
+        link_safety_state?: unknown;
+        updated_at?: unknown;
+      };
+    }>;
   };
 }
 
@@ -774,6 +801,10 @@ function mapMessage(r: MessageResponse): Message {
       : r.status === "pending_link_scan"
         ? "pending_link_scan"
         : "active",
+    // RF-21 link safety (issue #135), a separate axis from `status`: an active
+    // message may carry links the provider could not produce a verdict for. A
+    // removed message reports nothing, exactly as its body and quote do not.
+    linkSafetyState: isRemoved ? "" : normalizeLinkSafety(r.link_safety_state),
     deletedAt: r.deleted_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -822,6 +853,8 @@ function mapQuote(r: QuoteResponse): Message["quoted"] {
     isRemoved: r.is_removed ?? false,
     deletedAt: r.deleted_at ?? null,
     createdAt: r.created_at ?? "",
+    updatedAt: r.updated_at ?? r.created_at ?? "",
+    linkSafetyState: normalizeLinkSafety(r.link_safety_state),
   };
 }
 
@@ -845,6 +878,8 @@ function mapReference(r: ReferenceResponse): NonNullable<Message["reference"]> {
     bodyText: r.body ?? "",
     bodyFormat: normalizeBodyFormat(r.body_format),
     createdAt: r.created_at,
+    updatedAt: r.updated_at ?? r.created_at,
+    linkSafetyState: normalizeLinkSafety(r.link_safety_state),
   };
 }
 
@@ -971,6 +1006,76 @@ export async function resolveDMMessageReferences(
   return resolveMessageReferences("dm", conversationId, messageIds, signal);
 }
 
+export async function fetchChannelMessageSecuritySnapshots(
+  channelId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<MessageSecuritySnapshot[]> {
+  return fetchMessageSecuritySnapshots("channel", channelId, messageIds, signal);
+}
+
+export async function fetchDMMessageSecuritySnapshots(
+  conversationId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<MessageSecuritySnapshot[]> {
+  return fetchMessageSecuritySnapshots("dm", conversationId, messageIds, signal);
+}
+
+async function fetchMessageSecuritySnapshots(
+  kind: "channel" | "dm",
+  targetId: string,
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<MessageSecuritySnapshot[]> {
+  const targetSegment = kind === "channel" ? "channels" : "dm";
+  const res = await authenticatedFetch<MessageSecuritySnapshotsEnvelope>(
+    `${CHAT_BASE}/${targetSegment}/${encodeURIComponent(targetId)}/message-security-snapshots`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message_ids: messageIds }),
+      signal,
+    },
+  );
+  const validStatus = (status: unknown): status is Message["status"] =>
+    status === "active" || status === "deleted" || status === "pending_link_scan";
+  return (res.data.snapshots ?? []).flatMap<MessageSecuritySnapshot>((snapshot) => {
+    if (typeof snapshot.message_id !== "string") return [];
+    if (snapshot.available === false) {
+      return [{ messageId: snapshot.message_id, available: false }];
+    }
+    if (
+      snapshot.available !== true ||
+      !validStatus(snapshot.status) ||
+      typeof snapshot.updated_at !== "string"
+    )
+      return [];
+    const quoted =
+      snapshot.quoted &&
+      typeof snapshot.quoted.message_id === "string" &&
+      validStatus(snapshot.quoted.status) &&
+      typeof snapshot.quoted.updated_at === "string"
+        ? {
+            messageId: snapshot.quoted.message_id,
+            status: snapshot.quoted.status,
+            linkSafetyState: normalizeLinkSafety(snapshot.quoted.link_safety_state),
+            updatedAt: snapshot.quoted.updated_at,
+          }
+        : undefined;
+    return [
+      {
+        messageId: snapshot.message_id,
+        available: true,
+        status: snapshot.status,
+        linkSafetyState: normalizeLinkSafety(snapshot.link_safety_state),
+        updatedAt: snapshot.updated_at,
+        ...(quoted ? { quoted } : {}),
+      },
+    ];
+  });
+}
+
 async function resolveMessageReferences(
   kind: "channel" | "dm",
   targetId: string,
@@ -1000,11 +1105,17 @@ export async function fetchMentionCandidates(
   const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/mentions?q=${encodeURIComponent(query)}`;
   const res = await authenticatedFetch<MentionEnvelope>(url, { method: "GET", signal });
   if (!isMentionEnvelope(res)) return [];
-  return [...res.data.users, ...res.data.channels].map((candidate) => ({
-    mentionType: candidate.type,
-    id: candidate.id,
-    label: candidate.label,
-  }));
+  // Channel-reference mentions (backend still returns them; the composer no
+  // longer offers them) are intentionally dropped here — @-mentions are for
+  // people only. The .type === "user" filter also guards against a malformed
+  // backend response placing a "channel" entry in the users array.
+  return res.data.users
+    .filter((candidate) => candidate.type === "user")
+    .map((candidate) => ({
+      mentionType: "user" as const,
+      id: candidate.id,
+      label: candidate.label,
+    }));
 }
 
 export async function postDMMessage(
@@ -1088,6 +1199,59 @@ export async function fetchLinkSafetyStatuses(
         ]
       : [],
   );
+}
+
+/**
+ * Asks the server to take a second look at one message's unverified links
+ * (issue #135) — the "Verificar novamente" action.
+ *
+ * # What it is not
+ *
+ * It does not start a new scan, and the UI must not say it does. The server
+ * searches its own scan history for the URLs it recorded for this message and, if
+ * it finds one, reads that scan's report. There is deliberately no way to ask for
+ * a fresh scan and no "force" variant of this call.
+ *
+ * # What the client sends
+ *
+ * A message id, in the path, and an empty body. It does not send a URL and it
+ * cannot: the server reads the URLs from its own records. A client that could
+ * name one would have turned this into a URL-scanner proxy paid for by the
+ * deployment.
+ *
+ * The reply is the message's authoritative state plus a retry hint. `retryAfter`
+ * is the interval to keep the button disabled for; the server applies its own
+ * cooldown regardless, so a client that ignored it would only be refused.
+ */
+export type LinkSafetyReconcileResult = LinkSafetyRecheck;
+
+interface LinkSafetyReconcileEnvelope {
+  data: { link_safety_state?: unknown; updated_at?: unknown; retry_after_seconds?: unknown };
+}
+
+/** Fallback cooldown when the server does not send one. Matches its own default. */
+const defaultReconcileRetrySeconds = 60;
+
+export async function reconcileMessageLinkSafety(
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<LinkSafetyReconcileResult> {
+  const response = await authenticatedFetch<LinkSafetyReconcileEnvelope>(
+    `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}/link-safety/reconcile`,
+    { method: "POST", signal },
+  );
+  const retryAfter = response.data.retry_after_seconds;
+  if (typeof response.data.updated_at !== "string" || !response.data.updated_at) {
+    throw new Error("invalid link-safety reconcile response");
+  }
+  return {
+    state: normalizeLinkSafety(response.data.link_safety_state),
+    updatedAt: response.data.updated_at,
+    retryAfterSeconds:
+      typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter
+        : defaultReconcileRetrySeconds,
+  };
 }
 
 export async function editMessage(

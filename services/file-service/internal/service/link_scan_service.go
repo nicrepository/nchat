@@ -54,6 +54,14 @@ const (
 
 	// budgetWindowRetention is how long spent budget windows are kept.
 	budgetWindowRetention = time.Hour
+
+	// reconcileBatchSize bounds how many inconclusive scans one pass re-reads
+	// (issue #135).
+	//
+	// Half the scan batch, because each item costs two provider exchanges — a
+	// search and a result read — rather than one, and because nobody is waiting:
+	// a preview that cannot be rendered on this pass renders on a later one.
+	reconcileBatchSize = 4
 )
 
 // ErrLinkScanConflict reports that a compare-and-set lost: another worker
@@ -151,6 +159,17 @@ type LinkScanStore interface {
 	ReserveProviderSubmit(ctx context.Context, limit int, window time.Duration) (bool, error)
 	// PruneLinkScanBudget drops budget windows that can no longer be counted into.
 	PruneLinkScanBudget(ctx context.Context, olderThan time.Duration) error
+	// ClaimDueReconciliations leases inconclusive rows for a bounded recovery
+	// pass, consuming one of a small fixed number of attempts per URL (issue
+	// #135). It cannot lease anything else, and there is no method here that
+	// could turn one of its rows back into a submission.
+	ClaimDueReconciliations(ctx context.Context, batchSize int) ([]LinkScanJob, error)
+	// ReconcileVerdict is the one write that leaves the inconclusive state, bound
+	// to the scan the verdict was read from.
+	// It takes the evidence rather than a bare verdict because a clearance expires
+	// from when the provider produced it, never from when it was adopted
+	// (issue #135, CQ-001).
+	ReconcileVerdict(ctx context.Context, urlDigest []byte, scanUUID string, evidence urlsafety.ScanEvidence) error
 }
 
 // LinkScanSearcher is the recovery half, and is deliberately optional: a
@@ -167,6 +186,20 @@ type LinkScanSearcher interface {
 type LinkScanProvider interface {
 	Submit(ctx context.Context, canonicalURL string) (string, error)
 	Poll(ctx context.Context, canonicalURL, scanID string) (urlsafety.Verdict, error)
+}
+
+// LinkVerdictReconciler recovers a verdict for a scan that finished without one
+// (issue #135). *urlsafety.Service satisfies it, and it is deliberately optional
+// and deliberately separate from LinkScanProvider: this one has no Submit, so the
+// recovery path structurally cannot buy a second Cloudflare scan for a URL the
+// provider has already refused to scan again.
+//
+// Reconcile searches this account's own scan history for exactly the canonical
+// URL, then reads the full report for the scan it finds through the same strict
+// path an ordinary poll uses. The search's own summarised verdict field is never
+// consulted — urlsafety.ScanRecord has no field that could carry it.
+type LinkVerdictReconciler interface {
+	Reconcile(ctx context.Context, canonicalURL string) (urlsafety.ScanEvidence, error)
 }
 
 // LinkScanService drains file-service's scan queue.
@@ -259,11 +292,95 @@ func (s *LinkScanService) ProcessDue(ctx context.Context) (int, error) {
 		s.advance(ctx, jobs[0])
 		moved++
 	}
+	// The recovery pass (issue #135). Last, and deliberately not counted into
+	// `moved`: it does not advance the queue, it re-reads rows the queue has
+	// already finished with. A URL whose scan came back empty would otherwise
+	// never be previewable again, because the preview gate requires an explicit
+	// clearance and nothing else would ever produce one.
+	s.reconcileInconclusive(ctx)
 	s.observeBacklog(ctx)
 	if err := s.store.PruneLinkScanBudget(ctx, budgetWindowRetention); err != nil && ctx.Err() == nil {
 		s.logger.WarnContext(ctx, "prune link scan budget", slog.String("error", err.Error()))
 	}
 	return moved, nil
+}
+
+// reconcileInconclusive re-reads a bounded number of scans that finished without
+// a usable verdict.
+//
+// Runs on every pass and costs one query against a partial index that is empty
+// whenever nothing is inconclusive — which is the normal state — so the common
+// case is free. The claim itself consumes one of a small fixed number of attempts
+// per URL and schedules the next, whether or not the provider then answers, which
+// is what makes this terminate rather than loop.
+//
+// A provider client that cannot reconcile is a working deployment: the type
+// assertion simply fails and inconclusive rows stay inconclusive, which is the
+// fail-closed direction and exactly the behaviour before this existed.
+func (s *LinkScanService) reconcileInconclusive(ctx context.Context) {
+	reconciler, ok := s.provider.(LinkVerdictReconciler)
+	if !ok || ctx.Err() != nil {
+		return
+	}
+	jobs, err := s.store.ClaimDueReconciliations(ctx, reconcileBatchSize)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.WarnContext(ctx, "claim due reconciliations", slog.String("error", err.Error()))
+		}
+		return
+	}
+	for _, job := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		s.reconcileOne(ctx, reconciler, job)
+	}
+}
+
+// reconcileOne asks the provider about one inconclusive URL and records an
+// answer only if it got a real one.
+//
+// Every outcome that is not an explicit clearance or condemnation leaves the row
+// exactly as it was, which is what keeps the preview gate fail-closed: this
+// service's permission to fetch a URL is only ever restored by a VerdictSafe read
+// from a full provider report.
+func (s *LinkScanService) reconcileOne(
+	ctx context.Context, reconciler LinkVerdictReconciler, job LinkScanJob,
+) {
+	started := time.Now()
+	evidence, err := reconciler.Reconcile(ctx, job.CanonicalURL)
+	s.metrics.ObserveProviderDuration(urlsafety.OperationPoll, started)
+	if ctx.Err() != nil {
+		return
+	}
+	if evidence.CandidateFound {
+		// Counted before the outcome, and only for an exact-URL match whose report
+		// was actually read — the difference between "the search found nothing" and
+		// "it found something that did not clear anything".
+		s.metrics.ObserveVerdictReconciliation(
+			urlsafety.ReconcileSourceBackground, urlsafety.ReconcileCandidateFound)
+	}
+	s.metrics.ObserveVerdictReconciliation(
+		urlsafety.ReconcileSourceBackground, urlsafety.ReconcileOutcome(evidence.Verdict, err))
+	if err != nil {
+		if !errors.Is(err, urlsafety.ErrNotCheckable) {
+			// ErrNotCheckable is the ordinary "no candidate" answer — what a hostname
+			// another account scanned recently looks like on every pass — and is not
+			// worth a log line. Everything else is a fact about the provider.
+			s.logFailure(ctx, "reconcile link verdict", job, err)
+		}
+		return
+	}
+	switch err := s.store.ReconcileVerdict(
+		ctx, job.URLDigest, job.ScanUUID, evidence); {
+	case err == nil:
+	case errors.Is(err, ErrLinkScanConflict):
+		// The row moved on, or the database's own guard refused the transition.
+		// Either way this worker's answer is not the one that counts, and neither
+		// is ever a reason to submit.
+	default:
+		s.logFailure(ctx, "record reconciled verdict", job, err)
+	}
 }
 
 // advance moves one URL one step: start its scan, or read the one it has.
@@ -476,6 +593,12 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job LinkScanJob) {
 		// clearance.
 		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptPending)
 		return
+	case errors.Is(err, urlsafety.ErrScanInconclusive):
+		// The provider confirms this exact scan finished and produced no usable
+		// verdict. Terminal and fail-closed: recorded once, below, and never
+		// polled again — no path from here into resubmission.
+		s.recordVerdict(ctx, job, urlsafety.VerdictInconclusive)
+		return
 	case err != nil:
 		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptRetry)
 		s.logFailure(ctx, "poll link scan", job, err)
@@ -487,9 +610,22 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job LinkScanJob) {
 		s.logFailure(ctx, "poll link scan", job, urlsafety.ErrUnavailable)
 		return
 	}
+	s.recordVerdict(ctx, job, verdict)
+}
+
+// recordVerdict writes a terminal poll outcome — safe, malicious, or
+// inconclusive — and reports the attempt. Shared by pollClaim's ordinary
+// success path and its ErrScanInconclusive branch: both are "this scan id is
+// decided, write it down and stop polling", differing only in the outcome
+// label and in the TTL, which RecordVerdict itself ignores for inconclusive.
+func (s *LinkScanService) recordVerdict(ctx context.Context, job LinkScanJob, verdict urlsafety.Verdict) {
+	result := urlsafety.AttemptSuccess
+	if verdict == urlsafety.VerdictInconclusive {
+		result = urlsafety.AttemptInconclusive
+	}
 	switch err := s.store.RecordVerdict(ctx, job.URLDigest, job.ScanUUID, verdict, urlsafety.VerdictTTL); {
 	case err == nil:
-		s.metrics.ObserveAttempt(urlsafety.OperationPoll, urlsafety.AttemptSuccess)
+		s.metrics.ObserveAttempt(urlsafety.OperationPoll, result)
 	case errors.Is(err, ErrLinkScanConflict):
 		// This worker's lease was already lost and the row now carries a
 		// different scan. Its answer describes a scan nobody is waiting on.

@@ -166,6 +166,14 @@ export default function LiveKitSpikePage({
       onMicrophoneStateChanged(enabled) {
         if (isAttemptCurrent(attempt)) setMicrophoneEnabledState(enabled);
       },
+      // This PoC page only ever shows the single-remote 1:1 spike flow — see
+      // media/liveKitSession.ts for the multi-participant (RF-24) consumer.
+      onParticipantConnected: () => undefined,
+      onParticipantDisconnected: () => undefined,
+      onRemoteVideoAvailabilityChanged: () => undefined,
+      onActiveSpeakersChanged: () => undefined,
+      onScreenShareChanged: () => undefined,
+      onRemoteScreenShareChanged: () => undefined,
     };
   }
 

@@ -168,6 +168,9 @@ func TestCanonicalRefusesWhatCannotBeScanned(t *testing.T) {
 		"ipv4 literal":     "https://192.0.2.1/a",
 		"ipv6 literal":     "https://[2001:db8::1]/a",
 		"loopback literal": "https://127.0.0.1/a",
+		"short ipv4":       "http://127.1/a",
+		"octal ipv4":       "http://0177.0.0.1/a",
+		"hex ipv4":         "http://0x7f.0.0.1/a",
 		"credentials":      "https://user:pass@example.com/a",
 		"user only":        "https://user@example.com/a",
 		"single label":     "https://localhost/a",
@@ -260,6 +263,28 @@ func TestPollReportsPendingWithoutCachingIt(t *testing.T) {
 	}
 	if _, live := service.cache.get("https://example.com/"); live {
 		t.Fatal("a scan still running must not be cached as anything")
+	}
+}
+
+// TestPollReportsInconclusiveWithoutCachingIt: an inconclusive scan is
+// terminal for its scan id, but it is not a URL-level safety clearance, so
+// nothing here may cache it — the durable per-scan terminal state belongs to
+// the caller's own queue.
+func TestPollReportsInconclusiveWithoutCachingIt(t *testing.T) {
+	clock := &testClock{now: time.Unix(0, 0)}
+	scanner := &stubScanner{resultErr: ErrScanInconclusive}
+	service := newService(scanner, nil, clock.Now)
+
+	verdict, err := service.Poll(context.Background(), "https://example.com/", "scan-1")
+
+	if !errors.Is(err, ErrScanInconclusive) || verdict.IsFinal() {
+		t.Fatalf("verdict=%v err=%v", verdict, err)
+	}
+	if _, live := service.cache.get("https://example.com/"); live {
+		t.Fatal("an inconclusive scan must not be cached as anything")
+	}
+	if got, ok := service.Lookup("https://example.com/"); ok {
+		t.Fatalf("Lookup must still report a miss after an inconclusive poll, got %v", got)
 	}
 }
 

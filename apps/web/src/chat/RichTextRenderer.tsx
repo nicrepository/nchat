@@ -19,13 +19,14 @@ import {
   unescapeRichText,
   unescapeRichTextV3,
 } from "./richTextMarkers";
-import type { InlineMarkerType, ListType } from "./richTextMarkers";
+import type { InlineMarkerType, ListType, MentionType } from "./richTextMarkers";
+import { findAutolinks } from "./autolink";
 import type { MessageBodyFormat } from "./chatTypes";
 
 type InlineToken =
   | string
   | { type: InlineMarkerType; text: string }
-  | { type: "mention"; text: string; mentionType: "user" | "channel"; id: string };
+  | { type: "mention"; text: string; mentionType: MentionType; id: string };
 
 function tokenizeV1Inline(text: string): InlineToken[] {
   return text.split(LEGACY_INLINE_RE).flatMap((chunk): InlineToken[] => {
@@ -103,7 +104,7 @@ function tokenizeV3Inline(text: string): InlineToken[] {
       tokens.push({
         type: "mention",
         text: unescapeRichTextV3(mention[1]),
-        mentionType: mention[2] as "user" | "channel",
+        mentionType: mention[2] as MentionType,
         id: mention[3].toLowerCase(),
       });
       i += mention[0].length;
@@ -139,9 +140,56 @@ const tokenizeInline = (text: string, format: MessageBodyFormat): InlineToken[] 
       ? tokenizeV2Inline(text)
       : tokenizeV1Inline(text);
 
-function renderTokens(tokens: InlineToken[], keyPrefix: string): ReactNode[] {
+/**
+ * Splits one plain text run into text and anchors (RF-21 / issue #135).
+ *
+ * Applied only to the plain-string tokens. A URL inside an inline `code` span or
+ * a fenced code block is a *different* token type and never reaches here, which
+ * is the behaviour anyone writing `` `https://…` `` is asking for.
+ *
+ * Nothing is fetched. The anchor is ordinary browser navigation on click, and
+ * `target="_blank"` carries `rel="noopener noreferrer"`: noopener so the opened
+ * page cannot reach back through `window.opener`, noreferrer so this workspace's
+ * URL — which names a channel or a conversation — is not handed to whatever the
+ * link points at.
+ *
+ * The text is a React child and the href a React attribute, so both are escaped
+ * by React. There is no `dangerouslySetInnerHTML` anywhere in this file.
+ */
+function linkifyPlain(text: string, keyPrefix: string): ReactNode {
+  const spans = findAutolinks(text);
+  if (spans.length === 0) return text;
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  spans.forEach((span, index) => {
+    if (span.start > cursor) parts.push(text.slice(cursor, span.start));
+    parts.push(
+      <a
+        key={`${keyPrefix}-a${index}`}
+        className="rtr-link"
+        href={span.href}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {span.href}
+      </a>,
+    );
+    cursor = span.end;
+  });
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return <Fragment key={`${keyPrefix}-link`}>{parts}</Fragment>;
+}
+
+function renderTokens(
+  tokens: InlineToken[],
+  keyPrefix: string,
+  linksClickable: boolean,
+): ReactNode[] {
   return tokens.map((token, index): ReactNode => {
-    if (typeof token === "string") return token;
+    if (typeof token === "string") {
+      return linksClickable ? linkifyPlain(token, `${keyPrefix}-${index}`) : token;
+    }
     const key = `${keyPrefix}-${index}`;
     if (token.type === "mention")
       return (
@@ -279,19 +327,25 @@ function renderListItems(
   items: ListItemBlock[],
   keyPrefix: string,
   format: MessageBodyFormat,
+  linksClickable: boolean,
 ): ReactNode[] {
   return items.map((item, index) => (
     <li key={index}>
-      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`)}
+      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`, linksClickable)}
       {item.children.map((child, childIndex) =>
-        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format),
+        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format, linksClickable),
       )}
     </li>
   ));
 }
 
-function renderList(block: ListBlock, key: string, format: MessageBodyFormat): ReactNode {
-  const items = renderListItems(block.items, key, format);
+function renderList(
+  block: ListBlock,
+  key: string,
+  format: MessageBodyFormat,
+  linksClickable: boolean,
+): ReactNode {
+  const items = renderListItems(block.items, key, format, linksClickable);
   return block.type === "ul" ? (
     <ul key={key} className="rtr-list">
       {items}
@@ -306,9 +360,30 @@ function renderList(block: ListBlock, key: string, format: MessageBodyFormat): R
 export interface RichTextRendererProps {
   text: string;
   bodyFormat?: MessageBodyFormat;
+  /**
+   * Whether http(s) URLs in the body may be drawn as anchors (RF-21 / issue
+   * #135).
+   *
+   * **Defaults to `false`, and that default is the point.** Making a link
+   * clickable is a decision about link safety, and only a caller that has
+   * consulted `message.linkSafetyState` is in a position to make it. A new call
+   * site — a quote preview, a reference card, an edit history entry — therefore
+   * renders URLs as plain text until somebody deliberately opts it in, rather
+   * than inheriting a permission nobody thought about.
+   *
+   * Never derive this from `message.status`. A published message is not a
+   * verified one: since issue #135 a message whose links could not be verified is
+   * `active` and delivered to everyone, and it is `linkSafetyState` — not
+   * `status` — that says what may be done with its links.
+   */
+  linksClickable?: boolean;
 }
 
-export default function RichTextRenderer({ text, bodyFormat = "v1" }: RichTextRendererProps) {
+export default function RichTextRenderer({
+  text,
+  bodyFormat = "v1",
+  linksClickable = false,
+}: RichTextRendererProps) {
   if (!text) return null;
 
   return (
@@ -322,13 +397,17 @@ export default function RichTextRenderer({ text, bodyFormat = "v1" }: RichTextRe
           );
         }
         if (block.type !== "para") {
-          return renderList(block, String(blockIndex), bodyFormat);
+          return renderList(block, String(blockIndex), bodyFormat, linksClickable);
         }
         return (
           <Fragment key={blockIndex}>
             {block.lines.map((line, lineIndex, lines) => (
               <Fragment key={lineIndex}>
-                {renderTokens(tokenizeInline(line, bodyFormat), `${blockIndex}-${lineIndex}`)}
+                {renderTokens(
+                  tokenizeInline(line, bodyFormat),
+                  `${blockIndex}-${lineIndex}`,
+                  linksClickable,
+                )}
                 {lineIndex < lines.length - 1 && <br />}
               </Fragment>
             ))}

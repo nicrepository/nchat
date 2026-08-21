@@ -2,7 +2,9 @@ package storage_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -69,6 +71,11 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 	reset := func(t *testing.T) {
 		t.Helper()
 		for _, statement := range []string{
+			// The denylist is deliberately monotonic — nothing in the application
+			// ever removes a row — so a condemnation recorded by one subtest would
+			// otherwise dominate every later one that reuses the same URL. That is
+			// the intended production behaviour; here it is fixture state.
+			`DELETE FROM files.link_fetch_denylist`,
 			`DELETE FROM files.link_scans`,
 			`DELETE FROM files.link_scan_budget_usage`,
 		} {
@@ -79,6 +86,7 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		background := context.Background()
+		_, _ = pool.Exec(background, `DELETE FROM files.link_fetch_denylist`)
 		_, _ = pool.Exec(background, `DELETE FROM files.link_scans`)
 		_, _ = pool.Exec(background, `DELETE FROM files.link_scan_budget_usage`)
 	})
@@ -194,6 +202,16 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 		if err := store.RecordVerdict(ctx, job.URLDigest, "scan-stale",
 			urlsafety.VerdictMalicious, time.Hour); !errors.Is(err, service.ErrLinkScanConflict) {
 			t.Fatalf("RecordVerdict for a superseded scan: %v, want ErrLinkScanConflict", err)
+		}
+		var denied bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM files.link_fetch_denylist WHERE url_digest = $1
+			)`, job.URLDigest).Scan(&denied); err != nil {
+			t.Fatalf("read denylist after failed verdict CAS: %v", err)
+		}
+		if denied {
+			t.Fatal("a failed malicious verdict CAS published a global denial")
 		}
 		// And a second submission finds the row already polling.
 		if err := store.RecordSubmission(ctx, job.URLDigest, "scan-second", generation); !errors.Is(err, service.ErrLinkScanConflict) {
@@ -350,16 +368,52 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 			t.Fatalf("the condemnation was disturbed: %q, %v, %v", verdict, found, err)
 		}
 
-		// Once the verdict lapses it is neither served nor trusted: the row is
-		// re-opened and charged again, which is the only direction this moves.
+		// Expiring a *condemnation* does not make the URL unknown again. Since
+		// issue #135 a malicious verdict is also published to the shared fetch
+		// denylist, which is permanent by design: the per-service row's TTL governs
+		// when this service would re-scan, not whether the deployment still refuses
+		// to fetch. That the denial survives the lapse is the CQ-002 invariant, so
+		// it is asserted rather than worked around.
 		if _, err := pool.Exec(ctx,
 			`UPDATE files.link_scans SET verdict_expires_at = now() - interval '1 hour'`); err != nil {
 			t.Fatalf("expire verdict: %v", err)
 		}
-		if _, found, err := store.LoadVerdict(ctx, firstURL); err != nil || found {
-			t.Fatalf("a lapsed verdict was served: found %v (%v)", found, err)
+		if verdict, found, err := store.LoadVerdict(ctx, firstURL); err != nil ||
+			!found || verdict != urlsafety.VerdictMalicious {
+			t.Fatalf("a lapsed condemnation stopped refusing: %q, %v, %v", verdict, found, err)
 		}
-		reopened, err := store.AdmitScan(ctx, firstURL, unlimited)
+
+		// The lapse rule itself — a stale clearance is neither served nor trusted —
+		// is a property of a *safe* verdict, which is the one that grants something.
+		// Asserted on its own URL so the permanent denial above cannot mask it.
+		const lapsingURL = "https://lapsing.example/a"
+		if _, err := store.AdmitScan(ctx, lapsingURL, unlimited); err != nil {
+			t.Fatalf("AdmitScan(lapsing): %v", err)
+		}
+		lapsingJob := claimOne(t, lapsingURL)
+		lapsingGeneration, err := store.BeginSubmit(ctx, lapsingJob.URLDigest, lapsingJob.SubmitGeneration)
+		if err != nil {
+			t.Fatalf("BeginSubmit(lapsing): %v", err)
+		}
+		if err := store.RecordSubmission(ctx, lapsingJob.URLDigest, "scan-lapsing", lapsingGeneration); err != nil {
+			t.Fatalf("RecordSubmission(lapsing): %v", err)
+		}
+		if err := store.RecordVerdict(ctx, lapsingJob.URLDigest, "scan-lapsing",
+			urlsafety.VerdictSafe, time.Hour); err != nil {
+			t.Fatalf("RecordVerdict(lapsing): %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE files.link_scans SET verdict_expires_at = now() - interval '1 hour'
+			  WHERE url_digest = $1`, lapsingJob.URLDigest); err != nil {
+			t.Fatalf("expire lapsing verdict: %v", err)
+		}
+		if _, found, err := store.LoadVerdict(ctx, lapsingURL); err != nil || found {
+			t.Fatalf("a lapsed clearance was served: found %v (%v)", found, err)
+		}
+		// A lapsed clearance goes back into the queue and is charged again. Asserted
+		// on the lapsing URL rather than the condemned one, and scoped by digest,
+		// because the table now holds both.
+		reopened, err := store.AdmitScan(ctx, lapsingURL, unlimited)
 		if err != nil {
 			t.Fatalf("AdmitScan: %v", err)
 		}
@@ -368,7 +422,8 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 		}
 		var state string
 		if err := pool.QueryRow(ctx,
-			`SELECT state FROM files.link_scans`).Scan(&state); err != nil {
+			`SELECT state FROM files.link_scans WHERE url_digest = $1`,
+			lapsingJob.URLDigest).Scan(&state); err != nil {
 			t.Fatalf("read state: %v", err)
 		}
 		if state != "submit_pending" {
@@ -474,6 +529,198 @@ func TestLinkScanStorePostgreSQL(t *testing.T) {
 		}
 		if _, found, err := store.LoadVerdict(ctx, firstURL); err != nil || found {
 			t.Fatalf("a refused verdict left a row behind: found %v (%v)", found, err)
+		}
+	})
+
+	// The RF-21 incident this migration fixes: Cloudflare answers HTTP 200,
+	// task.status=finished, task.success=false, hasVerdicts=false. The provider
+	// layer reports that as VerdictInconclusive, and the row must settle into a
+	// terminal state that a real claim query, backlog query and re-admission
+	// all agree is done — not just what a Go fake believes.
+	t.Run("an inconclusive verdict is terminal, excluded from claims and backlog, and never reopened", func(t *testing.T) {
+		reset(t)
+		if _, err := store.AdmitScan(ctx, firstURL, unlimited); err != nil {
+			t.Fatalf("AdmitScan: %v", err)
+		}
+		job := claimOne(t, firstURL)
+		generation, err := store.BeginSubmit(ctx, job.URLDigest, job.SubmitGeneration)
+		if err != nil {
+			t.Fatalf("BeginSubmit: %v", err)
+		}
+		if err := store.RecordSubmission(ctx, job.URLDigest, "scan-inconclusive", generation); err != nil {
+			t.Fatalf("RecordSubmission: %v", err)
+		}
+
+		if err := store.RecordVerdict(ctx, job.URLDigest, "scan-inconclusive",
+			urlsafety.VerdictInconclusive, time.Hour); err != nil {
+			t.Fatalf("RecordVerdict(inconclusive): %v", err)
+		}
+
+		// Never a usable verdict, immediately after settling.
+		if _, found, err := store.LoadVerdict(ctx, firstURL); err != nil || found {
+			t.Fatalf("LoadVerdict = found %v (%v), want inconclusive to never resolve", found, err)
+		}
+
+		// Never claimed again — the real ClaimDueScans query, not a fake's map.
+		jobs, err := store.ClaimDueScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueScans: %v", err)
+		}
+		for _, j := range jobs {
+			if j.CanonicalURL == firstURL {
+				t.Fatalf("an inconclusive row was claimed again: %+v", j)
+			}
+		}
+
+		// Never counted in the backlog gauges. The database guard also makes the
+		// terminal row immutable to a stale or legacy UPDATE.
+		byState, _, err := store.Backlog(ctx)
+		if err != nil {
+			t.Fatalf("Backlog: %v", err)
+		}
+		if _, present := byState["inconclusive"]; present {
+			t.Fatalf("backlog counted an inconclusive row: %v", byState)
+		}
+		tag, err := pool.Exec(ctx,
+			`UPDATE files.link_scans SET updated_at = now() - interval '30 days' WHERE url_digest = $1`,
+			job.URLDigest)
+		if err != nil {
+			t.Fatalf("attempt to mutate terminal row: %v", err)
+		}
+		if tag.RowsAffected() != 0 {
+			t.Fatal("the terminal guard allowed an inconclusive row to be mutated")
+		}
+		byState, _, err = store.Backlog(ctx)
+		if err != nil {
+			t.Fatalf("Backlog after rejected mutation: %v", err)
+		}
+		if _, present := byState["inconclusive"]; present {
+			t.Fatalf("backlog counted an inconclusive row after rejected mutation: %v", byState)
+		}
+		jobs, err = store.ClaimDueScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueScans after rejected mutation: %v", err)
+		}
+		for _, j := range jobs {
+			if j.CanonicalURL == firstURL {
+				t.Fatalf("an inconclusive row was claimed after rejected mutation: %+v", j)
+			}
+		}
+
+		// A later preview request for the same URL must not reopen it — AdmitScan
+		// only reopens a 'done' row past its expiry, and inconclusive is never
+		// 'done'.
+		admission, err := store.AdmitScan(ctx, firstURL, unlimited)
+		if err != nil {
+			t.Fatalf("AdmitScan (re-request): %v", err)
+		}
+		if !admission.Allowed() || admission.NewScanCost != 0 {
+			t.Fatalf("admission = %+v, want a free admit that reopens nothing", admission)
+		}
+		var state string
+		if err := pool.QueryRow(ctx,
+			`SELECT state FROM files.link_scans WHERE url_digest = $1`, job.URLDigest,
+		).Scan(&state); err != nil {
+			t.Fatalf("read state after re-request: %v", err)
+		}
+		if state != "inconclusive" {
+			t.Fatalf("state = %q, a re-request reopened the row", state)
+		}
+	})
+
+	t.Run("inconclusive rows consume no pending capacity", func(t *testing.T) {
+		reset(t)
+		const limit = 3
+		for i := 0; i < limit; i++ {
+			url := fmt.Sprintf("https://inconclusive-capacity.example/%d", i)
+			digest := sha256.Sum256([]byte(url))
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO files.link_scans
+				    (url_digest, canonical_url, state, scan_uuid, attempts, created_at, updated_at)
+				VALUES ($1, $2, 'inconclusive', $3, $4,
+				        now() - interval '30 days', now() - interval '30 days')`,
+				digest[:], url, fmt.Sprintf("scan-%d", i), i+1); err != nil {
+				t.Fatalf("seed inconclusive row %d: %v", i, err)
+			}
+		}
+
+		admission, err := store.AdmitScan(ctx, secondURL,
+			service.LinkScanCapacity{MaxPendingJobs: limit})
+		if err != nil {
+			t.Fatalf("AdmitScan: %v", err)
+		}
+		if !admission.Allowed() || admission.NewScanCost != 1 {
+			t.Fatalf("admission = %+v, want one new job despite terminal rows", admission)
+		}
+
+		jobs, err := store.ClaimDueScans(ctx, 10)
+		if err != nil {
+			t.Fatalf("ClaimDueScans: %v", err)
+		}
+		for _, job := range jobs {
+			if job.State == "inconclusive" {
+				t.Fatalf("an inconclusive row became claimable: %+v", job)
+			}
+		}
+	})
+
+	t.Run("the origin develop claim cannot mutate or return an inconclusive row", func(t *testing.T) {
+		reset(t)
+		const url = "https://legacy-worker.example/inconclusive"
+		digest := sha256.Sum256([]byte(url))
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO files.link_scans
+			    (url_digest, canonical_url, state, scan_uuid, attempts, created_at, updated_at)
+			VALUES ($1, $2, 'inconclusive', 'scan-preserved', 9,
+			        now() - interval '30 days', now() - interval '30 days')`, digest[:], url); err != nil {
+			t.Fatalf("seed inconclusive row: %v", err)
+		}
+
+		// Exact claim semantics from origin/develop: every state except done is
+		// selected, then leased and returned to the legacy worker.
+		rows, err := pool.Query(ctx, `
+			WITH due AS (
+				SELECT ls.url_digest
+				FROM files.link_scans ls
+				WHERE ls.state <> 'done'
+				  AND (ls.next_attempt_at IS NULL OR ls.next_attempt_at <= now())
+				  AND (ls.lease_until IS NULL OR ls.lease_until <= now())
+				ORDER BY ls.next_attempt_at NULLS FIRST, ls.created_at
+				LIMIT 10
+				FOR UPDATE SKIP LOCKED
+			)
+			UPDATE files.link_scans ls
+			   SET attempts = LEAST(ls.attempts + 1, 32767),
+			       lease_until = now() + interval '60 seconds',
+			       next_attempt_at = now() + interval '60 seconds',
+			       updated_at = now()
+			  FROM due
+			 WHERE ls.url_digest = due.url_digest
+			RETURNING ls.url_digest`)
+		if err != nil {
+			t.Fatalf("legacy claim: %v", err)
+		}
+		defer rows.Close()
+		if rows.Next() {
+			t.Fatal("origin/develop claimed an inconclusive row")
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("legacy claim rows: %v", err)
+		}
+
+		var state, scanUUID string
+		var attempts int
+		var nextAttempt, leaseUntil *time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT state, scan_uuid, attempts, next_attempt_at, lease_until
+			FROM files.link_scans WHERE url_digest = $1`, digest[:],
+		).Scan(&state, &scanUUID, &attempts, &nextAttempt, &leaseUntil); err != nil {
+			t.Fatalf("read row after legacy claim: %v", err)
+		}
+		if state != "inconclusive" || scanUUID != "scan-preserved" || attempts != 9 ||
+			nextAttempt != nil || leaseUntil != nil {
+			t.Fatalf("legacy claim mutated state=%q uuid=%q attempts=%d next=%v lease=%v",
+				state, scanUUID, attempts, nextAttempt, leaseUntil)
 		}
 	})
 }

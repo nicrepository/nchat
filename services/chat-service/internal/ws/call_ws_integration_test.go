@@ -51,10 +51,23 @@ func (h *lifecycleCallHandler) TransitionCall(ctx context.Context, _, actorID, _
 	return call, nil
 }
 
-func (h *lifecycleCallHandler) CurrentCall(context.Context, string, string) (domain.Call, error) {
+func (h *lifecycleCallHandler) CurrentCall(context.Context, string, string, string) (domain.Call, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.call.ID == "" {
+		return domain.Call{}, domain.ErrNotFound
+	}
+	return h.call, nil
+}
+
+func (h *lifecycleCallHandler) RenewCallPresence(context.Context, string, string, string) error {
+	return nil
+}
+
+func (h *lifecycleCallHandler) LeaveCall(_ context.Context, _, actorID, _ string) (domain.Call, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.call.ID == "" || (!h.call.IsParticipant(actorID) && h.call.CallerID != actorID) {
 		return domain.Call{}, domain.ErrNotFound
 	}
 	return h.call, nil

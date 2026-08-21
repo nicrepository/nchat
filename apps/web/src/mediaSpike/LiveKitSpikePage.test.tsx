@@ -67,6 +67,9 @@ class FakeSession implements LiveKitSpikeSession {
   readonly setMicrophoneEnabled = vi.fn<LiveKitSpikeSession["setMicrophoneEnabled"]>(
     async () => undefined,
   );
+  readonly setScreenShareEnabled = vi.fn<LiveKitSpikeSession["setScreenShareEnabled"]>(
+    async () => undefined,
+  );
   readonly disconnect = vi.fn<LiveKitSpikeSession["disconnect"]>(async () => undefined);
 
   constructor(callbacks: LiveKitSpikeSessionCallbacks) {

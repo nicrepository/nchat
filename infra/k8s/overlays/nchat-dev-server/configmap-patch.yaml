@@ -33,16 +33,31 @@ data:
   FILE_MALWARE_SCAN_REQUIRED: "true"
   # Plain host:port dial target. No scheme, no path, no credentials.
   FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
-  # RF-21 Safe Browsing. Must Have, so it is stated here and asserted in CI:
-  # the application default is false, which means leaving these out would ship
-  # the MVP environment with link checking off. The credentials are not here —
-  # they are the nchat-link-safety Secret, mounted only by these two services.
+  # RF-21 Safe Browsing, temporarily OFF in this environment for the MVP.
   #
-  # Enabling without that Secret is a deliberate CrashLoopBackOff, not a
-  # degraded mode: both services refuse to start rather than accept links
-  # nobody checked.
-  CHAT_LINK_SAFETY_ENABLED: "true"
-  FILE_LINK_SAFETY_ENABLED: "true"
+  # This is a decision, not a default and not a fallback. The application
+  # default happens to also be false, which is exactly why the value is written
+  # out here and asserted in CI as the literal "false": a silently absent key
+  # and a deliberate "no" would otherwise look identical, and the next person to
+  # read this file could not tell which one they were looking at.
+  #
+  # Why off: the Cloudflare URL Scanner's behaviour makes the feature
+  # operationally unfit to gate messages in nchat-dev right now. Turning it off
+  # is the smaller harm than a link check that leaves submissions unresolved.
+  #
+  # Nothing was removed to achieve it. The implementation, the workers, the
+  # migrations and the nchat-link-safety Secret all stay exactly where they are,
+  # and both Deployments still wire the credentials — so this is one value away
+  # from being on again, which is the whole point of doing it here rather than
+  # in code. Flipping these two keys back to "true" (and the matching CI
+  # expectation in scripts/ci/k8s-manifests-check.sh) is the entire resumption.
+  #
+  # What being off means: no URL is submitted, no verdict is consulted, and
+  # links are delivered unchecked. Enabling again without the Secret remains a
+  # deliberate CrashLoopBackOff rather than a degraded mode — both services
+  # refuse to start rather than accept links nobody checked.
+  CHAT_LINK_SAFETY_ENABLED: "false"
+  FILE_LINK_SAFETY_ENABLED: "false"
   # RF-21 capacity. Stated explicitly per environment rather than left to the
   # application default, because the right numbers depend on the Cloudflare plan
   # this cluster is billed under and no code may assume one.
@@ -67,3 +82,9 @@ data:
   # clamd's own MaxScanTime (420000 ms) and it derives the worker's 330 s claim
   # lease; the ordering 300 < 330 < 420 is asserted in CI.
   FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"
+
+  # RF-44: corporate Keycloak SSO enabled only for nchat-dev.
+  # Provider credentials and public callback values remain in nchat-secrets.
+  OIDC_ENABLED: "true"
+  OIDC_AUTO_PROVISION_ENABLED: "true"
+  OIDC_ALLOWED_EMAIL_DOMAINS: "nic-labs.com.br"

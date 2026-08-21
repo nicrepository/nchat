@@ -43,7 +43,7 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 750_000_000, time.UTC)
 	wantDeadline := now.Add(5 * time.Minute).Truncate(time.Second)
 	authorizer := &tokenAuthorizerStub{result: AuthorizedResource{
-		ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute),
+		ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute), DisplayName: "Ana Lima",
 	}}
 	signer := &tokenSignerStub{result: SignedToken{
 		Token: "livekit-token", ExpiresAt: wantDeadline,
@@ -63,6 +63,9 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	}
 	if signer.input.Identity != serviceTestUserID {
 		t.Fatalf("identity must come from authenticated user, got %q", signer.input.Identity)
+	}
+	if signer.input.DisplayName != "Ana Lima" {
+		t.Fatalf("display name must come from the authorizer, got %q", signer.input.DisplayName)
 	}
 	if signer.input.Room != "call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
 		t.Fatalf("room must be server-derived, got %q", signer.input.Room)
@@ -228,6 +231,38 @@ func TestTokenServiceRejectsInvalidConfigurationAndPrincipal(t *testing.T) {
 			result, err := tt.svc.Issue(context.Background(), input)
 			if !errors.Is(err, tt.want) || result.Token != "" {
 				t.Fatalf("expected %v without token, result=%+v err=%v", tt.want, result, err)
+			}
+		})
+	}
+}
+
+func TestTokenServiceIssuesChannelAndDMTokensThroughTheSameAuthorizer(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	for _, kind := range []domain.ResourceKind{domain.ResourceKindChannel, domain.ResourceKindDM} {
+		t.Run(string(kind), func(t *testing.T) {
+			authorizer := &tokenAuthorizerStub{result: AuthorizedResource{
+				ID: serviceTestResource, SessionExpiresAt: now.Add(20 * time.Minute),
+			}}
+			signer := &tokenSignerStub{result: SignedToken{Token: "token", ExpiresAt: now.Add(5 * time.Minute)}}
+			svc := NewTokenService(authorizer, signer, 5*time.Minute, func() time.Time { return now })
+
+			result, err := svc.Issue(context.Background(), IssueTokenInput{
+				Kind: kind, ResourceID: serviceTestResource,
+				UserID: serviceTestUserID, SessionID: serviceTestSessionID,
+				AccessExpiresAt: now.Add(10 * time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("issue %s: %v", kind, err)
+			}
+			if result.Token == "" {
+				t.Fatalf("expected token for %s", kind)
+			}
+			if authorizer.input.Kind != kind {
+				t.Fatalf("authorizer did not receive kind %s: %+v", kind, authorizer.input)
+			}
+			wantRoom := string(kind) + ":aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+			if signer.input.Room != wantRoom {
+				t.Fatalf("expected room %q, got %q", wantRoom, signer.input.Room)
 			}
 		})
 	}

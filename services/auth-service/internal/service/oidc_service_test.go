@@ -11,6 +11,13 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
+// The two provider callback URIs a deployment publishes: one per origin. Since
+// issue #578 they are an allowlist the service owns, not provider config.
+const (
+	testChatRedirectURL  = "https://nchat.example.com/api/auth/oidc/keycloak/callback"
+	testAdminRedirectURL = "https://admin.nchat.example.com/api/auth/oidc/keycloak/callback"
+)
+
 type fakeOIDCStore struct {
 	createdAuthReq     domain.OIDCLoginRequest
 	createAuthErr      error
@@ -76,15 +83,21 @@ func (f *fakeOIDCStore) ConsumeExchange(_ context.Context, provider, codeHash st
 }
 
 type fakeOIDCProvider struct {
-	claims        domain.OIDCClaims
-	authErr       error
-	exchangeErr   error
-	validateErr   error
-	exchangedCode string
-	verifier      string
+	authorizationRedirectURL string
+	authorizationACRValues   []string
+	exchangeRedirectURL      string
+	claims                   domain.OIDCClaims
+	authErr                  error
+	exchangeErr              error
+	validateErr              error
+	exchangedCode            string
+	verifier                 string
 }
 
-func (f *fakeOIDCProvider) AuthorizationURL(state, nonce, challenge string) (string, error) {
+func (f *fakeOIDCProvider) AuthorizationURL(req AuthorizationRequest) (string, error) {
+	f.authorizationRedirectURL = req.RedirectURL
+	f.authorizationACRValues = req.ACRValues
+	state, nonce, challenge := req.State, req.Nonce, req.CodeChallenge
 	if f.authErr != nil {
 		return "", f.authErr
 	}
@@ -98,7 +111,8 @@ func (f *fakeOIDCProvider) AuthorizationURL(state, nonce, challenge string) (str
 	return u.String(), nil
 }
 
-func (f *fakeOIDCProvider) ExchangeCode(_ context.Context, code, verifier string) (oidcTokenSet, error) {
+func (f *fakeOIDCProvider) ExchangeCode(_ context.Context, code, verifier, redirectURL string) (oidcTokenSet, error) {
+	f.exchangeRedirectURL = redirectURL
 	if f.exchangeErr != nil {
 		return oidcTokenSet{}, f.exchangeErr
 	}
@@ -119,7 +133,7 @@ func TestOIDCService_LoginStoresHashedStateAndBuildsAuthorizationURL(t *testing.
 	store := &fakeOIDCStore{}
 	svc := newTestOIDCService(t, tokens, store, &fakeOIDCProvider{})
 
-	location, err := svc.Login(context.Background())
+	location, err := svc.Login(context.Background(), domain.OIDCAppChat)
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
@@ -267,6 +281,10 @@ func newTestOIDCServiceWithDomains(t *testing.T, tokens *TokenManager, store *fa
 		StateTTL:            10 * time.Minute,
 		AutoProvision:       true,
 		AllowedDomains:      domains,
+		RedirectURLs: map[domain.OIDCAppContext]string{
+			domain.OIDCAppChat:  testChatRedirectURL,
+			domain.OIDCAppAdmin: testAdminRedirectURL,
+		},
 	}, tokens, store, provider)
 	if err != nil {
 		t.Fatalf("new oidc service: %v", err)
@@ -297,7 +315,7 @@ func TestOIDCService_DisabledAndMisconfiguredFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new disabled service: %v", err)
 	}
-	if _, err := disabled.Login(context.Background()); !errors.Is(err, domain.ErrOIDCDisabled) {
+	if _, err := disabled.Login(context.Background(), domain.OIDCAppChat); !errors.Is(err, domain.ErrOIDCDisabled) {
 		t.Fatalf("expected disabled error, got %v", err)
 	}
 
@@ -305,7 +323,7 @@ func TestOIDCService_DisabledAndMisconfiguredFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new misconfigured service: %v", err)
 	}
-	if _, err := misconfigured.Login(context.Background()); !errors.Is(err, domain.ErrOIDCMisconfigured) {
+	if _, err := misconfigured.Login(context.Background(), domain.OIDCAppChat); !errors.Is(err, domain.ErrOIDCMisconfigured) {
 		t.Fatalf("expected misconfigured error, got %v", err)
 	}
 }
@@ -575,7 +593,7 @@ func TestOIDCService_LoginPropagatesStoreAndProviderErrors(t *testing.T) {
 	tokens := newTestOIDCTokenManager(t)
 	store := &fakeOIDCStore{}
 	svc := newTestOIDCService(t, tokens, store, &fakeOIDCProvider{authErr: errors.New("provider unavailable")})
-	if _, err := svc.Login(context.Background()); err == nil {
+	if _, err := svc.Login(context.Background(), domain.OIDCAppChat); err == nil {
 		t.Fatal("expected provider authorization error")
 	}
 }
@@ -616,7 +634,7 @@ func TestOIDCService_LoginPropagatesAuthRequestStoreError(t *testing.T) {
 	store := &fakeOIDCStore{createAuthErr: errors.New("state insert failed")}
 	svc := newTestOIDCService(t, tokens, store, &fakeOIDCProvider{})
 
-	if _, err := svc.Login(context.Background()); err == nil {
+	if _, err := svc.Login(context.Background(), domain.OIDCAppChat); err == nil {
 		t.Fatal("expected auth request store error")
 	}
 }

@@ -32,17 +32,19 @@ const (
 	// because "who can still be added" depends on who is already in it, and the
 	// panel's capped preview is not a membership list. Same prefix convention as
 	// /details and /members; the workspace is resolved from the session.
-	RouteChannelMemberCandidates = "/api/chat/channels/{channelID}/member-candidates"
-	RouteDMMemberCandidates      = "/api/chat/dm/{conversationID}/member-candidates"
-	RouteDMMembers               = "/api/chat/dm/{conversationID}/members"
-	RouteChannelMessages         = "/api/chat/channels/{channelID}/messages"
-	RouteChannelMessageForward   = "/api/chat/channels/{channelID}/messages/forward"
-	RouteChannelMessage          = "/api/chat/channels/{channelID}/messages/{messageID}"
-	RouteChannelReferences       = "/api/chat/channels/{channelID}/message-references"
-	RouteChannelMentions         = "/api/chat/channels/{channelID}/mentions"
-	RouteDMMessages              = "/api/chat/dm/{conversationID}/messages"
-	RouteDMMessage               = "/api/chat/dm/{conversationID}/messages/{messageID}"
-	RouteDMReferences            = "/api/chat/dm/{conversationID}/message-references"
+	RouteChannelMemberCandidates  = "/api/chat/channels/{channelID}/member-candidates"
+	RouteDMMemberCandidates       = "/api/chat/dm/{conversationID}/member-candidates"
+	RouteDMMembers                = "/api/chat/dm/{conversationID}/members"
+	RouteChannelMessages          = "/api/chat/channels/{channelID}/messages"
+	RouteChannelMessageForward    = "/api/chat/channels/{channelID}/messages/forward"
+	RouteChannelMessage           = "/api/chat/channels/{channelID}/messages/{messageID}"
+	RouteChannelReferences        = "/api/chat/channels/{channelID}/message-references"
+	RouteChannelSecuritySnapshots = "/api/chat/channels/{channelID}/message-security-snapshots"
+	RouteChannelMentions          = "/api/chat/channels/{channelID}/mentions"
+	RouteDMMessages               = "/api/chat/dm/{conversationID}/messages"
+	RouteDMMessage                = "/api/chat/dm/{conversationID}/messages/{messageID}"
+	RouteDMReferences             = "/api/chat/dm/{conversationID}/message-references"
+	RouteDMSecuritySnapshots      = "/api/chat/dm/{conversationID}/message-security-snapshots"
 	// Issue #441/#398 group-details panel. It lives under the DM prefix because a
 	// group *is* a chat.dm_conversations row (type='group'); a /channels/ route
 	// would name the wrong aggregate, and a separate /groups/ prefix would
@@ -69,8 +71,14 @@ const (
 	// different methods anyway. No target segment, because a client reconnecting
 	// asks about its own messages and the server already knows whose they are.
 	RouteMessageLinkSafetyStatus = "/api/chat/messages/link-safety-status"
-	RouteMessageEditHistory      = "/api/chat/messages/{messageID}/history"
-	RouteWorkspaceSettings       = "/api/v1/workspaces/{workspaceID}/settings"
+	// RF-21 "Verificar novamente" (issue #135). Message-scoped on purpose: the
+	// only thing a client may name is a message it can already read, and the URLs
+	// are derived from that message server-side. There is deliberately no
+	// URL-scoped variant — one would let anyone use this deployment's Cloudflare
+	// credentials to look up arbitrary URLs.
+	RouteMessageLinkSafetyReconcile = "/api/chat/messages/{messageID}/link-safety/reconcile"
+	RouteMessageEditHistory         = "/api/chat/messages/{messageID}/history"
+	RouteWorkspaceSettings          = "/api/v1/workspaces/{workspaceID}/settings"
 	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
 	// is the only prefix the gateways forward to chat-service (Traefik local and
 	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never

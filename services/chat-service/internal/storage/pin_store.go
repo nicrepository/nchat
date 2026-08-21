@@ -182,6 +182,7 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			''::text, ''::text, ''::text,
 			NULL::timestamptz, 0::integer, NULL::timestamptz,
 			'epoch'::timestamptz, 'epoch'::timestamptz,
+			''::text,
 			''::text, ''::text, FALSE,
 			'epoch'::timestamptz, '00000000-0000-0000-0000-000000000000'::uuid, 0::bigint
 		FROM target_access a
@@ -213,6 +214,7 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
 			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
+			(*string)(&msg.LinkSafety),
 			&msg.SenderDisplayName, &msg.SenderEmail,
 			&msg.IsFavorited,
 			&pin.PinnedAt, &pin.PinnedByUserID,

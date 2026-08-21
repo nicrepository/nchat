@@ -22,6 +22,21 @@ type UserStore interface {
 	// (id, display_name, avatar_url). ErrNotFound when the user is missing,
 	// deleted, or not active.
 	GetSelfProfile(ctx context.Context, id string) (domain.SelfProfile, error)
+	// UpdateDisplayName sets display_name for an active, non-deleted user and
+	// returns the resulting self-profile. ErrNotFound when the user is
+	// missing, deleted, or not active — the same scope GetSelfProfile reads.
+	UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error)
+	// UpdateProfileFields sets job_title, bio, timezone and custom_status for
+	// an active, non-deleted user in a single UPDATE, and
+	// returns the resulting self-profile. Each argument is independently
+	// optional: nil leaves that column untouched, a non-nil pointer to ""
+	// clears it, and a non-nil pointer to a non-empty string sets it. This is
+	// what lets two different callers (a display-name-only save and a
+	// details-only save) share one PATCH endpoint without either one
+	// clobbering fields the other never touched. ErrNotFound when the user is
+	// missing, deleted, or not active — the same scope UpdateDisplayName
+	// writes under.
+	UpdateProfileFields(ctx context.Context, userID string, jobTitle, bio, timezone, customStatus *string) (domain.SelfProfile, error)
 	UpdateUserStatus(ctx context.Context, id, status string) (domain.User, error)
 	// SetAvatarURL points the user's avatar_url at url and returns the previous
 	// value (empty when there was none) so the caller can delete the orphaned
@@ -117,24 +132,118 @@ func (s *PGXUserStore) CreateUser(ctx context.Context, input domain.CreateUserIn
 
 func (s *PGXUserStore) GetSelfProfile(ctx context.Context, id string) (domain.SelfProfile, error) {
 	var p domain.SelfProfile
-	var avatar *string
+	var avatar, jobTitle, bio, timezone, customStatus *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, display_name, avatar_url
+		SELECT id, display_name, avatar_url, job_title, bio, timezone, custom_status
 		FROM auth.users
 		WHERE id = $1
 		  AND status = 'active'
 		  AND deleted_at IS NULL`,
 		id,
-	).Scan(&p.ID, &p.DisplayName, &avatar)
+	).Scan(&p.ID, &p.DisplayName, &avatar, &jobTitle, &bio, &timezone, &customStatus)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.SelfProfile{}, domain.ErrNotFound
 		}
 		return domain.SelfProfile{}, fmt.Errorf("get self profile: %w", err)
 	}
+	applySelfProfileOptionalFields(&p, avatar, jobTitle, bio, timezone, customStatus)
+	return p, nil
+}
+
+// applySelfProfileOptionalFields copies the nullable columns every query site
+// below scans into their SelfProfile fields, "" when NULL. Kept in one place
+// so the query sites can't drift on which column maps to which field.
+func applySelfProfileOptionalFields(p *domain.SelfProfile, avatar, jobTitle, bio, timezone, customStatus *string) {
 	if avatar != nil {
 		p.AvatarURL = *avatar
 	}
+	if jobTitle != nil {
+		p.JobTitle = *jobTitle
+	}
+	if bio != nil {
+		p.Bio = *bio
+	}
+	if timezone != nil {
+		p.Timezone = *timezone
+	}
+	if customStatus != nil {
+		p.CustomStatus = *customStatus
+	}
+}
+
+// UpdateDisplayName sets display_name for an active, non-deleted user in a
+// single UPDATE and returns the resulting profile via RETURNING, so the row
+// read back is guaranteed to be the one just persisted — never a stale value
+// from a concurrent writer. Two concurrent calls for the same user simply
+// serialise on Postgres's normal per-row update lock; the last commit wins,
+// same last-write-wins semantics SetAvatarURL already relies on. The other
+// optional profile columns are read back but never written by this method —
+// display_name and job_title/bio/timezone/custom_status are
+// independent writes (see UpdateProfileFields), so this UPDATE's SET clause
+// names only display_name.
+func (s *PGXUserStore) UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	var p domain.SelfProfile
+	var avatar, jobTitle, bio, timezone, customStatus *string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE auth.users
+		SET display_name = $2, updated_at = now()
+		WHERE id = $1
+		  AND status = 'active'
+		  AND deleted_at IS NULL
+		RETURNING id, display_name, avatar_url, job_title, bio, timezone, custom_status`,
+		userID, displayName,
+	).Scan(&p.ID, &p.DisplayName, &avatar, &jobTitle, &bio, &timezone, &customStatus)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.SelfProfile{}, domain.ErrNotFound
+		}
+		return domain.SelfProfile{}, fmt.Errorf("update display name: %w", err)
+	}
+	applySelfProfileOptionalFields(&p, avatar, jobTitle, bio, timezone, customStatus)
+	return p, nil
+}
+
+// UpdateProfileFields sets job_title, bio, timezone and custom_status in a
+// single UPDATE and returns the full resulting profile via
+// RETURNING — the same read-your-write guarantee UpdateDisplayName provides
+// for display_name.
+//
+// Each argument is independently optional, which the CASE expressions below
+// implement directly in SQL rather than by building the query text
+// dynamically: a nil pointer leaves its column exactly as it was (the CASE
+// falls through to the column's own current value), a pointer to "" clears it
+// (stored as NULL, matching how GetSelfProfile/UpdateDisplayName already
+// treat NULL as "unset"), and a pointer to a non-empty string sets it. The
+// boolean parameters ($6-$9) are what the CASE branches on; they are still
+// bind parameters, never interpolated text, so this stays exactly as safe
+// against injection as every other query in this file.
+func (s *PGXUserStore) UpdateProfileFields(ctx context.Context, userID string, jobTitle, bio, timezone, customStatus *string) (domain.SelfProfile, error) {
+	var p domain.SelfProfile
+	var avatarOut, jobTitleOut, bioOut, timezoneOut, customStatusOut *string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE auth.users
+		SET job_title     = CASE WHEN $6 THEN $2 ELSE job_title END,
+		    bio           = CASE WHEN $7 THEN $3 ELSE bio END,
+		    timezone      = CASE WHEN $8 THEN $4 ELSE timezone END,
+		    custom_status = CASE WHEN $9 THEN $5 ELSE custom_status END,
+		    updated_at = now()
+		WHERE id = $1
+		  AND status = 'active'
+		  AND deleted_at IS NULL
+		RETURNING id, display_name, avatar_url, job_title, bio, timezone, custom_status`,
+		userID,
+		nullableStringPtr(jobTitle), nullableStringPtr(bio), nullableStringPtr(timezone),
+		nullableStringPtr(customStatus),
+		jobTitle != nil, bio != nil, timezone != nil, customStatus != nil,
+	).Scan(&p.ID, &p.DisplayName, &avatarOut, &jobTitleOut, &bioOut, &timezoneOut, &customStatusOut)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.SelfProfile{}, domain.ErrNotFound
+		}
+		return domain.SelfProfile{}, fmt.Errorf("update profile fields: %w", err)
+	}
+	applySelfProfileOptionalFields(&p, avatarOut, jobTitleOut, bioOut, timezoneOut, customStatusOut)
 	return p, nil
 }
 
@@ -247,6 +356,18 @@ func nullableString(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullableStringPtr is nullableString for an optional argument: a nil pointer
+// (field not provided) is passed through as NULL too, which is harmless
+// because UpdateProfileFields's CASE expressions never select this value for
+// a nil pointer in the first place — this only has to be a valid bind
+// parameter, not a meaningful one, in that case.
+func nullableStringPtr(s *string) any {
+	if s == nil {
+		return nil
+	}
+	return nullableString(*s)
 }
 
 // SetAvatarURL updates the avatar reference for an active user, returning the

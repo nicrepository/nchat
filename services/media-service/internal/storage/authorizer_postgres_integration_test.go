@@ -22,24 +22,35 @@ const (
 	pgUserActive   = "91000000-0000-4000-8000-000000000001"
 	pgUserOther    = "91000000-0000-4000-8000-000000000002"
 	pgUserInactive = "91000000-0000-4000-8000-000000000003"
+	// DisplayNameExpr precedence fixtures (issue #540 follow-up, Code Quality
+	// achado 2): three users exercising the three outcomes the expression
+	// must produce, proven against a real PostgreSQL COALESCE/NULLIF/BTRIM
+	// evaluation rather than the Go-side string constant.
+	pgUserNameFromFullName    = "91000000-0000-4000-8000-000000000004"
+	pgUserNameFromDisplayName = "91000000-0000-4000-8000-000000000005"
+	pgUserNameEmpty           = "91000000-0000-4000-8000-000000000006"
 
-	pgSessionActive         = "92000000-0000-4000-8000-000000000001"
-	pgSessionRevoked        = "92000000-0000-4000-8000-000000000002"
-	pgSessionIdleExpired    = "92000000-0000-4000-8000-000000000003"
-	pgSessionAbsolute       = "92000000-0000-4000-8000-000000000004"
-	pgSessionOtherUser      = "92000000-0000-4000-8000-000000000005"
-	pgSessionInactiveUser   = "92000000-0000-4000-8000-000000000006"
-	pgChannelAllowed        = "94000000-0000-4000-8000-000000000001"
-	pgChannelNoMembership   = "94000000-0000-4000-8000-000000000002"
-	pgChannelCrossWorkspace = "94000000-0000-4000-8000-000000000003"
-	pgChannelInactive       = "94000000-0000-4000-8000-000000000004"
-	pgDMAllowed             = "95000000-0000-4000-8000-000000000001"
-	pgDMNoParticipation     = "95000000-0000-4000-8000-000000000002"
-	pgDMCrossWorkspace      = "95000000-0000-4000-8000-000000000003"
-	pgCallActive            = "96000000-0000-4000-8000-000000000001"
-	pgCallRinging           = "96000000-0000-4000-8000-000000000002"
-	pgCallNonParticipant    = "96000000-0000-4000-8000-000000000003"
-	pgMissingResource       = "99000000-0000-4000-8000-000000000001"
+	pgSessionActive           = "92000000-0000-4000-8000-000000000001"
+	pgSessionRevoked          = "92000000-0000-4000-8000-000000000002"
+	pgSessionIdleExpired      = "92000000-0000-4000-8000-000000000003"
+	pgSessionAbsolute         = "92000000-0000-4000-8000-000000000004"
+	pgSessionOtherUser        = "92000000-0000-4000-8000-000000000005"
+	pgSessionInactiveUser     = "92000000-0000-4000-8000-000000000006"
+	pgSessionNameFromFullName = "92000000-0000-4000-8000-000000000007"
+	pgSessionNameFromDisplay  = "92000000-0000-4000-8000-000000000008"
+	pgSessionNameEmpty        = "92000000-0000-4000-8000-000000000009"
+	pgChannelAllowed          = "94000000-0000-4000-8000-000000000001"
+	pgChannelNoMembership     = "94000000-0000-4000-8000-000000000002"
+	pgChannelCrossWorkspace   = "94000000-0000-4000-8000-000000000003"
+	pgChannelInactive         = "94000000-0000-4000-8000-000000000004"
+	pgDMAllowed               = "95000000-0000-4000-8000-000000000001"
+	pgDMNoParticipation       = "95000000-0000-4000-8000-000000000002"
+	pgDMCrossWorkspace        = "95000000-0000-4000-8000-000000000003"
+	pgDMDirect                = "95000000-0000-4000-8000-000000000004"
+	pgCallActive              = "96000000-0000-4000-8000-000000000001"
+	pgCallRinging             = "96000000-0000-4000-8000-000000000002"
+	pgCallNonParticipant      = "96000000-0000-4000-8000-000000000003"
+	pgMissingResource         = "99000000-0000-4000-8000-000000000001"
 )
 
 func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
@@ -83,9 +94,22 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 		userID     string
 		sessionID  string
 		wantID     string
-		wantErr    error
+		// nil means "don't care about display name" for this row — never
+		// used for the three precedence rows below, where "" (both empty)
+		// is itself the assertion and must not be skipped.
+		wantDisplayName *string
+		wantErr         error
 	}{
-		{name: "active session and channel member allowed", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgChannelAllowed},
+		{name: "active session and channel member allowed", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgChannelAllowed, wantDisplayName: strPtr("Media Active")},
+		// DisplayNameExpr precedence (Code Quality achado 2): proven end to
+		// end against a real PostgreSQL COALESCE/NULLIF/BTRIM evaluation, not
+		// just the Go-side string constant. Uses the DM authorization path
+		// (not channel): display name resolution is shared by every resource
+		// kind through the same authorizedResourceSelect fragment, and DM
+		// authorization needs no dependency beyond dm_members/workspace_members.
+		{name: "display name: full_name wins when both are set", kind: domain.ResourceKindDM, resourceID: pgDMAllowed, userID: pgUserNameFromFullName, sessionID: pgSessionNameFromFullName, wantID: pgDMAllowed, wantDisplayName: strPtr("Pedro Completo")},
+		{name: "display name: falls back to display_name when full_name is empty", kind: domain.ResourceKindDM, resourceID: pgDMAllowed, userID: pgUserNameFromDisplayName, sessionID: pgSessionNameFromDisplay, wantID: pgDMAllowed, wantDisplayName: strPtr("Pedro")},
+		{name: "display name: empty when both full_name and display_name are empty", kind: domain.ResourceKindDM, resourceID: pgDMAllowed, userID: pgUserNameEmpty, sessionID: pgSessionNameEmpty, wantID: pgDMAllowed, wantDisplayName: strPtr("")},
 		{name: "active session and DM participant allowed", kind: domain.ResourceKindDM, resourceID: pgDMAllowed, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgDMAllowed},
 		{name: "active call participant allowed", kind: domain.ResourceKindCall, resourceID: pgCallActive, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgCallActive},
 		{name: "ringing call denied", kind: domain.ResourceKindCall, resourceID: pgCallRinging, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
@@ -100,6 +124,7 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 		{name: "inactive channel inaccessible", kind: domain.ResourceKindChannel, resourceID: pgChannelInactive, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "DM without participation inaccessible", kind: domain.ResourceKindDM, resourceID: pgDMNoParticipation, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "cross workspace DM inaccessible", kind: domain.ResourceKindDM, resourceID: pgDMCrossWorkspace, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "direct DM cannot use resource mode even with active participation", kind: domain.ResourceKindDM, resourceID: pgDMDirect, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "missing resource matches inaccessible result", kind: domain.ResourceKindChannel, resourceID: pgMissingResource, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 	}
 
@@ -121,9 +146,14 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 			if result.ID != tt.wantID || result.SessionExpiresAt.IsZero() {
 				t.Fatalf("unexpected authorized resource: %+v", result)
 			}
+			if tt.wantDisplayName != nil && result.DisplayName != *tt.wantDisplayName {
+				t.Fatalf("expected display name %q, got %q", *tt.wantDisplayName, result.DisplayName)
+			}
 		})
 	}
 }
+
+func strPtr(s string) *string { return &s }
 
 func requireTestDatabase(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 	t.Helper()
@@ -179,6 +209,10 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('91000000-0000-4000-8000-000000000001', 'media-active@example.test', 'Media Active', 'active'),
 			('91000000-0000-4000-8000-000000000002', 'media-other@example.test', 'Media Other', 'active'),
 			('91000000-0000-4000-8000-000000000003', 'media-inactive@example.test', 'Media Inactive', 'suspended');
+		INSERT INTO auth.users (id, email, display_name, full_name, status) VALUES
+			('91000000-0000-4000-8000-000000000004', 'media-name-full@example.test', 'Pedro', 'Pedro Completo', 'active'),
+			('91000000-0000-4000-8000-000000000005', 'media-name-display@example.test', 'Pedro', '', 'active'),
+			('91000000-0000-4000-8000-000000000006', 'media-name-empty@example.test', '', '', 'active');
 		INSERT INTO auth.user_sessions
 			(id, user_id, refresh_token_hash, idle_expires_at, absolute_expires_at, revoked_at)
 		VALUES
@@ -187,7 +221,10 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('92000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001', 'media-session-idle-expired', now() - interval '1 minute', now() + interval '60 minutes', NULL),
 			('92000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001', 'media-session-absolute-expired', now() + interval '30 minutes', now() - interval '1 minute', NULL),
 			('92000000-0000-4000-8000-000000000005', '91000000-0000-4000-8000-000000000002', 'media-session-other-user', now() + interval '30 minutes', now() + interval '60 minutes', NULL),
-			('92000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000003', 'media-session-inactive-user', now() + interval '30 minutes', now() + interval '60 minutes', NULL);
+			('92000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000003', 'media-session-inactive-user', now() + interval '30 minutes', now() + interval '60 minutes', NULL),
+			('92000000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000004', 'media-session-name-full', now() + interval '30 minutes', now() + interval '60 minutes', NULL),
+			('92000000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000005', 'media-session-name-display', now() + interval '30 minutes', now() + interval '60 minutes', NULL),
+			('92000000-0000-4000-8000-000000000009', '91000000-0000-4000-8000-000000000006', 'media-session-name-empty', now() + interval '30 minutes', now() + interval '60 minutes', NULL);
 
 		INSERT INTO chat.workspaces (id, slug, name, status) VALUES
 			('93000000-0000-4000-8000-000000000001', 'media-workspace-a', 'Media Workspace A', 'active'),
@@ -203,6 +240,9 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', 'active'),
 			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'active'),
 			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000003', 'active'),
+			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000004', 'active'),
+			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000005', 'active'),
+			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000006', 'active'),
 			('93000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000002', 'active');
 		INSERT INTO chat.channel_members (channel_id, user_id) VALUES
 			('94000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
@@ -212,11 +252,16 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 		INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by, direct_pair_key) VALUES
 			('95000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000001', NULL),
 			('95000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
-			('95000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL);
+			('95000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
+			('95000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'direct', 'active', '91000000-0000-4000-8000-000000000001', '2:1-user:2:2-user');
 		INSERT INTO chat.dm_members (conversation_id, user_id) VALUES
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
+			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000004'),
+			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000005'),
+			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000006'),
 			('95000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000002'),
-			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001');
+			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001'),
+			('95000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001');
 		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, call_type, status, expires_at) VALUES
 			('96000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'video', 'active', now() + interval '30 seconds'),
 			('96000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'audio', 'ringing', now() + interval '30 seconds'),

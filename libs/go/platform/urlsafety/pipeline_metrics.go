@@ -66,6 +66,12 @@ const (
 	// down. The provider may or may not have accepted it; the row is left for
 	// reconciliation rather than submitted again.
 	AttemptUncertain = "uncertain"
+	// AttemptInconclusive marks a poll whose scan the provider confirms is
+	// finished but produced no usable verdict. Distinct from AttemptRetry and
+	// AttemptError: nothing failed and nothing will be retried — the row is
+	// terminal, and an operator seeing these needs to know the pipeline stopped
+	// polling on purpose, not that the provider is unwell.
+	AttemptInconclusive = "inconclusive"
 
 	// Reconciliation outcomes, for the uncertain-submission window.
 	ReconcileAdopted = "adopted"
@@ -89,6 +95,44 @@ const (
 	// signal an operator alerts on: a scan whose submission has been unresolved
 	// for an hour needs a human, not another POST.
 	ReconcileStale = "stale"
+
+	// Verdict-reconciliation outcomes, for an inconclusive scan being re-read
+	// (issue #135). A separate closed set from the submission-reconciliation one
+	// above because it answers a different question: not "did my submission
+	// happen" but "has the provider since produced a verdict for a scan that
+	// finished without one". They share ReconcileUnsupported, which means the same
+	// thing in both.
+	//
+	// Every value is decided here. The provider's own refusal text is never one of
+	// them: it is an English sentence chosen by Cloudflare, it can contain the
+	// hostname, and a metric label built from it would be both unbounded and a
+	// URL leak into a scrape.
+	ReconcileRequested = "requested"
+	// ReconcileCandidateFound counts a search that produced an exact-URL
+	// candidate. It is counted before the report is read, so the ratio between it
+	// and the three outcomes below shows how often a candidate turns into an
+	// answer.
+	ReconcileCandidateFound = "candidate_found"
+	// ReconcileNoCandidate means the account-scoped search found no scan for
+	// exactly this canonical URL. The ordinary answer, and the expected one when
+	// the provider refused the scan because a *different* account scanned the
+	// hostname recently.
+	ReconcileNoCandidate = "no_candidate"
+	// ReconcileVerdictSafe and ReconcileVerdictMalicious are the only two
+	// outcomes that change stored state, and they are counted separately because
+	// the second one means a published message just lost its links.
+	ReconcileVerdictSafe      = "safe"
+	ReconcileVerdictMalicious = "malicious"
+	// ReconcileStillInconclusive means a candidate existed and its report still
+	// carries no usable verdict, or is still running. Nothing changed.
+	ReconcileStillInconclusive = "still_inconclusive"
+	// ReconcileRateLimited counts a manual reconciliation refused before the
+	// provider was asked. Distinct from an error: nothing failed, and an operator
+	// seeing these is looking at a client that is clicking, not at Cloudflare.
+	ReconcileRateLimited = "rate_limited"
+	// ReconcileProviderError means the question could not be asked or the answer
+	// could not be trusted. Never a reason to submit.
+	ReconcileProviderError = "provider_error"
 
 	// Admission outcomes, mirroring the storage layer's closed set.
 	AdmissionAllowed  = "allowed"
@@ -117,6 +161,7 @@ type PipelineMetrics struct {
 
 	admissions      *prometheus.CounterVec
 	reconciliations *prometheus.CounterVec
+	verdictRecon    *prometheus.CounterVec
 }
 
 // NewPipelineMetrics registers the pipeline collectors for one service.
@@ -182,9 +227,20 @@ func NewPipelineMetrics(metrics *observability.Metrics, service string) *Pipelin
 		Help: "Attempts to resolve a submission whose outcome was not recorded.",
 	}, []string{"service", "result"})
 
+	// The inconclusive-recovery signal (issue #135). Separate from the submission
+	// counter above because the two describe different pipelines: that one is
+	// "did my POST happen", this one is "did a scan that finished with nothing
+	// ever produce an answer". `source` distinguishes a reader pressing the button
+	// from the background pass, which is the difference between a user waiting and
+	// a schedule running, and it is a two-value closed set.
+	verdictRecon := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nchat_link_safety_reconcile_total",
+		Help: "Attempts to obtain a verdict for a scan that finished without one.",
+	}, []string{"service", "source", "result"})
+
 	if !registerAll(metrics,
 		pending, oldestAge, attempts, providerMs, outboxPending, outboxAge, revalidations,
-		admissions, reconciliations,
+		admissions, reconciliations, verdictRecon,
 	) {
 		return nil
 	}
@@ -194,7 +250,30 @@ func NewPipelineMetrics(metrics *observability.Metrics, service string) *Pipelin
 		outboxPending: outboxPending, outboxAge: outboxAge,
 		revalidations: revalidations,
 		admissions:    admissions, reconciliations: reconciliations,
+		verdictRecon: verdictRecon,
 	}
+}
+
+// Reconciliation sources. A closed two-value set: who asked.
+const (
+	// ReconcileSourceManual is a reader who pressed "Verificar novamente".
+	ReconcileSourceManual = "manual"
+	// ReconcileSourceBackground is the worker's own bounded schedule.
+	ReconcileSourceBackground = "background"
+)
+
+// ObserveVerdictReconciliation counts one attempt to obtain a verdict for an
+// inconclusive scan.
+//
+// Both labels come from closed sets decided in this package. There is no
+// parameter here that could carry a URL, a hostname, a scan uuid, a message id
+// or a user id, which is what keeps the series count bounded by
+// services × 2 × outcomes rather than by traffic.
+func (m *PipelineMetrics) ObserveVerdictReconciliation(source, result string) {
+	if m == nil {
+		return
+	}
+	m.verdictRecon.WithLabelValues(m.service, source, result).Inc()
 }
 
 // ObserveAdmission counts one capacity decision.

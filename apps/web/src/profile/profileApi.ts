@@ -33,7 +33,15 @@ interface AvatarResponse {
 }
 
 interface SelfProfileResponse {
-  data: { id: string; display_name?: unknown; avatar_url?: unknown };
+  data: {
+    id: string;
+    display_name?: unknown;
+    avatar_url?: unknown;
+    job_title?: unknown;
+    bio?: unknown;
+    timezone?: unknown;
+    custom_status?: unknown;
+  };
 }
 
 export interface SelfProfile {
@@ -46,6 +54,19 @@ export interface SelfProfile {
   displayName: string;
   /** Present only when set and same-origin; a cross-origin value is dropped. */
   avatarUrl?: string;
+  /**
+   * Trimmed, "" when unset — same convention as displayName. All four are
+   * optional at the domain level (matching auth.users' nullable columns) and
+   * optional here on the TS type too, for the same reason avatarUrl is:
+   * every real response includes them (selfProfileFromResponse always sets
+   * them), but a test fixture elsewhere constructing a partial SelfProfile
+   * should not be forced to invent values for fields it does not care about.
+   */
+  jobTitle?: string;
+  bio?: string;
+  /** An IANA time zone name (e.g. "America/Sao_Paulo"), or "" when unset. */
+  timezone?: string;
+  customStatus?: string;
 }
 
 /**
@@ -58,17 +79,16 @@ export async function fetchMyProfile(signal?: AbortSignal): Promise<SelfProfile>
     method: "GET",
     signal,
   });
-  return {
-    id: res.data.id,
-    displayName: normalizeDisplayName(res.data.display_name),
-    avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
-  };
+  return selfProfileFromResponse(res);
 }
 
 /**
  * "" for anything that is not a name: absent, null, empty, whitespace-only.
  * Trimming here rather than at render time means the same value decides both
- * what is shown and what the initials are derived from.
+ * what is shown and what the initials are derived from. Reused for
+ * job_title/bio/timezone/custom_status too — the rule ("" when there is
+ * nothing usable) is identical for every optional text field this client
+ * reads.
  */
 function normalizeDisplayName(raw: unknown): string {
   return typeof raw === "string" ? raw.trim() : "";
@@ -136,4 +156,128 @@ function mapAvatarError(error: unknown): AvatarUploadError {
     }
   }
   return new AvatarUploadError("unknown", "Não foi possível atualizar o avatar.");
+}
+
+export type UpdateDisplayNameErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateDisplayNameError extends Error {
+  readonly reason: UpdateDisplayNameErrorReason;
+  constructor(reason: UpdateDisplayNameErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateDisplayNameError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Updates the authenticated user's display name and returns the profile as
+ * persisted by the server — never the optimistic input. The body carries only
+ * display_name; identity comes from the session via authenticatedFetch, never
+ * from a client-supplied id.
+ *
+ * PATCH /auth/me treats an absent field as "leave it alone," so this call
+ * never touches job_title/bio/timezone/custom_status even though it does not
+ * mention them.
+ */
+export async function updateDisplayName(
+  displayName: string,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: displayName }),
+      signal,
+    });
+    return selfProfileFromResponse(res);
+  } catch (error) {
+    throw mapUpdateDisplayNameError(error);
+  }
+}
+
+function mapUpdateDisplayNameError(error: unknown): UpdateDisplayNameError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateDisplayNameError("invalid", "Nome inválido.");
+      case 403:
+        return new UpdateDisplayNameError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateDisplayNameError("unknown", "Não foi possível atualizar o nome.");
+}
+
+function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
+  return {
+    id: res.data.id,
+    displayName: normalizeDisplayName(res.data.display_name),
+    avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
+    jobTitle: normalizeDisplayName(res.data.job_title),
+    bio: normalizeDisplayName(res.data.bio),
+    timezone: normalizeDisplayName(res.data.timezone),
+    customStatus: normalizeDisplayName(res.data.custom_status),
+  };
+}
+
+export type UpdateProfileFieldsErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateProfileFieldsError extends Error {
+  readonly reason: UpdateProfileFieldsErrorReason;
+  constructor(reason: UpdateProfileFieldsErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateProfileFieldsError";
+    this.reason = reason;
+  }
+}
+
+/** The "Detalhes do perfil" form always submits all four together — see
+ * ProfilePage's onSaveDetails — so this takes a plain object rather than four
+ * positional parameters, matching that grouping. */
+export interface ProfileFieldsInput {
+  jobTitle: string;
+  bio: string;
+  timezone: string;
+  customStatus: string;
+}
+
+/**
+ * Updates job_title, bio, timezone and custom_status, and returns the profile
+ * as persisted. Does not send display_name at all: PATCH /auth/me treats an
+ * absent field as "leave it alone," so there is nothing to preserve here —
+ * unlike a design that would need to resend the current display name to
+ * avoid clobbering it.
+ */
+export async function updateProfileFields(
+  fields: ProfileFieldsInput,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_title: fields.jobTitle,
+        bio: fields.bio,
+        timezone: fields.timezone,
+        custom_status: fields.customStatus,
+      }),
+      signal,
+    });
+    return selfProfileFromResponse(res);
+  } catch (error) {
+    throw mapUpdateProfileFieldsError(error);
+  }
+}
+
+function mapUpdateProfileFieldsError(error: unknown): UpdateProfileFieldsError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateProfileFieldsError("invalid", "Dados inválidos.");
+      case 403:
+        return new UpdateProfileFieldsError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateProfileFieldsError("unknown", "Não foi possível atualizar o perfil.");
 }

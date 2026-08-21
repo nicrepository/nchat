@@ -22,7 +22,7 @@ func TestPGXOIDCStore_CreateAuthRequestStoresHashedState(t *testing.T) {
 
 	expiresAt := time.Now().Add(10 * time.Minute)
 	mock.ExpectExec(`INSERT INTO auth\.oidc_auth_requests`).
-		WithArgs("auth-id", "keycloak", "state-hash", "nonce-hash", "encrypted-verifier", nil, expiresAt).
+		WithArgs("auth-id", "keycloak", "state-hash", "nonce-hash", "encrypted-verifier", nil, "chat", expiresAt).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	store := storage.NewPGXOIDCStore(mock)
@@ -32,6 +32,7 @@ func TestPGXOIDCStore_CreateAuthRequestStoresHashedState(t *testing.T) {
 		StateHash:             "state-hash",
 		NonceHash:             "nonce-hash",
 		PKCEVerifierEncrypted: "encrypted-verifier",
+		AppContext:            domain.OIDCAppChat,
 		ExpiresAt:             expiresAt,
 	})
 	if err != nil {
@@ -238,8 +239,8 @@ func TestPGXOIDCStore_ConsumeAuthRequestReturnsStoredEncryptedVerifier(t *testin
 
 	mock.ExpectQuery(`UPDATE auth\.oidc_auth_requests`).
 		WithArgs("keycloak", "state-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "provider", "nonce_hash", "pkce_verifier_encrypted", "redirect_after"}).
-			AddRow("auth-id", "keycloak", "nonce-hash", "encrypted-verifier", ""))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "provider", "nonce_hash", "pkce_verifier_encrypted", "redirect_after", "app_context"}).
+			AddRow("auth-id", "keycloak", "nonce-hash", "encrypted-verifier", "", "chat"))
 
 	store := storage.NewPGXOIDCStore(mock)
 	req, err := store.ConsumeAuthRequest(context.Background(), "keycloak", "state-hash")
@@ -369,7 +370,7 @@ func TestPGXOIDCStore_CreateAuthRequestReturnsInsertError(t *testing.T) {
 	}
 	defer mock.Close()
 	mock.ExpectExec(`INSERT INTO auth\.oidc_auth_requests`).
-		WithArgs("", "", "", "", "", nil, time.Time{}).
+		WithArgs("", "", "", "", "", nil, "", time.Time{}).
 		WillReturnError(errors.New("insert failed"))
 	store := storage.NewPGXOIDCStore(mock)
 	if err := store.CreateAuthRequest(context.Background(), domain.OIDCLoginRequest{}); err == nil {
@@ -1073,6 +1074,122 @@ func TestPGXOIDCStore_ConsumeExchangeRejectsSuspendedUser(t *testing.T) {
 	_, err = store.ConsumeExchange(context.Background(), "keycloak", "code-hash")
 	if !errors.Is(err, domain.ErrInvalidToken) {
 		t.Fatalf("expected ErrInvalidToken for suspended user, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A provisioning insert that returns no row means a unique constraint was
+// already taken. When re-reading by subject finds the account, the login lost a
+// concurrent first-login race against itself and must proceed into the account
+// the winner created.
+func TestPGXOIDCStore_ProvisioningConflictResolvedBySubjectLogsIn(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	refreshExpiresAt := time.Now().Add(time.Hour)
+
+	mock.ExpectBegin()
+	expectOIDCPolicyQuery(mock)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT id\s+FROM auth\.users`).
+		WithArgs("new@example.com").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.users`).
+		WithArgs("new@example.com", "New User", "", "", "keycloak", "subject-1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name", "status", "deleted_at"}).
+			AddRow("winner-id", "new@example.com", "New User", "active", nil))
+	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
+		WithArgs("winner-id", "new@example.com", true, nil, nil, nil).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery(`INSERT INTO auth\.user_sessions`).
+		WithArgs("winner-id", nil, "refresh-hash", nil, nil, pgxmock.AnyArg(), refreshExpiresAt).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "user_id"}).AddRow("session-id", "winner-id"))
+	mock.ExpectExec(`INSERT INTO auth\.refresh_token_history`).
+		WithArgs("session-id", "refresh-hash").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(`UPDATE auth\.users SET last_login_at`).
+		WithArgs("winner-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`INSERT INTO auth\.oidc_exchange_codes`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectRollback()
+
+	store := storage.NewPGXOIDCStore(mock)
+	created, err := store.CreateOIDCSessionAndExchange(context.Background(), domain.OIDCSessionInput{
+		Provider:         "keycloak",
+		Subject:          "subject-1",
+		Email:            "new@example.com",
+		DisplayName:      "New User",
+		RefreshTokenHash: "refresh-hash",
+		RefreshExpiresAt: refreshExpiresAt,
+		AutoProvision:    true,
+	}, func(session domain.Session, user domain.LoginUser) (domain.OIDCExchangeInput, error) {
+		return domain.OIDCExchangeInput{
+			ID: "exchange-id", Provider: "keycloak", CodeHash: "code-hash",
+			AccessValueEncrypted: "a", RefreshValueEncrypted: "r",
+			BearerScheme: "Bearer", ExpiresIn: 900, User: user,
+			ExpiresAt: time.Now().Add(2 * time.Minute),
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("CreateOIDCSessionAndExchange: %v", err)
+	}
+	if created.User.ID != "winner-id" {
+		t.Fatalf("logged into %q, want the account the race winner created", created.User.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The same empty insert result, but the subject is still absent afterwards: the
+// unique constraint that fired was the e-mail, held by an account this subject
+// does not own. That must stay a conflict, never an implicit account takeover.
+func TestPGXOIDCStore_ProvisioningConflictWithoutSubjectStaysAConflict(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	expectOIDCPolicyQuery(mock)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT id\s+FROM auth\.users`).
+		WithArgs("new@example.com").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO auth\.users`).
+		WithArgs("new@example.com", "New User", "", "", "keycloak", "subject-1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`SELECT id, email::text, display_name, status, deleted_at`).
+		WithArgs("keycloak", "subject-1").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	store := storage.NewPGXOIDCStore(mock)
+	_, err = store.CreateOIDCSessionAndExchange(context.Background(), domain.OIDCSessionInput{
+		Provider: "keycloak", Subject: "subject-1", Email: "new@example.com",
+		DisplayName: "New User", AutoProvision: true,
+	}, func(domain.Session, domain.LoginUser) (domain.OIDCExchangeInput, error) {
+		return domain.OIDCExchangeInput{}, nil
+	})
+	if !errors.Is(err, domain.ErrOIDCAccountConflict) {
+		t.Fatalf("want ErrOIDCAccountConflict, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

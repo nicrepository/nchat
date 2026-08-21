@@ -528,6 +528,31 @@ func (f *fakeMessageStore) GetMessageByIDInWorkspace(_ context.Context, workspac
 	return domain.Message{}, domain.ErrNotFound
 }
 
+func (f *fakeMessageStore) ListMessageSecuritySnapshots(
+	_ context.Context, workspaceID, _ string, channelID, dmConversationID string, messageIDs []string,
+) ([]storage.MessageSecuritySnapshot, error) {
+	result := make([]storage.MessageSecuritySnapshot, 0, len(messageIDs))
+	for _, messageID := range messageIDs {
+		message, ok := f.messagesByKey[workspaceID+":"+messageID]
+		if !ok || message.ChannelID != channelID || message.DMConversationID != dmConversationID {
+			result = append(result, storage.MessageSecuritySnapshot{MessageID: messageID})
+			continue
+		}
+		snapshot := storage.MessageSecuritySnapshot{
+			MessageID: message.ID, Available: true, Status: message.Status,
+			LinkSafetyState: message.LinkSafety,
+		}
+		if message.Quoted != nil {
+			snapshot.Quoted = &storage.QuotedMessageSecuritySnapshot{
+				MessageID: message.Quoted.ID, Status: message.Quoted.Status,
+				LinkSafetyState: message.Quoted.LinkSafety,
+			}
+		}
+		result = append(result, snapshot)
+	}
+	return result, nil
+}
+
 func (f *fakeMessageStore) ValidateRefMessageInTarget(_ context.Context, _, _, _, _, _ string) error {
 	return f.validateRefTargetErr
 }
@@ -1340,6 +1365,76 @@ func TestMessageService_ResolveMessageReferenceBatch_EnforcesPageSizedLimit(t *t
 	input.MessageIDs = append(input.MessageIDs, uuid.NewString())
 	if _, err := svc.ResolveMessageReferenceBatch(t.Context(), input); !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("expected oversized batch rejection, got %v", err)
+	}
+}
+
+func TestMessageService_MessageSecuritySnapshots_AuthorizesTargetAndOmitsInvisibleIDs(t *testing.T) {
+	visibleID := uuid.NewString()
+	wrongTargetID := uuid.NewString()
+	missingID := uuid.NewString()
+	quotedID := uuid.NewString()
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{
+		"ws-1:" + visibleID: {
+			ID: visibleID, WorkspaceID: "ws-1", ChannelID: "destination",
+			Status: domain.MessageStatusActive, LinkSafety: domain.MessageLinkSafetyInconclusive,
+			Quoted: &domain.QuotedMessage{ID: quotedID, Status: domain.MessageStatusActive, LinkSafety: domain.MessageLinkSafetyMalicious},
+		},
+		"ws-1:" + wrongTargetID: {
+			ID: wrongTargetID, WorkspaceID: "ws-1", ChannelID: "other",
+			Status: domain.MessageStatusActive, LinkSafety: domain.MessageLinkSafetySafe,
+		},
+	}}
+	svc := service.NewMessageService(
+		&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")},
+		&fakeDMStore{}, store,
+	)
+
+	snapshots, err := svc.MessageSecuritySnapshots(t.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: "ws-1", ChannelID: "destination", CallerID: user1,
+		MessageIDs: []string{visibleID, wrongTargetID, missingID},
+	})
+	if err != nil {
+		t.Fatalf("MessageSecuritySnapshots: %v", err)
+	}
+	if len(snapshots) != 3 || !snapshots[0].Available || snapshots[0].MessageID != visibleID || snapshots[0].LinkSafetyState != domain.MessageLinkSafetyInconclusive {
+		t.Fatalf("unexpected snapshots: %+v", snapshots)
+	}
+	if snapshots[0].Quoted == nil || snapshots[0].Quoted.MessageID != quotedID || snapshots[0].Quoted.LinkSafetyState != domain.MessageLinkSafetyMalicious {
+		t.Fatalf("quoted security snapshot missing: %+v", snapshots[0].Quoted)
+	}
+	if snapshots[1].Available || snapshots[2].Available || snapshots[1].MessageID != wrongTargetID || snapshots[2].MessageID != missingID {
+		t.Fatalf("unavailable ids were distinguishable: %+v", snapshots[1:])
+	}
+}
+
+func TestMessageService_MessageSecuritySnapshots_EnforcesPageSizedLimit(t *testing.T) {
+	messageIDs := make([]string, service.MaxMessageSecuritySnapshotBatchSize+1)
+	for i := range messageIDs {
+		messageIDs[i] = uuid.NewString()
+	}
+	svc := service.NewMessageService(
+		&fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "destination")},
+		&fakeDMStore{}, &fakeMessageStore{},
+	)
+	_, err := svc.MessageSecuritySnapshots(t.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: "ws-1", ChannelID: "destination", CallerID: user1, MessageIDs: messageIDs,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected oversized batch rejection, got %v", err)
+	}
+}
+
+func TestMessageService_MessageSecuritySnapshots_RefusesAnInvisibleTargetBeforeReadingMessages(t *testing.T) {
+	store := &fakeMessageStore{}
+	svc := service.NewMessageService(
+		&fakeChannelStore{getVisibleErr: domain.ErrNotFound}, &fakeDMStore{}, store,
+	)
+	_, err := svc.MessageSecuritySnapshots(t.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: "ws-1", ChannelID: "destination", CallerID: user1,
+		MessageIDs: []string{uuid.NewString()},
+	})
+	if !errors.Is(err, domain.ErrNotFound) || store.getByIDCalls != 0 {
+		t.Fatalf("authorization error/calls = %v/%d", err, store.getByIDCalls)
 	}
 }
 

@@ -179,6 +179,34 @@ require_single_clamd_directive() {
   fi
 }
 
+# deployment_env_secret_refs prints one "VAR SECRET/KEY" line per environment
+# variable a workload document sources from a Secret.
+#
+# It parses the reference rather than grepping for a Secret name because the
+# name alone proves nothing about who reads it: the same string legitimately
+# appears in the SealedSecret's own metadata, and a key nobody asked for is
+# invisible to a presence check. Both orders of the rendered `key:`/`name:`
+# pair are accepted — kustomize sorts the map, kubectl does not always.
+deployment_env_secret_refs() {
+  awk '
+    function flush() { if (var != "" && secret != "" && key != "") print var " " secret "/" key }
+    /^[[:space:]]*- name: / { flush(); var = $NF; secret = ""; key = ""; in_ref = 0; next }
+    /^[[:space:]]*secretKeyRef:[[:space:]]*$/ { in_ref = 1; next }
+    in_ref && /^[[:space:]]*key: / { key = $NF; next }
+    in_ref && /^[[:space:]]*name: / { secret = $NF; next }
+    END { flush() }
+  ' <<<"$1" | LC_ALL=C sort
+}
+
+# resource_quota_hard prints one "KEY VALUE" line per spec.hard entry.
+resource_quota_hard() {
+  awk '
+    /^  hard:[[:space:]]*$/ { active = 1; next }
+    active && /^  [a-zA-Z]/ { active = 0 }
+    active && /^    [a-zA-Z.]+:/ { key = $1; sub(/:$/, "", key); value = $2; gsub(/"/, "", value); print key " " value }
+  ' <<<"$1" | LC_ALL=C sort
+}
+
 network_policy_names_by_type() {
   local file="$1" wanted_type="$2"
   awk -v wanted_type="$wanted_type" '
@@ -734,6 +762,8 @@ validate_nchat_dev() {
   grep -q 'name: nchat-default-deny-ingress' "$application"
 
   [[ "$(network_policy_names_by_type "$application" Egress)" == "$(printf '%s\n' \
+    nchat-allow-admin-postgres-egress \
+    nchat-allow-auth-keycloak-egress \
     nchat-allow-auth-postgres-egress \
     nchat-allow-chat-data-egress \
     nchat-allow-dns-egress \
@@ -744,14 +774,17 @@ validate_nchat_dev() {
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
+    nchat-allow-search-postgres-egress \
     nchat-allow-seaweedfs-volume-egress \
     nchat-allow-upload-guard-file-egress \
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
   for policy_block in \
     nchat-allow-dns-egress nchat-allow-traefik-http nchat-allow-postgres \
-    nchat-allow-valkey nchat-allow-auth-postgres-egress nchat-allow-chat-data-egress \
+    nchat-allow-valkey nchat-allow-admin-postgres-egress nchat-allow-auth-postgres-egress \
+    nchat-allow-chat-data-egress \
     nchat-allow-notification-postgres-egress nchat-allow-migrations-postgres-egress \
-    nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress; do
+    nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress \
+    nchat-allow-search-postgres-egress; do
     grep -q 'ports:' <<<"$(yaml_document "$application" NetworkPolicy "$policy_block")"
   done
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-traefik-http)"
@@ -945,6 +978,85 @@ validate_nchat_dev() {
     grep -q "app.kubernetes.io/component: $component" "$application"
   done
 
+  # --- search-service runtime configuration (issue #601) ---------------------
+  #
+  # The overlay replaces the base container's envFrom wholesale, which is what
+  # silently removed the only source of AUTH_JWT_HMAC_SECRET and left the
+  # service refusing to start on its own config validation. Both credentials
+  # are therefore asserted as an exact set: a missing one is the regression
+  # that happened, and an extra one is a credential nobody decided to grant.
+  policy_block="$(yaml_document "$application" Deployment search-service)"
+  [[ -n "$policy_block" ]] || { echo "error: nchat-dev must render Deployment/search-service" >&2; return 1; }
+  if [[ "$(deployment_env_secret_refs "$policy_block")" != "$(printf '%s\n' \
+    'AUTH_JWT_HMAC_SECRET nchat-secrets/AUTH_JWT_HMAC_SECRET' \
+    'DATABASE_URL nchat-postgres-runtime/DATABASE_URL' | LC_ALL=C sort)" ]]; then
+    echo "error: search-service must read exactly DATABASE_URL from" >&2
+    echo "nchat-postgres-runtime and AUTH_JWT_HMAC_SECRET from nchat-secrets" >&2
+    return 1
+  fi
+  # And the non-secret half of the same environment, which the patch must keep.
+  if ! grep -A1 -F 'configMapRef:' <<<"$policy_block" | grep -Fq 'name: nchat-config'; then
+    echo "error: search-service must still receive nchat-config" >&2
+    return 1
+  fi
+
+  # DNS, in the aggregated policy rather than in a second one of its own:
+  # without it the startup database ping never leaves the pod.
+  if ! grep -Fq -- '- search' <<<"$(yaml_document "$application" NetworkPolicy nchat-allow-dns-egress)"; then
+    echo "error: nchat-allow-dns-egress must authorize the search component" >&2
+    return 1
+  fi
+  # Both halves of search -> postgres. The ingress rides the aggregated policy,
+  # already asserted above to be TCP/5432 and one origin selector only.
+  if ! grep -Fq -- '- search' <<<"$(yaml_document "$application" NetworkPolicy nchat-allow-postgres)"; then
+    echo "error: nchat-allow-postgres must admit the search component" >&2
+    return 1
+  fi
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-search-postgres-egress)"
+  [[ -n "$policy_block" ]] || {
+    echo "error: nchat-dev must render NetworkPolicy/nchat-allow-search-postgres-egress" >&2
+    return 1
+  }
+  grep -Fq 'app.kubernetes.io/component: search' <<<"$policy_block"
+  if [[ "$(network_policy_flows "$policy_block")" != 'egress postgres TCP/5432' ]]; then
+    echo "error: nchat-allow-search-postgres-egress must allow exactly search->postgres:5432/TCP" >&2
+    return 1
+  fi
+  if grep -Eq 'ipBlock:|namespaceSelector' <<<"$policy_block"; then
+    echo "error: nchat-allow-search-postgres-egress must select its destination by podSelector only" >&2
+    return 1
+  fi
+  # The negative that keeps the least-privilege claim honest: no policy that
+  # names a CIDR may select or admit search. The two rules that leave the
+  # cluster today are asserted individually above; this is what stops a third
+  # one from quietly picking search up.
+  if [[ -n "$(awk '
+      function emit() { if (kind == "NetworkPolicy" && cidr && search) print name }
+      /^---$/ { emit(); kind=""; name=""; cidr=0; search=0; next }
+      /^kind:/ { kind=$2 }
+      /^  name:/ && name=="" { name=$2 }
+      /cidr:/ { cidr=1 }
+      /(component: search|- search)$/ { search=1 }
+      END { emit() }
+    ' "$application")" ]]; then
+    echo "error: search must not appear in a NetworkPolicy that allows an ipBlock destination" >&2
+    return 1
+  fi
+
+  # --- rollout headroom (issue #601) -----------------------------------------
+  #
+  # A quota on limits counts every Pod's declared ceiling, surge replicas
+  # included, so limits.cpu deliberately exceeds the node's 8 vCPUs: it
+  # reserves nothing. requests are what the scheduler actually books and stay
+  # conservative. Asserted as an exact set so neither half drifts unreviewed.
+  if [[ "$(resource_quota_hard "$(yaml_document "$application" ResourceQuota nchat-dev-quota)")" \
+    != "$(printf '%s\n' \
+      'limits.cpu 16' 'limits.memory 24Gi' 'persistentvolumeclaims 8' 'pods 40' \
+      'requests.cpu 6' 'requests.memory 12Gi' 'requests.storage 110Gi' 'services 25' | LC_ALL=C sort)" ]]; then
+    echo "error: the nchat-dev ResourceQuota must keep the headroom validated in the cluster" >&2
+    return 1
+  fi
+
   validate_clamav "$application"
 }
 
@@ -954,11 +1066,23 @@ validate_nchat_dev() {
 # previous round asserted it inside the nchat-dev-server validator only — and
 # k3s-dev and k3s-staging shipped with the control off, which is precisely the
 # regression a per-environment assertion cannot catch.
+#
+# The expected value is a parameter because nchat-dev-server has RF-21
+# deliberately off for the MVP, and every other environment does not. It is
+# still an exact match against one literal, never "any value": the point of
+# asserting a control at all is that neither a typo nor a dropped key nor an
+# unannounced flip can pass, and that has to hold for the "false" as strictly
+# as it holds for the "true". An environment changes side here, in the caller,
+# where the change is one reviewable line — and the surrounding assertions
+# below (credentials never in a ConfigMap, the Secret still wired, the provider
+# still the right one) run identically for every overlay whatever the flag says,
+# because turning the feature off is not a reason to stop checking that the
+# thing it is turned off *in* is still wired correctly.
 validate_link_safety() {
-  local name="$1" rendered="$2" flag
+  local name="$1" rendered="$2" expected="$3" flag
   for flag in CHAT_LINK_SAFETY_ENABLED FILE_LINK_SAFETY_ENABLED; do
-    if [[ "$(grep -Fxc "  $flag: \"true\"" "$rendered")" -ne 1 ]]; then
-      echo "error: $flag must be exactly \"true\" in nchat-config for $name" >&2
+    if [[ "$(grep -Fxc "  $flag: \"$expected\"" "$rendered")" -ne 1 ]]; then
+      echo "error: $flag must be exactly \"$expected\" in nchat-config for $name" >&2
       return 1
     fi
   done
@@ -1010,10 +1134,18 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
   # say otherwise.
   for overlay in \
     infra/k8s/overlays/k3s-dev \
-    infra/k8s/overlays/k3s-staging \
-    infra/k8s/overlays/nchat-dev-server; do
-    validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}"
+    infra/k8s/overlays/k3s-staging; do
+    validate_link_safety "$overlay" "${rendered_by_overlay[$overlay]}" true
   done
+  # nchat-dev-server: RF-21 is temporarily off for the MVP because the
+  # Cloudflare URL Scanner's behaviour makes it operationally unfit to gate
+  # messages there. Asserted as "false" rather than left unasserted, so the
+  # decision keeps a home in CI and going back to "true" stays a one-line,
+  # reviewed change here instead of a quiet drift in an overlay.
+  validate_link_safety \
+    infra/k8s/overlays/nchat-dev-server \
+    "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
+    false
 fi
 
 echo "K8s manifests CI check passed."

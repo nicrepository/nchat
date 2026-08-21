@@ -25,12 +25,14 @@ import {
   fetchDirectProfile,
   fetchGroupDetails,
   fetchChannelMessage,
+  fetchChannelMessageSecuritySnapshots,
   fetchChannelMessages,
   fetchPins,
   fetchFavorites,
   fetchAllowedReactionEmojis,
   fetchChannels,
   fetchDMMessage,
+  fetchDMMessageSecuritySnapshots,
   fetchDMMessages,
   fetchDMs,
   fetchMentionCandidates,
@@ -43,6 +45,7 @@ import {
   pinMessage,
   postChannelMessage,
   postDMMessage,
+  reconcileMessageLinkSafety,
   resetAllowedReactionEmojisCache,
   resolveChannelMessageReferences,
   resolveDMMessageReferences,
@@ -53,6 +56,38 @@ import {
   unfavoriteMessage,
   unpinMessage,
 } from "./chatApi";
+
+describe("message link-safety reconciliation", () => {
+  it("returns the authoritative state version used for event ordering", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        link_safety_state: "safe",
+        updated_at: "2026-08-18T12:00:00Z",
+        retry_after_seconds: 60,
+      },
+    });
+
+    await expect(reconcileMessageLinkSafety("message 1")).resolves.toEqual({
+      state: "safe",
+      updatedAt: "2026-08-18T12:00:00Z",
+      retryAfterSeconds: 60,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/messages/message%201/link-safety/reconcile",
+      { method: "POST", signal: undefined },
+    );
+  });
+
+  it("rejects a response without an authoritative version", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { link_safety_state: "safe", retry_after_seconds: 60 },
+    });
+
+    await expect(reconcileMessageLinkSafety("message-1")).rejects.toThrow(
+      "invalid link-safety reconcile response",
+    );
+  });
+});
 
 describe("message reference batch resolution", () => {
   it("posts destination IDs once and maps authorized and unavailable references", async () => {
@@ -107,6 +142,80 @@ describe("message reference batch resolution", () => {
     expect(mockAuthFetch).toHaveBeenCalledWith(
       "/api/chat/dm/dm-1/message-references",
       expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+describe("message security snapshots", () => {
+  it("posts only message IDs and conservatively maps the security projection", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            message_id: "message-1",
+            available: true,
+            status: "active",
+            link_safety_state: "future-state",
+            updated_at: "2026-08-18T12:00:00Z",
+            quoted: {
+              message_id: "source-1",
+              status: "active",
+              link_safety_state: "malicious",
+              updated_at: "2026-08-18T11:00:00Z",
+            },
+          },
+          {
+            message_id: "ignored",
+            available: true,
+            status: "future-status",
+            link_safety_state: "safe",
+          },
+          { message_id: "missing", available: false },
+        ],
+      },
+    });
+    const signal = new AbortController().signal;
+
+    const snapshots = await fetchChannelMessageSecuritySnapshots(
+      "canal privado",
+      ["message-1"],
+      signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/message-security-snapshots",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ message_ids: ["message-1"] }),
+        signal,
+      }),
+    );
+    expect(snapshots).toEqual([
+      {
+        messageId: "message-1",
+        available: true,
+        status: "active",
+        linkSafetyState: "unknown",
+        updatedAt: "2026-08-18T12:00:00Z",
+        quoted: {
+          messageId: "source-1",
+          status: "active",
+          linkSafetyState: "malicious",
+          updatedAt: "2026-08-18T11:00:00Z",
+        },
+      },
+      { messageId: "missing", available: false },
+    ]);
+  });
+
+  it("uses the DM target without accepting URLs or scan identifiers", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { snapshots: [] } });
+    await fetchDMMessageSecuritySnapshots("dm-1", ["message-1"]);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/message-security-snapshots",
+      expect.objectContaining({
+        body: JSON.stringify({ message_ids: ["message-1"] }),
+      }),
     );
   });
 });
@@ -1071,6 +1180,8 @@ describe("fetchChannelMessages", () => {
       isRemoved: false,
       deletedAt: null,
       createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
     });
   });
 
@@ -1133,6 +1244,8 @@ describe("fetchChannelMessages", () => {
       bodyText: "<img src=x onerror=alert(1)>",
       bodyFormat: "v3",
       createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
     });
     expect(page.messages[1].reference).toEqual({ available: false });
   });
@@ -1206,6 +1319,8 @@ describe("fetchChannelMessages", () => {
       bodyText: "",
       bodyFormat: "v1",
       createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
     });
   });
 
@@ -1727,7 +1842,7 @@ describe("forwardChannelMessage", () => {
 });
 
 describe("fetchMentionCandidates", () => {
-  it("scopes the query to the current channel and maps both candidate types", async () => {
+  it("scopes the query to the current channel and maps user candidates", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
         users: [{ type: "user", id: "user-1", label: "Ana" }],
@@ -1741,10 +1856,22 @@ describe("fetchMentionCandidates", () => {
       expect.stringContaining("/channels/channel-1/mentions?q=an"),
       expect.objectContaining({ method: "GET" }),
     );
-    expect(candidates).toEqual([
-      { mentionType: "user", id: "user-1", label: "Ana" },
-      { mentionType: "channel", id: "channel-2", label: "anuncios" },
-    ]);
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+  });
+
+  it("drops channel candidates even when the backend still returns them — mentions are for people only", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        users: [{ type: "user", id: "user-1", label: "Ana" }],
+        channels: [{ type: "channel", id: "channel-2", label: "anuncios" }],
+      },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    // MentionCandidate no longer has a "channel" variant at all — this
+    // exhaustively proves nothing from res.data.channels leaked through.
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
   });
 
   it("fails safe to an empty list when the response shape is malformed", async () => {

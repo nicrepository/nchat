@@ -1,0 +1,365 @@
+.incoming-call,
+.global-call-indicator {
+  position: fixed;
+  z-index: 80;
+  color: var(--color-text, #f8fafc);
+  background: color-mix(in srgb, var(--color-surface, #111827) 94%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(18px);
+}
+
+/*
+ * Own opaque dark surface, independent of --color-surface/--color-text:
+ * the floating call renders as a sibling of ChatShell's light-theme surface
+ * tokens, but :root also defines --color-surface (#fff) for the auth pages,
+ * so the shared rule above silently resolved to a near-white background here.
+ */
+.floating-call {
+  position: fixed;
+  z-index: 80;
+  color: #f8fafc;
+  background: rgb(15 23 42 / 96%);
+  border: 1px solid rgb(255 255 255 / 16%);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(18px);
+}
+
+.incoming-call {
+  right: 1rem;
+  bottom: 1rem;
+  width: min(24rem, calc(100vw - 2rem));
+  padding: 1rem;
+  border-radius: 1rem;
+}
+.incoming-call__identity,
+.incoming-call__actions,
+.global-call-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.incoming-call__identity > div:last-child,
+.global-call-indicator > div {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.incoming-call__identity span,
+.global-call-indicator span {
+  color: var(--color-text-muted, #94a3b8);
+  font-size: 0.82rem;
+}
+.incoming-call__avatar {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #334155;
+  font-weight: 700;
+}
+.incoming-call__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.incoming-call__actions {
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+.incoming-call button,
+.global-call-indicator button {
+  min-height: 2.5rem;
+  padding: 0 0.85rem;
+  border: 0;
+  border-radius: 0.65rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.incoming-call__accept {
+  color: #052e16;
+  background: #86efac;
+}
+.incoming-call__reject {
+  color: #fff;
+  background: #be123c;
+}
+
+.floating-call {
+  top: 0;
+  left: 0;
+  width: min(22rem, calc(100vw - 2rem));
+  overflow: hidden;
+  border-radius: 1rem;
+  touch-action: none;
+}
+.floating-call__handle,
+.dedicated-call__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+.floating-call__handle {
+  cursor: grab;
+  user-select: none;
+}
+.floating-call__handle > div {
+  display: grid;
+}
+.floating-call__handle span[role="status"] {
+  color: var(--color-text-muted, #94a3b8);
+  font-size: 0.8rem;
+}
+.floating-call__handle button,
+.dedicated-call__header button {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  color: inherit;
+  background: rgb(255 255 255 / 14%);
+  cursor: pointer;
+}
+.floating-call__handle button:hover,
+.dedicated-call__header button:hover {
+  background: rgb(255 255 255 / 24%);
+}
+.floating-call__handle button:focus-visible,
+.dedicated-call__header button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.floating-call__stage {
+  position: relative;
+  display: grid;
+  min-height: 10rem;
+  place-items: center;
+  overflow: hidden;
+  background: #020617;
+}
+.floating-call__remote {
+  position: absolute;
+  inset: 0;
+}
+.floating-call__remote video,
+.floating-call__local video,
+.dedicated-call__media video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.floating-call__local {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  width: 5.5rem;
+  height: 4rem;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 30%);
+  border-radius: 0.55rem;
+  background: #1e293b;
+}
+.floating-call__stage > span {
+  position: relative;
+  z-index: 1;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  background: rgb(2 6 23 / 72%);
+  font-size: 0.76rem;
+}
+.floating-call__stage > span + span {
+  margin-top: 2.2rem;
+}
+.call-presentation__controls {
+  display: flex;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.75rem;
+}
+.call-presentation__control {
+  display: grid;
+  width: 2.65rem;
+  height: 2.65rem;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 26%);
+  border-radius: 50%;
+  color: #f8fafc;
+  background: rgb(255 255 255 / 16%);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+.call-presentation__control:hover:not(:disabled) {
+  background: rgb(255 255 255 / 26%);
+}
+.call-presentation__control:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.call-presentation__control[aria-pressed="false"] {
+  border-color: rgb(254 205 213 / 45%);
+  color: #fecdd3;
+  background: rgb(190 18 60 / 24%);
+}
+.call-presentation__control[aria-pressed="false"]:hover:not(:disabled) {
+  background: rgb(190 18 60 / 34%);
+}
+.call-presentation__control:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.call-presentation__control--danger {
+  color: #fff;
+  border-color: #be123c;
+  background: #be123c;
+}
+.call-presentation__control--danger:hover:not(:disabled) {
+  background: #9f1239;
+}
+.floating-call__activate {
+  display: block;
+  min-height: 2.5rem;
+  margin: 0 auto 0.65rem;
+  border: 0;
+  border-radius: 0.6rem;
+  padding: 0 0.8rem;
+  font-weight: 700;
+}
+.floating-call__recovery {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0 0.75rem 0.65rem;
+  font-size: 0.8rem;
+}
+
+.call-global-error {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 45;
+  max-width: min(24rem, calc(100vw - 2rem));
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-danger, #dc2626);
+  border-radius: 0.75rem;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #111827);
+  box-shadow: 0 0.75rem 2rem rgb(15 23 42 / 18%);
+}
+.global-call-indicator {
+  top: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(32rem, calc(100vw - 2rem));
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.85rem;
+}
+.global-call-indicator__pulse {
+  width: 0.65rem;
+  height: 0.65rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #22c55e;
+}
+.global-call-indicator > div {
+  flex: 1;
+}
+
+.dedicated-call {
+  display: grid;
+  min-height: 100dvh;
+  grid-template-rows: auto 1fr auto;
+  color: var(--color-text, #f8fafc);
+  background: #020617;
+}
+.dedicated-call--message {
+  place-items: center;
+}
+.dedicated-call__header span {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+.dedicated-call__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+.dedicated-call__tile {
+  position: relative;
+  display: grid;
+  min-height: 15rem;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 0.85rem;
+  background: #111827;
+}
+.dedicated-call__tile > span {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.35rem;
+  background: rgb(0 0 0 / 65%);
+}
+.dedicated-call__media {
+  position: absolute;
+  inset: 0;
+}
+.dedicated-call__avatar {
+  display: grid;
+  width: 4rem;
+  height: 4rem;
+  place-items: center;
+  border-radius: 50%;
+  background: #334155;
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+.dedicated-call footer {
+  position: sticky;
+  bottom: 0;
+  background: rgb(2 6 23 / 82%);
+  backdrop-filter: blur(16px);
+}
+
+@media (max-width: 720px) {
+  .floating-call {
+    top: auto !important;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    left: 0.5rem;
+    width: auto;
+    transform: none !important;
+    touch-action: auto;
+  }
+  .floating-call__handle {
+    cursor: default;
+  }
+  .floating-call__stage {
+    min-height: 7rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .incoming-call,
+  .floating-call,
+  .global-call-indicator,
+  .call-presentation__control {
+    scroll-behavior: auto;
+    transition: none;
+    animation: none;
+  }
+}

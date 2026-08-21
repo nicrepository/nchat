@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 // broadcastAuthTimeout caps the per-client authorization re-check during
@@ -291,6 +293,12 @@ type Hub struct {
 	callStartLimit  int
 	callStartWindow int
 
+	// typingStore is the Valkey ghost-state backstop; nil-safe (typing.go).
+	typingStore                  TypingStore
+	typingLimiter                TypingLimiter
+	typingRateLimitMaxActions    int
+	typingRateLimitWindowSeconds int
+
 	register        chan registerReq
 	unregister      chan *Client
 	subReq          chan subscribeReq
@@ -388,6 +396,11 @@ type Hub struct {
 	clientSubs                 map[string]map[string]struct{} // clientID → set of targetKey strings
 	subscriptionGenerations    map[string]map[string]uint64   // clientID → targetKey → generation
 	nextSubscriptionGeneration uint64
+	// typingActive tracks which targets each client is currently marked typing
+	// on, so a disconnect or a lost subscription can promptly broadcast
+	// typing.stop instead of waiting out typingTTL. clientID → set of
+	// targetKey strings.
+	typingActive map[string]map[string]struct{}
 }
 
 // NewHub creates a Hub and starts its background goroutine.
@@ -436,6 +449,7 @@ func NewHub(authorizer SubscriptionAuthorizer, logger *slog.Logger, bus Broadcas
 		subs:                    make(map[string]map[string]struct{}),
 		clientSubs:              make(map[string]map[string]struct{}),
 		subscriptionGenerations: make(map[string]map[string]uint64),
+		typingActive:            make(map[string]map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -832,6 +846,105 @@ func (h *Hub) PublishConversationAvailable(
 	}
 }
 
+// PublishMessageLinkSafetyChanged corrects a published message's link-safety
+// state for everyone who received it (issue #135).
+//
+// Routed by (workspace, target) on the ordinary broadcast path — the same routing
+// message.created used — because the audience is the same: the message was
+// delivered, so every subscriber holding it has to converge. That is the
+// difference from PublishMessageBlocked, which is addressed to one author because
+// its message was shown to nobody.
+//
+// Unlike message.created, the payload survives the bus. It can: a message id and
+// a closed-set enum are not user content, there is nothing here for a remote node
+// to have to re-fetch, and the receiving side re-validates the state against the
+// same closed set before delivering it — see canonicalizeLinkSafetyEvent. A
+// remote instance therefore cannot inject a state this version does not
+// understand, and in particular cannot invent one a client might read as a
+// clearance.
+//
+// The empty state is refused rather than published: "this message has nothing to
+// say about links" is not a correction, and announcing it would let a client
+// clear a warning on no evidence.
+func (h *Hub) PublishMessageLinkSafetyChanged(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID, state string, updatedAt time.Time,
+) {
+	if workspaceID == "" || targetID == "" || messageID == "" || !isKnownLinkSafetyState(state) || updatedAt.IsZero() {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageLinkSafetyChanged,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		LinkSafety:       &MessageLinkSafetyPayload{MessageID: messageID, State: state, UpdatedAt: updatedAt},
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.link_safety_changed event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		// Deliberately no message id and no state in the log line: the state is a
+		// security fact about a specific message, and an operational log is not
+		// where it belongs.
+		h.logger.WarnContext(ctx, "ws: message.link_safety_changed bus publish failed",
+			"target_type", string(targetType), "error", err)
+	}
+}
+
+// isKnownLinkSafetyState reports whether a state is one of the three this version
+// announces.
+//
+// An allowlist, and the empty state is deliberately outside it. Adding a value to
+// domain.MessageLinkSafety must not make it publishable — or relayable — until
+// somebody has decided what a client should do with it.
+func isKnownLinkSafetyState(state string) bool {
+	switch domain.MessageLinkSafety(state) {
+	case domain.MessageLinkSafetySafe,
+		domain.MessageLinkSafetyInconclusive,
+		domain.MessageLinkSafetyMalicious:
+		return true
+	default:
+		return false
+	}
+}
+
+// canonicalizeLinkSafetyEvent validates a link-safety change arriving over the
+// bus.
+//
+// Three things are checked, and each one closes a way a remote node could say
+// something this instance would otherwise relay unexamined: the block has to be
+// present, its message id has to be the envelope's own (so the routing key and the
+// payload cannot disagree about which message is being corrected), and the state
+// has to be one of the three known values.
+//
+// A failure drops the whole event rather than sanitising it. There is no safe
+// partial version of "this message's links changed status".
+func canonicalizeLinkSafetyEvent(evt Event) (Event, bool) {
+	if evt.LinkSafety == nil || evt.MessageID == "" {
+		return Event{}, false
+	}
+	if evt.LinkSafety.MessageID != evt.MessageID {
+		return Event{}, false
+	}
+	if !isKnownLinkSafetyState(evt.LinkSafety.State) {
+		return Event{}, false
+	}
+	if evt.LinkSafety.UpdatedAt.IsZero() {
+		return Event{}, false
+	}
+	return evt, true
+}
+
 // PublishMessageBlocked tells one author their message was refused (RF-21).
 //
 // Addressed to a single recipient, on the same mechanism conversation.available
@@ -841,16 +954,18 @@ func (h *Hub) PublishConversationAvailable(
 //
 // The payload is the message id and a fixed reason. No body, no URL, no scan id,
 // no provider response — the author needs to stop seeing "checking links…", and
-// nothing else about the verdict is theirs to receive.
-func (h *Hub) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID string) {
-	if workspaceID == "" || recipientUserID == "" || messageID == "" {
+// nothing else about the verdict is theirs to receive. reason must be one of
+// the MessageBlockedReason* constants; an empty or unrecognised value is a
+// caller bug, not something this method may paper over.
+func (h *Hub) PublishMessageBlocked(ctx context.Context, workspaceID, recipientUserID, messageID, reason string) {
+	if workspaceID == "" || recipientUserID == "" || messageID == "" || reason == "" {
 		return
 	}
 	evt := Event{
 		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageBlocked,
 		WorkspaceID: workspaceID, MessageID: messageID,
 		RecipientUserID:  recipientUserID,
-		Reason:           MessageBlockedReasonMaliciousLink,
+		Reason:           reason,
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
 	}
@@ -2331,8 +2446,20 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 			return Event{}, false
 		}
 	}
+	if evt.Type == EventTypeMessageLinkSafetyChanged {
+		evt, ok = canonicalizeLinkSafetyEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
 	if isCallEventType(evt.Type) {
 		evt, ok = canonicalizeCallEvent(evt)
+		if !ok {
+			return Event{}, false
+		}
+	}
+	if evt.Type == EventTypeTypingUpdated {
+		evt, ok = canonicalizeTypingEvent(evt)
 		if !ok {
 			return Event{}, false
 		}
@@ -2342,11 +2469,20 @@ func canonicalizeRemoteEvent(evt Event) (Event, bool) {
 	// them so remote nodes route by IDs only; clients fetch by ID if needed.
 	evt.Payload = nil
 	evt.MessageUpdate = nil
-	// A presence block belongs to exactly one event type. Anything else carrying
-	// one is relaying a state nobody asked it about, so it is dropped here rather
-	// than forwarded alongside an unrelated event.
+	// A presence/typing block belongs to exactly one event type each. Anything
+	// else carrying one is relaying a state nobody asked it about, so it is
+	// dropped here rather than forwarded alongside an unrelated event.
 	if evt.Type != EventTypePresenceUpdated {
 		evt.Presence = nil
+	}
+	// Same rule as the presence block: a link-safety correction belongs to exactly
+	// one event type, and anything else carrying one is relaying a security state
+	// nobody asked it about.
+	if evt.Type != EventTypeMessageLinkSafetyChanged {
+		evt.LinkSafety = nil
+	}
+	if evt.Type != EventTypeTypingUpdated {
+		evt.Typing = nil
 	}
 
 	return evt, true
@@ -2366,10 +2502,10 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageBlocked,
+	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
-		EventTypePresenceUpdated,
+		EventTypePresenceUpdated, EventTypeTypingUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
 		// OK
@@ -2455,10 +2591,10 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 	// in the target, not about a message, and an attachment can outlive the
 	// message that carried it.
 	//
-	// presence.updated is about a person in the target rather than about
-	// anything in it, so it names no message either.
+	// presence.updated and typing.updated are both about a person in the target
+	// rather than about anything in it, so neither names a message either.
 	if evt.Type == EventTypeMembersAdded || evt.Type == EventTypeAttachmentStatus ||
-		evt.Type == EventTypePresenceUpdated {
+		evt.Type == EventTypePresenceUpdated || evt.Type == EventTypeTypingUpdated {
 		if evt.MessageID != "" {
 			return Event{}, false
 		}
@@ -2705,12 +2841,18 @@ func (h *Hub) dropClient(c *Client) {
 	// cover the difference is what made presence outlive both the subscription and
 	// the membership that justified it.
 	keys := h.clientSubscriptionKeys(c)
+	typingKeys := h.clientTypingKeys(c)
 
 	removed := h.removeClient(c)
 	if removed == nil {
 		return
 	}
 	removed.close()
+
+	// Broadcast typing.stop for anything this connection was still asserting,
+	// rather than waiting out typingTTL — the common case of an orderly
+	// disconnect should clear peers' indicators immediately.
+	h.stopAllTyping(context.Background(), removed, typingKeys)
 
 	if h.presence == nil {
 		return
@@ -2781,6 +2923,7 @@ func (h *Hub) removeClient(c *Client) *Client {
 	}
 	delete(h.clientSubs, c.id)
 	delete(h.subscriptionGenerations, c.id)
+	delete(h.typingActive, c.id)
 	return removed
 }
 
@@ -2797,6 +2940,7 @@ func (h *Hub) clearClients() []*Client {
 	h.subs = make(map[string]map[string]struct{})
 	h.clientSubs = make(map[string]map[string]struct{})
 	h.subscriptionGenerations = make(map[string]map[string]uint64)
+	h.typingActive = make(map[string]map[string]struct{})
 	return clients
 }
 
@@ -3013,8 +3157,13 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		}
 		return nil
 	case ClientMessageTypeCallStart, ClientMessageTypeCallAccept, ClientMessageTypeCallDecline,
-		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallSync:
+		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallLeave,
+		ClientMessageTypeCallSync, ClientMessageTypeCallPresence:
 		return h.handleCallMessage(ctx, c, msg)
+	case ClientMessageTypeTypingStart:
+		return h.handleTypingStart(ctx, c, msg)
+	case ClientMessageTypeTypingStop:
+		return h.handleTypingStop(ctx, c, msg)
 	default:
 		return fmt.Errorf("ws: unknown client message type %q", msg.Type)
 	}
@@ -3082,11 +3231,14 @@ func (h *Hub) broadcastSnapshot(key string) []broadcastSubscription {
 func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	orphaned := false
 	reconcile := false
-	// All three run after h.mu is released: forget what reconciliation last sent a
+	stoppedTyping := false
+	// All four run after h.mu is released: forget what reconciliation last sent a
 	// target nobody watches here any more; withdraw the directory assertion if
-	// this was the last local cover for it; and, if the subject has stopped
-	// covering a target other people here are still watching, rebuild that
-	// target's roster so they stop being shown someone who left it.
+	// this was the last local cover for it; if the subject has stopped covering
+	// a target other people here are still watching, rebuild that target's
+	// roster so they stop being shown someone who left it; and if the client
+	// was mid-typing on this target, broadcast the stop now rather than
+	// leaving peers to wait out typingTTL.
 	defer func() {
 		if orphaned {
 			h.forgetReconciledTarget(key)
@@ -3094,6 +3246,9 @@ func (h *Hub) revokeSubscription(client *Client, key string) bool {
 		if reconcile {
 			h.reconcileAssertions(client.workspaceID, client.userID)
 			h.reconcileLostCoverage(client.workspaceID, client.userID, []string{key})
+		}
+		if stoppedTyping {
+			h.finishTypingStop(context.Background(), client, key)
 		}
 	}()
 
@@ -3116,6 +3271,15 @@ func (h *Hub) revokeSubscription(client *Client, key string) bool {
 	}
 	if generations, ok := h.subscriptionGenerations[client.id]; ok {
 		delete(generations, key)
+	}
+	if targets, ok := h.typingActive[client.id]; ok {
+		if _, typing := targets[key]; typing {
+			delete(targets, key)
+			if len(targets) == 0 {
+				delete(h.typingActive, client.id)
+			}
+			stoppedTyping = true
+		}
 	}
 	reconcile = true
 	return true

@@ -1,21 +1,22 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes, useOutletContext } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
-import { issueCallToken } from "./callApi";
+import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData } from "./chatApi";
-import ChatShell from "./ChatShell";
+import ChatShell, { type ChatOutletContext } from "./ChatShell";
+import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
-import { requestMediaPermission } from "./mediaPermission";
+import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
 import { useCallMedia } from "./useCallMedia";
 
 vi.mock("./chatApi", async () => {
   const actual = await vi.importActual<typeof import("./chatApi")>("./chatApi");
   return { ...actual, fetchSidebarData: vi.fn() };
 });
-vi.mock("./callApi", () => ({ issueCallToken: vi.fn() }));
+vi.mock("./callApi", () => ({ issueCallToken: vi.fn(), issueResourceCallToken: vi.fn() }));
 vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: vi.fn() }));
 vi.mock("./useCallMedia", () => ({ useCallMedia: vi.fn() }));
 vi.mock("./mediaPermission", () => ({ requestMediaPermission: vi.fn() }));
@@ -38,6 +39,34 @@ class FakeWebSocket {
 
   send(data: string) {
     this.sentMessages.push(data);
+    const message = JSON.parse(data) as Record<string, unknown>;
+    // Auto-acks call.leave the way chat-service does: a direct reply to the
+    // sender alone (see call_protocol.go's sendCallToClient). The RF-23 x
+    // RF-24 arbitration suite below drives useResourceCallSession.leave()
+    // for real (issue #569) and needs this to settle for the handoff to
+    // proceed; its exact status is irrelevant to those tests, only that
+    // leave() resolves.
+    if (message.type === "call.leave" && typeof message.call_id === "string") {
+      const callID = message.call_id;
+      queueMicrotask(() => {
+        this.simulateMessage({
+          type: "call.ended",
+          event_id: `call-leave-ack-${callID}`,
+          target_type: "channel",
+          target_id: "chan-1",
+          call: {
+            ...call,
+            call_id: callID,
+            caller_id: currentUserId,
+            callee_id: "",
+            target_type: "channel",
+            target_id: "chan-1",
+            call_type: "audio",
+            status: "ended",
+          },
+        });
+      });
+    }
   }
 
   close() {
@@ -80,6 +109,7 @@ const call = {
 
 const prepareMedia = vi.fn(async () => undefined);
 const connectMedia = vi.fn(async () => undefined);
+const stopMedia = vi.fn(async () => undefined);
 const OriginalWebSocket = global.WebSocket;
 
 beforeEach(() => {
@@ -87,11 +117,25 @@ beforeEach(() => {
   _resetChatSocket(() => 0);
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   setTokens("test-token");
+  // This file uses the REAL createOwnershipCoordinator (never mocked), which
+  // persists ParticipationToken generations to real localStorage — issue
+  // #594 adversarial follow-up, round 3's fix now makes ChatShell's own
+  // join button actually allocate one. Without this, generations accumulate
+  // across tests in this file (all sharing jsdom's one localStorage) instead
+  // of each test starting from a clean, predictable floor.
+  localStorage.clear();
   prepareMedia.mockClear();
   connectMedia.mockClear();
+  stopMedia.mockClear();
   vi.mocked(issueCallToken).mockReset();
   vi.mocked(issueCallToken).mockResolvedValue({
     token: "media-token",
+    expiresAt: "2026-08-03T12:05:00Z",
+    serverUrl: "wss://livekit-dev.nic-labs.com",
+  });
+  vi.mocked(issueResourceCallToken).mockReset();
+  vi.mocked(issueResourceCallToken).mockResolvedValue({
+    token: "resource-token",
     expiresAt: "2026-08-03T12:05:00Z",
     serverUrl: "wss://livekit-dev.nic-labs.com",
   });
@@ -109,15 +153,21 @@ beforeEach(() => {
     audioActivationRequired: false,
     error: null,
     pendingControl: null,
+    activeSpeakerId: null,
+    screenShareEnabled: false,
+    remoteScreenShare: null,
     bindLocalMedia: vi.fn(),
     bindRemoteMedia: vi.fn(),
+    participants: [],
+    bindRemoteAudio: vi.fn(),
     toggleMicrophone: vi.fn(async () => undefined),
     toggleCamera: vi.fn(async () => undefined),
+    toggleScreenShare: vi.fn(async () => undefined),
     activateAudio: vi.fn(async () => undefined),
     prepare: prepareMedia,
     startAudio: vi.fn(async () => undefined),
     connect: connectMedia,
-    stop: vi.fn(async () => undefined),
+    stop: stopMedia,
   });
 });
 
@@ -135,7 +185,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -151,9 +203,9 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
+    const dialog = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
-    expect(screen.queryByRole("button", { name: "Atender" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Atender com câmera" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(prepareMedia).not.toHaveBeenCalled();
@@ -176,7 +228,7 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
     expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -196,7 +248,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -213,22 +267,23 @@ describe("ChatShell call identity bootstrap", () => {
     );
     await act(async () => initialSidebar.reject(new Error("offline")));
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
+    const dialog = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(within(dialog).getByRole("alert")).toHaveTextContent(
       "Não foi possível preparar a chamada",
     );
     const retry = within(dialog).getByRole("button", { name: "Tentar novamente" });
-    expect(retry).toHaveFocus();
-    await user.keyboard("{Enter}");
+    expect(retry).not.toHaveFocus();
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(retry).toBeDisabled();
-    await user.keyboard("{Enter}");
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(prepareMedia).not.toHaveBeenCalled();
 
     await act(async () => failedRetry.reject(new Error("still offline")));
-    expect(retry).toBeEnabled();
-    await user.keyboard("{Enter}");
+    const retryAgain = within(dialog).getByRole("button", { name: "Tentar novamente" });
+    expect(retryAgain).toBeEnabled();
+    await user.click(retryAgain);
     expect(fetchSidebarData).toHaveBeenCalledTimes(3);
     expect(retry).toBeDisabled();
 
@@ -249,7 +304,7 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender" })).toHaveFocus();
+    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
     expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -269,7 +324,9 @@ describe("ChatShell call identity bootstrap", () => {
 
     render(
       <MemoryRouter initialEntries={["/chat"]}>
-        <ChatShell />
+        <CallSessionProvider>
+          <ChatShell />
+        </CallSessionProvider>
       </MemoryRouter>,
     );
 
@@ -285,25 +342,23 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialog = screen.getByRole("dialog", { name: "Chamada de vídeo com Participante" });
-    expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
-    expect(
-      within(dialog).queryByRole("button", { name: "Encerrar chamada" }),
-    ).not.toBeInTheDocument();
+    const dialog = screen.getByTestId("floating-call-window");
+    expect(within(dialog).getByText("Preparando chamada…")).toBeInTheDocument();
     expect(issueCallToken).not.toHaveBeenCalled();
     expect(connectMedia).not.toHaveBeenCalled();
 
     await act(async () => initialSidebar.reject(new Error("offline")));
     const retry = within(dialog).getByRole("button", { name: "Tentar novamente" });
-    expect(retry).toHaveFocus();
-    await user.keyboard("{Enter}");
-    await user.keyboard("{Enter}");
+    expect(retry).not.toHaveFocus();
+    await user.click(retry);
+    await user.click(retry);
     expect(fetchSidebarData).toHaveBeenCalledTimes(2);
     expect(issueCallToken).not.toHaveBeenCalled();
 
     await act(async () => failedRetry.reject(new Error("still offline")));
-    expect(retry).toBeEnabled();
-    await user.keyboard("{Enter}");
+    const retryAgain = within(dialog).getByRole("button", { name: "Tentar novamente" });
+    expect(retryAgain).toBeEnabled();
+    await user.click(retryAgain);
     expect(fetchSidebarData).toHaveBeenCalledTimes(3);
 
     await act(async () =>
@@ -323,11 +378,9 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    const dialogAfterRecovery = await screen.findByRole("dialog", {
-      name: "Chamada de vídeo com Ana Lima",
-    });
+    const dialogAfterRecovery = await screen.findByLabelText("Chamada com Ana Lima");
     expect(dialogAfterRecovery).toBeVisible();
-    expect(screen.getByRole("button", { name: "Encerrar chamada" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Encerrar chamada" })).not.toHaveFocus();
 
     // This call reached "active" via a raw push, never through this hook's
     // own start()/accept() preflight, so RF-23 requires an explicit gesture
@@ -351,3 +404,560 @@ function syncCommands(socket: FakeWebSocket) {
     .map((message) => JSON.parse(message) as { type: string })
     .filter((message) => message.type === "call.sync");
 }
+
+function declineCommands(socket: FakeWebSocket) {
+  return socket.sentMessages
+    .map((message) => JSON.parse(message) as { type: string; call_id?: string })
+    .filter((message) => message.type === "call.decline");
+}
+
+// ── RF-24 code review achado 3: RF-23 x RF-24 arbitration ───────────────────
+
+function JoinChannelButton() {
+  const ctx = useOutletContext<ChatOutletContext>();
+  return (
+    <button
+      type="button"
+      disabled={!ctx.joinResourceCall}
+      onClick={() => ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral" })}
+    >
+      Entrar no canal
+    </button>
+  );
+}
+
+async function renderWithJoinButtonReady() {
+  vi.mocked(fetchSidebarData).mockResolvedValue({
+    currentUserId,
+    channels: [{ id: "chan-1", name: "Geral", type: "public", canWrite: true }],
+    dms: [
+      {
+        id: "00000000-0000-4000-8000-000000000406",
+        type: "1:1",
+        name: "Ana Lima",
+        participants: [],
+        counterpart: { userId: callerId, displayName: "Ana Lima" },
+      },
+    ],
+    categories: [],
+  });
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <Routes>
+        <Route
+          path="/chat"
+          element={
+            <CallSessionProvider>
+              <ChatShell />
+            </CallSessionProvider>
+          }
+        >
+          <Route index element={<JoinChannelButton />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+  const socket = FakeWebSocket.instances[0];
+  await act(async () => socket.simulateOpen());
+  await screen.findByRole("button", { name: "Entrar no canal" });
+  return socket;
+}
+
+async function joinResource(user: ReturnType<typeof userEvent.setup>, socket: FakeWebSocket) {
+  await user.click(screen.getByRole("button", { name: "Entrar no canal" }));
+  let requestID = "";
+  await waitFor(() => {
+    const command = socket.sentMessages
+      .map((message) => JSON.parse(message) as { type: string; request_id?: string })
+      .find((message) => message.type === "call.start" && message.request_id);
+    expect(command).toBeDefined();
+    requestID = command!.request_id!;
+  });
+  act(() =>
+    socket.simulateMessage({
+      type: "call.accepted",
+      event_id: crypto.randomUUID(),
+      target_type: "channel",
+      target_id: "chan-1",
+      call: {
+        ...call,
+        call_id: "00000000-0000-4000-8000-000000000550",
+        request_id: requestID,
+        caller_id: currentUserId,
+        callee_id: "",
+        target_type: "channel",
+        target_id: "chan-1",
+        call_type: "audio",
+        status: "active",
+      },
+    }),
+  );
+}
+
+describe("ChatShell RF-23 x RF-24 arbitration", () => {
+  it("Caso A: an incoming RF-23 call stays visible and can be declined while a resource room is active", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+
+    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Recusar" }));
+
+    await waitFor(() =>
+      expect(declineCommands(socket)).toContainEqual({
+        type: "call.decline",
+        call_id: call.call_id,
+      }),
+    );
+    // The decline must never tear down the active resource room's media:
+    // stop() only ever ran for the resource room's own join, never again.
+    expect(stopMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("achado A: accept() that never manages to send (preflight stuck open) leaves RF-24 completely untouched", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+
+    // The permission prompt never resolves: call.accept is never sent, so
+    // RF-23 never reaches "active" and never asks for the Room.
+    let resolvePermission!: (value: MediaPermissionResult) => void;
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePermission = resolve;
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+
+    expect(syncCommands(socket)).toHaveLength(1); // only the initial call.sync
+    expect(stopMedia).not.toHaveBeenCalled();
+    expect(connectMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+    // Cleanup: let the pending preflight resolve so the test doesn't leak a
+    // dangling promise/timer into the next test.
+    await act(async () => resolvePermission({ ok: true }));
+  });
+
+  it("achado B: a denied permission preflight leaves RF-24 active and never calls stop", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    vi.mocked(requestMediaPermission).mockResolvedValueOnce({
+      ok: false,
+      kind: "permission_denied",
+      message: "Permissão negada.",
+    });
+
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
+    expect(syncCommands(socket)).toHaveLength(1);
+    expect(stopMedia).not.toHaveBeenCalled();
+    expect(connectMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("achado C: accepting only hands the Room to RF-23 once the server confirms active, never on the local accept() call alone", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+
+    // The command was accepted locally (preflight granted, call.accept sent)
+    // but the server has not confirmed "active" yet: RF-24 must still be
+    // intact at this point.
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
+    expect(stopMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.accepted",
+        event_id: "00000000-0000-4000-8000-000000000407",
+        target_type: "user",
+        target_id: currentUserId,
+        call: { ...call, status: "active", version: 2, accepted_at: call.occurred_at },
+      }),
+    );
+
+    // leave() calls the real, unguarded media.stop() directly — this is the
+    // ownership handoff, distinct from the guarded stop() RF-23 itself uses.
+    await waitFor(() => expect(stopMedia).toHaveBeenCalledOnce());
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+  });
+
+  it("achado D: resource cleanup resolves before the direct call's media.connect() runs, never after", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
+
+    let resolveStop!: () => void;
+    stopMedia.mockReturnValueOnce(
+      new Promise<undefined>((resolve) => {
+        resolveStop = () => resolve(undefined);
+      }),
+    );
+    act(() =>
+      socket.simulateMessage({
+        type: "call.accepted",
+        event_id: "00000000-0000-4000-8000-000000000407",
+        target_type: "user",
+        target_id: currentUserId,
+        call: { ...call, status: "active", version: 2, accepted_at: call.occurred_at },
+      }),
+    );
+
+    await waitFor(() => expect(stopMedia).toHaveBeenCalledOnce());
+    // stop() is still pending: connect() must not have run yet.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(connectMedia).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveStop();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+  });
+
+  it("achado 3 (round 2): Recusar stays enabled and sends call.decline with the right call_id while Atender's preflight is still pending", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+
+    let resolvePermission!: (value: MediaPermissionResult) => void;
+    vi.mocked(requestMediaPermission).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePermission = resolve;
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
+
+    const recusar = screen.getByRole("button", { name: "Recusar" });
+    expect(recusar).toBeEnabled();
+    await user.click(recusar);
+
+    expect(declineCommands(socket)).toContainEqual({
+      type: "call.decline",
+      call_id: call.call_id,
+    });
+    expect(stopMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+
+    // Cleanup: resolve the stale preflight so it doesn't leak into later tests.
+    await act(async () => resolvePermission({ ok: true }));
+  });
+
+  it("shows the RF-23 dialog immediately once the call is confirmed active, even while its own token request is still pending", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
+
+    const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
+    vi.mocked(issueCallToken).mockReturnValueOnce(token.promise);
+    act(() =>
+      socket.simulateMessage({
+        type: "call.accepted",
+        event_id: "00000000-0000-4000-8000-000000000407",
+        target_type: "user",
+        target_id: currentUserId,
+        call: { ...call, status: "active", version: 2, accepted_at: call.occurred_at },
+      }),
+    );
+
+    await waitFor(() => expect(stopMedia).toHaveBeenCalledOnce());
+    // The token request hasn't resolved yet — RF-23 must already be showing,
+    // never hidden behind the resource room while its own media is pending.
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Chamada com Ana Lima")).toBeInTheDocument();
+    expect(connectMedia).not.toHaveBeenCalled();
+
+    await act(async () => {
+      token.resolve({
+        token: "media-token",
+        expiresAt: "2026-08-03T12:05:00Z",
+        serverUrl: "wss://livekit-dev.nic-labs.com",
+      });
+      await token.promise;
+    });
+
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+  });
+
+  it("keeps the RF-23 dialog visible with a recoverable error when the handoff's RF-24 cleanup fails, never falling back to the resource room", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+    connectMedia.mockClear();
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+    await screen.findByRole("button", { name: "Atender com câmera" });
+    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
+
+    stopMedia.mockRejectedValueOnce(new Error("cleanup failed"));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.accepted",
+        event_id: "00000000-0000-4000-8000-000000000407",
+        target_type: "user",
+        target_id: currentUserId,
+        call: { ...call, status: "active", version: 2, accepted_at: call.occurred_at },
+      }),
+    );
+
+    await waitFor(() => expect(stopMedia).toHaveBeenCalledOnce());
+    vi.mocked(issueCallToken).mockClear();
+    expect(issueCallToken).not.toHaveBeenCalled();
+    expect(connectMedia).not.toHaveBeenCalled();
+    // RF-23 stays visible and recoverable — never silently reverts to RF-24
+    // just because the room it was trying to take over never actually left.
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Chamada com Ana Lima")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("floating-call-window")).getByRole("alert"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("Caso C: joining a resource room stays unavailable while a direct call is ringing/active", async () => {
+    const socket = await renderWithJoinButtonReady();
+    act(() =>
+      socket.simulateMessage({
+        type: "call.ringing",
+        event_id: "00000000-0000-4000-8000-000000000405",
+        target_type: "user",
+        target_id: currentUserId,
+        call,
+      }),
+    );
+
+    expect(await screen.findByRole("button", { name: "Entrar no canal" })).toBeDisabled();
+  });
+});
+
+// ── issue #594 adversarial follow-up, round 3: ChatShell's own fresh-join
+// button (target.callId undefined — the server decides/reuses the call_id)
+// is the primary real-world entry point for this bug, and previously called
+// resourceCall.join() directly, bypassing BOTH the causal race protection
+// AND beginResourceParticipation — meaning a join through this exact button
+// never registered a ParticipationToken or broadcast "participating" at
+// all. Drives the REAL CallSessionProvider/ownership coordinator end to
+// end, including a genuine second BroadcastChannel instance standing in for
+// another tab, since this file deliberately never mocks callOwnership.ts. ──
+
+describe("ChatShell RF-24 fresh join — issue #594 adversarial follow-up (round 3)", () => {
+  it("joins through the protected mechanism: registers a real ParticipationToken (previously never happened at all), and an old 'left' for the call_id the server reuses never aborts the in-flight join", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    const reusedCallId = "00000000-0000-4000-8000-000000000550";
+    const otherWriterId = "00000000-0000-4000-8000-000000009001";
+    // Seeds the SAME shared, per-writer storage allocateParticipationGeneration
+    // itself reads (issue #570 follow-up design) — mirrors what the OLD
+    // participation's own real allocateParticipationGeneration() call would
+    // already have written. Without this, the fresh join's own real
+    // allocation (which reads this SAME storage) would independently also
+    // land on generation 1, and the writerId tie-break in
+    // compareParticipationTokens could go either way — never a realistic
+    // simulation of "the storage already has a real, older generation on
+    // record".
+    localStorage.setItem(
+      `nchat.call.participation.v2.${encodeURIComponent(reusedCallId)}:${otherWriterId}`,
+      JSON.stringify({ v: 2, generation: 1 }),
+    );
+
+    let resolveConnect!: () => void;
+    connectMedia.mockReturnValueOnce(
+      new Promise<undefined>((resolve) => {
+        resolveConnect = () => resolve(undefined);
+      }),
+    );
+
+    const otherTab = new BroadcastChannel("nchat-call-ownership-v1");
+    const receivedFromProvider: Array<Record<string, unknown>> = [];
+    otherTab.onmessage = (event: MessageEvent) => {
+      receivedFromProvider.push(event.data as Record<string, unknown>);
+    };
+    try {
+      // Click through call.start -> call.accepted: target.callId was
+      // undefined at the click, and is only now, synchronously inside
+      // join(), resolved to reusedCallId — issueResourceCallToken (mocked)
+      // resolves immediately after, leaving media.connect() as the one
+      // genuinely still-pending step. Waiting for connectMedia's own call
+      // (not just joinResource()'s return) is what makes this deterministic
+      // — it can only have been reached after onCallIdResolved already ran.
+      // (resource-call-panel itself is not a useful "still connecting"
+      // signal here: it shows as soon as callId resolves, well before
+      // media.connect() itself settles.)
+      await joinResource(user, socket);
+      await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+
+      // An OLD participation for this EXACT call_id — the server reused it
+      // for a brand-new join, exactly the scenario the ordering guard
+      // cannot yet know differs from "the same one" — genuinely ended in
+      // another tab. Its "left" (generation 1) arrives now, posted on a
+      // real second BroadcastChannel instance the same way another tab's
+      // coordinator would.
+      act(() => {
+        otherTab.postMessage({
+          v: 1,
+          type: "left",
+          callId: reusedCallId,
+          tabId: otherWriterId,
+          epoch: 3,
+          generation: 1,
+          writerId: otherWriterId,
+          sequence: 1,
+        });
+      });
+      // Real BroadcastChannel dispatch is a genuine task, not a microtask —
+      // let it actually run.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      // The in-flight join must not have been aborted by it: letting
+      // media.connect() finally resolve still reaches "active" and shows
+      // the panel — an aborted attempt would instead leave resource.status
+      // stuck at "idle" (convergeRemoteLeave) with nothing left to await.
+      resolveConnect();
+      expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+
+      // The new participation is registered for real — generation 2, since
+      // the shared storage already recorded generation 1 for this call_id
+      // (issue #594 adversarial follow-up: was NEVER broadcast at all
+      // before this fix, since resourceCall.join() bypassed
+      // beginResourceParticipation entirely).
+      await waitFor(() =>
+        expect(receivedFromProvider).toContainEqual(
+          expect.objectContaining({
+            type: "participating",
+            callId: reusedCallId,
+            generation: 2,
+            sequence: 0,
+          }),
+        ),
+      );
+    } finally {
+      otherTab.close();
+    }
+  });
+});

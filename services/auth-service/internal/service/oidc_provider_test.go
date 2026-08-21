@@ -20,6 +20,11 @@ import (
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
 
+// testProviderRedirectURL is the callback URI these tests hand the provider.
+// Since issue #578 the redirect is a per-request parameter rather than provider
+// configuration, because one deployment serves two origins.
+const testProviderRedirectURL = "https://auth.example.com/api/auth/oidc/keycloak/callback"
+
 func TestKeycloakProvider_ValidateIDTokenRejectsInvalidClaimsAndAlgorithm(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -53,11 +58,10 @@ func TestKeycloakProvider_ValidateIDTokenRejectsInvalidClaimsAndAlgorithm(t *tes
 	defer server.Close()
 
 	provider := NewKeycloakProvider(KeycloakProviderConfig{
-		IssuerURL:   server.URL,
-		ClientID:    "nchat-web",
-		RedirectURL: "https://auth.example.com/callback",
-		Scopes:      "openid email profile",
-		HTTPClient:  server.Client(),
+		IssuerURL:  server.URL,
+		ClientID:   "nchat-web",
+		Scopes:     "openid email profile",
+		HTTPClient: server.Client(),
 	})
 
 	now := time.Now()
@@ -322,12 +326,11 @@ func TestKeycloakProvider_AuthorizationURLAndExchangeCode(t *testing.T) {
 		IssuerURL:    server.URL,
 		ClientID:     "nchat-web",
 		ClientSecret: "client-secret",
-		RedirectURL:  "https://auth.example.com/auth/oidc/keycloak/callback",
 		Scopes:       "openid email profile",
 		HTTPClient:   server.Client(),
 	})
 
-	location, err := provider.AuthorizationURL("state", "nonce", "challenge")
+	location, err := provider.AuthorizationURL(AuthorizationRequest{State: "state", Nonce: "nonce", CodeChallenge: "challenge", RedirectURL: testProviderRedirectURL})
 	if err != nil {
 		t.Fatalf("AuthorizationURL: %v", err)
 	}
@@ -339,7 +342,7 @@ func TestKeycloakProvider_AuthorizationURLAndExchangeCode(t *testing.T) {
 		t.Fatalf("unexpected auth URL: %s", location)
 	}
 
-	set, err := provider.ExchangeCode(context.Background(), "provider-code", "pkce-verifier")
+	set, err := provider.ExchangeCode(context.Background(), "provider-code", "pkce-verifier", testProviderRedirectURL)
 	if err != nil {
 		t.Fatalf("ExchangeCode: %v", err)
 	}
@@ -374,8 +377,8 @@ func TestKeycloakProvider_ExchangeCodeRejectsProviderErrorAndMissingIDToken(t *t
 				}
 			}))
 			defer server.Close()
-			provider := NewKeycloakProvider(KeycloakProviderConfig{IssuerURL: server.URL, ClientID: "nchat-web", ClientSecret: "client-secret", RedirectURL: "https://auth.example.com/callback", Scopes: "openid", HTTPClient: server.Client()})
-			if _, err := provider.ExchangeCode(context.Background(), "code", "verifier"); err == nil {
+			provider := NewKeycloakProvider(KeycloakProviderConfig{IssuerURL: server.URL, ClientID: "nchat-web", ClientSecret: "client-secret", Scopes: "openid", HTTPClient: server.Client()})
+			if _, err := provider.ExchangeCode(context.Background(), "code", "verifier", testProviderRedirectURL); err == nil {
 				t.Fatal("expected exchange error")
 			}
 		})
@@ -388,8 +391,8 @@ func TestKeycloakProvider_AuthorizationURLRejectsBadDiscovery(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewKeycloakProvider(KeycloakProviderConfig{IssuerURL: server.URL, ClientID: "nchat-web", RedirectURL: "https://auth.example.com/callback", Scopes: "openid", HTTPClient: server.Client()})
-	if _, err := provider.AuthorizationURL("state", "nonce", "challenge"); err == nil {
+	provider := NewKeycloakProvider(KeycloakProviderConfig{IssuerURL: server.URL, ClientID: "nchat-web", Scopes: "openid", HTTPClient: server.Client()})
+	if _, err := provider.AuthorizationURL(AuthorizationRequest{State: "state", Nonce: "nonce", CodeChallenge: "challenge", RedirectURL: testProviderRedirectURL}); err == nil {
 		t.Fatal("expected authorization URL error")
 	}
 }

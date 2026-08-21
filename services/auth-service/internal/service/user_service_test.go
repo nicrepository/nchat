@@ -56,6 +56,14 @@ func (f *fakeStore) GetSelfProfile(_ context.Context, _ string) (domain.SelfProf
 	return domain.SelfProfile{}, nil
 }
 
+func (f *fakeStore) UpdateDisplayName(_ context.Context, _, _ string) (domain.SelfProfile, error) {
+	return domain.SelfProfile{}, nil
+}
+
+func (f *fakeStore) UpdateProfileFields(_ context.Context, _ string, _, _, _, _ *string) (domain.SelfProfile, error) {
+	return domain.SelfProfile{}, nil
+}
+
 func (f *fakeStore) ListWorkspaceUsers(_ context.Context, workspaceID string, limit int, afterUserID string) ([]domain.WorkspaceUser, error) {
 	f.gotWorkspaceID = workspaceID
 	f.gotLimit = limit
@@ -314,6 +322,344 @@ func TestUserService_GetProfile_PropagatesError(t *testing.T) {
 	store := &profileStore{err: domain.ErrNotFound}
 	svc := service.NewUserService(store)
 	if _, err := svc.GetProfile(context.Background(), "u1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// ── UpdateDisplayName (ID 7 — cronograma 19/08) ─────────────────────────────
+
+// updateDisplayNameStore records what the service passed to the store, so
+// tests can assert validation happens before storage is ever reached, and
+// that the value forwarded is the sanitized one, not the raw input.
+type updateDisplayNameStore struct {
+	fakeStore
+	gotUserID      string
+	gotDisplayName string
+	calls          int
+	profile        domain.SelfProfile
+	err            error
+}
+
+func (s *updateDisplayNameStore) UpdateDisplayName(_ context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	s.gotUserID = userID
+	s.gotDisplayName = displayName
+	s.calls++
+	return s.profile, s.err
+}
+
+func TestUserService_UpdateDisplayName_TrimsAndDelegates(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1", DisplayName: "Ana Lima"}}
+	svc := service.NewUserService(store)
+
+	got, err := svc.UpdateDisplayName(context.Background(), "u1", "  Ana Lima  ")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotUserID != "u1" {
+		t.Fatalf("expected userID u1 to reach the store, got %q", store.gotUserID)
+	}
+	if store.gotDisplayName != "Ana Lima" {
+		t.Fatalf("expected trimmed display_name to reach the store, got %q", store.gotDisplayName)
+	}
+	if got.DisplayName != "Ana Lima" {
+		t.Fatalf("expected the store's persisted value to be returned, got %+v", got)
+	}
+}
+
+func TestUserService_UpdateDisplayName_StripsControlCharacters(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateDisplayName(context.Background(), "u1", "Ana\x00\nLima"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotDisplayName != "AnaLima" {
+		t.Fatalf("expected control characters stripped, got %q", store.gotDisplayName)
+	}
+}
+
+func TestUserService_UpdateDisplayName_RejectsEmptyAfterTrim(t *testing.T) {
+	store := &updateDisplayNameStore{}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", "   ")
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatal("store must not be called when validation fails")
+	}
+}
+
+func TestUserService_UpdateDisplayName_RejectsTooLong(t *testing.T) {
+	store := &updateDisplayNameStore{}
+	svc := service.NewUserService(store)
+
+	tooLong := strings.Repeat("a", 81)
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", tooLong)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatal("store must not be called when validation fails")
+	}
+}
+
+func TestUserService_UpdateDisplayName_AcceptsMaxLength(t *testing.T) {
+	store := &updateDisplayNameStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	exactly80 := strings.Repeat("a", 80)
+	if _, err := svc.UpdateDisplayName(context.Background(), "u1", exactly80); err != nil {
+		t.Fatalf("unexpected error at the boundary: %v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("expected exactly one store call, got %d", store.calls)
+	}
+}
+
+func TestUserService_UpdateDisplayName_PropagatesStoreError(t *testing.T) {
+	store := &updateDisplayNameStore{err: domain.ErrNotFound}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateDisplayName(context.Background(), "u1", "Ana")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// ── UpdateProfileFields (job_title/bio/timezone/custom_status) ────────────
+
+// updateProfileFieldsStore records what the service passed to the store, so
+// tests can assert validation and sanitization happen before storage is ever
+// reached, and that a nil argument in stays a nil argument out (the "leave
+// this field alone" signal must survive the service layer unchanged).
+type updateProfileFieldsStore struct {
+	fakeStore
+	gotUserID       string
+	gotJobTitle     *string
+	gotBio          *string
+	gotTimezone     *string
+	gotCustomStatus *string
+	calls           int
+	profile         domain.SelfProfile
+	err             error
+}
+
+func (s *updateProfileFieldsStore) UpdateProfileFields(_ context.Context, userID string, jobTitle, bio, timezone, customStatus *string) (domain.SelfProfile, error) {
+	s.gotUserID = userID
+	s.gotJobTitle = jobTitle
+	s.gotBio = bio
+	s.gotTimezone = timezone
+	s.gotCustomStatus = customStatus
+	s.calls++
+	return s.profile, s.err
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestUserService_UpdateProfileFields_TrimsAndDelegates(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateProfileFields(context.Background(), "u1",
+		strPtr("  Engenheira  "), strPtr("  Gosto de café.  "), strPtr("  America/Sao_Paulo  "),
+		strPtr("  Em reunião  "))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotUserID != "u1" {
+		t.Fatalf("expected userID u1 to reach the store, got %q", store.gotUserID)
+	}
+	if store.gotJobTitle == nil || *store.gotJobTitle != "Engenheira" {
+		t.Fatalf("expected trimmed job_title, got %v", store.gotJobTitle)
+	}
+	if store.gotBio == nil || *store.gotBio != "Gosto de café." {
+		t.Fatalf("expected trimmed bio, got %v", store.gotBio)
+	}
+	if store.gotTimezone == nil || *store.gotTimezone != "America/Sao_Paulo" {
+		t.Fatalf("expected trimmed timezone, got %v", store.gotTimezone)
+	}
+	if store.gotCustomStatus == nil || *store.gotCustomStatus != "Em reunião" {
+		t.Fatalf("expected trimmed custom_status, got %v", store.gotCustomStatus)
+	}
+}
+
+func TestUserService_UpdateProfileFields_StripsControlCharacters(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", strPtr("Eng\x00enheira"), nil, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *store.gotJobTitle != "Engenheira" {
+		t.Fatalf("expected control characters stripped, got %q", *store.gotJobTitle)
+	}
+}
+
+func TestUserService_UpdateProfileFields_PreservesBioLineBreaks(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", nil, strPtr("  Primeira linha\r\nSegunda\x00 linha\rTerceira linha  "), nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotBio == nil || *store.gotBio != "Primeira linha\nSegunda linha\nTerceira linha" {
+		t.Fatalf("expected normalized multiline bio, got %v", store.gotBio)
+	}
+}
+
+// A nil argument means "the caller did not touch this field" and must reach
+// the store as nil too — the service must never invent a value for a field
+// nobody asked to change.
+func TestUserService_UpdateProfileFields_NilFieldsStayNil(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", strPtr("Engenheira"), nil, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotBio != nil || store.gotTimezone != nil || store.gotCustomStatus != nil {
+		t.Fatalf("expected untouched fields to stay nil, got bio=%v timezone=%v custom_status=%v",
+			store.gotBio, store.gotTimezone, store.gotCustomStatus)
+	}
+}
+
+func TestUserService_UpdateProfileFields_CustomStatusOnly(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", nil, nil, nil, strPtr("Em reunião")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotCustomStatus == nil || *store.gotCustomStatus != "Em reunião" {
+		t.Fatalf("expected custom_status to reach the store, got %v", store.gotCustomStatus)
+	}
+}
+
+// Unlike display_name, a provided-but-empty value is accepted for every one
+// of these four fields — it clears the field rather than being rejected.
+func TestUserService_UpdateProfileFields_EmptyClears(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", strPtr(""), strPtr(""), strPtr(""), strPtr("")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotJobTitle == nil || *store.gotJobTitle != "" {
+		t.Fatalf("expected job_title cleared (non-nil empty), got %v", store.gotJobTitle)
+	}
+	if store.gotTimezone == nil || *store.gotTimezone != "" {
+		t.Fatalf("expected timezone cleared (non-nil empty), got %v", store.gotTimezone)
+	}
+	if store.gotCustomStatus == nil || *store.gotCustomStatus != "" {
+		t.Fatalf("expected custom_status cleared (non-nil empty), got %v", store.gotCustomStatus)
+	}
+	if store.calls != 1 {
+		t.Fatalf("expected exactly one store call, got %d", store.calls)
+	}
+}
+
+func TestUserService_UpdateProfileFields_RejectsTooLong(t *testing.T) {
+	tooLong81 := strings.Repeat("a", 81)
+	tooLong501 := strings.Repeat("a", 501)
+	cases := []struct {
+		name                                  string
+		jobTitle, bio, timezone, customStatus *string
+	}{
+		{"job_title", strPtr(tooLong81), nil, nil, nil},
+		{"bio", nil, strPtr(tooLong501), nil, nil},
+		{"custom_status", nil, nil, nil, strPtr(tooLong81)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &updateProfileFieldsStore{}
+			svc := service.NewUserService(store)
+			_, err := svc.UpdateProfileFields(context.Background(), "u1", tc.jobTitle, tc.bio, tc.timezone, tc.customStatus)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+			if store.calls != 0 {
+				t.Fatal("store must not be called when validation fails")
+			}
+		})
+	}
+}
+
+func TestUserService_UpdateProfileFields_AcceptsMaxLength(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	exactly80 := strings.Repeat("a", 80)
+	exactly500 := strings.Repeat("a", 500)
+	_, err := svc.UpdateProfileFields(context.Background(), "u1", strPtr(exactly80), strPtr(exactly500), nil, strPtr(exactly80))
+	if err != nil {
+		t.Fatalf("unexpected error at the boundary: %v", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("expected exactly one store call, got %d", store.calls)
+	}
+}
+
+func TestUserService_UpdateProfileFields_AcceptsRealTimezone(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	for _, tz := range []string{"America/Sao_Paulo", "UTC", "Europe/Lisbon", "Asia/Tokyo"} {
+		store.calls = 0
+		if _, err := svc.UpdateProfileFields(context.Background(), "u1", nil, nil, strPtr(tz), nil); err != nil {
+			t.Fatalf("unexpected error for %q: %v", tz, err)
+		}
+		if *store.gotTimezone != tz {
+			t.Fatalf("expected timezone %q to reach the store, got %q", tz, *store.gotTimezone)
+		}
+	}
+}
+
+func TestUserService_UpdateProfileFields_RejectsFakeTimezone(t *testing.T) {
+	store := &updateProfileFieldsStore{}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateProfileFields(context.Background(), "u1", nil, nil, strPtr("Mars/Olympus_Mons"), nil)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+	if store.calls != 0 {
+		t.Fatal("store must not be called when timezone validation fails")
+	}
+}
+
+// "Local" is Go's sentinel for the host's own system zone, not a zone the
+// user chose — accepting it would store a value whose meaning silently
+// depends on wherever the server happens to be deployed.
+func TestUserService_UpdateProfileFields_RejectsLocalSentinel(t *testing.T) {
+	store := &updateProfileFieldsStore{}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateProfileFields(context.Background(), "u1", nil, nil, strPtr("Local"), nil)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+func TestUserService_UpdateProfileFields_EmptyTimezoneClearsWithoutValidation(t *testing.T) {
+	store := &updateProfileFieldsStore{profile: domain.SelfProfile{ID: "u1"}}
+	svc := service.NewUserService(store)
+
+	if _, err := svc.UpdateProfileFields(context.Background(), "u1", nil, nil, strPtr("  "), nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.gotTimezone == nil || *store.gotTimezone != "" {
+		t.Fatalf("expected timezone cleared, got %v", store.gotTimezone)
+	}
+}
+
+func TestUserService_UpdateProfileFields_PropagatesStoreError(t *testing.T) {
+	store := &updateProfileFieldsStore{err: domain.ErrNotFound}
+	svc := service.NewUserService(store)
+
+	_, err := svc.UpdateProfileFields(context.Background(), "u1", strPtr("Engenheira"), nil, nil, nil)
+	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }

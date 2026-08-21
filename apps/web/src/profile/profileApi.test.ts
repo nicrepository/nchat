@@ -1,7 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiRequestError } from "../lib/api";
-import { AvatarUploadError, fetchMyProfile, removeAvatar, uploadAvatar } from "./profileApi";
+import {
+  AvatarUploadError,
+  fetchMyProfile,
+  removeAvatar,
+  updateDisplayName,
+  UpdateDisplayNameError,
+  updateProfileFields,
+  UpdateProfileFieldsError,
+  uploadAvatar,
+} from "./profileApi";
 
 const { mockAuthFetch } = vi.hoisted(() => ({ mockAuthFetch: vi.fn() }));
 
@@ -66,7 +75,15 @@ describe("fetchMyProfile", () => {
       data: { id: "u1", display_name: "Ana", avatar_url: "/api/auth/avatars/x.png" },
     });
     const profile = await fetchMyProfile();
-    expect(profile).toEqual({ id: "u1", displayName: "Ana", avatarUrl: "/api/auth/avatars/x.png" });
+    expect(profile).toEqual({
+      id: "u1",
+      displayName: "Ana",
+      avatarUrl: "/api/auth/avatars/x.png",
+      jobTitle: "",
+      bio: "",
+      timezone: "",
+      customStatus: "",
+    });
     const [url, init] = mockAuthFetch.mock.calls[0];
     expect(url).toContain("/me");
     expect(init.method).toBe("GET");
@@ -136,6 +153,133 @@ describe("fetchMyProfile", () => {
       },
     });
     expect((await fetchMyProfile()).avatarUrl).toBe("http://localhost:3000/api/auth/avatars/a.png");
+  });
+});
+
+describe("updateDisplayName", () => {
+  it("sends a PATCH with only display_name and returns the persisted profile", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "u1", display_name: "Ana Lima", avatar_url: "/api/auth/avatars/x.png" },
+    });
+
+    const profile = await updateDisplayName("Ana Lima");
+
+    expect(profile).toEqual({
+      id: "u1",
+      displayName: "Ana Lima",
+      avatarUrl: "/api/auth/avatars/x.png",
+      jobTitle: "",
+      bio: "",
+      timezone: "",
+      customStatus: "",
+    });
+    const [calledUrl, init] = mockAuthFetch.mock.calls[0];
+    expect(calledUrl).toContain("/me");
+    expect(calledUrl).not.toContain("/me/avatar");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ display_name: "Ana Lima" });
+    // The client never sends an id, user_id or any other field — identity is
+    // the session's, and nothing else is editable through this call.
+    expect(Object.keys(JSON.parse(init.body as string))).toEqual(["display_name"]);
+  });
+
+  it("forwards an abort signal to the transport", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: "Ana" } });
+    const controller = new AbortController();
+    await updateDisplayName("Ana", controller.signal);
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("maps 400 to an invalid reason", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(400, "bad_request", "bad"));
+    await expect(updateDisplayName("")).rejects.toMatchObject({
+      name: "UpdateDisplayNameError",
+      reason: "invalid",
+    });
+  });
+
+  it("maps 403 to forbidden", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "no"));
+    await expect(updateDisplayName("Ana")).rejects.toMatchObject({ reason: "forbidden" });
+  });
+
+  it("maps an unknown failure to a generic reason", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(updateDisplayName("Ana")).rejects.toBeInstanceOf(UpdateDisplayNameError);
+  });
+});
+
+describe("updateProfileFields", () => {
+  const emptyFields = { jobTitle: "", bio: "", timezone: "", customStatus: "" };
+
+  it("sends a PATCH with only the four fields (no display_name) and returns the persisted profile", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        id: "u1",
+        display_name: "Ana Lima",
+        job_title: "Engenheira",
+        bio: "Focada em backend.",
+        timezone: "America/Sao_Paulo",
+        custom_status: "Em reunião",
+      },
+    });
+
+    const profile = await updateProfileFields({
+      jobTitle: "Engenheira",
+      bio: "Focada em backend.",
+      timezone: "America/Sao_Paulo",
+      customStatus: "Em reunião",
+    });
+
+    expect(profile).toEqual({
+      id: "u1",
+      displayName: "Ana Lima",
+      avatarUrl: undefined,
+      jobTitle: "Engenheira",
+      bio: "Focada em backend.",
+      timezone: "America/Sao_Paulo",
+      customStatus: "Em reunião",
+    });
+    const [calledUrl, init] = mockAuthFetch.mock.calls[0];
+    expect(calledUrl).toContain("/me");
+    expect(init.method).toBe("PATCH");
+    const sentBody = JSON.parse(init.body as string);
+    expect(sentBody).toEqual({
+      job_title: "Engenheira",
+      bio: "Focada em backend.",
+      timezone: "America/Sao_Paulo",
+      custom_status: "Em reunião",
+    });
+    // display_name is never sent by this call — PATCH /auth/me treats an
+    // absent field as "leave it alone," so there is nothing to preserve.
+    expect(sentBody).not.toHaveProperty("display_name");
+  });
+
+  it("forwards an abort signal to the transport", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: "Ana" } });
+    const controller = new AbortController();
+    await updateProfileFields(emptyFields, controller.signal);
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("maps 400 to an invalid reason", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(400, "bad_request", "bad"));
+    await expect(updateProfileFields(emptyFields)).rejects.toMatchObject({
+      name: "UpdateProfileFieldsError",
+      reason: "invalid",
+    });
+  });
+
+  it("maps 403 to forbidden", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "no"));
+    await expect(updateProfileFields(emptyFields)).rejects.toMatchObject({
+      reason: "forbidden",
+    });
+  });
+
+  it("maps an unknown failure to a generic reason", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(updateProfileFields(emptyFields)).rejects.toBeInstanceOf(UpdateProfileFieldsError);
   });
 });
 

@@ -53,6 +53,12 @@ export interface WSMessagePayload {
   /** Missing means legacy v1 during rolling deploys. */
   body_format?: "v1" | "v2" | "v3";
   status: string;
+  /**
+   * RF-21 link safety (issue #135), a separate axis from `status`. Absent on a
+   * message with no links and on any pre-#135 server; the value is narrowed by
+   * the client that reads it.
+   */
+  link_safety_state?: unknown;
   is_removed: boolean;
   created_at: string;
   updated_at: string;
@@ -77,6 +83,9 @@ export interface WSQuotePayload {
   is_removed?: boolean;
   deleted_at?: string | null;
   created_at: string;
+  updated_at?: string;
+  /** Absent on a pre-#135 server; treated as "unknown" by the reader. */
+  link_safety_state?: string;
 }
 
 export interface WSMessageCreatedEvent {
@@ -108,6 +117,32 @@ export interface WSReactionUpdatedEvent {
 }
 
 /**
+ * Someone's typing state in a channel or DM changed.
+ *
+ * IsTyping is exactly what the server accepted from the typing user's own
+ * typing.start/typing.stop — never inferred, never the local user's own
+ * keystrokes echoed back with a different meaning. No draft, no character
+ * count, no body: this answers "is this person typing right now" and nothing
+ * about what they wrote.
+ */
+export interface WSTypingUpdatedEvent {
+  type: "typing.updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  typing?: {
+    user_id: string;
+    /**
+     * The typing user's display name, resolved server-side once per
+     * WebSocket connection. Absent when the server couldn't resolve one
+     * (rare) — the caller falls back to its own heuristic in that case.
+     */
+    user_display_name?: string;
+    is_typing: boolean;
+    updated_at?: string;
+  };
+}
+
+/**
  * RF-21: the author's message was refused by the link-safety check.
  *
  * Recipient-scoped rather than target-scoped — the server addresses it to one
@@ -119,6 +154,34 @@ export interface WSMessageBlockedEvent {
   type: "message.blocked";
   message_id: string;
   reason?: string;
+}
+
+/**
+ * RF-21: what is known about a published message's links changed (issue #135).
+ *
+ * Target-scoped, unlike message.blocked, and that difference is the whole point:
+ * the message *was* delivered, so everyone holding it has to converge. It arrives
+ * when a reconciliation obtains a verdict for a link whose scan had finished
+ * without one — in either direction:
+ *
+ *   inconclusive -> safe       the "could not verify" notice goes away
+ *   inconclusive -> malicious  the links stop being usable
+ *
+ * It carries a message id, state, and update time. No URL, scan id, or provider
+ * text. The timestamp orders it against delayed create/edit events; the reducer
+ * can retain it until the corresponding message arrives without inventing a
+ * partial message.
+ */
+export interface WSMessageLinkSafetyChangedEvent {
+  type: "message.link_safety_changed";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+  link_safety: {
+    message_id: string;
+    state: string;
+    updated_at: string;
+  };
 }
 
 export interface WSMessageUpdatedEvent {
@@ -133,6 +196,7 @@ export interface WSMessageUpdatedEvent {
     dm_id?: string;
     body: string;
     body_format: "v1" | "v2" | "v3";
+    link_safety_state?: unknown;
     edited_at: string;
     edit_count: number;
     is_edited: boolean;
@@ -159,6 +223,8 @@ function isMessageUpdatedEvent(
     typeof payload["edited_at"] === "string" &&
     typeof payload["edit_count"] === "number" &&
     typeof payload["is_edited"] === "boolean" &&
+    (payload["link_safety_state"] === undefined ||
+      typeof payload["link_safety_state"] === "string") &&
     (payload["status"] === undefined ||
       payload["status"] === "active" ||
       payload["status"] === "deleted") &&
@@ -268,8 +334,10 @@ interface UseChatWebSocketOptions {
   additionalTargets?: readonly WSSubscriptionTarget[];
   onMessageCreated: (event: WSMessageCreatedEvent) => void;
   onMessageBlocked?: (event: WSMessageBlockedEvent) => void;
+  onMessageLinkSafetyChanged?: (event: WSMessageLinkSafetyChangedEvent) => void;
   onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
   onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+  onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
@@ -281,6 +349,13 @@ interface UseChatWebSocketOptions {
 
 export interface ChatWebSocketActions {
   toggleReaction: (messageId: string, emoji: string) => boolean;
+  /**
+   * Declares this user's typing intent for the primary target. Returns false
+   * when the shared socket is not open, the same "nothing sent, caller may
+   * retry" contract toggleReaction uses. Never sends the composer's content —
+   * only the boolean state.
+   */
+  sendTyping: (isTyping: boolean) => boolean;
   /** Shared connection state, for discreet feedback and diagnosis. */
   connectionStatus: ChatSocketStatus;
 }
@@ -305,8 +380,10 @@ export function useChatWebSocket({
   additionalTargets,
   onMessageCreated,
   onMessageBlocked,
+  onMessageLinkSafetyChanged,
   onMessageUpdated,
   onReactionUpdated,
+  onTypingUpdated,
   onPinUpdated,
   onMembersAdded,
   onAttachmentStatus,
@@ -334,8 +411,10 @@ export function useChatWebSocket({
   // Keep the callback current without restarting the effect.
   const onMessageRef = useRef(onMessageCreated);
   const onMessageBlockedRef = useRef(onMessageBlocked);
+  const onLinkSafetyRef = useRef(onMessageLinkSafetyChanged);
   const onMessageUpdatedRef = useRef(onMessageUpdated);
   const onReactionRef = useRef(onReactionUpdated);
+  const onTypingRef = useRef(onTypingUpdated);
   const onPinRef = useRef(onPinUpdated);
   const onMembersRef = useRef(onMembersAdded);
   const onAttachmentStatusRef = useRef(onAttachmentStatus);
@@ -356,8 +435,10 @@ export function useChatWebSocket({
   useLayoutEffect(() => {
     onMessageRef.current = onMessageCreated;
     onMessageBlockedRef.current = onMessageBlocked;
+    onLinkSafetyRef.current = onMessageLinkSafetyChanged;
     onMessageUpdatedRef.current = onMessageUpdated;
     onReactionRef.current = onReactionUpdated;
+    onTypingRef.current = onTypingUpdated;
     onPinRef.current = onPinUpdated;
     onMembersRef.current = onMembersAdded;
     onAttachmentStatusRef.current = onAttachmentStatus;
@@ -375,6 +456,22 @@ export function useChatWebSocket({
     if (!handle) return false;
     return handle.send({ type: "reaction.toggle", message_id: messageId, emoji });
   }, []);
+
+  // Scoped to the primary target only — the one conversation actually open —
+  // same as toggleReaction reading socketRef at call time rather than closing
+  // over a stale handle.
+  const sendTyping = useCallback(
+    (isTyping: boolean) => {
+      const handle = socketRef.current;
+      if (!handle) return false;
+      return handle.send({
+        type: isTyping ? "typing.start" : "typing.stop",
+        target_type: kind,
+        target_id: normalizedTargetId,
+      });
+    },
+    [kind, normalizedTargetId],
+  );
 
   useEffect(() => {
     const primaryTarget = JSON.parse(primaryTargetSignature) as WSSubscriptionTarget | null;
@@ -553,6 +650,27 @@ export function useChatWebSocket({
           return;
         }
         if (!control.expected.has(incomingTargetKey)) return;
+        // Routed for any subscribed target rather than only the primary one, for
+        // the same reason attachment.status is: a reconciliation lands minutes
+        // after the message and quite possibly while the reader is looking at a
+        // different conversation. The correction still has to be applied — a
+        // message that stopped being safe must not stay drawn as safe just
+        // because its tab is in the background.
+        if (d["type"] === "message.link_safety_changed" && typeof d["message_id"] === "string") {
+          const linkSafety = d["link_safety"];
+          if (
+            !linkSafety ||
+            typeof linkSafety !== "object" ||
+            typeof (linkSafety as Record<string, unknown>)["message_id"] !== "string" ||
+            (linkSafety as Record<string, unknown>)["message_id"] !== d["message_id"] ||
+            typeof (linkSafety as Record<string, unknown>)["state"] !== "string" ||
+            typeof (linkSafety as Record<string, unknown>)["updated_at"] !== "string"
+          ) {
+            return;
+          }
+          onLinkSafetyRef.current?.(normalizedData as unknown as WSMessageLinkSafetyChangedEvent);
+          return;
+        }
         if (d["type"] === "message.created") {
           onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
           return;
@@ -572,6 +690,8 @@ export function useChatWebSocket({
           onMessageUpdatedRef.current?.(normalizedData);
         } else if (d["type"] === "reaction.updated") {
           onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
+        } else if (d["type"] === "typing.updated") {
+          onTypingRef.current?.(normalizedData as unknown as WSTypingUpdatedEvent);
         } else if (d["type"] === "pin.updated") {
           onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
         } else if (d["type"] === "members.added") {
@@ -672,5 +792,5 @@ export function useChatWebSocket({
     }
   }, [subscriptionSignature, primaryTargetSignature]);
 
-  return { toggleReaction, connectionStatus };
+  return { toggleReaction, sendTyping, connectionStatus };
 }

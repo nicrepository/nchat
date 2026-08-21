@@ -14,6 +14,7 @@ import {
 } from "./callState";
 import { requestMediaPermission } from "./mediaPermission";
 import type { CallMediaSessionController } from "./useCallMedia";
+import { randomId } from "../lib/randomId";
 
 export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
 
@@ -84,7 +85,19 @@ export interface CallController {
   clearTerminal: () => void;
 }
 
-export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): CallController {
+export function useCallSignaling(
+  media?: CallMediaBridge,
+  mediaEnabled = true,
+  // Called once, right when this call's own media request begins for a
+  // confirmed `active` call — before any token is requested. The intended
+  // use is transferring shared-Room ownership away from something else
+  // (RF-24's resource room) at the earliest point this call is guaranteed
+  // to actually need the Room, never earlier (accept() alone is not that
+  // guarantee: it can fail preflight or never be delivered) and never later
+  // (deep inside connect(), which only runs after a token request already
+  // succeeded).
+  onBeforeDirectMedia?: (call: Call) => void | Promise<void>,
+): CallController {
   const [state, setState] = useState<CallState>(initialCallState);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,6 +114,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   const mediaRetryPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
   const mediaCleanupPromiseRef = useRef<Promise<boolean> | null>(null);
   const mediaRef = useRef(media);
+  const onBeforeDirectMediaRef = useRef(onBeforeDirectMedia);
   const mediaEnabledRef = useRef(mediaEnabled);
   const localAuthorizationRef = useRef<LocalMediaAuthorization | null>(null);
   const activateMediaPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
@@ -109,6 +123,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
   useEffect(() => {
     mediaRef.current = media;
   }, [media]);
+
+  useEffect(() => {
+    onBeforeDirectMediaRef.current = onBeforeDirectMedia;
+  }, [onBeforeDirectMedia]);
 
   const requestMedia = useCallback(async (call: Call) => {
     if (
@@ -130,10 +148,26 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       callRef.current.status === "active";
     try {
       if (!current()) return;
+      // Runs before any network request for this call's own media: it is
+      // where ownership of the shared Room is handed to this call, so that
+      // ownership never depends on issueCallToken()/connect() ever
+      // succeeding — a resource room the caller is leaving stays left
+      // (or its cleanup keeps being retried) regardless of what happens to
+      // this call's own token/connect below. A rejection here is handled
+      // exactly like a token/connect failure: no Room is touched, and the
+      // existing recoverable-error/retry path takes over.
+      await onBeforeDirectMediaRef.current?.(call);
+      if (!current()) return;
       const result = await issueCallToken(call.call_id);
       if (!current()) return;
       await mediaRef.current?.connect(call, result.token, result.serverUrl);
       if (!current()) return;
+      // The gesture-time startAudio() in accept() may have unlocked a
+      // session that onBeforeDirectMedia above just tore down (a resource
+      // room's Room A): the browser's autoplay-unlock is per-Room, so the
+      // session that just connected — possibly a brand new Room B — needs
+      // its own explicit unlock too. Idempotent when no handoff happened.
+      void mediaRef.current?.startAudio();
       mediaCallIdRef.current = call.call_id;
       setMediaReady(true);
       setError(null);
@@ -233,6 +267,10 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
       onMessage: (value, generation) => {
         if (closed || generation !== socketGenerationRef.current) return;
         const event = parseCallEvent(value);
+        // Resource-room events share the socket but have their own lifecycle
+        // controller. Treating one as a direct call would create a second media
+        // owner for the same call_id.
+        if (event && event.target_type !== "user") return;
         if (event) {
           const currentCall = callRef.current;
           const reconciliation =
@@ -327,37 +365,76 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
         if (value["type"] === "call.error") {
           const operation = value["operation"];
           const code = value["code"];
-          if (operation === "call.sync" && code === "call_not_found") {
+          if (operation === "call.sync") {
+            // call.sync never has a PendingCallCommand of its own (it isn't
+            // sent through send()/sendGated()): its correlation is entirely
+            // syncReconciliationRef, scoped to this connection's generation.
+            // No match means this reply belongs to an abandoned/older
+            // reconciliation attempt, so it is ignored rather than shown.
             const reconciliation =
               syncReconciliationRef.current?.generation === generation
                 ? syncReconciliationRef.current
                 : null;
             if (!reconciliation) return;
+            if (code === "call_not_found") {
+              syncReconciliationRef.current = null;
+              pendingRef.current = null;
+              const staleCall = callRef.current;
+              callRef.current = null;
+              setState(initialCallState);
+              setPending(false);
+              setError(null);
+              invalidateMediaRequest();
+              if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaCleanup) {
+                void stopMedia();
+              }
+              return;
+            }
             syncReconciliationRef.current = null;
             pendingRef.current = null;
-            const staleCall = callRef.current;
-            callRef.current = null;
-            setState(initialCallState);
             setPending(false);
+            setError(
+              code === "call_rate_limited"
+                ? "Muitas tentativas de chamada. Aguarde um minuto."
+                : "Não foi possível concluir a ação da chamada.",
+            );
+            return;
+          }
+          // Every remaining call.error answers a normal command (call.start,
+          // call.accept, call.decline, call.cancel or call.end): it is only
+          // processed if it matches the PendingCallCommand this hook actually
+          // has in flight. A stale reply for a command that was already
+          // superseded (or one for a different call_id) must not touch
+          // pending/error/call/media state at all — including when nothing
+          // is pending, since there is nothing here for it to correlate to.
+          const pendingCommand = pendingRef.current;
+          if (!pendingCommand || !errorMatchesPending(pendingCommand, value)) {
+            return;
+          }
+          if (code === "call_invalid_state" && pendingCommand.operation !== "call.start") {
+            // The backend disagrees with the local transition: the call_id we
+            // acted on is correlated, but its authoritative state has moved
+            // on. call.start has no established call_id to reconcile against
+            // (and its own errors never echo request_id, see
+            // errorMatchesPending), so it keeps the generic release below;
+            // every other transition reconciles through the same call.sync
+            // path a reconnect uses, instead of guessing at the new state.
+            // The in-flight media cleanup this command already started (see
+            // decline/cancel/end below) carries over into the reconciliation
+            // so it is never started a second time.
+            const mediaCleanup = mediaCleanupPromiseRef.current;
+            pendingRef.current = null;
             setError(null);
-            invalidateMediaRequest();
-            if (staleCall && !isTerminalCall(staleCall.status) && !reconciliation.mediaCleanup) {
-              void stopMedia();
+            syncReconciliationRef.current = { generation, mediaCleanup };
+            if (!handle.send({ type: "call.sync" })) {
+              syncReconciliationRef.current = null;
+              setPending(false);
+              setError("Conexão em tempo real indisponível.");
             }
             return;
           }
-          if (
-            operation === "call.sync" &&
-            syncReconciliationRef.current?.generation === generation
-          ) {
-            syncReconciliationRef.current = null;
-            pendingRef.current = null;
-            setPending(false);
-          }
-          if (errorMatchesPending(pendingRef.current, value)) {
-            pendingRef.current = null;
-            setPending(false);
-          }
+          pendingRef.current = null;
+          setPending(false);
           setError(
             code === "call_rate_limited"
               ? "Muitas tentativas de chamada. Aguarde um minuto."
@@ -573,7 +650,7 @@ export function useCallSignaling(media?: CallMediaBridge, mediaEnabled = true): 
     mediaActivationRequired,
     start: (targetUserId, callType) => {
       const started = sendGated("call.start", callType, {
-        request_id: crypto.randomUUID(),
+        request_id: randomId(),
         target_user_id: targetUserId,
         call_type: callType,
       });

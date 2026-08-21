@@ -8,6 +8,17 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
+	"unicode"
+
+	// The runtime image is distroless (see Dockerfile.service), which ships
+	// no /usr/share/zoneinfo. Without this, every timezone other than "UTC"
+	// and "Local" would fail validateTimezone's time.LoadLocation call in
+	// production even though the exact same code works on a developer's
+	// machine, where the OS usually does have a zoneinfo database. This
+	// blank import embeds the full IANA database in the binary instead of
+	// depending on the runtime environment providing one.
+	_ "time/tzdata"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 	"github.com/nicrepository/nchat/services/auth-service/internal/storage"
@@ -31,6 +42,21 @@ type UserStatusManager interface {
 // SelfProfileReader reads the authenticated user's own minimal profile.
 type SelfProfileReader interface {
 	GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error)
+}
+
+// SelfProfileWriter edits the authenticated user's own minimal profile.
+type SelfProfileWriter interface {
+	// UpdateDisplayName validates and persists a new display_name for userID,
+	// then returns the resulting profile — the same shape GetProfile returns,
+	// so a caller can render the confirmed value without a second round trip.
+	UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error)
+	// UpdateProfileFields validates and persists job_title, bio, timezone and
+	// custom_status for userID, then returns the resulting
+	// profile. Each argument is independently optional: nil leaves that field
+	// untouched, a pointer to "" clears it, and a pointer to a non-empty
+	// string sets it (after validation) — see UpdateProfileFields's own doc
+	// comment below. custom_status is intentionally a single text field.
+	UpdateProfileFields(ctx context.Context, userID string, jobTitle, bio, timezone, customStatus *string) (domain.SelfProfile, error)
 }
 
 // WorkspaceAdminResolver answers "which workspace does this caller
@@ -59,6 +85,7 @@ type UserAdmin interface {
 	UserCreator
 	UserStatusManager
 	SelfProfileReader
+	SelfProfileWriter
 	WorkspaceAdminResolver
 	WorkspaceUserLister
 }
@@ -77,6 +104,131 @@ func NewUserService(store storage.UserStore) *UserService {
 // comes from the session; there is no lookup by any client-supplied identifier.
 func (s *UserService) GetProfile(ctx context.Context, userID string) (domain.SelfProfile, error) {
 	return s.store.GetSelfProfile(ctx, userID)
+}
+
+// selfDisplayNameMinLen and selfDisplayNameMaxLen bound a user's own
+// display_name. There is no requirement document specifying this field's
+// length, so the bound is not invented: it reuses the value already chosen
+// for the same kind of field in this package — a short, human-chosen label —
+// by UpdateDeviceDisplayName below (deviceDisplayNameMaxLen).
+const (
+	selfDisplayNameMinLen = 1
+	selfDisplayNameMaxLen = 80
+)
+
+// UpdateDisplayName validates and persists a new display_name for userID, then
+// returns the resulting profile so the caller can render the confirmed value.
+// The userID comes from the session, exactly like GetProfile; there is no
+// lookup or update by any client-supplied identifier. Only an active,
+// non-deleted user can be updated — the same scope GetSelfProfile reads and
+// SetAvatarURL writes under, enforced by the store.
+func (s *UserService) UpdateDisplayName(ctx context.Context, userID, displayName string) (domain.SelfProfile, error) {
+	displayName = sanitizeDisplayName(displayName)
+	if len([]rune(displayName)) < selfDisplayNameMinLen {
+		return domain.SelfProfile{}, fmt.Errorf("%w: display_name must be at least 1 character", domain.ErrInvalidInput)
+	}
+	if len([]rune(displayName)) > selfDisplayNameMaxLen {
+		return domain.SelfProfile{}, fmt.Errorf("%w: display_name must be at most 80 characters", domain.ErrInvalidInput)
+	}
+	return s.store.UpdateDisplayName(ctx, userID, displayName)
+}
+
+// selfShortFieldMaxLen bounds job_title and custom_status: same category as
+// display_name (a short, human-chosen label), so it reuses
+// selfDisplayNameMaxLen's value and justification rather than inventing a new
+// number.
+const selfShortFieldMaxLen = selfDisplayNameMaxLen
+
+// selfBioMaxLen bounds bio. Unlike the fields above, there is no sibling field
+// in this codebase for "free-form paragraph text" to reuse a bound from — this
+// value is a judgment call, not a requirement, and can be revisited.
+const selfBioMaxLen = 500
+
+// UpdateProfileFields validates and persists job_title, bio, timezone and
+// custom_status for userID, then returns the resulting profile.
+//
+// Each argument is independently optional at the transport level (nil means
+// "the caller did not touch this field" and is passed straight through to the
+// store, which leaves the column alone), but once a field IS provided, "" is
+// treated as "clear it" rather than rejected — unlike display_name, none of
+// these four fields is ever required to be non-empty. job_title and
+// custom_status reuse sanitizeDisplayName's trim-and-strip-control-characters
+// treatment. Bio has its own sanitizer because it is multiline: it preserves
+// line feeds while still dropping other control characters. Timezone gets its
+// own validation, since a syntactically fine string is not the same thing as a
+// real time zone.
+func (s *UserService) UpdateProfileFields(ctx context.Context, userID string, jobTitle, bio, timezone, customStatus *string) (domain.SelfProfile, error) {
+	if jobTitle != nil {
+		sanitized := sanitizeDisplayName(*jobTitle)
+		if len([]rune(sanitized)) > selfShortFieldMaxLen {
+			return domain.SelfProfile{}, fmt.Errorf("%w: job_title must be at most %d characters", domain.ErrInvalidInput, selfShortFieldMaxLen)
+		}
+		jobTitle = &sanitized
+	}
+	if bio != nil {
+		sanitized := sanitizeBio(*bio)
+		if len([]rune(sanitized)) > selfBioMaxLen {
+			return domain.SelfProfile{}, fmt.Errorf("%w: bio must be at most %d characters", domain.ErrInvalidInput, selfBioMaxLen)
+		}
+		bio = &sanitized
+	}
+	if customStatus != nil {
+		sanitized := sanitizeDisplayName(*customStatus)
+		if len([]rune(sanitized)) > selfShortFieldMaxLen {
+			return domain.SelfProfile{}, fmt.Errorf("%w: custom_status must be at most %d characters", domain.ErrInvalidInput, selfShortFieldMaxLen)
+		}
+		customStatus = &sanitized
+	}
+	if timezone != nil {
+		validated, err := validateTimezone(*timezone)
+		if err != nil {
+			return domain.SelfProfile{}, err
+		}
+		timezone = &validated
+	}
+
+	return s.store.UpdateProfileFields(ctx, userID, jobTitle, bio, timezone, customStatus)
+}
+
+// sanitizeBio normalizes all line endings to LF, trims only external
+// whitespace, and removes control characters except LF. A bio is free-form
+// multiline text, unlike a display name; treating LF as invalid would silently
+// flatten the value the textarea lets a user enter.
+func sanitizeBio(bio string) string {
+	bio = strings.ReplaceAll(bio, "\r\n", "\n")
+	bio = strings.ReplaceAll(bio, "\r", "\n")
+	bio = strings.TrimSpace(bio)
+
+	var sb strings.Builder
+	for _, r := range bio {
+		if unicode.IsControl(r) && r != '\n' {
+			continue
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+// validateTimezone accepts "" (clearing the field) or a real IANA time zone
+// name, and rejects everything else. A free-text timezone field would let a
+// client store a string that looks plausible but resolves to nothing useful;
+// validating against the actual database is what makes the stored value safe
+// for a future consumer to compute a local time from. "Local" is rejected even
+// though time.LoadLocation accepts it, because it names the server's own
+// system zone, not a zone the user chose — storing it would silently change
+// meaning if the server's deployment environment ever changes.
+func validateTimezone(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	if trimmed == "Local" {
+		return "", fmt.Errorf("%w: timezone must be a valid IANA time zone name", domain.ErrInvalidInput)
+	}
+	if _, err := time.LoadLocation(trimmed); err != nil {
+		return "", fmt.Errorf("%w: timezone must be a valid IANA time zone name", domain.ErrInvalidInput)
+	}
+	return trimmed, nil
 }
 
 func (s *UserService) CreateUser(ctx context.Context, input domain.CreateUserInput) (domain.User, error) {

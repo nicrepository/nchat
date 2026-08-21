@@ -30,14 +30,69 @@ const (
 	// conversation. Everyone else was never shown the message and must not learn
 	// that it existed.
 	EventTypeMessageBlocked EventType = "message.blocked"
+	// EventTypeMessageLinkSafetyChanged tells the subscribers of a conversation
+	// that what is known about a published message's links has changed (issue
+	// #135).
+	//
+	// It exists because a message may now be published while its links are only
+	// *inconclusive* — the provider confirmed a scan finished without producing a
+	// verdict, which is not evidence of anything and must not block a legitimate
+	// send. Reconciliation may later obtain the real answer, in either direction,
+	// and this is how every client that already holds the message converges:
+	//
+	//   inconclusive -> safe       the "could not verify" notice is removed
+	//   inconclusive -> malicious  the links stop being usable
+	//
+	// It is addressed to the conversation and not to the author, unlike
+	// message.blocked, and that is the whole difference: the message *was*
+	// delivered, so everyone holding it has to be corrected. Emitting a second
+	// message.created instead would duplicate the message and re-fire its
+	// mentions; this event mutates one field of a message the client already has.
+	//
+	// The payload is a message id and a state from a closed set. No URL, no scan
+	// uuid, no provider text — see MessageLinkSafetyPayload.
+	EventTypeMessageLinkSafetyChanged EventType = "message.link_safety_changed"
 )
 
-// MessageBlockedReasonMaliciousLink is the only reason message.blocked carries.
+// MessageLinkSafetyPayload carries the new link-safety state of one published
+// message (issue #135).
 //
-// A constant rather than a message from the provider: whichever category
+// Three fields, and the omissions are the contract. There is no URL, because a
+// subscriber does not need to be told which of a message's links changed and a
+// broadcast is the worst possible place to enumerate them. There is no scan uuid,
+// because that is an account-internal provider identifier. There is no provider
+// message: Cloudflare's own text is an English sentence that can name the
+// hostname, and it is never shown to a user or carried in an event.
+//
+// State is one of the domain.MessageLinkSafety values, as a string. It is
+// re-validated against that closed set when the event arrives over the bus, so a
+// remote instance cannot inject a state this version does not understand — and in
+// particular cannot invent one that a client might treat as a clearance.
+//
+// UpdatedAt orders this correction against message.updated/message.created.
+// It is safe to relay across the bus, unlike MessagePayload, precisely because it
+// carries no user content. There is nothing here to re-fetch by id.
+type MessageLinkSafetyPayload struct {
+	MessageID string `json:"message_id"`
+	// State is a domain.MessageLinkSafety value: "safe", "inconclusive" or
+	// "malicious". The empty state is never announced — a message with nothing to
+	// say about links has nothing to correct.
+	State     string    `json:"state"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// MessageBlockedReasonMaliciousLink and MessageBlockedReasonLinkCheckInconclusive
+// are the only reasons message.blocked carries — a closed set.
+//
+// Constants rather than a message from the provider: whichever category
 // Cloudflare reported is not the author's to receive, and repeating it would
-// make the endpoint an oracle for which domains are already known.
-const MessageBlockedReasonMaliciousLink = "malicious_link"
+// make the endpoint an oracle for which domains are already known. The two are
+// kept distinct so a scan that finished without a usable verdict is never
+// announced to its author as "malicious" — it is fail-closed, not a finding.
+const (
+	MessageBlockedReasonMaliciousLink         = "malicious_link"
+	MessageBlockedReasonLinkCheckInconclusive = "link_check_inconclusive"
+)
 
 const (
 	EventTypeReactionUpdated EventType = "reaction.updated"
@@ -113,6 +168,21 @@ const (
 	EventTypeCallCancelled EventType = "call.cancelled"
 	EventTypeCallTimedOut  EventType = "call.timed_out"
 	EventTypeCallEnded     EventType = "call.ended"
+
+	// EventTypeTypingUpdated carries one user's typing state in a channel or DM.
+	//
+	// It routes by (workspace, target) exactly like presence.updated, and for
+	// the same reason: fan-out already re-authorizes every subscriber, so that
+	// is the whole authorization story here too. Unlike presence, the state is
+	// client-declared (typing.start/typing.stop) rather than inferred from
+	// arbitrary traffic — the server never invents a typing state, it only
+	// relays and expires the one the client asserted, and only for a target the
+	// asserting connection is currently authorized on.
+	//
+	// The payload never carries what was typed, only that someone is typing.
+	// Ephemeral by design: never persisted to Postgres, backed by a short-TTL
+	// Valkey key that self-clears if no stop is ever sent.
+	EventTypeTypingUpdated EventType = "typing.updated"
 )
 
 // CurrentEventSchemaVersion is the version of the outbound WebSocket event
@@ -133,7 +203,15 @@ const (
 	ClientMessageTypeCallDecline    ClientMessageType = "call.decline"
 	ClientMessageTypeCallCancel     ClientMessageType = "call.cancel"
 	ClientMessageTypeCallEnd        ClientMessageType = "call.end"
-	ClientMessageTypeCallSync       ClientMessageType = "call.sync"
+	// ClientMessageTypeCallLeave releases one participant's own presence in a
+	// resource (channel/group-DM) call without ending it for anyone else —
+	// see CallHandler.LeaveCall (issue #569). It has no direct-call meaning:
+	// a 1:1 call's participants use call.decline/call.cancel/call.end.
+	ClientMessageTypeCallLeave    ClientMessageType = "call.leave"
+	ClientMessageTypeCallSync     ClientMessageType = "call.sync"
+	ClientMessageTypeCallPresence ClientMessageType = "call.presence"
+	ClientMessageTypeTypingStart  ClientMessageType = "typing.start"
+	ClientMessageTypeTypingStop   ClientMessageType = "typing.stop"
 )
 
 // MessagePayload carries the full message DTO for message.created events.
@@ -145,23 +223,29 @@ const (
 //   - All fields are server-populated from the authoritative DB record.
 //   - No tokens, secrets, credentials, or sender email may appear in any field.
 type MessagePayload struct {
-	ID                string        `json:"id"`
-	WorkspaceID       string        `json:"workspace_id"`
-	ChannelID         string        `json:"channel_id,omitempty"`
-	DMConversationID  string        `json:"dm_conversation_id,omitempty"`
-	SenderID          string        `json:"sender_id"`
-	SenderDisplayName string        `json:"sender_display_name"`
-	Kind              string        `json:"kind"`
-	BodyText          string        `json:"body_text"`
-	BodyFormat        string        `json:"body_format"`
-	Status            string        `json:"status"`
-	IsRemoved         bool          `json:"is_removed"`
-	CreatedAt         time.Time     `json:"created_at"`
-	UpdatedAt         time.Time     `json:"updated_at"`
-	EditedAt          *time.Time    `json:"edited_at,omitempty"`
-	DeletedAt         *time.Time    `json:"deleted_at,omitempty"`
-	Quoted            *QuotePayload `json:"quoted,omitempty"`
-	IsForwarded       bool          `json:"is_forwarded"`
+	ID                string `json:"id"`
+	WorkspaceID       string `json:"workspace_id"`
+	ChannelID         string `json:"channel_id,omitempty"`
+	DMConversationID  string `json:"dm_conversation_id,omitempty"`
+	SenderID          string `json:"sender_id"`
+	SenderDisplayName string `json:"sender_display_name"`
+	Kind              string `json:"kind"`
+	BodyText          string `json:"body_text"`
+	BodyFormat        string `json:"body_format"`
+	Status            string `json:"status"`
+	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
+	// A subscriber uses it to decide whether to draw the "could not verify this
+	// link" notice on a message it is inserting. It authorises nothing — see
+	// domain.MessageLinkSafety — and is omitted for the overwhelming majority of
+	// messages, which carry no links at all.
+	LinkSafetyState string        `json:"link_safety_state,omitempty"`
+	IsRemoved       bool          `json:"is_removed"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+	EditedAt        *time.Time    `json:"edited_at,omitempty"`
+	DeletedAt       *time.Time    `json:"deleted_at,omitempty"`
+	Quoted          *QuotePayload `json:"quoted,omitempty"`
+	IsForwarded     bool          `json:"is_forwarded"`
 	// Attachments lets a subscriber render a message that carries a file without
 	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
 	// metadata the list endpoints publish and grants nothing: content and preview
@@ -176,18 +260,19 @@ type MessagePayload struct {
 
 // MessageUpdatedPayload carries authoritative edit or deletion fields.
 type MessageUpdatedPayload struct {
-	MessageID  string     `json:"message_id"`
-	ChannelID  string     `json:"channel_id,omitempty"`
-	DMID       string     `json:"dm_id,omitempty"`
-	Body       string     `json:"body"`
-	BodyFormat string     `json:"body_format"`
-	EditedAt   time.Time  `json:"edited_at"`
-	EditCount  int        `json:"edit_count"`
-	IsEdited   bool       `json:"is_edited"`
-	Status     string     `json:"status"`
-	IsRemoved  bool       `json:"is_removed"`
-	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	MessageID       string     `json:"message_id"`
+	ChannelID       string     `json:"channel_id,omitempty"`
+	DMID            string     `json:"dm_id,omitempty"`
+	Body            string     `json:"body"`
+	BodyFormat      string     `json:"body_format"`
+	LinkSafetyState string     `json:"link_safety_state"`
+	EditedAt        time.Time  `json:"edited_at"`
+	EditCount       int        `json:"edit_count"`
+	IsEdited        bool       `json:"is_edited"`
+	Status          string     `json:"status"`
+	IsRemoved       bool       `json:"is_removed"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // MessageAttachmentPayload mirrors the attachment metadata the HTTP message
@@ -203,13 +288,15 @@ type MessageAttachmentPayload struct {
 }
 
 type QuotePayload struct {
-	ID         string     `json:"id"`
-	AuthorID   string     `json:"author_id"`
-	Body       string     `json:"body,omitempty"`
-	BodyFormat string     `json:"body_format"`
-	IsRemoved  bool       `json:"is_removed,omitempty"`
-	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID              string     `json:"id"`
+	AuthorID        string     `json:"author_id"`
+	Body            string     `json:"body,omitempty"`
+	BodyFormat      string     `json:"body_format"`
+	LinkSafetyState string     `json:"link_safety_state,omitempty"`
+	IsRemoved       bool       `json:"is_removed,omitempty"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type ReactionPayload struct {
@@ -286,6 +373,32 @@ type PresencePayload struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+// TypingEventPayload is one user's typing state in a channel or DM.
+//
+// IsTyping is exactly what the client asserted (typing.start => true,
+// typing.stop or expiry => false) — never inferred. UpdatedAt is when the
+// server accepted that assertion, as an RFC 3339 string for the same reason
+// PresencePayload's is: a producer's formatting must not be able to make the
+// whole envelope undecodable, and it is the ordering key a client uses to
+// discard a stale update without trusting its own clock.
+//
+// UserDisplayName is resolved server-side once per WebSocket connection (see
+// ws.UserDisplayNameResolver / Client.displayName) rather than guessed by each
+// recipient's client from whatever roster or message history it happens to
+// have loaded — that guess is what previously fell back to the literal
+// placeholder "Alguém" for a channel typist who hadn't posted yet. Empty when
+// the lookup failed or the user has no display name; clients keep their own
+// heuristic as a fallback in that case.
+//
+// There is deliberately no body, no draft, no character count: this payload
+// answers "is this person typing right now", nothing about what they wrote.
+type TypingEventPayload struct {
+	UserID          string `json:"user_id"`
+	UserDisplayName string `json:"user_display_name,omitempty"`
+	IsTyping        bool   `json:"is_typing"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
 // PresenceSnapshotResponse answers a subscribe with the presence of the users
 // already in that target (RF-58).
 //
@@ -350,18 +463,20 @@ type ReactionEventPayload struct {
 }
 
 type CallEventPayload struct {
-	ID         string            `json:"call_id"`
-	RequestID  string            `json:"request_id"`
-	CallerID   string            `json:"caller_id"`
-	CalleeID   string            `json:"callee_id"`
-	CallType   domain.CallType   `json:"call_type"`
-	Status     domain.CallStatus `json:"status"`
-	Version    int64             `json:"version"`
-	CreatedAt  time.Time         `json:"created_at"`
-	OccurredAt time.Time         `json:"occurred_at"`
-	ExpiresAt  time.Time         `json:"expires_at"`
-	AcceptedAt *time.Time        `json:"accepted_at,omitempty"`
-	EndedAt    *time.Time        `json:"ended_at,omitempty"`
+	ID         string                `json:"call_id"`
+	RequestID  string                `json:"request_id"`
+	CallerID   string                `json:"caller_id"`
+	CalleeID   string                `json:"callee_id,omitempty"`
+	TargetType domain.CallTargetType `json:"target_type"`
+	TargetID   string                `json:"target_id"`
+	CallType   domain.CallType       `json:"call_type"`
+	Status     domain.CallStatus     `json:"status"`
+	Version    int64                 `json:"version"`
+	CreatedAt  time.Time             `json:"created_at"`
+	OccurredAt time.Time             `json:"occurred_at"`
+	ExpiresAt  time.Time             `json:"expires_at"`
+	AcceptedAt *time.Time            `json:"accepted_at,omitempty"`
+	EndedAt    *time.Time            `json:"ended_at,omitempty"`
 }
 
 // Event is the outbound event envelope sent to WebSocket clients and exchanged
@@ -393,6 +508,13 @@ type Event struct {
 	Attachment *AttachmentStatusPayload `json:"attachment,omitempty"`
 	// Presence carries one user's online/away/offline state (RF-58).
 	Presence *PresencePayload `json:"presence,omitempty"`
+	// LinkSafety carries a change to what is known about a published message's
+	// links (issue #135). Set only for message.link_safety_changed, and stripped
+	// from every other event type on arrival — an event carrying one alongside an
+	// unrelated type is relaying a state nobody asked it about.
+	LinkSafety *MessageLinkSafetyPayload `json:"link_safety,omitempty"`
+	// Typing carries one user's typing state in a channel or DM.
+	Typing *TypingEventPayload `json:"typing,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.
 	//
 	// Set only for conversation.available, which is not delivered by

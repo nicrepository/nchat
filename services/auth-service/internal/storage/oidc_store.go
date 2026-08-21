@@ -23,9 +23,9 @@ func NewPGXOIDCStore(pool Pool) *PGXOIDCStore {
 func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLoginRequest) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO auth.oidc_auth_requests
-		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), req.ExpiresAt,
+		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, app_context, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), string(req.AppContext), req.ExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert oidc auth request: %w", err)
@@ -35,6 +35,7 @@ func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLog
 
 func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHash string) (domain.OIDCConsumedAuthRequest, error) {
 	var req domain.OIDCConsumedAuthRequest
+	var appContext string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE auth.oidc_auth_requests
 		SET used_at = now()
@@ -42,15 +43,23 @@ func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHa
 		  AND state_hash = $2
 		  AND used_at IS NULL
 		  AND expires_at > now()
-		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, '')`,
+		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, ''), app_context`,
 		provider, stateHash,
-	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter)
+	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter, &appContext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
 	}
 	if err != nil {
 		return domain.OIDCConsumedAuthRequest{}, fmt.Errorf("consume oidc auth request: %w", err)
 	}
+	// The stored label is re-parsed rather than cast: a row written by a future
+	// build, or edited by hand, must not smuggle an unknown context past the
+	// service's allowlist.
+	parsed, ok := domain.ParseOIDCAppContext(appContext)
+	if !ok {
+		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
+	}
+	req.AppContext = parsed
 	return req, nil
 }
 
@@ -150,7 +159,29 @@ func resolveOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInp
 	if !input.AutoProvision {
 		return domain.LoginUser{}, domain.ErrOIDCProvisioningDisabled
 	}
-	return insertOIDCUser(ctx, tx, input)
+
+	user, inserted, err := insertOIDCUser(ctx, tx, input)
+	if err != nil {
+		return domain.LoginUser{}, err
+	}
+	if inserted {
+		return user, nil
+	}
+
+	// The insert found a unique constraint already taken. Nothing above locked
+	// the absent row, so the winner of a concurrent first login is the ordinary
+	// outcome here: the ON CONFLICT clause waited for that transaction to
+	// commit, and its account is now visible. Re-reading by subject is what
+	// tells the two cases apart — the same identity means log in, anything else
+	// means the e-mail belongs to an account this subject does not own.
+	user, found, err = selectOIDCUserBySubject(ctx, tx, input.Provider, input.Subject)
+	if err != nil {
+		return domain.LoginUser{}, err
+	}
+	if !found {
+		return domain.LoginUser{}, domain.ErrOIDCAccountConflict
+	}
+	return user, nil
 }
 
 func selectOIDCUserBySubject(ctx context.Context, tx pgx.Tx, provider, subject string) (domain.LoginUser, bool, error) {
@@ -197,7 +228,7 @@ func oidcEmailExists(ctx context.Context, tx pgx.Tx, email string) (bool, error)
 	return true, nil
 }
 
-func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInput) (domain.LoginUser, error) {
+func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInput) (domain.LoginUser, bool, error) {
 	// display_name is NOT NULL, so provisioning is the one place the generic
 	// placeholder applies. full_name and avatar_url stay NULL when unknown.
 	displayName := input.DisplayName
@@ -205,19 +236,29 @@ func insertOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInpu
 		displayName = domain.DefaultDisplayName
 	}
 	var user domain.LoginUser
+	// ON CONFLICT DO NOTHING rather than a bare insert: a raw 23505 would abort
+	// the whole login transaction, leaving no way to tell a lost provisioning
+	// race from a genuine e-mail collision. The clause covers every unique
+	// constraint on the table — users_email_unique and the partial index on
+	// (external_provider, external_subject) alike — and returns no row instead,
+	// which the caller resolves.
 	err := tx.QueryRow(ctx, `
 		INSERT INTO auth.users
 		  (email, display_name, full_name, avatar_url, status, auth_source,
 		   external_provider, external_subject, email_verified_at)
 		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), 'active', 'oidc', $5, $6, now())
+		ON CONFLICT DO NOTHING
 		RETURNING id, email::text, display_name`,
 		input.Email, displayName, input.FullName, input.AvatarURL,
 		input.Provider, input.Subject,
 	).Scan(&user.ID, &user.Email, &user.DisplayName)
-	if err != nil {
-		return domain.LoginUser{}, fmt.Errorf("insert oidc user: %w", err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.LoginUser{}, false, nil
 	}
-	return user, nil
+	if err != nil {
+		return domain.LoginUser{}, false, fmt.Errorf("insert oidc user: %w", err)
+	}
+	return user, true, nil
 }
 
 // syncOIDCUserProfile refreshes the profile of a returning OIDC user from the

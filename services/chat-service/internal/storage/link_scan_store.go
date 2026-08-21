@@ -100,6 +100,11 @@ type LinkScanJob struct {
 type ResolveSummary struct {
 	Published int
 	Blocked   int
+	// PublishedInconclusive is the subset of Published whose links could not all
+	// be verified. Counted separately because it is the number that tells an
+	// operator the provider has stopped producing verdicts — the messages went
+	// out, so nothing else about the system looks wrong.
+	PublishedInconclusive int
 }
 
 // Total reports how many withheld messages the pass decided.
@@ -120,6 +125,11 @@ type PublishEvent struct {
 	TargetID   string
 	Message    domain.Message
 
+	// Reason is set only for a message.blocked event: one of the closed set the
+	// ws package defines (malicious_link, link_check_inconclusive), read back
+	// from block_reason. Empty for message.created, which carries no reason.
+	Reason string
+
 	// Cancelled marks an event whose message no longer exists, so the dispatcher
 	// retires it instead of retrying something that can never succeed.
 	Cancelled bool
@@ -132,6 +142,11 @@ const (
 	EventMessageBlocked = "message.blocked"
 
 	TargetSender = "sender"
+	// TargetChannel and TargetDM name the two conversation audiences. They were
+	// SQL literals until the link-safety change event needed to address the same
+	// audiences from Go; naming them keeps the two routings provably identical.
+	TargetChannel = "channel"
+	TargetDM      = "dm"
 )
 
 // Blocked reports whether this event announces a refusal rather than a
@@ -157,8 +172,18 @@ const (
 // riding a verdict from last week. Reputation changes in both directions, and a
 // cache that never expires is a control that only ever gets weaker.
 //
-// A URL absent from the result has no usable verdict. There is no third return
-// value saying why, because every reason has the same consequence.
+// Three states are returned, not two: `safe`, `malicious` and `inconclusive`.
+// The first two are subject to the freshness window; `inconclusive` is not,
+// because it is terminal rather than a clearance with a lifetime.
+//
+// Returning inconclusive here is **not** returning a verdict. The caller's policy
+// (aggregateLinkDecision) is what decides what each state means, and it has never
+// treated inconclusive as an answer — it is reported so that the one caller which
+// genuinely needs to tell "decided to say nothing" from "not decided yet", the
+// edit path, can do so without a second query and a second policy.
+//
+// A URL absent from the result has no usable state at all: never scanned, or
+// scanned and expired.
 func (s *PGXMessageStore) LoadLinkVerdicts(
 	ctx context.Context, canonicalURLs []string,
 ) (map[string]urlsafety.Verdict, error) {
@@ -169,7 +194,7 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 		SELECT canonical_url, status
 		FROM chat.link_scans
 		WHERE canonical_url = ANY($1::text[])
-		  AND status <> 'pending'
+		  AND status IN ('safe', 'malicious')
 		  AND decided_at > now() - ($2 * interval '1 second')`,
 		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
 	)
@@ -197,12 +222,15 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 	return verdicts, nil
 }
 
-// verdictIsLoadable reports whether a stored status may be served as a verdict.
+// verdictIsLoadable reports whether a stored status is one this package
+// recognises and may report to the policy layer.
 //
-// One place, so "what counts as an answer" cannot drift between the read path
-// and the writer that is supposed to have refused it.
+// It is *not* "may be treated as a clearance" — inconclusive passes here and is
+// never a clearance anywhere. One place, so a corrupted or future status cannot
+// reach the policy layer at all.
 func verdictIsLoadable(status string) bool {
-	return urlsafety.Verdict(status).IsFinal()
+	verdict := urlsafety.Verdict(status)
+	return verdict.IsFinal() || verdict == urlsafety.VerdictInconclusive
 }
 
 // EnsureLinkScans records that these canonical URLs need a verdict.
@@ -232,12 +260,18 @@ func (s *PGXMessageStore) EnsureLinkScans(ctx context.Context, canonicalURLs []s
 	// A decided row whose verdict has expired is due again. This is the one
 	// update that may touch a decided row, and it can only ever move it from
 	// "stale clearance" to "must be re-scanned" — never the other way.
+	//
+	// Scoped to safe/malicious only: inconclusive is deliberately excluded. It
+	// has no clearance to go stale, and reopening it here would be exactly the
+	// automatic resubmit loop the fix for that terminal state refuses to
+	// introduce — an inconclusive row stays inconclusive until something
+	// deliberate changes it, not until VerdictTTL happens to elapse.
 	_, err = s.pool.Exec(ctx, `
 		UPDATE chat.link_scans
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
 		       attempts = 0, next_attempt_at = NULL, updated_at = now()
 		 WHERE canonical_url = ANY($1::text[])
-		   AND status <> 'pending'
+		   AND status IN ('safe', 'malicious')
 		   AND decided_at <= now() - ($2 * interval '1 second')`,
 		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
 	)
@@ -314,17 +348,21 @@ func (s *PGXMessageStore) LinkScanBacklog(ctx context.Context) (map[string]int, 
 // Idempotent by construction: a row already pending is not matched, so repeated
 // passes and concurrent workers cannot produce a second scan for one URL.
 func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error) {
+	// Scoped to safe/malicious for the same reason EnsureLinkScans is: an
+	// inconclusive row has no clearance to expire, and reopening it on a timer
+	// would be the automatic resubmit loop this terminal state must not have.
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans ls
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
 		       attempts = 0, next_attempt_at = NULL, updated_at = now()
-		 WHERE ls.status <> 'pending'
+		 WHERE ls.status IN ('safe', 'malicious')
 		   AND ls.decided_at <= now() - ($1 * interval '1 second')
 		   AND EXISTS (
 		       SELECT 1
 		       FROM chat.message_link_scans mls
 		       JOIN chat.messages m ON m.id = mls.message_id
 		       WHERE mls.canonical_url = ls.canonical_url
+		         AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
 		         AND m.status = 'pending_link_scan'
 		   )`,
 		urlsafety.VerdictTTL.Seconds(),
@@ -381,7 +419,15 @@ const linkSafetyStatesQuery = `
 	           WHERE mls.message_id = m.id
 	             AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
 	             AND ls.status = 'malicious'
-	       ) AS malicious
+	       ) AS malicious,
+	       EXISTS (
+	           SELECT 1
+	           FROM chat.message_link_scans mls
+	           JOIN chat.link_scans ls ON ls.canonical_url = mls.canonical_url
+	           WHERE mls.message_id = m.id
+	             AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
+	             AND ls.status = 'inconclusive'
+	       ) AS inconclusive
 	FROM chat.messages m
 	JOIN chat.workspace_members wm
 	  ON wm.workspace_id = m.workspace_id
@@ -412,12 +458,13 @@ func (s *PGXMessageStore) LinkSafetyStates(
 	states := make([]domain.MessageLinkSafetyState, 0, len(messageIDs))
 	for rows.Next() {
 		var id, status string
-		var malicious bool
-		if err := rows.Scan(&id, &status, &malicious); err != nil {
+		var malicious, inconclusive bool
+		if err := rows.Scan(&id, &status, &malicious, &inconclusive); err != nil {
 			return nil, fmt.Errorf("scan link safety state: %w", err)
 		}
+		state, reason := linkSafetyState(status, malicious, inconclusive)
 		states = append(states, domain.MessageLinkSafetyState{
-			MessageID: id, State: linkSafetyState(status, malicious),
+			MessageID: id, State: state, Reason: reason,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -426,21 +473,26 @@ func (s *PGXMessageStore) LinkSafetyStates(
 	return states, nil
 }
 
-// linkSafetyState maps a stored row to the state its author is told about.
+// linkSafetyState maps a stored row to the state, and for a blocked one the
+// reason, its author is told about.
 //
 // A separate function so the mapping is unit-testable without a database, and
 // so the one branch that matters — a deleted message is only *blocked* when a
-// malicious verdict explains it — is stated in one place.
-func linkSafetyState(status string, malicious bool) domain.LinkSafetyState {
+// malicious or inconclusive verdict explains it — is stated in one place.
+// Malicious wins the tie: a message whose links included both a malicious URL
+// and an inconclusive one was refused for the stronger reason.
+func linkSafetyState(status string, malicious, inconclusive bool) (domain.LinkSafetyState, string) {
 	switch {
 	case status == string(domain.MessageStatusPendingLinkScan):
-		return domain.LinkSafetyStatePending
+		return domain.LinkSafetyStatePending, ""
 	case status == string(domain.MessageStatusActive):
-		return domain.LinkSafetyStateActive
+		return domain.LinkSafetyStateActive, ""
 	case malicious:
-		return domain.LinkSafetyStateBlocked
+		return domain.LinkSafetyStateBlocked, domain.LinkSafetyReasonMaliciousLink
+	case inconclusive:
+		return domain.LinkSafetyStateBlocked, domain.LinkSafetyReasonLinkCheckInconclusive
 	default:
-		return domain.LinkSafetyStateDeleted
+		return domain.LinkSafetyStateDeleted, ""
 	}
 }
 
@@ -546,12 +598,15 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(
 	return nil
 }
 
-// RecordLinkVerdict stores a final verdict.
+// RecordLinkVerdict stores a terminal poll outcome: safe, malicious, or
+// inconclusive.
 //
-// It refuses anything that is not an explicit clearance or condemnation, which
-// is the same rule the shared package applies: a zero value, a value from a
-// future version, or a provider client bug must not be able to write a row that
-// later reads as safe.
+// It refuses anything that is not one of those three, which is the same rule
+// the shared package applies: a zero value, a value from a future version, or a
+// provider client bug must not be able to write a row that later reads as safe.
+// Inconclusive is accepted here but is never IsFinal() and is never loadable as
+// a verdict by LoadLinkVerdicts — it is a terminal lifecycle state for the scan,
+// not a clearance.
 //
 // The write is bound to the scan it came from. A worker whose lease expired
 // while it was waiting on the provider may still be holding a verdict for a scan
@@ -563,8 +618,11 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(
 func (s *PGXMessageStore) RecordLinkVerdict(
 	ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict,
 ) error {
-	if !verdict.IsFinal() {
+	if !verdict.IsFinal() && verdict != urlsafety.VerdictInconclusive {
 		return fmt.Errorf("%w: refusing to store a non-final verdict", domain.ErrInvalidInput)
+	}
+	if verdict == urlsafety.VerdictMalicious {
+		return s.recordMaliciousLinkVerdict(ctx, canonicalURL, scanUUID, "pending")
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans
@@ -581,14 +639,102 @@ func (s *PGXMessageStore) RecordLinkVerdict(
 	return nil
 }
 
+// recordMaliciousLinkVerdict is the one compare-and-set for every chat
+// condemnation, whether it came from the initial poll or reconciliation.
+// Publishing the global denial and expiring a file-service SAFE row are CTEs of
+// the same statement, so success can never expose chat=malicious while either
+// current or rolling-deploy file readers still have fetch authority.
+const recordMaliciousLinkVerdictQuery = `
+	WITH updated AS (
+		UPDATE chat.link_scans
+		   SET status = 'malicious', decided_at = now(), next_attempt_at = NULL,
+		       next_reconcile_at = NULL, updated_at = now()
+		 WHERE canonical_url = $1
+		   AND status = $2
+		   AND scan_uuid IS NOT NULL
+		   AND scan_uuid = $3
+		 RETURNING canonical_url
+	),
+	denied AS (
+		INSERT INTO files.link_fetch_denylist (url_digest, canonical_url, source)
+		SELECT $4, updated.canonical_url, 'chat'
+		FROM updated
+		ON CONFLICT (url_digest) DO NOTHING
+		RETURNING url_digest
+	),
+	-- Expiring the per-service row is what reaches an *old* pod during a rolling
+	-- update: its gate is "done and not expired", so an expired row is absent, and
+	-- absent is refusal. Scoped to 'done' because that is the only state that can
+	-- currently authorise a fetch, and because inconclusive rows are protected by
+	-- the 000009 trigger, which this must not fight.
+	expired AS (
+		UPDATE files.link_scans
+		   SET verdict_expires_at = now(), updated_at = now()
+		 WHERE url_digest = $4
+		   AND state = 'done'
+		   AND verdict_expires_at > now()
+		   AND EXISTS (SELECT 1 FROM updated)
+		 RETURNING url_digest
+	)
+	SELECT EXISTS (SELECT 1 FROM updated)`
+
+func (s *PGXMessageStore) recordMaliciousLinkVerdict(
+	ctx context.Context, canonicalURL, scanUUID, expectedStatus string,
+) error {
+	var updated bool
+	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery,
+		canonicalURL, expectedStatus, scanUUID, urlsafety.URLDigest(canonicalURL),
+	).Scan(&updated)
+	if err != nil {
+		return fmt.Errorf("record malicious link verdict: %w", err)
+	}
+	if !updated {
+		return ErrLinkScanConflict
+	}
+	return nil
+}
+
 // resolvePendingMessagesQuery decides every withheld message whose links are all
 // decided, in one statement.
 //
 // The rule is stated once, in SQL, because it has to be atomic with the state
-// change: a message is blocked if *any* of its URLs is malicious, published if
-// *all* of them are safe, and left alone otherwise. Computing it in Go and then
-// writing the result would leave a window in which two replicas both decided to
-// publish the same message and both broadcast it.
+// change. Computing it in Go and then writing the result would leave a window in
+// which two replicas both decided to publish the same message and both broadcast
+// it.
+//
+// # The aggregation, and the two things that changed for issue #135
+//
+// Per URL, a row is *terminal* when it is a fresh clearance, a fresh
+// condemnation, or inconclusive. It is not terminal while it is pending, and a
+// safe or malicious verdict older than VerdictTTL is not terminal either — the
+// send path already refuses an expired clearance and this applies the same rule,
+// which is what an earlier review found missing.
+//
+// Over a message's URLs:
+//
+//	any terminal-malicious          -> blocked, immediately
+//	otherwise, all terminal:
+//	    any inconclusive            -> published, link_safety_state=inconclusive
+//	    otherwise                   -> published, link_safety_state=safe
+//	otherwise                       -> left alone; work is still outstanding
+//
+// The first change is `all_terminal` replacing `all_fresh_safe`, and it is a
+// correctness requirement created by the second: while inconclusive meant
+// "refuse", publishing early on it was impossible, so it was safe to decide a
+// message the moment *any* URL came back inconclusive. Now that inconclusive
+// publishes, deciding early would deliver a message whose second URL could still
+// turn out to be malicious. A message is not published while any of its links may
+// still be condemned.
+//
+// Malicious is still allowed to decide the message on its own, before the other
+// URLs are terminal. That is not the same risk in reverse: the outcome is a
+// refusal, and no later verdict can make a refusal wrong.
+//
+// The second change is that inconclusive no longer produces status='deleted' and a
+// sender-only message.blocked. It publishes, to the ordinary audience, carrying
+// link_safety_state='inconclusive' — a marker the client draws a notice from and
+// that nothing in this codebase may read as permission to fetch the URL. See
+// domain.MessageLinkSafety.
 //
 // The UPDATE's own predicate — status = 'pending_link_scan' — is what makes the
 // promotion exactly-once. Two replicas may both evaluate the rule; only one
@@ -598,15 +744,22 @@ const resolvePendingMessagesQuery = `
 	WITH candidate AS (
 		SELECT m.id,
 		       m.link_safety_fingerprint AS fingerprint,
-		       -- A verdict is only usable while it is fresh. The send path already
-		       -- refuses an expired clearance; this is the same rule applied here,
-		       -- which is what the review found missing — the resolver only asked
-		       -- whether a row had stopped being pending, so a clearance decided
-		       -- hours ago still promoted a message.
 		       bool_or(ls.status = 'malicious'
 		               AND ls.decided_at > now() - ($2 * interval '1 second')) AS blocked,
-		       bool_and(ls.status = 'safe'
-		                AND ls.decided_at > now() - ($2 * interval '1 second')) AS all_fresh_safe
+		       -- Inconclusive has no freshness window — see ReopenExpiredVerdicts —
+		       -- so it is checked without one: a scan that finished without a
+		       -- usable verdict stays that way until reconciliation deliberately
+		       -- changes it, and a message waiting on it must stop waiting rather
+		       -- than poll a terminal row forever.
+		       bool_or(ls.status = 'inconclusive') AS has_inconclusive,
+		       -- "No link of this message can still change to malicious." This is
+		       -- the gate that keeps a message with one inconclusive URL and one
+		       -- still-pending URL withheld.
+		       bool_and(
+		           (ls.status IN ('safe', 'malicious')
+		            AND ls.decided_at > now() - ($2 * interval '1 second'))
+		           OR ls.status = 'inconclusive'
+		       ) AS all_terminal
 		FROM chat.messages m
 		JOIN chat.message_link_scans mls
 		  ON mls.message_id = m.id
@@ -623,6 +776,16 @@ const resolvePendingMessagesQuery = `
 		UPDATE chat.messages m
 		   SET status = CASE WHEN candidate.blocked THEN 'deleted' ELSE 'active' END,
 		       deleted_at = CASE WHEN candidate.blocked THEN now() ELSE m.deleted_at END,
+		       -- Written in the same statement as the status, so a published
+		       -- message can never exist without the marker that says what may be
+		       -- done with its links. A blocked one is marked too: its author's
+		       -- client is told nothing about the body, but the row itself carries
+		       -- the reason it is a tombstone.
+		       link_safety_state = CASE
+		                             WHEN candidate.blocked THEN 'malicious'
+		                             WHEN candidate.has_inconclusive THEN 'inconclusive'
+		                             ELSE 'safe'
+		                           END,
 		       updated_at = now()
 		  FROM candidate
 		 WHERE m.id = candidate.id
@@ -632,17 +795,25 @@ const resolvePendingMessagesQuery = `
 		   -- published.
 		   AND m.status = 'pending_link_scan'
 		   AND COALESCE(m.link_safety_fingerprint, '') = COALESCE(candidate.fingerprint, '')
-		   AND (candidate.blocked OR candidate.all_fresh_safe)
-		RETURNING m.id, m.workspace_id, m.sender_id, NOT candidate.blocked AS published,
+		   AND (candidate.blocked OR candidate.all_terminal)
+		RETURNING m.id, m.workspace_id, m.sender_id,
+		          NOT candidate.blocked AS published,
+		          candidate.has_inconclusive,
 		          COALESCE(m.channel_id::text, '') AS channel_id,
 		          COALESCE(m.dm_conversation_id::text, '') AS conversation_id
 	),
 	queued AS (
-		-- Two terminal outcomes, both announced durably. A promotion goes to the
-		-- target; a block goes only to its author, who would otherwise be left
-		-- watching a message that never resolves.
+		-- Two terminal outcomes now, not three. A promotion — safe or
+		-- inconclusive — goes to the target, because the message was published and
+		-- its recipients must receive it exactly as they would any other. A
+		-- refusal goes only to its author.
+		--
+		-- block_reason is always 'malicious_link' here: a refusal can no longer be
+		-- caused by an inconclusive scan. The column keeps its other permitted
+		-- value for the rows written by the previous version, which are still in
+		-- the table and still deliverable.
 		INSERT INTO chat.message_publish_outbox
-			(message_id, workspace_id, event_type, target_type, target_id)
+			(message_id, workspace_id, event_type, target_type, target_id, block_reason)
 		SELECT promoted.id, promoted.workspace_id,
 		       CASE WHEN promoted.published THEN 'message.created' ELSE 'message.blocked' END,
 		       CASE
@@ -654,7 +825,8 @@ const resolvePendingMessagesQuery = `
 		          WHEN NOT promoted.published THEN promoted.sender_id::text
 		          WHEN promoted.channel_id <> '' THEN promoted.channel_id
 		          ELSE promoted.conversation_id
-		        END)::uuid
+		        END)::uuid,
+		       CASE WHEN promoted.published THEN NULL ELSE 'malicious_link' END
 		FROM promoted
 		ON CONFLICT (message_id) DO NOTHING
 		RETURNING message_id
@@ -665,6 +837,11 @@ const resolvePendingMessagesQuery = `
 		-- mentions were parked at creation and are released here, in the same
 		-- transaction that makes the message publishable. A blocked message never
 		-- reaches this step.
+		--
+		-- An inconclusive message does, and that is deliberate: it was published,
+		-- so its mentions are as real as any other message's. A notification names
+		-- a message, it does not fetch a URL, so nothing downstream of here gains
+		-- an authority the message itself does not have.
 		INSERT INTO chat.notification_outbox
 			(workspace_id, message_id, recipient_user_id, kind, status)
 		SELECT promoted.workspace_id, promoted.id, mention.user_id, 'mention', 'pending'
@@ -674,7 +851,7 @@ const resolvePendingMessagesQuery = `
 		ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 		RETURNING message_id
 	)
-	SELECT id::text, published FROM promoted`
+	SELECT id::text, published, has_inconclusive FROM promoted`
 
 // ResolveDecidedMessages promotes or blocks withheld messages whose links have
 // all been decided.
@@ -700,15 +877,18 @@ func (s *PGXMessageStore) ResolveDecidedMessages(ctx context.Context) (ResolveSu
 	var summary ResolveSummary
 	for rows.Next() {
 		var id string
-		var published bool
-		if err := rows.Scan(&id, &published); err != nil {
+		var published, inconclusive bool
+		if err := rows.Scan(&id, &published, &inconclusive); err != nil {
 			return ResolveSummary{}, fmt.Errorf("scan resolved message: %w", err)
 		}
-		if published {
-			summary.Published++
+		if !published {
+			summary.Blocked++
 			continue
 		}
-		summary.Blocked++
+		summary.Published++
+		if inconclusive {
+			summary.PublishedInconclusive++
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return ResolveSummary{}, fmt.Errorf("resolve decided messages: %w", err)
@@ -739,7 +919,7 @@ const claimPublishEventsQuery = `
 	  FROM due
 	 WHERE o.message_id = due.message_id
 	RETURNING o.message_id::text, o.workspace_id::text, o.event_type,
-	          o.target_type, o.target_id::text`
+	          o.target_type, o.target_id::text, COALESCE(o.block_reason, '')`
 
 // ClaimPublishEvents leases up to batchSize undelivered promotion events and
 // returns them with the message payload the broadcast needs.
@@ -762,7 +942,7 @@ func (s *PGXMessageStore) ClaimPublishEvents(ctx context.Context, batchSize int)
 	for rows.Next() {
 		var event PublishEvent
 		if err := rows.Scan(&event.MessageID, &event.WorkspaceID, &event.EventType,
-			&event.TargetType, &event.TargetID); err != nil {
+			&event.TargetType, &event.TargetID, &event.Reason); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan publish event: %w", err)
 		}

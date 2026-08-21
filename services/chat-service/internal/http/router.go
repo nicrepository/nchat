@@ -41,6 +41,34 @@ const pinActionRateLimit = 10
 // mentionSearchRateLimit limits autocomplete enumeration independently from messages.
 const mentionSearchRateLimit = 30
 
+// linkReconcileRateLimit and linkReconcileRateWindow are the per-user budget for
+// "Verificar novamente" (issue #135).
+//
+// A small number, because this is the only user-triggered route that reaches a
+// paid third party. It is deliberately not the read budget: a client that treated
+// the button as a poll would spend Cloudflare quota at 30 a minute per user, and
+// the whole point of the feature is that it is a considered second look rather
+// than a refresh.
+//
+// Enforced by the shared Valkey limiter inside the handler rather than by an
+// in-process middleware, so it is six per minute for a *user* and not six per
+// minute per replica — see actionRateLimiter. Without that, N pods would admit
+// 6 × N.
+//
+// It is the outer of two limits. The inner one is a deployment-wide, durable
+// cooldown of one provider search per canonical URL per minute
+// (storage.ManualReconcileCooldown): this one bounds how often one person may
+// ask, that one bounds how often anyone may cause a request to leave the
+// building.
+const (
+	linkReconcileRateLimit  = 6
+	linkReconcileRateWindow = time.Minute
+	// linkReconcileAction names the counter. It joins the shared
+	// `nchat:chat:action:` namespace, and the user id is hashed by the limiter, so
+	// no identifier reaches Valkey in the clear.
+	linkReconcileAction = "link_safety_reconcile"
+)
+
 const RouteMetrics = "/metrics"
 
 func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, validator *TokenValidator, sessionValidator SessionValidator, sidebar *SidebarHandler, messages *MessageHandler, wsHandler http.Handler, directMessages *DMHandler, channels *ChannelHandler, channelCategories *ChannelCategoryHandler, antiSpam *AntiSpamGuard, sharedMetrics ...*observability.Metrics) http.Handler {
@@ -167,6 +195,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("POST "+RouteChannelReferences, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ResolveChannelMessageReferences)),
 	))
+	mux.Handle("POST "+RouteChannelSecuritySnapshots, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetChannelMessageSecuritySnapshots)),
+	))
 	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
@@ -237,6 +268,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("POST "+RouteDMReferences, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.ResolveDMMessageReferences)),
 	))
+	mux.Handle("POST "+RouteDMSecuritySnapshots, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetDMMessageSecuritySnapshots)),
+	))
 
 	// RF-13/RF-14 message editing, history, soft deletion, and workspace edit-window configuration.
 	// The edit handler applies the shared Valkey Lua limiter before touching DB.
@@ -264,6 +298,19 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	// decides otherwise.
 	mux.Handle("POST "+RouteMessageLinkSafetyStatus, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageLinkSafetyStatus)),
+	))
+	// RF-21 "Verificar novamente" (issue #135). No middleware limiter here on
+	// purpose: this route's budget must hold across replicas, so it is applied
+	// inside the handler against the shared Valkey counter. An in-process
+	// middleware would hand every pod its own full allowance at the one route that
+	// reaches a paid third party. The durable per-URL cooldown in storage is the
+	// second layer.
+	//
+	// POST because it may change state, and message-scoped because the message is
+	// the only thing a client is allowed to name — the URLs behind it are read
+	// server-side. There is deliberately no route here that takes a URL.
+	mux.Handle("POST "+RouteMessageLinkSafetyReconcile, authMiddleware(
+		http.HandlerFunc(messages.ReconcileMessageLinkSafety),
 	))
 	mux.Handle("PATCH "+RouteWorkspaceSettings, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.UpdateWorkspaceEditWindow)),
