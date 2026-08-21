@@ -5,11 +5,25 @@ metadata:
   namespace: nchat
 spec:
   hard:
-    requests.cpu: "4"
-    requests.memory: 6Gi
-    limits.cpu: "8"
-    limits.memory: 12Gi
-    pods: "30"
-    services: "20"
-    persistentvolumeclaims: "5"
+    # Sized for the rollout, not for the steady state. Every Deployment here
+    # uses RollingUpdate with maxUnavailable=0/maxSurge=1, so during a deploy
+    # the namespace briefly books one extra Pod per workload — and a quota on
+    # limits counts the declared ceiling of each of them, not their real usage.
+    # The previous limits.cpu: "8" was reached at ~7850m mid-rollout and
+    # refused the surge Pods and the postgres-bootstrap Job outright, while the
+    # namespace's actual requests sat near 1.1 CPU / 3.1 GiB on a node with
+    # 8 vCPUs and ~49 GiB.
+    #
+    # limits.cpu above the node's core count is deliberate: a quota on limits
+    # reserves nothing, it only caps the sum of declared ceilings. requests are
+    # what the scheduler actually reserves, so those stay conservative.
+    requests.cpu: "6"
+    requests.memory: 12Gi
+    limits.cpu: "16"
+    limits.memory: 24Gi
+    pods: "40"
+    services: "25"
+    persistentvolumeclaims: "8"
+    # Unchanged: raising it needs evidence of the storage backend's real
+    # capacity, which a rollout headroom problem does not provide.
     requests.storage: 110Gi

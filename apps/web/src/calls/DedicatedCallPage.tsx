@@ -17,14 +17,13 @@ export default function DedicatedCallPage() {
   const session = useCallSession();
   const {
     acknowledgeDedicated,
+    activateResourceParticipation,
     announceDedicated,
-    beginResourceParticipation,
     calls,
     dedicatedRecoveryFailed,
     media,
     ownerState,
     registerDirectory,
-    resource,
   } = session;
   const [resolved, setResolved] = useState<Call | null>(null);
   const [directory, setDirectory] = useState<Awaited<ReturnType<typeof fetchSidebarData>> | null>(
@@ -82,23 +81,26 @@ export default function DedicatedCallPage() {
     if (resolved.target_type === "user") {
       void calls.activateMedia();
     } else if (resolved.target_type === "channel" || resolved.target_type === "dm") {
-      // Registers the new participation only once join() itself confirms it
-      // actually succeeded (issue #570 follow-up) — never inferred from
+      // activateResourceParticipation both runs the real join() and — only
+      // once it actually confirms success (issue #570 follow-up) —
+      // registers the new participation; never inferred from
       // resource.callId changing, which a rejoin of the very same call_id
       // (e.g. reopening this exact dedicated tab for a call this user
-      // already left) would never observably do.
-      void resource
-        .join({
-          kind: resolved.target_type,
-          id: resolved.target_id!,
-          name: target.name,
-          callId: resolved.call_id,
-        })
-        .then((joinedCallId) => {
-          if (joinedCallId) void beginResourceParticipation(joinedCallId);
-        });
+      // already left) would never observably do. Deliberately NOT
+      // joinResourceParticipation: this effect runs on every successful
+      // ownerState -> "local" transition, including a plain handoff
+      // continuation reconnecting media for an ALREADY-active participation
+      // — treating that as a fresh join intent would risk masking a real,
+      // currently-accepted "left" for it (issue #594 adversarial follow-up,
+      // round 3).
+      void activateResourceParticipation({
+        kind: resolved.target_type,
+        id: resolved.target_id!,
+        name: target.name,
+        callId: resolved.call_id,
+      });
     }
-  }, [beginResourceParticipation, calls, ownerState, resolved, resource, target]);
+  }, [activateResourceParticipation, calls, ownerState, resolved, target]);
 
   useEffect(() => {
     if (!resolved || acknowledged.current || activationCall.current !== resolved.call_id) return;

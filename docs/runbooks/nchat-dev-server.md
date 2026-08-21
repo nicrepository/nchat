@@ -1173,6 +1173,55 @@ Nunca, como forma de "destravar" uploads:
 - remover `nchat-file-encryption`;
 - abrir NetworkPolicy ou remover as default-deny.
 
+### 17.5 Convergência do search-service (issue #601)
+
+O `search-service` foi estabilizado à mão no cluster: `kubectl set env` para
+`DATABASE_URL` e `AUTH_JWT_HMAC_SECRET`, três NetworkPolicies criadas
+manualmente, e a `ResourceQuota` editada para dar folga ao RollingUpdate. Os
+quatro pontos passam a existir no overlay `nchat-dev-server`, portanto o deploy
+versionado reconstrói o estado sozinho — nenhum `kubectl set env` deve voltar a
+ser necessário.
+
+1. Aplique o deploy versionado. O `apply` **adota**
+   `nchat-allow-search-postgres-egress`, que existe no repositório com o mesmo
+   nome do objeto criado à mão. Ela **não deve ser removida**.
+2. Confirme a convergência do Deployment e da policy adotada:
+
+   ```bash
+   # [srv-apps-01]
+   kubectl -n nchat-dev get deployment search-service \
+     -o jsonpath='{.spec.template.spec.containers[0].env[*].name}'; echo
+   kubectl -n nchat-dev get networkpolicy nchat-allow-search-postgres-egress -o yaml
+   kubectl -n nchat-dev get resourcequota nchat-dev-quota
+   ```
+
+   O Deployment deve listar `DATABASE_URL` e `AUTH_JWT_HMAC_SECRET` vindos de
+   `secretKeyRef` (nunca imprima os valores). Se o objeto vivo tiver campo
+   residual por ter sido criado fora do `apply`, resolva com um `kubectl
+replace` nominal **desse único objeto** — nunca com `delete`.
+
+3. Reinicie o serviço e confirme `READY 1/1`:
+
+   ```bash
+   # [srv-apps-01]
+   kubectl -n nchat-dev rollout restart deployment search-service
+   kubectl -n nchat-dev rollout status  deployment search-service
+   ```
+
+4. **Somente depois** de validar os passos acima, remova nominalmente as duas
+   policies temporárias cujos fluxos passaram a ser cobertos por
+   `nchat-allow-dns-egress` e `nchat-allow-postgres`:
+
+   ```bash
+   # [srv-apps-01]
+   kubectl delete networkpolicy nchat-allow-search-dns-egress      -n nchat-dev
+   kubectl delete networkpolicy nchat-allow-search-postgres-ingress -n nchat-dev
+   ```
+
+Proibido em qualquer etapa: `--prune`, curingas, `delete` genérico, remover
+`nchat-allow-search-postgres-egress`, ou remover qualquer policy antes da
+validação.
+
 ## 18. Rollback
 
 Rollback de aplicação não reverte schema. Confirme compatibilidade da migration;

@@ -179,6 +179,34 @@ require_single_clamd_directive() {
   fi
 }
 
+# deployment_env_secret_refs prints one "VAR SECRET/KEY" line per environment
+# variable a workload document sources from a Secret.
+#
+# It parses the reference rather than grepping for a Secret name because the
+# name alone proves nothing about who reads it: the same string legitimately
+# appears in the SealedSecret's own metadata, and a key nobody asked for is
+# invisible to a presence check. Both orders of the rendered `key:`/`name:`
+# pair are accepted — kustomize sorts the map, kubectl does not always.
+deployment_env_secret_refs() {
+  awk '
+    function flush() { if (var != "" && secret != "" && key != "") print var " " secret "/" key }
+    /^[[:space:]]*- name: / { flush(); var = $NF; secret = ""; key = ""; in_ref = 0; next }
+    /^[[:space:]]*secretKeyRef:[[:space:]]*$/ { in_ref = 1; next }
+    in_ref && /^[[:space:]]*key: / { key = $NF; next }
+    in_ref && /^[[:space:]]*name: / { secret = $NF; next }
+    END { flush() }
+  ' <<<"$1" | LC_ALL=C sort
+}
+
+# resource_quota_hard prints one "KEY VALUE" line per spec.hard entry.
+resource_quota_hard() {
+  awk '
+    /^  hard:[[:space:]]*$/ { active = 1; next }
+    active && /^  [a-zA-Z]/ { active = 0 }
+    active && /^    [a-zA-Z.]+:/ { key = $1; sub(/:$/, "", key); value = $2; gsub(/"/, "", value); print key " " value }
+  ' <<<"$1" | LC_ALL=C sort
+}
+
 network_policy_names_by_type() {
   local file="$1" wanted_type="$2"
   awk -v wanted_type="$wanted_type" '
@@ -746,6 +774,7 @@ validate_nchat_dev() {
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
+    nchat-allow-search-postgres-egress \
     nchat-allow-seaweedfs-volume-egress \
     nchat-allow-upload-guard-file-egress \
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
@@ -754,7 +783,8 @@ validate_nchat_dev() {
     nchat-allow-valkey nchat-allow-admin-postgres-egress nchat-allow-auth-postgres-egress \
     nchat-allow-chat-data-egress \
     nchat-allow-notification-postgres-egress nchat-allow-migrations-postgres-egress \
-    nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress; do
+    nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress \
+    nchat-allow-search-postgres-egress; do
     grep -q 'ports:' <<<"$(yaml_document "$application" NetworkPolicy "$policy_block")"
   done
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-traefik-http)"
@@ -947,6 +977,85 @@ validate_nchat_dev() {
   for component in auth chat file notification admin search media web clamav upload-guard; do
     grep -q "app.kubernetes.io/component: $component" "$application"
   done
+
+  # --- search-service runtime configuration (issue #601) ---------------------
+  #
+  # The overlay replaces the base container's envFrom wholesale, which is what
+  # silently removed the only source of AUTH_JWT_HMAC_SECRET and left the
+  # service refusing to start on its own config validation. Both credentials
+  # are therefore asserted as an exact set: a missing one is the regression
+  # that happened, and an extra one is a credential nobody decided to grant.
+  policy_block="$(yaml_document "$application" Deployment search-service)"
+  [[ -n "$policy_block" ]] || { echo "error: nchat-dev must render Deployment/search-service" >&2; return 1; }
+  if [[ "$(deployment_env_secret_refs "$policy_block")" != "$(printf '%s\n' \
+    'AUTH_JWT_HMAC_SECRET nchat-secrets/AUTH_JWT_HMAC_SECRET' \
+    'DATABASE_URL nchat-postgres-runtime/DATABASE_URL' | LC_ALL=C sort)" ]]; then
+    echo "error: search-service must read exactly DATABASE_URL from" >&2
+    echo "nchat-postgres-runtime and AUTH_JWT_HMAC_SECRET from nchat-secrets" >&2
+    return 1
+  fi
+  # And the non-secret half of the same environment, which the patch must keep.
+  if ! grep -A1 -F 'configMapRef:' <<<"$policy_block" | grep -Fq 'name: nchat-config'; then
+    echo "error: search-service must still receive nchat-config" >&2
+    return 1
+  fi
+
+  # DNS, in the aggregated policy rather than in a second one of its own:
+  # without it the startup database ping never leaves the pod.
+  if ! grep -Fq -- '- search' <<<"$(yaml_document "$application" NetworkPolicy nchat-allow-dns-egress)"; then
+    echo "error: nchat-allow-dns-egress must authorize the search component" >&2
+    return 1
+  fi
+  # Both halves of search -> postgres. The ingress rides the aggregated policy,
+  # already asserted above to be TCP/5432 and one origin selector only.
+  if ! grep -Fq -- '- search' <<<"$(yaml_document "$application" NetworkPolicy nchat-allow-postgres)"; then
+    echo "error: nchat-allow-postgres must admit the search component" >&2
+    return 1
+  fi
+  policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-search-postgres-egress)"
+  [[ -n "$policy_block" ]] || {
+    echo "error: nchat-dev must render NetworkPolicy/nchat-allow-search-postgres-egress" >&2
+    return 1
+  }
+  grep -Fq 'app.kubernetes.io/component: search' <<<"$policy_block"
+  if [[ "$(network_policy_flows "$policy_block")" != 'egress postgres TCP/5432' ]]; then
+    echo "error: nchat-allow-search-postgres-egress must allow exactly search->postgres:5432/TCP" >&2
+    return 1
+  fi
+  if grep -Eq 'ipBlock:|namespaceSelector' <<<"$policy_block"; then
+    echo "error: nchat-allow-search-postgres-egress must select its destination by podSelector only" >&2
+    return 1
+  fi
+  # The negative that keeps the least-privilege claim honest: no policy that
+  # names a CIDR may select or admit search. The two rules that leave the
+  # cluster today are asserted individually above; this is what stops a third
+  # one from quietly picking search up.
+  if [[ -n "$(awk '
+      function emit() { if (kind == "NetworkPolicy" && cidr && search) print name }
+      /^---$/ { emit(); kind=""; name=""; cidr=0; search=0; next }
+      /^kind:/ { kind=$2 }
+      /^  name:/ && name=="" { name=$2 }
+      /cidr:/ { cidr=1 }
+      /(component: search|- search)$/ { search=1 }
+      END { emit() }
+    ' "$application")" ]]; then
+    echo "error: search must not appear in a NetworkPolicy that allows an ipBlock destination" >&2
+    return 1
+  fi
+
+  # --- rollout headroom (issue #601) -----------------------------------------
+  #
+  # A quota on limits counts every Pod's declared ceiling, surge replicas
+  # included, so limits.cpu deliberately exceeds the node's 8 vCPUs: it
+  # reserves nothing. requests are what the scheduler actually books and stay
+  # conservative. Asserted as an exact set so neither half drifts unreviewed.
+  if [[ "$(resource_quota_hard "$(yaml_document "$application" ResourceQuota nchat-dev-quota)")" \
+    != "$(printf '%s\n' \
+      'limits.cpu 16' 'limits.memory 24Gi' 'persistentvolumeclaims 8' 'pods 40' \
+      'requests.cpu 6' 'requests.memory 12Gi' 'requests.storage 110Gi' 'services 25' | LC_ALL=C sort)" ]]; then
+    echo "error: the nchat-dev ResourceQuota must keep the headroom validated in the cluster" >&2
+    return 1
+  fi
 
   validate_clamav "$application"
 }

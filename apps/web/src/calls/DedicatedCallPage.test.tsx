@@ -17,9 +17,18 @@ const announceDedicated = vi.fn();
 const acknowledgeDedicated = vi.fn();
 // Mirrors the real hook: resolves with the joined call_id (every real call
 // site always supplies target.callId), never rejects.
-const join = vi.fn(async () => callId);
+const join = vi.fn(async (target: { callId?: string }) => target.callId ?? callId);
 const takeOver = vi.fn(async () => true);
 const beginResourceParticipation = vi.fn();
+// Mirrors CallSessionProvider's real activateResourceParticipation: runs
+// join(), then registers the participation only once it actually resolves
+// with a callId — the same causal path DedicatedCallPage now drives through
+// (never joinResourceParticipation: that one is fresh-join-only).
+const activateResourceParticipation = vi.fn(async (target: { callId?: string }) => {
+  const joinedCallId = await join(target);
+  if (joinedCallId) await beginResourceParticipation(joinedCallId);
+  return joinedCallId;
+});
 
 const session = {
   ownerState: "local",
@@ -27,6 +36,7 @@ const session = {
   announceDedicated,
   acknowledgeDedicated,
   beginResourceParticipation,
+  activateResourceParticipation,
   takeOver,
   releaseDedicated: vi.fn(async () => undefined),
   leaveDedicated: vi.fn(async () => undefined),
