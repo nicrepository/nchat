@@ -61,6 +61,11 @@ const TIMEZONE_OPTIONS = supportedTimezones();
  * explicitly out of scope here — that synchronization is ID 13 (20/08) — so
  * the screen must reflect the persisted value on its own rather than relying
  * on that propagation.
+ *
+ * Section order is a product requirement (ID 14): the avatar card renders
+ * first, above "Nome de exibição" and "Detalhes do perfil" — the user sees
+ * and picks their photo before editing their information, never the other
+ * way round. Keep it first if this component is restructured further.
  */
 export default function ProfilePage() {
   // persistedAvatarUrl: undefined = still loading / unknown, "" = confirmed none.
@@ -75,6 +80,12 @@ export default function ProfilePage() {
   const [networkError, setNetworkError] = useState<string | null>(null);
   const [notice, setNotice] = useState<"saved" | "removed" | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Same reasoning as savingNameRef/savingDetailsRef below: `uploading`/
+  // `removing` only update on the next render, so a second click fired in the
+  // same tick (before the button disables) would otherwise reach the network
+  // twice.
+  const uploadingRef = useRef(false);
+  const removingRef = useRef(false);
   // Local-only preference (no backend endpoint for it yet), read once at
   // mount — every write goes through setSoundNotificationMode immediately
   // below, so this state never drifts from what's persisted.
@@ -220,7 +231,8 @@ export default function ProfilePage() {
   );
 
   const onUpload = useCallback(async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || uploadingRef.current) return;
+    uploadingRef.current = true;
     setUploading(true);
     setNetworkError(null);
     setNotice(null);
@@ -238,11 +250,14 @@ export default function ProfilePage() {
         error instanceof AvatarUploadError ? error.message : "Não foi possível enviar o avatar.";
       setNetworkError(message); // selection is preserved so the user can retry.
     } finally {
+      uploadingRef.current = false;
       setUploading(false);
     }
   }, [selectedFile, discardSelection]);
 
   const onRemove = useCallback(async () => {
+    if (removingRef.current) return;
+    removingRef.current = true;
     setRemoving(true);
     setNetworkError(null);
     setNotice(null);
@@ -257,6 +272,7 @@ export default function ProfilePage() {
         error instanceof AvatarUploadError ? error.message : "Não foi possível remover o avatar.";
       setNetworkError(message); // persisted avatar stays visible on failure.
     } finally {
+      removingRef.current = false;
       setRemoving(false);
     }
   }, [discardSelection]);
@@ -449,6 +465,83 @@ export default function ProfilePage() {
         </Link>
       </header>
 
+      <section className="profile-page__avatar-card" aria-label="Avatar">
+        <div className="profile-page__avatar-preview">
+          {loadingProfile ? (
+            <span className="profile-page__avatar-loading" role="status" aria-label="Carregando" />
+          ) : shownImage ? (
+            <img
+              className="profile-page__avatar-img"
+              src={shownImage}
+              alt="Pré-visualização do avatar"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <span className="profile-page__avatar-placeholder" aria-hidden="true">
+              ?
+            </span>
+          )}
+        </div>
+
+        <div className="profile-page__avatar-actions">
+          <p className="profile-page__hint">JPEG ou PNG, até 5 MB.</p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png"
+            className="profile-page__file"
+            aria-label="Escolher imagem de avatar"
+            onChange={onSelect}
+            disabled={busy || loadingProfile}
+          />
+          <div className="profile-page__buttons">
+            <button
+              type="button"
+              className="profile-page__btn profile-page__btn--primary"
+              onClick={onUpload}
+              disabled={!selectedFile || busy}
+              aria-busy={uploading}
+            >
+              {uploading ? "Enviando…" : "Enviar avatar"}
+            </button>
+            {selectedFile && (
+              <button
+                type="button"
+                className="profile-page__btn"
+                onClick={discardSelection}
+                disabled={busy}
+              >
+                Cancelar nova imagem
+              </button>
+            )}
+            <button
+              type="button"
+              className="profile-page__btn"
+              onClick={onRemove}
+              disabled={busy || loadingProfile || !hasPersistedAvatar}
+              aria-busy={removing}
+            >
+              {removing ? "Removendo…" : "Remover avatar"}
+            </button>
+          </div>
+
+          <div className="profile-page__status" role="status" aria-live="polite">
+            {selectionError && <span className="profile-page__error">{selectionError}</span>}
+            {networkError && <span className="profile-page__error">{networkError}</span>}
+            {profileLoadError && (
+              <span className="profile-page__error">
+                Não foi possível carregar o perfil.{" "}
+                <button type="button" className="profile-page__retry" onClick={retryLoadProfile}>
+                  Tentar novamente
+                </button>
+              </span>
+            )}
+            {notice === "saved" && <span className="profile-page__ok">Avatar atualizado.</span>}
+            {notice === "removed" && <span className="profile-page__ok">Avatar removido.</span>}
+          </div>
+        </div>
+      </section>
+
       <section className="profile-page__name-card" aria-label="Nome de exibição">
         <form className="profile-page__name-form" onSubmit={onNameFormSubmit}>
           <label className="profile-page__field-label" htmlFor="profile-display-name">
@@ -623,81 +716,6 @@ export default function ProfilePage() {
             {detailsNotice && <span className="profile-page__ok">Perfil atualizado.</span>}
           </div>
         </form>
-      </section>
-
-      <section className="profile-page__avatar-card" aria-label="Avatar">
-        <div className="profile-page__avatar-preview">
-          {loadingProfile ? (
-            <span className="profile-page__avatar-loading" role="status" aria-label="Carregando" />
-          ) : shownImage ? (
-            <img
-              className="profile-page__avatar-img"
-              src={shownImage}
-              alt="Pré-visualização do avatar"
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <span className="profile-page__avatar-placeholder" aria-hidden="true">
-              ?
-            </span>
-          )}
-        </div>
-
-        <div className="profile-page__avatar-actions">
-          <p className="profile-page__hint">JPEG ou PNG, até 5 MB.</p>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/jpeg,image/png"
-            className="profile-page__file"
-            aria-label="Escolher imagem de avatar"
-            onChange={onSelect}
-            disabled={busy || loadingProfile}
-          />
-          <div className="profile-page__buttons">
-            <button
-              type="button"
-              className="profile-page__btn profile-page__btn--primary"
-              onClick={onUpload}
-              disabled={!selectedFile || busy}
-            >
-              {uploading ? "Enviando…" : "Enviar avatar"}
-            </button>
-            {selectedFile && (
-              <button
-                type="button"
-                className="profile-page__btn"
-                onClick={discardSelection}
-                disabled={busy}
-              >
-                Cancelar nova imagem
-              </button>
-            )}
-            <button
-              type="button"
-              className="profile-page__btn"
-              onClick={onRemove}
-              disabled={busy || loadingProfile || !hasPersistedAvatar}
-            >
-              {removing ? "Removendo…" : "Remover avatar"}
-            </button>
-          </div>
-
-          <div className="profile-page__status" role="status" aria-live="polite">
-            {selectionError && <span className="profile-page__error">{selectionError}</span>}
-            {networkError && <span className="profile-page__error">{networkError}</span>}
-            {profileLoadError && (
-              <span className="profile-page__error">
-                Não foi possível carregar o perfil.{" "}
-                <button type="button" className="profile-page__retry" onClick={retryLoadProfile}>
-                  Tentar novamente
-                </button>
-              </span>
-            )}
-            {notice === "saved" && <span className="profile-page__ok">Avatar atualizado.</span>}
-            {notice === "removed" && <span className="profile-page__ok">Avatar removido.</span>}
-          </div>
-        </div>
       </section>
 
       <section className="profile-page__notifications-card" aria-label="Notificações">

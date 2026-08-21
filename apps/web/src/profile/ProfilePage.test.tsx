@@ -105,6 +105,25 @@ async function settled() {
   await waitFor(() => expect(fileInput()).not.toBeDisabled());
 }
 
+// Product requirement: opening "Meu perfil" must show the avatar first, with
+// the profile-information sections below it — never the other way round.
+describe("ProfilePage — layout order", () => {
+  it("renders the avatar section before the name and details sections", async () => {
+    renderPage();
+    await settled();
+
+    const regionNames = screen
+      .getAllByRole("region")
+      .map((region) => region.getAttribute("aria-label"));
+
+    expect(regionNames.indexOf("Avatar")).toBeGreaterThanOrEqual(0);
+    expect(regionNames.indexOf("Avatar")).toBeLessThan(regionNames.indexOf("Nome de exibição"));
+    expect(regionNames.indexOf("Nome de exibição")).toBeLessThan(
+      regionNames.indexOf("Detalhes do perfil"),
+    );
+  });
+});
+
 describe("ProfilePage — initial load", () => {
   it("shows the persisted avatar after (re)load and enables removal", async () => {
     mockFetchProfile.mockResolvedValue({
@@ -388,6 +407,25 @@ describe("ProfilePage — upload", () => {
       ),
     );
   });
+
+  it("a duplicate click in the same tick reaches the service exactly once", async () => {
+    let resolveUpload!: (value: string) => void;
+    mockUpload.mockReturnValue(new Promise((resolve) => (resolveUpload = resolve)));
+    renderPage();
+    await settled();
+    await userEvent.setup().upload(fileInput(), pngFile());
+
+    const btn = uploadBtn();
+    // Two clicks fired before either promise settles: the synchronous
+    // uploadingRef guard, not just the (async) disabled attribute, is what
+    // keeps this to one call.
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    resolveUpload("/api/auth/avatars/once.png");
+    await waitFor(() => expect(screen.getByText(/avatar atualizado/i)).toBeInTheDocument());
+  });
 });
 
 describe("ProfilePage — removal", () => {
@@ -426,6 +464,26 @@ describe("ProfilePage — removal", () => {
       "src",
       "/api/auth/avatars/saved.png",
     );
+  });
+
+  it("a duplicate click in the same tick reaches the service exactly once", async () => {
+    let resolveRemove!: () => void;
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Ana",
+      avatarUrl: "/api/auth/avatars/saved.png",
+    });
+    mockRemove.mockReturnValue(new Promise<void>((resolve) => (resolveRemove = resolve)));
+    renderPage();
+    await settled();
+
+    const btn = removeBtn();
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+
+    expect(mockRemove).toHaveBeenCalledTimes(1);
+    resolveRemove();
+    await waitFor(() => expect(screen.getByText(/avatar removido/i)).toBeInTheDocument());
   });
 });
 
