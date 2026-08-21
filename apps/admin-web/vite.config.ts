@@ -26,7 +26,14 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "json", "html", ["lcovonly", { projectRoot: repositoryRoot }]],
       reportsDirectory: "../../coverage/admin-web",
-      exclude: [...(configDefaults.coverage?.exclude ?? []), "src/main.tsx", "e2e/**"],
+      // src/test holds the specs' own scaffolding: a fetch stub and a session
+      // provider. It is test code, excluded for the same reason e2e/** is.
+      exclude: [
+        ...(configDefaults.coverage?.exclude ?? []),
+        "src/main.tsx",
+        "src/test/**",
+        "e2e/**",
+      ],
       thresholds: {
         lines: 90,
         functions: 90,

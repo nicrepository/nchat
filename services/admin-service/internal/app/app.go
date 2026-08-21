@@ -111,6 +111,12 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 		return httpapi.RouterDependencies{}, nil, fmt.Errorf("admin session policy: %w", err)
 	}
 	audit := service.NewAuditService(store, logger)
+	// The management stores share the pool, not the store: each owns its own
+	// queries, so a change to the channel directory cannot reach the session
+	// authorization path by being in the same file.
+	users := service.NewUserAdminService(storage.NewPGXUserDirectoryStore(pool), audit)
+	channels := service.NewChannelAdminService(storage.NewPGXChannelDirectoryStore(pool), audit)
+	policies := service.NewPolicyService(storage.NewPGXPolicyStore(pool), audit)
 	return httpapi.RouterDependencies{
 		TokenValidator:  validator,
 		Sessions:        sessions,
@@ -119,6 +125,7 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 		Audit:           httpapi.NewAuditPorts(audit, audit),
 		RateLimiter:     httpapi.NewIPRateLimiter(cfg.SessionRateLimitPerMinute, cfg.SessionRateLimitBurst, httputil.ParseCIDRs(cfg.TrustedProxyCIDRs)),
 		ReadinessPinger: store,
+		Management:      httpapi.NewManagementPorts(users, channels, policies),
 	}, pool, nil
 }
 

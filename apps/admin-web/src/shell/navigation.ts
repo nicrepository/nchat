@@ -21,10 +21,25 @@ export interface AdminNavItem {
 
 export const ADMIN_NAV: AdminNavItem[] = [
   { id: "overview", label: "Visão geral", capability: "admin.config.read", path: "/" },
-  { id: "users", label: "Usuários", capability: "admin.users.read" },
-  { id: "channels", label: "Canais e grupos", capability: "admin.channels.read" },
-  { id: "security", label: "Segurança e políticas", capability: "admin.security.read" },
-  { id: "files", label: "Arquivos e armazenamento", capability: "admin.infrastructure.read" },
+  { id: "users", label: "Usuários", capability: "admin.users.read", path: "/users" },
+  {
+    id: "channels",
+    label: "Canais e grupos",
+    capability: "admin.channels.read",
+    path: "/channels",
+  },
+  {
+    id: "security",
+    label: "Segurança e políticas",
+    capability: "admin.security.read",
+    path: "/security",
+  },
+  {
+    id: "files",
+    label: "Arquivos e armazenamento",
+    capability: "admin.infrastructure.read",
+    path: "/files",
+  },
   { id: "authentication", label: "Autenticação", capability: "admin.integrations.read" },
   { id: "email", label: "E-mail", capability: "admin.integrations.read" },
   { id: "calls", label: "Chamadas", capability: "admin.integrations.read" },

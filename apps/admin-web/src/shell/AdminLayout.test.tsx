@@ -105,7 +105,14 @@ describe("AdminLayout", () => {
       within(nav)
         .getAllByRole("link")
         .map((link) => link.textContent),
-    ).toEqual(["Visão geral", "Auditoria"]);
+    ).toEqual([
+      "Visão geral",
+      "Usuários",
+      "Canais e grupos",
+      "Segurança e políticas",
+      "Arquivos e armazenamento",
+      "Auditoria",
+    ]);
   });
 
   it("navigates between implemented sections and marks the current one", async () => {

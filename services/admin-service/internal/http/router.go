@@ -25,6 +25,25 @@ type RouterDependencies struct {
 	Audit           *AuditPorts
 	RateLimiter     *IPRateLimiter
 	ReadinessPinger PostgresPinger
+	// Management is the issue #579 surface. It is a separate pointer so a
+	// deployment that has the foundation wired but not the management services
+	// answers 503 on those paths instead of serving one of them unguarded — the
+	// same all-or-nothing rule the rest of this router applies.
+	Management *ManagementPorts
+}
+
+// ManagementPorts groups the three management surfaces. They are wired
+// together because they are enabled together: there is no supported deployment
+// that serves the user directory and not the channel one.
+type ManagementPorts struct {
+	Users    UserAdmin
+	Channels ChannelAdmin
+	Policies PolicyAdmin
+}
+
+// NewManagementPorts wires the management services into the router.
+func NewManagementPorts(users UserAdmin, channels ChannelAdmin, policies PolicyAdmin) *ManagementPorts {
+	return &ManagementPorts{Users: users, Channels: channels, Policies: policies}
 }
 
 // AuditPorts groups the two directions of the audit trail. They are one
@@ -116,6 +135,101 @@ func registerAdminAPI(mux *http.ServeMux, cfg config.Config, logger *slog.Logger
 	}))
 	mux.Handle(RouteAdminBootstrap, httputil.MethodNotAllowed(http.MethodGet, bootstrap))
 	mux.Handle(RouteAdminAudit, httputil.MethodNotAllowed(http.MethodGet, auditEvents))
+
+	registerManagementAPI(mux, cfg, deps, ready)
+}
+
+// managedRoute is one management endpoint as the table below declares it.
+//
+// The capability is a field rather than something applied at the call site
+// because that is what makes the whole surface reviewable in one place: reading
+// the table below answers "what does this endpoint require" for every route,
+// and a route added without a capability does not compile.
+type managedRoute struct {
+	path       string
+	method     string
+	capability domain.Capability
+	// mutating routes additionally pass the CSRF guard. It is derived from the
+	// method rather than declared, so a new mutation cannot be added without
+	// it.
+	handler func(*ManagementPorts) http.Handler
+}
+
+// registerManagementAPI wires the issue #579 surface.
+//
+// Every route is guarded the same way and in the same order: the administrative
+// session first, then — for a mutation — the CSRF and origin checks, then the
+// one capability the route declares. There is no path that skips a step and no
+// second, "internal" router: a request that reaches a management handler has
+// passed all of them.
+func registerManagementAPI(mux *http.ServeMux, cfg config.Config, deps RouterDependencies, ready bool) {
+	routes := []managedRoute{
+		{RouteAdminUsers, http.MethodGet, domain.CapabilityUsersRead,
+			func(p *ManagementPorts) http.Handler { return ListUsers(p.Users) }},
+		{RouteAdminUser, http.MethodGet, domain.CapabilityUsersRead,
+			func(p *ManagementPorts) http.Handler { return GetUser(p.Users) }},
+		{RouteAdminUserStatus, http.MethodPatch, domain.CapabilityUsersManage,
+			func(p *ManagementPorts) http.Handler { return UpdateUserStatus(p.Users) }},
+		{RouteAdminUserSessions, http.MethodDelete, domain.CapabilityUsersManage,
+			func(p *ManagementPorts) http.Handler { return RevokeUserSessions(p.Users) }},
+		// Changing who administers the platform requires administering all of
+		// it: a principal may only confer authority it already holds, so
+		// anything narrower than superuser here would be horizontal escalation.
+		{RouteAdminUserRoles, http.MethodPost, domain.CapabilitySuperuser,
+			func(p *ManagementPorts) http.Handler { return GrantAdminRole(p.Users) }},
+		{RouteAdminUserRole, http.MethodDelete, domain.CapabilitySuperuser,
+			func(p *ManagementPorts) http.Handler { return RevokeAdminRole(p.Users) }},
+
+		{RouteAdminChannels, http.MethodGet, domain.CapabilityChannelsRead,
+			func(p *ManagementPorts) http.Handler { return ListChannels(p.Channels) }},
+		{RouteAdminChannel, http.MethodGet, domain.CapabilityChannelsRead,
+			func(p *ManagementPorts) http.Handler { return GetChannel(p.Channels) }},
+		{RouteAdminChannelStatus, http.MethodPatch, domain.CapabilityChannelsManage,
+			func(p *ManagementPorts) http.Handler { return UpdateChannelStatus(p.Channels) }},
+		// Membership is a mutation, so it requires the manage capability and not
+		// the read one, and it passes the CSRF guard like every other mutation.
+		{RouteAdminChannelCandidates, http.MethodGet, domain.CapabilityChannelsManage,
+			func(p *ManagementPorts) http.Handler { return ListMemberCandidates(p.Channels) }},
+		{RouteAdminChannelMembers, http.MethodPost, domain.CapabilityChannelsManage,
+			func(p *ManagementPorts) http.Handler { return AddChannelMembers(p.Channels) }},
+		{RouteAdminChannelMember, http.MethodDelete, domain.CapabilityChannelsManage,
+			func(p *ManagementPorts) http.Handler { return RemoveChannelMember(p.Channels) }},
+		{RouteAdminConversations, http.MethodGet, domain.CapabilityChannelsRead,
+			func(p *ManagementPorts) http.Handler { return ListConversations(p.Channels) }},
+
+		{RouteAdminAntiSpam, http.MethodGet, domain.CapabilitySecurityRead,
+			func(p *ManagementPorts) http.Handler { return ListAntiSpamPolicies(p.Policies) }},
+		{RouteAdminAntiSpamUpdate, http.MethodPatch, domain.CapabilitySecurityManage,
+			func(p *ManagementPorts) http.Handler { return UpdateAntiSpamPolicy(p.Policies) }},
+		{RouteAdminUploadPolicy, http.MethodGet, domain.CapabilityInfrastructureRead,
+			func(p *ManagementPorts) http.Handler { return ListUploadPolicies(p.Policies) }},
+		{RouteAdminUploadPolicyOne, http.MethodPatch, domain.CapabilityInfrastructureManage,
+			func(p *ManagementPorts) http.Handler { return UpdateUploadPolicy(p.Policies) }},
+	}
+
+	enabled := ready && deps.Management != nil &&
+		deps.Management.Users != nil && deps.Management.Channels != nil && deps.Management.Policies != nil
+	for _, route := range routes {
+		handler := adminUnavailable()
+		if enabled {
+			handler = guardManagement(cfg, deps, route)
+		}
+		mux.Handle(route.path, httputil.MethodNotAllowed(route.method, handler))
+	}
+}
+
+// guardManagement assembles one route's guard chain.
+//
+// CSRF runs before the capability check on purpose: a forged cross-site request
+// must be refused as a forgery, not recorded in the audit trail as somebody's
+// authorization failure. The operator reading that trail should see real
+// denials, not noise a hostile page can generate at will.
+func guardManagement(cfg config.Config, deps RouterDependencies, route managedRoute) http.Handler {
+	handler := RequireCapability(route.capability, deps.Audit.Recorder)(route.handler(deps.Management))
+	if !isSafeMethod(route.method) {
+		handler = RequireCSRF(deps.CSRF, cfg.AllowedOrigins)(handler)
+	}
+	return RequireAdminSession(deps.Authenticator, sessionCookieName)(handler)
 }
 
 func adminUnavailable() http.Handler {

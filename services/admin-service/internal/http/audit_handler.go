@@ -12,7 +12,7 @@ import (
 
 // AuditReader lists the administrative audit trail.
 type AuditReader interface {
-	List(ctx context.Context, limit int) ([]domain.AuditEntry, error)
+	List(ctx context.Context, limit int, userID string) ([]domain.AuditEntry, error)
 }
 
 type auditEntryPayload struct {
@@ -33,10 +33,16 @@ type auditEntryPayload struct {
 // authenticated administrator would be a privilege escalation dressed as a
 // listing.
 //
-// There is no resource identifier in the request. The endpoint returns the
-// platform-wide trail or refuses; there is no per-object path segment to
-// tamper with, which is what keeps an IDOR out of this surface by
-// construction rather than by validation.
+// It takes one optional narrowing — `user_id`, the person an event was
+// performed *on* — because an operator looking at somebody's record needs their
+// history, and the last fifty platform-wide events are not it.
+//
+// That parameter is not an object reference to tamper with. The trail is
+// platform-wide and this capability authorizes all of it, so narrowing it
+// reaches nothing a caller could not already read; there is no row that becomes
+// visible by naming an id, and none that becomes hidden. The value is validated
+// as a UUID and converted into the canonical resource key by the service, so
+// what reaches the column is a string this service built.
 func ListAuditEvents(audit AuditReader) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if audit == nil {
@@ -48,9 +54,18 @@ func ListAuditEvents(audit AuditReader) http.Handler {
 			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "limit must be a positive integer")
 			return
 		}
-		entries, err := audit.List(r.Context(), limit)
+		// Absent means the platform-wide trail, which is what this endpoint has
+		// always returned. Malformed is refused rather than ignored: silently
+		// dropping a filter would show an operator somebody else's history under
+		// that person's name.
+		userID, err := parseUUIDFilter(r.URL.Query(), "user_id")
 		if err != nil {
-			writeAuthError(w, err)
+			httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "user_id must be a valid identifier")
+			return
+		}
+		entries, err := audit.List(r.Context(), limit, userID)
+		if err != nil {
+			writeDomainError(w, err)
 			return
 		}
 		payload := make([]auditEntryPayload, 0, len(entries))

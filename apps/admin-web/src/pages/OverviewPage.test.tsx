@@ -53,7 +53,7 @@ describe("OverviewPage", () => {
   it("counts implemented sections against visible ones", () => {
     renderWith({ ...BOOTSTRAP, capabilities: ["admin.superuser"] });
 
-    expect(screen.getByText(/2 de 13 seções visíveis/)).toBeInTheDocument();
+    expect(screen.getByText(/6 de 13 seções visíveis/)).toBeInTheDocument();
   });
 
   it("renders nothing without a session", () => {
