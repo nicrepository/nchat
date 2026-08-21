@@ -89,15 +89,8 @@ func (s *PGXCallStore) CreateCall(ctx context.Context, input CreateCallInput) (d
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	participantIDs := []string{input.CallerID, input.CalleeID}
-	sort.Strings(participantIDs)
-	for _, participantID := range participantIDs {
-		if _, err := tx.Exec(ctx,
-			`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
-			participantID,
-		); err != nil {
-			return domain.Call{}, false, fmt.Errorf("lock call participant: %w", err)
-		}
+	if err := lockCallKeys(ctx, tx, input.CallerID, input.CalleeID); err != nil {
+		return domain.Call{}, false, err
 	}
 
 	existing, err := scanCall(tx.QueryRow(ctx,
@@ -177,9 +170,15 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The resource-target lock (serializes admission into this target's
+	// active call) and the actor's own participant lock (issue #609: makes
+	// this admission mutually exclusive with any other CreateCall/
+	// CreateResourceCall for the same actor) are acquired together, through
+	// the same deterministic ordering as CreateCall's participant pair — see
+	// lockCallKeys.
 	lockKey := input.WorkspaceID + ":" + string(input.TargetType) + ":" + input.TargetID
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
-		return domain.Call{}, false, fmt.Errorf("lock call resource: %w", err)
+	if err := lockCallKeys(ctx, tx, lockKey, input.CallerID); err != nil {
+		return domain.Call{}, false, err
 	}
 	existing, err := scanCall(tx.QueryRow(ctx,
 		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND caller_id = $2 AND request_id = $3`,
@@ -234,6 +233,33 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 			return domain.Call{}, false, fmt.Errorf("insert resource call: %w", err)
 		}
 	}
+
+	// Busy means the actor already holds an active/ringing direct call, or a
+	// live participant lease on a DIFFERENT active resource call — the same
+	// invariant CreateCall enforces (issue #609), now actually serialized
+	// against it by the shared participant advisory lock above. Considers
+	// only the actor trying to join, never a second participant, since a
+	// resource admission only ever seats one person at a time.
+	//
+	// `resource_calls.id <> $3` excludes the very call being joined/rejoined
+	// here: a participant already on this call (late join, refresh, rejoin)
+	// must never be told they are busy with themselves — #569 established
+	// the lease, not caller_id, as the authoritative participation signal,
+	// and an expired lease (filtered by expires_at) never blocks either.
+	//
+	// If `active` was just inserted above, this deliberately still runs
+	// before that new row has any lease of its own: a genuinely busy actor
+	// is still rejected, and because this call has not committed yet, the
+	// deferred rollback removes the row this transaction just inserted —
+	// no orphan call is left behind.
+	busy, err := callParticipantBusy(ctx, tx, input.WorkspaceID, input.CallerID, active.ID)
+	if err != nil {
+		return domain.Call{}, false, err
+	}
+	if busy {
+		return domain.Call{}, false, domain.ErrCallParticipantBusy
+	}
+
 	if err := upsertCallPresence(ctx, tx, active.ID, input.CallerID, input.ExpiresAt); err != nil {
 		return domain.Call{}, false, err
 	}
@@ -241,6 +267,31 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 		return domain.Call{}, false, fmt.Errorf("commit resource call: %w", err)
 	}
 	return active, active.RequestID == input.RequestID && active.CallerID == input.CallerID, nil
+}
+
+// lockCallKeys acquires a per-transaction advisory lock for each key, always
+// in the same deterministic (lexicographic) order — the one thing every
+// call-admission path (CreateCall's caller/callee pair, CreateResourceCall's
+// resource-target/actor pair) must share to rule out a lock-ordering deadlock
+// (issue #609). If every transaction that takes more than one of these locks
+// sorts its own keys the same way before acquiring them, no two transactions
+// can ever each hold a lock the other is waiting for: a cycle in the wait-for
+// graph would require some pair of keys to be acquired in opposite orders by
+// two transactions, which a single shared total order over the whole key
+// space (Go's string comparison, applied uniformly here) makes impossible —
+// regardless of how many distinct keys or transactions are involved, or
+// whether the two callsites are locking the same *kind* of key. Locks are
+// released automatically at the end of the transaction (commit or
+// rollback), never held past it.
+func lockCallKeys(ctx context.Context, tx pgx.Tx, keys ...string) error {
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	for _, key := range sorted {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
+			return fmt.Errorf("lock call participant: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPresenceInput) error {
@@ -252,6 +303,9 @@ func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPre
 		return fmt.Errorf("begin call presence: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockCallKeys(ctx, tx, input.ActorID); err != nil {
+		return err
+	}
 	call, err := scanCall(tx.QueryRow(ctx,
 		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND id = $2 FOR SHARE`,
 		input.WorkspaceID, input.CallID,
@@ -269,6 +323,13 @@ func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPre
 	if !authorized {
 		return domain.ErrNotFound
 	}
+	busy, err := callParticipantBusy(ctx, tx, input.WorkspaceID, input.ActorID, call.ID)
+	if err != nil {
+		return err
+	}
+	if busy {
+		return domain.ErrCallParticipantBusy
+	}
 	if err := upsertCallPresence(ctx, tx, call.ID, input.ActorID, input.ExpiresAt); err != nil {
 		return err
 	}
@@ -276,6 +337,28 @@ func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPre
 		return fmt.Errorf("commit call presence: %w", err)
 	}
 	return nil
+}
+
+func callParticipantBusy(ctx context.Context, tx pgx.Tx, workspaceID, actorID, exceptCallID string) (bool, error) {
+	var busy bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM chat.calls
+			WHERE workspace_id = $1 AND target_type = 'user' AND status IN ('ringing', 'active')
+			  AND (caller_id = $2 OR callee_id = $2)
+			UNION ALL
+			SELECT 1 FROM chat.call_participant_leases leases
+			JOIN chat.calls resource_calls ON resource_calls.id = leases.call_id
+			WHERE resource_calls.workspace_id = $1 AND resource_calls.status = 'active'
+			  AND resource_calls.target_type IN ('channel', 'dm')
+			  AND leases.user_id = $2 AND leases.expires_at > clock_timestamp()
+			  AND resource_calls.id <> $3
+		)`,
+		workspaceID, actorID, exceptCallID,
+	).Scan(&busy); err != nil {
+		return false, fmt.Errorf("check active calls: %w", err)
+	}
+	return busy, nil
 }
 
 func authorizeResourceTarget(ctx context.Context, tx pgx.Tx, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (bool, error) {
@@ -338,6 +421,14 @@ func (s *PGXCallStore) LeaveResourceCall(ctx context.Context, input LeaveResourc
 		return TransitionCallResult{}, fmt.Errorf("begin call leave: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Serialize the release with every admission/heartbeat for this actor.
+	// This must precede the call-row lock: all paths that take both acquire
+	// participant advisory lock(s) before any call row, so no row -> participant
+	// cycle is possible. A join waiting behind this leave then sees the deleted
+	// lease after commit instead of failing busy based on pre-leave state.
+	if err := lockCallKeys(ctx, tx, input.ActorID); err != nil {
+		return TransitionCallResult{}, err
+	}
 
 	call, err := scanCall(tx.QueryRow(ctx,
 		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND id = $2 FOR UPDATE`,

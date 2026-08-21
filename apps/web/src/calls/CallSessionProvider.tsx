@@ -438,6 +438,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     if (resource.active) await resource.leave();
   }, [resource]);
   const calls = useCallSignaling(directMedia, mediaEnabled, releaseResource);
+  const directCallBusy = calls.call !== null && !terminal.has(calls.call.status);
 
   const postParticipation = useCallback(
     (
@@ -520,6 +521,13 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // fires) so cleanup always releases the right one.
   const joinResourceParticipation = useCallback(
     async (target: ResourceCallTarget): Promise<string | undefined> => {
+      if (
+        directCallBusy ||
+        (resource.active &&
+          (resource.active.kind !== target.kind || resource.active.id !== target.id))
+      ) {
+        return undefined;
+      }
       let protectedCallId: string | null = null;
       if (target.callId) {
         protectedCallId = target.callId;
@@ -538,7 +546,14 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         if (protectedCallId) unprotectJoinAttempt(protectedCallId);
       }
     },
-    [beginResourceParticipation, joinResourceCall, protectJoinAttempt, unprotectJoinAttempt],
+    [
+      beginResourceParticipation,
+      directCallBusy,
+      joinResourceCall,
+      protectJoinAttempt,
+      resource.active,
+      unprotectJoinAttempt,
+    ],
   );
   // DedicatedCallPage/handoff-only entry point (issue #594 adversarial
   // follow-up, round 3) — deliberately NEVER registers a fresh-join-intent
@@ -1135,6 +1150,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       ? directory?.channels.find((channel) => channel.id === incomingResource.target_id)
       : directory?.dms.find((dm) => dm.id === incomingResource.target_id)
     : null;
+  const incomingResourceBusy =
+    directCallBusy ||
+    Boolean(
+      incomingResource &&
+      resource.active &&
+      (resource.active.kind !== incomingResource.target_type ||
+        resource.active.id !== incomingResource.target_id),
+    );
+  const globalCallError = calls.error ?? resource.error;
 
   return (
     <CallSessionContext.Provider value={value}>
@@ -1157,35 +1181,39 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           onRetryIdentity={() => identity.retry?.()}
         />
       )}
-      {!dedicated && !directIncoming && incomingResource && incomingTarget && (
-        <IncomingCallPopup
-          name={incomingTarget.name}
-          targetKind={incomingResource.target_type as "channel" | "dm"}
-          callType={incomingResource.call_type}
-          participantCount={1}
-          onAccept={() => {
-            emitCallTechnicalEvent("accepted");
-            setIncomingResource(null);
-            // joinResourceParticipation both runs the real join() and — only
-            // once it actually confirms success (issue #570 follow-up) —
-            // registers the new participation; it also protects this
-            // attempt, from before join() even starts, against an old
-            // "left" for the participation it supersedes (issue #594
-            // adversarial follow-up).
-            void joinResourceParticipation({
-              kind: incomingResource.target_type as "channel" | "dm",
-              id: incomingResource.target_id!,
-              name: incomingTarget.name,
-              callId: incomingResource.call_id,
-            });
-          }}
-          onReject={() => {
-            emitCallTechnicalEvent("rejected");
-            ignoredResourceCalls.current.add(incomingResource.call_id);
-            setIncomingResource(null);
-          }}
-        />
-      )}
+      {!dedicated &&
+        !directIncoming &&
+        !incomingResourceBusy &&
+        incomingResource &&
+        incomingTarget && (
+          <IncomingCallPopup
+            name={incomingTarget.name}
+            targetKind={incomingResource.target_type as "channel" | "dm"}
+            callType={incomingResource.call_type}
+            participantCount={1}
+            onAccept={() => {
+              emitCallTechnicalEvent("accepted");
+              setIncomingResource(null);
+              // joinResourceParticipation both runs the real join() and — only
+              // once it actually confirms success (issue #570 follow-up) —
+              // registers the new participation; it also protects this
+              // attempt, from before join() even starts, against an old
+              // "left" for the participation it supersedes (issue #594
+              // adversarial follow-up).
+              void joinResourceParticipation({
+                kind: incomingResource.target_type as "channel" | "dm",
+                id: incomingResource.target_id!,
+                name: incomingTarget.name,
+                callId: incomingResource.call_id,
+              });
+            }}
+            onReject={() => {
+              emitCallTechnicalEvent("rejected");
+              ignoredResourceCalls.current.add(incomingResource.call_id);
+              setIncomingResource(null);
+            }}
+          />
+        )}
       {!dedicated && activeCallId && ownerState === "remote" && (
         <GlobalCallIndicator
           title={title}
@@ -1226,9 +1254,9 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           }
         />
       )}
-      {!dedicated && !activeCallId && calls.error && (
+      {!dedicated && !activeCallId && globalCallError && (
         <p className="call-global-error" role="alert">
-          {calls.error}
+          {globalCallError}
         </p>
       )}
     </CallSessionContext.Provider>

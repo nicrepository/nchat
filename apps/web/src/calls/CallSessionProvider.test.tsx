@@ -28,6 +28,7 @@ const callId = "00000000-0000-4000-8000-000000000546";
 const userA = "00000000-0000-4000-8000-000000000547";
 const userB = "00000000-0000-4000-8000-000000000548";
 const channelId = "00000000-0000-4000-8000-000000000549";
+const channelYId = "00000000-0000-4000-8000-000000000550";
 const lease = {
   v: 1,
   callId,
@@ -161,7 +162,10 @@ function Probe() {
         onClick={() =>
           session.registerDirectory({
             currentUserId: userB,
-            channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
+            channels: [
+              { id: channelId, name: "Produto", type: "public", canWrite: true },
+              { id: channelYId, name: "Suporte", type: "public", canWrite: true },
+            ],
             dms: [
               {
                 id: "dm-1",
@@ -416,6 +420,67 @@ describe("CallSessionProvider", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Recusar" }));
     expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer incoming resource Y while X is active and keeps same-target continuation valid", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-resource-y",
+          target_type: "channel",
+          target_id: channelYId,
+          call: {
+            ...activeDirect(),
+            call_id: "00000000-0000-4000-8000-000000000551",
+            target_type: "channel",
+            target_id: channelYId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(resource.join).not.toHaveBeenCalled();
+    expect(resource.active).toEqual({ kind: "channel", id: channelId, name: "Produto" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Fresh join probe (no callId)" }));
+    await waitFor(() => expect(resource.join).toHaveBeenCalledOnce());
+  });
+
+  it("does not offer or join an incoming resource while a direct call is active", () => {
+    calls.call = activeDirect();
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-resource-during-direct",
+          target_type: "channel",
+          target_id: channelYId,
+          call: {
+            ...activeDirect(),
+            call_id: "00000000-0000-4000-8000-000000000552",
+            target_type: "channel",
+            target_id: channelYId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(resource.join).not.toHaveBeenCalled();
   });
 
   it("performs main-to-dedicated handoff, ACK, timeout rollback, and failure rollback", async () => {

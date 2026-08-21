@@ -96,6 +96,17 @@ describe("resource call signaling", () => {
       target_id: call.target_id,
       call_type: "audio",
     });
+    const wrongTarget = "00000000-0000-4000-8000-000000000550";
+    socket.listener.onMessage?.(
+      {
+        type: "call.accepted",
+        event_id: "wrong-target",
+        target_type: "channel",
+        target_id: wrongTarget,
+        call: { ...call, target_id: wrongTarget },
+      },
+      1,
+    );
     socket.listener.onMessage?.(
       {
         type: "call.accepted",
@@ -196,7 +207,7 @@ describe("resource call signaling", () => {
     await expect(timeout).rejects.toThrow("call leave timed out");
   });
 
-  it("fails closed on a correlated server error", async () => {
+  it("fails closed on a call.start server error", async () => {
     const socket = setup();
     const starting = startResourceCall(
       { kind: "channel", id: call.target_id },
@@ -214,6 +225,30 @@ describe("resource call signaling", () => {
     );
 
     await expect(starting).rejects.toThrow("resource call start failed");
+    expect(socket.handle.release).toHaveBeenCalledOnce();
+  });
+
+  it("preserves call_participant_busy on a resource call.start rejection", async () => {
+    const socket = setup();
+    const starting = startResourceCall(
+      { kind: "channel", id: call.target_id },
+      {
+        acquire: socket.acquire,
+        requestId: () => call.request_id,
+        setTimeout: vi.fn(() => 1),
+        clearTimeout: vi.fn(),
+      },
+    );
+
+    socket.listener.onMessage?.(
+      { type: "call.error", operation: "call.start", code: "call_participant_busy" },
+      1,
+    );
+
+    await expect(starting).rejects.toMatchObject({
+      operation: "call.start",
+      code: "call_participant_busy",
+    });
     expect(socket.handle.release).toHaveBeenCalledOnce();
   });
 
