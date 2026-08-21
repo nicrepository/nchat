@@ -16,6 +16,18 @@ interface ResourceCallSignalingOptions {
   timeoutMs?: number;
 }
 
+export class ResourceCallSignalingError extends Error {
+  readonly operation: "call.start";
+  readonly code: string;
+
+  constructor(operation: "call.start", code: string) {
+    super("resource call start failed");
+    this.name = "ResourceCallSignalingError";
+    this.operation = operation;
+    this.code = code;
+  }
+}
+
 export function startResourceCall(
   target: ResourceCallStartTarget,
   options: ResourceCallSignalingOptions = {},
@@ -60,7 +72,12 @@ export function startResourceCall(
       },
       onMessage(data) {
         if (data["type"] === "call.error" && data["operation"] === "call.start") {
-          finish(new Error("resource call start failed"));
+          finish(
+            new ResourceCallSignalingError(
+              "call.start",
+              typeof data["code"] === "string" ? data["code"] : "call_error",
+            ),
+          );
           return;
         }
         const event = parseCallEvent(data);

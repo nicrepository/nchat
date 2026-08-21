@@ -416,13 +416,22 @@ function declineCommands(socket: FakeWebSocket) {
 function JoinChannelButton() {
   const ctx = useOutletContext<ChatOutletContext>();
   return (
-    <button
-      type="button"
-      disabled={!ctx.joinResourceCall}
-      onClick={() => ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral" })}
-    >
-      Entrar no canal
-    </button>
+    <>
+      <button
+        type="button"
+        disabled={!ctx.joinResourceCall}
+        onClick={() => ctx.joinResourceCall?.({ kind: "channel", id: "chan-1", name: "Geral" })}
+      >
+        Entrar no canal
+      </button>
+      <button
+        type="button"
+        disabled={!ctx.startCall}
+        onClick={() => ctx.startCall?.(callerId, "audio")}
+      >
+        Ligar direto
+      </button>
+    </>
   );
 }
 
@@ -851,6 +860,17 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
     );
 
     expect(await screen.findByRole("button", { name: "Entrar no canal" })).toBeDisabled();
+  });
+
+  it("keeps both a second resource join and a direct start unavailable while a resource call is active", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+
+    await joinResource(user, socket);
+    await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+
+    expect(screen.getByRole("button", { name: "Entrar no canal" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Ligar direto" })).toBeDisabled();
   });
 });
 

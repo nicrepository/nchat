@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { issueCallToken, type ResourceCallKind } from "./callApi";
 import { acquireChatSocket } from "./chatSocket";
-import { leaveResourceCall, startResourceCall } from "./resourceCallSignaling";
+import {
+  leaveResourceCall,
+  ResourceCallSignalingError,
+  startResourceCall,
+} from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
@@ -231,6 +235,15 @@ export function useResourceCallSession(
       target: ResourceCallTarget,
       onCallIdResolved?: (callId: string) => void,
     ): Promise<string | undefined> => {
+      const previousActive = activeRef.current;
+      const previousCallId = callIdRef.current;
+      if (
+        previousActive &&
+        cleanupPromiseRef.current === null &&
+        (previousActive.kind !== target.kind || previousActive.id !== target.id)
+      ) {
+        return Promise.resolve(undefined);
+      }
       const pending = joinPromiseRef.current;
       if (
         pending &&
@@ -292,9 +305,22 @@ export function useResourceCallSession(
         if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
         setStatus("active");
         return call.call_id;
-      })().catch((): string | undefined => {
+      })().catch((joinError: unknown): string | undefined => {
         if (attemptGenerationRef.current !== generation) return undefined;
         if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
+        if (
+          joinError instanceof ResourceCallSignalingError &&
+          joinError.code === "call_participant_busy"
+        ) {
+          activeRef.current = previousActive;
+          callIdRef.current = previousCallId;
+          setActive(previousActive);
+          setCallId(previousCallId);
+          setStatus(previousCallId ? "active" : "error");
+          setErrorOperation("join");
+          setError("Você já está em outra chamada.");
+          return undefined;
+        }
         setStatus("error");
         setErrorOperation("join");
         setError("Não foi possível entrar na chamada.");

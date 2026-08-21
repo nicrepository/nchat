@@ -50,10 +50,13 @@ usa `schema_version`, `event_id`, `target_type: "user"`, `target_id` e `call`:
 Falhas esperadas usam `call.error` com `operation`, `call_id` quando aplicável e
 códigos estáveis: `call_invalid`, `call_not_found`, `call_invalid_state`,
 `call_participant_busy`, `call_rate_limited` ou `call_unavailable`. Elas não
-fecham a conexão. `call_participant_busy` é específico de `call.start`: o
-autor ou o destinatário já está em outra chamada 1:1 ou é participante ativo
-de uma chamada de canal/DM em grupo; `call_invalid_state` continua reservado
-para conflitos reais de versão/transição de estado.
+fecham a conexão. `call_participant_busy` é específico de `call.start`. Em uma
+chamada direta, o autor ou o destinatário pode estar ocupado por outra chamada
+incompatível. Ao iniciar ou entrar em uma chamada de canal/DM em grupo, o
+próprio ator pode estar ocupado por outra chamada incompatível. Entrar
+novamente na mesma chamada de recurso ativa não conta como "outra chamada" e
+continua válido. `call_invalid_state` permanece reservado para conflitos reais
+de lifecycle/estado.
 
 O cliente aplica somente versões crescentes para o mesmo `call_id`. `call.sync`
 reenvia a chamada `ringing` ou `active` do usuário após reconexão.
