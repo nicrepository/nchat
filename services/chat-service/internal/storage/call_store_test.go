@@ -127,6 +127,12 @@ func TestPGXCallStoreCreateIsIdempotentAndDetectsRequestConflict(t *testing.T) {
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
+			if test.wantErr != nil && errors.Is(err, domain.ErrCallParticipantBusy) {
+				// A mismatched idempotent replay is a real request conflict,
+				// not a busy participant — it must never be classified as
+				// busy (issue #575).
+				t.Fatalf("error = %v, want plain conflict, not participant-busy", err)
+			}
 			if test.wantErr == nil && (created || call.ID != callID) {
 				t.Fatalf("expected existing call, call=%+v created=%v", call, created)
 			}
@@ -135,10 +141,17 @@ func TestPGXCallStoreCreateIsIdempotentAndDetectsRequestConflict(t *testing.T) {
 	}
 }
 
-func TestPGXCallStoreCreateRejectsWhenCallerHoldsActiveResourceCallLease(t *testing.T) {
-	// Issue #569: busy must reflect active participation (a live
-	// call_participant_leases row), not merely having once been a resource
-	// call's caller_id, which never changes for the life of that row.
+// TestPGXCallStoreCreateRejectsBusyParticipant covers every path that trips
+// the combined busy check in one query (an active/ringing direct call, or a
+// live call_participant_leases row from a resource call): caller busy,
+// callee busy, and callee busy via resource participation all share the same
+// $2/$3 IN-list, so they are indistinguishable from the caller's side and
+// exercised as one scenario here. Issue #569 established the lease-vs-stale-
+// caller_id distinction; issue #575 requires the result to classify as the
+// specific domain.ErrCallParticipantBusy rather than the generic
+// domain.ErrConflict, so it reaches the client as a busy-specific message
+// instead of "call already changed state".
+func TestPGXCallStoreCreateRejectsBusyParticipant(t *testing.T) {
 	mock := newCategoryMock(t)
 	now := time.Now().UTC()
 	mock.ExpectBegin()
@@ -159,8 +172,11 @@ func TestPGXCallStoreCreateRejectsWhenCallerHoldsActiveResourceCallLease(t *test
 		CallerID: callCallerID, CalleeID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
 	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant-busy", err)
+	}
 	if !errors.Is(err, domain.ErrConflict) {
-		t.Fatalf("error = %v, want conflict", err)
+		t.Fatalf("error = %v, want it to still satisfy the wrapped ErrConflict check", err)
 	}
 	requireMetExpectations(t, mock)
 }
