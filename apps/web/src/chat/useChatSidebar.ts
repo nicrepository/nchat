@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { useLocation } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
+import { showBrowserMessageNotification } from "./browserNotification";
 import { fetchSidebarData, setSidebarConversationPinned } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
@@ -216,6 +217,7 @@ function targetFromPath(pathname: string): WSSubscriptionTarget | undefined {
 export function useChatSidebar() {
   const [state, dispatch] = useReducer(reducer, { status: "loading" });
   const { pathname } = useLocation();
+  const navigate = useNavigate();
   const openedTarget = targetFromPath(pathname);
   const openedTargetKind = openedTarget?.kind;
   const openedTargetId = openedTarget?.targetId;
@@ -349,6 +351,7 @@ export function useChatSidebar() {
           openedTarget?.kind === event.target_type && openedTarget.targetId === event.target_id;
         const classified = classifySoundEvent(payload, event.target_type, state.currentUserId);
         isMentioned = classified.isMentioned;
+        const isWindowFocused = document.visibilityState === "visible";
         const play = shouldPlayMessageSound({
           mode: getSoundNotificationMode(),
           // Already past the seenRealtimeMessageIds check above — this event
@@ -358,16 +361,42 @@ export function useChatSidebar() {
           category: classified.category,
           isMentioned: classified.isMentioned,
           isActiveConversation,
-          isWindowFocused: document.visibilityState === "visible",
+          isWindowFocused,
         });
         if (play) {
-          // playMessageSound() already never throws, but the unread badge
-          // must update even if that guarantee is ever violated — a failed
-          // chime is never allowed to break message receipt.
-          try {
-            playMessageSound();
-          } catch {
-            // Swallowed on purpose: see above.
+          // The native notification and the chime are alternate channels for
+          // the same eligible event, never both: a native one shown
+          // successfully replaces the chime; anything else (denied/default/
+          // unsupported permission, background API failure, or the tab being
+          // in the foreground — native notifications never fire there) falls
+          // through to the existing sound path unchanged.
+          let shown = false;
+          if (!isWindowFocused) {
+            try {
+              shown = showBrowserMessageNotification({
+                targetKind: event.target_type,
+                targetId: event.target_id,
+                senderDisplayName: payload.sender_display_name,
+                bodyText: payload.body_text,
+                onNavigate: (path) => {
+                  navigate(path);
+                  refreshSidebar();
+                },
+              }).shown;
+            } catch {
+              // The module already guards itself; this is defense in depth —
+              // the WS callback must never break because of it.
+            }
+          }
+          if (!shown) {
+            // playMessageSound() already never throws, but the unread badge
+            // must update even if that guarantee is ever violated — a failed
+            // chime is never allowed to break message receipt.
+            try {
+              playMessageSound();
+            } catch {
+              // Swallowed on purpose: see above.
+            }
           }
         }
       }

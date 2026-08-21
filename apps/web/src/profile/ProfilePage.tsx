@@ -3,6 +3,12 @@ import { Link } from "react-router";
 
 import "./ProfilePage.css";
 import {
+  type BrowserNotificationPermission,
+  getBrowserNotificationPermission,
+  isBrowserNotificationSecureContext,
+  requestBrowserNotificationPermission,
+} from "../chat/browserNotification";
+import {
   getSoundNotificationMode,
   setSoundNotificationMode,
   type SoundNotificationMode,
@@ -92,6 +98,16 @@ export default function ProfilePage() {
   const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() =>
     getSoundNotificationMode(),
   );
+  // Notification.permission is the canonical state (never mirrored to
+  // localStorage) — read fresh at mount and re-read on visibilitychange so a
+  // permission the user changes via the browser's own UI (e.g. the address
+  // bar lock icon) shows up here without requiring a reload.
+  const [browserPermission, setBrowserPermission] = useState<BrowserNotificationPermission>(() =>
+    getBrowserNotificationPermission(),
+  );
+  // Whether the "how to unblock" steps are expanded, in the 'denied' state —
+  // there's no functional retry there (see onEnableBrowserNotifications).
+  const [showBrowserNotificationHelp, setShowBrowserNotificationHelp] = useState(false);
 
   // persistedDisplayName: undefined = still loading / unknown.
   const [persistedDisplayName, setPersistedDisplayName] = useState<string | undefined>(undefined);
@@ -281,6 +297,33 @@ export default function ProfilePage() {
     const next = event.currentTarget.value as SoundNotificationMode;
     setSoundNotificationMode(next);
     setSoundModeState(next);
+  }, []);
+
+  // Only ever invoked by the 'default'-state button's onClick below —
+  // requestPermission() must never run on mount, on login, or when a message
+  // arrives. Once denied, browsers never reopen the native prompt from a
+  // second call, which is why 'denied' offers instructions instead of a
+  // retry (see the JSX below).
+  const onEnableBrowserNotifications = useCallback(async () => {
+    const result = await requestBrowserNotificationPermission();
+    setBrowserPermission(result);
+  }, []);
+
+  // Notification.permission can change outside this page's own control (the
+  // user unblocks it via the browser's own lock-icon UI, in this tab or
+  // another) — re-read it whenever the user could plausibly have done that:
+  // this tab regaining focus, or the whole document becoming visible again.
+  useEffect(() => {
+    const refreshBrowserPermission = () => setBrowserPermission(getBrowserNotificationPermission());
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") refreshBrowserPermission();
+    };
+    window.addEventListener("focus", refreshBrowserPermission);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", refreshBrowserPermission);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
   const busy = uploading || removing;
@@ -766,6 +809,60 @@ export default function ProfilePage() {
             Menções e mensagens diretas
           </label>
         </fieldset>
+
+        <div className="profile-page__browser-notifications">
+          {browserPermission === "granted" && (
+            <p className="profile-page__browser-notifications-status">
+              Notificações do navegador estão ativadas.
+            </p>
+          )}
+          {browserPermission === "denied" && (
+            <>
+              <p className="profile-page__browser-notifications-status">
+                Notificações do navegador foram bloqueadas. Para ativá-las, altere a permissão deste
+                site nas configurações do seu navegador.
+              </p>
+              <button
+                type="button"
+                className="profile-page__browser-notifications-button"
+                aria-expanded={showBrowserNotificationHelp}
+                onClick={() => setShowBrowserNotificationHelp((shown) => !shown)}
+              >
+                Como ativar notificações
+              </button>
+              {showBrowserNotificationHelp && (
+                <ol className="profile-page__browser-notifications-help">
+                  <li>Clique no ícone de cadeado ao lado do endereço do site.</li>
+                  <li>Localize a permissão de notificações.</li>
+                  <li>Remova o bloqueio ou selecione &quot;Permitir&quot;.</li>
+                  <li>Recarregue a página ou volte ao NChat.</li>
+                </ol>
+              )}
+            </>
+          )}
+          {browserPermission === "unsupported" && (
+            <p className="profile-page__browser-notifications-status">
+              {isBrowserNotificationSecureContext()
+                ? "Seu navegador não tem suporte a notificações nativas."
+                : "As notificações do navegador não estão disponíveis neste endereço. Acesse o NChat por HTTPS ou localhost."}
+            </p>
+          )}
+          {browserPermission === "default" && (
+            <>
+              <p className="profile-page__browser-notifications-status">
+                Ative notificações do navegador para ser avisado de novas mensagens mesmo com a aba
+                em segundo plano.
+              </p>
+              <button
+                type="button"
+                className="profile-page__browser-notifications-button"
+                onClick={onEnableBrowserNotifications}
+              >
+                Ativar notificações do navegador
+              </button>
+            </>
+          )}
+        </div>
       </section>
     </main>
   );
