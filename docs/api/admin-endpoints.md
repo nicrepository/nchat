@@ -1,10 +1,12 @@
 # Admin Service — Admin API
 
-> **Scope:** the Admin Console foundation (issue #578). This document covers the
-> endpoints that exist today: the administrative session handshake, the console
-> bootstrap, and the audit trail. Administrative management of users, channels,
-> integrations and infrastructure is **not** implemented and is not described
-> here.
+> **Scope:** the Admin Console foundation (issue #578) plus the management
+> surface (issue #579). This document covers the endpoints that exist today: the
+> administrative session handshake, the console bootstrap, the audit trail, the
+> platform user directory, the channel and conversation directories, and the two
+> operational policies that are configurable at runtime. Integrations,
+> infrastructure administration and a Health Center are **not** implemented and
+> are not described here.
 
 Public base: `/api/admin`. The gateways rewrite `/api/admin/<rest>` to
 `/<rest>` before the request reaches the pod, so the paths admin-service
@@ -33,6 +35,13 @@ Every response uses the platform envelope: `{"data": …}` on success,
 | 2   | DELETE | `/api/admin/session`      | Admin session cookie + CSRF token |
 | 3   | GET    | `/api/admin/bootstrap`    | Admin session cookie              |
 | 4   | GET    | `/api/admin/audit/events` | Admin session cookie + capability |
+| 5   | —      | Management (issue #579)   | Admin session cookie + capability |
+
+Every management route below is guarded in the same order: the administrative
+session, then — for a mutation — the origin and CSRF checks, then the one
+capability the route declares. There is no path that skips a step, no second
+router, and no generic mutation endpoint that takes the object type as a
+parameter.
 
 ---
 
@@ -159,9 +168,10 @@ Requires the `admin.audit.read` capability.
 
 **Query**
 
-| Name    | Default | Notes                                          |
-| ------- | ------- | ---------------------------------------------- |
-| `limit` | `50`    | Positive integer, capped server-side at `200`. |
+| Name      | Default | Notes                                                                                                            |
+| --------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `limit`   | `50`    | Positive integer, capped server-side at `200`.                                                                   |
+| `user_id` | —       | Optional. A user id (UUID); narrows the trail to the events performed **on** that account. Malformed is a `400`. |
 
 ```json
 {
@@ -182,16 +192,47 @@ Requires the `admin.audit.read` capability.
 }
 ```
 
-The endpoint takes no resource identifier: it returns the platform-wide trail or
-refuses, so there is no object reference for a caller to tamper with.
+`user_id` is the one narrowing this endpoint offers, and it exists because an
+operator looking at somebody's record needs their history — the last fifty
+platform-wide events are not it.
 
-| Status | Meaning                               |
-| ------ | ------------------------------------- |
-| `200`  | Events returned, newest first.        |
-| `400`  | `limit` is not a positive integer.    |
-| `401`  | No live administrative session.       |
-| `403`  | Missing `admin.audit.read`.           |
-| `503`  | Admin API not configured on this pod. |
+The filter runs in the database, in the `WHERE` clause, **before** the ordering
+and the limit. That is the whole point: an event that is the two-hundredth most
+recent on the platform is still the first one in its own subject's history, and
+a filter applied after the limit — or in the browser — would never find it.
+
+It is not an object reference to tamper with. The trail is platform-wide and
+`admin.audit.read` authorizes all of it, so narrowing reaches nothing a caller
+could not already read: no row becomes visible by naming an id, and none becomes
+hidden. The value is validated as a UUID and converted by the service into the
+canonical resource key `admin.user:<uuid>`, so what reaches the indexed
+`resource` column is a string this service built.
+
+"Performed on" is the deliberate reading. `actor_user_id` answers a different
+question — what somebody _did_ — and is not what this filter compares. The four
+mutations that act on an account (`admin.user.status.update`,
+`admin.user.sessions.revoke`, `admin.user.role.grant`,
+`admin.user.role.revoke`) all write that same resource key, so one filter finds
+every one of them.
+
+Channel membership events are filed under the **channel**
+(`admin.channel:<uuid>`), because that is the object that changed; the affected
+person travels in the metadata for the channel's own trail. Re-keying them to
+the user would claim a user record was modified when a channel's membership was.
+
+There is no filter on metadata, no JSON path, no pattern and no expression. The
+API expresses one intent — this person's history — and nothing a caller composes
+reaches the query.
+
+Absent `user_id`, the response is the platform-wide trail exactly as before.
+
+| Status | Meaning                                                                    |
+| ------ | -------------------------------------------------------------------------- |
+| `200`  | Events returned, newest first.                                             |
+| `400`  | `limit` is not a positive integer, or `user_id` is not a valid identifier. |
+| `401`  | No live administrative session.                                            |
+| `403`  | Missing `admin.audit.read`.                                                |
+| `503`  | Admin API not configured on this pod.                                      |
 
 ---
 
@@ -229,3 +270,617 @@ so a capability the platform does not define cannot be granted:
 `admin.superuser` implies the rest. An unknown capability is refused even for a
 superuser. See `docs/security/rbac-matrix.md` for the policy and
 `docs/runbooks/task-admin-console-foundation.md` for how a principal is granted.
+
+---
+
+# Management surface (issue #579)
+
+## Conventions
+
+**Pagination.** Every listing is keyset-paginated and newest-first. There is no
+page number and no total: a page costs its own rows, and a count would mean
+scanning the whole table on every request.
+
+| Query    | Default | Notes                                                |
+| -------- | ------- | ---------------------------------------------------- |
+| `limit`  | `25`    | Positive integer; values above `100` are capped.     |
+| `cursor` | —       | Opaque token from the previous page's `next_cursor`. |
+
+```json
+"pagination": { "next_cursor": "MjAyNi0wOC0yMFQxMDowMDowMFp8dXVpZA", "has_more": true }
+```
+
+On the last page the field is present and null:
+
+```json
+"pagination": { "next_cursor": null, "has_more": false }
+```
+
+`has_more` is derived from `next_cursor`, so the two can never disagree. The
+last page is always `null` and never `""` — the field is never omitted either,
+so a client never has to tell "no more pages" from a key the server forgot to
+send. A malformed cursor is a `400`, not a silent restart from page one.
+
+The cursor is opaque but not secret and not a capability: it names a position in
+an ordering the caller is already authorized to read, and the authorization is
+re-evaluated on the request that carries it.
+
+**Ordering.** There is no `sort` parameter on any endpoint. Each listing has one
+fixed order, so there is no ordering expression a request can influence.
+
+**Filters.** Every filter is drawn from a closed allowlist or is a bounded
+scalar. An unrecognised value is a `400` rather than a filter that silently
+matches nothing. No filter is ever concatenated into SQL: the queries bind their
+parameters and use one prepared statement for every combination.
+
+**Search.** `q` is matched with `ILIKE` against a bound pattern. `%`, `_` and
+`\` are escaped before the pattern is built, and every predicate states
+`ESCAPE E'\\'` rather than relying on the server default — so a term containing
+them matches them literally instead of turning into a wildcard that quietly
+stops filtering. The escaping is proved against a real PostgreSQL by the
+`TestPostgreSQL_Search*` suite, which seeds decoy records that would be false
+positives if either character were still a wildcard and asserts the rows the
+query returned, not the pattern the helper produced.
+
+**Bodies.** Mutating bodies are capped at 64 KiB, decoded with unknown fields
+refused, and accept exactly one JSON document. A body carrying a field the
+endpoint does not name — `role`, `capabilities`, `platform_admin`, a second
+identifier — is a `400`, never a partially applied update.
+
+**Statuses.** `400` malformed request; `401` no live administrative session;
+`403` missing capability, rejected origin or invalid CSRF token; `404` the named
+object does not exist; `409` the object is not in the state the command
+requires, including a change another request made first; `503` the Admin API is
+not configured on this pod.
+
+---
+
+## Users
+
+| Method | Path                                               | Capability           |
+| ------ | -------------------------------------------------- | -------------------- |
+| GET    | `/api/admin/users`                                 | `admin.users.read`   |
+| GET    | `/api/admin/users/{userID}`                        | `admin.users.read`   |
+| PATCH  | `/api/admin/users/{userID}/status`                 | `admin.users.manage` |
+| DELETE | `/api/admin/users/{userID}/sessions`               | `admin.users.manage` |
+| POST   | `/api/admin/users/{userID}/admin-roles`            | `admin.superuser`    |
+| DELETE | `/api/admin/users/{userID}/admin-roles/{roleSlug}` | `admin.superuser`    |
+
+### `GET /api/admin/users`
+
+| Query    | Values                                                                                   |
+| -------- | ---------------------------------------------------------------------------------------- |
+| `q`      | Free text, ≤128 chars; matches display name, full name or e-mail. Wildcards are escaped. |
+| `status` | `active` \| `invited` \| `suspended` \| `locked`                                         |
+
+`deleted` is a status `auth.users` can hold and is deliberately **not** an
+accepted filter — `status=deleted` is a `400`. The directory excludes
+soft-deleted accounts unconditionally, as every reader of `auth.users` on this
+platform does, so the value could never return a row; making it return rows
+would turn a contract fix into administrative access to erased and anonymized
+people, which is retention work this issue does not do.
+| `auth_source` | `manual` \| `oidc` \| `imported` |
+| `platform_admin` | `true` \| `false`. Absent means "either", which is not the same as `false`. |
+| `workspace_role` | `owner` \| `admin` \| `moderator` \| `member` \| `guest` |
+| `inactivity` | `never` \| `7d` \| `30d` \| `90d` |
+
+`workspace_role` is a **workspace** role, from `chat.workspace_members` as
+migration 000022 widened it. It is not a platform role and not a capability:
+`platform_admin` is a separate question, and the two combine rather than replace
+each other — asking for both returns the workspace owners who are also platform
+administrators.
+
+The directory is platform-wide and no request names a workspace, so the filter
+reads as _"holds at least one active membership with this role, in any active
+workspace"_. It cannot mean "in workspace X" because there is no X in the
+request. It is applied as an `EXISTS`, so somebody who owns two workspaces
+appears once and the page size stays honest. A membership that has ended, or one
+in a disabled workspace, does not select.
+
+```json
+{
+  "data": {
+    "users": [
+      {
+        "id": "…",
+        "email": "ana@example.test",
+        "display_name": "Ana",
+        "full_name": "Ana Lima",
+        "avatar_url": "",
+        "status": "active",
+        "auth_source": "oidc",
+        "external_provider": "keycloak",
+        "identity_managed_externally": true,
+        "last_login_at": "2026-08-01T10:00:00Z",
+        "created_at": "2026-01-01T00:00:00Z",
+        "platform_admin": false,
+        "admin_roles": [],
+        "workspace_roles": [
+          {
+            "workspace_id": "…",
+            "workspace_name": "NChat",
+            "role": "member",
+            "status": "active",
+            "joined_at": "2026-01-01T00:00:00Z"
+          }
+        ],
+        "active_sessions": 2
+      }
+    ],
+    "pagination": { "next_cursor": null, "has_more": false }
+  }
+}
+```
+
+The payload is an allowlist, not a filter. `auth.users` carries more than this —
+the subject identifier the identity provider knows the person by, the
+soft-delete timestamp, the anonymization timestamp — and none of it can arrive
+here by somebody adding a column. `identity_managed_externally` is derived
+server-side so the console does not re-derive it.
+
+The row aggregates (`workspace_roles`, `admin_roles`, `active_sessions`) come
+from lateral joins evaluated once per row of the page, on indexes already keyed
+by `user_id`. There is no per-row follow-up request.
+
+### `GET /api/admin/users/{userID}`
+
+Adds `memberships`, `channel_count`, `role_grants` (with `granted_at` and
+`granted_by`) and `available_roles` — the catalogue of grantable roles and what
+each confers. The catalogue travels with the record so the console does not need
+a second endpoint for it; it names roles and capabilities, which are public
+policy, and no principal.
+
+### `PATCH /api/admin/users/{userID}/status`
+
+```json
+{ "status": "suspended" }
+```
+
+`active` and `suspended` only. `invited`, `locked` and `deleted` belong to other
+flows and are not a switch an operator flips.
+
+Suspension and session revocation are one transaction: the user row is locked,
+the transition is validated under that lock, every live session is revoked with
+`revoked_reason = 'admin_suspension'`, the matching refresh-token history is
+marked revoked, and pending OIDC exchange codes are consumed so a code minted
+before the suspension cannot be redeemed after it. Activation restores nothing —
+the person signs in again.
+
+```json
+{
+  "data": {
+    "user_id": "…",
+    "from_status": "active",
+    "to_status": "suspended",
+    "revoked_sessions": 2
+  }
+}
+```
+
+An administrator cannot change their own status: a `403`, recorded as a denial.
+A transition onto the status the account already has is a `409`, so two
+concurrent suspensions produce one change and one conflict rather than two audit
+rows claiming the same thing.
+
+### `DELETE /api/admin/users/{userID}/sessions`
+
+Signs one account out everywhere without changing what it is allowed to do.
+Answers `{ "data": { "user_id": "…", "revoked_sessions": 3 } }`. Same self
+guard: revoking the operator's own logins would end the administrative session
+riding on one of them from inside the request that asked for it.
+
+### `POST` / `DELETE /api/admin/users/{userID}/admin-roles`
+
+```json
+{ "role_slug": "platform-auditor" }
+```
+
+Both answer `204`.
+
+`admin.superuser` and not `admin.users.manage`. A principal may only confer
+authority it holds in full; anything narrower granting a role would be
+horizontal escalation — an administrator with `admin.users.manage` handing
+somebody `admin.security.manage`.
+
+Enforced invariants:
+
+- **self-escalation and self-lockout** — an administrator cannot change their own
+  roles (`403`);
+- **target validity** — the account must exist, not be soft-deleted, and be
+  active; a suspended account is a `409`;
+- **principal suspension is not undone** — a role grant does not reactivate a
+  principal suspended out of band (`409`);
+- **the platform is never left without an administrator** — a revocation counts
+  the remaining principals reaching `admin.superuser` _after_ the delete and
+  _inside_ the transaction, under a transaction-scoped advisory lock, and rolls
+  back if the count would reach zero (`409`). The lock is what makes it correct
+  under concurrency: the rule is about a count across rows, and two transactions
+  each deleting a different row would otherwise both see the other's row still
+  present and both commit.
+
+Removing a principal's last role leaves the principal row in place. It confers
+nothing — the session service refuses a principal holding no capability on every
+request, so the removal takes effect immediately — and deleting it would cascade
+through `auth.admin_sessions`, destroying records the audit trail refers to.
+
+---
+
+## Channels and conversations
+
+| Method | Path                                                | Capability              |
+| ------ | --------------------------------------------------- | ----------------------- |
+| GET    | `/api/admin/channels`                               | `admin.channels.read`   |
+| GET    | `/api/admin/channels/{channelID}`                   | `admin.channels.read`   |
+| PATCH  | `/api/admin/channels/{channelID}/status`            | `admin.channels.manage` |
+| GET    | `/api/admin/channels/{channelID}/member-candidates` | `admin.channels.manage` |
+| POST   | `/api/admin/channels/{channelID}/members`           | `admin.channels.manage` |
+| DELETE | `/api/admin/channels/{channelID}/members/{userID}`  | `admin.channels.manage` |
+| GET    | `/api/admin/conversations`                          | `admin.channels.read`   |
+
+### `GET /api/admin/channels`
+
+| Query             | Values                                  |
+| ----------------- | --------------------------------------- |
+| `q`               | Matches display name or slug.           |
+| `workspace_id`    | UUID.                                   |
+| `type`            | `public` \| `private`                   |
+| `status`          | `active` \| `archived`                  |
+| `min_members`     | Non-negative integer, ≤1000000.         |
+| `active_within`   | `7d` \| `30d` \| `90d`                  |
+| `administered_by` | A user id (UUID). Malformed is a `400`. |
+
+`administered_by` selects the channels that person **administers**, which in
+this domain means _created_ (`chat.channels.created_by`) **or** _moderates_
+(`chat.channel_members.role = 'moderator'`). It is deliberately narrow: the chat
+domain has no channel owner and no channel admin.
+
+It does **not** include the workspace's owners and admins. Those govern the
+workspace, not one channel, and folding them in would make every channel in a
+workspace match its owner — a different question, and precisely the collapse
+`docs/security/rbac-matrix.md` exists to prevent.
+
+Each row carries the workspace, visibility, state, member and moderator counts,
+who created it, and a last-activity **timestamp**. Not a preview: the console
+lists where conversation happens, never what was said.
+
+Private channels appear. That is not a widening of the channel read policy — the
+row states that a private channel exists, how large it is and who administers
+it, which is what `admin.channels.read` authorizes. No message and no member
+name of a private channel is reachable from the listing, and
+`chat.channel_visible_to_user` remains the only thing that decides who may read
+one.
+
+### `GET /api/admin/channels/{channelID}`
+
+Adds `category_name`, `message_count` (a volume, not a listing) and two separate
+people lists:
+
+- `moderators` — `chat.channel_members.role = 'moderator'`, a per-channel role;
+- `workspace_admins` — `chat.workspace_members.role IN ('owner','admin')`, which
+  governs the workspace.
+
+They are separate fields because they are separate authorities. Merging them
+into one "admins" array is exactly the collapse `docs/security/rbac-matrix.md`
+exists to prevent. Both lists are capped at 50.
+
+A third list, `members`, is a bounded preview of the channel's membership so the
+console has something to administer. It is capped at 50; `member_count` on the
+summary is the real total, and capping the preview is what keeps a detail view
+from doubling as a membership export. Being in a channel is not the same as
+administering it, which is why it is its own field and not merged into either of
+the two above.
+
+### `PATCH /api/admin/channels/{channelID}/status`
+
+```json
+{ "status": "archived" }
+```
+
+Archive and unarchive, both directions. There is **no delete**: a channel holds
+its members' history, and removing it is not an operation an administrative
+click should perform. The workspace's `#geral` channel is refused with `403` —
+chat-service treats it as immutable and this console must not become a second
+way around that. A transition onto the current status is a `409`.
+
+### `GET /api/admin/channels/{channelID}/member-candidates`
+
+The picker behind the add: it answers "who could I add to this channel", so an
+operator finds a colleague by name instead of knowing an identifier.
+
+| Query | Notes                                                                         |
+| ----- | ----------------------------------------------------------------------------- |
+| `q`   | Matches display name, full name or e-mail, ≤128 chars. Wildcards are escaped. |
+
+Requires **`admin.channels.manage`** — the capability of the mutation it feeds,
+not `admin.channels.read`. Seeing that a channel exists must not also enumerate
+the people in its workspace.
+
+The workspace is derived from the channel inside the query, so no request can
+point the search at another tenant's directory. That is the reason this is a
+channel-scoped endpoint rather than a filter on `/users`.
+
+The result set is the same population the add would admit — active member of the
+channel's workspace, active workspace, active channel, active non-deleted
+account — minus anybody already in the channel, excluded by a `NOT EXISTS` in
+the same statement rather than by a lookup per candidate. Capped at 10.
+
+```json
+{
+  "data": {
+    "candidates": [
+      {
+        "user_id": "…",
+        "display_name": "Ana",
+        "full_name": "Ana Lima",
+        "email": "ana@example.test",
+        "avatar_url": "",
+        "workspace_role": "member"
+      }
+    ]
+  }
+}
+```
+
+Deliberately narrower than a directory row: no administrative role, no
+membership list, no session count, no identity-provider detail. A picker behind
+a channel capability must not double as a second, wider user directory.
+
+This is a convenience and never a control. `POST .../members` re-decides
+eligibility for whoever is actually submitted, under the shared rule, in the
+statement that writes — a client that skips this search gains nothing.
+
+### `POST /api/admin/channels/{channelID}/members`
+
+```json
+{ "user_ids": ["…", "…"] }
+```
+
+User ids and nothing else. There is no `role` in the contract — every
+administratively added member joins as an ordinary `member`, and an endpoint
+that could create a channel moderator would be a privilege grant wearing the
+shape of a membership change. There is no `workspace_id` either: it is derived
+from the channel, so no request can aim the operation at another workspace. A
+body carrying either is a `400`.
+
+The list must be non-empty, at most 50 entries, and every entry a distinct
+well-formed UUID; anything else is a `400` before a statement runs.
+
+**Eligibility** is the shared rule in `libs/go/platform/channelmembership`,
+embedded verbatim by this service _and_ by chat-service — the two writers of
+`chat.channel_members` do not each carry their own copy. A target must be an
+active member of the channel's workspace, in an active workspace, in an active
+channel, with an active non-deleted account. Guests are eligible: being added to
+a channel is the only way a guest reaches one.
+
+What is **not** shared is the actor check, because it is genuinely different.
+chat-service re-derives the caller's owner/admin/moderator workspace membership
+inside its transaction; here the authority is the platform capability
+`admin.channels.manage`, re-read from the database by the session guard on this
+request, and the actor is typically not a member of the workspace at all.
+
+The add is **all-or-nothing**: if any requested target is ineligible, nothing is
+written and the answer is `409`. `409` rather than `403` on purpose — the caller
+already holds the capability and can already list every channel and every user,
+so there is nothing left to conceal, and `403` in this API means "you lack the
+capability", which would be a lie.
+
+Idempotent: a repeat adds nobody and says so.
+
+```json
+{
+  "data": {
+    "channel_id": "…",
+    "workspace_id": "…",
+    "added": 1,
+    "already_members": 0,
+    "removed": false,
+    "member_count": 13
+  }
+}
+```
+
+`added` and `already_members` are separate because they are separate outcomes.
+Reporting a retry as "1 added" would tell the operator something false.
+
+`member_count` is the channel's total **after this operation**, and it is exact
+under concurrency. Every writer of `chat.channel_members` — this endpoint, the
+removal below, and chat-service's own add, single-add and remove — takes an
+exclusive row lock on the channel as the first statement of its transaction, and
+counts after its write and before its commit. Two administrators adding
+different people to a channel of ten therefore answer 11 and 12, in whichever
+order they win the lock, and the committed total is 12. The lock is per channel:
+mutations on different channels never wait for each other.
+
+This changes membership and grants the actor nothing: they do not become a
+member, and no message becomes reachable anywhere in this service as a result.
+
+### `DELETE /api/admin/channels/{channelID}/members/{userID}`
+
+The target is a path segment, so the operation has the idempotent shape a
+`DELETE` should have and cannot be re-aimed by a body the console did not send.
+
+Removing somebody who is not a member answers `200` with `removed: false`: the
+caller's intent already holds, and a `404` would make a safe retry look like a
+failure.
+
+An **archived** channel is not a refusal. Removal does not read the channel's
+status — taking somebody out of a channel nobody uses needs no live channel, and
+chat-service's own removal behaves the same way. Only _adding_ requires an
+active channel, because the shared eligibility rule does.
+
+`#geral` is refused with `403`, mirroring `ErrCannotLeaveGeneralChannel` in
+chat-service. Every member of a workspace belongs to its general channel by
+construction, and this console must not become a second way around that.
+Additions to `#geral` are _not_ refused: a guest is not enrolled in it
+automatically, so adding one is a real operation.
+
+**Not offered, deliberately:** membership of a private DM group. A platform
+administrator has no authority over a conversation they cannot read, and
+`chat.dm_members` remains the only thing that decides who participates in one.
+"Groups" in this console means the workspace's channels.
+
+### `GET /api/admin/conversations`
+
+| Query          | Values                 |
+| -------------- | ---------------------- |
+| `workspace_id` | UUID.                  |
+| `type`         | `direct` \| `group`    |
+| `status`       | `active` \| `archived` |
+
+```json
+{
+  "data": {
+    "conversations": [
+      {
+        "id": "…",
+        "workspace_id": "…",
+        "workspace_name": "NChat",
+        "type": "group",
+        "status": "active",
+        "participant_count": 4,
+        "message_count": 120,
+        "created_at": "…",
+        "updated_at": "…",
+        "last_activity_at": "…"
+      }
+    ],
+    "pagination": { "next_cursor": null, "has_more": false }
+  }
+}
+```
+
+**What is absent is the contract.** No body, no rich text, no attachment, no
+quote, no reaction, no preview, no "most recent message", no title — a group's
+title is written by its participants — and no participant identity. There is no
+search over conversations, no per-conversation detail endpoint, and no
+administrative message endpoint of any kind in this service.
+
+Being a platform administrator does not make somebody a participant.
+`chat.dm_members` remains the only thing consulted to decide who may read a
+conversation, and no query added by this issue reads `chat.messages.body_text`.
+`TestConversationQuery_NeverSelectsMessageContent` asserts that against the SQL
+itself, and `TestListConversations_ExposesNoContentAndNoParticipants` asserts it
+against the response.
+
+There is no `q` parameter here on purpose: searching conversations would mean
+searching their titles or their content.
+
+---
+
+## Operational policies
+
+| Method | Path                                          | Capability                    |
+| ------ | --------------------------------------------- | ----------------------------- |
+| GET    | `/api/admin/policies/anti-spam`               | `admin.security.read`         |
+| PATCH  | `/api/admin/policies/anti-spam/{workspaceID}` | `admin.security.manage`       |
+| GET    | `/api/admin/policies/upload`                  | `admin.infrastructure.read`   |
+| PATCH  | `/api/admin/policies/upload/{workspaceID}`    | `admin.infrastructure.manage` |
+
+These are the **only two** operational policies that are configurable at
+runtime. Both are columns on `chat.workspaces` with a database `CHECK`, read by
+the enforcing service on the path that enforces them, so an administrative
+change takes effect without a restart.
+
+Everything else an operator might want to tune — burst windows, reaction and
+edit limits, conversation-creation limits, link-scan budgets, malware scanner
+behaviour, upload concurrency, the gateway body cap — is read from the
+environment at boot by the service that enforces it. Changing one is a rollout,
+not a click, and this API offers no field that would store a number nobody
+reads. The upload listing names the ones that are real and fixed rather than
+staying silent about them.
+
+Both listings echo the server's own bounds so a client validates and renders
+against them instead of restating limits it decided:
+
+```json
+"bounds": { "min": 1, "max": 600, "default": 60, "unit": "messages_per_minute" }
+```
+
+`unit` is named explicitly: a limit whose unit the screen has to guess is how
+"60" becomes per-second on one side and per-minute on the other. `step`, present
+on the upload bounds, is the granularity every accepted value must be an exact
+multiple of.
+
+### Anti-spam (RF-19)
+
+```json
+{ "message_rate_limit_per_minute": 30 }
+```
+
+Bounds `[1, 600]`, default `60`. The minimum is 1 and not 0 by design: an
+anti-spam control must not double as a way to mute a workspace, so "unlimited"
+and "disabled" are both inexpressible.
+
+The same column chat-service's own workspace-admin endpoint writes, under the
+same `CHECK`. What differs is the authorization: chat-service asks "does this
+person administer this workspace", this service asks "does this principal hold
+the platform capability". Propagation is unchanged — chat-service caches the
+policy per workspace for five seconds, so an instance other than the one serving
+the change picks it up within that window. This API claims no hot reload the
+platform does not perform.
+
+### Upload limit (RF-32)
+
+```json
+{ "max_upload_bytes": 104857600 }
+```
+
+Bounds `[1 MiB, 512 MiB]`, default 250 MiB, and every accepted value is an exact
+multiple of 1 MiB. A value off that grid is **refused**, never rounded: the
+administrative screen edits whole MiB, so a stored limit that is not one could
+not be shown there without being changed, and an ordinary save would then write
+a limit nobody typed.
+
+Refused with `400`, at the HTTP boundary and before the service: decimals,
+exponent notation, a number sent as a JSON string, `null`, an absent field, a
+value too large for `int64`, and anything outside the bounds. A number that does
+not fit `int64` cannot wrap into a small positive limit.
+
+The listing also publishes what this policy is not:
+
+```json
+"gateway_hard_cap_bytes": 536879104,
+"deployment_managed": ["malware_scanning", "upload_concurrency"]
+```
+
+`gateway_hard_cap_bytes` is the static infrastructure ceiling, derived from the
+same constant the gateway configuration is, so the two cannot drift. No
+workspace limit can exceed it. No value of this policy disables malware
+scanning, bypasses admission control or makes an unavailable control mean
+"allow unlimited": the bounds make that inexpressible and every failure path in
+file-service keeps a limit in force.
+
+---
+
+## Audit
+
+Every mutation above writes one row to `auth.admin_audit_events` through the
+existing audit service, with the actor taken from the session and the
+correlation id minted by this service — never accepted from a header.
+
+| Action                         | Written by                                  |
+| ------------------------------ | ------------------------------------------- |
+| `admin.user.status.update`     | `PATCH /users/{id}/status`                  |
+| `admin.user.sessions.revoke`   | `DELETE /users/{id}/sessions`               |
+| `admin.user.role.grant`        | `POST /users/{id}/admin-roles`              |
+| `admin.user.role.revoke`       | `DELETE /users/{id}/admin-roles/{slug}`     |
+| `admin.channel.status.update`  | `PATCH /channels/{id}/status`               |
+| `admin.channel.member.add`     | `POST /channels/{id}/members`               |
+| `admin.channel.member.remove`  | `DELETE /channels/{id}/members/{userID}`    |
+| `admin.policy.antispam.update` | `PATCH /policies/anti-spam/{workspaceID}`   |
+| `admin.policy.upload.update`   | `PATCH /policies/upload/{workspaceID}`      |
+| `admin.authorization.deny`     | Any capability refusal on any guarded route |
+
+Refusals are recorded too, and `result` distinguishes them: `denied` is the
+platform saying no, `error` is the platform breaking. Collapsing the two would
+make an attack look like an outage.
+
+Metadata is an allowlist by construction — a `map[string]string` each producer
+builds field by field from server-derived values. For a policy change it carries
+the field, the unit, the previous value, the new value and the permitted range;
+for a status change, the previous status and how many sessions the transition
+closed; for a membership change, how many targets were requested, how many
+were added, how many were already members, and — for a removal — whether
+anything was actually removed, so the trail never claims a removal that did not
+happen. No token, header, cookie, password, client secret or message content is
+reachable from any producer.
