@@ -1,5 +1,11 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
+
+// O SonarQube resolve os caminhos do LCOV a partir da raiz do repositorio, e o
+// lcovonly os escreve relativos a este projectRoot. Sem isto o relatorio sairia
+// com "src/..." e nenhum arquivo seria reconhecido na analise do monorepo.
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 // The administrative console is a separate bundle with a separate dev server.
 // Nothing here imports from apps/web: the console must be able to mount, and to
@@ -18,7 +24,7 @@ export default defineConfig({
     exclude: [...configDefaults.exclude, "e2e/**", "**/e2e/**", "**/*.e2e.*"],
     coverage: {
       provider: "v8",
-      reporter: ["text", "json", "html"],
+      reporter: ["text", "json", "html", ["lcovonly", { projectRoot: repositoryRoot }]],
       reportsDirectory: "../../coverage/admin-web",
       exclude: [...(configDefaults.coverage?.exclude ?? []), "src/main.tsx", "e2e/**"],
       thresholds: {
