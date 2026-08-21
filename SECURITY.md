@@ -129,9 +129,13 @@ concretas; a matriz e a referencia completa.
 
 Os cinco papeis do RF-74 e onde cada um vive:
 
-- **Admin Master** — escopo de plataforma. Nao existe papel global no banco: o
-  unico mecanismo e a identidade de bootstrap `X-NChat-Admin-Token`, restrita as
-  tres rotas `/admin/*` do auth-service. Nao le canal nem DM.
+- **Admin Master** — escopo de plataforma. Desde a issue #578 existe um modelo
+  persistido: `auth.admin_principals` diz quem e administrador de plataforma e
+  `auth.admin_principal_roles` → `auth.admin_role_capabilities` diz o que cada um
+  pode. A identidade de bootstrap `X-NChat-Admin-Token` continua existindo, agora
+  estritamente como caminho CLI das tres rotas `/admin/*` do auth-service. Nem o
+  papel nem o token concedem leitura de canal ou de DM. Ver "Console
+  administrativo" abaixo.
 - **Admin de Workspace** — `chat.workspace_members.role IN ('owner','admin')`,
   exposto como `domain.CanManageWorkspace`. `owner` **nao** e Admin Master: e a
   autoridade maxima dentro de um workspace e nada fora dele.
@@ -294,14 +298,176 @@ diferente de listar, convidar e suspender pessoas.
 
 As rotas `/admin/users`, `/admin/invites` e `/admin/users/{id}/status`
 permanecem atras de `AdminBootstrapGuard` (`X-NChat-Admin-Token`), CLI-only.
-Esse bypass e o unico escopo de plataforma que existe hoje e e o que o RF-74
-documenta como **Admin Master**: nao ha tabela, coluna nem papel global de
-administrador de plataforma, e o RF-74 nao criou um -- um papel que nenhum
-endpoint sabe atribuir seria o mesmo codigo morto ja recusado acima para o
-moderador. O token continua porque e o unico caminho que funciona antes de
-existir um primeiro administrador; substitui-lo exige decidir como esse primeiro
-administrador nasce, o que esta fora do RF-74. A limitacao esta registrada em
-`docs/security/rbac-matrix.md`.
+Elas nao foram substituidas pela issue #578 e continuam sendo o caminho de
+provisionamento anterior a existencia de um administrador de plataforma. O que
+mudou e que esse token deixou de ser o _unico_ escopo de plataforma: a issue #578
+persistiu o modelo de administrador global descrito abaixo, e o primeiro
+administrador passa a nascer de uma concessao no banco em vez de um segredo
+estatico compartilhado.
+
+## Console administrativo (issue #578)
+
+O Admin Console e uma aplicacao separada (`apps/admin-web`), com bundle proprio,
+Content-Security-Policy propria e host proprio, servida pela Admin API do
+`admin-service` em `/api/admin`. O contrato esta em `docs/api/admin-endpoints.md`
+e a operacao em `docs/runbooks/task-admin-console-foundation.md`.
+
+### O que autoriza
+
+Nao existe `isAdmin` em lugar algum. A unidade de autorizacao e a _capability_, e
+cada endpoint privilegiado declara a que exige. As capabilities sao lidas do
+banco a cada requisicao — nunca de uma claim de token — entao remover um papel
+passa a valer na requisicao seguinte, e nao no proximo login.
+
+Deny by default em tres pontos independentes:
+
+- uma capability que a plataforma nao define e recusada mesmo para
+  `admin.superuser`, entao um erro de digitacao num guard falha fechado;
+- o conjunto vazio (principal sem papel, ou principal nao carregado) nao concede
+  nada;
+- o `CHECK` de `auth.admin_role_capabilities` impede que uma capability
+  desconhecida sequer seja gravada.
+
+Estar autenticado no NChat **nao** e autoridade administrativa: a sessao ativa
+prova identidade, e `auth.admin_principals` decide o resto. As capabilities
+enviadas ao frontend sao dado de apresentacao — elas escolhem o que a barra
+lateral desenha, nunca o que um endpoint permite.
+
+### A credencial do console
+
+Cookie opaco gerado pelo servidor, nunca um token no Web Storage:
+
+```
+__Host-nchat_admin_session=<opaco>; Path=/; HttpOnly; Secure; SameSite=Strict
+```
+
+`HttpOnly` impede que um XSS no console leia a credencial; `SameSite=Strict`
+retira o cookie de toda requisicao cross-site; o prefixo `__Host-` faz o
+navegador recusar o cookie se ele nao for `Secure`, `Path=/` e sem `Domain` — o
+que impede o host do chat, um subdominio irmao, de plantar ou ler a sessao
+administrativa. Session fixation e impossivel por construcao: o valor e gerado
+por `crypto/rand` no servidor e nenhum valor enviado pelo cliente e adotado como
+identificador de sessao.
+
+O token de acesso do chat e aceito uma unica vez, no handshake
+`POST /api/admin/session`, para provar quem esta pedindo. Ele nao autoriza nada,
+nao e persistido pelo console e nao vira a credencial do console.
+
+`X-NChat-Admin-Token` nao participa de nenhuma rota da Admin API. Ele nao pode
+ser enviado ao frontend, aparecer em bundle, em `localStorage`, em
+`sessionStorage`, em cookie de navegador, em resposta ou em log.
+
+### Sessao administrativa
+
+Politica propria e mais restritiva que a do chat: idle de 15 minutos, vida
+absoluta de 8 horas, ambas gravadas na propria linha contra a qual a requisicao e
+autorizada. Cada handshake cria uma linha nova, entao a credencial depois da
+autenticacao nunca e a mesma de antes dela. Revogar a sessao administrativa, o
+principal ou o login de origem encerra o acesso; a revalidacao por requisicao
+verifica os tres.
+
+### Isolamento de origem do console (issue #578)
+
+`/api/admin/*` e publicado **somente** no host administrativo. O host do chat
+nao possui rota alguma para o `admin-service`, em nenhum ambiente versionado nem
+no gateway local.
+
+Isso e o que sobrevive a um XSS no chat: um atacante que roube o access token do
+`sessionStorage` e tente `POST /api/admin/session` a partir da origem do chat
+nao alcanca backend administrativo nenhum — a requisicao cai no catch-all da SPA
+e nenhuma sessao administrativa e criada. Esconder o link no frontend nao
+produziria essa propriedade; a recusa esta na tabela de roteamento.
+
+Se o mesmo atacante enderecar o host administrativo, ele encontra a segunda
+barreira: o preflight CORS da origem do chat e recusado, o cookie de sessao e
+`__Host-` (host-only, sem `Domain`) e `SameSite=Strict`, e os metodos mutaveis
+exigem origem reconhecida mais o token de dupla submissao.
+
+`scripts/ci/admin-route-contract-check.sh` renderiza os overlays e o gateway
+local e falha se qualquer host que nao seja o do console passar a apontar para o
+`admin-service`.
+
+### MFA administrativo
+
+A autoridade de autenticacao continua sendo o Keycloak: o NChat nao armazena
+TOTP, nao implementa segundo fator e nao mantem senha administrativa paralela.
+
+O que a foundation acrescenta e a outra metade do controle. `OIDC_ADMIN_ACR_VALUES`
+lista os valores de `acr` que o ambiente aceita como prova de que o fluxo
+administrativo rodou. Vazio significa que nenhum requisito foi declarado.
+Preenchido, o requisito e real e fail-closed: o login administrativo envia
+`acr_values` ao provedor e o callback recusa um token que nao volte com um dos
+valores configurados, respondendo `403 oidc_insufficient_assurance` sem criar
+sessao.
+
+Tres decisoes deliberadas:
+
+- **`acr` ausente e recusa.** O claim e opcional em OIDC; "o provedor nao disse
+  nada" nunca e "usou segundo fator".
+- **Comparacao exata**, sem prefixo ou substring: um nivel de assurance e um
+  identificador, nao uma escala que este servico possa ordenar.
+- **Somente `app=admin`.** Uma politica administrativa nao muda como todas as
+  pessoas do produto entram no chat.
+
+O valor nunca e inventado por este repositorio: e o que o realm emite, e a
+configuracao operacional esta em
+`docs/runbooks/task-admin-console-foundation.md`.
+
+### Single sign-on nos dois hosts
+
+O console reutiliza o fluxo Keycloak/OIDC do chat inteiro — mesmo client, mesmo
+state, nonce e PKCE. A unica diferenca e a URI de callback, porque as duas
+aplicacoes vivem em origens diferentes.
+
+A escolha e feita por um rotulo de um conjunto fechado (`chat` | `admin`) no
+parametro `app` de `/auth/oidc/keycloak/login`. O rotulo seleciona uma URI que
+esta na configuracao do servidor; ele nunca vira destino, e um valor fora do
+conjunto recebe `400` sem iniciar login algum. Nao existe `returnTo`,
+`redirect_uri` nem qualquer outro parametro de destino aceito do cliente — a
+superficie de open redirect e, por construcao, vazia.
+
+O contexto escolhido e gravado em `auth.oidc_auth_requests.app_context`, na mesma
+linha dos hashes de state e nonce que o callback ja consome atomicamente. O
+callback o relê dali, nao da requisicao que volta: entre a saida e o retorno o
+navegador passa pelo provedor de identidade, e o retorno e exatamente o que um
+atacante controla.
+
+O redirecionamento final para o frontend continua sendo o caminho **relativo**
+`/oidc-callback`, entao o navegador permanece na origem em que o callback rodou.
+
+Um login OIDC bem-sucedido nao concede capability administrativa alguma: ele
+produz uma sessao NChat comum, e `POST /api/admin/session` ainda consulta
+`auth.admin_principals`.
+
+### CSRF, CORS e cabecalhos
+
+Metodos mutaveis exigem, alem do cookie `SameSite=Strict`, uma origem
+reconhecida (`Origin`, ou `Referer` quando o navegador omite `Origin` — a
+ausencia dos dois e recusa) e um token de dupla submissao derivado da sessao em
+`X-NChat-Admin-CSRF`. O CORS e uma allowlist explicita; `*` e descartado no
+carregamento da configuracao, porque com credenciais ele nunca e valido.
+
+A CSP do console e mais estreita que a do chat: `connect-src 'self'`,
+`frame-ancestors 'none'`, sem `unsafe-inline` em `script-src`, sem `unsafe-eval`,
+sem `blob:`, sem `media-src`. `scripts/ci/web-security-headers-check.sh` valida
+as duas politicas e falha se qualquer outra camada do repositorio passar a emitir
+uma terceira.
+
+### Auditoria
+
+`auth.admin_audit_events` registra login administrativo, logout e negacao de
+autorizacao, com ator, acao, recurso, resultado, timestamp e o `X-Request-ID` da
+chamada. `metadata` e um objeto JSON montado campo a campo pelo produtor. Nunca
+sao gravados: access token, refresh token, bootstrap token, senha, client secret,
+conteudo de mensagem, header `Authorization` e header `Cookie`. Uma falha de
+escrita e registrada no log do servico e nao derruba a requisicao — a trilha e
+evidencia, nao pre-condicao.
+
+### Observabilidade
+
+A Admin API usa a instrumentacao HTTP compartilhada, cujas labels sao metodo,
+rota e status. Nenhum e-mail, user ID, session ID ou identificador de recurso
+entra em label de metrica, e nenhum token entra em trace.
 
 ## Regras para uploads
 

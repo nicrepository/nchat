@@ -28,6 +28,29 @@ type OIDCServiceConfig struct {
 	StateTTL            time.Duration
 	AutoProvision       bool
 	AllowedDomains      []string
+	// RedirectURLs is the closed allowlist of provider callback URIs, one per
+	// application context. It is built from configuration at startup and is the
+	// only place a redirect URI can come from: a login names a context, never a
+	// URL, and the callback re-resolves the URI from the context it recorded.
+	//
+	// A context absent from this map is unavailable, not defaulted. Falling back
+	// to another context's URI would send the browser to the wrong origin after
+	// a successful authentication.
+	RedirectURLs map[domain.OIDCAppContext]string
+	// AdminACRValues is the set of `acr` values a deployment accepts as proof
+	// that the administrative authentication context ran — typically the one
+	// its Keycloak authentication flow emits for a password + second factor
+	// login.
+	//
+	// Empty means the deployment has stated no requirement, and the console
+	// behaves exactly as before. Non-empty means the requirement is real and
+	// enforced: the login asks for the context, and the callback refuses a token
+	// that does not come back carrying one of these values.
+	//
+	// The values are never invented here. They are whatever the operator's
+	// identity provider is configured to emit, which is the only thing that can
+	// make them meaningful.
+	AdminACRValues []string
 }
 
 type OIDCCallbackInput struct {
@@ -48,7 +71,7 @@ type OIDCStore interface {
 }
 
 type OIDCManager interface {
-	Login(ctx context.Context) (string, error)
+	Login(ctx context.Context, app domain.OIDCAppContext) (string, error)
 	Callback(ctx context.Context, input OIDCCallbackInput) (string, error)
 	Exchange(ctx context.Context, code string) (domain.OIDCExchangeResult, error)
 }
@@ -82,8 +105,17 @@ func NewOIDCService(cfg OIDCServiceConfig, tokens *TokenManager, store OIDCStore
 	return &OIDCService{cfg: cfg, tokens: tokens, store: store, provider: provider, crypto: crypto}, nil
 }
 
-func (s *OIDCService) Login(ctx context.Context) (string, error) {
+// Login starts a single sign-on run for one application context.
+//
+// The context selects a redirect URI from the service's own allowlist and is
+// then stored with the state, so the callback does not have to trust anything
+// the returning request says about where the run began.
+func (s *OIDCService) Login(ctx context.Context, app domain.OIDCAppContext) (string, error) {
 	if err := s.ensureAvailable(); err != nil {
+		return "", err
+	}
+	redirectURL, err := s.redirectURLFor(app)
+	if err != nil {
 		return "", err
 	}
 	state, err := randomOpaqueString(32)
@@ -109,12 +141,70 @@ func (s *OIDCService) Login(ctx context.Context) (string, error) {
 		StateHash:             s.tokens.HashOIDCState(state),
 		NonceHash:             s.tokens.HashOIDCNonce(nonce),
 		PKCEVerifierEncrypted: encryptedVerifier,
+		AppContext:            app,
 		ExpiresAt:             time.Now().UTC().Add(s.cfg.StateTTL),
 	}); err != nil {
 		return "", err
 	}
 	challenge := pkceChallenge(verifier)
-	return s.provider.AuthorizationURL(state, nonce, challenge)
+	return s.provider.AuthorizationURL(AuthorizationRequest{
+		State:         state,
+		Nonce:         nonce,
+		CodeChallenge: challenge,
+		RedirectURL:   redirectURL,
+		ACRValues:     s.requiredACRValues(app),
+	})
+}
+
+// requiredACRValues returns the authentication contexts this run must satisfy.
+//
+// Only the administrative context can carry a requirement: applying it to the
+// chat would change how every person in the product signs in, which is not what
+// an administrative policy is for.
+func (s *OIDCService) requiredACRValues(app domain.OIDCAppContext) []string {
+	if app != domain.OIDCAppAdmin {
+		return nil
+	}
+	return s.cfg.AdminACRValues
+}
+
+// enforceAuthenticationContext refuses a token whose authentication context does
+// not satisfy the policy for this run.
+//
+// Fail-closed in the way that matters: a missing `acr` is a refusal, not a pass.
+// The claim is optional in OIDC, so its absence means the provider said nothing
+// about how the person authenticated — and "said nothing" is not "used a second
+// factor". Exact comparison, no prefix or substring matching: an assurance
+// level is an identifier, not a scale this service is entitled to interpret.
+func (s *OIDCService) enforceAuthenticationContext(app domain.OIDCAppContext, claims domain.OIDCClaims) error {
+	required := s.requiredACRValues(app)
+	if len(required) == 0 {
+		return nil
+	}
+	for _, accepted := range required {
+		if claims.AuthenticationContextClass == accepted {
+			return nil
+		}
+	}
+	return domain.ErrOIDCInsufficientAssurance
+}
+
+// redirectURLFor resolves a context to the provider callback URI configured for
+// it. An unknown or unconfigured context is refused; there is no default.
+func (s *OIDCService) redirectURLFor(app domain.OIDCAppContext) (string, error) {
+	// The lookup key is the *parsed* label, never the raw one. Normalizing here
+	// is what makes an empty context — a row written before the column existed —
+	// resolve to the chat application instead of missing the map and looking
+	// like an unconfigured deployment.
+	parsed, ok := domain.ParseOIDCAppContext(string(app))
+	if !ok {
+		return "", domain.ErrOIDCMisconfigured
+	}
+	redirectURL, ok := s.cfg.RedirectURLs[parsed]
+	if !ok || strings.TrimSpace(redirectURL) == "" {
+		return "", domain.ErrOIDCMisconfigured
+	}
+	return redirectURL, nil
 }
 
 func (s *OIDCService) Callback(ctx context.Context, input OIDCCallbackInput) (string, error) {
@@ -137,7 +227,15 @@ func (s *OIDCService) Callback(ctx context.Context, input OIDCCallbackInput) (st
 	if err != nil {
 		return "", domain.ErrOIDCInvalidCallback
 	}
-	providerTokens, err := s.provider.ExchangeCode(ctx, code, verifier)
+	// The redirect URI sent to the token endpoint must be byte-identical to the
+	// one the authorization request carried, so it is re-resolved from the
+	// context this run recorded — not from the returning request, and not from
+	// a default. A row whose context is no longer configured cannot complete.
+	redirectURL, err := s.redirectURLFor(authReq.AppContext)
+	if err != nil {
+		return "", domain.ErrOIDCInvalidCallback
+	}
+	providerTokens, err := s.provider.ExchangeCode(ctx, code, verifier, redirectURL)
 	if err != nil {
 		return "", domain.ErrOIDCInvalidCallback
 	}
@@ -147,6 +245,12 @@ func (s *OIDCService) Callback(ctx context.Context, input OIDCCallbackInput) (st
 	}
 	if !hmac.Equal([]byte(s.tokens.HashOIDCNonce(claims.Nonce)), []byte(authReq.NonceHash)) {
 		return "", domain.ErrOIDCInvalidCallback
+	}
+	// The authentication context is checked against the policy for the context
+	// this run started in — recovered from the stored row, not from the
+	// returning request — and before any session exists.
+	if err := s.enforceAuthenticationContext(authReq.AppContext, claims); err != nil {
+		return "", err
 	}
 	if !claims.EmailVerified {
 		return "", domain.ErrOIDCEmailUnverified

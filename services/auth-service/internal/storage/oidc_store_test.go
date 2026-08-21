@@ -22,7 +22,7 @@ func TestPGXOIDCStore_CreateAuthRequestStoresHashedState(t *testing.T) {
 
 	expiresAt := time.Now().Add(10 * time.Minute)
 	mock.ExpectExec(`INSERT INTO auth\.oidc_auth_requests`).
-		WithArgs("auth-id", "keycloak", "state-hash", "nonce-hash", "encrypted-verifier", nil, expiresAt).
+		WithArgs("auth-id", "keycloak", "state-hash", "nonce-hash", "encrypted-verifier", nil, "chat", expiresAt).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	store := storage.NewPGXOIDCStore(mock)
@@ -32,6 +32,7 @@ func TestPGXOIDCStore_CreateAuthRequestStoresHashedState(t *testing.T) {
 		StateHash:             "state-hash",
 		NonceHash:             "nonce-hash",
 		PKCEVerifierEncrypted: "encrypted-verifier",
+		AppContext:            domain.OIDCAppChat,
 		ExpiresAt:             expiresAt,
 	})
 	if err != nil {
@@ -238,8 +239,8 @@ func TestPGXOIDCStore_ConsumeAuthRequestReturnsStoredEncryptedVerifier(t *testin
 
 	mock.ExpectQuery(`UPDATE auth\.oidc_auth_requests`).
 		WithArgs("keycloak", "state-hash").
-		WillReturnRows(pgxmock.NewRows([]string{"id", "provider", "nonce_hash", "pkce_verifier_encrypted", "redirect_after"}).
-			AddRow("auth-id", "keycloak", "nonce-hash", "encrypted-verifier", ""))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "provider", "nonce_hash", "pkce_verifier_encrypted", "redirect_after", "app_context"}).
+			AddRow("auth-id", "keycloak", "nonce-hash", "encrypted-verifier", "", "chat"))
 
 	store := storage.NewPGXOIDCStore(mock)
 	req, err := store.ConsumeAuthRequest(context.Background(), "keycloak", "state-hash")
@@ -369,7 +370,7 @@ func TestPGXOIDCStore_CreateAuthRequestReturnsInsertError(t *testing.T) {
 	}
 	defer mock.Close()
 	mock.ExpectExec(`INSERT INTO auth\.oidc_auth_requests`).
-		WithArgs("", "", "", "", "", nil, time.Time{}).
+		WithArgs("", "", "", "", "", nil, "", time.Time{}).
 		WillReturnError(errors.New("insert failed"))
 	store := storage.NewPGXOIDCStore(mock)
 	if err := store.CreateAuthRequest(context.Background(), domain.OIDCLoginRequest{}); err == nil {

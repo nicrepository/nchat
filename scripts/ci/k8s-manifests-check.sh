@@ -734,6 +734,7 @@ validate_nchat_dev() {
   grep -q 'name: nchat-default-deny-ingress' "$application"
 
   [[ "$(network_policy_names_by_type "$application" Egress)" == "$(printf '%s\n' \
+    nchat-allow-admin-postgres-egress \
     nchat-allow-auth-keycloak-egress \
     nchat-allow-auth-postgres-egress \
     nchat-allow-chat-data-egress \
@@ -750,7 +751,8 @@ validate_nchat_dev() {
     nchat-default-deny-egress | LC_ALL=C sort)" ]]
   for policy_block in \
     nchat-allow-dns-egress nchat-allow-traefik-http nchat-allow-postgres \
-    nchat-allow-valkey nchat-allow-auth-postgres-egress nchat-allow-chat-data-egress \
+    nchat-allow-valkey nchat-allow-admin-postgres-egress nchat-allow-auth-postgres-egress \
+    nchat-allow-chat-data-egress \
     nchat-allow-notification-postgres-egress nchat-allow-migrations-postgres-egress \
     nchat-allow-livekit-api-egress nchat-allow-media-postgres-egress; do
     grep -q 'ports:' <<<"$(yaml_document "$application" NetworkPolicy "$policy_block")"
