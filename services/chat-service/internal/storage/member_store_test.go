@@ -278,10 +278,17 @@ func TestPGXMemberStore_AddChannelMember_Success(t *testing.T) {
 	defer mock.Close()
 
 	now := time.Now()
+	// The channel row is locked first: every writer of chat.channel_members
+	// obeys the same protocol, so a concurrent add cannot land between another
+	// transaction's write and its member count.
+	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs("ch-1").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`INSERT INTO chat.channel_members`).
 		WithArgs("ch-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "user_id", "role", "joined_at"}).
 			AddRow("ch-1", "user-1", "member", now))
+	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
 	m, err := store.AddChannelMember(context.Background(), "ch-1", "user-1", domain.ChannelRoleMember)
@@ -300,9 +307,13 @@ func TestPGXMemberStore_AddChannelMember_AlreadyMember(t *testing.T) {
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs("ch-1").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`INSERT INTO chat.channel_members`).
 		WithArgs("ch-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "user_id", "role", "joined_at"}))
+	mock.ExpectRollback()
 
 	store := storage.NewPGXMemberStore(mock)
 	_, err = store.AddChannelMember(context.Background(), "ch-1", "user-1", domain.ChannelRoleMember)
@@ -1050,12 +1061,14 @@ func TestPGXMemberStore_RemoveChannelMember_Success(t *testing.T) {
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
 		WithArgs("ch-1", "ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
 	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
 		WithArgs("ch-1", "user-1").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
 	if err := store.RemoveChannelMember(context.Background(), "ws-1", "ch-1", "user-1"); err != nil {
@@ -1073,12 +1086,14 @@ func TestPGXMemberStore_RemoveChannelMember_NotMember_Idempotent(t *testing.T) {
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
 		WithArgs("ch-1", "ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
 	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
 		WithArgs("ch-1", "user-99").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
 	if err := store.RemoveChannelMember(context.Background(), "ws-1", "ch-1", "user-99"); err != nil {
@@ -1096,6 +1111,7 @@ func TestPGXMemberStore_RemoveChannelMember_ChannelNotInWorkspace_Idempotent(t *
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
 		WithArgs("ch-1", "ws-other").
 		WillReturnError(pgx.ErrNoRows)
@@ -1116,6 +1132,7 @@ func TestPGXMemberStore_RemoveChannelMember_GeneralChannel_Denied(t *testing.T) 
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
 		WithArgs("ch-geral", "ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(true))

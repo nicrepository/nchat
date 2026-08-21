@@ -38,6 +38,10 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	// Channel first: the shared serialization protocol every writer of
+	// chat.channel_members obeys.
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator'\).*FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
@@ -75,6 +79,8 @@ func TestPGXMemberStore_AddChannelMembers_RollsBackWhenActorLostAuthority(t *tes
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`(?s)FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnError(pgx.ErrNoRows)
@@ -103,6 +109,8 @@ func TestPGXMemberStore_AddChannelMembers_RollsBackOnIneligibleTarget(t *testing
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`(?s)FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
@@ -135,6 +143,8 @@ func TestPGXMemberStore_AddChannelMembers_ReportsExistingMembers(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`(?s)FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
