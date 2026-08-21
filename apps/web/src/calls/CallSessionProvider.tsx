@@ -1087,6 +1087,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const peer = directory?.dms.find((dm) => dm.counterpart?.userId === peerId)?.counterpart;
   const resourceTarget = directActive ? null : resource.active;
   const title = peer?.displayName ?? resourceTarget?.name ?? "Participante";
+  // Real identity seed for the floating remote fallback avatar's color —
+  // peerId itself (not peer?.userId) so a direct call still gets a stable,
+  // real user id even before `directory` has resolved (peer is a directory
+  // lookup and can be briefly undefined while directActive already exists).
+  // resourceTarget.id covers the group/channel case. `title` is only ever
+  // the last resort when neither identity is known yet — never the primary
+  // seed, since two different peers can share the same display name.
+  const remoteSeed = peerId || resourceTarget?.id || title;
+  // Stable seed for the local fallback avatar — the current user's own id.
+  // Falls back to a fixed literal only for the brief window before
+  // `directory` (fetched by the host page) has resolved; never a new
+  // profile fetch just for this.
+  const localSeed = directory?.currentUserId ?? "local";
   const participants = media.participants ?? [];
   const participantCount = Math.max(1, participants.length + 1);
   const activeSpeakerName =
@@ -1187,6 +1200,10 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           participantCount={participantCount}
           activeSpeakerName={activeSpeakerName}
           screenShareActive={media.screenShareEnabled || Boolean(media.remoteScreenShare)}
+          hasRemoteVideo={media.hasRemoteVideo}
+          remoteSeed={remoteSeed}
+          hasLocalVideo={media.hasLocalVideo}
+          localSeed={localSeed}
           controls={controls}
           onExpand={expand}
           bindLocalMedia={media.bindLocalMedia}

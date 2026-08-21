@@ -138,9 +138,7 @@
 }
 .floating-call__stage {
   position: relative;
-  display: grid;
   min-height: 10rem;
-  place-items: center;
   overflow: hidden;
   background: #020617;
 }
@@ -148,8 +146,24 @@
   position: absolute;
   inset: 0;
 }
+/*
+ * The fallback avatar and the three status indicators (count/speaker/share)
+ * are each pinned to an explicit absolute slot instead of stacking in normal
+ * flow. Mounting/unmounting one must never shift another — the old markup
+ * centered every indicator as a `display: grid; place-items: center` block
+ * and used a `span + span { margin-top }` sibling rule, so the whole stack's
+ * center of mass (and therefore the participant count's own position) moved
+ * every time active-speaker/screen-share appeared or disappeared.
+ */
+.floating-call__avatar-wrap {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
 .floating-call__remote video,
-.floating-call__local video,
+.floating-call__local-media video,
 .dedicated-call__media video {
   width: 100%;
   height: 100%;
@@ -166,16 +180,51 @@
   border-radius: 0.55rem;
   background: #1e293b;
 }
-.floating-call__stage > span {
-  position: relative;
+.floating-call__local-media {
+  position: absolute;
+  inset: 0;
+}
+.floating-call__avatar {
+  width: 3.5rem;
+  height: 3.5rem;
+  font-size: 1.15rem;
+}
+.floating-call__local-avatar {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  margin: auto;
+  font-size: 0.7rem;
+}
+.floating-call__count,
+.floating-call__speaker,
+.floating-call__share {
+  position: absolute;
   z-index: 1;
+  max-width: calc(100% - 1rem);
   padding: 0.2rem 0.45rem;
   border-radius: 999px;
   background: rgb(2 6 23 / 72%);
   font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
 }
-.floating-call__stage > span + span {
-  margin-top: 2.2rem;
+.floating-call__count {
+  top: 0.5rem;
+  left: 0.5rem;
+}
+.floating-call__speaker {
+  top: 0.5rem;
+  right: 0.5rem;
+}
+.floating-call__share {
+  bottom: 0.5rem;
+  left: 0.5rem;
 }
 .call-presentation__controls {
   display: flex;
@@ -319,14 +368,42 @@
   inset: 0;
 }
 .dedicated-call__avatar {
-  display: grid;
   width: 4rem;
   height: 4rem;
+  font-size: 1.4rem;
+}
+
+/*
+ * Shared identity-fallback styling for both the dedicated grid and the
+ * floating stage. Sizing comes from .dedicated-call__avatar/.floating-call__avatar;
+ * color comes from one of these modifiers, mapped 1:1 to the AvatarColor
+ * palette already used for chat avatars (see chat-sidebar__avatar--*) so a
+ * participant's fallback swatch matches the color they show up as elsewhere.
+ */
+.call-avatar {
+  display: grid;
   place-items: center;
   border-radius: 50%;
-  background: #334155;
-  font-size: 1.4rem;
+  color: #f8fafc;
   font-weight: 700;
+}
+.call-avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.call-avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.call-avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.call-avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.call-avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.call-avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
 }
 .dedicated-call footer {
   position: sticky;
