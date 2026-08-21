@@ -151,7 +151,7 @@ func (s *PGXCallStore) CreateCall(ctx context.Context, input CreateCallInput) (d
 		return domain.Call{}, false, fmt.Errorf("check active calls: %w", err)
 	}
 	if busy {
-		return domain.Call{}, false, domain.ErrConflict
+		return domain.Call{}, false, domain.ErrCallParticipantBusy
 	}
 
 	call, err := scanCall(tx.QueryRow(ctx,

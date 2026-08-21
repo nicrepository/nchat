@@ -32,8 +32,13 @@ load_nchat_dev_image_inventory() {
         NCHAT_DEV_RUNTIME_IMAGES+=("$image")
         NCHAT_DEV_APPLICATION_DEPLOYMENTS+=("$deployment")
         ;;
+      # Static frontend bundles. Each one is its own image and its own
+      # Deployment: the chat app and the administrative console (issue #578) do
+      # not share a bundle, a CSP or a release cadence, so
+      # they must not share an image either. The Dockerfile is derived from the
+      # image name in .github/workflows/images.yml.
       web)
-        [[ "$image" == web && "$deployment" =~ ^[a-z0-9-]+$ ]] || return 1
+        [[ "$image" =~ ^[a-z0-9-]+$ && "$deployment" =~ ^[a-z0-9-]+$ ]] || return 1
         NCHAT_DEV_RUNTIME_IMAGES+=("$image")
         NCHAT_DEV_APPLICATION_DEPLOYMENTS+=("$deployment")
         ;;
@@ -50,9 +55,9 @@ load_nchat_dev_image_inventory() {
   done <"$inventory"
 
   [[ "${#NCHAT_DEV_GO_SERVICES[@]}" -eq 7 ]] || return 1
-  [[ "${#NCHAT_DEV_RUNTIME_IMAGES[@]}" -eq 8 ]] || return 1
-  [[ "${#NCHAT_DEV_IMAGES[@]}" -eq 9 ]] || return 1
-  [[ "${#NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}" -eq 8 ]] || return 1
+  [[ "${#NCHAT_DEV_RUNTIME_IMAGES[@]}" -eq 9 ]] || return 1
+  [[ "${#NCHAT_DEV_IMAGES[@]}" -eq 10 ]] || return 1
+  [[ "${#NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}" -eq 9 ]] || return 1
 }
 
 load_nchat_dev_image_inventory "$NCHAT_DEV_IMAGE_INVENTORY"

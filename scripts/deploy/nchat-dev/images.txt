@@ -6,4 +6,5 @@ go media-service media-service
 go notification-service notification-service
 go search-service search-service
 migration migrations -
+web admin-web nchat-admin-web
 web web nchat-web

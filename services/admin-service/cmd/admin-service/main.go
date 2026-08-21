@@ -13,7 +13,14 @@ import (
 
 func main() {
 	cfg := config.Load()
-	application := app.New(cfg)
+	// A configured Admin API that cannot be built is a startup failure, not a
+	// degraded mode: nothing reopens the database later, and a readiness probe
+	// that never passes does not restart a container. Exiting non-zero is what
+	// gives the orchestrator something to act on.
+	application, err := app.New(cfg)
+	if err != nil {
+		log.Fatalf("%s failed to start: %v", cfg.ServiceName, err)
+	}
 	addr := ":" + strconv.Itoa(cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -21,9 +28,11 @@ func main() {
 		ReadHeaderTimeout: time.Duration(cfg.ReadHeaderTimeoutSeconds) * time.Second,
 	}
 
-	application.Logger.Info("service starting", "port", cfg.Port)
+	application.Logger.Info("service starting", "port", cfg.Port, "admin_api", cfg.AdminAPIEnabled())
 	serveErr := httpServer.ListenAndServe()
-	_ = application.TracingShutdown(context.Background())
+	// Shutdown releases the database pool as well as the tracer, so a restart
+	// does not leave a connection behind.
+	_ = application.Shutdown(context.Background())
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatalf("%s failed: %v", cfg.ServiceName, serveErr)
 	}

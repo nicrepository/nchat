@@ -288,6 +288,12 @@ func handleCallClientError(c *Client, operation ClientMessageType, callID string
 		response.Code = "call_invalid"
 	case errors.Is(callErr, domain.ErrNotFound), errors.Is(callErr, domain.ErrForbidden):
 		response.Code = "call_not_found"
+	case errors.Is(callErr, domain.ErrCallParticipantBusy):
+		// Must be checked before the generic ErrConflict case below:
+		// ErrCallParticipantBusy wraps ErrConflict, so it would otherwise
+		// match that broader case first and be misreported as a lifecycle
+		// state conflict (issue #575).
+		response.Code = "call_participant_busy"
 	case errors.Is(callErr, domain.ErrConflict):
 		response.Code = "call_invalid_state"
 	default:

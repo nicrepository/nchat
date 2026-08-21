@@ -12,21 +12,23 @@ Nenhuma linha desta tabela descreve um endpoint que nao esta implementado.
 Autorizacao no NChat nao e uma ordenacao numerica unica. Um papel pode ter
 autoridade num escopo e nenhuma em outro.
 
-| Papel RF-74        | Onde vive                                                     | Escopo                               |
-| ------------------ | ------------------------------------------------------------- | ------------------------------------ |
-| Admin Master       | identidade de bootstrap `X-NChat-Admin-Token` no auth-service | plataforma (CLI)                     |
-| Admin de Workspace | `chat.workspace_members.role IN ('owner','admin')`            | um workspace                         |
-| Moderador          | `chat.workspace_members.role = 'moderator'`                   | um workspace                         |
-| Usuario            | `chat.workspace_members.role = 'member'`                      | um workspace                         |
-| Guest              | `chat.workspace_members.role = 'guest'`                       | apenas os canais em que foi incluido |
+| Papel RF-74        | Onde vive                                                                                                               | Escopo                               |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Admin Master       | `auth.admin_principals` + `auth.admin_principal_roles` (issue #578); `X-NChat-Admin-Token` permanece como bootstrap CLI | plataforma                           |
+| Admin de Workspace | `chat.workspace_members.role IN ('owner','admin')`                                                                      | um workspace                         |
+| Moderador          | `chat.workspace_members.role = 'moderator'`                                                                             | um workspace                         |
+| Usuario            | `chat.workspace_members.role = 'member'`                                                                                | um workspace                         |
+| Guest              | `chat.workspace_members.role = 'guest'`                                                                                 | apenas os canais em que foi incluido |
 
 Distincoes que essa tabela existe para nao deixar colapsar:
 
 - **`owner` nao e Admin Master.** `owner` e a autoridade maxima _dentro de um
   workspace_ e nao tem poder algum fora dele. Admin Master e um escopo de
-  plataforma; hoje ele so existe como a identidade de bootstrap do auth-service
-  (ver "Admin Master" abaixo). Nao ha papel global em `chat.workspace_members`,
-  deliberadamente: colocar um la destruiria a separacao de escopo.
+  plataforma e vive em outra tabela, em outro schema logico de autorizacao (ver
+  "Admin Master" abaixo). Continua nao havendo papel global em
+  `chat.workspace_members`, deliberadamente: colocar um la destruiria a
+  separacao de escopo. Ser `owner` de um workspace nao concede capability
+  administrativa alguma, e nenhuma consulta le uma coisa como a outra.
 - **Moderador de workspace nao e `chat.channel_members.role = 'moderator'`.**
   O segundo e um papel por canal. Nenhum caminho de codigo le um como o outro, e
   nenhuma decisao de autorizacao consulta `chat.channel_members.role`.
@@ -77,6 +79,8 @@ executam.
 | Alterar limite anti-spam (RF-19)           | nao          | sim                | **nao**   | nao     | nao   | idem                                                                                |
 | Alterar limite de upload (RF-32)           | nao          | sim                | **nao**   | nao     | nao   | idem                                                                                |
 | Listar/convidar/suspender usuarios         | sim          | sim                | **nao**   | nao     | nao   | `/auth/admin/*` resolve o workspace pela sessao; `/admin/*` pelo token de bootstrap |
+| Abrir o Admin Console                      | **sim**      | nao                | **nao**   | nao     | nao   | `auth.admin_principals` ativo com ao menos uma capability                           |
+| Ler a auditoria administrativa             | **sim**      | nao                | **nao**   | nao     | nao   | capability `admin.audit.read`                                                       |
 | Criar/renomear/reordenar/excluir categoria | nao          | sim                | **sim**   | nao     | nao   | `CanManageChannelCategories`, re-verificado no `UPDATE`/`INSERT`                    |
 | Ler a listagem agrupada de canais          | nao          | sim                | sim       | sim     | sim   | os canais de cada grupo vem da politica de leitura                                  |
 | Alterar papel de um membro                 | —            | —                  | —         | —       | —     | **nenhum endpoint existe** (ver Limitacoes)                                         |
@@ -126,9 +130,51 @@ operacao de adicionar participante.
 
 ## Admin Master
 
-O sistema **nao possui** hoje tabela, coluna, flag ou papel global de
-administrador de plataforma. O unico mecanismo de escopo global existente e a
-identidade de bootstrap do auth-service:
+Desde a issue #578 o Admin Master **existe no banco**, com capabilities
+granulares. O modelo tem quatro tabelas no schema `auth` (migration 000008):
+
+| Tabela                         | Responde                            |
+| ------------------------------ | ----------------------------------- |
+| `auth.admin_principals`        | quem e administrador de plataforma  |
+| `auth.admin_roles`             | quais papeis existem                |
+| `auth.admin_role_capabilities` | o que cada papel concede            |
+| `auth.admin_principal_roles`   | quem tem qual papel, e desde quando |
+
+Papeis semeados pela migration: `platform-superuser` (concede
+`admin.superuser`) e `platform-auditor` (somente leitura + auditoria).
+
+Capabilities definidas, fechadas por `CHECK` em `auth.admin_role_capabilities`:
+
+`admin.superuser`, `admin.users.read`, `admin.users.manage`,
+`admin.channels.read`, `admin.channels.manage`, `admin.security.read`,
+`admin.security.manage`, `admin.integrations.read`, `admin.integrations.manage`,
+`admin.infrastructure.read`, `admin.infrastructure.manage`, `admin.audit.read`,
+`admin.config.read`, `admin.config.manage`.
+
+Regras de avaliacao (`services/admin-service/internal/domain/capability.go`):
+
+- deny by default: conjunto vazio nao concede nada;
+- `admin.superuser` implica as demais;
+- uma capability que a plataforma nao define e recusada **inclusive** para um
+  superuser, entao um guard escrito errado falha fechado;
+- a leitura acontece a cada requisicao, contra o banco, entao remover um papel
+  vale na requisicao seguinte.
+
+Onde essas capabilities decidem hoje: `GET /api/admin/audit/events` exige
+`admin.audit.read`. As demais ainda nao tem endpoint — elas existem porque o
+modelo precisa nomear o que as proximas issues vao exigir, e porque conceder um
+papel hoje precisa ter significado estavel amanha.
+
+Escopo do Admin Master permanece estritamente de plataforma: ele **nao** le
+canal, **nao** le DM, **nao** altera settings de workspace e **nao** aparece em
+nenhuma consulta de conteudo. Nenhuma capability administrativa concede acesso a
+mensagem.
+
+O primeiro administrador nasce de uma concessao no banco, executada por quem ja
+tem acesso ao PostgreSQL — nunca de um segredo estatico no navegador. O
+procedimento esta em `docs/runbooks/task-admin-console-foundation.md`.
+
+### Bootstrap CLI que permanece
 
 - guard: `AdminBootstrapGuard` (`services/auth-service/internal/http/admin_middleware.go`);
 - header: `X-NChat-Admin-Token`, comparado em tempo constante contra
@@ -136,12 +182,9 @@ identidade de bootstrap do auth-service:
 - rotas protegidas: `POST /admin/users`, `POST /admin/invites`,
   `PATCH /admin/users/{id}/status`.
 
-O RF-74 nao criou um papel global novo. Criar um exigiria uma tabela ou coluna
-que nenhum endpoint sabe escrever — exatamente o "codigo morto alargando uma
-constraint de seguranca" que o SECURITY.md ja recusou uma vez para o moderador.
-Admin Master, portanto, tem poder **somente** nas acoes acima e em nenhuma
-outra: nao le canal, nao le DM, nao altera settings de workspace, nao aparece
-em nenhuma consulta de conteudo.
+Ele nao participa de nenhuma rota da Admin API e nao pode ser enviado ao
+navegador. Continua existindo porque e o caminho de provisionamento de contas
+anterior ao console, e substitui-lo e trabalho de outra issue.
 
 O equivalente browser-side dessas operacoes ja existe e **nao** usa o token:
 `/auth/admin/users` e `/auth/admin/invites` passam por `BearerAuth` +
@@ -158,11 +201,15 @@ e nao aceita nenhum valor do cliente. Um Moderador recebe `403` ali.
    abuso (auto-promocao, mass assignment, promocao a `owner`), e nao foi
    introduzida aqui de carona.
 2. **O bootstrap por `X-NChat-Admin-Token` continua existindo** em paralelo a
-   autorizacao por sessao, nas tres rotas `/admin/*` listadas acima. Ele
-   permanece porque e o unico caminho que funciona antes de existir um primeiro
-   administrador. Substitui-lo exige decidir como o primeiro admin nasce, o que
-   esta fora do RF-74.
-3. **Guest e o diretorio do workspace.** A busca de candidatos a DM continua
+   autorizacao por sessao, nas tres rotas `/admin/*` listadas acima. A issue #578
+   decidiu como o primeiro administrador de plataforma nasce (concessao no banco,
+   ver acima), mas nao substituiu essas tres rotas de provisionamento de contas —
+   isso e trabalho proprio.
+3. **A maioria das capabilities ainda nao tem endpoint.** Somente
+   `admin.audit.read` decide algo hoje. As demais estao definidas para que o
+   modelo de papeis seja estavel entre as issues administrativas seguintes; ate
+   la, conceder uma nao abre nenhuma rota.
+4. **Guest e o diretorio do workspace.** A busca de candidatos a DM continua
    visivel a um Guest. Isso e comportamento pre-existente e nao foi alterado: o
    RF-74 restringe o alcance de **canais**, e estreitar o diretorio e uma
    decisao de produto separada.

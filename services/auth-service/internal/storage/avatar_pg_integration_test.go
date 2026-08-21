@@ -253,6 +253,138 @@ func TestPGXUserStore_UpdateDisplayNameRejectsDeletedUserPostgreSQL(t *testing.T
 	}
 }
 
+// TestPGXUserStore_UpdateProfileFieldsPostgreSQL runs the real CASE-based
+// UPDATE against the actual auth.users schema: a pgxmock-only test can pass
+// with a CASE expression Postgres would refuse to plan (a type Postgres
+// cannot unify across the WHEN/ELSE branches, for instance), so this proves
+// the SQL text actually executes and persists.
+func TestPGXUserStore_UpdateProfileFieldsPostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "profilefields@example.test")
+
+	jobTitle, bio, timezone, customStatus := "Engenheira", "Focada em backend.", "America/Sao_Paulo", "Em reunião"
+	profile, err := store.UpdateProfileFields(ctx, userID, &jobTitle, &bio, &timezone, &customStatus)
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if profile.JobTitle != jobTitle || profile.Bio != bio || profile.Timezone != timezone ||
+		profile.CustomStatus != customStatus {
+		t.Fatalf("unexpected returned profile: %+v", profile)
+	}
+
+	reread, err := store.GetSelfProfile(ctx, userID)
+	if err != nil || reread.JobTitle != jobTitle || reread.Bio != bio ||
+		reread.Timezone != timezone || reread.CustomStatus != customStatus {
+		t.Fatalf("reload after update: %+v err=%v", reread, err)
+	}
+}
+
+// TestPGXUserStore_UpdateProfileFieldsPostgreSQL_PartialUpdateLeavesOthersAlone
+// is the real-database proof for the bug the pointer-based signature exists
+// to prevent: updating only job_title must leave a previously-set bio,
+// timezone and custom_status exactly as they were, not NULL them out.
+func TestPGXUserStore_UpdateProfileFieldsPostgreSQL_PartialUpdateLeavesOthersAlone(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "partialfields@example.test")
+
+	bio, timezone, customStatus := "Focada em backend.", "America/Sao_Paulo", "Em reunião"
+	if _, err := store.UpdateProfileFields(ctx, userID, nil, &bio, &timezone, &customStatus); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	jobTitle := "Engenheira"
+	profile, err := store.UpdateProfileFields(ctx, userID, &jobTitle, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("partial update: %v", err)
+	}
+	if profile.JobTitle != jobTitle {
+		t.Fatalf("expected job_title set, got %q", profile.JobTitle)
+	}
+	if profile.Bio != bio || profile.Timezone != timezone || profile.CustomStatus != customStatus {
+		t.Fatalf("expected untouched fields to survive a partial update, got %+v", profile)
+	}
+}
+
+func TestPGXUserStore_UpdateProfileFieldsPostgreSQL_CustomStatusOnly(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "customstatus@example.test")
+
+	customStatus := "Em reunião"
+	profile, err := store.UpdateProfileFields(ctx, userID, nil, nil, nil, &customStatus)
+	if err != nil {
+		t.Fatalf("update custom_status: %v", err)
+	}
+	if profile.CustomStatus != customStatus {
+		t.Fatalf("expected custom_status set, got %q", profile.CustomStatus)
+	}
+}
+
+// A pointer to "" is a request to clear the field, distinct from nil — the
+// real-database counterpart to the pgxmock proof in
+// TestPGXUserStore_UpdateProfileFields_EmptyStringClearsColumn.
+func TestPGXUserStore_UpdateProfileFieldsPostgreSQL_EmptyClearsField(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "clearfields@example.test")
+
+	customStatus := "Em reunião"
+	if _, err := store.UpdateProfileFields(ctx, userID, nil, nil, nil, &customStatus); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	empty := ""
+	profile, err := store.UpdateProfileFields(ctx, userID, nil, nil, nil, &empty)
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if profile.CustomStatus != "" {
+		t.Fatalf("expected custom_status cleared, got %q", profile.CustomStatus)
+	}
+}
+
+func TestPGXUserStore_UpdateProfileFieldsRejectsSuspendedUserPostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "suspended-fields@example.test")
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET status = 'suspended' WHERE id = $1`, userID); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+
+	jobTitle := "Should Not Persist"
+	if _, err := store.UpdateProfileFields(ctx, userID, &jobTitle, nil, nil, nil); err != domain.ErrNotFound {
+		t.Fatalf("expected ErrNotFound for suspended user, got %v", err)
+	}
+}
+
+func TestPGXUserStore_UpdateProfileFieldsRejectsDeletedUserPostgreSQL(t *testing.T) {
+	pool := connectAuthTestDB(t)
+	applyAuthMigrations(t, pool)
+	store := storage.NewPGXUserStore(pool)
+	ctx := context.Background()
+	userID := insertActiveUser(t, pool, "deleted-fields@example.test")
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET deleted_at = now() WHERE id = $1`, userID); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+
+	jobTitle := "Should Not Persist"
+	if _, err := store.UpdateProfileFields(ctx, userID, &jobTitle, nil, nil, nil); err != domain.ErrNotFound {
+		t.Fatalf("expected ErrNotFound for deleted user, got %v", err)
+	}
+}
+
 func readDisplayNameAndUpdatedAt(t *testing.T, pool *pgxpool.Pool, userID string) (string, time.Time) {
 	t.Helper()
 	var name string
@@ -273,6 +405,9 @@ func readDisplayNameAndUpdatedAt(t *testing.T, pool *pgxpool.Pool, userID string
 func TestPGXOIDCStore_ReloginDoesNotClobberUploadedAvatarPostgreSQL(t *testing.T) {
 	pool := connectAuthTestDB(t)
 	applyAuthMigrations(t, pool)
+	// JIT provisioning enrolls the new user in the default workspace, so the
+	// chat schema has to be there for the login under test to succeed.
+	applyChatMigrations(t, pool)
 	ctx := context.Background()
 
 	oidcStore := storage.NewPGXOIDCStore(pool)

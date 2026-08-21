@@ -1,9 +1,10 @@
-.PHONY: help install dev-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web test-web lint-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
+.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
 
 help:
 	@echo "NChat development commands"
 	@echo "  make install     Install frontend dependencies"
 	@echo "  make dev-web     Run web app locally"
+	@echo "  make dev-admin-web Run admin console locally"
 	@echo "  make dev-env-up  Start local data services"
 	@echo "  make dev-env-down Stop local data services"
 	@echo "  make dev-env-validate Validate local data services"
@@ -29,8 +30,11 @@ help:
 	@echo "  make gateway-config-check Run gateway config validation"
 	@echo "  make sealed-secrets-policy-check Run Sealed Secrets policy validation"
 	@echo "  make build-web   Build web app"
+	@echo "  make build-admin-web Build admin console app"
 	@echo "  make test-web    Run frontend tests"
+	@echo "  make test-admin-web Run admin console tests"
 	@echo "  make lint-web    Run frontend lint"
+	@echo "  make lint-admin-web Run admin console lint"
 	@echo "  make test-go     Run Go tests"
 	@echo "  make vet-go      Run Go vet"
 	@echo "  make fmt-go      Check Go formatting"
@@ -72,6 +76,9 @@ install:
 
 dev-web:
 	pnpm dev:web
+
+dev-admin-web:
+	pnpm dev:admin-web
 
 dev-env-up:
 	pnpm dev:env:up
@@ -175,11 +182,20 @@ sealed-secrets-fetch-cert:
 build-web:
 	pnpm build:web
 
+build-admin-web:
+	pnpm build:admin-web
+
 test-web:
 	pnpm test:web
 
+test-admin-web:
+	pnpm test:admin-web
+
 lint-web:
 	pnpm lint:web
+
+lint-admin-web:
+	pnpm lint:admin-web
 
 test-go:
 	pnpm test:go

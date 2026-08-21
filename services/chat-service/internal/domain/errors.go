@@ -18,6 +18,13 @@ var (
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
 	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrCallParticipantBusy reports that starting a 1:1 call was refused
+	// because the caller or callee already holds an active/ringing direct
+	// call or a live participant lease on a resource (channel/group-DM)
+	// call. It wraps ErrConflict so existing generic conflict handling still
+	// matches it, but callers that need to tell "someone is busy" apart from
+	// a real lifecycle/version conflict (issue #575) can check for it first.
+	ErrCallParticipantBusy = fmt.Errorf("%w: call participant already in another call", ErrConflict)
 	// ErrInconsistentDirectConversation reports a chat.dm_conversations row of
 	// type 'direct' that does not resolve to exactly one other active
 	// participant. The domain says a direct conversation is a pair, so this is

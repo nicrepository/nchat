@@ -134,8 +134,42 @@ probe_route auth-service "$AUTH_SERVICE_HOST_PORT" /api/auth/healthz
 probe_route chat-service "$CHAT_SERVICE_HOST_PORT" /api/chat/healthz
 probe_route file-service "$FILE_SERVICE_HOST_PORT" /api/files/healthz
 probe_route notification-service "$NOTIFICATION_SERVICE_HOST_PORT" /api/notifications/healthz
-probe_route admin-service "$ADMIN_SERVICE_HOST_PORT" /api/admin/healthz
 probe_route search-service "$SEARCH_SERVICE_HOST_PORT" /api/search/healthz
 probe_route media-service "$MEDIA_SERVICE_HOST_PORT" /api/media/healthz
+
+# The administrative console host, derived from the chat host exactly as the
+# gateway and the Kubernetes overlays derive it. Deriving rather than requiring
+# a new key keeps every existing .env.dev working.
+NCHAT_LOCAL_ADMIN_HOST="admin.${NCHAT_LOCAL_HOST}"
+
+# The Admin API is deliberately absent from the loop above: since issue #578 it
+# is published only on the administrative host, so probing it through
+# ${NCHAT_LOCAL_HOST} would assert exactly the boundary this project removed.
+probe_admin_route() {
+  local name="$1" port="$2" path="$3"
+  if nc -z localhost "$port" 2>/dev/null; then
+    echo "probe: ${name} via ${NCHAT_LOCAL_ADMIN_HOST}${path}"
+    curl --fail --silent --show-error --max-time 5 \
+      --resolve "${NCHAT_LOCAL_ADMIN_HOST}:${TRAEFIK_HTTP_HOST_PORT}:127.0.0.1" \
+      "http://${NCHAT_LOCAL_ADMIN_HOST}:${TRAEFIK_HTTP_HOST_PORT}${path}" >/dev/null
+  else
+    echo "skip: ${name} is not listening on localhost:${port}; skipped ${path} route probe."
+  fi
+}
+
+probe_admin_route admin-service "$ADMIN_SERVICE_HOST_PORT" /api/admin/healthz
+
+# And the negative half: the chat host must not reach admin-service. A response
+# from the SPA catch-all is fine; a response from the Admin API is not.
+if nc -z localhost "$ADMIN_SERVICE_HOST_PORT" 2>/dev/null; then
+  admin_via_chat_host="$(curl --silent --max-time 5 \
+    --resolve "${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTP_HOST_PORT}:127.0.0.1" \
+    "http://${NCHAT_LOCAL_HOST}:${TRAEFIK_HTTP_HOST_PORT}/api/admin/healthz" || true)"
+  if printf '%s' "$admin_via_chat_host" | grep -q '"service":"admin-service"'; then
+    echo "error: ${NCHAT_LOCAL_HOST} reached admin-service; the Admin API must be host-isolated." >&2
+    exit 1
+  fi
+  echo "probe: ${NCHAT_LOCAL_HOST}/api/admin is not routed to admin-service"
+fi
 
 echo "NChat local gateway validation passed."

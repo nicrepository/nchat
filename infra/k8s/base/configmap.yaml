@@ -24,6 +24,11 @@ data:
   OIDC_STATE_TTL_MINUTES: "10"
   OIDC_AUTO_PROVISION_ENABLED: "false"
   OIDC_ALLOWED_EMAIL_DOMAINS: ""
+  # Administrative authentication context (issue #578). Empty states no
+  # requirement; a value makes administrative single sign-on fail-closed against
+  # the `acr` the deployment's Keycloak flow emits. Not a secret — it is a
+  # policy identifier, and it must match the identity provider's configuration.
+  OIDC_ADMIN_ACR_VALUES: ""
   POSTGRES_HOST: postgres
   POSTGRES_PORT: "5432"
   POSTGRES_DB: nchat

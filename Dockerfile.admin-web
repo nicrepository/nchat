@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1.7
+#
+# The administrative console is built and served separately from the chat app
+# (issue #578). Sharing an image would mean sharing a CSP, a host and a
+# deployment cadence, which is exactly the isolation this console exists to
+# have.
+FROM node:24.10.0-alpine AS build
+WORKDIR /src
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/admin-web/package.json apps/admin-web/package.json
+RUN pnpm install --frozen-lockfile --filter @nchat/admin-web...
+COPY apps/admin-web apps/admin-web
+RUN pnpm --filter @nchat/admin-web build
+
+FROM nginxinc/nginx-unprivileged:1.29.3-alpine
+COPY infra/docker/admin-web/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /src/apps/admin-web/dist /usr/share/nginx/html
+USER 101:101

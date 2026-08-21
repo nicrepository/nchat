@@ -440,7 +440,9 @@ export function useCallSignaling(
               ? "Muitas tentativas de chamada. Aguarde um minuto."
               : code === "call_invalid_state"
                 ? "A chamada já mudou de estado."
-                : "Não foi possível concluir a ação da chamada.",
+                : code === "call_participant_busy"
+                  ? "Você ou este usuário já está em outra chamada."
+                  : "Não foi possível concluir a ação da chamada.",
           );
         }
       },

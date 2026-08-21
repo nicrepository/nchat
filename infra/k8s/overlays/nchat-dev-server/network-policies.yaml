@@ -26,12 +26,17 @@ spec:
           - livekit
           - coturn
           - media
+          # admin-service resolves postgres for the Admin API (issue #578).
+          - admin
           # file resolves postgres, valkey, seaweedfs and clamav; upload-guard
           # resolves file-service at nginx config load, so without DNS it does
           # not even start. clamav is absent on purpose: freshclam is off and
           # the daemon only accepts connections, it never opens any.
           - file
           - upload-guard
+          # search-service resolves postgres for the message index (issue
+          # #601). Without DNS its startup database ping never leaves the pod.
+          - search
   policyTypes:
     - Egress
   egress:
@@ -56,6 +61,9 @@ spec:
         operator: In
         values:
           - web
+          # The administrative console frontend (issue #578). Served on its own
+          # host, so Traefik must reach it directly; it talks to nothing else.
+          - admin-web
           - auth
           - chat
           - file
@@ -112,6 +120,14 @@ spec:
                   # Attachment metadata, and the advisory locks that upload
                   # admission control reserves one connection at a time from.
                   - file
+                  # Administrative principals, capabilities, sessions and the
+                  # audit trail (issue #578). admin-service is the only writer
+                  # of auth.admin_* and reads auth.user_sessions to
+                  # re-authorize on every request.
+                  - admin
+                  # The message index search-service queries, and the readiness
+                  # ping it refuses to start without (issue #601).
+                  - search
       ports:
         - protocol: TCP
           port: 5432
@@ -218,6 +234,59 @@ spec:
         values:
           - migrations
           - postgres-bootstrap
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# admin-service reaches PostgreSQL and nothing else. It has no object storage,
+# no cache and no outbound internet: the Admin API is a database-backed
+# authorization boundary, not an integration hub.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-admin-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# The sending half of the search ingress above. It is a policy of its own
+# because that is this overlay's shape: one minimal egress rule per service,
+# so removing a service's database access is deleting a document rather than
+# editing a shared list.
+#
+# The name is deliberate: a policy with exactly this name was created by hand
+# in nchat-dev while search-service was being diagnosed, so `kubectl apply`
+# adopts that object instead of leaving an unmanaged twin beside it. The two
+# other temporary policies from that session (search DNS egress and search
+# postgres ingress) are absent on purpose — their flows moved into the
+# aggregated nchat-allow-dns-egress and nchat-allow-postgres above, and they
+# are to be deleted by hand once this overlay is applied.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-search-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: search
   policyTypes:
     - Egress
   egress:

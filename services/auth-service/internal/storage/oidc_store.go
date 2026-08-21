@@ -23,9 +23,9 @@ func NewPGXOIDCStore(pool Pool) *PGXOIDCStore {
 func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLoginRequest) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO auth.oidc_auth_requests
-		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), req.ExpiresAt,
+		  (id, provider, state_hash, nonce_hash, pkce_verifier_encrypted, redirect_after, app_context, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		req.ID, req.Provider, req.StateHash, req.NonceHash, req.PKCEVerifierEncrypted, nullableString(req.RedirectAfter), string(req.AppContext), req.ExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert oidc auth request: %w", err)
@@ -35,6 +35,7 @@ func (s *PGXOIDCStore) CreateAuthRequest(ctx context.Context, req domain.OIDCLog
 
 func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHash string) (domain.OIDCConsumedAuthRequest, error) {
 	var req domain.OIDCConsumedAuthRequest
+	var appContext string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE auth.oidc_auth_requests
 		SET used_at = now()
@@ -42,15 +43,23 @@ func (s *PGXOIDCStore) ConsumeAuthRequest(ctx context.Context, provider, stateHa
 		  AND state_hash = $2
 		  AND used_at IS NULL
 		  AND expires_at > now()
-		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, '')`,
+		RETURNING id, provider, nonce_hash, pkce_verifier_encrypted, COALESCE(redirect_after, ''), app_context`,
 		provider, stateHash,
-	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter)
+	).Scan(&req.ID, &req.Provider, &req.NonceHash, &req.PKCEVerifierEncrypted, &req.RedirectAfter, &appContext)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
 	}
 	if err != nil {
 		return domain.OIDCConsumedAuthRequest{}, fmt.Errorf("consume oidc auth request: %w", err)
 	}
+	// The stored label is re-parsed rather than cast: a row written by a future
+	// build, or edited by hand, must not smuggle an unknown context past the
+	// service's allowlist.
+	parsed, ok := domain.ParseOIDCAppContext(appContext)
+	if !ok {
+		return domain.OIDCConsumedAuthRequest{}, domain.ErrInvalidToken
+	}
+	req.AppContext = parsed
 	return req, nil
 }
 
@@ -156,6 +165,13 @@ func resolveOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInp
 		return domain.LoginUser{}, err
 	}
 	if inserted {
+		// Enrollment belongs to the creation event and nowhere else: a login
+		// that finds an existing account never reaches this branch, so a
+		// membership that was suspended, left, or deliberately removed stays
+		// as the administrator left it, and an existing role is never touched.
+		if err := enrollInDefaultWorkspace(ctx, tx, user.ID); err != nil {
+			return domain.LoginUser{}, err
+		}
 		return user, nil
 	}
 
@@ -173,6 +189,48 @@ func resolveOIDCUser(ctx context.Context, tx pgx.Tx, input domain.OIDCSessionInp
 		return domain.LoginUser{}, domain.ErrOIDCAccountConflict
 	}
 	return user, nil
+}
+
+// errDefaultWorkspaceMissing means the deployment has no active workspace with
+// slug 'default'. JIT provisioning fails closed on it: half-provisioning a user
+// who cannot open a single channel is what issue #604 was about, so the whole
+// login transaction — user, session and exchange code alike — is rolled back
+// and the operator gets a 500 instead of an orphan account.
+var errDefaultWorkspaceMissing = errors.New("chat default workspace not found")
+
+// enrollInDefaultWorkspace gives a just-provisioned OIDC user the
+// chat.workspace_members row the chat API authorizes against, inside the same
+// transaction that created the account.
+//
+// The workspace is resolved by the logical rule the rest of the platform uses
+// (slug = 'default' AND status = 'active', as in search-service), not by the
+// seed UUID, so no environment-specific id leaks into the code.
+//
+// The role is the literal 'member' and the status the literal 'active'. Nothing
+// from the identity provider reaches either column: NChat RBAC stays internal
+// and server-side, and no Keycloak role or group is mapped.
+//
+// No ON CONFLICT clause: this runs only for a user id created moments earlier
+// by this very transaction, so a pre-existing membership would be an anomaly
+// worth failing on rather than a race to absorb.
+func enrollInDefaultWorkspace(ctx context.Context, tx pgx.Tx, userID string) error {
+	var workspaceID string
+	err := tx.QueryRow(ctx, `
+		INSERT INTO chat.workspace_members (workspace_id, user_id, role, status)
+		SELECT w.id, $1::uuid, 'member', 'active'
+		FROM chat.workspaces w
+		WHERE w.slug = 'default'
+		  AND w.status = 'active'
+		RETURNING workspace_id::text`,
+		userID,
+	).Scan(&workspaceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errDefaultWorkspaceMissing
+	}
+	if err != nil {
+		return fmt.Errorf("enroll oidc user in default workspace: %w", err)
+	}
+	return nil
 }
 
 func selectOIDCUserBySubject(ctx context.Context, tx pgx.Tx, provider, subject string) (domain.LoginUser, bool, error) {

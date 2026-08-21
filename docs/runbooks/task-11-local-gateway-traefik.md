@@ -25,6 +25,10 @@ Criar gateway local para desenvolvimento do NChat.
 | `/api/search`        | search-service `8086`       |
 | `/api/media`         | media-service `8087`        |
 
+O host `admin.nchat.local` foi acrescentado depois, pela issue #578, com suas
+proprias rotas (`/` para o console em `5174`, `/api/admin` e `/api/auth`). Ver
+`infra/traefik/local/README.md`.
+
 ## Arquivos criados
 
 - `infra/traefik/local/traefik.yml`

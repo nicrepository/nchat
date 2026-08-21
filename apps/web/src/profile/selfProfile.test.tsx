@@ -77,6 +77,42 @@ describe("useSelfProfile", () => {
     await waitFor(() => expect(probe()).toBe("ready:Ana Souza"));
   });
 
+  it("keeps the newest of two close refreshes when the earlier response arrives last", async () => {
+    render(<Probe />);
+    await waitFor(() => expect(probe()).toBe("ready:Ana"));
+
+    let resolveEarlier: (profile: SelfProfile) => void = () => {};
+    let resolveLatest: (profile: SelfProfile) => void = () => {};
+    mockFetchMyProfile
+      .mockImplementationOnce(
+        () =>
+          new Promise<SelfProfile>((resolve) => {
+            resolveEarlier = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<SelfProfile>((resolve) => {
+            resolveLatest = resolve;
+          }),
+      );
+
+    act(() => refreshSelfProfile());
+    act(() => refreshSelfProfile());
+    // Initial load plus exactly the two confirmed invalidations: no effect-driven duplicate fetch.
+    expect(mockFetchMyProfile).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      resolveLatest({ id: "u1", displayName: "Ana Atual" });
+    });
+    expect(probe()).toBe("ready:Ana Atual");
+
+    await act(async () => {
+      resolveEarlier({ id: "u1", displayName: "Ana Antiga" });
+    });
+    expect(probe()).toBe("ready:Ana Atual");
+  });
+
   it("drops the previous session's profile the moment the session changes", async () => {
     setTokens("token-a");
     render(<Probe />);

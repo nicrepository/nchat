@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import DedicatedCallStage from "./DedicatedCallStage";
 import FloatingCallWindow from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
@@ -17,6 +18,16 @@ const controls = {
   onCamera: noop,
   onScreenShare: noop,
   onEnd: noop,
+};
+
+// Every FloatingCallWindow test below that isn't specifically exercising the
+// identity fallback wants "video is present, no fallback" — these are the
+// two real media flags plus their (irrelevant-to-those-tests) color seeds.
+const videoPresent = {
+  hasRemoteVideo: true,
+  remoteSeed: "peer-seed",
+  hasLocalVideo: true,
+  localSeed: "local-user",
 };
 
 describe("IncomingCallPopup", () => {
@@ -112,6 +123,7 @@ describe("FloatingCallWindow", () => {
         screenShareActive
         controls={controls}
         onExpand={noop}
+        {...videoPresent}
       />,
     );
 
@@ -133,6 +145,7 @@ describe("FloatingCallWindow", () => {
         participantCount={2}
         controls={controls}
         onExpand={noop}
+        {...videoPresent}
       />,
     );
     const windowElement = screen.getByTestId("floating-call-window");
@@ -163,6 +176,7 @@ describe("FloatingCallWindow", () => {
         participantCount={2}
         controls={controls}
         onExpand={onExpand}
+        {...videoPresent}
       />,
     );
 
@@ -223,6 +237,7 @@ describe("FloatingCallWindow", () => {
         participantCount={2}
         controls={controls}
         onExpand={noop}
+        {...videoPresent}
       />,
     );
     const windowElement = screen.getByTestId("floating-call-window");
@@ -267,6 +282,7 @@ describe("FloatingCallWindow", () => {
         onActivate={noop}
         error="Falha"
         onRetry={retry}
+        {...videoPresent}
       />,
     );
     const handle = screen.getByTestId("floating-call-handle");
@@ -303,6 +319,7 @@ describe("FloatingCallWindow", () => {
         onExpand={noop}
         identityStatus="loading"
         error="Falha sem nova tentativa"
+        {...videoPresent}
       />,
     );
     const handle = screen.getByTestId("floating-call-handle");
@@ -341,6 +358,7 @@ describe("FloatingCallWindow", () => {
         onExpand={noop}
         activationRequired
         onActivate={noop}
+        {...videoPresent}
       />,
     );
 
@@ -372,6 +390,191 @@ describe("FloatingCallWindow", () => {
     localStorage.removeItem("nchat.call.floating-corner.v1");
     vi.unstubAllGlobals();
   });
+
+  it("shows a deterministic initials fallback when there is no usable remote video", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana Beatriz"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+        hasRemoteVideo={false}
+        remoteSeed="peer-1"
+      />,
+    );
+    const avatar = document.querySelector(".floating-call__avatar");
+    expect(avatar).not.toBeNull();
+    expect(avatar).toHaveTextContent(initialsFrom("Ana Beatriz"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor("peer-1")}`);
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("hides the remote avatar fallback once remote video is usable", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana Beatriz"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+        hasRemoteVideo
+        remoteSeed="peer-1"
+      />,
+    );
+    expect(document.querySelector(".floating-call__avatar")).toBeNull();
+  });
+
+  it("shows a deterministic initials fallback in the local preview when there is no usable local video", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+        hasLocalVideo={false}
+        localSeed="current-user"
+      />,
+    );
+    const avatar = document.querySelector(".floating-call__local-avatar");
+    expect(avatar).not.toBeNull();
+    expect(avatar).toHaveTextContent(initialsFrom("Você"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("hides the local avatar fallback in the floating preview once local video is usable", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(document.querySelector(".floating-call__local-avatar")).toBeNull();
+  });
+
+  it("keeps the participant count in its own stable slot across active-speaker mount/unmount", () => {
+    const view = render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    const countBefore = document.querySelector(".floating-call__count");
+    expect(countBefore).not.toBeNull();
+
+    view.rerender(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        activeSpeakerName="Ana"
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    const countDuring = document.querySelector(".floating-call__count");
+    expect(countDuring).toBe(countBefore);
+    expect(document.querySelector(".floating-call__speaker")).toHaveTextContent("Ana está falando");
+
+    view.rerender(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    expect(document.querySelector(".floating-call__count")).toBe(countBefore);
+    expect(document.querySelector(".floating-call__speaker")).toBeNull();
+  });
+
+  it("keeps the participant count in its own stable slot across screen-share mount/unmount", () => {
+    const view = render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    const countBefore = document.querySelector(".floating-call__count");
+
+    view.rerender(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        screenShareActive
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    expect(document.querySelector(".floating-call__count")).toBe(countBefore);
+    expect(document.querySelector(".floating-call__share")).toHaveTextContent(
+      "Compartilhando tela",
+    );
+
+    view.rerender(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    expect(document.querySelector(".floating-call__count")).toBe(countBefore);
+    expect(document.querySelector(".floating-call__share")).toBeNull();
+  });
+
+  it("renders active speaker and screen share as independent, non-nested slots that coexist", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={3}
+        activeSpeakerName="Ana"
+        screenShareActive
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    const stage = document.querySelector(".floating-call__stage")!;
+    const count = stage.querySelector(":scope > .floating-call__count");
+    const speaker = stage.querySelector(":scope > .floating-call__speaker");
+    const share = stage.querySelector(":scope > .floating-call__share");
+    expect(count).not.toBeNull();
+    expect(speaker).not.toBeNull();
+    expect(share).not.toBeNull();
+    // Independent siblings, never one nested inside another — that coupling
+    // is exactly what made mounting one shift the others.
+    expect(speaker?.contains(share!)).toBe(false);
+    expect(share?.contains(speaker!)).toBe(false);
+    expect(count?.contains(speaker!)).toBe(false);
+  });
 });
 
 describe("global and dedicated presentation", () => {
@@ -394,6 +597,8 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         screenShareName="Ana"
         bindScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
       />,
     );
     expect(screen.getByRole("main", { name: "Chamada Produto" })).toBeInTheDocument();
@@ -413,6 +618,8 @@ describe("global and dedicated presentation", () => {
         participants={[{ identity: "remote", displayName: "Ana", hasVideo: true }]}
         controls={controls}
         onMinimize={noop}
+        hasLocalVideo
+        localSeed="current-user"
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Reconectando");
@@ -429,8 +636,83 @@ describe("global and dedicated presentation", () => {
         controls={controls}
         onMinimize={noop}
         bindScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
       />,
     );
     expect(screen.getByText("Tela de Participante")).toBeInTheDocument();
+  });
+
+  it("shows deterministic initials and color for a camera-off remote participant", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "user-1", displayName: "Ana Beatriz", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    const avatar = document.querySelector(".dedicated-call__avatar");
+    expect(avatar).not.toBeNull();
+    expect(avatar).toHaveTextContent(initialsFrom("Ana Beatriz"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor("user-1")}`);
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+    // The visible name label stays available to the accessibility tree.
+    expect(screen.getByText("Ana Beatriz")).toBeInTheDocument();
+  });
+
+  it("derives a single-initial fallback for a simple remote name", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "user-2", displayName: "Zoe", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(document.querySelector(".dedicated-call__avatar")).toHaveTextContent("Z");
+  });
+
+  it("shows a local avatar fallback when there is no local video", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={1}
+        participants={[]}
+        controls={controls}
+        onMinimize={noop}
+        hasLocalVideo={false}
+        localSeed="current-user"
+      />,
+    );
+    const avatars = document.querySelectorAll(".dedicated-call__avatar");
+    expect(avatars).toHaveLength(1);
+    expect(avatars[0]).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
+    expect(screen.getByText("Você")).toBeInTheDocument();
+  });
+
+  it("hides the local avatar fallback once local video is active", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={1}
+        participants={[]}
+        controls={controls}
+        onMinimize={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(document.querySelector(".dedicated-call__avatar")).toBeNull();
   });
 });
