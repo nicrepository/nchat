@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import CallControls, { type CallControlProps } from "./CallControls";
 import {
   clampPosition,
@@ -30,6 +31,19 @@ interface FloatingCallWindowProps {
   onExpand: () => unknown;
   bindLocalMedia?: React.RefCallback<HTMLDivElement>;
   bindRemoteMedia?: React.RefCallback<HTMLDivElement>;
+  /**
+   * Whether the remote stage currently has a usable video track. Required,
+   * not defaulted: a callsite that forgets to wire real media state must get
+   * a type error, never a silent "assume video is present" that hides the
+   * fallback forever.
+   */
+  hasRemoteVideo: boolean;
+  /** Stable seed (peer/group id) for the remote fallback avatar's color. */
+  remoteSeed: string;
+  /** Whether the local preview currently has a usable video track. Same no-default rule as hasRemoteVideo. */
+  hasLocalVideo: boolean;
+  /** Stable seed (the current user's id) for the local fallback avatar's color. */
+  localSeed: string;
   testId?: string;
   activationRequired?: boolean;
   activationLabel?: string;
@@ -66,6 +80,10 @@ export default function FloatingCallWindow({
   onExpand,
   bindLocalMedia,
   bindRemoteMedia,
+  hasRemoteVideo,
+  remoteSeed,
+  hasLocalVideo,
+  localSeed,
   testId = "floating-call-window",
   activationRequired = false,
   activationLabel = "Permitir câmera e microfone",
@@ -201,12 +219,34 @@ export default function FloatingCallWindow({
       </header>
       <div className="floating-call__stage">
         <div ref={bindRemoteMedia} className="floating-call__remote" />
-        <div ref={bindLocalMedia} className="floating-call__local" />
+        {!hasRemoteVideo && (
+          <div className="floating-call__avatar-wrap">
+            <div
+              className={`floating-call__avatar call-avatar call-avatar--${avatarColorFor(remoteSeed)}`}
+              aria-hidden="true"
+            >
+              {initialsFrom(title)}
+            </div>
+          </div>
+        )}
+        <div className="floating-call__local">
+          <div ref={bindLocalMedia} className="floating-call__local-media" />
+          {!hasLocalVideo && (
+            <div
+              className={`floating-call__local-avatar call-avatar call-avatar--${avatarColorFor(localSeed)}`}
+              aria-hidden="true"
+            >
+              {initialsFrom("Você")}
+            </div>
+          )}
+        </div>
         <span className="floating-call__count">
           {participantCount} participante{participantCount === 1 ? "" : "s"}
         </span>
-        {activeSpeakerName && <span>{activeSpeakerName} está falando</span>}
-        {screenShareActive && <span>Compartilhando tela</span>}
+        {activeSpeakerName && (
+          <span className="floating-call__speaker">{activeSpeakerName} está falando</span>
+        )}
+        {screenShareActive && <span className="floating-call__share">Compartilhando tela</span>}
       </div>
       <CallControls {...controls} />
       {identityStatus === "loading" && (

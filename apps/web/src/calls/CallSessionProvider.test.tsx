@@ -4,6 +4,7 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { acquireChatSocket, type ChatSocketListener } from "../chat/chatSocket";
+import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import { useCallMedia } from "../chat/useCallMedia";
 import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
@@ -103,6 +104,8 @@ const media = {
   }>,
   activeSpeakerId: null as string | null,
   remoteScreenShare: null as null | { identity: string; bindMedia: ReturnType<typeof vi.fn> },
+  hasRemoteVideo: true,
+  hasLocalVideo: true,
   microphoneEnabled: false,
   cameraEnabled: false,
   screenShareEnabled: false,
@@ -568,6 +571,74 @@ describe("CallSessionProvider", () => {
     // (exercised in the recovery tests below) ever does that.
     expect(ownership.release).not.toHaveBeenCalled();
     expect(screen.getByTestId("owner")).toHaveTextContent("local");
+  });
+
+  it("floats a direct call's remote fallback avatar with the peer's real identity", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasRemoteVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await screen.findByTestId("floating-call-window");
+
+    // Peer is "Ana" (userA) per the registered directory — never an index or
+    // a made-up identity.
+    const avatar = document.querySelector(".floating-call__avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userA)}`);
+  });
+
+  it("floats the local fallback avatar with the current user's real id", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasLocalVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await screen.findByTestId("floating-call-window");
+
+    const avatar = document.querySelector(".floating-call__local-avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Você"));
+    // currentUserId (userB) — the registered directory's own id, never a
+    // fetched profile just for this fallback.
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userB)}`);
+  });
+
+  it("floats a resource call's remote fallback using the room's own identity, never a specific participant", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    media.hasRemoteVideo = false;
+    // Multiple participants exist, but the fallback must represent the room
+    // — not pick one of them as if it were a 1:1 call.
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    const avatar = document.querySelector(".floating-call__avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Produto"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(channelId)}`);
+  });
+
+  it("never masks a resource participant's real video with the group fallback", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    // hasRemoteVideo mirrors whether ANY remote element (direct peer or
+    // resource participant, same onRemoteElement stream in useCallMedia)
+    // currently renders — a participant's real video already fills
+    // bindRemoteMedia's flat container, so the fallback must stay hidden.
+    media.hasRemoteVideo = true;
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: true, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    expect(document.querySelector(".floating-call__avatar")).toBeNull();
   });
 
   it("recovers resource ownership, including activation and failed-claim paths", async () => {

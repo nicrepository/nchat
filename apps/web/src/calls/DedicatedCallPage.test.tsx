@@ -3,6 +3,7 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { fetchSidebarData } from "../chat/chatApi";
+import { avatarColorFor } from "../chat/messageDisplay";
 import { resolveCall } from "../chat/resourceCallSignaling";
 import DedicatedCallPage from "./DedicatedCallPage";
 import { useCallSession } from "./CallSessionProvider";
@@ -51,6 +52,7 @@ const session = {
     status: "connected" as string,
     participants: [] as unknown[],
     remoteScreenShare: null as unknown,
+    hasLocalVideo: true,
     microphoneEnabled: true,
     cameraEnabled: false,
     screenShareEnabled: false,
@@ -98,6 +100,7 @@ describe("DedicatedCallPage", () => {
     session.media.status = "connected";
     session.media.participants = [];
     session.media.remoteScreenShare = null;
+    session.media.hasLocalVideo = true;
     vi.mocked(useCallSession).mockReturnValue(session as never);
     vi.mocked(resolveCall).mockResolvedValue(resolvedCall);
     vi.mocked(fetchSidebarData).mockResolvedValue({
@@ -268,6 +271,45 @@ describe("DedicatedCallPage", () => {
     await waitFor(() => expect(session.calls.activateMedia).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
     expect(session.calls.end).toHaveBeenCalledOnce();
+  });
+
+  it("wires the local fallback avatar's seed to directory.currentUserId, never a fetched profile", async () => {
+    const direct = {
+      call_id: callId,
+      request_id: "request",
+      caller_id: "caller",
+      callee_id: "current-user",
+      target_type: "user" as const,
+      call_type: "video" as const,
+      status: "active" as const,
+      version: 1,
+      created_at: "2026-08-18T12:00:00Z",
+      occurred_at: "2026-08-18T12:00:00Z",
+      expires_at: "2026-08-18T13:00:00Z",
+    };
+    vi.mocked(resolveCall).mockResolvedValueOnce(direct);
+    vi.mocked(fetchSidebarData).mockResolvedValueOnce({
+      currentUserId: "current-user",
+      channels: [],
+      dms: [
+        {
+          id: "dm-direct",
+          name: "Ana",
+          type: "1:1",
+          participants: [],
+          counterpart: { userId: "caller", displayName: "Ana" },
+        },
+      ],
+      categories: [],
+    });
+    session.calls.call = direct;
+    session.media.hasLocalVideo = false;
+    renderPage();
+
+    const avatar = await screen.findByText("Você", { selector: "span" });
+    const tile = avatar.closest("article")!;
+    const localAvatar = tile.querySelector(".dedicated-call__avatar")!;
+    expect(localAvatar).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
   });
 
   it("releases (stopping media first) before attempting window.close, then falls back to /chat when it is blocked", async () => {

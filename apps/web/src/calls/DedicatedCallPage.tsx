@@ -205,6 +205,8 @@ export default function DedicatedCallPage() {
             : undefined
         }
         bindScreenShare={media.remoteScreenShare?.bindMedia}
+        hasLocalVideo={media.hasLocalVideo}
+        localSeed={directory.currentUserId}
         onMinimize={() => {
           void session.releaseDedicated(resolved.call_id).then(() => {
             window.close();
