@@ -25,6 +25,7 @@ import (
 func TestPGXOIDCStore_ConcurrentFirstLoginProvisionsExactlyOneUser(t *testing.T) {
 	pool := connectAuthTestDB(t)
 	applyAuthMigrations(t, pool)
+	applyChatMigrations(t, pool)
 	store := storage.NewPGXOIDCStore(pool)
 
 	const subject = "concurrent-subject"
@@ -81,6 +82,20 @@ func TestPGXOIDCStore_ConcurrentFirstLoginProvisionsExactlyOneUser(t *testing.T)
 	}
 	if users != 1 {
 		t.Fatalf("auth.users holds %d rows for subject %q, want exactly 1", users, subject)
+	}
+
+	// One identity means one membership: the enrollment rides inside the
+	// provisioning transaction, so the loser of the race — which never inserts
+	// a user — must not insert a membership either.
+	var memberships int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM chat.workspace_members WHERE user_id::text = $1`,
+		results[0].created.User.ID,
+	).Scan(&memberships); err != nil {
+		t.Fatalf("count memberships: %v", err)
+	}
+	if memberships != 1 {
+		t.Fatalf("chat.workspace_members holds %d rows for the provisioned user, want exactly 1", memberships)
 	}
 }
 
