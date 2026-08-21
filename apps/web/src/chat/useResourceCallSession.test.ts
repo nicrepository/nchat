@@ -4,14 +4,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { issueCallToken } from "./callApi";
 import type { Call } from "./callState";
 import { acquireChatSocket } from "./chatSocket";
-import { leaveResourceCall, startResourceCall } from "./resourceCallSignaling";
+import {
+  leaveResourceCall,
+  ResourceCallSignalingError,
+  startResourceCall,
+} from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
 
 vi.mock("./callApi", () => ({
   issueCallToken: vi.fn(),
 }));
-vi.mock("./resourceCallSignaling", () => ({
+vi.mock("./resourceCallSignaling", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./resourceCallSignaling")>()),
   startResourceCall: vi.fn(),
   leaveResourceCall: vi.fn(),
 }));
@@ -152,6 +157,101 @@ describe("useResourceCallSession", () => {
     });
 
     expect(issueCallToken).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a different local join without touching the active resource session", async () => {
+    vi.useFakeTimers();
+    try {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      const originalCallId = view.result.current.callId;
+      const acquireCount = vi.mocked(acquireChatSocket).mock.results.length;
+      const presenceHandle = vi.mocked(acquireChatSocket).mock.results.at(-1)!.value as {
+        send: ReturnType<typeof vi.fn>;
+      };
+      presenceHandle.send.mockClear();
+      vi.mocked(startResourceCall).mockClear();
+      media.startAudio.mockClear();
+      media.connect.mockClear();
+      media.stop.mockClear();
+
+      await act(() =>
+        view.result.current.join({
+          kind: "channel",
+          id: "00000000-0000-4000-8000-000000000702",
+          name: "outro",
+        }),
+      );
+
+      expect(startResourceCall).not.toHaveBeenCalled();
+      expect(media.startAudio).not.toHaveBeenCalled();
+      expect(media.connect).not.toHaveBeenCalled();
+      expect(media.stop).not.toHaveBeenCalled();
+      expect(vi.mocked(acquireChatSocket).mock.results.length).toBe(acquireCount);
+      expect(view.result.current.active).toEqual(channelTarget);
+      expect(view.result.current.callId).toBe(originalCallId);
+      expect(view.result.current.status).toBe("active");
+
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(presenceHandle.send).toHaveBeenCalledWith({
+        type: "call.presence",
+        call_id: originalCallId,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a same-target rejoin legitimate", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+    vi.mocked(startResourceCall).mockClear();
+
+    await act(() => view.result.current.join({ ...channelTarget }));
+
+    expect(startResourceCall).toHaveBeenCalledExactlyOnceWith({ ...channelTarget });
+    expect(view.result.current.active).toEqual(channelTarget);
+    expect(view.result.current.callId).toBe(resourceCall.call_id);
+  });
+
+  it("rolls back only a stale fresh attempt rejected as participant busy", async () => {
+    const media = fakeMedia();
+    vi.mocked(startResourceCall).mockRejectedValueOnce(
+      new ResourceCallSignalingError("call.start", "call_participant_busy"),
+    );
+    const view = renderHook(() => useResourceCallSession(media));
+
+    await act(() => view.result.current.join(channelTarget));
+
+    expect(view.result.current.active).toBeNull();
+    expect(view.result.current.callId).toBeNull();
+    expect(view.result.current.status).toBe("error");
+    expect(view.result.current.error).toBe("Você já está em outra chamada.");
+    expect(media.connect).not.toHaveBeenCalled();
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
+  it("restores an existing same-target session when stale server state rejects its rejoin as busy", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+    const originalCallId = view.result.current.callId;
+    vi.mocked(startResourceCall).mockRejectedValueOnce(
+      new ResourceCallSignalingError("call.start", "call_participant_busy"),
+    );
+    media.connect.mockClear();
+    media.stop.mockClear();
+
+    await act(() => view.result.current.join({ ...channelTarget }));
+
+    expect(view.result.current.active).toEqual(channelTarget);
+    expect(view.result.current.callId).toBe(originalCallId);
+    expect(view.result.current.status).toBe("active");
+    expect(view.result.current.error).toBe("Você já está em outra chamada.");
+    expect(media.connect).not.toHaveBeenCalled();
+    expect(media.stop).not.toHaveBeenCalled();
   });
 
   // ── issue #569: leave() must release this participant's server-side
