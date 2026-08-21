@@ -3,6 +3,10 @@ import type { PropsWithChildren } from "react";
 import { MemoryRouter, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  ShowBrowserMessageNotificationInput,
+  ShowBrowserMessageNotificationResult,
+} from "./browserNotification";
 import { parseInstant } from "./sidebarOrder";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatSidebar } from "./useChatSidebar";
@@ -24,7 +28,9 @@ const {
   // Defaults to {shown:false} so every existing test below — written before
   // the browser Notification integration existed — keeps falling through to
   // the chime exactly as before, with no changes required to those tests.
-  mockShowBrowserMessageNotification: vi.fn(() => ({ shown: false })),
+  mockShowBrowserMessageNotification: vi.fn<
+    (input: ShowBrowserMessageNotificationInput) => ShowBrowserMessageNotificationResult
+  >(() => ({ shown: false })),
   websocket: {
     onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     onConversationAvailable: null as (() => void) | null,
