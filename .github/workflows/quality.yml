@@ -43,6 +43,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # O SonarQube usa o historico completo para atribuir autoria e datas
+          # (analise SCM); um clone raso deixa toda a base como codigo novo.
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -128,3 +132,17 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # O SonarQube Community Build analisa uma unica branch principal e nao faz
+      # analise de pull request, entao so `develop` (a branch de integracao) e
+      # enviada. Todos os demais gates continuam rodando normalmente nos PRs.
+      - name: SonarQube scan
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
