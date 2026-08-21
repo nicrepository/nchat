@@ -44,7 +44,7 @@ func RequireAdminSession(authenticator AdminAuthenticator, cookie string) func(h
 			}
 			admin, err := authenticator.Authenticate(r.Context(), presented.Value)
 			if err != nil {
-				writeAuthError(w, err)
+				writeDomainError(w, err)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminContextKey{}, admin)))
@@ -59,19 +59,37 @@ func AdminFromContext(r *http.Request) (domain.AuthenticatedAdmin, bool) {
 	return admin, ok
 }
 
-// writeAuthError maps the domain errors onto the two answers a client is
-// allowed to tell apart, and nothing more granular: 401 means "prove who you
-// are again", 403 means "you are known and still not allowed". Neither body
+// writeDomainError maps the domain errors onto the answers a client is allowed
+// to tell apart.
+//
+// The authorization pair stays as coarse as it was: 401 means "prove who you
+// are again", 403 means "you are known and still not allowed", and neither body
 // says which of the several possible reasons applied.
-func writeAuthError(w http.ResponseWriter, err error) {
+//
+// 404 and 409 are new with the management surface and are deliberately
+// distinguishable. Every endpoint that can produce them is already behind a
+// platform-wide capability, so there is no object set to enumerate: a caller
+// holding admin.users.read is entitled to know whether a user id exists, and
+// answering 403 instead would only make a broken console impossible to
+// diagnose. 409 is what tells an operator their click lost a race rather than
+// silently doing nothing.
+func writeDomainError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrUnauthorized):
 		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
 	case errors.Is(err, domain.ErrForbidden):
 		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrConflict):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflicting state")
 	case errors.Is(err, domain.ErrUnavailable):
 		writeUnavailable(w)
 	default:
+		// Nothing about the underlying failure reaches the body: a wrapped
+		// database error can name a table, a column or a constraint.
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
 }

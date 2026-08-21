@@ -41,6 +41,7 @@ type stubStore struct {
 	revokeErr    error
 	audit        []domain.AuditEvent
 	auditEntries []domain.AuditEntry
+	auditFilter  domain.AuditFilter
 	auditListErr error
 	pingErr      error
 }
@@ -101,7 +102,8 @@ func (s *stubStore) AppendAudit(_ context.Context, event domain.AuditEvent) erro
 	return nil
 }
 
-func (s *stubStore) ListAuditEvents(_ context.Context, _ int) ([]domain.AuditEntry, error) {
+func (s *stubStore) ListAuditEvents(_ context.Context, filter domain.AuditFilter) ([]domain.AuditEntry, error) {
+	s.auditFilter = filter
 	return s.auditEntries, s.auditListErr
 }
 
@@ -163,8 +165,16 @@ type testHarness struct {
 type harnessOption func(*harnessSettings)
 
 type harnessSettings struct {
-	cfg    config.Config
-	logger *slog.Logger
+	cfg config.Config
+	// management is the issue #579 surface. It defaults to nil so the
+	// foundation's specs keep exercising a router that serves those paths as
+	// unavailable, which is the deployment state they describe.
+	management *ManagementPorts
+	logger     *slog.Logger
+}
+
+func withManagement(ports *ManagementPorts) harnessOption {
+	return func(s *harnessSettings) { s.management = ports }
 }
 
 func withConfig(apply func(*config.Config)) harnessOption {
@@ -199,6 +209,7 @@ func newHarness(t *testing.T, store *stubStore, options ...harnessOption) *testH
 		Audit:           NewAuditPorts(audit, audit),
 		RateLimiter:     NewIPRateLimiter(1000, 1000, nil),
 		ReadinessPinger: store,
+		Management:      settings.management,
 	})
 	return &testHarness{router: router, store: store, cfg: cfg, auth: sessions}
 }

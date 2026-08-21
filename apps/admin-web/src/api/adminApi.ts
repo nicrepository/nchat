@@ -60,8 +60,26 @@ export async function destroyAdminSession(): Promise<void> {
   }
 }
 
-export async function listAuditEvents(limit?: number): Promise<AuditEvent[]> {
-  const query = limit === undefined ? "" : `?limit=${encodeURIComponent(String(limit))}`;
-  const body = await adminFetch<{ events: AuditEvent[] }>(`/audit/events${query}`);
+/**
+ * Reads the administrative audit trail.
+ *
+ * `userID` narrows it to the events performed *on* that account. The narrowing
+ * happens in the database, before the limit — the point of the parameter is
+ * finding an event the platform-wide window no longer reaches, which a
+ * client-side filter over the last fifty rows could never do.
+ */
+export async function listAuditEvents(
+  limit?: number,
+  userID?: string,
+  signal?: AbortSignal,
+): Promise<AuditEvent[]> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) params.set("limit", String(limit));
+  if (userID) params.set("user_id", userID);
+  const suffix = params.toString();
+  const body = await adminFetch<{ events: AuditEvent[] }>(
+    `/audit/events${suffix ? `?${suffix}` : ""}`,
+    { signal },
+  );
   return body.events ?? [];
 }

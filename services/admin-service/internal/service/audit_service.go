@@ -21,7 +21,7 @@ const (
 // AuditStore is the audit persistence this service needs.
 type AuditStore interface {
 	AppendAudit(ctx context.Context, event domain.AuditEvent) error
-	ListAuditEvents(ctx context.Context, limit int) ([]domain.AuditEntry, error)
+	ListAuditEvents(ctx context.Context, filter domain.AuditFilter) ([]domain.AuditEntry, error)
 }
 
 // AuditService records and reads the administrative audit trail.
@@ -63,11 +63,23 @@ func (s *AuditService) Record(ctx context.Context, event domain.AuditEvent) {
 
 // List returns the most recent audit entries, with the limit clamped to a
 // range this endpoint is willing to serve.
-func (s *AuditService) List(ctx context.Context, limit int) ([]domain.AuditEntry, error) {
+//
+// The filter arrives already validated: this layer turns a user id into the
+// canonical resource key and refuses a malformed one, so the store only ever
+// receives a key it built itself. A caller cannot reach the resource column
+// with a value of their own choosing.
+func (s *AuditService) List(ctx context.Context, limit int, userID string) ([]domain.AuditEntry, error) {
 	if s == nil || s.store == nil {
 		return nil, domain.ErrUnavailable
 	}
-	return s.store.ListAuditEvents(ctx, ClampAuditLimit(limit))
+	filter := domain.AuditFilter{Limit: ClampAuditLimit(limit)}
+	if userID != "" {
+		if !domain.ValidUUID(userID) {
+			return nil, domain.ErrInvalidInput
+		}
+		filter.Resource = domain.AuditUserResource(userID)
+	}
+	return s.store.ListAuditEvents(ctx, filter)
 }
 
 // ClampAuditLimit normalizes a requested page size. Zero or negative means

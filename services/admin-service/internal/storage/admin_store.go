@@ -272,21 +272,39 @@ func (s *PGXAdminStore) AppendAudit(ctx context.Context, event domain.AuditEvent
 	return nil
 }
 
+// listAuditQuery returns the trail, optionally narrowed to one resource.
+//
+// The resource predicate is applied in the WHERE clause, so it runs *before*
+// the ORDER BY and the LIMIT. That ordering is the whole feature: an event that
+// is the two-hundredth most recent on the platform is still the first one in
+// its own subject's history, and a filter applied after the limit — or in the
+// browser — would never find it.
+//
+// The comparison is equality against a bound parameter. There is no pattern, no
+// JSON path and no metadata lookup: auth.admin_audit_events.metadata is written
+// by producers from named values and is deliberately not something this API
+// lets a caller search.
+//
+// NULL means "not narrowed", which keeps the platform-wide trail on exactly the
+// plan it had before this filter existed.
 const listAuditQuery = `
 	SELECT e.id, e.occurred_at, COALESCE(e.actor_user_id::text, ''), COALESCE(u.email::text, ''),
 	       e.action, COALESCE(e.resource, ''), e.result, COALESCE(e.correlation_id, '')
 	FROM auth.admin_audit_events AS e
 	LEFT JOIN auth.users AS u ON u.id = e.actor_user_id
+	WHERE ($1::text IS NULL OR e.resource = $1)
 	ORDER BY e.occurred_at DESC, e.id DESC
-	LIMIT $1`
+	LIMIT $2`
 
-// ListAuditEvents returns the most recent audit rows. The limit is applied by
-// the caller's validated value, never by a raw query parameter.
-func (s *PGXAdminStore) ListAuditEvents(ctx context.Context, limit int) ([]domain.AuditEntry, error) {
+// ListAuditEvents returns the most recent audit rows, optionally narrowed to
+// one resource. The limit is applied by the caller's validated value, never by
+// a raw query parameter.
+func (s *PGXAdminStore) ListAuditEvents(ctx context.Context, filter domain.AuditFilter) ([]domain.AuditEntry, error) {
 	if s == nil || s.pool == nil {
 		return nil, domain.ErrUnavailable
 	}
-	rows, err := s.pool.Query(ctx, listAuditQuery, limit)
+	limit := filter.Limit
+	rows, err := s.pool.Query(ctx, listAuditQuery, nullableText(filter.Resource), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list admin audit events: %w", err)
 	}
