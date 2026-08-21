@@ -247,12 +247,12 @@ func TestListAuditEvents(t *testing.T) {
 	mock := newMock(t)
 	occurred := time.Now().UTC()
 	mock.ExpectQuery(`FROM auth\.admin_audit_events AS e`).
-		WithArgs(10).
+		WithArgs(nil, 10).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "occurred_at", "actor_user_id", "email", "action", "resource", "result", "correlation_id"}).
 			AddRow(int64(2), occurred, "user-1", "admin@example.test", "admin.session.create", "admin.session", "success", "req-2").
 			AddRow(int64(1), occurred, "", "", "admin.authorization.deny", "/audit/events", "denied", ""))
 
-	entries, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), 10)
+	entries, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), domain.AuditFilter{Limit: 10})
 	if err != nil {
 		t.Fatalf("ListAuditEvents: %v", err)
 	}
@@ -266,9 +266,9 @@ func TestListAuditEvents(t *testing.T) {
 
 func TestListAuditEvents_PropagatesQueryFailure(t *testing.T) {
 	mock := newMock(t)
-	mock.ExpectQuery(`FROM auth\.admin_audit_events AS e`).WithArgs(pgxmock.AnyArg()).WillReturnError(errors.New("boom"))
+	mock.ExpectQuery(`FROM auth\.admin_audit_events AS e`).WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("boom"))
 
-	if _, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), 10); err == nil {
+	if _, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), domain.AuditFilter{Limit: 10}); err == nil {
 		t.Fatal("expected an error")
 	}
 }
@@ -276,10 +276,10 @@ func TestListAuditEvents_PropagatesQueryFailure(t *testing.T) {
 func TestListAuditEvents_PropagatesScanFailure(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`FROM auth\.admin_audit_events AS e`).
-		WithArgs(pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("not-an-id"))
 
-	if _, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), 10); err == nil {
+	if _, err := storage.NewPGXAdminStore(mock).ListAuditEvents(context.Background(), domain.AuditFilter{Limit: 10}); err == nil {
 		t.Fatal("expected a scan error")
 	}
 }
@@ -317,7 +317,7 @@ func TestNilPoolRefusesEveryOperation(t *testing.T) {
 	if err := store.AppendAudit(ctx, domain.AuditEvent{}); !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("AppendAudit: expected ErrUnavailable, got %v", err)
 	}
-	if _, err := store.ListAuditEvents(ctx, 10); !errors.Is(err, domain.ErrUnavailable) {
+	if _, err := store.ListAuditEvents(ctx, domain.AuditFilter{Limit: 10}); !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("ListAuditEvents: expected ErrUnavailable, got %v", err)
 	}
 	if err := store.Ping(ctx); !errors.Is(err, domain.ErrUnavailable) {
