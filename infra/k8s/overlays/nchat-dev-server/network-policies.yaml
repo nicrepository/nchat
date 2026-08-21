@@ -34,6 +34,9 @@ spec:
           # the daemon only accepts connections, it never opens any.
           - file
           - upload-guard
+          # search-service resolves postgres for the message index (issue
+          # #601). Without DNS its startup database ping never leaves the pod.
+          - search
   policyTypes:
     - Egress
   egress:
@@ -122,6 +125,9 @@ spec:
                   # of auth.admin_* and reads auth.user_sessions to
                   # re-authorize on every request.
                   - admin
+                  # The message index search-service queries, and the readiness
+                  # ping it refuses to start without (issue #601).
+                  - search
       ports:
         - protocol: TCP
           port: 5432
@@ -250,6 +256,37 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/component: admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# The sending half of the search ingress above. It is a policy of its own
+# because that is this overlay's shape: one minimal egress rule per service,
+# so removing a service's database access is deleting a document rather than
+# editing a shared list.
+#
+# The name is deliberate: a policy with exactly this name was created by hand
+# in nchat-dev while search-service was being diagnosed, so `kubectl apply`
+# adopts that object instead of leaving an unmanaged twin beside it. The two
+# other temporary policies from that session (search DNS egress and search
+# postgres ingress) are absent on purpose — their flows moved into the
+# aggregated nchat-allow-dns-egress and nchat-allow-postgres above, and they
+# are to be deleted by hand once this overlay is applied.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-search-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: search
   policyTypes:
     - Egress
   egress:
