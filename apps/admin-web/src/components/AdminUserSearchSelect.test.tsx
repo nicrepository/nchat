@@ -57,7 +57,16 @@ async function type(text: string) {
   await userEvent.type(field(), text, { delay: null });
 }
 
-/** Lets the debounce elapse and the resulting request settle. */
+/**
+ * Runs out the debounce timer.
+ *
+ * It does **not** prove the search that timer started has finished: the chain
+ * from the settled term to a rendered row is debounce → render → new loader →
+ * effect → promise → render, and only the first link is a timer. Advancing the
+ * clock returns with the listbox still empty. So every spec that needs the new
+ * results waits for one of them to appear before touching the list — never on
+ * this helper alone.
+ */
 async function settle() {
   await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 50);
 }
@@ -120,10 +129,15 @@ describe("AdminUserSearchSelect", () => {
     // must not have behaved like a selection either.
     expect(field()).toHaveValue("Bru");
 
-    // Once the new search settles, Enter picks from it.
+    // Once the new search really has an answer on screen, Enter picks from it.
+    // Waiting for Bruno to be on offer is the assertion, not scaffolding: the
+    // property is "selectable again once the new results exist", so the spec has
+    // to establish that they exist before pressing the key.
     await settle();
+    expect(await screen.findByRole("option", { name: /Bruno Reis/ })).toBeInTheDocument();
     await userEvent.keyboard("{Enter}");
-    expect(onSelect).toHaveBeenCalledWith(BRUNO);
+    // Exactly once, which re-proves the Enter above selected nobody at all.
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith(BRUNO);
   });
 
   it("a click cannot land on a row from the previous term", async () => {
