@@ -3158,7 +3158,8 @@ func (h *Hub) handleClientMessage(ctx context.Context, c *Client, msg ClientMess
 		return nil
 	case ClientMessageTypeCallStart, ClientMessageTypeCallAccept, ClientMessageTypeCallDecline,
 		ClientMessageTypeCallCancel, ClientMessageTypeCallEnd, ClientMessageTypeCallLeave,
-		ClientMessageTypeCallSync, ClientMessageTypeCallPresence:
+		ClientMessageTypeCallSync, ClientMessageTypeCallPresence,
+		ClientMessageTypeCallResourceSync, ClientMessageTypeCallJoin:
 		return h.handleCallMessage(ctx, c, msg)
 	case ClientMessageTypeTypingStart:
 		return h.handleTypingStart(ctx, c, msg)

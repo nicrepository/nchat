@@ -339,6 +339,239 @@ func (s *PGXCallStore) RenewCallPresence(ctx context.Context, input RenewCallPre
 	return nil
 }
 
+// JoinResourceCallInput identifies an explicit call.join (issue #622): the
+// actor's claim of which call, and which target it believes that call
+// belongs to — the target is re-validated against the call's own persisted
+// TargetType/TargetID before anything else, never trusted as-is.
+type JoinResourceCallInput struct {
+	WorkspaceID string
+	CallID      string
+	ActorID     string
+	TargetType  domain.CallTargetType
+	TargetID    string
+	ExpiresAt   time.Time
+}
+
+// JoinResourceCall admits ActorID into an already-existing, active resource
+// call — issue #622's call.join. Unlike CreateResourceCall, it never creates
+// a call: an unknown call_id, a call that is not a resource call, a
+// target_type/target_id that does not match the call's own persisted target,
+// or a call the actor is not authorized for all fail identically with
+// domain.ErrNotFound and no mutation, so a guessed call_id learns nothing.
+// A call that is no longer active fails with domain.ErrConflict — the join
+// simply arrived too late; the caller is expected to re-sync.
+//
+// Lock order matches every other admission path (issue #609): the actor's
+// own participant advisory lock first, then the call's row lock, then the
+// busy check, then the lease upsert. JoinResourceCall never takes a
+// target-level lock of its own — the call row's own FOR UPDATE lock is what
+// serializes it against a concurrent LeaveResourceCall/TransitionCall(end) or
+// CreateResourceCall reusing the very same row, exactly as those already
+// serialize against each other.
+func (s *PGXCallStore) JoinResourceCall(ctx context.Context, input JoinResourceCallInput) (domain.Call, error) {
+	if s == nil || s.pool == nil {
+		return domain.Call{}, errors.New("call store unavailable")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Call{}, fmt.Errorf("begin join resource call: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockCallKeys(ctx, tx, input.ActorID); err != nil {
+		return domain.Call{}, err
+	}
+
+	call, err := scanCall(tx.QueryRow(ctx,
+		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND id = $2 FOR UPDATE`,
+		input.WorkspaceID, input.CallID,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Call{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Call{}, fmt.Errorf("lock call for join: %w", err)
+	}
+	if !call.IsResource() {
+		return domain.Call{}, domain.ErrNotFound
+	}
+	// The client's target claim must match the call's own persisted target
+	// before anything else runs: call_id X + target Y fails here, with no
+	// mutation and no distinction from "call not found" — a mismatched guess
+	// learns nothing about X's real target.
+	if call.TargetType != input.TargetType || call.TargetID != input.TargetID {
+		return domain.Call{}, domain.ErrNotFound
+	}
+	if call.Status != domain.CallStatusActive {
+		return domain.Call{}, domain.ErrConflict
+	}
+
+	authorized, err := authorizeResourceTarget(ctx, tx, input.WorkspaceID, input.ActorID, call.TargetType, call.TargetID)
+	if err != nil {
+		return domain.Call{}, err
+	}
+	if !authorized {
+		return domain.Call{}, domain.ErrNotFound
+	}
+
+	busy, err := callParticipantBusy(ctx, tx, input.WorkspaceID, input.ActorID, call.ID)
+	if err != nil {
+		return domain.Call{}, err
+	}
+	if busy {
+		return domain.Call{}, domain.ErrCallParticipantBusy
+	}
+
+	if err := upsertCallPresence(ctx, tx, call.ID, input.ActorID, input.ExpiresAt); err != nil {
+		return domain.Call{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Call{}, fmt.Errorf("commit join resource call: %w", err)
+	}
+	return call, nil
+}
+
+// ActiveResourceCallResult is ActiveResourceCall's answer (issue #622).
+// Authorized and Found are kept apart deliberately: the storage layer can
+// tell "no active call" from "not authorized for this target" even though the
+// protocol layer (CallService.ResourceSync) collapses both into the same
+// found=false response — an unauthorized caller must never learn a call
+// exists purely by getting a different answer shape than a genuinely idle
+// target would produce.
+type ActiveResourceCallResult struct {
+	Call       domain.Call
+	Found      bool
+	Authorized bool
+	ObservedAt time.Time
+}
+
+// ActiveResourceCall answers call.resource.sync (issue #622): the
+// authoritative active call of one channel/group-DM target, read-only —
+// creates no lease, issues no token, mutates nothing.
+//
+// This runs as ONE statement: the authorization check, the active-call
+// lookup (a LEFT JOIN, so the row is simply absent rather than fetched by a
+// second query) and the observed_at snapshot are all decided from the exact
+// same READ COMMITTED snapshot. Two separate round trips would let each see
+// a different snapshot — "authorized" and "found" could disagree with a
+// second query's own answer if the call changed in between — which is
+// exactly the torn read this single-statement design rules out.
+//
+// ObservedAt uses statement_timestamp(), not clock_timestamp(). Postgres
+// documents statement_timestamp() as the start time of the current
+// statement — the same instant a READ COMMITTED snapshot for that statement
+// is established — so it cannot be later than the commit of any row this
+// statement's snapshot fails to see, no matter how long the statement then
+// takes to finish evaluating. clock_timestamp() has no such guarantee: it is
+// volatile and re-evaluated at the moment each expression actually runs, so
+// a concurrent commit landing between snapshot acquisition and that
+// evaluation could commit a call with a created_at earlier than the
+// observed_at this query would then report for "not found" — the exact
+// false-negative-freshness bug the null-sync race must not allow. See
+// TestStatementTimestampIsFixedAtStatementStartNotReevaluatedPostgreSQL for
+// the semantic proof, and resource_sync_postgres_test.go for the concurrent
+// proof.
+func (s *PGXCallStore) ActiveResourceCall(ctx context.Context, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (ActiveResourceCallResult, error) {
+	if s == nil || s.pool == nil {
+		return ActiveResourceCallResult{}, errors.New("call store unavailable")
+	}
+	var query string
+	switch targetType {
+	case domain.CallTargetChannel:
+		query = activeResourceCallChannelQuery
+	case domain.CallTargetDM:
+		query = activeResourceCallDMQuery
+	default:
+		return ActiveResourceCallResult{}, domain.ErrInvalidInput
+	}
+
+	var authorized bool
+	var observedAt time.Time
+	var id, workspaceIDCol, requestID, callerID, calleeID, targetIDCol pgtype.UUID
+	var targetTypeCol, callTypeCol, statusCol pgtype.Text
+	var version pgtype.Int8
+	var createdAt, updatedAt, expiresAt, acceptedAt, endedAt pgtype.Timestamptz
+
+	err := s.pool.QueryRow(ctx, query, workspaceID, actorID, targetID).Scan(
+		&authorized, &observedAt,
+		&id, &workspaceIDCol, &requestID, &callerID, &calleeID,
+		&targetTypeCol, &targetIDCol, &callTypeCol, &statusCol,
+		&version, &createdAt, &updatedAt, &expiresAt, &acceptedAt, &endedAt,
+	)
+	if err != nil {
+		return ActiveResourceCallResult{}, fmt.Errorf("check active resource call: %w", err)
+	}
+	result := ActiveResourceCallResult{Authorized: authorized, ObservedAt: observedAt.UTC()}
+	if !authorized || !id.Valid {
+		return result, nil
+	}
+
+	call := domain.Call{
+		ID:          uuid.UUID(id.Bytes).String(),
+		WorkspaceID: uuid.UUID(workspaceIDCol.Bytes).String(),
+		RequestID:   uuid.UUID(requestID.Bytes).String(),
+		CallerID:    uuid.UUID(callerID.Bytes).String(),
+		TargetType:  domain.CallTargetType(targetTypeCol.String),
+		TargetID:    uuid.UUID(targetIDCol.Bytes).String(),
+		Type:        domain.CallType(callTypeCol.String),
+		Status:      domain.CallStatus(statusCol.String),
+		Version:     version.Int64,
+		CreatedAt:   createdAt.Time.UTC(),
+		UpdatedAt:   updatedAt.Time.UTC(),
+		ExpiresAt:   expiresAt.Time.UTC(),
+	}
+	if calleeID.Valid {
+		call.CalleeID = uuid.UUID(calleeID.Bytes).String()
+	}
+	if acceptedAt.Valid {
+		v := acceptedAt.Time.UTC()
+		call.AcceptedAt = &v
+	}
+	if endedAt.Valid {
+		v := endedAt.Time.UTC()
+		call.EndedAt = &v
+	}
+	result.Call = call
+	result.Found = true
+	return result, nil
+}
+
+const activeResourceCallChannelQuery = `
+	WITH authorized AS (
+		SELECT EXISTS (
+			SELECT 1 FROM chat.channels c
+			JOIN chat.workspace_members wm ON wm.workspace_id = c.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
+			WHERE c.id = $3 AND c.workspace_id = $1 AND c.status = 'active'
+			  AND chat.channel_visible_to_user(c.id, $2::uuid)
+		) AS ok
+	),
+	active_call AS (
+		SELECT ` + callSelectColumns + `
+		FROM chat.calls
+		WHERE workspace_id = $1 AND target_type = 'channel' AND target_id = $3 AND status = 'active'
+	)
+	SELECT authorized.ok, statement_timestamp(), active_call.*
+	FROM authorized
+	LEFT JOIN active_call ON true`
+
+const activeResourceCallDMQuery = `
+	WITH authorized AS (
+		SELECT EXISTS (
+			SELECT 1 FROM chat.dm_conversations dc
+			JOIN chat.workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
+			JOIN chat.dm_members dm ON dm.conversation_id = dc.id AND dm.user_id = $2 AND dm.status = 'active'
+			WHERE dc.id = $3 AND dc.workspace_id = $1 AND dc.status = 'active' AND dc.type = 'group'
+		) AS ok
+	),
+	active_call AS (
+		SELECT ` + callSelectColumns + `
+		FROM chat.calls
+		WHERE workspace_id = $1 AND target_type = 'dm' AND target_id = $3 AND status = 'active'
+	)
+	SELECT authorized.ok, statement_timestamp(), active_call.*
+	FROM authorized
+	LEFT JOIN active_call ON true`
+
 func callParticipantBusy(ctx context.Context, tx pgx.Tx, workspaceID, actorID, exceptCallID string) (bool, error) {
 	var busy bool
 	if err := tx.QueryRow(ctx,
@@ -361,7 +594,16 @@ func callParticipantBusy(ctx context.Context, tx pgx.Tx, workspaceID, actorID, e
 	return busy, nil
 }
 
-func authorizeResourceTarget(ctx context.Context, tx pgx.Tx, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (bool, error) {
+// queryRower is satisfied by both pgx.Tx and Pool — narrow enough that
+// authorizeResourceTarget and callParticipantBusy can run either inside an
+// existing transaction (every admission/mutation path) or directly against
+// the pool for a plain read that needs no transaction of its own (see
+// ActiveResourceCall).
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func authorizeResourceTarget(ctx context.Context, tx queryRower, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (bool, error) {
 	var query string
 	switch targetType {
 	case domain.CallTargetChannel:

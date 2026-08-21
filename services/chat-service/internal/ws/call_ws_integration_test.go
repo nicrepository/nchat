@@ -73,6 +73,14 @@ func (h *lifecycleCallHandler) LeaveCall(_ context.Context, _, actorID, _ string
 	return h.call, nil
 }
 
+func (h *lifecycleCallHandler) ResourceSync(context.Context, string, string, TargetType, string) (domain.Call, bool, time.Time, error) {
+	return domain.Call{}, false, time.Time{}, nil
+}
+
+func (h *lifecycleCallHandler) JoinCall(context.Context, string, string, string, TargetType, string) (domain.Call, error) {
+	return domain.Call{}, domain.ErrNotFound
+}
+
 func TestCallWebSocketLifecycleNotifiesTwoAuthenticatedClients(t *testing.T) {
 	handler := &lifecycleCallHandler{}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-ws-integration",

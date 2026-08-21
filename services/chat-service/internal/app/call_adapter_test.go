@@ -26,6 +26,11 @@ type adapterCallStore struct {
 	transitionInput storage.TransitionCallInput
 	leaveInput      storage.LeaveResourceCallInput
 	currentCallID   string
+	joinInput       storage.JoinResourceCallInput
+	syncWorkspaceID string
+	syncActorID     string
+	syncTargetType  domain.CallTargetType
+	syncTargetID    string
 }
 
 func (s *adapterCallStore) CreateCall(context.Context, storage.CreateCallInput) (domain.Call, bool, error) {
@@ -59,6 +64,16 @@ func (s *adapterCallStore) CurrentCallForUser(_ context.Context, _, _, callID st
 
 func (s *adapterCallStore) ExpireDueCalls(context.Context, int) ([]domain.Call, error) {
 	return nil, domain.ErrConflict
+}
+
+func (s *adapterCallStore) JoinResourceCall(_ context.Context, input storage.JoinResourceCallInput) (domain.Call, error) {
+	s.joinInput = input
+	return domain.Call{}, domain.ErrConflict
+}
+
+func (s *adapterCallStore) ActiveResourceCall(_ context.Context, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (storage.ActiveResourceCallResult, error) {
+	s.syncWorkspaceID, s.syncActorID, s.syncTargetType, s.syncTargetID = workspaceID, actorID, targetType, targetID
+	return storage.ActiveResourceCallResult{}, domain.ErrConflict
 }
 
 func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
@@ -151,5 +166,29 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 	}
 	if store.currentCallID != adapterCallID {
 		t.Fatalf("current call id = %q", store.currentCallID)
+	}
+
+	_, err = adapter.JoinCall(
+		context.Background(), adapterWorkspace, adapterActor, adapterCallID, ws.TargetTypeChannel, adapterTarget,
+	)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("JoinCall error = %v", err)
+	}
+	if store.joinInput.WorkspaceID != adapterWorkspace || store.joinInput.ActorID != adapterActor ||
+		store.joinInput.CallID != adapterCallID || store.joinInput.TargetType != domain.CallTargetChannel ||
+		store.joinInput.TargetID != adapterTarget {
+		t.Fatalf("join input = %+v", store.joinInput)
+	}
+
+	_, _, _, err = adapter.ResourceSync(
+		context.Background(), adapterWorkspace, adapterActor, ws.TargetTypeChannel, adapterTarget,
+	)
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("ResourceSync error = %v", err)
+	}
+	if store.syncWorkspaceID != adapterWorkspace || store.syncActorID != adapterActor ||
+		store.syncTargetType != domain.CallTargetChannel || store.syncTargetID != adapterTarget {
+		t.Fatalf("sync input = workspace=%q actor=%q targetType=%q targetID=%q",
+			store.syncWorkspaceID, store.syncActorID, store.syncTargetType, store.syncTargetID)
 	}
 }

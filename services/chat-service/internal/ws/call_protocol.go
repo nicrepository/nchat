@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -40,6 +41,23 @@ type CallHandler interface {
 	// call's original caller may use to end it for everyone (issue #569).
 	// workspaceID, actorID, callID, in that order.
 	LeaveCall(context.Context, string, string, string) (domain.Call, error)
+	// ResourceSync answers call.resource.sync: the authoritative active call
+	// (if any) of one channel/group-DM target, requester-only, never
+	// creating a lease or a call (issue #622). workspaceID, actorID,
+	// targetType, targetID, in that order. found is false for both "no
+	// active call" and "not authorized for this target" — the two must be
+	// indistinguishable on the wire (see ResourceSync's storage-layer
+	// counterpart, which keeps them distinguishable internally).
+	// observedAt orders this answer against a call that starts concurrently:
+	// it must never be later than the created_at of a call that had not yet
+	// committed when this read happened.
+	ResourceSync(ctx context.Context, workspaceID, actorID string, targetType TargetType, targetID string) (call domain.Call, found bool, observedAt time.Time, err error)
+	// JoinCall admits actorID into an already-known, active resource call —
+	// never creates one (issue #622). workspaceID, actorID, callID,
+	// targetType, targetID, in that order; targetType/targetID are the
+	// client's claim and are revalidated against the call's own persisted
+	// target before anything is authorized.
+	JoinCall(ctx context.Context, workspaceID, actorID, callID string, targetType TargetType, targetID string) (domain.Call, error)
 }
 
 type CallLimiter interface {
@@ -100,7 +118,7 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 		if !allowed {
 			return ErrCallRateLimited
 		}
-		_, err = h.callHandler.StartCall(ctx, StartCallCommand{
+		call, err := h.callHandler.StartCall(ctx, StartCallCommand{
 			WorkspaceID: c.workspaceID,
 			RequestID:   requestID,
 			CallerID:    c.userID,
@@ -109,7 +127,64 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 			TargetID:    targetID,
 			Type:        msg.CallType,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		if resource {
+			// call.admitted is the command-response ACK for this resource
+			// call.start, correlated by request_id — separate from the
+			// call.accepted lifecycle broadcast PublishCall already sent
+			// inside the handler above (issue #622). Direct call.start keeps
+			// its existing behavior: no ACK, unchanged from before #622.
+			h.sendCallAdmitted(c, ClientMessageTypeCallStart, requestID, call)
+		}
+		return nil
+
+	case ClientMessageTypeCallResourceSync:
+		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" || msg.CallID != "" ||
+			msg.MessageID != "" || msg.Emoji != "" || msg.SyncID == "" ||
+			(msg.TargetType != TargetTypeChannel && msg.TargetType != TargetTypeDM) || msg.TargetID == "" {
+			return domain.ErrInvalidInput
+		}
+		syncID, err := canonicalCallUUID(msg.SyncID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		targetID, err := canonicalCallUUID(msg.TargetID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		call, found, observedAt, err := h.callHandler.ResourceSync(ctx, c.workspaceID, c.userID, msg.TargetType, targetID)
+		if err != nil {
+			return err
+		}
+		h.sendResourceSynced(c, syncID, msg.TargetType, targetID, call, found, observedAt)
+		return nil
+
+	case ClientMessageTypeCallJoin:
+		if msg.TargetUserID != "" || msg.CallType != "" || msg.MessageID != "" || msg.Emoji != "" ||
+			msg.RequestID == "" || msg.CallID == "" ||
+			(msg.TargetType != TargetTypeChannel && msg.TargetType != TargetTypeDM) || msg.TargetID == "" {
+			return domain.ErrInvalidInput
+		}
+		requestID, err := canonicalCallUUID(msg.RequestID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		joinCallID, err := canonicalCallUUID(msg.CallID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		targetID, err := canonicalCallUUID(msg.TargetID)
+		if err != nil {
+			return domain.ErrInvalidInput
+		}
+		call, err := h.callHandler.JoinCall(ctx, c.workspaceID, c.userID, joinCallID, msg.TargetType, targetID)
+		if err != nil {
+			return err
+		}
+		h.sendCallAdmitted(c, ClientMessageTypeCallJoin, requestID, call)
+		return nil
 
 	case ClientMessageTypeCallPresence:
 		if msg.RequestID != "" || msg.TargetUserID != "" || msg.CallType != "" || msg.TargetType != "" ||
@@ -233,21 +308,87 @@ func (h *Hub) newCallEvent(call domain.Call, targetType TargetType, targetID str
 	if !ok {
 		return Event{}, false
 	}
+	payload := callEventPayload(call)
 	return Event{
-		SchemaVersion: CurrentEventSchemaVersion,
-		Type:          eventType,
-		WorkspaceID:   call.WorkspaceID,
-		TargetType:    targetType,
-		TargetID:      targetID,
-		Call: &CallEventPayload{
-			ID: call.ID, RequestID: call.RequestID, CallerID: call.CallerID, CalleeID: call.CalleeID,
-			TargetType: call.TargetType, TargetID: call.TargetID,
-			CallType: call.Type, Status: call.Status, Version: call.Version,
-			CreatedAt: call.CreatedAt, OccurredAt: call.UpdatedAt, ExpiresAt: call.ExpiresAt,
-			AcceptedAt: call.AcceptedAt, EndedAt: call.EndedAt,
-		},
-		EventID: uuid.NewString(), SourceInstanceID: h.presenceInstanceID, CreatedAt: call.UpdatedAt,
+		SchemaVersion:    CurrentEventSchemaVersion,
+		Type:             eventType,
+		WorkspaceID:      call.WorkspaceID,
+		TargetType:       targetType,
+		TargetID:         targetID,
+		Call:             &payload,
+		EventID:          uuid.NewString(),
+		SourceInstanceID: h.presenceInstanceID,
+		CreatedAt:        call.UpdatedAt,
 	}, true
+}
+
+func callEventPayload(call domain.Call) CallEventPayload {
+	return CallEventPayload{
+		ID: call.ID, RequestID: call.RequestID, CallerID: call.CallerID, CalleeID: call.CalleeID,
+		TargetType: call.TargetType, TargetID: call.TargetID,
+		CallType: call.Type, Status: call.Status, Version: call.Version,
+		CreatedAt: call.CreatedAt, OccurredAt: call.UpdatedAt, ExpiresAt: call.ExpiresAt,
+		AcceptedAt: call.AcceptedAt, EndedAt: call.EndedAt,
+	}
+}
+
+// callAdmittedResponse is the requester-only command-response ACK for a
+// resource call.start or a call.join (issue #622) — distinct from the
+// call.accepted/call.ringing lifecycle broadcast PublishCall sends to every
+// participant. response_to correlates it to the request_id of the command
+// that produced it; never confused with a lifecycle event, and never sent to
+// anyone but the requester.
+type callAdmittedResponse struct {
+	Type       string           `json:"type"`
+	Operation  string           `json:"operation"`
+	ResponseTo string           `json:"response_to"`
+	Call       CallEventPayload `json:"call"`
+}
+
+func (h *Hub) sendCallAdmitted(c *Client, operation ClientMessageType, responseTo string, call domain.Call) {
+	data, err := json.Marshal(callAdmittedResponse{
+		Type: "call.admitted", Operation: string(operation), ResponseTo: responseTo,
+		Call: callEventPayload(call),
+	})
+	if err == nil {
+		_ = c.enqueue(data)
+	}
+}
+
+// callResourceSyncedResponse is the requester-only answer to
+// call.resource.sync (issue #622): the authoritative active call of one
+// channel/group-DM target, or null. Never broadcast. sync_id correlates it to
+// the request. Call is nil for both "no active call" and "not authorized for
+// this target" — the two are indistinguishable on the wire by design (see
+// CallHandler.ResourceSync).
+//
+// ObservedAt orders this answer against a call that starts concurrently: a
+// future client must never let an in-flight null response, once it lands,
+// override a call it already learned about from a broadcast that occurred
+// after this response's snapshot. See storage.PGXCallStore.ActiveResourceCall
+// for how it is derived to make that safe.
+type callResourceSyncedResponse struct {
+	Type       string            `json:"type"`
+	SyncID     string            `json:"sync_id"`
+	TargetType TargetType        `json:"target_type"`
+	TargetID   string            `json:"target_id"`
+	Call       *CallEventPayload `json:"call"`
+	ObservedAt time.Time         `json:"observed_at"`
+}
+
+func (h *Hub) sendResourceSynced(c *Client, syncID string, targetType TargetType, targetID string, call domain.Call, found bool, observedAt time.Time) {
+	response := callResourceSyncedResponse{
+		Type: "call.resource.synced", SyncID: syncID,
+		TargetType: targetType, TargetID: targetID, ObservedAt: observedAt,
+	}
+	if found {
+		payload := callEventPayload(call)
+		response.Call = &payload
+	}
+	data, err := json.Marshal(response)
+	if err == nil {
+		_ = c.enqueue(data)
+	}
 }
 
 func callEventType(status domain.CallStatus) (EventType, bool) {
@@ -277,8 +418,13 @@ func canonicalCallUUID(value string) (string, error) {
 	return id.String(), nil
 }
 
-func handleCallClientError(c *Client, operation ClientMessageType, callID string, callErr error) bool {
-	response := clientErrorResponse{Type: "call.error", Operation: string(operation), CallID: callID}
+// handleCallClientError writes the requester-only call.error for a failed
+// call command. responseTo is non-empty only for the commands issue #622
+// added correlation to (call.resource.sync via sync_id, call.join and a
+// RESOURCE call.start via request_id) — see callResponseTo. Direct call.start
+// and every pre-existing call command keep responseTo empty, unchanged.
+func handleCallClientError(c *Client, operation ClientMessageType, callID string, responseTo string, callErr error) bool {
+	response := clientErrorResponse{Type: "call.error", Operation: string(operation), CallID: callID, ResponseTo: responseTo}
 	switch {
 	case errors.Is(callErr, ErrCallRateLimited):
 		response.Code, response.RetryAfter = "call_rate_limited", defaultCallStartWindow
@@ -301,4 +447,26 @@ func handleCallClientError(c *Client, operation ClientMessageType, callID string
 	}
 	data, err := json.Marshal(response)
 	return err == nil && c.enqueue(data)
+}
+
+// callResponseTo derives the response_to a failed call command's call.error
+// should carry (issue #622). Only the newly-correlated commands get one: a
+// RESOURCE call.start and call.join reuse their own request_id, and
+// call.resource.sync uses its sync_id. A direct call.start (identified by
+// carrying target_user_id, which no resource command ever does) and every
+// other existing call command carry none, unchanged from before #622.
+func callResponseTo(msg ClientMessage) string {
+	switch msg.Type {
+	case ClientMessageTypeCallStart:
+		if msg.TargetUserID == "" {
+			return msg.RequestID
+		}
+		return ""
+	case ClientMessageTypeCallJoin:
+		return msg.RequestID
+	case ClientMessageTypeCallResourceSync:
+		return msg.SyncID
+	default:
+		return ""
+	}
 }

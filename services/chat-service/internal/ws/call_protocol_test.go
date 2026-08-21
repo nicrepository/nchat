@@ -29,6 +29,12 @@ type fakeCallHandler struct {
 	syncCallID     string
 	leaveActorID   string
 	leaveCallID    string
+	resourceSyncID string
+	found          bool
+	observedAt     time.Time
+	joinCallID     string
+	joinTargetType TargetType
+	joinTargetID   string
 	err            error
 }
 
@@ -54,6 +60,15 @@ func (h *fakeCallHandler) RenewCallPresence(_ context.Context, _ string, actorID
 
 func (h *fakeCallHandler) LeaveCall(_ context.Context, _ string, actorID, callID string) (domain.Call, error) {
 	h.leaveActorID, h.leaveCallID = actorID, callID
+	return h.call, h.err
+}
+
+func (h *fakeCallHandler) ResourceSync(_ context.Context, _, _ string, _ TargetType, _ string) (domain.Call, bool, time.Time, error) {
+	return h.call, h.found, h.observedAt, h.err
+}
+
+func (h *fakeCallHandler) JoinCall(_ context.Context, _, _, callID string, targetType TargetType, targetID string) (domain.Call, error) {
+	h.joinCallID, h.joinTargetType, h.joinTargetID = callID, targetType, targetID
 	return h.call, h.err
 }
 
@@ -165,7 +180,7 @@ func TestResourceCallStartBusyProducesParticipantBusyCallError(t *testing.T) {
 		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
 	})
 	if !errors.Is(err, domain.ErrCallParticipantBusy) ||
-		!handleCallClientError(client, ClientMessageTypeCallStart, "", err) {
+		!handleCallClientError(client, ClientMessageTypeCallStart, "", "", err) {
 		t.Fatalf("unexpected resource start error: %v", err)
 	}
 
@@ -321,7 +336,7 @@ func TestResourceCallLeaveUnauthorizedMapsToTheSameGenericNotFoundError(t *testi
 	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
 		Type: ClientMessageTypeCallLeave, CallID: callTestID,
 	})
-	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallLeave, callTestID, err) {
+	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallLeave, callTestID, "", err) {
 		t.Fatalf("unexpected error classification: %v", err)
 	}
 	var response clientErrorResponse
@@ -344,7 +359,7 @@ func TestCallErrorsAreStableAndDoNotConsumeInvalidBudget(t *testing.T) {
 	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
 		Type: ClientMessageTypeCallAccept, CallID: callTestID,
 	})
-	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallAccept, callTestID, err) {
+	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallAccept, callTestID, "", err) {
 		t.Fatalf("unexpected error classification: %v", err)
 	}
 	var response clientErrorResponse
@@ -374,7 +389,7 @@ func TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newClient("busy-client", callTestCaller, callTestWorkspace, &fakeSender{})
-			if !handleCallClientError(client, ClientMessageTypeCallStart, "", test.err) {
+			if !handleCallClientError(client, ClientMessageTypeCallStart, "", "", test.err) {
 				t.Fatal("expected call error to be handled")
 			}
 			var response clientErrorResponse

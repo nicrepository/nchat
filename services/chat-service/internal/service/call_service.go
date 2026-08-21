@@ -17,6 +17,12 @@ type callStore interface {
 	LeaveResourceCall(context.Context, storage.LeaveResourceCallInput) (storage.TransitionCallResult, error)
 	CurrentCallForUser(context.Context, string, string, string) (domain.Call, error)
 	ExpireDueCalls(context.Context, int) ([]domain.Call, error)
+	// JoinResourceCall admits an actor into an already-existing, active
+	// resource call (issue #622) — see storage.PGXCallStore.JoinResourceCall.
+	JoinResourceCall(context.Context, storage.JoinResourceCallInput) (domain.Call, error)
+	// ActiveResourceCall answers call.resource.sync (issue #622) — see
+	// storage.PGXCallStore.ActiveResourceCall.
+	ActiveResourceCall(ctx context.Context, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (storage.ActiveResourceCallResult, error)
 }
 
 type CallEventPublisher interface {
@@ -178,6 +184,75 @@ func (s *CallService) Leave(ctx context.Context, workspaceID, actorID, callID st
 		s.publish(ctx, result.Call)
 	}
 	return result.Call, err
+}
+
+// JoinCallInput identifies an explicit call.join (issue #622): the actor's
+// claim of which call and which target it believes that call belongs to.
+type JoinCallInput struct {
+	WorkspaceID string
+	ActorID     string
+	CallID      string
+	TargetType  domain.CallTargetType
+	TargetID    string
+}
+
+// Join admits ActorID into an already-known, active resource call — issue
+// #622's call.join. It never creates a call and never publishes: joining
+// changes nothing observable for any other participant (only the lease
+// table), so there is nothing for PublishCall to broadcast — unlike Start,
+// Leave and transition, which all mutate the call's own lifecycle row.
+func (s *CallService) Join(ctx context.Context, input JoinCallInput) (domain.Call, error) {
+	workspaceID, err := canonicalUUID(input.WorkspaceID)
+	if err != nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	actorID, err := canonicalUUID(input.ActorID)
+	if err != nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	callID, err := canonicalUUID(input.CallID)
+	if err != nil {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	targetID, err := canonicalUUID(input.TargetID)
+	if err != nil || s == nil || s.store == nil || s.timeout <= 0 ||
+		(input.TargetType != domain.CallTargetChannel && input.TargetType != domain.CallTargetDM) {
+		return domain.Call{}, domain.ErrInvalidInput
+	}
+	return s.store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+		WorkspaceID: workspaceID,
+		CallID:      callID,
+		ActorID:     actorID,
+		TargetType:  input.TargetType,
+		TargetID:    targetID,
+		ExpiresAt:   s.now().UTC().Add(s.timeout),
+	})
+}
+
+// ResourceSync answers call.resource.sync (issue #622): the authoritative
+// active call of one channel/group-DM target, or found=false — for both "no
+// active call" and "not authorized for this target", deliberately
+// indistinguishable here (see storage.ActiveResourceCallResult). Creates no
+// lease, issues no token, mutates nothing.
+func (s *CallService) ResourceSync(ctx context.Context, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (domain.Call, bool, time.Time, error) {
+	workspaceID, err := canonicalUUID(workspaceID)
+	if err != nil {
+		return domain.Call{}, false, time.Time{}, domain.ErrInvalidInput
+	}
+	actorID, err = canonicalUUID(actorID)
+	if err != nil {
+		return domain.Call{}, false, time.Time{}, domain.ErrInvalidInput
+	}
+	targetID, err = canonicalUUID(targetID)
+	if err != nil || s == nil || s.store == nil ||
+		(targetType != domain.CallTargetChannel && targetType != domain.CallTargetDM) {
+		return domain.Call{}, false, time.Time{}, domain.ErrInvalidInput
+	}
+	result, err := s.store.ActiveResourceCall(ctx, workspaceID, actorID, targetType, targetID)
+	if err != nil {
+		return domain.Call{}, false, time.Time{}, err
+	}
+	return result.Call, result.Found, result.ObservedAt, nil
 }
 
 func (s *CallService) Current(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {

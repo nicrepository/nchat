@@ -18,6 +18,7 @@ const (
 	serviceCallCaller    = "00000000-0000-4000-8000-000000000014"
 	serviceCallCallee    = "00000000-0000-4000-8000-000000000015"
 	serviceCallOutsider  = "00000000-0000-4000-8000-000000000016"
+	serviceCallTarget    = "00000000-0000-4000-8000-000000000017"
 )
 
 type fakeCallStore struct {
@@ -38,6 +39,10 @@ type fakeCallStore struct {
 	currentCallID    string
 	expired          []domain.Call
 	expireErr        error
+	joinInput        storage.JoinResourceCallInput
+	joinErr          error
+	syncResult       storage.ActiveResourceCallResult
+	syncErr          error
 }
 
 func (f *fakeCallStore) CreateCall(_ context.Context, input storage.CreateCallInput) (domain.Call, bool, error) {
@@ -80,6 +85,17 @@ func (f *fakeCallStore) CurrentCallForUser(_ context.Context, _, _, callID strin
 
 func (f *fakeCallStore) ExpireDueCalls(context.Context, int) ([]domain.Call, error) {
 	return f.expired, f.expireErr
+}
+
+func (f *fakeCallStore) JoinResourceCall(_ context.Context, input storage.JoinResourceCallInput) (domain.Call, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joinInput = input
+	return f.call, f.joinErr
+}
+
+func (f *fakeCallStore) ActiveResourceCall(context.Context, string, string, domain.CallTargetType, string) (storage.ActiveResourceCallResult, error) {
+	return f.syncResult, f.syncErr
 }
 
 type fakeCallPublisher struct {
@@ -553,4 +569,154 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 			})
 		}
 	})
+}
+
+// issue #622: call.join never mutates the call's own lifecycle row (only the
+// lease table), so it must never publish — unlike Start/Leave/transition.
+func TestCallServiceJoinDelegatesWithCanonicalInputsAndNeverPublishes(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	resource := serviceCall(domain.CallStatusActive, 2)
+	resource.CalleeID = ""
+	resource.TargetType = domain.CallTargetChannel
+	resource.TargetID = serviceCallTarget
+	store := &fakeCallStore{call: resource}
+	publisher := &fakeCallPublisher{}
+	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, publisher)
+
+	call, err := svc.Join(context.Background(), JoinCallInput{
+		WorkspaceID: serviceCallWorkspace,
+		ActorID:     serviceCallCaller,
+		CallID:      serviceCallID,
+		TargetType:  domain.CallTargetChannel,
+		TargetID:    serviceCallTarget,
+	})
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if call.ID != serviceCallID {
+		t.Fatalf("call = %+v", call)
+	}
+	if store.joinInput.WorkspaceID != serviceCallWorkspace || store.joinInput.ActorID != serviceCallCaller ||
+		store.joinInput.CallID != serviceCallID || store.joinInput.TargetType != domain.CallTargetChannel ||
+		store.joinInput.TargetID != serviceCallTarget {
+		t.Fatalf("join input = %+v", store.joinInput)
+	}
+	if !store.joinInput.ExpiresAt.Equal(now.Add(30 * time.Second)) {
+		t.Fatalf("expires_at = %s", store.joinInput.ExpiresAt)
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatalf("Join must never publish, got %d publish(es)", len(publisher.calls))
+	}
+}
+
+func TestCallServiceJoinPropagatesStoreErrorsWithoutPublishing(t *testing.T) {
+	store := &fakeCallStore{joinErr: domain.ErrCallParticipantBusy}
+	publisher := &fakeCallPublisher{}
+	svc := NewCallService(store, 30*time.Second, time.Now, publisher)
+
+	_, err := svc.Join(context.Background(), JoinCallInput{
+		WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID,
+		TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget,
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant busy", err)
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatal("a failed join must never publish")
+	}
+}
+
+func TestCallServiceJoinRejectsInvalidInputBeforeStorage(t *testing.T) {
+	tests := []struct {
+		name  string
+		input JoinCallInput
+	}{
+		{"invalid workspace", JoinCallInput{WorkspaceID: "bad", ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid actor", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: "bad", CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid call id", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: "bad", TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid target id", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: "bad"}},
+		{"direct target type", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetUser, TargetID: serviceCallTarget}},
+		{"empty target type", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetID: serviceCallTarget}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{}
+			_, err := NewCallService(store, 30*time.Second, nil, nil).Join(context.Background(), test.input)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want invalid input", err)
+			}
+			if store.joinInput.WorkspaceID != "" {
+				t.Fatal("storage called for invalid input")
+			}
+		})
+	}
+}
+
+// issue #622: found=false must cover both "no active call" and "not
+// authorized" identically — ResourceSync just forwards the store's Found,
+// never re-derives anything from Authorized.
+func TestCallServiceResourceSyncForwardsStoreResultVerbatim(t *testing.T) {
+	observedAt := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	resource := serviceCall(domain.CallStatusActive, 4)
+	resource.CalleeID = ""
+	resource.TargetType = domain.CallTargetChannel
+	resource.TargetID = serviceCallTarget
+
+	tests := []struct {
+		name       string
+		syncResult storage.ActiveResourceCallResult
+		wantFound  bool
+	}{
+		{"authorized and found", storage.ActiveResourceCallResult{Call: resource, Found: true, Authorized: true, ObservedAt: observedAt}, true},
+		{"authorized, no active call", storage.ActiveResourceCallResult{Found: false, Authorized: true, ObservedAt: observedAt}, false},
+		{"not authorized", storage.ActiveResourceCallResult{Found: false, Authorized: false, ObservedAt: observedAt}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{syncResult: test.syncResult}
+			svc := NewCallService(store, 30*time.Second, time.Now, nil)
+
+			call, found, gotObservedAt, err := svc.ResourceSync(
+				context.Background(), serviceCallWorkspace, serviceCallCaller, domain.CallTargetChannel, serviceCallTarget,
+			)
+			if err != nil {
+				t.Fatalf("ResourceSync: %v", err)
+			}
+			if found != test.wantFound {
+				t.Fatalf("found = %v, want %v", found, test.wantFound)
+			}
+			if !gotObservedAt.Equal(observedAt) {
+				t.Fatalf("observed_at = %v, want %v", gotObservedAt, observedAt)
+			}
+			if test.wantFound && call.ID != resource.ID {
+				t.Fatalf("call = %+v, want %+v", call, resource)
+			}
+		})
+	}
+}
+
+func TestCallServiceResourceSyncRejectsInvalidInputBeforeStorage(t *testing.T) {
+	tests := []struct {
+		name       string
+		workspace  string
+		actor      string
+		targetType domain.CallTargetType
+		targetID   string
+	}{
+		{"invalid workspace", "bad", serviceCallCaller, domain.CallTargetChannel, serviceCallTarget},
+		{"invalid actor", serviceCallWorkspace, "bad", domain.CallTargetChannel, serviceCallTarget},
+		{"invalid target id", serviceCallWorkspace, serviceCallCaller, domain.CallTargetChannel, "bad"},
+		{"direct target type", serviceCallWorkspace, serviceCallCaller, domain.CallTargetUser, serviceCallTarget},
+		{"empty target type", serviceCallWorkspace, serviceCallCaller, "", serviceCallTarget},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{}
+			svc := NewCallService(store, 30*time.Second, nil, nil)
+			_, _, _, err := svc.ResourceSync(context.Background(), test.workspace, test.actor, test.targetType, test.targetID)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want invalid input", err)
+			}
+		})
+	}
 }
