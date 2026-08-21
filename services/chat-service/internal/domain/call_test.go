@@ -1,6 +1,10 @@
 package domain
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestCallTypesAndStatuses(t *testing.T) {
 	for _, callType := range []CallType{CallTypeAudio, CallTypeVideo} {
@@ -69,5 +73,29 @@ func TestCallTargetsKeepDirectAndResourceSemanticsSeparate(t *testing.T) {
 	}
 	if resource.IsDirect() || !resource.IsResource() || resource.IsParticipant("channel") {
 		t.Fatal("resource identifiers must never become user participants")
+	}
+}
+
+// TestErrCallParticipantBusyWrapsErrConflictOneWay proves the exact errors.Is
+// contract issue #575 relies on: ErrCallParticipantBusy must be detectable as
+// an ErrConflict (existing generic conflict handling keeps working), the
+// reverse must not hold (a plain ErrConflict is not a busy signal), and a
+// further wrap of ErrCallParticipantBusy must still be caught by an
+// errors.Is check for it specifically — that is what lets
+// handleCallClientError classify busy correctly before falling through to
+// the generic conflict case.
+func TestErrCallParticipantBusyWrapsErrConflictOneWay(t *testing.T) {
+	if !errors.Is(ErrCallParticipantBusy, ErrConflict) {
+		t.Fatal("ErrCallParticipantBusy must satisfy errors.Is(_, ErrConflict)")
+	}
+	if errors.Is(ErrConflict, ErrCallParticipantBusy) {
+		t.Fatal("a plain ErrConflict must not satisfy errors.Is(_, ErrCallParticipantBusy)")
+	}
+	rewrapped := fmt.Errorf("start call: %w", ErrCallParticipantBusy)
+	if !errors.Is(rewrapped, ErrCallParticipantBusy) {
+		t.Fatal("a further-wrapped ErrCallParticipantBusy must still match errors.Is(_, ErrCallParticipantBusy)")
+	}
+	if !errors.Is(rewrapped, ErrConflict) {
+		t.Fatal("a further-wrapped ErrCallParticipantBusy must still match errors.Is(_, ErrConflict)")
 	}
 }
