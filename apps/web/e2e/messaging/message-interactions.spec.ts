@@ -14,6 +14,7 @@ import {
   makeMessage,
   messageBubble,
   messagesFor,
+  openMoreActions,
   revealActions,
   uniqueId,
 } from "../helpers/messagingApi";
@@ -197,11 +198,13 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/dm/${targetId}`);
 
-    await revealActions(page, original.id);
-    const favoriteBtn = page.getByRole("button", { name: "Favoritar mensagem" });
+    const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
+    const favoriteBtn = bubble.getByRole("button", { name: "Favoritar mensagem" });
     await expect(favoriteBtn).toHaveAttribute("aria-pressed", "false");
     await favoriteBtn.click();
 
+    await openMoreActions(bubble);
     const activeFavoriteBtn = messageBubble(page, original.id).getByRole("button", {
       name: "Remover dos favoritos",
     });
@@ -210,7 +213,8 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
 
     await page.reload();
     await expect(messageBubble(page, original.id)).toContainText("mensagem para favoritar");
-    await revealActions(page, original.id);
+    const reloadedBubble = await revealActions(page, original.id);
+    await openMoreActions(reloadedBubble);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Remover dos favoritos" }),
     ).toHaveAttribute("aria-pressed", "true");
@@ -218,6 +222,7 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await messageBubble(page, original.id)
       .getByRole("button", { name: "Remover dos favoritos" })
       .click();
+    await openMoreActions(reloadedBubble);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Favoritar mensagem" }),
     ).toHaveAttribute("aria-pressed", "false");
@@ -249,8 +254,9 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await installMessagingMocks(page, scenario);
     await page.goto(`/chat/dm/${targetId}`);
 
-    await revealActions(page, original.id);
-    await page.getByRole("button", { name: "Fixar mensagem" }).click();
+    const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
+    await bubble.getByRole("button", { name: "Fixar mensagem" }).click();
 
     // The bar previews the pinned message itself (issue #435), so what is
     // asserted is the author and the body of the message just pinned. The
@@ -260,6 +266,7 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     await expect(pinsBar).toBeVisible();
     await expect(pinsBar).toHaveAttribute("aria-label", "Mensagem fixada");
     await expectPinPreview(pinsBar, pinnedText);
+    await openMoreActions(bubble);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Desafixar mensagem" }),
     ).toHaveAttribute("aria-pressed", "true");
@@ -270,7 +277,8 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     const pinsBarAfterReload = page.getByTestId("chat-pins");
     await expect(pinsBarAfterReload).toBeVisible();
     await expectPinPreview(pinsBarAfterReload, pinnedText);
-    await revealActions(page, original.id);
+    const reloadedBubble = await revealActions(page, original.id);
+    await openMoreActions(reloadedBubble);
     await expect(
       messageBubble(page, original.id).getByRole("button", { name: "Desafixar mensagem" }),
     ).toHaveAttribute("aria-pressed", "true");

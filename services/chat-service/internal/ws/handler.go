@@ -472,6 +472,7 @@ type clientErrorResponse struct {
 	Code       string `json:"code"`
 	CallID     string `json:"call_id,omitempty"`
 	RetryAfter int    `json:"retry_after,omitempty"`
+	Limit      int    `json:"limit,omitempty"`
 }
 
 type subscribeSuccessResponse struct {
@@ -543,6 +544,9 @@ func handleReactionClientError(c *Client, err error) bool {
 		response.RetryAfter = 60
 	case errors.Is(err, ErrReactionFeatureDisabled):
 		response.Code = "temporarily_unavailable"
+	case errors.Is(err, domain.ErrReactionLimitReached):
+		response.Code = "reaction_limit_reached"
+		response.Limit = 5
 	default:
 		return false
 	}

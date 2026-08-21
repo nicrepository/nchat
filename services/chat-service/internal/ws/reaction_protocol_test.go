@@ -3,6 +3,8 @@ package ws
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
 func TestDecodeClientMessage_RejectsUnknownFields(t *testing.T) {
@@ -56,6 +58,25 @@ func TestHandleReactionClientError_FeatureDisabledUsesNeutralResponse(t *testing
 		t.Fatal(err)
 	}
 	if got["type"] != "error" || got["code"] != "temporarily_unavailable" {
+		t.Fatalf("unexpected response: %+v", got)
+	}
+}
+
+func TestHandleReactionClientError_ReactionLimitIsStructuredAndHandled(t *testing.T) {
+	c := newClient("client-1", "user-1", "workspace-1", &fakeSender{})
+	if !handleReactionClientError(c, domain.ErrReactionLimitReached) {
+		t.Fatal("expected reaction limit to be handled separately")
+	}
+
+	var got struct {
+		Type  string `json:"type"`
+		Code  string `json:"code"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(<-c.outbox, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != "error" || got.Code != "reaction_limit_reached" || got.Limit != 5 {
 		t.Fatalf("unexpected response: %+v", got)
 	}
 }

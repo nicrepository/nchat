@@ -165,11 +165,80 @@ func TestPGXReactionStoreDifferentUsersDoNotSerializeOnSameMessage(t *testing.T)
 	assertReactionTuplesDoNotBlock(t, fixture, fixture.input(reactionUserID), fixture.input(reactionOtherUserID))
 }
 
-func TestPGXReactionStoreSameUserDifferentEmojiDoNotSerializeOnSameMessage(t *testing.T) {
+func TestPGXReactionStoreLimitsOneUserToFiveDistinctReactionsPerMessage(t *testing.T) {
 	fixture := newReactionPostgresFixture(t)
-	otherEmoji := fixture.input(reactionUserID)
-	otherEmoji.Emoji = "🔥"
-	assertReactionTuplesDoNotBlock(t, fixture, fixture.input(reactionUserID), otherEmoji)
+	emojis := []string{"👍", "❤️", "😂", "🎉", "😮", "😢"}
+
+	type outcome struct {
+		emoji string
+		err   error
+	}
+	outcomes := make(chan outcome, len(emojis))
+	var wg sync.WaitGroup
+	for _, emoji := range emojis {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			input := fixture.input(reactionUserID)
+			input.Emoji = emoji
+			_, err := fixture.store.ToggleReaction(context.Background(), input)
+			outcomes <- outcome{emoji: emoji, err: err}
+		}()
+	}
+	wg.Wait()
+	close(outcomes)
+
+	failedEmoji := ""
+	successes := 0
+	for outcome := range outcomes {
+		if outcome.err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(outcome.err, domain.ErrReactionLimitReached) {
+			t.Fatalf("toggle %q: %v", outcome.emoji, outcome.err)
+		}
+		if failedEmoji != "" {
+			t.Fatalf("more than one toggle rejected: %q and %q", failedEmoji, outcome.emoji)
+		}
+		failedEmoji = outcome.emoji
+	}
+	if successes != 5 || failedEmoji == "" {
+		t.Fatalf("expected five additions and one rejection, got %d additions and failed emoji %q", successes, failedEmoji)
+	}
+
+	var stored []string
+	rows, err := fixture.pool.Query(context.Background(),
+		`SELECT emoji FROM chat.message_reactions WHERE message_id = $1 AND user_id = $2 ORDER BY emoji`,
+		fixture.messageID, reactionUserID)
+	if err != nil {
+		t.Fatalf("list stored reactions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var emoji string
+		if err := rows.Scan(&emoji); err != nil {
+			t.Fatalf("scan stored reaction: %v", err)
+		}
+		stored = append(stored, emoji)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate stored reactions: %v", err)
+	}
+	if len(stored) != 5 {
+		t.Fatalf("stored reaction count = %d, want 5", len(stored))
+	}
+
+	remove := fixture.input(reactionUserID)
+	remove.Emoji = stored[0]
+	if result, err := fixture.store.ToggleReaction(context.Background(), remove); err != nil || result.Added {
+		t.Fatalf("remove reaction: result=%+v err=%v", result, err)
+	}
+	add := fixture.input(reactionUserID)
+	add.Emoji = failedEmoji
+	if result, err := fixture.store.ToggleReaction(context.Background(), add); err != nil || !result.Added {
+		t.Fatalf("add after removal: result=%+v err=%v", result, err)
+	}
 }
 
 func assertReactionTuplesDoNotBlock(

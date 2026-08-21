@@ -11,6 +11,7 @@ import {
   makeMessage,
   messageBubble,
   messagesFor,
+  openMoreActions,
   replaceEditorText,
   revealActions,
   uniqueId,
@@ -114,6 +115,7 @@ test.describe("mensagens diretas 1:1", () => {
     await page.goto(`/chat/dm/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     await bubble.getByRole("button", { name: "Editar mensagem" }).click();
     await replaceEditorText(page, page.getByTestId(`chat-edit-input-${original.id}`), editedText);
 
@@ -177,6 +179,7 @@ test.describe("mensagens diretas 1:1", () => {
     await page.goto(`/chat/dm/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     await bubble.getByRole("button", { name: "Editar mensagem" }).click();
     await replaceEditorText(page, page.getByTestId(`chat-edit-input-${original.id}`), editedText);
 
@@ -234,6 +237,7 @@ test.describe("mensagens diretas 1:1", () => {
     await page.goto(`/chat/dm/${targetId}`);
 
     const bubble = await revealActions(page, original.id);
+    await openMoreActions(bubble);
     page.once("dialog", (dialog) => dialog.accept());
     const deleteResponse = page.waitForResponse(
       (response) =>

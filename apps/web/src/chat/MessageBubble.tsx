@@ -17,6 +17,7 @@ import MessageEditHistory from "./MessageEditHistory";
 import { formatTime, senderLabel } from "./messageDisplay";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import PresenceDot from "./PresenceDot";
+import { canToggleReaction, maxReactionsPerUserPerMessage } from "./reactionLimit";
 import RichTextRenderer from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
@@ -40,7 +41,7 @@ export interface MessageBubbleProps {
   isGrouped?: boolean;
   onToggleReaction: (messageId: string, emoji: string) => void;
   onReplyMessage: (message: Message) => void;
-  onReferenceMessage: (message: Message) => void;
+  onReferenceMessage: (message: Message, trigger: HTMLElement) => void;
   onForwardMessage?: (message: Message) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   onEditMessage: (
@@ -136,6 +137,8 @@ type MessageReactionsProps = Pick<
   onStartEdit?: () => void;
   onDelete?: () => void;
   deleting?: boolean;
+  actionsOpen: boolean;
+  onActionsOpenChange: (open: boolean | ((current: boolean) => boolean)) => void;
 };
 
 function MessageReactions({
@@ -158,10 +161,14 @@ function MessageReactions({
   onStartEdit,
   onDelete,
   deleting = false,
+  actionsOpen,
+  onActionsOpenChange,
 }: MessageReactionsProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const actionsButtonRef = useRef<HTMLButtonElement>(null);
 
   const positionMenu = useCallback(() => {
     if (!reactionMenuVisible || !bubbleRef.current || !menuRef.current) return;
@@ -194,6 +201,22 @@ function MessageReactions({
     document.addEventListener("scroll", positionMenu, true);
     return () => document.removeEventListener("scroll", positionMenu, true);
   }, [positionMenu, reactionMenuVisible]);
+
+  useEffect(() => {
+    if (!actionsOpen) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!actionsRef.current?.contains(event.target as Node)) onActionsOpenChange(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onActionsOpenChange(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [actionsOpen, onActionsOpenChange]);
 
   const positionPicker = useCallback(() => {
     if (!pickerOpen || !anchorRef.current || !pickerRef.current) return;
@@ -244,8 +267,10 @@ function MessageReactions({
 
   const selectReaction = (emoji: string) => {
     onToggleReaction(message.id, emoji);
-    onPickerOpenChange(message.id, false);
+    if (canToggleReaction(message.reactions, emoji)) onPickerOpenChange(message.id, false);
   };
+
+  const reactionToggleHint = `Você pode adicionar no máximo ${maxReactionsPerUserPerMessage} reações por mensagem. Remova uma reação sua para adicionar outra.`;
 
   if (message.isRemoved) return null;
   return (
@@ -259,6 +284,12 @@ function MessageReactions({
               className={`chat-msg-area__reaction${reaction.reactedByMe ? " chat-msg-area__reaction--mine" : ""}`}
               aria-label={`${reaction.reactedByMe ? "Remover" : "Adicionar"} reação ${reaction.emoji}`}
               aria-pressed={reaction.reactedByMe}
+              aria-disabled={!canToggleReaction(message.reactions, reaction.emoji)}
+              title={
+                canToggleReaction(message.reactions, reaction.emoji)
+                  ? undefined
+                  : reactionToggleHint
+              }
               onClick={() => onToggleReaction(message.id, reaction.emoji)}
             >
               <span aria-hidden="true">{reaction.emoji}</span> {reaction.count}
@@ -280,6 +311,8 @@ function MessageReactions({
               key={emoji}
               type="button"
               aria-label={`Reagir rapidamente com ${emoji}`}
+              aria-disabled={!canToggleReaction(message.reactions, emoji)}
+              title={canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint}
               onClick={() => onToggleReaction(message.id, emoji)}
             >
               {emoji}
@@ -290,66 +323,93 @@ function MessageReactions({
               reply
             </span>
           </button>
-          <button
-            type="button"
-            aria-label="Citar em outra conversa"
-            onClick={() => onReferenceMessage(message)}
-          >
-            <span className="material-symbols-outlined" aria-hidden="true">
-              format_quote
-            </span>
-          </button>
-          {onForwardMessage && message.kind === "user" && (
-            <button type="button" aria-label="Encaminhar" onClick={() => onForwardMessage(message)}>
-              <span className="material-symbols-outlined" aria-hidden="true">
-                forward
-              </span>
-            </button>
-          )}
-          {onStartEdit && (
-            <button type="button" aria-label="Editar mensagem" onClick={onStartEdit}>
-              <span className="material-symbols-outlined" aria-hidden="true">
-                edit
-              </span>
-            </button>
-          )}
-          {onDelete && (
+          <div ref={actionsRef} className="chat-msg-area__more-actions">
             <button
               type="button"
-              aria-label={deleting ? "Excluindo mensagem" : "Excluir mensagem"}
-              aria-busy={deleting}
-              disabled={deleting}
-              onClick={onDelete}
+              ref={actionsButtonRef}
+              aria-label="Mais ações"
+              aria-expanded={actionsOpen}
+              aria-haspopup="true"
+              onClick={() => onActionsOpenChange((open) => !open)}
             >
               <span className="material-symbols-outlined" aria-hidden="true">
-                {deleting ? "progress_activity" : "delete"}
+                more_vert
               </span>
             </button>
-          )}
-          <button
-            type="button"
-            className={message.isFavorited ? "chat-msg-area__favorite--active" : undefined}
-            aria-label={message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
-            aria-pressed={message.isFavorited}
-            onClick={() => onToggleFavorite(message.id, !message.isFavorited)}
-          >
-            <span className="material-symbols-outlined" aria-hidden="true">
-              star
-            </span>
-          </button>
-          {onTogglePin && (
-            <button
-              type="button"
-              className={isPinned ? "chat-msg-area__pin--active" : undefined}
-              aria-label={isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
-              aria-pressed={isPinned}
-              onClick={() => onTogglePin(message.id, !isPinned)}
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">
-                keep
-              </span>
-            </button>
-          )}
+            {actionsOpen && (
+              <div
+                className="chat-msg-area__more-actions-menu"
+                role="group"
+                aria-label="Ações da mensagem"
+              >
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.currentTarget.focus();
+                    onReferenceMessage(message, actionsButtonRef.current ?? event.currentTarget);
+                  }}
+                >
+                  Citar em outra conversa
+                </button>
+                {onForwardMessage && message.kind === "user" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onForwardMessage(message);
+                      onActionsOpenChange(false);
+                    }}
+                  >
+                    Encaminhar
+                  </button>
+                )}
+                {onStartEdit && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onStartEdit();
+                      onActionsOpenChange(false);
+                    }}
+                  >
+                    Editar mensagem
+                  </button>
+                )}
+                {onDelete && (
+                  <button
+                    type="button"
+                    aria-busy={deleting}
+                    disabled={deleting}
+                    onClick={() => {
+                      onDelete();
+                    }}
+                  >
+                    {deleting ? "Excluindo mensagem" : "Excluir mensagem"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  aria-pressed={message.isFavorited}
+                  onClick={() => {
+                    onToggleFavorite(message.id, !message.isFavorited);
+                    onActionsOpenChange(false);
+                  }}
+                >
+                  {message.isFavorited ? "Remover dos favoritos" : "Favoritar mensagem"}
+                </button>
+                {onTogglePin && (
+                  <button
+                    type="button"
+                    aria-pressed={isPinned}
+                    onClick={() => {
+                      onTogglePin(message.id, !isPinned);
+                      onActionsOpenChange(false);
+                    }}
+                  >
+                    {isPinned ? "Desafixar mensagem" : "Fixar mensagem"}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
           <button
             ref={anchorRef}
             type="button"
@@ -377,6 +437,10 @@ function MessageReactions({
                     key={emoji}
                     type="button"
                     aria-label={`Reagir com ${emoji}`}
+                    aria-disabled={!canToggleReaction(message.reactions, emoji)}
+                    title={
+                      canToggleReaction(message.reactions, emoji) ? undefined : reactionToggleHint
+                    }
                     onClick={() => selectReaction(emoji)}
                   >
                     {emoji}
@@ -698,6 +762,7 @@ export default function MessageBubble({
     !message.isRemoved && message.status === "active" && linkSafetyAllowsAnchors(linkSafetyState);
   const [editing, setEditing] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   // Read for every message, including the user's own, so the hook order does
   // not depend on who wrote it. Only the other party's avatar is drawn.
@@ -737,12 +802,14 @@ export default function MessageBubble({
       onMouseLeave={(event) => {
         const nextTarget = event.relatedTarget;
         if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+          setActionsOpen(false);
           onReactionMenuVisibleChange(message.id, false);
         }
       }}
       onFocus={() => onReactionMenuVisibleChange(message.id, true)}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) {
+          setActionsOpen(false);
           onReactionMenuVisibleChange(message.id, false);
         }
       }}
@@ -889,6 +956,8 @@ export default function MessageBubble({
             isMine && message.kind === "user" && !editing ? () => void handleDelete() : undefined
           }
           deleting={deleting}
+          actionsOpen={actionsOpen}
+          onActionsOpenChange={setActionsOpen}
         />
         {historyOpen && !message.isRemoved && (
           <MessageEditHistory messageId={message.id} onClose={() => setHistoryOpen(false)} />

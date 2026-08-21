@@ -923,14 +923,42 @@
   font-size: 17px;
 }
 
-.chat-msg-area__favorite--active .material-symbols-outlined {
-  color: var(--color-warning, #f5a623);
-  font-variation-settings: "FILL" 1;
+.chat-msg-area__more-actions {
+  position: relative;
 }
 
-.chat-msg-area__pin--active .material-symbols-outlined {
-  color: var(--color-accent, #4a7dff);
-  font-variation-settings: "FILL" 1;
+.chat-msg-area__more-actions-menu {
+  position: absolute;
+  z-index: 1;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  min-width: 184px;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.chat-msg-area__more-actions-menu button {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  justify-content: flex-start;
+  padding: 7px 9px;
+  color: var(--color-ink-2);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+
+.chat-msg-area__more-actions-menu button:hover,
+.chat-msg-area__more-actions-menu button:focus-visible {
+  background: var(--color-primary-tint);
+  outline: none;
 }
 
 /* ── Mensagens fixadas / pins (RF-05) ───────────────────────────────────── */

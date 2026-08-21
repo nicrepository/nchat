@@ -314,6 +314,7 @@ export interface WSClientErrorEvent {
   operation?: string;
   code: string;
   retry_after?: number;
+  limit?: number;
 }
 
 export interface WSSubscribedEvent {

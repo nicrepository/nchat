@@ -2065,6 +2065,13 @@ export async function revealActions(page: Page, messageId: string): Promise<Loca
   return bubble;
 }
 
+// Citar, encaminhar, editar, excluir, favoritar e fixar/desafixar ficam
+// dentro do menu textual "Mais ações", não mais direto na barra de ações.
+export async function openMoreActions(bubble: Locator): Promise<void> {
+  await bubble.getByRole("button", { name: "Mais ações" }).click();
+  await expect(bubble.getByRole("group", { name: "Ações da mensagem" })).toBeVisible();
+}
+
 export async function fillComposer(page: Page, text: string) {
   const input = page.getByTestId("chat-composer-input");
   await expect(input).toBeVisible();
