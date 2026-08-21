@@ -1,7 +1,10 @@
 import type { RefCallback } from "react";
 
+import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import CallControls, { type CallControlProps } from "./CallControls";
 import "./CallPresentation.css";
+
+const localDisplayName = "Você";
 
 interface DedicatedParticipant {
   identity: string;
@@ -21,6 +24,8 @@ export default function DedicatedCallStage({
   bindRemoteAudio,
   screenShareName,
   bindScreenShare,
+  hasLocalVideo,
+  localSeed,
 }: {
   title: string;
   status: "connecting" | "connected" | "reconnecting" | "failed";
@@ -32,6 +37,15 @@ export default function DedicatedCallStage({
   bindRemoteAudio?: RefCallback<HTMLDivElement>;
   screenShareName?: string;
   bindScreenShare?: RefCallback<HTMLDivElement>;
+  /**
+   * Whether the local preview currently has a usable video track. Required,
+   * not defaulted: DedicatedCallPage is this component's only real callsite,
+   * and it always knows media.hasLocalVideo — a missing wire-up should be a
+   * type error, never a silent "assume true" that hides the fallback.
+   */
+  hasLocalVideo: boolean;
+  /** Stable seed (the current user's id) for the local fallback avatar's color. */
+  localSeed: string;
 }) {
   return (
     <main className="dedicated-call" aria-label={`Chamada ${title}`}>
@@ -57,14 +71,25 @@ export default function DedicatedCallStage({
         )}
         <article className="dedicated-call__tile">
           <div ref={bindLocalMedia} className="dedicated-call__media" />
-          <span>Você</span>
+          {!hasLocalVideo && (
+            <div
+              className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(localSeed)}`}
+              aria-hidden="true"
+            >
+              {initialsFrom(localDisplayName)}
+            </div>
+          )}
+          <span>{localDisplayName}</span>
         </article>
         {participants.map((participant) => (
           <article key={participant.identity} className="dedicated-call__tile">
             <div ref={participant.bindVideo} className="dedicated-call__media" />
             {!participant.hasVideo && (
-              <div className="dedicated-call__avatar" aria-hidden="true">
-                {participant.displayName.at(0)}
+              <div
+                className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(participant.identity)}`}
+                aria-hidden="true"
+              >
+                {initialsFrom(participant.displayName)}
               </div>
             )}
             <span>{participant.displayName}</span>

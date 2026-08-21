@@ -153,6 +153,32 @@ func TestResourceCallStartAndPresenceUseAuthenticatedClientIdentity(t *testing.T
 	}
 }
 
+func TestResourceCallStartBusyProducesParticipantBusyCallError(t *testing.T) {
+	handler := &fakeCallHandler{err: domain.ErrCallParticipantBusy}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-call-busy-test",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("busy-resource-client", callTestCaller, callTestWorkspace, &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) ||
+		!handleCallClientError(client, ClientMessageTypeCallStart, "", err) {
+		t.Fatalf("unexpected resource start error: %v", err)
+	}
+
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode call error: %v", err)
+	}
+	if response.Type != "call.error" || response.Operation != "call.start" ||
+		response.Code != "call_participant_busy" {
+		t.Fatalf("unexpected call error: %+v", response)
+	}
+}
+
 func TestCallCommandValidationRejectsClientControlledIdentity(t *testing.T) {
 	_, err := decodeClientMessage([]byte(`{"type":"call.start","request_id":"` + callTestRequest +
 		`","target_user_id":"` + callTestCallee + `","call_type":"audio","actor_user_id":"` + callTestOutsider + `"}`))
@@ -327,5 +353,37 @@ func TestCallErrorsAreStableAndDoNotConsumeInvalidBudget(t *testing.T) {
 	}
 	if response.Code != "call_not_found" || response.Operation != "call.accept" {
 		t.Fatalf("unexpected call error: %+v", response)
+	}
+}
+
+// TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback covers issue
+// #575: domain.ErrCallParticipantBusy wraps domain.ErrConflict, so its case
+// in handleCallClientError's switch MUST be evaluated before the generic
+// errors.Is(callErr, domain.ErrConflict) case, or every busy rejection would
+// keep falling through to the misleading "call already changed state"
+// message. A plain domain.ErrConflict (a real lifecycle/version conflict)
+// must still map to call_invalid_state, unchanged.
+func TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{name: "busy participant", err: domain.ErrCallParticipantBusy, wantCode: "call_participant_busy"},
+		{name: "real lifecycle conflict", err: domain.ErrConflict, wantCode: "call_invalid_state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newClient("busy-client", callTestCaller, callTestWorkspace, &fakeSender{})
+			if !handleCallClientError(client, ClientMessageTypeCallStart, "", test.err) {
+				t.Fatal("expected call error to be handled")
+			}
+			var response clientErrorResponse
+			if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+				t.Fatalf("decode call error: %v", err)
+			}
+			if response.Code != test.wantCode || response.Operation != "call.start" {
+				t.Fatalf("unexpected call error: %+v, want code %q", response, test.wantCode)
+			}
+		})
 	}
 }

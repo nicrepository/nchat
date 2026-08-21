@@ -127,6 +127,12 @@ func TestPGXCallStoreCreateIsIdempotentAndDetectsRequestConflict(t *testing.T) {
 			if !errors.Is(err, test.wantErr) {
 				t.Fatalf("error = %v, want %v", err, test.wantErr)
 			}
+			if test.wantErr != nil && errors.Is(err, domain.ErrCallParticipantBusy) {
+				// A mismatched idempotent replay is a real request conflict,
+				// not a busy participant — it must never be classified as
+				// busy (issue #575).
+				t.Fatalf("error = %v, want plain conflict, not participant-busy", err)
+			}
 			if test.wantErr == nil && (created || call.ID != callID) {
 				t.Fatalf("expected existing call, call=%+v created=%v", call, created)
 			}
@@ -135,10 +141,17 @@ func TestPGXCallStoreCreateIsIdempotentAndDetectsRequestConflict(t *testing.T) {
 	}
 }
 
-func TestPGXCallStoreCreateRejectsWhenCallerHoldsActiveResourceCallLease(t *testing.T) {
-	// Issue #569: busy must reflect active participation (a live
-	// call_participant_leases row), not merely having once been a resource
-	// call's caller_id, which never changes for the life of that row.
+// TestPGXCallStoreCreateRejectsBusyParticipant covers every path that trips
+// the combined busy check in one query (an active/ringing direct call, or a
+// live call_participant_leases row from a resource call): caller busy,
+// callee busy, and callee busy via resource participation all share the same
+// $2/$3 IN-list, so they are indistinguishable from the caller's side and
+// exercised as one scenario here. Issue #569 established the lease-vs-stale-
+// caller_id distinction; issue #575 requires the result to classify as the
+// specific domain.ErrCallParticipantBusy rather than the generic
+// domain.ErrConflict, so it reaches the client as a busy-specific message
+// instead of "call already changed state".
+func TestPGXCallStoreCreateRejectsBusyParticipant(t *testing.T) {
 	mock := newCategoryMock(t)
 	now := time.Now().UTC()
 	mock.ExpectBegin()
@@ -159,8 +172,11 @@ func TestPGXCallStoreCreateRejectsWhenCallerHoldsActiveResourceCallLease(t *test
 		CallerID: callCallerID, CalleeID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
 	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant-busy", err)
+	}
 	if !errors.Is(err, domain.ErrConflict) {
-		t.Fatalf("error = %v, want conflict", err)
+		t.Fatalf("error = %v, want it to still satisfy the wrapped ErrConflict check", err)
 	}
 	requireMetExpectations(t, mock)
 }
@@ -173,6 +189,8 @@ func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
@@ -184,6 +202,8 @@ func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO chat.calls.*'active'`).
 		WithArgs(callWorkspaceID, callRequestID, callCallerID, string(domain.CallTargetChannel), callCalleeID, string(domain.CallTypeVideo), expiresAt).
 		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
 		WithArgs(callID, callCallerID, expiresAt).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -196,6 +216,138 @@ func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
 	})
 	if err != nil || !created || call.TargetType != domain.CallTargetChannel || call.Status != domain.CallStatusActive {
 		t.Fatalf("resource call=%+v created=%v err=%v", call, created, err)
+	}
+	requireMetExpectations(t, mock)
+}
+
+func TestPGXCallStoreCreateResourceReplayStaysIdempotentAndDetectsMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	for _, test := range []struct {
+		name     string
+		targetID string
+		wantErr  error
+	}{
+		{name: "same payload", targetID: callCalleeID},
+		{name: "different target", targetID: callOutsiderID, wantErr: domain.ErrConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mock := newCategoryMock(t)
+			lockKey := callWorkspaceID + ":channel:" + test.targetID
+			mock.ExpectBegin()
+			mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
+				WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+			if test.wantErr == nil {
+				mock.ExpectCommit()
+			} else {
+				mock.ExpectRollback()
+			}
+
+			call, created, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+				WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
+				TargetType: domain.CallTargetChannel, TargetID: test.targetID,
+				Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
+			})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if errors.Is(err, domain.ErrCallParticipantBusy) {
+				t.Fatalf("mismatched replay must remain a plain conflict: %v", err)
+			}
+			if test.wantErr == nil && (created || call.ID != callID) {
+				t.Fatalf("expected idempotent replay, call=%+v created=%v", call, created)
+			}
+			requireMetExpectations(t, mock)
+		})
+	}
+}
+
+// TestPGXCallStoreCreateResourceRejectsBusyActorAndRollsBackTheNewCall covers
+// issue #609: an actor already busy elsewhere (direct call, or a lease on a
+// DIFFERENT active resource call) must be refused even for the very first
+// join that has to insert a brand-new chat.calls row for this target — and
+// that insert must not survive. Since pgxmock.ExpectRollback (rather than
+// ExpectCommit) is the only expectation after the busy check, this proves the
+// call store never reaches upsertCallPresence/commit for the newly-inserted
+// row; PostgreSQL-integration coverage below additionally proves the row is
+// actually gone afterwards, which pgxmock cannot observe.
+func TestPGXCallStoreCreateResourceRejectsBusyActorAndRollsBackTheNewCall(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Second)
+	lockKey := callWorkspaceID + ":channel:" + callCalleeID
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(`FROM chat.calls.*target_type.*status = 'active'`).
+		WithArgs(callWorkspaceID, string(domain.CallTargetChannel), callCalleeID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO chat.calls.*'active'`).
+		WithArgs(callWorkspaceID, callRequestID, callCallerID, string(domain.CallTargetChannel), callCalleeID, string(domain.CallTypeVideo), expiresAt).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectRollback()
+
+	_, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
+		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
+		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant-busy", err)
+	}
+	requireMetExpectations(t, mock)
+}
+
+// TestPGXCallStoreCreateResourceExcludesTheSameCallFromItsOwnBusyCheck covers
+// the late-join/rejoin path (issue #609): the busy query's third argument
+// must be the EXISTING active call's id, not a freshly-inserted one, so a
+// participant who already holds a live lease on the very call they are
+// joining is never told they are busy with themselves.
+func TestPGXCallStoreCreateResourceExcludesTheSameCallFromItsOwnBusyCheck(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Second)
+	lockKey := callWorkspaceID + ":channel:" + callCalleeID
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	// An already-active call for this target is found — no INSERT this time.
+	mock.ExpectQuery(`FROM chat.calls.*target_type.*status = 'active'`).
+		WithArgs(callWorkspaceID, string(domain.CallTargetChannel), callCalleeID).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 3))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
+		WithArgs(callID, callCallerID, expiresAt).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	call, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
+		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
+		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
+	})
+	if err != nil || call.ID != callID {
+		t.Fatalf("rejoin call=%+v err=%v", call, err)
 	}
 	requireMetExpectations(t, mock)
 }
@@ -213,12 +365,16 @@ func TestPGXCallStoreRenewsPresenceOnlyAfterResourceAuthorization(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			mock := newCategoryMock(t)
 			mock.ExpectBegin()
+			mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
 			mock.ExpectQuery(`FROM chat.calls.*FOR SHARE`).WithArgs(callWorkspaceID, callID).
 				WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
 			mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
 				WithArgs(callWorkspaceID, callCallerID, callCalleeID).
 				WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(test.authorized))
 			if test.authorized {
+				mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+					WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
 				mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
 					WithArgs(callID, callCallerID, now.Add(30*time.Second)).
 					WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -238,6 +394,31 @@ func TestPGXCallStoreRenewsPresenceOnlyAfterResourceAuthorization(t *testing.T) 
 	}
 }
 
+func TestPGXCallStoreRenewPresenceCannotAdmitActorBusyInAnotherCall(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Now().UTC()
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*FOR SHARE`).WithArgs(callWorkspaceID, callID).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectRollback()
+
+	err := storage.NewPGXCallStore(mock).RenewCallPresence(context.Background(), storage.RenewCallPresenceInput{
+		WorkspaceID: callWorkspaceID, CallID: callID, ActorID: callCallerID,
+		ExpiresAt: now.Add(30 * time.Second),
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant-busy", err)
+	}
+	requireMetExpectations(t, mock)
+}
+
 // ── LeaveResourceCall (issue #569): a participant leaving must release only
 // their own lease, never the whole call — and must end the call
 // deterministically, right away, only when they were its last one. ────────
@@ -247,6 +428,8 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyTheActorsLease(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
 		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 3))
 	mock.ExpectQuery(`DELETE FROM chat.call_participant_leases`).
@@ -275,6 +458,8 @@ func TestPGXCallStoreLeaveResourceCallEndsDeterministicallyWhenLastParticipantLe
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
 		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 3))
 	mock.ExpectQuery(`DELETE FROM chat.call_participant_leases`).
@@ -307,6 +492,8 @@ func TestPGXCallStoreLeaveResourceCallIsIdempotentWhenActorAlreadyLeft(t *testin
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
 		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 3))
 	mock.ExpectQuery(`DELETE FROM chat.call_participant_leases`).
@@ -345,6 +532,8 @@ func TestPGXCallStoreLeaveResourceCallRejectsUnauthorizedActorWithoutMetadata(t 
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callOutsiderID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
 		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 3))
 	mock.ExpectQuery(`DELETE FROM chat.call_participant_leases`).
@@ -372,6 +561,8 @@ func TestPGXCallStoreLeaveResourceCallRejectsDirectCalls(t *testing.T) {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
 		WillReturnRows(callRow(now, domain.CallStatusActive, 2))
 	mock.ExpectRollback()
@@ -390,6 +581,8 @@ func TestPGXCallStoreLeaveResourceCallRejectsDirectCalls(t *testing.T) {
 func TestPGXCallStoreLeaveResourceCallReturnsNotFoundForMissingCall(t *testing.T) {
 	mock := newCategoryMock(t)
 	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 

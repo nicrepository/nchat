@@ -20,7 +20,13 @@ export interface ChatOutletContext {
 
 export default function ChatShell() {
   const { state, retry, setPinned } = useChatSidebar();
-  const { calls, resource: resourceCall, registerDirectory, registerIdentity } = useCallSession();
+  const {
+    calls,
+    resource: resourceCall,
+    joinResourceParticipation,
+    registerDirectory,
+    registerIdentity,
+  } = useCallSession();
   useEffect(() => registerIdentity(state.status, retry), [registerIdentity, retry, state.status]);
   useEffect(() => {
     if (state.status === "ready") {
@@ -43,10 +49,16 @@ export default function ChatShell() {
     channels: state.status === "ready" ? state.channels : [],
     dms: state.status === "ready" ? state.dms : [],
     startCall: resourceCall.active ? undefined : calls.start,
+    // Fresh join/rejoin gesture (issue #594 adversarial follow-up, round
+    // 3): must go through joinResourceParticipation, never resourceCall.join
+    // directly, so an old "left" for whatever this callId's participation
+    // used to be can never abort this brand-new attempt before it registers
+    // — target.callId is undefined here (the server decides/reuses it), a
+    // case joinResourceParticipation is specifically built to still protect.
     joinResourceCall:
       directCallBusy || resourceCall.active
         ? undefined
-        : (target) => void resourceCall.join(target),
+        : (target) => void joinResourceParticipation(target),
   };
 
   return (

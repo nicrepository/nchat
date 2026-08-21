@@ -27,6 +27,7 @@ import {
 import {
   useResourceCallSession,
   type ResourceCallController,
+  type ResourceCallTarget,
 } from "../chat/useResourceCallSession";
 import {
   compareParticipationTokens,
@@ -92,6 +93,42 @@ export interface CallSessionContextValue {
    * still remembers for this callId.
    */
   beginResourceParticipation: (callId: string) => Promise<void>;
+  /**
+   * The one real call site every FRESH, user-initiated resource join/rejoin
+   * must go through — ChatShell's "start/join group call" flow and
+   * IncomingCallPopup's accept (issue #594 adversarial follow-up, rounds
+   * 2-3). Wraps resource.join() with a LOCAL-ONLY, causal "this callId has a
+   * fresh attempt in flight" marker, registered synchronously BEFORE join()
+   * starts — even when target.callId is still undefined at that instant
+   * (the server resolves/reuses it), via join()'s own onCallIdResolved
+   * callback — and cleared once join() settles either way. Closes the
+   * window between join() starting and beginResourceParticipation()
+   * registering the real, higher-ranked ParticipationToken, during which
+   * the OLD participation this rejoin is superseding can still have its own
+   * (real, legitimately accepted) "left" arrive — without this marker, that
+   * "left" would still look "current" to commitParticipation's ordering and
+   * would wrongly converge/abort this brand-new, not-yet-registered
+   * attempt. Never itself posts anything to other tabs or writes to shared
+   * storage — that stays exclusively beginResourceParticipation's job, run
+   * only once join() actually confirms success, so a still-failable attempt
+   * is never announced as a real participation. NEVER the right call for
+   * DedicatedCallPage's own handoff/continuation join — see
+   * activateResourceParticipation below.
+   */
+  joinResourceParticipation: (target: ResourceCallTarget) => Promise<string | undefined>;
+  /**
+   * DedicatedCallPage/handoff's own entry point (issue #594 adversarial
+   * follow-up, round 3) — same join()+beginResourceParticipation shape as
+   * joinResourceParticipation, but deliberately never registers the
+   * fresh-join-intent marker. DedicatedCallPage's activation effect runs on
+   * EVERY successful ownerState -> "local" transition, including a plain
+   * handoff continuation reconnecting media for an ALREADY-active
+   * participation (issue #570 problem 3) — treating that as a fresh intent
+   * would risk masking a real, currently-accepted "left" for the very
+   * participation being reconnected to, which is strictly worse than the
+   * narrower, deliberately-unprotected race this leaves open.
+   */
+  activateResourceParticipation: (target: ResourceCallTarget) => Promise<string | undefined>;
 }
 
 const CallSessionContext = createContext<CallSessionContextValue | null>(null);
@@ -184,6 +221,52 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     { phase: "participating" | "leaving" | "left"; token: ParticipationToken; sequence: number }
   >;
   const participationRecordsRef = useRef<ParticipationRecords>(new Map());
+  // Local-only, causal "a fresh join for this callId is in flight and not
+  // yet registered" markers (issue #594 adversarial follow-up, rounds 2-3) —
+  // see joinResourceParticipation below, the only writer. Never posted to
+  // other tabs, never written to shared storage: purely a same-tab guard so
+  // the ownership-message effect can tell "this accepted left refers to the
+  // OLD participation my new, still-unregistered attempt is superseding"
+  // from "this accepted left genuinely applies to my current, already-
+  // registered participation" — the latter must still converge normally. A
+  // tab can never be the source of a `left` for a callId it hasn't yet
+  // registered as participating in (endResourceParticipation only ever runs
+  // against an already-`active` participation), so suppressing convergence
+  // unconditionally while a callId's entry is present here is exhaustively
+  // correct for this window, with no token comparison needed.
+  //
+  // Reference-counted (a callId -> how many overlapping fresh attempts are
+  // currently protecting it), not a bare Set: two overlapping fresh attempts
+  // for the same callId (e.g. a rapid double "Entrar" click before the
+  // first one's own dedup in useResourceCallSession.join() has registered)
+  // must not let the first one's finally-cleanup remove protection the
+  // second one still needs.
+  //
+  // ONLY ever written by a genuinely fresh, user-initiated join/rejoin
+  // gesture (ChatShell's "start/join group call" flow, IncomingCallPopup's
+  // accept) — DedicatedCallPage's activation-effect join() deliberately
+  // never writes here (see activateResourceParticipation below): it runs on
+  // every successful ownerState -> "local" transition, including a plain
+  // handoff continuation reconnecting media for an ALREADY-active
+  // participation (issue #570 problem 3), and a dedicated tab has no
+  // reliable local signal to distinguish that from a genuinely fresh
+  // rejoin — its own participationRecordsRef starts empty even for a real
+  // continuation, since it never observed the original "participating"
+  // broadcast. Treating every DedicatedCallPage join() as a fresh intent
+  // would risk suppressing a real, currently-accepted "left" for the very
+  // participation it is simply reconnecting to — a worse failure than the
+  // narrower, deliberately-unprotected race this leaves open.
+  const pendingJoinAttemptsRef = useRef<Map<string, number>>(new Map());
+  const protectJoinAttempt = useCallback((joinCallId: string) => {
+    const map = pendingJoinAttemptsRef.current;
+    map.set(joinCallId, (map.get(joinCallId) ?? 0) + 1);
+  }, []);
+  const unprotectJoinAttempt = useCallback((joinCallId: string) => {
+    const map = pendingJoinAttemptsRef.current;
+    const count = map.get(joinCallId) ?? 0;
+    if (count <= 1) map.delete(joinCallId);
+    else map.set(joinCallId, count - 1);
+  }, []);
   // Independently initialized to an empty Map — never read from the ref
   // (react-hooks/refs forbids that during render, and this initializer runs
   // at render time on first mount) — the two simply start in the same
@@ -215,27 +298,32 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       phase: "participating" | "leaving" | "left",
       token: ParticipationToken,
       sequence: number,
-    ) => {
+    ): boolean => {
       const existing = participationRecordsRef.current.get(callId);
       if (existing) {
         const cmp = compareParticipationTokens(token, existing.token);
-        if (cmp < 0) return;
-        if (cmp === 0 && sequence <= existing.sequence) return;
+        if (cmp < 0) return false;
+        if (cmp === 0 && sequence <= existing.sequence) return false;
       }
       const next = new Map(participationRecordsRef.current);
       next.set(callId, { phase, token, sequence });
       participationRecordsRef.current = next;
       setParticipationRecords(next);
+      return true;
     },
     [],
   );
+  // Returns whether the event actually advanced callId's record (false for a
+  // stale/superseded one — see the ordering guard above) so a caller like
+  // the "left" handling below can tell a genuinely-applied confirmation from
+  // one the ordering already rejected.
   const applyParticipationEvent = useCallback(
     (
       callId: string,
       phase: "participating" | "leaving" | "left",
       token: ParticipationToken,
       sequence: number,
-    ) => commitParticipation(callId, phase, token, sequence),
+    ): boolean => commitParticipation(callId, phase, token, sequence),
     [commitParticipation],
   );
   useEffect(() => {
@@ -322,6 +410,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     [getOwnership, media, role, setOwner],
   );
   const resource = useResourceCallSession(ownedMedia, ownerState === "local");
+  // Pulled out as its own binding so the ownership-subscribe effect below
+  // can depend on this specific, permanently-stable callback (issue #594
+  // adversarial follow-up) instead of the whole `resource` object, which is
+  // a brand-new object literal every render — depending on it directly
+  // would unsubscribe/resubscribe the ownership coordinator on every single
+  // render for no reason. (No message-loss risk either way: subscribe/
+  // unsubscribe are synchronous Set mutations in callOwnership.ts, and a
+  // cross-tab message only ever arrives via an async BroadcastChannel
+  // event, so there is no window for one to land in between.)
+  // resource.join is itself permanently stable (useResourceCallSession's own
+  // useCallback has `[]` deps) — pulling it out the same way lets
+  // joinResourceParticipation below depend on it directly too.
+  const { convergeRemoteLeave, join: joinResourceCall } = resource;
   const directMedia = useMemo<CallMediaBridge>(
     () => ({
       startAudio: ownedMedia.startAudio,
@@ -337,6 +438,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     if (resource.active) await resource.leave();
   }, [resource]);
   const calls = useCallSignaling(directMedia, mediaEnabled, releaseResource);
+  const directCallBusy = calls.call !== null && !terminal.has(calls.call.status);
 
   const postParticipation = useCallback(
     (
@@ -392,6 +494,83 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       postParticipation(callId, "participating", token, 0);
     },
     [commitParticipation, getOwnership, postParticipation],
+  );
+  // The real call site every FRESH, user-initiated resource join/rejoin must
+  // go through (issue #594 adversarial follow-up, rounds 2-3) — ChatShell's
+  // "start/join group call" flow and IncomingCallPopup's accept, never
+  // DedicatedCallPage (see activateResourceParticipation below and
+  // pendingJoinAttemptsRef's own comment). Registers the local-only intent
+  // synchronously, BEFORE resource.join() itself starts (never after — that
+  // would reopen the exact window this exists to close), and only ever
+  // clears it once join() has fully settled: promoted via
+  // beginResourceParticipation on success (whose own commitParticipation
+  // call is synchronous, so the real, higher-ranked token is already in
+  // place the instant this awaits past it — no gap), or simply dropped on
+  // failure/supersession, since there is then nothing left to protect.
+  //
+  // target.callId is undefined for a genuinely fresh join (ChatShell: the
+  // server decides/reuses the call_id) — the protection cannot simply key
+  // off target.callId in that case, since there is nothing to key off of at
+  // the instant of the gesture. Instead it rides useResourceCallSession's
+  // own onCallIdResolved callback, which fires SYNCHRONOUSLY the moment the
+  // real call_id becomes known inside join() itself (see that hook's own
+  // doc comment) — before issueCallToken/media.connect's own await ever
+  // gives a cross-tab message a chance to interleave. protectedCallId tracks
+  // whichever callId is currently protected by THIS attempt (initially
+  // target.callId if already known, reassigned the instant the callback
+  // fires) so cleanup always releases the right one.
+  const joinResourceParticipation = useCallback(
+    async (target: ResourceCallTarget): Promise<string | undefined> => {
+      if (
+        directCallBusy ||
+        (resource.active &&
+          (resource.active.kind !== target.kind || resource.active.id !== target.id))
+      ) {
+        return undefined;
+      }
+      let protectedCallId: string | null = null;
+      if (target.callId) {
+        protectedCallId = target.callId;
+        protectJoinAttempt(protectedCallId);
+      }
+      try {
+        const joinedCallId = await joinResourceCall(target, (resolvedCallId) => {
+          if (protectedCallId === resolvedCallId) return;
+          if (protectedCallId) unprotectJoinAttempt(protectedCallId);
+          protectedCallId = resolvedCallId;
+          protectJoinAttempt(protectedCallId);
+        });
+        if (joinedCallId) await beginResourceParticipation(joinedCallId);
+        return joinedCallId;
+      } finally {
+        if (protectedCallId) unprotectJoinAttempt(protectedCallId);
+      }
+    },
+    [
+      beginResourceParticipation,
+      directCallBusy,
+      joinResourceCall,
+      protectJoinAttempt,
+      resource.active,
+      unprotectJoinAttempt,
+    ],
+  );
+  // DedicatedCallPage/handoff-only entry point (issue #594 adversarial
+  // follow-up, round 3) — deliberately NEVER registers a fresh-join-intent
+  // (pendingJoinAttemptsRef): see that ref's own comment for why treating
+  // every DedicatedCallPage activation as a fresh attempt would risk
+  // masking a real, currently-accepted "left" for the participation it is
+  // simply reconnecting media for. Still registers the real participation
+  // on success, via the exact same beginResourceParticipation used by
+  // joinResourceParticipation — issue #570 problem 3's "harmless, idempotent
+  // refresh" behavior for a plain continuation is unaffected either way.
+  const activateResourceParticipation = useCallback(
+    async (target: ResourceCallTarget): Promise<string | undefined> => {
+      const joinedCallId = await joinResourceCall(target);
+      if (joinedCallId) await beginResourceParticipation(joinedCallId);
+      return joinedCallId;
+    },
+    [beginResourceParticipation, joinResourceCall],
   );
   // Advances the CURRENT participation (same token, next sequence) — used
   // by endResourceParticipation below for leaving/left/leave-cancelled,
@@ -509,12 +688,35 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         message.type === "left" ||
         message.type === "leave-cancelled"
       ) {
-        applyParticipationEvent(
+        const applied = applyParticipationEvent(
           message.callId,
           message.type === "leave-cancelled" ? "participating" : message.type,
           { generation: message.generation, writerId: message.writerId },
           message.sequence,
         );
+        // A "left" that actually advanced this callId's record (never a
+        // stale/superseded one) means the real server-side leave already
+        // happened in whichever tab sent it. Converge THIS tab's own
+        // resource session too, if it still represents that same callId
+        // (issue #594) — purely local, never a second call.leave — so the
+        // buttons this tab gates on resource.active recover without a
+        // reload.
+        //
+        // Unless a fresh join for this exact callId is already in flight
+        // locally and not yet registered (pendingJoinAttemptsRef, issue #594
+        // adversarial follow-up): commitParticipation's ordering can only
+        // judge this "left" against whatever token it already knows about,
+        // which — during that window — is still the OLD participation this
+        // new attempt is superseding, not the new one (which has no token
+        // yet). Converging here would abort a legitimate rejoin instead of
+        // the stale participation it actually refers to.
+        if (
+          applied &&
+          message.type === "left" &&
+          !pendingJoinAttemptsRef.current.has(message.callId)
+        ) {
+          convergeRemoteLeave(message.callId);
+        }
         return;
       }
       const callId = activeCallId || handoffCall.current;
@@ -592,7 +794,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         void restoreOwnership(callId, handoffEpoch.current);
       }
     });
-  }, [activeCallId, applyParticipationEvent, getOwnership, restoreOwnership, role, setOwner]);
+  }, [
+    activeCallId,
+    applyParticipationEvent,
+    convergeRemoteLeave,
+    getOwnership,
+    restoreOwnership,
+    role,
+    setOwner,
+  ]);
 
   useEffect(() => {
     if (role !== "main" || ownerState !== "remote" || !activeCallId || !handoffEpoch.current)
@@ -854,15 +1064,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       releaseDedicated,
       leaveDedicated,
       beginResourceParticipation,
+      joinResourceParticipation,
+      activateResourceParticipation,
     }),
     [
       acknowledgeDedicated,
+      activateResourceParticipation,
       announceDedicated,
       beginResourceParticipation,
       calls,
       dedicatedRecoveryFailed,
       enableMedia,
       expand,
+      joinResourceParticipation,
       leaveDedicated,
       media,
       ownerState,
@@ -888,6 +1102,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const peer = directory?.dms.find((dm) => dm.counterpart?.userId === peerId)?.counterpart;
   const resourceTarget = directActive ? null : resource.active;
   const title = peer?.displayName ?? resourceTarget?.name ?? "Participante";
+  // Real identity seed for the floating remote fallback avatar's color —
+  // peerId itself (not peer?.userId) so a direct call still gets a stable,
+  // real user id even before `directory` has resolved (peer is a directory
+  // lookup and can be briefly undefined while directActive already exists).
+  // resourceTarget.id covers the group/channel case. `title` is only ever
+  // the last resort when neither identity is known yet — never the primary
+  // seed, since two different peers can share the same display name.
+  const remoteSeed = peerId || resourceTarget?.id || title;
+  // Stable seed for the local fallback avatar — the current user's own id.
+  // Falls back to a fixed literal only for the brief window before
+  // `directory` (fetched by the host page) has resolved; never a new
+  // profile fetch just for this.
+  const localSeed = directory?.currentUserId ?? "local";
   const participants = media.participants ?? [];
   const participantCount = Math.max(1, participants.length + 1);
   const activeSpeakerName =
@@ -923,6 +1150,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       ? directory?.channels.find((channel) => channel.id === incomingResource.target_id)
       : directory?.dms.find((dm) => dm.id === incomingResource.target_id)
     : null;
+  const incomingResourceBusy =
+    directCallBusy ||
+    Boolean(
+      incomingResource &&
+      resource.active &&
+      (resource.active.kind !== incomingResource.target_type ||
+        resource.active.id !== incomingResource.target_id),
+    );
+  const globalCallError = calls.error ?? resource.error;
 
   return (
     <CallSessionContext.Provider value={value}>
@@ -945,37 +1181,39 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           onRetryIdentity={() => identity.retry?.()}
         />
       )}
-      {!dedicated && !directIncoming && incomingResource && incomingTarget && (
-        <IncomingCallPopup
-          name={incomingTarget.name}
-          targetKind={incomingResource.target_type as "channel" | "dm"}
-          callType={incomingResource.call_type}
-          participantCount={1}
-          onAccept={() => {
-            emitCallTechnicalEvent("accepted");
-            setIncomingResource(null);
-            // Registers the new participation only once join() itself
-            // confirms it actually succeeded (issue #570 follow-up) — never
-            // inferred from resource.callId changing, which a rejoin of the
-            // very same call_id would never observably do.
-            void resource
-              .join({
+      {!dedicated &&
+        !directIncoming &&
+        !incomingResourceBusy &&
+        incomingResource &&
+        incomingTarget && (
+          <IncomingCallPopup
+            name={incomingTarget.name}
+            targetKind={incomingResource.target_type as "channel" | "dm"}
+            callType={incomingResource.call_type}
+            participantCount={1}
+            onAccept={() => {
+              emitCallTechnicalEvent("accepted");
+              setIncomingResource(null);
+              // joinResourceParticipation both runs the real join() and — only
+              // once it actually confirms success (issue #570 follow-up) —
+              // registers the new participation; it also protects this
+              // attempt, from before join() even starts, against an old
+              // "left" for the participation it supersedes (issue #594
+              // adversarial follow-up).
+              void joinResourceParticipation({
                 kind: incomingResource.target_type as "channel" | "dm",
                 id: incomingResource.target_id!,
                 name: incomingTarget.name,
                 callId: incomingResource.call_id,
-              })
-              .then((joinedCallId) => {
-                if (joinedCallId) void beginResourceParticipation(joinedCallId);
               });
-          }}
-          onReject={() => {
-            emitCallTechnicalEvent("rejected");
-            ignoredResourceCalls.current.add(incomingResource.call_id);
-            setIncomingResource(null);
-          }}
-        />
-      )}
+            }}
+            onReject={() => {
+              emitCallTechnicalEvent("rejected");
+              ignoredResourceCalls.current.add(incomingResource.call_id);
+              setIncomingResource(null);
+            }}
+          />
+        )}
       {!dedicated && activeCallId && ownerState === "remote" && (
         <GlobalCallIndicator
           title={title}
@@ -990,6 +1228,10 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           participantCount={participantCount}
           activeSpeakerName={activeSpeakerName}
           screenShareActive={media.screenShareEnabled || Boolean(media.remoteScreenShare)}
+          hasRemoteVideo={media.hasRemoteVideo}
+          remoteSeed={remoteSeed}
+          hasLocalVideo={media.hasLocalVideo}
+          localSeed={localSeed}
           controls={controls}
           onExpand={expand}
           bindLocalMedia={media.bindLocalMedia}
@@ -1012,9 +1254,9 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           }
         />
       )}
-      {!dedicated && !activeCallId && calls.error && (
+      {!dedicated && !activeCallId && globalCallError && (
         <p className="call-global-error" role="alert">
-          {calls.error}
+          {globalCallError}
         </p>
       )}
     </CallSessionContext.Provider>

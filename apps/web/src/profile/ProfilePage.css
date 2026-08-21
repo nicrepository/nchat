@@ -79,7 +79,9 @@
   display: flex;
   gap: 24px;
   align-items: flex-start;
+  flex-wrap: wrap;
   padding: 24px;
+  margin-bottom: 20px;
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 12px;
 }

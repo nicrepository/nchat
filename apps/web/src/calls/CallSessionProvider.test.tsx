@@ -4,6 +4,7 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { acquireChatSocket, type ChatSocketListener } from "../chat/chatSocket";
+import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import { useCallMedia } from "../chat/useCallMedia";
 import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
@@ -27,6 +28,7 @@ const callId = "00000000-0000-4000-8000-000000000546";
 const userA = "00000000-0000-4000-8000-000000000547";
 const userB = "00000000-0000-4000-8000-000000000548";
 const channelId = "00000000-0000-4000-8000-000000000549";
+const channelYId = "00000000-0000-4000-8000-000000000550";
 const lease = {
   v: 1,
   callId,
@@ -103,6 +105,8 @@ const media = {
   }>,
   activeSpeakerId: null as string | null,
   remoteScreenShare: null as null | { identity: string; bindMedia: ReturnType<typeof vi.fn> },
+  hasRemoteVideo: true,
+  hasLocalVideo: true,
   microphoneEnabled: false,
   cameraEnabled: false,
   screenShareEnabled: false,
@@ -136,6 +140,7 @@ const resource = {
   join: vi.fn(async (target: { callId?: string }) => target.callId),
   leave: vi.fn(async () => undefined),
   reconnect: vi.fn(async () => undefined),
+  convergeRemoteLeave: vi.fn(),
 };
 
 function Probe() {
@@ -157,7 +162,10 @@ function Probe() {
         onClick={() =>
           session.registerDirectory({
             currentUserId: userB,
-            channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
+            channels: [
+              { id: channelId, name: "Produto", type: "public", canWrite: true },
+              { id: channelYId, name: "Suporte", type: "public", canWrite: true },
+            ],
             dms: [
               {
                 id: "dm-1",
@@ -201,6 +209,27 @@ function Probe() {
       </button>
       <button type="button" onClick={() => void session.beginResourceParticipation(callId)}>
         Begin participation probe
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          void session.joinResourceParticipation({ kind: "channel", id: channelId, name: "Geral" })
+        }
+      >
+        Fresh join probe (no callId)
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          void session.activateResourceParticipation({
+            kind: "channel",
+            id: channelId,
+            name: "Geral",
+            callId,
+          })
+        }
+      >
+        Activate participation probe
       </button>
       <Outlet />
     </>
@@ -372,7 +401,10 @@ describe("CallSessionProvider", () => {
       ),
     );
     fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
-    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }));
+    expect(resource.join).toHaveBeenCalledWith(
+      expect.objectContaining({ callId }),
+      expect.any(Function),
+    );
 
     act(() =>
       socketListener.onMessage?.(
@@ -388,6 +420,67 @@ describe("CallSessionProvider", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Recusar" }));
     expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer incoming resource Y while X is active and keeps same-target continuation valid", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-resource-y",
+          target_type: "channel",
+          target_id: channelYId,
+          call: {
+            ...activeDirect(),
+            call_id: "00000000-0000-4000-8000-000000000551",
+            target_type: "channel",
+            target_id: channelYId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(resource.join).not.toHaveBeenCalled();
+    expect(resource.active).toEqual({ kind: "channel", id: channelId, name: "Produto" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Fresh join probe (no callId)" }));
+    await waitFor(() => expect(resource.join).toHaveBeenCalledOnce());
+  });
+
+  it("does not offer or join an incoming resource while a direct call is active", () => {
+    calls.call = activeDirect();
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-resource-during-direct",
+          target_type: "channel",
+          target_id: channelYId,
+          call: {
+            ...activeDirect(),
+            call_id: "00000000-0000-4000-8000-000000000552",
+            target_type: "channel",
+            target_id: channelYId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(resource.join).not.toHaveBeenCalled();
   });
 
   it("performs main-to-dedicated handoff, ACK, timeout rollback, and failure rollback", async () => {
@@ -543,6 +636,74 @@ describe("CallSessionProvider", () => {
     // (exercised in the recovery tests below) ever does that.
     expect(ownership.release).not.toHaveBeenCalled();
     expect(screen.getByTestId("owner")).toHaveTextContent("local");
+  });
+
+  it("floats a direct call's remote fallback avatar with the peer's real identity", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasRemoteVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await screen.findByTestId("floating-call-window");
+
+    // Peer is "Ana" (userA) per the registered directory — never an index or
+    // a made-up identity.
+    const avatar = document.querySelector(".floating-call__avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userA)}`);
+  });
+
+  it("floats the local fallback avatar with the current user's real id", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasLocalVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await screen.findByTestId("floating-call-window");
+
+    const avatar = document.querySelector(".floating-call__local-avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Você"));
+    // currentUserId (userB) — the registered directory's own id, never a
+    // fetched profile just for this fallback.
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userB)}`);
+  });
+
+  it("floats a resource call's remote fallback using the room's own identity, never a specific participant", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    media.hasRemoteVideo = false;
+    // Multiple participants exist, but the fallback must represent the room
+    // — not pick one of them as if it were a 1:1 call.
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    const avatar = document.querySelector(".floating-call__avatar")!;
+    expect(avatar).toHaveTextContent(initialsFrom("Produto"));
+    expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(channelId)}`);
+  });
+
+  it("never masks a resource participant's real video with the group fallback", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    // hasRemoteVideo mirrors whether ANY remote element (direct peer or
+    // resource participant, same onRemoteElement stream in useCallMedia)
+    // currently renders — a participant's real video already fills
+    // bindRemoteMedia's flat container, so the fallback must stay hidden.
+    media.hasRemoteVideo = true;
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: true, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    expect(document.querySelector(".floating-call__avatar")).toBeNull();
   });
 
   it("recovers resource ownership, including activation and failed-claim paths", async () => {
@@ -1069,10 +1230,17 @@ describe("dedicated participant leave converges ownership and main tab state (is
       ),
     );
     await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
+    // This tab's own leave already cleared its own resource session via
+    // resource.leave() above — convergeRemoteLeave (issue #594) is for OTHER
+    // tabs that only ever observe this "left" cross-tab, never this one.
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
   });
 
   it("main tab converges once it observes the dedicated tab's 'left' broadcast: stops showing the call as open elsewhere and never reconnects (leave confirmado)", async () => {
     vi.useFakeTimers();
+    // Main's own resource session is the stale one from before the handoff
+    // (issue #594) — the real production shape: a handoff never nulls it.
+    resource.callId = callId;
     renderProvider();
     act(() =>
       ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
@@ -1098,6 +1266,12 @@ describe("dedicated participant leave converges ownership and main tab state (is
 
     expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
 
+    // Main's own (stale) resource-call session converges to idle locally —
+    // never a second call.leave, the server-side leave already happened in
+    // the dedicated tab (issue #594).
+    expect(resource.convergeRemoteLeave).toHaveBeenCalledExactlyOnceWith(callId);
+    expect(resource.leave).not.toHaveBeenCalled();
+
     // Neither the automatic recovery interval nor an explicit "Abrir aqui"
     // click may reconnect a resource call whose participation is already
     // confirmed over.
@@ -1110,6 +1284,29 @@ describe("dedicated participant leave converges ownership and main tab state (is
     expect(resource.reconnect).not.toHaveBeenCalled();
     expect(ownership.claim).not.toHaveBeenCalled();
     vi.useRealTimers();
+  });
+
+  it("a resource call's 'left' broadcast never touches an unrelated, concurrently active direct 1:1 call (issue #594, no regression)", async () => {
+    calls.call = activeDirect();
+    resource.callId = callId;
+    renderProvider();
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+
+    expect(resource.convergeRemoteLeave).toHaveBeenCalledExactlyOnceWith(callId);
+    expect(calls.end).not.toHaveBeenCalled();
+    expect(screen.getByTestId("floating-call-window")).toBeInTheDocument();
   });
 
   it("a plain 'released' message (minimize, not leave) never blocks a legitimate reclaim", async () => {
@@ -1133,6 +1330,9 @@ describe("dedicated participant leave converges ownership and main tab state (is
     await act(async () => vi.advanceTimersByTime(1_500));
     expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
     expect(resource.reconnect).toHaveBeenCalled();
+    // Minimize/handoff is never a leave (issue #594): it must never
+    // converge/clear resource.active or resource.callId.
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -1173,6 +1373,9 @@ describe("dedicated participant leave converges ownership and main tab state (is
     await act(async () => undefined);
     expect(resource.reconnect).not.toHaveBeenCalled();
     expect(ownership.claim).not.toHaveBeenCalled();
+    // "leaving" alone must never converge/clear the local resource session —
+    // only its matching "left" may (issue #594).
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -1217,6 +1420,9 @@ describe("dedicated participant leave converges ownership and main tab state (is
     await act(async () => vi.advanceTimersByTime(1_500));
     expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
     expect(resource.reconnect).toHaveBeenCalled();
+    // "leave-cancelled" restores the participation — it must never converge
+    // the local resource session (issue #594): there is nothing to undo.
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -1286,7 +1492,10 @@ describe("dedicated participant leave converges ownership and main tab state (is
     // The explicit, real join — resource.join() resolves with call_id X,
     // exactly like the real hook does when target.callId is supplied.
     fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
-    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }));
+    expect(resource.join).toHaveBeenCalledWith(
+      expect.objectContaining({ callId }),
+      expect.any(Function),
+    );
 
     // The new participation lands with a fresh generation (2, one past the
     // old participation's 1) and activeCallId/UI converge back to X.
@@ -1454,6 +1663,10 @@ describe("participation ordering is causal, not wall-clock (issue #570 follow-up
         } as never),
       );
       expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
+      // The old, superseded "left" must never converge/clear the newer
+      // rejoin's resource session (issue #594) — only the FIRST "left"
+      // above (which had no newer participation to contend with) may have.
+      expect(resource.convergeRemoteLeave).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
@@ -1678,6 +1891,274 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
         expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
       ),
     );
+  });
+
+  // ── issue #594 adversarial follow-up: a rejoin already under way — before
+  // resource.join() has resolved and beginResourceParticipation could ever
+  // register its real, higher-ranked token — must be protected from an old
+  // "left" for the OLD participation it supersedes, which commitParticipation
+  // would otherwise still consider "current" during that exact window. ─────
+
+  it("a rejoin started before join() resolves is protected from an old 'left' for the participation it supersedes, still registers its own generation once it resolves, and a real left for THAT new generation converges normally afterward", async () => {
+    // N: an existing participation this tab already knows about (generation
+    // 1, real join through the popup).
+    renderProvider();
+    await joinViaPopup();
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+    ownership.post.mockClear();
+
+    // The old participation enters "leaving" (e.g. announced by whatever
+    // else is ending it server-side) — this is also what makes the incoming
+    // popup eligible to reoffer this exact callId at all: it deliberately
+    // refuses to reoffer a callId this tab still considers "participating".
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "leaving",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 2,
+        generation: 1,
+        writerId: "tab-main",
+        sequence: 1,
+      } as never),
+    );
+
+    // The user starts a legitimate rejoin of the SAME callId — resource.join()
+    // is called (joinResourceParticipation's own protection window opens
+    // the instant this happens, synchronously, before any await) but does
+    // not resolve yet: beginResourceParticipation cannot have registered
+    // generation 2 at this point.
+    let resolveJoin!: (value: string | undefined) => void;
+    resource.join.mockReturnValueOnce(
+      new Promise<string | undefined>((resolve) => {
+        resolveJoin = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    const incoming = {
+      ...activeDirect(),
+      call_id: callId,
+      target_type: "channel",
+      target_id: channelId,
+      status: "active",
+    };
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "rejoin-in-flight",
+          target_type: "channel",
+          target_id: channelId,
+          call: incoming,
+        },
+        1,
+      ),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
+    expect(resource.join).toHaveBeenCalledTimes(2);
+
+    // C: a redelivered/late "left" for generation 1 — the OLD participation,
+    // still the only one commitParticipation knows about — arrives and is
+    // legitimately accepted by the ordering guard.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-main",
+        sequence: 2,
+      } as never),
+    );
+
+    // D: the in-flight rejoin must NOT be aborted by it.
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
+
+    // E: join() now resolves for real.
+    resolveJoin(callId);
+    await act(async () => undefined);
+
+    // F: the new participation is registered at generation 2, exactly as if
+    // the old "left" above had never arrived.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+
+    // G: the SAME old "left" (generation 1, sequence 2) redelivered again
+    // after the rejoin completed must still never clear the new generation
+    // 2 — rejected as stale by the ordinary ordering guard this time (no
+    // longer even needs the pending-attempt protection, since generation 2
+    // is now the registered current record).
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-main",
+        sequence: 2,
+      } as never),
+    );
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
+
+    // Inverse: a real "left" that actually corresponds to the NOW-current
+    // generation (2) must still converge normally — the protection window
+    // is gone once the rejoin registered for real, it must never linger.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 4,
+        generation: 2,
+        writerId: "tab-main",
+        sequence: 1,
+      } as never),
+    );
+    expect(resource.convergeRemoteLeave).toHaveBeenCalledExactlyOnceWith(callId);
+  });
+
+  it("issue #594 adversarial follow-up (round 3): a fresh join with target.callId undefined (ChatShell's own shape) is protected the instant the server resolves it — before issueCallToken/media.connect ever settle — surviving an old left, and a late duplicate never clears the real registration", async () => {
+    // The shared storage already holds a real, older generation for this
+    // callId (mirrors what that OLD participation's own real
+    // allocateParticipationGeneration() call would have written) — this is
+    // what the fresh join's OWN real allocation reads from, independent of
+    // any locally observed broadcast.
+    participationStorage = { [callId]: { "tab-dedicated": 1 } };
+    renderProvider();
+
+    // resource.join() itself resolves the real call_id mid-flight (target
+    // had none) and reports it via onCallIdResolved BEFORE settling —
+    // exactly like the real hook's own placement, right before its own
+    // issueCallToken/media.connect awaits.
+    let resolveJoin!: (value: string | undefined) => void;
+    let onCallIdResolved: ((resolvedCallId: string) => void) | undefined;
+    resource.join.mockImplementationOnce(
+      (_target: unknown, callback?: (resolvedCallId: string) => void) => {
+        onCallIdResolved = callback;
+        return new Promise<string | undefined>((resolve) => {
+          resolveJoin = resolve;
+        });
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Fresh join probe (no callId)" }));
+    expect(resource.join).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "channel", id: channelId }),
+      expect.any(Function),
+    );
+    expect((resource.join.mock.calls[0]![0] as { callId?: string }).callId).toBeUndefined();
+
+    // The server resolves the real callId (the SAME, reused one) — reported
+    // synchronously, before issueCallToken/media.connect would ever run in
+    // the real hook.
+    act(() => onCallIdResolved?.(callId));
+
+    // An old "left" (generation 1 — the only one the ordering guard knows
+    // about, since the fresh attempt hasn't registered its own generation
+    // yet) arrives right in this window and is legitimately accepted.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+
+    // The in-flight fresh join must NOT be aborted by it.
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
+
+    // join() now resolves for real.
+    resolveJoin(callId);
+    await act(async () => undefined);
+
+    // The new participation registers at generation 2.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 2, sequence: 0 }),
+      ),
+    );
+
+    // A late/duplicate redelivery of the same old "left" (generation 1)
+    // must never clear the new generation 2.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-dedicated",
+        sequence: 1,
+      } as never),
+    );
+    expect(resource.convergeRemoteLeave).not.toHaveBeenCalled();
+  });
+
+  it("issue #594 adversarial follow-up (round 3): DedicatedCallPage's activateResourceParticipation never registers a fresh-join intent — a real, current 'left' arriving while it connects still converges normally, never masked", async () => {
+    renderProvider();
+
+    // This tab already genuinely participates in callId (generation 1,
+    // real registration) — activateResourceParticipation is now just
+    // reconnecting media for that SAME, already-current participation
+    // (issue #570 problem 3's handoff-continuation shape), not starting a
+    // new one.
+    fireEvent.click(screen.getByRole("button", { name: "Begin participation probe" }));
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "participating", callId, generation: 1, sequence: 0 }),
+      ),
+    );
+
+    let resolveJoin!: (value: string | undefined) => void;
+    resource.join.mockReturnValueOnce(
+      new Promise<string | undefined>((resolve) => {
+        resolveJoin = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Activate participation probe" }));
+    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }));
+
+    // The REAL, current participation (generation 1) genuinely ends now,
+    // while activateResourceParticipation's own join() is still connecting.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "left",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+        generation: 1,
+        writerId: "tab-main",
+        sequence: 1,
+      } as never),
+    );
+
+    // This must converge normally — never masked just because
+    // activateResourceParticipation happens to be connecting. It never
+    // registered any fresh-join-intent to suppress it with.
+    expect(resource.convergeRemoteLeave).toHaveBeenCalledExactlyOnceWith(callId);
+
+    resolveJoin(callId);
+    await act(async () => undefined);
   });
 
   it("reload: this tab's own earlier participation ended, the provider is unmounted and recreated, and a delayed message from before the reload never outranks the post-reload rejoin", async () => {

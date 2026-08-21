@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { issueCallToken, type ResourceCallKind } from "./callApi";
 import { acquireChatSocket } from "./chatSocket";
-import { leaveResourceCall, startResourceCall } from "./resourceCallSignaling";
+import {
+  leaveResourceCall,
+  ResourceCallSignalingError,
+  startResourceCall,
+} from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
@@ -38,7 +42,23 @@ export interface ResourceCallController {
    * exact same resource call), so React never produces an observable state
    * transition on it that an effect could key off.
    */
-  join: (target: ResourceCallTarget) => Promise<string | undefined>;
+  /**
+   * `onCallIdResolved`, if given, fires SYNCHRONOUSLY — in the same tick as
+   * this hook's own internal `callId` authority, before the very next
+   * `await` (issueCallToken) — the instant this attempt's call_id becomes
+   * known, whether that was already known (`target.callId`, the common
+   * case) or only just resolved from the server (issue #594 adversarial
+   * follow-up, round 3: a fresh join whose target has no callId yet, e.g.
+   * ChatShell's "start/join group call" flow). This is the only way an
+   * external causal-intent tracker (CallSessionProvider's
+   * pendingJoinAttemptsRef) can associate itself with the real callId
+   * before any cross-tab message has a chance to interleave — waiting for
+   * this promise to resolve would already be too late.
+   */
+  join: (
+    target: ResourceCallTarget,
+    onCallIdResolved?: (callId: string) => void,
+  ) => Promise<string | undefined>;
   /** Reacquires a token and Room after this tab regains ownership. */
   reconnect: () => Promise<void>;
   /**
@@ -55,6 +75,19 @@ export interface ResourceCallController {
    * idempotent, so a duplicate/retried leave never corrupts state.
    */
   leave: () => Promise<void>;
+  /**
+   * Converges this session to idle for a participation the server already
+   * ended in a DIFFERENT tab (issue #594) — e.g. this tab handed ownership
+   * off and a dedicated tab then ran its own real leave(). Never calls
+   * leaveResourceCall itself; that round trip already happened wherever the
+   * real leave ran — this is purely local state. No-ops unless `callId`
+   * still matches this hook's own current callId, so a stale/reordered
+   * cross-tab "left" can never clear a rejoin this same hook has since
+   * moved on to. Bumps the attempt generation exactly like leave()'s success
+   * path, so any join()/reconnect() still in flight for the converged
+   * participation aborts instead of resurrecting it.
+   */
+  convergeRemoteLeave: (callId: string) => void;
 }
 
 export function useResourceCallSession(
@@ -67,6 +100,36 @@ export function useResourceCallSession(
   const [error, setError] = useState<string | null>(null);
   const [errorOperation, setErrorOperation] = useState<ResourceCallErrorOperation>(null);
   const activeRef = useRef<ResourceCallTarget | null>(null);
+  // The synchronous, always-current authority for "which callId is this
+  // hook's own participation right now" (issue #594 adversarial follow-up).
+  // Written in the SAME tick as setCallId(), never only via the `callId`
+  // React state closure: a cross-tab "left" can arrive and be accepted by
+  // the ordering guard in CallSessionProvider before this hook's own
+  // component (or CallSessionProvider's, which holds the `resource` object
+  // convergeRemoteLeave lives on) has re-rendered — at which point any
+  // closure over the `callId` state variable would still read the OLD
+  // value, silently no-op the convergence, and — because the ordering guard
+  // already consumed that "left" as accepted — leave this session stuck
+  // active forever, since a redelivered duplicate is rejected as stale.
+  // Mirrors the participationRecordsRef/participationRecords split in
+  // CallSessionProvider.tsx for exactly the same reason: never read a
+  // React state value from a callback that must react to something that
+  // just happened in the same synchronous instant.
+  const callIdRef = useRef<string | null>(null);
+  // Generation-scoped, exactly like joinPromiseRef/cleanupPromiseRef below:
+  // set the instant THIS attempt (join() or reconnect()) marks itself
+  // "connecting", cleared only by whichever attempt's own generation still
+  // owns it — so a superseded attempt's own bail-out can never wipe a
+  // newer attempt's still-genuine in-flight marker. convergeRemoteLeave
+  // (issue #594) reads this to know whether the shared media bridge
+  // currently has a live/in-flight connection THIS HOOK is responsible for
+  // tearing down — never true for a merely-stale `active`/`callId` left
+  // over from a handoff (whose media was already stopped elsewhere), and
+  // never true once join()/reconnect() has itself settled either way. That
+  // distinction matters: unconditionally stopping the shared media bridge
+  // from convergeRemoteLeave would also stop an unrelated, already-active
+  // direct 1:1 call that happens to be reusing the same bridge.
+  const connectingGenerationRef = useRef<number | null>(null);
   // Generation-scoped: a pending join is only deduplicable while its
   // generation is still current. leave() bumps the generation without
   // clearing joinPromiseRef synchronously (it only clears once its own
@@ -127,6 +190,11 @@ export function useResourceCallSession(
     // call.leave is sent but before the server processes it would resend
     // call.presence and resurrect the lease call.leave just released.
     stopHeartbeatRef.current?.();
+    // This leave() is about to run its own stopMedia() below regardless of
+    // outcome, so any older attempt's "connecting" marker is moot the
+    // instant this generation bump supersedes it — never left dangling for
+    // convergeRemoteLeave to misread later as "still connecting".
+    connectingGenerationRef.current = null;
     // Only a call that actually reached the server (a callId is known) has
     // anything server-side to release; an abandoned in-flight join never
     // created a lease, so there is nothing to send — the generation bump
@@ -145,6 +213,7 @@ export function useResourceCallSession(
         if (attemptGenerationRef.current !== generation) return;
         activeRef.current = null;
         joinPromiseRef.current = null;
+        callIdRef.current = null;
         setActive(null);
         setCallId(null);
         setStatus("idle");
@@ -161,70 +230,154 @@ export function useResourceCallSession(
     );
   }, [callId, stopMedia]);
 
-  const join = useCallback((target: ResourceCallTarget): Promise<string | undefined> => {
-    const pending = joinPromiseRef.current;
-    if (
-      pending &&
-      pending.generation === attemptGenerationRef.current &&
-      pending.target.kind === target.kind &&
-      pending.target.id === target.id
-    ) {
-      return pending.promise;
-    }
-    const generation = ++attemptGenerationRef.current;
-    activeRef.current = target;
-    setActive(target);
-    setStatus("connecting");
-    setError(null);
-    setErrorOperation(null);
-    const attempt = (async () => {
-      // Never request a new Room before a pending leave()/unmount has
-      // actually finished releasing the previous one — and never after
-      // one that failed either: its rejection propagates from here.
-      const cleanup = cleanupPromiseRef.current;
-      if (cleanup) await cleanup;
-      if (attemptGenerationRef.current !== generation) return;
-      await mediaRef.current.startAudio();
-      if (attemptGenerationRef.current !== generation) return;
-      const call = target.callId ? { call_id: target.callId } : await startResourceCall(target);
-      if (attemptGenerationRef.current !== generation) return;
-      setCallId(call.call_id);
-      const result = await issueCallToken(call.call_id);
-      if (attemptGenerationRef.current !== generation) return;
-      // RF-24 follow-up: a resource room is one call, camera and microphone
-      // are just controls within it — "audio"/"video" is not a concept of
-      // this room. "audio" is passed only because useCallMedia.connect()
-      // still uses call_type internally to decide whether to auto-enable the
-      // camera (kept for RF-23 compatibility); the camera must never turn on
-      // by itself here, so this stays "audio" unconditionally and the user
-      // enables the camera explicitly via toggleCamera().
-      await mediaRef.current.connect(
-        { call_id: call.call_id, call_type: "audio" },
-        result.token,
-        result.serverUrl,
-      );
-      if (attemptGenerationRef.current !== generation) return undefined;
-      setStatus("active");
-      return call.call_id;
-    })().catch((): string | undefined => {
-      if (attemptGenerationRef.current !== generation) return undefined;
-      setStatus("error");
-      setErrorOperation("join");
-      setError("Não foi possível entrar na chamada.");
-      return undefined;
-    });
-    joinPromiseRef.current = { generation, target, promise: attempt };
-    void attempt.finally(() => {
-      if (joinPromiseRef.current?.promise === attempt) joinPromiseRef.current = null;
-    });
-    return attempt;
-  }, []);
+  const join = useCallback(
+    (
+      target: ResourceCallTarget,
+      onCallIdResolved?: (callId: string) => void,
+    ): Promise<string | undefined> => {
+      const previousActive = activeRef.current;
+      const previousCallId = callIdRef.current;
+      if (
+        previousActive &&
+        cleanupPromiseRef.current === null &&
+        (previousActive.kind !== target.kind || previousActive.id !== target.id)
+      ) {
+        return Promise.resolve(undefined);
+      }
+      const pending = joinPromiseRef.current;
+      if (
+        pending &&
+        pending.generation === attemptGenerationRef.current &&
+        pending.target.kind === target.kind &&
+        pending.target.id === target.id
+      ) {
+        // The already-in-flight attempt this dedups into may already have
+        // resolved its own callId (synchronously, before its next await) —
+        // this new caller's own callback still deserves that fact.
+        if (callIdRef.current) onCallIdResolved?.(callIdRef.current);
+        return pending.promise;
+      }
+      const generation = ++attemptGenerationRef.current;
+      activeRef.current = target;
+      setActive(target);
+      setStatus("connecting");
+      // Marks this attempt as the one THIS callId's convergeRemoteLeave, if it
+      // fires mid-flight, is responsible for tearing media down for — see the
+      // ref's own comment above for why a state-based `status === "connecting"`
+      // read would be too stale/coarse for that decision.
+      connectingGenerationRef.current = generation;
+      setError(null);
+      setErrorOperation(null);
+      const attempt = (async () => {
+        // Never request a new Room before a pending leave()/unmount has
+        // actually finished releasing the previous one — and never after
+        // one that failed either: its rejection propagates from here.
+        const cleanup = cleanupPromiseRef.current;
+        if (cleanup) await cleanup;
+        if (attemptGenerationRef.current !== generation) return;
+        await mediaRef.current.startAudio();
+        if (attemptGenerationRef.current !== generation) return;
+        const call = target.callId ? { call_id: target.callId } : await startResourceCall(target);
+        if (attemptGenerationRef.current !== generation) return;
+        setCallId(call.call_id);
+        // Written synchronously in this same tick as setCallId() above — see
+        // callIdRef's own comment for why the React state alone isn't enough.
+        callIdRef.current = call.call_id;
+        // Fires BEFORE the next await (issueCallToken) — see the interface's
+        // own doc comment for why this exact placement is what makes it
+        // useful to an external causal-intent tracker.
+        onCallIdResolved?.(call.call_id);
+        const result = await issueCallToken(call.call_id);
+        if (attemptGenerationRef.current !== generation) return;
+        // RF-24 follow-up: a resource room is one call, camera and microphone
+        // are just controls within it — "audio"/"video" is not a concept of
+        // this room. "audio" is passed only because useCallMedia.connect()
+        // still uses call_type internally to decide whether to auto-enable
+        // the camera (kept for RF-23 compatibility); the camera must never
+        // turn on by itself here, so this stays "audio" unconditionally and
+        // the user enables the camera explicitly via toggleCamera().
+        await mediaRef.current.connect(
+          { call_id: call.call_id, call_type: "audio" },
+          result.token,
+          result.serverUrl,
+        );
+        if (attemptGenerationRef.current !== generation) return undefined;
+        if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
+        setStatus("active");
+        return call.call_id;
+      })().catch((joinError: unknown): string | undefined => {
+        if (attemptGenerationRef.current !== generation) return undefined;
+        if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
+        if (
+          joinError instanceof ResourceCallSignalingError &&
+          joinError.code === "call_participant_busy"
+        ) {
+          activeRef.current = previousActive;
+          callIdRef.current = previousCallId;
+          setActive(previousActive);
+          setCallId(previousCallId);
+          setStatus(previousCallId ? "active" : "error");
+          setErrorOperation("join");
+          setError("Você já está em outra chamada.");
+          return undefined;
+        }
+        setStatus("error");
+        setErrorOperation("join");
+        setError("Não foi possível entrar na chamada.");
+        return undefined;
+      });
+      joinPromiseRef.current = { generation, target, promise: attempt };
+      void attempt.finally(() => {
+        if (joinPromiseRef.current?.promise === attempt) joinPromiseRef.current = null;
+      });
+      return attempt;
+    },
+    [],
+  );
+
+  const convergeRemoteLeave = useCallback(
+    (leftCallId: string) => {
+      // callIdRef, never the `callId` state closure — see its own comment
+      // above for the render-timing race this avoids.
+      if (callIdRef.current !== leftCallId) return;
+      attemptGenerationRef.current += 1;
+      stopHeartbeatRef.current?.();
+      activeRef.current = null;
+      joinPromiseRef.current = null;
+      callIdRef.current = null;
+      // Only ever stop the shared media bridge here when THIS hook's own
+      // join()/reconnect() genuinely still has a connect in flight for the
+      // participation being converged — never unconditionally: a merely
+      // stale `active`/`callId` (the common #594 case, left over from a
+      // handoff whose media was already stopped elsewhere) must not risk
+      // reaching into a media bridge that could, by now, be servicing an
+      // entirely unrelated, currently-active direct 1:1 call instead.
+      const hadPendingConnect = connectingGenerationRef.current !== null;
+      connectingGenerationRef.current = null;
+      setActive(null);
+      setCallId(null);
+      setStatus("idle");
+      setError(null);
+      setErrorOperation(null);
+      // Safe even while media.connect() is still awaiting the server: the
+      // underlying LiveKitSpikeSession.connect() checks its own `disposed`
+      // flag (set synchronously by disconnect(), before any await) right
+      // after its room.connect() await resolves, and self-disconnects
+      // instead of completing — and useCallMedia.connect()'s own
+      // sessionRef/generationRef check independently stops it from ever
+      // reporting "connected". Never lets a connect that started before
+      // this convergence end up left running in the background.
+      if (hadPendingConnect) void stopMedia().catch(() => undefined);
+    },
+    [stopMedia],
+  );
 
   const reconnect = useCallback(async (): Promise<void> => {
     const target = activeRef.current;
     if (!target || !callId) return;
     const generation = ++attemptGenerationRef.current;
     setStatus("connecting");
+    connectingGenerationRef.current = generation;
     setError(null);
     setErrorOperation(null);
     try {
@@ -238,9 +391,13 @@ export function useResourceCallSession(
         result.token,
         result.serverUrl,
       );
-      if (attemptGenerationRef.current === generation) setStatus("active");
+      if (attemptGenerationRef.current === generation) {
+        if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
+        setStatus("active");
+      }
     } catch (reconnectError) {
       if (attemptGenerationRef.current !== generation) return;
+      if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
       setStatus("error");
       setErrorOperation("join");
       setError("Não foi possível recuperar a chamada.");
@@ -278,5 +435,15 @@ export function useResourceCallSession(
     return stop;
   }, [callId, presenceEnabled, status]);
 
-  return { active, callId, status, error, errorOperation, join, reconnect, leave };
+  return {
+    active,
+    callId,
+    status,
+    error,
+    errorOperation,
+    join,
+    reconnect,
+    leave,
+    convergeRemoteLeave,
+  };
 }
