@@ -405,6 +405,9 @@ func readDisplayNameAndUpdatedAt(t *testing.T, pool *pgxpool.Pool, userID string
 func TestPGXOIDCStore_ReloginDoesNotClobberUploadedAvatarPostgreSQL(t *testing.T) {
 	pool := connectAuthTestDB(t)
 	applyAuthMigrations(t, pool)
+	// JIT provisioning enrolls the new user in the default workspace, so the
+	// chat schema has to be there for the login under test to succeed.
+	applyChatMigrations(t, pool)
 	ctx := context.Background()
 
 	oidcStore := storage.NewPGXOIDCStore(pool)

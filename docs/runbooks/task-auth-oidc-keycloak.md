@@ -111,33 +111,40 @@ The partial unique index on `(external_provider, external_subject)` is what
 makes a duplicate account impossible; this branch is what keeps the second
 browser from seeing a 500.
 
-### Workspace membership is NOT provisioned
+### Workspace membership is provisioned with the account (issue #604)
 
-JIT provisioning creates the `auth.users` row and an NChat session. It does
-**not** create a `chat.workspace_members` row, because workspace membership
-lives in the chat schema, behind chat-service, and no login path in the platform
-writes it.
+JIT provisioning creates the `auth.users` row **and** the
+`chat.workspace_members` row, inside the same transaction that creates the
+session and the exchange code. Without it a successful SSO login produced a user
+every chat endpoint answered 403 to, because chat authorization is the workspace
+membership.
 
-This is not specific to SSO — a manually created user is in exactly the same
-position. At the time of writing, `MemberService.JoinWorkspace` has no HTTP
-caller, so **every** new account (manual or OIDC) needs its workspace membership
-created out of band before the person can use the chat.
+The rules:
 
-Operationally this means an SSO user can authenticate and receive valid NChat
-tokens while still having no channel to open. Do not read a successful SSO login
-as "the user is onboarded". See "Pending decisions" below.
+- the workspace is resolved by the logical rule `slug = 'default' AND status =
+  'active'`, never by the seed UUID;
+- the membership is always `role = 'member'`, `status = 'active'`. NChat RBAC
+  stays internal and server-side: no Keycloak role, group or claim is mapped,
+  and `owner`, `admin` and `moderator` are never granted implicitly;
+- it happens **only** when this login created the account. A login by an
+  existing user never writes the table, so a `suspended` or `left` membership is
+  not reactivated, a deliberately removed membership is not recreated, and an
+  existing role is never rewritten;
+- if there is no active default workspace, or the membership cannot be
+  inserted, provisioning fails and the whole transaction rolls back — no
+  account, no session, no exchange code. The login returns 500; the fix is
+  operational (restore the default workspace), not a retry.
 
-### Pending decisions
+The auth-service writes one table of the chat schema for this. That is
+deliberate: the alternatives (a synchronous call to chat-service, or an
+asynchronous event) both allow a login to complete while the user is still
+unusable, and neither exists in the platform today. The runtime role `nchat_app`
+already had `INSERT` on `chat` (`scripts/db/grant-runtime.sql`), so no new grant
+was needed.
 
-Not decided in this task, because each one is a product/RBAC policy choice
-rather than an OIDC detail:
-
-- which workspace a JIT-provisioned user should join, if any;
-- with which role (the safe default is the ordinary `member`; `owner`, `admin`
-  and `moderator` must never be granted implicitly, and no Keycloak role is
-  mapped to an NChat role today);
-- whether joining should happen at provisioning time or stay an explicit admin
-  action.
+Manually created users are **not** covered by this: `MemberService.JoinWorkspace`
+still has no HTTP caller, so an account created by an administrator continues to
+need its membership created out of band.
 
 ## Security Notes
 

@@ -176,6 +176,7 @@ func TestPGXOIDCStore_CreateOIDCSessionAndExchangeAutoProvisionsUser(t *testing.
 	mock.ExpectQuery(`INSERT INTO auth\.users`).
 		WithArgs("new@example.com", "New User", "", "", "keycloak", "subject-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "email", "display_name"}).AddRow("user-id", "new@example.com", "New User"))
+	expectDefaultWorkspaceEnrollment(mock)
 	mock.ExpectExec(`INSERT INTO auth\.login_attempts`).
 		WithArgs("user-id", "new@example.com", true, nil, nil, nil).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
