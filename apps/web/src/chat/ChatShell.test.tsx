@@ -117,6 +117,13 @@ beforeEach(() => {
   _resetChatSocket(() => 0);
   global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
   setTokens("test-token");
+  // This file uses the REAL createOwnershipCoordinator (never mocked), which
+  // persists ParticipationToken generations to real localStorage — issue
+  // #594 adversarial follow-up, round 3's fix now makes ChatShell's own
+  // join button actually allocate one. Without this, generations accumulate
+  // across tests in this file (all sharing jsdom's one localStorage) instead
+  // of each test starting from a clean, predictable floor.
+  localStorage.clear();
   prepareMedia.mockClear();
   connectMedia.mockClear();
   stopMedia.mockClear();
@@ -844,5 +851,113 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
     );
 
     expect(await screen.findByRole("button", { name: "Entrar no canal" })).toBeDisabled();
+  });
+});
+
+// ── issue #594 adversarial follow-up, round 3: ChatShell's own fresh-join
+// button (target.callId undefined — the server decides/reuses the call_id)
+// is the primary real-world entry point for this bug, and previously called
+// resourceCall.join() directly, bypassing BOTH the causal race protection
+// AND beginResourceParticipation — meaning a join through this exact button
+// never registered a ParticipationToken or broadcast "participating" at
+// all. Drives the REAL CallSessionProvider/ownership coordinator end to
+// end, including a genuine second BroadcastChannel instance standing in for
+// another tab, since this file deliberately never mocks callOwnership.ts. ──
+
+describe("ChatShell RF-24 fresh join — issue #594 adversarial follow-up (round 3)", () => {
+  it("joins through the protected mechanism: registers a real ParticipationToken (previously never happened at all), and an old 'left' for the call_id the server reuses never aborts the in-flight join", async () => {
+    const user = userEvent.setup();
+    const socket = await renderWithJoinButtonReady();
+    const reusedCallId = "00000000-0000-4000-8000-000000000550";
+    const otherWriterId = "00000000-0000-4000-8000-000000009001";
+    // Seeds the SAME shared, per-writer storage allocateParticipationGeneration
+    // itself reads (issue #570 follow-up design) — mirrors what the OLD
+    // participation's own real allocateParticipationGeneration() call would
+    // already have written. Without this, the fresh join's own real
+    // allocation (which reads this SAME storage) would independently also
+    // land on generation 1, and the writerId tie-break in
+    // compareParticipationTokens could go either way — never a realistic
+    // simulation of "the storage already has a real, older generation on
+    // record".
+    localStorage.setItem(
+      `nchat.call.participation.v2.${encodeURIComponent(reusedCallId)}:${otherWriterId}`,
+      JSON.stringify({ v: 2, generation: 1 }),
+    );
+
+    let resolveConnect!: () => void;
+    connectMedia.mockReturnValueOnce(
+      new Promise<undefined>((resolve) => {
+        resolveConnect = () => resolve(undefined);
+      }),
+    );
+
+    const otherTab = new BroadcastChannel("nchat-call-ownership-v1");
+    const receivedFromProvider: Array<Record<string, unknown>> = [];
+    otherTab.onmessage = (event: MessageEvent) => {
+      receivedFromProvider.push(event.data as Record<string, unknown>);
+    };
+    try {
+      // Click through call.start -> call.accepted: target.callId was
+      // undefined at the click, and is only now, synchronously inside
+      // join(), resolved to reusedCallId — issueResourceCallToken (mocked)
+      // resolves immediately after, leaving media.connect() as the one
+      // genuinely still-pending step. Waiting for connectMedia's own call
+      // (not just joinResource()'s return) is what makes this deterministic
+      // — it can only have been reached after onCallIdResolved already ran.
+      // (resource-call-panel itself is not a useful "still connecting"
+      // signal here: it shows as soon as callId resolves, well before
+      // media.connect() itself settles.)
+      await joinResource(user, socket);
+      await waitFor(() => expect(connectMedia).toHaveBeenCalledOnce());
+
+      // An OLD participation for this EXACT call_id — the server reused it
+      // for a brand-new join, exactly the scenario the ordering guard
+      // cannot yet know differs from "the same one" — genuinely ended in
+      // another tab. Its "left" (generation 1) arrives now, posted on a
+      // real second BroadcastChannel instance the same way another tab's
+      // coordinator would.
+      act(() => {
+        otherTab.postMessage({
+          v: 1,
+          type: "left",
+          callId: reusedCallId,
+          tabId: otherWriterId,
+          epoch: 3,
+          generation: 1,
+          writerId: otherWriterId,
+          sequence: 1,
+        });
+      });
+      // Real BroadcastChannel dispatch is a genuine task, not a microtask —
+      // let it actually run.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      // The in-flight join must not have been aborted by it: letting
+      // media.connect() finally resolve still reaches "active" and shows
+      // the panel — an aborted attempt would instead leave resource.status
+      // stuck at "idle" (convergeRemoteLeave) with nothing left to await.
+      resolveConnect();
+      expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+
+      // The new participation is registered for real — generation 2, since
+      // the shared storage already recorded generation 1 for this call_id
+      // (issue #594 adversarial follow-up: was NEVER broadcast at all
+      // before this fix, since resourceCall.join() bypassed
+      // beginResourceParticipation entirely).
+      await waitFor(() =>
+        expect(receivedFromProvider).toContainEqual(
+          expect.objectContaining({
+            type: "participating",
+            callId: reusedCallId,
+            generation: 2,
+            sequence: 0,
+          }),
+        ),
+      );
+    } finally {
+      otherTab.close();
+    }
   });
 });
