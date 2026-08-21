@@ -859,4 +859,228 @@ describe("useResourceCallSession", () => {
       expect(view.result.current.errorOperation).toBeNull();
     });
   });
+
+  // ── issue #594: converging a participation another tab already ended
+  // server-side must clear this session locally, without ever sending
+  // another call.leave — and must never let a stale in-flight join/reconnect
+  // resurrect it afterward. ────────────────────────────────────────────────
+
+  describe("convergeRemoteLeave", () => {
+    it("clears active/callId/status to idle without ever calling leaveResourceCall or stopping media again (already-settled participation)", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      expect(view.result.current.status).toBe("active");
+      media.stop.mockClear();
+
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.callId).toBeNull();
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.error).toBeNull();
+      expect(leaveResourceCall).not.toHaveBeenCalled();
+      // Nothing was in flight for this hook at convergence time — a settled
+      // "active" participation's media is either already torn down by
+      // whatever made it stale (e.g. an ownership handoff) or, if this tab
+      // still legitimately owned it, is someone else's responsibility to
+      // stop — convergeRemoteLeave must not reach for the shared media
+      // bridge just because it once had a session.
+      expect(media.stop).not.toHaveBeenCalled();
+    });
+
+    it("no-ops for a callId that doesn't match this hook's own current participation", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+
+      act(() => view.result.current.convergeRemoteLeave("00000000-0000-4000-8000-000000000999"));
+
+      expect(view.result.current.active).toEqual(channelTarget);
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(view.result.current.status).toBe("active");
+    });
+
+    it("no-ops when nothing is active", () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.status).toBe("idle");
+      expect(media.stop).not.toHaveBeenCalled();
+    });
+
+    // ── adversarial follow-up: convergeRemoteLeave must use a synchronous
+    // ref, never the `callId` React state closure, so it can never observe
+    // a stale/old callId at the exact moment a cross-tab "left" for THIS
+    // attempt's own, just-claimed callId is accepted — and it must actually
+    // tear down a still-connecting media session, never just the outer
+    // active/status/callId bookkeeping, so no LiveKit Room is ever left
+    // running in the background. ──────────────────────────────────────────
+
+    it("a 'left' that arrives before callId is known (startAudio still pending) never converges and never blocks the join from completing normally", async () => {
+      const media = fakeMedia();
+      let resolveStartAudio!: () => void;
+      media.startAudio.mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          resolveStartAudio = resolve;
+        }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+
+      let joining!: Promise<string | undefined>;
+      act(() => {
+        joining = view.result.current.join(channelTarget);
+      });
+      expect(view.result.current.callId).toBeNull();
+
+      // Nothing this hook has claimed yet — a "left" for the callId this
+      // join() is ABOUT to claim must be a pure no-op, never interfering
+      // with the attempt already under way.
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+      expect(view.result.current.status).toBe("connecting");
+
+      await act(async () => {
+        resolveStartAudio();
+        await joining;
+      });
+
+      expect(view.result.current.status).toBe("active");
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+    });
+
+    it("a 'left' accepted the INSTANT callId becomes authoritative (same tick as setCallId, before startResourceCall's caller could ever re-render) still converges — proving the ref, not the callId state closure, is what's read", async () => {
+      const media = fakeMedia();
+      let resolveToken!: (value: { token: string; expiresAt: string; serverUrl: string }) => void;
+      vi.mocked(issueCallToken).mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveToken = resolve;
+        }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+
+      let joining!: Promise<string | undefined>;
+      act(() => {
+        joining = view.result.current.join(channelTarget);
+      });
+      // Only startAudio() (an already-resolved mock) has had a chance to
+      // settle — callId was just claimed synchronously in that same
+      // continuation, and the attempt is now genuinely stalled awaiting
+      // issueCallToken(), the very next step.
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // A single accepted "left" here must fully converge — not merely
+      // "eventually, once a duplicate redelivers it": the ordering guard
+      // upstream (CallSessionProvider's commitParticipation) already
+      // consumes the message on this first delivery, so if this call missed
+      // it (e.g. by reading a stale `callId` closure instead of a ref), the
+      // session would be stuck active forever with no second chance.
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.callId).toBeNull();
+
+      await act(async () => {
+        resolveToken({ token: "late", expiresAt: "2026-01-01T00:00:00Z", serverUrl: "wss://x" });
+        await joining;
+      });
+
+      // The late token/connect continuation must never resurrect it.
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.callId).toBeNull();
+      expect(media.connect).not.toHaveBeenCalled();
+    });
+
+    it("invalidates a join still in flight, tears down its still-pending media.connect() (no ghost Room), and never resurrects on late resolution", async () => {
+      const media = fakeMedia();
+      let resolveConnect!: () => void;
+      media.connect.mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          resolveConnect = resolve;
+        }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+
+      let joining!: Promise<string | undefined>;
+      act(() => {
+        joining = view.result.current.join(channelTarget);
+      });
+      // Let startResourceCall/issueCallToken (already-resolved mocks) settle
+      // so callId is known and the attempt is genuinely stalled at connect().
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      media.stop.mockClear();
+
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+      expect(view.result.current.status).toBe("idle");
+      // The in-flight media.connect() is torn down immediately, not merely
+      // ignored once it eventually settles — this is what actually prevents
+      // a live LiveKit Room from being left connected in the background.
+      expect(media.stop).toHaveBeenCalledOnce();
+
+      await act(async () => {
+        resolveConnect();
+        await joining;
+      });
+
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.callId).toBeNull();
+    });
+
+    it("invalidates a reconnect() still in flight, tears down its still-pending media.connect() (no ghost Room), and never resurrects on late resolution", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+
+      let resolveConnect!: () => void;
+      media.connect.mockReturnValueOnce(
+        new Promise<void>((resolve) => {
+          resolveConnect = resolve;
+        }),
+      );
+      let reconnecting!: Promise<void>;
+      act(() => {
+        reconnecting = view.result.current.reconnect().catch(() => undefined);
+      });
+      media.stop.mockClear();
+
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+      expect(view.result.current.status).toBe("idle");
+      expect(media.stop).toHaveBeenCalled();
+
+      await act(async () => {
+        resolveConnect();
+        await reconnecting;
+      });
+
+      expect(view.result.current.status).toBe("idle");
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.callId).toBeNull();
+    });
+
+    it("a second join() for the SAME callId after convergence starts a real new attempt, unaffected by the prior convergence's now-superseded generation", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
+      expect(view.result.current.status).toBe("idle");
+      media.connect.mockClear();
+
+      await act(() => view.result.current.join(channelTarget));
+
+      expect(view.result.current.status).toBe("active");
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(media.connect).toHaveBeenCalledOnce();
+    });
+  });
 });
