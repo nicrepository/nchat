@@ -378,7 +378,10 @@ export function useChatSidebar() {
                 targetId: event.target_id,
                 senderDisplayName: payload.sender_display_name,
                 bodyText: payload.body_text,
-                onNavigate: navigate,
+                onNavigate: (path) => {
+                  navigate(path);
+                  refreshSidebar();
+                },
               }).shown;
             } catch {
               // The module already guards itself; this is defense in depth —
