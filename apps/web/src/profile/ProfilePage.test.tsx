@@ -147,6 +147,38 @@ describe("ProfilePage — initial load", () => {
     expect(removeBtn()).toBeDisabled();
   });
 
+  // ID 19: the fallback is the user's own initials (reusing initialsFrom, the
+  // same helper ChatSidebar's Avatar uses), not a generic "?" glyph.
+  it("shows the user's initials, not a generic glyph, when there is no avatar", async () => {
+    mockFetchProfile.mockResolvedValue({ id: "u1", displayName: "Bruno Silva", avatarUrl: undefined });
+    renderPage();
+    await settled();
+    expect(screen.getByText("BS")).toBeInTheDocument();
+    expect(screen.queryByText("?")).not.toBeInTheDocument();
+  });
+
+  // ID 19: a persisted URL that fails to load (404, corrupt file, expired
+  // link) must fall back to initials — never the browser's broken-image icon
+  // — mirroring the same reset-on-src-change rule ChatSidebar's Avatar uses.
+  it("falls back to initials when the persisted avatar URL fails to load", async () => {
+    mockFetchProfile.mockResolvedValue({
+      id: "u1",
+      displayName: "Bruno Silva",
+      avatarUrl: "/api/auth/avatars/broken.png",
+    });
+    renderPage();
+    await settled();
+
+    const img = await screen.findByAltText(/pré-visualização/i);
+    fireEvent.error(img);
+
+    expect(screen.queryByAltText(/pré-visualização/i)).not.toBeInTheDocument();
+    expect(screen.getByText("BS")).toBeInTheDocument();
+    // The persisted value is untouched by a render-time failure — removal
+    // must still be offered, and a reload should get a fresh chance to load it.
+    expect(removeBtn()).toBeEnabled();
+  });
+
   it("does not enable removal or show 'no avatar' while still loading", async () => {
     mockFetchProfile.mockReturnValue(new Promise(() => {}));
     renderPage();
