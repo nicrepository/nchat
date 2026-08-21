@@ -214,6 +214,7 @@ describe("ChatShell call identity bootstrap", () => {
     await act(async () =>
       sidebar.resolve({
         currentUserId,
+        workspaceId: "workspace-1",
         channels: [],
         dms: [
           {
@@ -290,6 +291,7 @@ describe("ChatShell call identity bootstrap", () => {
     await act(async () =>
       successfulRetry.resolve({
         currentUserId,
+        workspaceId: "workspace-1",
         channels: [],
         dms: [
           {
@@ -364,6 +366,7 @@ describe("ChatShell call identity bootstrap", () => {
     await act(async () =>
       successfulRetry.resolve({
         currentUserId,
+        workspaceId: "workspace-1",
         channels: [],
         dms: [
           {
@@ -438,6 +441,7 @@ function JoinChannelButton() {
 async function renderWithJoinButtonReady() {
   vi.mocked(fetchSidebarData).mockResolvedValue({
     currentUserId,
+    workspaceId: "workspace-1",
     channels: [{ id: "chan-1", name: "Geral", type: "public", canWrite: true }],
     dms: [
       {

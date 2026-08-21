@@ -893,3 +893,81 @@ func TestChatStores_ChannelReadAccessIsOnlyTheSharedFunction(t *testing.T) {
 		}
 	}
 }
+
+// The Admin Console (issue #579) reads two of this schema's tables
+// platform-wide, with no workspace in the request, so every index those tables
+// already had leads with the wrong column. These two are what keep the listings
+// from sorting a growing table to return one page.
+//
+// Asserted here rather than only in admin-service because the indexes live in
+// this schema's migrations: whoever removes them will be reading this file.
+func TestChatMigration_AddsAdminDirectoryPaginationIndexes(t *testing.T) {
+	migration := readChatMigration(t, "000033_admin_directory_pagination_indexes.up.sql")
+	for _, expected := range []string{
+		// GET /api/admin/conversations orders by (updated_at, id) DESC and
+		// resumes with a row-value comparison on the same pair.
+		"CREATE INDEX idx_dm_conversations_directory_page",
+		"ON chat.dm_conversations (updated_at DESC, id DESC)",
+		// GET /api/admin/policies/{anti-spam,upload} order by (created_at, id) DESC.
+		"CREATE INDEX idx_workspaces_directory_page",
+		"ON chat.workspaces (created_at DESC, id DESC)",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("admin directory pagination migration missing %q", expected)
+		}
+	}
+	// Neither is partial: every filter on those endpoints is optional, so a
+	// predicate would stop covering the listing as soon as one is cleared. The
+	// comment block documents the indexes that are partial, so only the
+	// statements count here.
+	if statements := strippedComments(migration); strings.Contains(statements, "WHERE") {
+		t.Fatalf("the directory pagination indexes must cover every row, got:\n%s", statements)
+	}
+}
+
+// strippedComments drops line comments so an assertion about what a migration
+// does is not satisfied by a migration that merely mentions it.
+func strippedComments(migration string) string {
+	var kept []string
+	for _, line := range strings.Split(migration, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			kept = append(kept, line)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+func TestChatMigration_AdminDirectoryPaginationDownRemovesBothIndexes(t *testing.T) {
+	migration := readChatMigration(t, "000033_admin_directory_pagination_indexes.down.sql")
+	for _, expected := range []string{
+		"DROP INDEX IF EXISTS chat.idx_workspaces_directory_page",
+		"DROP INDEX IF EXISTS chat.idx_dm_conversations_directory_page",
+	} {
+		if !strings.Contains(migration, expected) {
+			t.Fatalf("admin directory pagination rollback missing %q", expected)
+		}
+	}
+	// Index-only: the rollback must cost no row and no constraint.
+	for _, forbidden := range []string{"DROP TABLE", "DROP COLUMN", "DELETE FROM", "ALTER TABLE"} {
+		if strings.Contains(migration, forbidden) {
+			t.Fatalf("the rollback must be index-only, found %q", forbidden)
+		}
+	}
+}
+
+// The workspace-scoped indexes chat-service reads are a different access
+// pattern, not a superseded one. A B-tree leading with workspace_id cannot
+// produce the global ordering, and the global index cannot answer a
+// workspace-filtered lookup cheaply — removing either one would be a
+// regression for whichever service depends on it.
+func TestChatMigration_KeepsWorkspaceScopedConversationIndexes(t *testing.T) {
+	migrations := strippedComments(readAllChatUpMigrations(t))
+	for _, expected := range []string{
+		"ON chat.dm_conversations (workspace_id, status, updated_at DESC)",
+		"ON chat.dm_conversations (workspace_id, updated_at DESC)",
+	} {
+		if !strings.Contains(migrations, expected) {
+			t.Fatalf("a workspace-scoped conversation index was removed: %q", expected)
+		}
+	}
+}

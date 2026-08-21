@@ -52,7 +52,7 @@ func CreateAdminSession(sessions AdminSessionManager, audit AuthorizationRecorde
 		})
 		if err != nil {
 			recordSessionEvent(r, audit, bearer.UserID, domain.AuditActionSessionCreate, auditResultFor(err))
-			writeAuthError(w, err)
+			writeDomainError(w, err)
 			return
 		}
 		recordSessionEvent(r, audit, bearer.UserID, domain.AuditActionSessionCreate, domain.AuditResultSuccess)

@@ -144,6 +144,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("DELETE "+RouteDMSidebarPin, authMiddleware(
 		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnpinDM)),
 	))
+	mux.Handle("POST "+RouteChannelRead, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MarkChannelRead)),
+	))
+	mux.Handle("POST "+RouteDMRead, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MarkDMRead)),
+	))
 
 	// RF-19 (issue #419): every route that creates a message goes through
 	// sendLimit, so there is exactly one place a send can be admitted from and

@@ -116,7 +116,7 @@ func TestWriteAuthError_MapsEachDomainErrorOnce(t *testing.T) {
 	}
 	for err, want := range tests {
 		response := httptest.NewRecorder()
-		writeAuthError(response, err)
+		writeDomainError(response, err)
 		if response.Code != want {
 			t.Fatalf("%v: expected %d, got %d", err, want, response.Code)
 		}

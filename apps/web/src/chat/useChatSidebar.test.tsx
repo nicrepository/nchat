@@ -8,11 +8,13 @@ import type {
   ShowBrowserMessageNotificationResult,
 } from "./browserNotification";
 import { parseInstant } from "./sidebarOrder";
+import { savePersistedUnread } from "./sidebarUnreadPersistence";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
 import { useChatSidebar } from "./useChatSidebar";
 
 const {
   mockFetchSidebarData,
+  mockMarkConversationRead,
   mockSetSidebarConversationPinned,
   mockPlayMessageSound,
   mockGetSoundNotificationMode,
@@ -20,6 +22,7 @@ const {
   websocket,
 } = vi.hoisted(() => ({
   mockFetchSidebarData: vi.fn(),
+  mockMarkConversationRead: vi.fn(),
   mockSetSidebarConversationPinned: vi.fn(),
   mockPlayMessageSound: vi.fn(),
   mockGetSoundNotificationMode: vi.fn(
@@ -39,6 +42,7 @@ const {
 
 vi.mock("./chatApi", () => ({
   fetchSidebarData: mockFetchSidebarData,
+  markConversationRead: mockMarkConversationRead,
   setSidebarConversationPinned: mockSetSidebarConversationPinned,
 }));
 vi.mock("./messageSound", () => ({
@@ -1892,5 +1896,253 @@ describe("useChatSidebar — conversa recém-disponível", () => {
     });
 
     expect(seen).not.toContain("loading");
+  });
+});
+
+// ── Badge persistence ─────────────────────────────────────────────────────────
+// The gates covered above (own message, active conversation, dedup, sound
+// preference) are unaffected by persistence — mergeUnread only changes what a
+// "loaded" dispatch does with unread/mention fields, never message_created or
+// target_opened. These tests cover the persistence contract itself.
+describe("useChatSidebar — badge persistence", () => {
+  const workspaceId = "workspace-1";
+  const otherWorkspaceId = "workspace-2";
+
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    websocket.onConversationAvailable = null;
+    mockFetchSidebarData.mockReset();
+    mockMarkConversationRead.mockReset();
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
+  });
+
+  it("uses the server unread count over a different persisted value", async () => {
+    savePersistedUnread(currentUserId, workspaceId, [
+      { id: channelA, type: "channel", unreadCount: 9, hasMentionUnread: true },
+    ]);
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 2 }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    expect(unreadCounts(result.current.state).channelA).toBe(2);
+    expect(
+      result.current.state.status === "ready" && result.current.state.channels[0].hasMentionUnread,
+    ).toBe(true);
+  });
+
+  it("lets a lower server count replace the current tab count on refresh", async () => {
+    mockFetchSidebarData
+      .mockResolvedValueOnce({
+        currentUserId,
+        workspaceId,
+        channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 4 }],
+        dms: [],
+      })
+      .mockResolvedValueOnce({
+        currentUserId,
+        workspaceId,
+        channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 1 }],
+        dms: [],
+      });
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(4));
+
+    await act(async () => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(1));
+  });
+
+  it("marks the opened conversation read without blocking the local badge clear", async () => {
+    mockMarkConversationRead.mockRejectedValueOnce(new Error("offline"));
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 3 }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA));
+    expect(unreadCounts(result.current.state).channelA).toBe(0);
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("hydrates unread and mention state from localStorage on a fresh mount — the same mechanism behind refresh, browser reopen, remount and re-login by the same user, all of which start with no in-memory previous state", async () => {
+    savePersistedUnread(currentUserId, workspaceId, [
+      { id: channelA, type: "channel", unreadCount: 2, hasMentionUnread: true },
+    ]);
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    if (result.current.state.status === "ready") {
+      const channel = result.current.state.channels.find((c) => c.id === channelA);
+      expect(channel?.unreadCount).toBe(2);
+      expect(channel?.hasMentionUnread).toBe(true);
+    }
+  });
+
+  it("keeps a live unread count when an older backend omits unread_count during refresh", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("live-1", channelA)));
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+
+    await act(async () => {
+      websocket.onConversationAvailable?.();
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  it("does not resurrect a conversation's badge after it was marked read, even on a fresh remount", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+
+    const { Wrapper, navigateRef } = navigableWrapper("/chat");
+    const { result, unmount } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("to-be-read", channelA)));
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+
+    act(() => navigateRef.current(`/chat/channel/${channelA}`));
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
+    unmount();
+
+    const { result: remounted } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(remounted.current.state.status).toBe("ready"));
+    expect(unreadCounts(remounted.current.state).channelA).toBe(0);
+  });
+
+  it("keeps two different users' badges isolated within the same workspace", async () => {
+    savePersistedUnread(currentUserId, workspaceId, [
+      { id: channelA, type: "channel", unreadCount: 3, hasMentionUnread: false },
+    ]);
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId: otherUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+    const { result: asOtherUser } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(asOtherUser.current.state.status).toBe("ready"));
+    expect(unreadCounts(asOtherUser.current.state).channelA).toBe(0);
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+    const { result: asOriginalUser } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(asOriginalUser.current.state.status).toBe("ready"));
+    expect(unreadCounts(asOriginalUser.current.state).channelA).toBe(3);
+  });
+
+  it("keeps the same user's badges isolated between two different workspaces", async () => {
+    savePersistedUnread(currentUserId, workspaceId, [
+      { id: channelA, type: "channel", unreadCount: 4, hasMentionUnread: false },
+    ]);
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId: otherWorkspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+    const { result: inOtherWorkspace } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(inOtherWorkspace.current.state.status).toBe("ready"));
+    expect(unreadCounts(inOtherWorkspace.current.state).channelA).toBe(0);
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+    const { result: inOriginalWorkspace } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(inOriginalWorkspace.current.state.status).toBe("ready"));
+    expect(unreadCounts(inOriginalWorkspace.current.state).channelA).toBe(4);
+  });
+
+  it("never plays a sound or attempts a native notification while hydrating persisted badges", async () => {
+    savePersistedUnread(currentUserId, workspaceId, [
+      { id: channelA, type: "channel", unreadCount: 5, hasMentionUnread: true },
+    ]);
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    expect(unreadCounts(result.current.state).channelA).toBe(5);
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not crash on a corrupted localStorage payload and falls back to the server's counts", async () => {
+    // Mirrors sidebarUnreadPersistence.ts's own key format — that module
+    // already proves loadPersistedUnread() never throws on this; this test
+    // proves the hook mounts correctly end-to-end when it doesn't.
+    localStorage.setItem(`nchat.sidebar.unread.v1:${workspaceId}:${currentUserId}`, "{not json");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(unreadCounts(result.current.state).channelA).toBe(0);
   });
 });

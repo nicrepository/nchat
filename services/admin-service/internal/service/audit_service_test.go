@@ -11,12 +11,13 @@ import (
 )
 
 type fakeAuditStore struct {
-	appended   []domain.AuditEvent
-	appendErr  error
-	entries    []domain.AuditEntry
-	listErr    error
-	lastLimit  int
-	listCalled bool
+	appended     []domain.AuditEvent
+	appendErr    error
+	entries      []domain.AuditEntry
+	listErr      error
+	lastLimit    int
+	lastResource string
+	listCalled   bool
 }
 
 func (f *fakeAuditStore) AppendAudit(_ context.Context, event domain.AuditEvent) error {
@@ -24,9 +25,10 @@ func (f *fakeAuditStore) AppendAudit(_ context.Context, event domain.AuditEvent)
 	return f.appendErr
 }
 
-func (f *fakeAuditStore) ListAuditEvents(_ context.Context, limit int) ([]domain.AuditEntry, error) {
+func (f *fakeAuditStore) ListAuditEvents(_ context.Context, filter domain.AuditFilter) ([]domain.AuditEntry, error) {
 	f.listCalled = true
-	f.lastLimit = limit
+	f.lastLimit = filter.Limit
+	f.lastResource = filter.Resource
 	return f.entries, f.listErr
 }
 
@@ -79,7 +81,7 @@ func TestAuditService_NilServiceAndStoreAreNoOps(t *testing.T) {
 
 	audit := service.NewAuditService(nil, nil)
 	audit.Record(context.Background(), domain.AuditEvent{})
-	if _, err := audit.List(context.Background(), 10); !errors.Is(err, domain.ErrUnavailable) {
+	if _, err := audit.List(context.Background(), 10, ""); !errors.Is(err, domain.ErrUnavailable) {
 		t.Fatalf("expected ErrUnavailable, got %v", err)
 	}
 }
@@ -91,7 +93,7 @@ func TestAuditService_ListClampsTheLimit(t *testing.T) {
 	for _, tt := range []struct{ requested, want int }{
 		{0, 50}, {-5, 50}, {10, 10}, {200, 200}, {5000, 200},
 	} {
-		if _, err := audit.List(context.Background(), tt.requested); err != nil {
+		if _, err := audit.List(context.Background(), tt.requested, ""); err != nil {
 			t.Fatalf("List(%d): %v", tt.requested, err)
 		}
 		if store.lastLimit != tt.want {
@@ -110,7 +112,7 @@ func TestAuditService_ListPropagatesStoreErrors(t *testing.T) {
 	store := &fakeAuditStore{listErr: errors.New("boom")}
 	audit := service.NewAuditService(store, discardLogger())
 
-	if _, err := audit.List(context.Background(), 10); err == nil {
+	if _, err := audit.List(context.Background(), 10, ""); err == nil {
 		t.Fatal("expected the store error to surface")
 	}
 }

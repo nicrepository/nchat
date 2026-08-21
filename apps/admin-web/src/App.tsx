@@ -4,8 +4,12 @@ import "./styles.css";
 import LoginPage from "./auth/LoginPage";
 import OIDCCallbackPage from "./auth/OIDCCallbackPage";
 import AuditPage from "./pages/AuditPage";
+import ChannelsPage from "./pages/ChannelsPage";
+import FilesPage from "./pages/FilesPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import OverviewPage from "./pages/OverviewPage";
+import SecurityPage from "./pages/SecurityPage";
+import UsersPage from "./pages/UsersPage";
 import AdminSessionProvider from "./session/AdminSessionProvider";
 import { useAdminSession } from "./session/useAdminSession";
 import AdminLayout from "./shell/AdminLayout";
@@ -63,6 +67,13 @@ export default function App() {
           <Route path="/oidc-callback" element={<OIDCCallbackPage />} />
           <Route element={<AdminGate />}>
             <Route index element={<OverviewPage />} />
+            {/* Routing is not authorization. Each of these renders a page that
+                asks the API, and the API refuses a principal without the
+                capability whether or not the sidebar drew the link. */}
+            <Route path="users" element={<UsersPage />} />
+            <Route path="channels" element={<ChannelsPage />} />
+            <Route path="security" element={<SecurityPage />} />
+            <Route path="files" element={<FilesPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>

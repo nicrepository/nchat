@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -372,9 +373,30 @@ func addGeneralChannelMember(ctx context.Context, q memberQuerier, channelID, wo
 
 // AddChannelMember inserts a channel membership. Returns ErrAlreadyMember when
 // ON CONFLICT DO NOTHING fires (no row returned).
+//
+// It joins the same serialization protocol as every other writer of
+// chat.channel_members. This path returns no count of its own, but it moves the
+// count that admin-service reports, so running outside the protocol would let
+// it change a channel's membership between another transaction's write and its
+// count — and that answer is the one the Admin API promises is the total.
 func (s *PGXMemberStore) AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("begin add channel member: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if _, err := tx.Exec(ctx, channelmembership.LockChannelSQL, channelID); err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("lock channel for membership: %w", err)
+	}
+
 	var m domain.ChannelMember
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO chat.channel_members (channel_id, user_id, role)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (channel_id, user_id) DO NOTHING
@@ -387,6 +409,10 @@ func (s *PGXMemberStore) AddChannelMember(ctx context.Context, channelID, userID
 		}
 		return domain.ChannelMember{}, fmt.Errorf("add channel member: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.ChannelMember{}, fmt.Errorf("commit add channel member: %w", err)
+	}
+	committed = true
 	return m, nil
 }
 
@@ -461,6 +487,18 @@ func (s *PGXMemberStore) AddChannelMembers(
 		}
 	}()
 
+	// Serialize every membership mutation on this channel, before anything else
+	// in this transaction. channelmembership.LockChannelSQL is the protocol
+	// admin-service obeys too — TotalCount below is read after the insert and
+	// before the commit, so two concurrent adds report eleven and twelve rather
+	// than eleven twice.
+	//
+	// It is also the first lock taken, which is what keeps the order canonical:
+	// channel, then the actor's membership, then the target rows.
+	if _, err := tx.Exec(ctx, channelmembership.LockChannelSQL, channelID); err != nil {
+		return AddMembersResult{}, fmt.Errorf("lock channel for membership: %w", err)
+	}
+
 	// Re-establish the actor's authority inside the transaction, before anything
 	// is written.
 	//
@@ -514,22 +552,14 @@ func (s *PGXMemberStore) AddChannelMembers(
 
 	var eligible, inserted int
 	var addedUserIDs []string
+	// The eligibility half of this statement is channelmembership.EligibleTargetsCTE,
+	// shared with admin-service (issue #579). Who may be added to a channel is a
+	// fact about the channel and the person, not about who is asking, so the two
+	// writers of chat.channel_members must not each carry their own copy of it.
+	// The actor check above stays here: that half really is different in the two
+	// services.
 	err = tx.QueryRow(ctx, `
-		WITH eligible AS (
-			SELECT wm.user_id
-			FROM unnest($3::uuid[]) AS candidate(user_id)
-			JOIN chat.workspace_members wm
-			  ON wm.workspace_id = $1::uuid
-			 AND wm.user_id = candidate.user_id
-			 AND wm.status = 'active'
-			JOIN chat.workspaces w
-			  ON w.id = wm.workspace_id AND w.status = 'active'
-			JOIN chat.channels c
-			  ON c.id = $2::uuid
-			 AND c.workspace_id = wm.workspace_id
-			 AND c.status = 'active'
-			JOIN auth.users u
-			  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WITH eligible AS (`+channelmembership.EligibleTargetsCTE+`
 		),
 		inserted AS (
 			INSERT INTO chat.channel_members (channel_id, user_id, role)
@@ -901,10 +931,25 @@ func (s *PGXMemberStore) GetEligibleDMMember(ctx context.Context, workspaceID, u
 // bypassing the service-level guard via direct storage calls.
 // Returns nil when the channel is not in the workspace or the user is not a member.
 func (s *PGXMemberStore) RemoveChannelMember(ctx context.Context, workspaceID, channelID, userID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin remove channel member: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Same protocol as every other writer, and taken first: this removal moves
+	// the total that admin-service reports as `member_count`, so it must not
+	// land between another transaction's write and its count.
 	var isGeneral bool
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT is_general FROM chat.channels
-		WHERE id = $1 AND workspace_id = $2`,
+		WHERE id = $1 AND workspace_id = $2
+		FOR UPDATE`,
 		channelID, workspaceID,
 	).Scan(&isGeneral)
 	if err != nil {
@@ -916,12 +961,16 @@ func (s *PGXMemberStore) RemoveChannelMember(ctx context.Context, workspaceID, c
 	if isGeneral {
 		return domain.ErrCannotLeaveGeneralChannel
 	}
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		DELETE FROM chat.channel_members
 		WHERE channel_id = $1 AND user_id = $2`,
 		channelID, userID,
 	); err != nil {
 		return fmt.Errorf("remove channel member: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit remove channel member: %w", err)
+	}
+	committed = true
 	return nil
 }

@@ -39,6 +39,14 @@ func (r errRow) Scan(...any) error { return r.err }
 func (f *fakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
+
+// Begin refuses rather than returning a nil transaction: the app tests never
+// reach a mutation, and a nil pgx.Tx would turn a future test that does into a
+// panic instead of a failure that names the missing wiring.
+func (f *fakePool) Begin(context.Context) (pgx.Tx, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (f *fakePool) Ping(context.Context) error { return nil }
 func (f *fakePool) Close()                     { f.closed = true }
 

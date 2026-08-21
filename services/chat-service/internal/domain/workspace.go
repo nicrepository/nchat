@@ -5,6 +5,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/nicrepository/nchat/libs/go/platform/antispampolicy"
 	"github.com/nicrepository/nchat/libs/go/platform/uploadpolicy"
 )
 
@@ -134,41 +135,30 @@ func ValidMaxUploadBytes(value int64) bool { return uploadpolicy.Valid(value) }
 // populated; in both cases the answer is the default, never "no limit".
 func EffectiveMaxUploadBytes(value int64) int64 { return uploadpolicy.Effective(value) }
 
-// RF-19 anti-spam bounds. These are the single source of truth: the database
-// CHECK in migration 000018, the admin endpoint validation and the frontend
-// input all restate these three numbers and none of them may widen them.
+// RF-19 anti-spam bounds (issue #419).
+//
+// They are re-exported from libs/go/platform/antispampolicy rather than
+// restated, for the same reason the RF-32 bounds below are: the column is
+// enforced here and is now also edited from the Admin Console (issue #579), in
+// another module. A second copy of "1, 60, 600" is exactly the drift the
+// requirement forbids. The database CHECK in migration 000018 mirrors the same
+// two bounds.
 const (
-	// DefaultMessageRateLimitPerMinute is what a workspace gets with no explicit
-	// policy, and what enforcement falls back to when the policy cannot be read.
-	// It is the value the limit was hardcoded to before RF-19, so making the
-	// limit configurable changed no existing behaviour on its own.
-	DefaultMessageRateLimitPerMinute = 60
-	// MinMessageRateLimitPerMinute is deliberately 1 and not 0: an anti-spam
-	// control must not double as a way to mute a workspace.
-	MinMessageRateLimitPerMinute = 1
-	// MaxMessageRateLimitPerMinute caps the policy at 10 messages/second per
-	// user, well above any human cadence, so raising the limit cannot be used to
-	// disable the protection outright.
-	MaxMessageRateLimitPerMinute = 600
+	DefaultMessageRateLimitPerMinute = antispampolicy.Default
+	MinMessageRateLimitPerMinute     = antispampolicy.Min
+	MaxMessageRateLimitPerMinute     = antispampolicy.Max
 )
 
 // ValidMessageRateLimitPerMinute reports whether value is an acceptable RF-19
 // policy. Used by the admin endpoint before touching the database, which
 // enforces the same bounds as a backstop.
-func ValidMessageRateLimitPerMinute(value int) bool {
-	return value >= MinMessageRateLimitPerMinute && value <= MaxMessageRateLimitPerMinute
-}
+func ValidMessageRateLimitPerMinute(value int) bool { return antispampolicy.Valid(value) }
 
 // EffectiveMessageRateLimitPerMinute normalises a persisted policy into a value
 // safe to hand to the rate limiter. A zero or out-of-range value can only come
 // from a row written before migration 000018 or from a struct that was never
 // populated; in both cases the answer is the default, never "no limit".
-func EffectiveMessageRateLimitPerMinute(value int) int {
-	if !ValidMessageRateLimitPerMinute(value) {
-		return DefaultMessageRateLimitPerMinute
-	}
-	return value
-}
+func EffectiveMessageRateLimitPerMinute(value int) int { return antispampolicy.Effective(value) }
 
 // ChannelCategory is an organisational folder for channels within a workspace.
 type ChannelCategory struct {
@@ -377,6 +367,7 @@ type DMConversationWithParticipantIDs struct {
 	CounterpartAvatarURL   string
 	LastMessageAt          *time.Time
 	PinnedAt               *time.Time
+	UnreadCount            int
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.

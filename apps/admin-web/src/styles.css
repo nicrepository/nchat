@@ -349,3 +349,347 @@ a {
     white-space: nowrap;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Gestão (issue #579)
+ *
+ * Mesmas regras da folha acima: unidades relativas para sobreviver a zoom de
+ * 200%, nenhum estado dependendo apenas de cor, foco sempre visível.
+ * ------------------------------------------------------------------------- */
+
+.admin-subsection {
+  margin-top: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--admin-border);
+}
+
+.admin-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: end;
+  margin: 1rem 0;
+}
+
+.admin-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 12rem;
+  flex: 1 1 12rem;
+}
+
+.admin-field > span {
+  font-size: 0.85rem;
+  color: var(--admin-muted);
+}
+
+.admin-field input,
+.admin-field select,
+.admin-field__row input {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+  color: var(--admin-text);
+  font: inherit;
+}
+
+.admin-field__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.admin-field__row input {
+  width: 8rem;
+}
+
+.admin-field__unit {
+  color: var(--admin-muted);
+  font-size: 0.9rem;
+}
+
+.admin-field__help {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  color: var(--admin-muted);
+}
+
+.admin-field input[aria-invalid="true"] {
+  border-color: var(--admin-danger);
+}
+
+.admin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.admin-button--ghost {
+  background: transparent;
+  color: var(--admin-text);
+  font-weight: 500;
+}
+
+.admin-button--danger {
+  background: var(--admin-danger);
+  color: #1a0c0c;
+}
+
+.admin-table__person {
+  display: table-cell;
+}
+
+.admin-table__name {
+  display: block;
+  font-weight: 600;
+}
+
+.admin-table__muted {
+  color: var(--admin-muted);
+  font-size: 0.85rem;
+}
+
+.admin-chip,
+.admin-badge {
+  display: inline-block;
+  margin: 0 0.25rem 0.25rem 0;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--admin-border);
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.admin-badge--strong {
+  border-color: var(--admin-accent);
+  color: var(--admin-accent);
+}
+
+/* Situação também é texto: a cor é reforço, nunca a informação. */
+.admin-status--active,
+.admin-status--public {
+  color: var(--admin-ok);
+}
+
+.admin-status--suspended,
+.admin-status--archived,
+.admin-status--locked {
+  color: var(--admin-warn);
+}
+
+.admin-status--private {
+  color: var(--admin-accent);
+}
+
+.admin-empty {
+  padding: 1rem;
+  border: 1px dashed var(--admin-border);
+  border-radius: var(--admin-radius);
+  color: var(--admin-muted);
+}
+
+.admin-notice {
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  color: var(--admin-muted);
+}
+
+.admin-warning {
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--admin-warn);
+  border-radius: var(--admin-radius);
+  color: var(--admin-warn);
+}
+
+.admin-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.admin-skeleton__row {
+  height: 1.75rem;
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+}
+
+.admin-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1rem;
+}
+
+.admin-pagination__status {
+  margin: 0;
+  color: var(--admin-muted);
+  font-size: 0.9rem;
+}
+
+.admin-pagination__actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.admin-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2rem 1rem;
+  overflow-y: auto;
+  background: rgb(0 0 0 / 65%);
+}
+
+.admin-dialog {
+  width: min(32rem, 100%);
+  padding: 1.25rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+}
+
+.admin-dialog--wide {
+  width: min(52rem, 100%);
+}
+
+.admin-dialog__header {
+  display: flex;
+  gap: 1rem;
+  align-items: start;
+  justify-content: space-between;
+}
+
+.admin-dialog__actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+
+.admin-policy-list,
+.admin-role-list,
+.admin-fixed-list {
+  padding: 0;
+  margin: 1rem 0;
+  list-style: none;
+}
+
+.admin-fixed-list li {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--admin-border);
+  color: var(--admin-muted);
+}
+
+.admin-policy,
+.admin-role {
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.admin-policy h3,
+.admin-role__name {
+  margin: 0 0 0.25rem;
+}
+
+.admin-role {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.admin-role__action {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* Seletor de pessoa (segunda rodada de revisao).
+ * O identificador nunca aparece: a linha e avatar, nome e e-mail. */
+
+.admin-picker {
+  position: relative;
+}
+
+.admin-picker__results {
+  margin-top: 0.35rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+}
+
+.admin-picker__list {
+  max-height: 16rem;
+  padding: 0;
+  margin: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.admin-picker__option {
+  display: block;
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* O item ativo tem fundo E borda lateral: teclado e mouse precisam
+ * enxergar a mesma coisa, e cor sozinha nao serve. */
+.admin-picker__option--active {
+  border-left: 3px solid var(--admin-accent);
+  background: rgb(76 141 255 / 12%);
+}
+
+.admin-picker__person {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.admin-picker__avatar {
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.admin-picker__avatar--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--admin-border);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.admin-picker__names {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.admin-picker__selected {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}

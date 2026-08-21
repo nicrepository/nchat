@@ -48,6 +48,15 @@ func connectAdminTestDB(t *testing.T) *pgxpool.Pool {
 // platform ships rather than a hand-written approximation.
 func applyAuthMigrations(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
+	applyMigrations(t, pool, "auth")
+}
+
+// applyMigrations rebuilds one migration domain's schema from its real files.
+//
+// Domains are applied in the order the caller names them, because chat's tables
+// reference auth's; the reset drops them in reverse for the same reason.
+func applyMigrations(t *testing.T, pool *pgxpool.Pool, domains ...string) {
+	t.Helper()
 	ctx := context.Background()
 
 	var database string
@@ -57,13 +66,27 @@ func applyAuthMigrations(t *testing.T, pool *pgxpool.Pool) {
 	if !strings.HasSuffix(database, "_test") {
 		t.Fatalf("refusing to run destructive migrations on non-test database %q", database)
 	}
-	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS auth CASCADE`); err != nil {
-		t.Fatalf("reset auth schema: %v", err)
+	for i := len(domains) - 1; i >= 0; i-- {
+		if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS `+domains[i]+` CASCADE`); err != nil {
+			t.Fatalf("reset %s schema: %v", domains[i], err)
+		}
 	}
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS auth CASCADE`) })
+	t.Cleanup(func() {
+		for i := len(domains) - 1; i >= 0; i-- {
+			_, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+domains[i]+` CASCADE`)
+		}
+	})
+	for _, domain := range domains {
+		applyMigrationDomain(t, pool, domain)
+	}
+}
+
+func applyMigrationDomain(t *testing.T, pool *pgxpool.Pool, domain string) {
+	t.Helper()
+	ctx := context.Background()
 
 	_, currentFile, _, _ := runtime.Caller(0)
-	dir := filepath.Join(filepath.Dir(currentFile), "..", "..", "..", "..", "migrations", "auth")
+	dir := filepath.Join(filepath.Dir(currentFile), "..", "..", "..", "..", "migrations", domain)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)
