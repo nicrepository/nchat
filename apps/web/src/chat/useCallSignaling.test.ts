@@ -464,6 +464,51 @@ describe("useCallSignaling", () => {
     expect(media.stop).not.toHaveBeenCalled();
   });
 
+  it("shows a busy-specific message for a call.start rejected as call_participant_busy", async () => {
+    const media = mediaBridge();
+    const { result } = renderHook(() => useCallSignaling(media));
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_participant_busy",
+      }),
+    );
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("Você ou este usuário já está em outra chamada.");
+    expect(result.current.error).not.toBe("A chamada já mudou de estado.");
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
+  it("keeps the call_invalid_state message unchanged for call.start", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_invalid_state",
+      }),
+    );
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("A chamada já mudou de estado.");
+  });
+
   it("ignores an event carrying an older version than the current call state", () => {
     const { result } = renderHook(() => useCallSignaling());
     act(() => FakeWebSocket.instances[0].simulateOpen());

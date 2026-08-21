@@ -329,3 +329,35 @@ func TestCallErrorsAreStableAndDoNotConsumeInvalidBudget(t *testing.T) {
 		t.Fatalf("unexpected call error: %+v", response)
 	}
 }
+
+// TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback covers issue
+// #575: domain.ErrCallParticipantBusy wraps domain.ErrConflict, so its case
+// in handleCallClientError's switch MUST be evaluated before the generic
+// errors.Is(callErr, domain.ErrConflict) case, or every busy rejection would
+// keep falling through to the misleading "call already changed state"
+// message. A plain domain.ErrConflict (a real lifecycle/version conflict)
+// must still map to call_invalid_state, unchanged.
+func TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{name: "busy participant", err: domain.ErrCallParticipantBusy, wantCode: "call_participant_busy"},
+		{name: "real lifecycle conflict", err: domain.ErrConflict, wantCode: "call_invalid_state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newClient("busy-client", callTestCaller, callTestWorkspace, &fakeSender{})
+			if !handleCallClientError(client, ClientMessageTypeCallStart, "", test.err) {
+				t.Fatal("expected call error to be handled")
+			}
+			var response clientErrorResponse
+			if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+				t.Fatalf("decode call error: %v", err)
+			}
+			if response.Code != test.wantCode || response.Operation != "call.start" {
+				t.Fatalf("unexpected call error: %+v, want code %q", response, test.wantCode)
+			}
+		})
+	}
+}
