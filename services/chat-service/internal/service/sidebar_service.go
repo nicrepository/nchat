@@ -41,6 +41,7 @@ type SidebarChannel struct {
 	CanWrite      bool
 	LastMessageAt *time.Time
 	PinnedAt      *time.Time
+	UnreadCount   int
 }
 
 type sidebarChannelStore interface {
@@ -55,13 +56,35 @@ type SidebarService struct {
 	members    storage.MemberStore
 	dms        storage.DMStore
 	pins       storage.SidebarPinStore
+	readState  storage.ConversationReadStateStore
 }
+
+const (
+	ReadTargetChannel = storage.ConversationReadTargetChannel
+	ReadTargetDM      = storage.ConversationReadTargetDM
+)
 
 // WithPins adds the optional per-user preference store without changing the
 // existing constructor used by sidebar readers and tests.
 func (s *SidebarService) WithPins(pins storage.SidebarPinStore) *SidebarService {
 	s.pins = pins
 	return s
+}
+
+func (s *SidebarService) WithReadState(readState storage.ConversationReadStateStore) *SidebarService {
+	s.readState = readState
+	return s
+}
+
+func (s *SidebarService) MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error {
+	workspace, _, err := s.authorizeWorkspaceMember(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if s.readState == nil {
+		return fmt.Errorf("conversation read state unavailable")
+	}
+	return s.readState.MarkRead(ctx, workspace.ID, userID, targetType, targetID, lastReadMessageID)
 }
 
 // PinConversation and UnpinConversation always resolve the workspace from the
@@ -145,6 +168,7 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		return SidebarData{}, fmt.Errorf("list channels: %w", err)
 	}
 	pinnedAt := map[string]time.Time{}
+	unreadCounts := map[string]int{}
 	if s.pins != nil {
 		pins, err := s.pins.ListVisible(ctx, workspace.ID, userID)
 		if err != nil {
@@ -152,6 +176,12 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 		}
 		for _, pin := range pins {
 			pinnedAt[pin.TargetType+"\x00"+pin.TargetID] = pin.PinnedAt
+		}
+	}
+	if s.readState != nil {
+		unreadCounts, err = s.readState.UnreadCounts(ctx, workspace.ID, userID)
+		if err != nil {
+			return SidebarData{}, fmt.Errorf("list unread counts: %w", err)
 		}
 	}
 	sidebarChannels := make([]SidebarChannel, 0, len(channels))
@@ -167,6 +197,7 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 			CanWrite:      domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
 			LastMessageAt: access.LastMessageAt,
 			PinnedAt:      pinnedPtr,
+			UnreadCount:   unreadCounts[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID],
 		})
 	}
 
@@ -179,6 +210,7 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 			pinnedCopy := pinned
 			dms[i].PinnedAt = &pinnedCopy
 		}
+		dms[i].UnreadCount = unreadCounts[storage.ConversationReadTargetDM+"\x00"+dms[i].ID]
 	}
 
 	return SidebarData{

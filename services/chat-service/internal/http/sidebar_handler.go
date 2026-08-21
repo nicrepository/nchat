@@ -22,6 +22,10 @@ type sidebarPinProvider interface {
 	UnpinConversation(ctx context.Context, userID, targetType, targetID string) error
 }
 
+type sidebarReadProvider interface {
+	MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error
+}
+
 // sidebarWorkspaceJSON is the JSON shape for workspace info in the sidebar response.
 type sidebarWorkspaceJSON struct {
 	ID   string `json:"id"`
@@ -65,6 +69,7 @@ type sidebarChannelJSON struct {
 	CreatedAt     string  `json:"created_at"`
 	LastMessageAt *string `json:"last_message_at"`
 	PinnedAt      *string `json:"pinned_at"`
+	UnreadCount   *int    `json:"unread_count,omitempty"`
 }
 
 // sidebarDMCounterpartJSON is the identity of the other participant of a 1:1
@@ -96,6 +101,7 @@ type sidebarDMJSON struct {
 	CreatedAt     string                    `json:"created_at"`
 	LastMessageAt *string                   `json:"last_message_at"`
 	PinnedAt      *string                   `json:"pinned_at"`
+	UnreadCount   int                       `json:"unread_count"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -181,6 +187,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 	out := make([]sidebarChannelJSON, 0, len(channels))
 	for _, sidebarChannel := range channels {
 		ch := sidebarChannel.Channel
+		unreadCount := sidebarChannel.UnreadCount
 		out = append(out, sidebarChannelJSON{
 			ID:            ch.ID,
 			Slug:          ch.Slug,
@@ -191,6 +198,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			CreatedAt:     formatSidebarTime(ch.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
 			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),
+			UnreadCount:   &unreadCount,
 		})
 	}
 	return out
@@ -209,6 +217,7 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			CreatedAt:     formatSidebarTime(dm.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
 			PinnedAt:      formatSidebarTimePtr(dm.PinnedAt),
+			UnreadCount:   dm.UnreadCount,
 		})
 	}
 	return out
@@ -228,6 +237,46 @@ func (h *SidebarHandler) PinDM(w http.ResponseWriter, r *http.Request) {
 
 func (h *SidebarHandler) UnpinDM(w http.ResponseWriter, r *http.Request) {
 	h.pinConversation(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id", false)
+}
+
+type markConversationReadRequest struct {
+	LastReadMessageID *string `json:"last_read_message_id"`
+}
+
+func (h *SidebarHandler) MarkChannelRead(w http.ResponseWriter, r *http.Request) {
+	h.markConversationRead(w, r, service.ReadTargetChannel, r.PathValue("channelID"), "channel_id")
+}
+
+func (h *SidebarHandler) MarkDMRead(w http.ResponseWriter, r *http.Request) {
+	h.markConversationRead(w, r, service.ReadTargetDM, r.PathValue("conversationID"), "conversation_id")
+}
+
+func (h *SidebarHandler) markConversationRead(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string) {
+	reads, ok := h.svc.(sidebarReadProvider)
+	if h.svc == nil || !ok {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar not available")
+		return
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var body markConversationReadRequest
+	if r.ContentLength > 0 && !decodeStrictJSON(w, r, &body) {
+		return
+	}
+	if body.LastReadMessageID != nil && !validateTargetID(w, *body.LastReadMessageID, "last_read_message_id") {
+		return
+	}
+	if err := reads.MarkConversationRead(r.Context(), userID, targetType, targetID, body.LastReadMessageID); err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *SidebarHandler) pinConversation(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string, pinned bool) {

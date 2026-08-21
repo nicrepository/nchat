@@ -38,6 +38,7 @@ import {
   fetchMentionCandidates,
   getOrCreateDirectDM,
   getMessageHistory,
+  markConversationRead,
   MessageEditError,
   fetchSidebarData,
   fetchWorkspaceUploadLimit,
@@ -782,6 +783,63 @@ describe("fetchSidebarData", () => {
     expect(dms[0]).toMatchObject({ id: "group-1", pinnedAt: "2026-08-12T11:00:00Z" });
   });
 
+  it("maps only valid authoritative unread counts", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "ch-1", slug: "geral", display_name: "geral", type: "public", unread_count: 3 },
+          { id: "ch-2", slug: "ruim", display_name: "ruim", type: "public", unread_count: -1 },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Ana", unread_count: 2 }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0].unreadCount).toBe(3);
+    expect(channels[1].unreadCount).toBeUndefined();
+    expect(dms[0].unreadCount).toBe(2);
+  });
+
+  it("keeps the sidebar's authoritative unread count for categorized channels", async () => {
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            {
+              id: "ch-1",
+              slug: "geral",
+              display_name: "geral",
+              type: "public",
+              unread_count: 3,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [
+            {
+              kind: "category",
+              id: "cat-1",
+              name: "Equipe",
+              channels: [
+                {
+                  id: "ch-1",
+                  slug: "geral",
+                  display_name: "geral",
+                  type: "public",
+                  unread_count: 0,
+                },
+              ],
+            },
+          ],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({ id: "ch-1", categoryId: "cat-1", unreadCount: 3 });
+  });
+
   it("uses target-specific idempotent pin endpoints without user or workspace payload", async () => {
     mockAuthFetch.mockResolvedValue({});
     await setSidebarConversationPinned("channel", "ch 1", true);
@@ -792,6 +850,21 @@ describe("fetchSidebarData", () => {
     });
     expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/sidebar-pin", {
       method: "DELETE",
+    });
+  });
+
+  it("marks target-specific conversations read with an optional message id", async () => {
+    mockAuthFetch.mockResolvedValue({});
+    await markConversationRead("channel", "ch 1");
+    await markConversationRead("dm", "dm 1", "message-1");
+
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/read", {
+      method: "POST",
+    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ last_read_message_id: "message-1" }),
     });
   });
 
@@ -958,6 +1031,7 @@ describe("partial sidebar compatibility", () => {
     await expect(fetchDMs()).resolves.toEqual([]);
     await expect(fetchSidebarData()).resolves.toEqual({
       currentUserId: "user-1",
+      workspaceId: "ws-1",
       channels: [],
       dms: [],
       categories: [],
@@ -2293,7 +2367,13 @@ describe("fetchSidebarData", () => {
     for (const value of [true, false, "true", 1, {}, null]) {
       mockAuthFetch.mockResolvedValue(sidebarPayload({ can_create_channel: value }));
       const data = await fetchSidebarData();
-      expect(data).toEqual({ currentUserId: "user-1", channels: [], dms: [], categories: [] });
+      expect(data).toEqual({
+        currentUserId: "user-1",
+        workspaceId: "ws-1",
+        channels: [],
+        dms: [],
+        categories: [],
+      });
     }
   });
 
@@ -2301,6 +2381,7 @@ describe("fetchSidebarData", () => {
     mockAuthFetch.mockResolvedValue(sidebarPayload());
     await expect(fetchSidebarData()).resolves.toEqual({
       currentUserId: "user-1",
+      workspaceId: "ws-1",
       channels: [],
       dms: [],
       categories: [],

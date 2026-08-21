@@ -27,6 +27,7 @@ const {
   mockGetOrCreateDirectDM,
   mockCreateGroupDM,
   mockCreateChannel,
+  mockMarkConversationRead,
 } = vi.hoisted(() => ({
   mockFetchSidebarData: vi.fn<
     () => Promise<{
@@ -52,6 +53,7 @@ const {
       signal?: AbortSignal,
     ) => Promise<Channel>
   >(),
+  mockMarkConversationRead: vi.fn<() => Promise<void>>(),
 }));
 
 vi.mock("./chatApi", () => ({
@@ -83,6 +85,7 @@ vi.mock("./chatApi", () => ({
     input: { slug: string; displayName: string; type: "public" | "private"; categoryId?: string },
     signal?: AbortSignal,
   ) => mockCreateChannel(input, signal),
+  markConversationRead: () => mockMarkConversationRead(),
 }));
 
 // ── Mock profileApi (the footer's identity source) ────────────────────────────
@@ -689,6 +692,7 @@ describe("ChatSidebar — DMs", () => {
     const readyState = (avatarUrl: string) => ({
       status: "ready" as const,
       currentUserId: "user-a",
+      workspaceId: "workspace-1",
       channels: [] as Channel[],
       dms: [
         {
@@ -1372,6 +1376,7 @@ describe("ChatSidebar — section classification", () => {
     const stateWith = (dms: DMConversation[]) => ({
       status: "ready" as const,
       currentUserId: "user-a",
+      workspaceId: "workspace-1",
       channels: [{ ...PUBLIC_CHANNEL }],
       dms,
       categories: [] as ChannelCategory[],
@@ -1447,6 +1452,7 @@ describe("ChatSidebar — activity ordering", () => {
   const readyState = (channels: Channel[], dms: DMConversation[]) => ({
     status: "ready" as const,
     currentUserId: "user-a",
+    workspaceId: "workspace-1",
     channels,
     dms,
     categories: [] as ChannelCategory[],
@@ -2010,6 +2016,7 @@ describe("ChatSidebar — footer", () => {
           state={{
             status: "ready",
             currentUserId: "user-a",
+            workspaceId: "workspace-1",
             channels: [],
             dms: [],
             categories: [],

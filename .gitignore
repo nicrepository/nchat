@@ -139,6 +139,13 @@ apps/admin-web/playwright-report/
 apps/admin-web/test-results/
 apps/web/test-results/
 
+# NChat local development bootstrap (machine-specific config and seed data)
+.nchat-local/
+scripts/dev/nchat-local.sh
+scripts/dev/nchat-local-test.sh
+scripts/db/local-seed.sh
+scripts/db/local-seed.sql
+
 # Security scan artifacts
 results.sarif
 *.sarif

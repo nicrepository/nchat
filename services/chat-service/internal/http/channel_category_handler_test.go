@@ -233,6 +233,9 @@ func TestChannelCategoryHandler_List_DistinguishesTheVirtualGroup(t *testing.T) 
 	if channel["can_write"] != false {
 		t.Fatalf("can_write = %v, want false", channel["can_write"])
 	}
+	if _, present := channel["unread_count"]; present {
+		t.Fatalf("category projection must not publish a non-authoritative unread count: %v", channel)
+	}
 }
 
 // A group with no channel must serialise as [] rather than null, so a client never
