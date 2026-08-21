@@ -122,7 +122,7 @@ membership.
 The rules:
 
 - the workspace is resolved by the logical rule `slug = 'default' AND status =
-  'active'`, never by the seed UUID;
+'active'`, never by the seed UUID;
 - the membership is always `role = 'member'`, `status = 'active'`. NChat RBAC
   stays internal and server-side: no Keycloak role, group or claim is mapped,
   and `owner`, `admin` and `moderator` are never granted implicitly;
