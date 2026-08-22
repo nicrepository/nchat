@@ -40,6 +40,12 @@ export const ADMIN_NAV: AdminNavItem[] = [
     capability: "admin.infrastructure.read",
     path: "/files",
   },
+  {
+    id: "configuration",
+    label: "Configurações",
+    capability: "admin.config.read",
+    path: "/configuration",
+  },
   { id: "authentication", label: "Autenticação", capability: "admin.integrations.read" },
   { id: "email", label: "E-mail", capability: "admin.integrations.read" },
   { id: "calls", label: "Chamadas", capability: "admin.integrations.read" },

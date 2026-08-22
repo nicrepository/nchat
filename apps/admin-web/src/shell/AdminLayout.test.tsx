@@ -111,6 +111,7 @@ describe("AdminLayout", () => {
       "Canais e grupos",
       "Segurança e políticas",
       "Arquivos e armazenamento",
+      "Configurações",
       "Auditoria",
     ]);
   });

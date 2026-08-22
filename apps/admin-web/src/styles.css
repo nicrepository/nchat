@@ -693,3 +693,108 @@ a {
   border: 1px solid var(--admin-border);
   border-radius: var(--admin-radius);
 }
+
+/* ---------------------------------------------------------------------------
+   Configuracoes (issue #580)
+
+   Uma configuracao e um bloco, nao uma linha de tabela: alem do valor, ela
+   carrega classe, fonte de verdade, modo de aplicacao e — quando nao e
+   editavel — o motivo. Colocar isso numa celula esconderia justamente o que o
+   operador precisa ler antes de mudar qualquer coisa.
+   --------------------------------------------------------------------------- */
+
+.admin-config-list {
+  padding: 0;
+  margin: 1rem 0;
+  list-style: none;
+}
+
+.admin-config {
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.admin-config__header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.admin-config__label {
+  font-weight: 600;
+}
+
+.admin-config__description {
+  margin: 0.35rem 0;
+  color: var(--admin-muted);
+}
+
+.admin-config__badges {
+  margin: 0.5rem 0 0.35rem;
+}
+
+.admin-config__state p {
+  margin: 0.25rem 0;
+}
+
+/* O diff e tipado, nao textual: cada entrada nomeia o campo, o valor anterior e
+   o novo. A cor reforca a direcao; o sinal e o texto continuam sendo a
+   informacao. */
+.admin-diff {
+  padding: 0;
+  margin: 0 0 1rem;
+  list-style: none;
+}
+
+.admin-diff__entry {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--admin-border);
+}
+
+.admin-diff__label {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.admin-diff__transition {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0 0 0.25rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.admin-diff__from {
+  color: var(--admin-danger);
+}
+
+.admin-diff__to {
+  color: var(--admin-ok);
+}
+
+.admin-version-list {
+  padding: 0;
+  margin: 1rem 0;
+  list-style: none;
+}
+
+.admin-version {
+  padding: 0.85rem 1rem;
+  margin-bottom: 0.6rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.admin-version__header {
+  margin: 0 0 0.35rem;
+}
+
+.admin-version__changes {
+  padding-left: 1.1rem;
+  margin: 0.35rem 0;
+  color: var(--admin-muted);
+}

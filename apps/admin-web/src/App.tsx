@@ -5,6 +5,7 @@ import LoginPage from "./auth/LoginPage";
 import OIDCCallbackPage from "./auth/OIDCCallbackPage";
 import AuditPage from "./pages/AuditPage";
 import ChannelsPage from "./pages/ChannelsPage";
+import ConfigurationPage from "./pages/ConfigurationPage";
 import FilesPage from "./pages/FilesPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import OverviewPage from "./pages/OverviewPage";
@@ -74,6 +75,7 @@ export default function App() {
             <Route path="channels" element={<ChannelsPage />} />
             <Route path="security" element={<SecurityPage />} />
             <Route path="files" element={<FilesPage />} />
+            <Route path="configuration" element={<ConfigurationPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>
