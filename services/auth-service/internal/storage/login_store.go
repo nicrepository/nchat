@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -25,6 +26,10 @@ type loginCandidate struct {
 	Status       string
 	Deleted      bool
 	PasswordHash string //nolint:gosec
+	// PasswordChangedAt is when this password was set, and the only input the
+	// expiry rule takes from the row. It is zero when the user has no password
+	// credential at all, which the caller has already refused by then.
+	PasswordChangedAt time.Time
 }
 
 // PGXLoginStore implements service.LoginStore using a pgx connection pool.
@@ -40,9 +45,14 @@ func NewPGXLoginStore(pool Pool, verifyPassword PasswordVerifier, dummyVerify Du
 	return &PGXLoginStore{pool: pool, verifyPassword: verifyPassword, dummyVerify: dummyVerify}
 }
 
-// CreateLoginSession runs the full login transaction:
-// policy fetch → user + credential fetch → lockout check → password verify →
-// optional device upsert → session insert → token history insert → last-login update.
+// CreateLoginSession runs the full login transaction in three phases:
+// prepare (policy, per-email serialization), authenticate, grant.
+//
+// The phases are separate functions because they answer separate questions and
+// fail differently. Authentication either produces a candidate or commits a
+// recorded refusal and returns the error a caller may surface; granting either
+// produces a session or does the same. Everything below therefore reads as: get
+// the policy, take the lock, prove the identity, grant the session, commit.
 func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.CreateSessionInput) (domain.CreatedLoginSession, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -63,68 +73,14 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 		return domain.CreatedLoginSession{}, fmt.Errorf("acquire login lock: %w", err)
 	}
 
-	candidate, found, err := selectLoginUser(ctx, tx, input.Email)
+	candidate, err := s.authenticate(ctx, tx, input, policy)
 	if err != nil {
 		return domain.CreatedLoginSession{}, err
 	}
 
-	locked, err := loginTemporarilyLocked(ctx, tx, found, candidate.User.ID, input.Email, policy)
+	session, err := grantLoginSession(ctx, tx, candidate.User.ID, input, policy)
 	if err != nil {
 		return domain.CreatedLoginSession{}, err
-	}
-	if locked {
-		return commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "failed_login_limit_exceeded")
-	}
-
-	if !found || candidate.Status != "active" || candidate.Deleted || candidate.PasswordHash == "" {
-		s.dummyVerify(input.Password)
-		return commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "invalid_credentials")
-	}
-
-	ok, verifyErr := s.verifyPassword(input.Password, candidate.PasswordHash)
-	if verifyErr != nil || !ok {
-		return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "invalid_credentials")
-	}
-
-	// Re-validate that the user is still active, taking a row-level lock.
-	// This serializes with the suspension transaction (which also locks the user row via
-	// SELECT ... FOR UPDATE). Two outcomes:
-	//   - If suspension committed first (status != 'active'): abort login; no session created.
-	//   - If login reaches this point first: hold the lock through session insert; suspension
-	//     then waits, locks the row, and revokes the newly-created session in its own TX.
-	// The error is the same generic ErrInvalidCredentials used for wrong passwords so that
-	// callers cannot distinguish "suspended" from "bad credentials".
-	if err := revalidateUserActive(ctx, tx, candidate.User.ID); err != nil {
-		return domain.CreatedLoginSession{}, err
-	}
-
-	deviceID, err := resolveLoginDevice(ctx, tx, candidate.User.ID, input, policy)
-	if err != nil {
-		switch {
-		case errors.Is(err, errDeviceRevoked):
-			return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "device_revoked")
-		case errors.Is(err, domain.ErrInvalidCredentials):
-			return commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "max_devices_exceeded")
-		default:
-			return domain.CreatedLoginSession{}, err
-		}
-	}
-
-	if err := recordLoginAttempt(ctx, tx, candidate.User.ID, input.Email, true, "", input.IPAddress, input.UserAgent); err != nil {
-		return domain.CreatedLoginSession{}, err
-	}
-
-	session, err := insertLoginSession(ctx, tx, candidate.User.ID, deviceID, input, policy)
-	if err != nil {
-		return domain.CreatedLoginSession{}, err
-	}
-
-	if err := insertInitialRefreshTokenHistory(ctx, tx, session.ID, input.RefreshTokenHash); err != nil {
-		return domain.CreatedLoginSession{}, err
-	}
-
-	if _, err := tx.Exec(ctx, `UPDATE auth.users SET last_login_at = now() WHERE id = $1`, candidate.User.ID); err != nil {
-		return domain.CreatedLoginSession{}, fmt.Errorf("update last_login_at: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -132,6 +88,126 @@ func (s *PGXLoginStore) CreateLoginSession(ctx context.Context, input domain.Cre
 	}
 
 	return domain.CreatedLoginSession{Session: session, User: candidate.User}, nil
+}
+
+// authenticate proves the request holds a usable credential, or refuses it.
+//
+// Every refusal here records the attempt and commits before returning, so the
+// trail keeps the reason even though the login produced nothing. The error it
+// returns is the one the caller surfaces unchanged: generic for anything
+// credential-shaped, and specific for an expired password, which is the one
+// refusal the person needs to be able to act on.
+func (s *PGXLoginStore) authenticate(ctx context.Context, tx pgx.Tx, input domain.CreateSessionInput, policy domain.PolicySettings) (loginCandidate, error) {
+	candidate, found, err := selectLoginUser(ctx, tx, input.Email)
+	if err != nil {
+		return loginCandidate{}, err
+	}
+
+	locked, err := loginTemporarilyLocked(ctx, tx, found, candidate.User.ID, input.Email, policy)
+	if err != nil {
+		return loginCandidate{}, err
+	}
+	if locked {
+		_, err := commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "failed_login_limit_exceeded")
+		return loginCandidate{}, err
+	}
+
+	if !usableCredential(candidate, found) {
+		// The dummy verification keeps the response time of an unknown or
+		// unusable account indistinguishable from a wrong password.
+		s.dummyVerify(input.Password)
+		_, err := commitFailedLoginAttempt(ctx, tx, nullableUserID(found, candidate.User.ID), input, "invalid_credentials")
+		return loginCandidate{}, err
+	}
+
+	ok, verifyErr := s.verifyPassword(input.Password, candidate.PasswordHash)
+	if verifyErr != nil || !ok {
+		_, err := commitFailedLoginAttempt(ctx, tx, candidate.User.ID, input, "invalid_credentials")
+		return loginCandidate{}, err
+	}
+
+	// RF-47 password expiry, checked after the password is known to be correct
+	// and before anything is granted.
+	//
+	// It is recorded as a refusal rather than a credential failure, so it lands
+	// in the trail with its own reason and does not feed the brute-force
+	// counter — repeatedly presenting a *correct* password is not an attack, and
+	// locking the account for it would punish the person who owns it.
+	if domain.PasswordExpired(candidate.PasswordChangedAt, time.Now(), policy) {
+		_, err := commitRefusedLogin(ctx, tx, candidate.User.ID, input, "password_expired", domain.ErrPasswordExpired)
+		return loginCandidate{}, err
+	}
+
+	return candidate, nil
+}
+
+// usableCredential reports whether this row can be authenticated against at all:
+// the account exists, is active, is not soft-deleted, and has a password set.
+//
+// All four are the same answer to the caller — invalid credentials — so they are
+// one predicate rather than four branches that must each remember not to say
+// which of them applied.
+func usableCredential(candidate loginCandidate, found bool) bool {
+	return found && candidate.Status == "active" && !candidate.Deleted && candidate.PasswordHash != ""
+}
+
+// grantLoginSession creates the session and everything that must exist with it.
+//
+// It starts by re-validating that the user is still active, taking a row-level
+// lock. This serializes with the suspension transaction (which also locks the
+// user row via SELECT ... FOR UPDATE). Two outcomes:
+//   - If suspension committed first (status != 'active'): abort login; no session created.
+//   - If login reaches this point first: hold the lock through session insert; suspension
+//     then waits, locks the row, and revokes the newly-created session in its own TX.
+//
+// The error is the same generic ErrInvalidCredentials used for wrong passwords so that
+// callers cannot distinguish "suspended" from "bad credentials".
+func grantLoginSession(ctx context.Context, tx pgx.Tx, userID string, input domain.CreateSessionInput, policy domain.PolicySettings) (domain.Session, error) {
+	if err := revalidateUserActive(ctx, tx, userID); err != nil {
+		return domain.Session{}, err
+	}
+
+	deviceID, err := resolveLoginDevice(ctx, tx, userID, input, policy)
+	if err != nil {
+		return domain.Session{}, commitDeviceRefusal(ctx, tx, userID, input, err)
+	}
+
+	if err := recordLoginAttempt(ctx, tx, userID, input.Email, true, "", input.IPAddress, input.UserAgent); err != nil {
+		return domain.Session{}, err
+	}
+
+	session, err := insertLoginSession(ctx, tx, userID, deviceID, input, policy)
+	if err != nil {
+		return domain.Session{}, err
+	}
+
+	if err := insertInitialRefreshTokenHistory(ctx, tx, session.ID, input.RefreshTokenHash); err != nil {
+		return domain.Session{}, err
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE auth.users SET last_login_at = now() WHERE id = $1`, userID); err != nil {
+		return domain.Session{}, fmt.Errorf("update last_login_at: %w", err)
+	}
+	return session, nil
+}
+
+// commitDeviceRefusal turns a device-binding failure into the recorded refusal
+// it should be, or passes an infrastructure failure through untouched.
+//
+// Neither refusal counts toward the lockout: the credential was correct, and the
+// lockout query only counts credential reasons.
+func commitDeviceRefusal(ctx context.Context, tx pgx.Tx, userID string, input domain.CreateSessionInput, cause error) error {
+	reason := ""
+	switch {
+	case errors.Is(cause, errDeviceRevoked):
+		reason = "device_revoked"
+	case errors.Is(cause, domain.ErrInvalidCredentials):
+		reason = "max_devices_exceeded"
+	default:
+		return cause
+	}
+	_, err := commitFailedLoginAttempt(ctx, tx, userID, input, reason)
+	return err
 }
 
 // selectLoginPolicy reads the policy settings from the DB within the given transaction.
@@ -142,7 +218,11 @@ func selectLoginPolicy(ctx context.Context, tx pgx.Tx) (domain.PolicySettings, e
 		       require_number, require_symbol, failed_login_limit,
 		       failed_login_window_minutes, failed_login_lockout_minutes,
 		       session_idle_timeout_minutes, max_devices_per_user,
-		       password_reset_token_ttl_minutes, invite_token_ttl_hours
+		       password_reset_token_ttl_minutes, invite_token_ttl_hours,
+		       -- NULL is "passwords do not expire". The column CHECK refuses a
+		       -- stored zero, so collapsing NULL to zero here cannot be
+		       -- mistaken for a configured expiry.
+		       COALESCE(password_expiration_days, 0)
 		FROM auth.auth_policy_settings
 		WHERE id = 1`,
 	).Scan(
@@ -151,6 +231,7 @@ func selectLoginPolicy(ctx context.Context, tx pgx.Tx) (domain.PolicySettings, e
 		&p.FailedLoginWindowMinutes, &p.FailedLoginLockoutMinutes,
 		&p.SessionIdleTimeoutMinutes, &p.MaxDevicesPerUser,
 		&p.PasswordResetTokenTTLMinutes, &p.InviteTokenTTLHours,
+		&p.PasswordExpirationDays,
 	)
 	if err != nil {
 		return domain.PolicySettings{}, fmt.Errorf("get login policy: %w", err)
@@ -163,11 +244,15 @@ func selectLoginPolicy(ctx context.Context, tx pgx.Tx) (domain.PolicySettings, e
 func selectLoginUser(ctx context.Context, tx pgx.Tx, email string) (loginCandidate, bool, error) {
 	var c loginCandidate
 	var deletedAt *time.Time
+	// Nullable because the join is outer: a user with no password credential has
+	// no password age, and is refused before the expiry rule is ever consulted.
+	var passwordChangedAt sql.NullTime
 	err := tx.QueryRow(ctx, `
 		SELECT u.id, u.email::text, u.display_name,
 		       u.status, u.deleted_at,
 		       COALESCE(pc.password_hash, ''),
-		       COALESCE(pc.must_change_password, false)
+		       COALESCE(pc.must_change_password, false),
+		       pc.password_changed_at
 		FROM auth.users AS u
 		LEFT JOIN auth.user_password_credentials AS pc ON pc.user_id = u.id
 		WHERE u.email = $1
@@ -176,7 +261,7 @@ func selectLoginUser(ctx context.Context, tx pgx.Tx, email string) (loginCandida
 	).Scan(
 		&c.User.ID, &c.User.Email, &c.User.DisplayName,
 		&c.Status, &deletedAt,
-		&c.PasswordHash, &c.User.MustChangePassword,
+		&c.PasswordHash, &c.User.MustChangePassword, &passwordChangedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return loginCandidate{}, false, nil
@@ -185,6 +270,9 @@ func selectLoginUser(ctx context.Context, tx pgx.Tx, email string) (loginCandida
 		return loginCandidate{}, false, fmt.Errorf("select login user: %w", err)
 	}
 	c.Deleted = deletedAt != nil
+	if passwordChangedAt.Valid {
+		c.PasswordChangedAt = passwordChangedAt.Time
+	}
 	return c, true, nil
 }
 
@@ -302,13 +390,25 @@ func recordLoginAttempt(ctx context.Context, tx pgx.Tx, userID any, email string
 }
 
 func commitFailedLoginAttempt(ctx context.Context, tx pgx.Tx, userID any, input domain.CreateSessionInput, failureReason string) (domain.CreatedLoginSession, error) {
+	return commitRefusedLogin(ctx, tx, userID, input, failureReason, domain.ErrInvalidCredentials)
+}
+
+// commitRefusedLogin records the refusal, commits the attempt, and answers with
+// the error the caller must surface.
+//
+// The outcome is a parameter because not every refusal is a credential
+// failure: a correct password that has expired is refused with its own error,
+// and the person presenting it has to be told which of the two happened or they
+// cannot act on it. The recording and the commit are identical either way,
+// which is why there is one function and not two.
+func commitRefusedLogin(ctx context.Context, tx pgx.Tx, userID any, input domain.CreateSessionInput, failureReason string, outcome error) (domain.CreatedLoginSession, error) {
 	if err := recordLoginAttempt(ctx, tx, userID, input.Email, false, failureReason, input.IPAddress, input.UserAgent); err != nil {
 		return domain.CreatedLoginSession{}, fmt.Errorf("record failed login attempt: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.CreatedLoginSession{}, fmt.Errorf("commit failed login attempt: %w", err)
 	}
-	return domain.CreatedLoginSession{}, domain.ErrInvalidCredentials
+	return domain.CreatedLoginSession{}, outcome
 }
 
 // resolveLoginDevice returns the device_id to use for the session.
