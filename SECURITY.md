@@ -463,6 +463,94 @@ conteudo de mensagem, header `Authorization` e header `Cookie`. Uma falha de
 escrita e registrada no log do servico e nao derruba a requisicao — a trilha e
 evidencia, nao pre-condicao.
 
+### Configuracao e secrets (issue #580)
+
+Invariantes da camada de configuracao administrativa:
+
+- **A plataforma decide o que existe.** Toda configuracao administravel esta num
+  registry tipado server-side
+  (`services/admin-service/internal/domain/config_catalog.go`). Uma chave que o
+  registry nao declara e recusada com `400`; o cliente nomeia uma chave, nunca
+  define uma. Nao existe `PATCH /config/{key}` irrestrito, e nenhuma requisicao
+  nomeia servico, variavel de ambiente, Secret, caminho de arquivo, namespace ou
+  recurso do Kubernetes.
+- **A Admin API so escreve o banco.** Toda definicao editavel tem
+  `source = database`, verificado por `ValidateConfigCatalog`. Nao ha escrita em
+  ConfigMap, em Secret nem em qualquer objeto do cluster, e o browser jamais
+  recebe credencial de Kubernetes. Como consequencia direta, nenhum validador
+  acessa a rede — nao existe "testar endpoint" e nao ha superficie de SSRF nesta
+  camada.
+- **Um secret armazenado nunca e devolvido.** A leitura responde apenas
+  `configured: true|false`, e o valor bruto nao e atribuido a nenhum campo que
+  saia do servico. Nao ha classe de configuracao "credencial editavel": nao
+  existe backend de secret que a Admin API possa escrever, e rotacao continua
+  sendo `docs/runbooks/sealed-secrets-rotation.md`.
+- **O historico e estruturalmente incapaz de guardar credencial.**
+  `auth.admin_config_version_changes.value_from` e `value_to` sao JSONB com
+  `CHECK (jsonb_typeof(...) IN ('number','boolean','null'))`, entao uma string
+  nao pode ser armazenada ali. Versionamento nao pode virar mecanismo de
+  recuperacao de secret antigo.
+- **Concorrencia e otimista e falha fechada.** A escrita e um compare-and-swap
+  (`UPDATE ... WHERE id = 1 AND revision = $expected`), num unico statement.
+  Dois administradores salvando ao mesmo tempo produzem uma escrita e um `409`;
+  nao existe last-write-wins nem merge silencioso.
+- **Alteracao perigosa exige capability mais restrita.** Um valor resultante que
+  enfraquece a autenticacao exige `admin.superuser` alem de
+  `admin.config.manage`, e um motivo declarado. A confirmacao na tela nao
+  substitui essa verificacao: ela acontece no servidor, depois do parse e da
+  validacao.
+- **Auditoria por allowlist.** `admin.config.update` e `admin.config.rollback`
+  gravam documento, revisoes, id da versao, chaves alteradas com `from -> to`
+  (sempre nao sensiveis, por construcao), se a mudanca era perigosa, a capability
+  exigida, o resultado da validacao e se houve motivo. O texto do motivo nao e
+  copiado para a trilha: e prosa do operador, ja persistida na linha da versao, e
+  o id da versao e o que liga as duas.
+
+### Autorizacao transacional de mutation privilegiada (CWE-367)
+
+O middleware autoriza quando a requisicao chega; a escrita commita depois. Entre
+os dois momentos a autoridade pode ser retirada — papel revogado, principal
+suspenso, conta desativada, sessao do console encerrada — e o snapshot que o
+middleware colocou no contexto nao muda quando isso acontece.
+
+Por isso toda mutation privilegiada de configuracao **revalida a autorizacao
+dentro da mesma transacao PostgreSQL que grava**, como primeiro statement dela e
+antes de qualquer escrita. A revalidacao le o banco, nao o snapshot, e confere:
+
+- a sessao administrativa existe, nao foi revogada e nao expirou;
+- a sessao de login por tras dela continua valida;
+- a conta esta ativa e nao foi excluida;
+- o principal continua ativo;
+- o principal ainda detem a capability exigida — que para configuracao pode ser
+  mais restrita que a da rota, porque um valor que enfraquece a plataforma exige
+  `admin.superuser`.
+
+Revalidar sem travar apenas encurtaria a janela. A revalidacao trava duas linhas
+(`auth.admin_sessions` e `auth.admin_principals` do ator, nunca uma tabela nem
+linhas de outro administrador) e **todo caminho de revogacao trava a mesma linha
+de principal**: revogacao de papel, suspensao de conta e revogacao das sessoes
+de login. Revogar a sessao administrativa ja atualiza a propria linha travada.
+
+Ordem canonica de locks, respeitada por todos os caminhos:
+
+1. `auth.admin_sessions` (sessao do ator);
+2. `auth.admin_principals` (principal do ator) — sempre o ultimo lock de
+   autorizacao adquirido por este servico;
+3. as linhas que a mutation escreve.
+
+Nenhum caminho toma 1 e 2 na ordem inversa e nenhuma revogacao toca 3, entao nao
+ha ciclo.
+
+O resultado e uma serializacao. Revogacao que commita primeiro faz a escrita
+falhar com `401` (identidade) ou `403` (capability), sem alterar configuracao,
+sem nova revision, sem versao e sem evento de auditoria de sucesso. Escrita que
+toma os locks primeiro faz a revogacao esperar — e nesse caso ela realmente
+aconteceu antes, o que e a ordem serializada correta.
+
+O middleware continua sendo a primeira barreira: recusa cedo e mantem trabalho
+nao autorizado longe dos handlers. Isto e a segunda, no unico ponto onde "ainda
+pode" e "ja foi gravado" nao podem ser separados.
+
 ### Observabilidade
 
 A Admin API usa a instrumentacao HTTP compartilhada, cujas labels sao metodo,

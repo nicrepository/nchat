@@ -263,16 +263,30 @@ currently sends `device_name: "NIC Chat Web"` and omits `device_fingerprint`.
 
 **Common errors:**
 
-| Code                  | HTTP | Condition                                                     |
-| --------------------- | ---- | ------------------------------------------------------------- |
-| `invalid_credentials` | 401  | Wrong email, wrong password, locked account, or inactive user |
-| `bad_request`         | 400  | Malformed JSON                                                |
-| `service_unavailable` | 503  | Database not configured                                       |
+| Code                  | HTTP | Condition                                                            |
+| --------------------- | ---- | -------------------------------------------------------------------- |
+| `invalid_credentials` | 401  | Wrong email, wrong password, locked account, or inactive user        |
+| `password_expired`    | 401  | Correct password, older than `auth.password.expiration_days` (RF-47) |
+| `bad_request`         | 400  | Malformed JSON                                                       |
+| `service_unavailable` | 503  | Database not configured                                              |
 
 **Security notes:**
 
 - All credential errors (wrong password, lockout, unknown email) return the same
   `invalid_credentials` 401 to prevent user enumeration.
+
+> **Password expiry (RF-47).** `password_expired` is the one 401 that says more
+> than the others, and it can: it is only reachable after the password has been
+> verified, so it tells nobody anything they do not already hold. Withholding it
+> would leave the owner retrying a correct password until something else stopped
+> them. No session is created and no token is issued. The refusal is recorded in
+> `auth.login_attempts` under its own reason, which the lockout query does not
+> count — presenting a correct password is not a brute-force attempt. The window
+> is `auth.password.expiration_days`, editable from the Admin Console and applied
+> on the next login with no restart; the age comes from
+> `auth.user_password_credentials.password_changed_at`, which every path that
+> sets a password resets.
+
 - Access token is a signed HMAC-SHA256 JWT. Never log or expose it in URLs.
 - Refresh token is an opaque random value; only its SHA-256 hash is stored.
 - IP address is collected for audit (RF-49) using trusted-proxy-aware extraction.
