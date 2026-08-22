@@ -572,4 +572,10 @@ type ClientMessage struct {
 	// call.resource.synced response (issue #622). Client-generated, never
 	// used for authorization.
 	SyncID string `json:"sync_id,omitempty"`
+	// ParticipationID fences a call.leave or call.presence to one specific
+	// resource-call admission (issue #622 round 3) — the value that
+	// admission's own call.admitted response carried. Empty claims the
+	// pre-fencing legacy identity; never used for direct calls, which are
+	// never fenced. See docs/api/calls-websocket.md.
+	ParticipationID string `json:"participation_id,omitempty"`
 }

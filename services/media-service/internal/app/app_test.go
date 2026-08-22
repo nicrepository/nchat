@@ -63,7 +63,7 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	cfg := validAppConfig()
 	sessionExpiry := time.Now().UTC().Add(10 * time.Minute)
 	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.calls`).
-		WithArgs(appTestSessionID, appTestUserID, appTestResource).
+		WithArgs(appTestSessionID, appTestUserID, appTestResource, "").
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
 			AddRow(sessionExpiry, appTestResource, "App Test User"))
 

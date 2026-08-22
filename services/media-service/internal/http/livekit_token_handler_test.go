@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	handlerTestUserID    = "11111111-1111-4111-8111-111111111111"
-	handlerTestSessionID = "22222222-2222-4222-8222-222222222222"
-	handlerTestResource  = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	handlerTestServerURL = "wss://livekit-dev.nic-labs.com"
+	handlerTestUserID        = "11111111-1111-4111-8111-111111111111"
+	handlerTestSessionID     = "22222222-2222-4222-8222-222222222222"
+	handlerTestResource      = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	handlerTestParticipation = "33333333-3333-4333-8333-333333333333"
+	handlerTestServerURL     = "wss://livekit-dev.nic-labs.com"
 )
 
 type fakeTokenIssuer struct {
@@ -48,7 +49,7 @@ func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
 	}}
 	response := serveLiveKitHandler(
 		LiveKitToken(issuer, handlerTestServerURL, slog.Default()),
-		`{"call_id":"`+handlerTestResource+`"}`,
+		`{"call_id":"`+handlerTestResource+`","participation_id":"`+handlerTestParticipation+`"}`,
 		authenticatedRequestContext(),
 	)
 
@@ -73,7 +74,8 @@ func TestLiveKitTokenHandlerIssuesCallTokenFromPrincipal(t *testing.T) {
 		t.Fatalf("expected one issuer call, got %d", issuer.calls)
 	}
 	if issuer.input.Kind != domain.ResourceKindCall || issuer.input.ResourceID != handlerTestResource ||
-		issuer.input.UserID != handlerTestUserID || issuer.input.SessionID != handlerTestSessionID {
+		issuer.input.UserID != handlerTestUserID || issuer.input.SessionID != handlerTestSessionID ||
+		issuer.input.ParticipationID != handlerTestParticipation {
 		t.Fatalf("issuer received untrusted or incorrect input: %+v", issuer.input)
 	}
 	if !issuer.input.AccessExpiresAt.Equal(authenticatedRequestContext().Value(principalContextKey{}).(Principal).AccessExpiresAt) {
@@ -118,6 +120,8 @@ func TestLiveKitTokenHandlerRejectsInvalidBodies(t *testing.T) {
 		{name: "malformed", body: "{", want: http.StatusBadRequest},
 		{name: "invalid kind", body: `{"kind":"group","id":"` + handlerTestResource + `"}`, want: http.StatusBadRequest},
 		{name: "invalid uuid", body: `{"call_id":"not-a-uuid"}`, want: http.StatusBadRequest},
+		{name: "invalid participation uuid", body: `{"call_id":"` + handlerTestResource + `","participation_id":"not-a-uuid"}`, want: http.StatusBadRequest},
+		{name: "participation without call", body: `{"resource_kind":"channel","resource_id":"` + handlerTestResource + `","participation_id":"` + handlerTestParticipation + `"}`, want: http.StatusBadRequest},
 		{name: "trailing json", body: `{"call_id":"` + handlerTestResource + `"}{}`, want: http.StatusBadRequest},
 		{name: "identity", body: `{"call_id":"` + handlerTestResource + `","identity":"other"}`, want: http.StatusBadRequest},
 		{name: "room", body: `{"call_id":"` + handlerTestResource + `","room":"admin"}`, want: http.StatusBadRequest},

@@ -37,7 +37,11 @@ func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.Aut
 	var sessionExpiresAt pgtype.Timestamptz
 	var resourceID pgtype.Text
 	var displayName pgtype.Text
-	if err := a.pool.QueryRow(ctx, query, input.SessionID, input.UserID, input.ResourceID).
+	args := []any{input.SessionID, input.UserID, input.ResourceID}
+	if input.Kind == domain.ResourceKindCall {
+		args = append(args, input.ParticipationID)
+	}
+	if err := a.pool.QueryRow(ctx, query, args...).
 		Scan(&sessionExpiresAt, &resourceID, &displayName); err != nil {
 		return service.AuthorizedResource{}, fmt.Errorf("authorize media resource: %w", err)
 	}
@@ -139,6 +143,7 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 				SELECT 1 FROM chat.call_participant_leases AS lease
 				WHERE lease.call_id = c.id
 				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
 				  AND lease.expires_at > clock_timestamp()
 			))
 			OR
@@ -156,6 +161,7 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 				SELECT 1 FROM chat.call_participant_leases AS lease
 				WHERE lease.call_id = c.id
 				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
 				  AND lease.expires_at > clock_timestamp()
 			))
 		  )

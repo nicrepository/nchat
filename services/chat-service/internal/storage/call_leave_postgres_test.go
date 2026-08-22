@@ -161,7 +161,7 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyLeavingParticipantsBusyStatusP
 	leaseTTL := now.Add(30 * time.Second)
 
 	// A starts the resource call.
-	call, created, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, created, participationA, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000f1",
 		CallerID:    leavePGUserA,
@@ -175,7 +175,7 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyLeavingParticipantsBusyStatusP
 	}
 
 	// B joins the same, already-active resource call.
-	joined, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	joined, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000f2",
 		CallerID:    leavePGUserB,
@@ -195,9 +195,10 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyLeavingParticipantsBusyStatusP
 
 	// A leaves.
 	result, err := store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
-		WorkspaceID: leavePGWorkspace,
-		CallID:      call.ID,
-		ActorID:     leavePGUserA,
+		WorkspaceID:     leavePGWorkspace,
+		CallID:          call.ID,
+		ActorID:         leavePGUserA,
+		ParticipationID: participationA,
 	})
 	if err != nil {
 		t.Fatalf("A leaves: %v", err)
@@ -270,7 +271,7 @@ func TestPGXCallStoreLastLeaveNeverLeavesJoinerWithStaleActiveSnapshotPostgreSQL
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000a1",
 		CallerID:    leavePGUserA,
@@ -319,7 +320,7 @@ func TestPGXCallStoreLastLeaveNeverLeavesJoinerWithStaleActiveSnapshotPostgreSQL
 	var joinErr error
 	go func() {
 		defer close(joined)
-		joinedCall, _, joinErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		joinedCall, _, _, joinErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: leavePGWorkspace,
 			RequestID:   "c5000000-0000-4000-8000-0000000000a2",
 			CallerID:    leavePGUserC,
@@ -404,7 +405,7 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, participationA, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000b1",
 		CallerID:    leavePGUserA,
@@ -416,7 +417,7 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 	if err != nil {
 		t.Fatalf("A starts resource call: %v", err)
 	}
-	if _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	_, _, participationB, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000b2",
 		CallerID:    leavePGUserB,
@@ -424,11 +425,13 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 		TargetID:    leavePGChannel,
 		Type:        domain.CallTypeAudio,
 		ExpiresAt:   leaseTTL,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("B joins resource call: %v", err)
 	}
 
 	actors := []string{leavePGUserA, leavePGUserB}
+	participations := []string{participationA, participationB}
 	results := make([]storage.TransitionCallResult, len(actors))
 	errs := make([]error, len(actors))
 	start := make(chan struct{})
@@ -439,9 +442,10 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 			defer wg.Done()
 			<-start
 			results[i], errs[i] = store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
-				WorkspaceID: leavePGWorkspace,
-				CallID:      call.ID,
-				ActorID:     actor,
+				WorkspaceID:     leavePGWorkspace,
+				CallID:          call.ID,
+				ActorID:         actor,
+				ParticipationID: participations[i],
 			})
 		}(i, actor)
 	}

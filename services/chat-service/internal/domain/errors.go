@@ -25,6 +25,19 @@ var (
 	// callers that need to tell "someone is busy" apart from a real
 	// lifecycle/version conflict (issue #575) can check for it first.
 	ErrCallParticipantBusy = fmt.Errorf("%w: call participant already in another call", ErrConflict)
+	// ErrCallParticipationStale reports that a call.leave or call.presence
+	// carried a participation_id fencing token that no longer matches the
+	// actor's current lease on that call (issue #622 round 3) — a newer
+	// admission (a rejoin, a handoff, a second tab) already rotated it, or
+	// the actor never held a fenced lease with that identity in the first
+	// place. Wraps ErrConflict for the same reason ErrCallParticipantBusy
+	// does: existing generic conflict handling still matches it, but a
+	// caller that must never treat this as "my current participation ended"
+	// (issue #622 round 3's cross-tab false-left guard) checks for it first.
+	// Never reveals the actual current participation_id or any other
+	// participant's identity — the caller learns only that its own claimed
+	// fencing token is no longer authoritative.
+	ErrCallParticipationStale = fmt.Errorf("%w: call participation is no longer current", ErrConflict)
 	// ErrInconsistentDirectConversation reports a chat.dm_conversations row of
 	// type 'direct' that does not resolve to exactly one other active
 	// participant. The domain says a direct conversation is a pair, so this is

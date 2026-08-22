@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { issueCallToken, type ResourceCallKind } from "./callApi";
 import { acquireChatSocket } from "./chatSocket";
 import {
+  joinResourceCall,
   leaveResourceCall,
   ResourceCallSignalingError,
   startResourceCall,
@@ -11,6 +12,28 @@ import type { CallMediaBridge } from "./useCallSignaling";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
 export type ResourceCallErrorOperation = "join" | "leave" | null;
+
+/**
+ * Internal marker for join()'s own catch handler (issue #622 round 2,
+ * post-admission compensation): thrown only when admission already
+ * succeeded (a lease now exists server-side) and this attempt's own
+ * best-effort call.leave to release it also failed. Never thrown across a
+ * public API boundary — join() itself always resolves to `undefined` on any
+ * failure, per its existing contract.
+ */
+class ResourceJoinCompensationFailedError extends Error {
+  callId: string;
+  participationId: string;
+  cause: unknown;
+
+  constructor(callId: string, participationId: string, cause: unknown) {
+    super("resource join compensation failed");
+    this.name = "ResourceJoinCompensationFailedError";
+    this.callId = callId;
+    this.participationId = participationId;
+    this.cause = cause;
+  }
+}
 
 export interface ResourceCallTarget {
   kind: ResourceCallKind;
@@ -74,7 +97,7 @@ export interface ResourceCallController {
    * more than once for the same leave: the server-side release is
    * idempotent, so a duplicate/retried leave never corrupts state.
    */
-  leave: () => Promise<void>;
+  leave: () => Promise<boolean>;
   /**
    * Converges this session to idle for a participation the server already
    * ended in a DIFFERENT tab (issue #594) — e.g. this tab handed ownership
@@ -116,6 +139,7 @@ export function useResourceCallSession(
   // React state value from a callback that must react to something that
   // just happened in the same synchronous instant.
   const callIdRef = useRef<string | null>(null);
+  const participationIdRef = useRef<string | null>(null);
   // Generation-scoped, exactly like joinPromiseRef/cleanupPromiseRef below:
   // set the instant THIS attempt (join() or reconnect()) marks itself
   // "connecting", cleared only by whichever attempt's own generation still
@@ -181,7 +205,7 @@ export function useResourceCallSession(
     return cleanup;
   }, []);
 
-  const leave = useCallback((): Promise<void> => {
+  const leave = useCallback((): Promise<boolean> => {
     const generation = ++attemptGenerationRef.current;
     // Stops the presence heartbeat before anything else — synchronously,
     // not via setStatus()/setCallId() and a future render. Those only take
@@ -199,25 +223,29 @@ export function useResourceCallSession(
     // anything server-side to release; an abandoned in-flight join never
     // created a lease, so there is nothing to send — the generation bump
     // above already invalidates that attempt's continuation.
-    const leavingCallId = callId;
+    const leavingCallId = callIdRef.current;
+    const leavingParticipationId = participationIdRef.current;
     setError(null);
     setErrorOperation(null);
     const mediaCleanup = stopMedia();
-    const serverRelease = leavingCallId
-      ? leaveResourceCall(leavingCallId).then(() => undefined)
-      : Promise.resolve();
+    const serverRelease =
+      leavingCallId && leavingParticipationId
+        ? leaveResourceCall(leavingCallId, leavingParticipationId).then(({ released }) => released)
+        : Promise.resolve(false);
     return Promise.all([mediaCleanup, serverRelease]).then(
-      () => {
+      ([, released]) => {
         // A newer join()/leave() may already have moved past this attempt;
         // only the leave() that is still current gets to clear the room.
-        if (attemptGenerationRef.current !== generation) return;
+        if (attemptGenerationRef.current !== generation) return false;
         activeRef.current = null;
         joinPromiseRef.current = null;
         callIdRef.current = null;
+        participationIdRef.current = null;
         setActive(null);
         setCallId(null);
         setStatus("idle");
         setErrorOperation(null);
+        return released;
       },
       (leaveError: unknown) => {
         if (attemptGenerationRef.current === generation) {
@@ -228,7 +256,7 @@ export function useResourceCallSession(
         throw leaveError;
       },
     );
-  }, [callId, stopMedia]);
+  }, [stopMedia]);
 
   const join = useCallback(
     (
@@ -237,6 +265,7 @@ export function useResourceCallSession(
     ): Promise<string | undefined> => {
       const previousActive = activeRef.current;
       const previousCallId = callIdRef.current;
+      const previousParticipationId = participationIdRef.current;
       if (
         previousActive &&
         cleanupPromiseRef.current === null &&
@@ -268,6 +297,14 @@ export function useResourceCallSession(
       connectingGenerationRef.current = generation;
       setError(null);
       setErrorOperation(null);
+      // Set only once THIS attempt's own admission (call.start/call.join)
+      // has actually succeeded — distinguishes a post-admission failure
+      // (issue #622 round 2: a lease now exists and callId/active were
+      // already moved to it, so a rollback is required) from a pre-admission
+      // one (busy or otherwise — nothing was ever admitted, so active/callId
+      // were never touched by this attempt and the existing pre-#622
+      // behavior applies unchanged).
+      let admittedThisAttempt = false;
       const attempt = (async () => {
         // Never request a new Room before a pending leave()/unmount has
         // actually finished releasing the previous one — and never after
@@ -277,35 +314,107 @@ export function useResourceCallSession(
         if (attemptGenerationRef.current !== generation) return;
         await mediaRef.current.startAudio();
         if (attemptGenerationRef.current !== generation) return;
-        const call = target.callId ? { call_id: target.callId } : await startResourceCall(target);
-        if (attemptGenerationRef.current !== generation) return;
+        // A known call_id is protected (CallSessionProvider's
+        // pendingJoinAttemptsRef) synchronously, before any await — the
+        // callback must fire here, before call.join's own round trip, not
+        // after: the call_id is already known, so there is no reason to
+        // wait for the server to echo it back (issue #622 round 2).
+        if (target.callId) onCallIdResolved?.(target.callId);
+        // A known call_id is obligatory admission via call.join — it is
+        // never synthesised locally: only call.admitted actually creates the
+        // participant lease media-service's token now requires (issue
+        // #622 round 2). A fresh target (no call_id yet) still goes through
+        // call.start, which creates-or-reuses the canonical call AND admits
+        // this actor in one round trip.
+        const admission = target.callId
+          ? await joinResourceCall(target.callId, target)
+          : await startResourceCall(target);
+        const { call, participationId } = admission;
+        // Admission succeeded: a participant lease now exists server-side
+        // for call.call_id, regardless of whether this attempt is still the
+        // one this hook is tracking.
+        if (attemptGenerationRef.current !== generation) {
+          // Superseded while the admission round trip was in flight: no
+          // other attempt observed or will ever release this lease, so this
+          // attempt alone must (issue #622 round 2, post-admission
+          // compensation) — best-effort; nothing left here to report to.
+          void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+          return;
+        }
         setCallId(call.call_id);
         // Written synchronously in this same tick as setCallId() above — see
         // callIdRef's own comment for why the React state alone isn't enough.
         callIdRef.current = call.call_id;
-        // Fires BEFORE the next await (issueCallToken) — see the interface's
-        // own doc comment for why this exact placement is what makes it
-        // useful to an external causal-intent tracker.
-        onCallIdResolved?.(call.call_id);
-        const result = await issueCallToken(call.call_id);
-        if (attemptGenerationRef.current !== generation) return;
-        // RF-24 follow-up: a resource room is one call, camera and microphone
-        // are just controls within it — "audio"/"video" is not a concept of
-        // this room. "audio" is passed only because useCallMedia.connect()
-        // still uses call_type internally to decide whether to auto-enable
-        // the camera (kept for RF-23 compatibility); the camera must never
-        // turn on by itself here, so this stays "audio" unconditionally and
-        // the user enables the camera explicitly via toggleCamera().
-        await mediaRef.current.connect(
-          { call_id: call.call_id, call_type: "audio" },
-          result.token,
-          result.serverUrl,
-        );
-        if (attemptGenerationRef.current !== generation) return undefined;
-        if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
-        setStatus("active");
-        return call.call_id;
+        participationIdRef.current = participationId;
+        admittedThisAttempt = true;
+        // Fresh-target case: call_id was not known before admission, so this
+        // is the first (and only) time onCallIdResolved fires for it.
+        if (!target.callId) onCallIdResolved?.(call.call_id);
+        try {
+          const result = await issueCallToken(call.call_id, participationId);
+          if (attemptGenerationRef.current !== generation) {
+            void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+            return;
+          }
+          // RF-24 follow-up: a resource room is one call, camera and
+          // microphone are just controls within it — "audio"/"video" is not
+          // a concept of this room. "audio" is passed only because
+          // useCallMedia.connect() still uses call_type internally to
+          // decide whether to auto-enable the camera (kept for RF-23
+          // compatibility); the camera must never turn on by itself here,
+          // so this stays "audio" unconditionally and the user enables the
+          // camera explicitly via toggleCamera().
+          await mediaRef.current.connect(
+            { call_id: call.call_id, call_type: "audio" },
+            result.token,
+            result.serverUrl,
+          );
+          if (attemptGenerationRef.current !== generation) {
+            void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+            return undefined;
+          }
+          if (connectingGenerationRef.current === generation)
+            connectingGenerationRef.current = null;
+          setStatus("active");
+          return call.call_id;
+        } catch (postAdmissionError) {
+          // Token issuance or media connect failed AFTER admission already
+          // created a lease (issue #622 round 2): that lease must never be
+          // left orphaned. Only this still-current attempt may compensate —
+          // a superseded one would risk releasing a lease a newer attempt
+          // (a rejoin of the very same call_id) has since made live again,
+          // since a lease is keyed by (user, call), not by frontend attempt.
+          if (attemptGenerationRef.current === generation) {
+            try {
+              await leaveResourceCall(call.call_id, participationId);
+            } catch (compensationError) {
+              throw new ResourceJoinCompensationFailedError(
+                call.call_id,
+                participationId,
+                compensationError,
+              );
+            }
+          }
+          throw postAdmissionError;
+        }
       })().catch((joinError: unknown): string | undefined => {
+        if (joinError instanceof ResourceJoinCompensationFailedError) {
+          // Compensation itself failed: never claim idle while the lease
+          // might still be live. Preserve callId/active so the existing
+          // "Tentar novamente" affordance retries leave() (idempotent)
+          // against the right call, never re-joins.
+          if (attemptGenerationRef.current === generation) {
+            activeRef.current = target;
+            callIdRef.current = joinError.callId;
+            participationIdRef.current = joinError.participationId;
+            setActive(target);
+            setCallId(joinError.callId);
+            setStatus("error");
+            setErrorOperation("leave");
+            setError("Não foi possível encerrar a participação anterior. Tente novamente.");
+          }
+          return undefined;
+        }
         if (attemptGenerationRef.current !== generation) return undefined;
         if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
         if (
@@ -314,6 +423,7 @@ export function useResourceCallSession(
         ) {
           activeRef.current = previousActive;
           callIdRef.current = previousCallId;
+          participationIdRef.current = previousParticipationId;
           setActive(previousActive);
           setCallId(previousCallId);
           setStatus(previousCallId ? "active" : "error");
@@ -321,6 +431,22 @@ export function useResourceCallSession(
           setError("Você já está em outra chamada.");
           return undefined;
         }
+        if (admittedThisAttempt) {
+          // Post-admission failure, compensation already succeeded (the
+          // ResourceJoinCompensationFailedError branch above handles the
+          // failed-compensation case separately): the lease this attempt
+          // created is gone, so active/callId must roll back to whatever
+          // this attempt actually had before it started — never left
+          // pointing at a lease that no longer exists (issue #622 round 2).
+          activeRef.current = previousActive;
+          callIdRef.current = previousCallId;
+          participationIdRef.current = previousParticipationId;
+          setActive(previousActive);
+          setCallId(previousCallId);
+        }
+        // A pre-admission failure never touched active/callId in the first
+        // place — unchanged from before #622, active stays this attempt's
+        // target so its own retry affordance still targets it.
         setStatus("error");
         setErrorOperation("join");
         setError("Não foi possível entrar na chamada.");
@@ -345,6 +471,7 @@ export function useResourceCallSession(
       activeRef.current = null;
       joinPromiseRef.current = null;
       callIdRef.current = null;
+      participationIdRef.current = null;
       // Only ever stop the shared media bridge here when THIS hook's own
       // join()/reconnect() genuinely still has a connect in flight for the
       // participation being converged — never unconditionally: a merely
@@ -374,36 +501,73 @@ export function useResourceCallSession(
 
   const reconnect = useCallback(async (): Promise<void> => {
     const target = activeRef.current;
-    if (!target || !callId) return;
+    const knownCallId = callIdRef.current;
+    if (!target || !knownCallId) return;
     const generation = ++attemptGenerationRef.current;
     setStatus("connecting");
     connectingGenerationRef.current = generation;
     setError(null);
     setErrorOperation(null);
+    let admission: Awaited<ReturnType<typeof joinResourceCall>> | null = null;
     try {
       await stopMedia();
       if (attemptGenerationRef.current !== generation) return;
       await mediaRef.current.startAudio();
-      const result = await issueCallToken(callId);
       if (attemptGenerationRef.current !== generation) return;
+      admission = await joinResourceCall(knownCallId, target);
+      const { call, participationId } = admission;
+      if (attemptGenerationRef.current !== generation) {
+        void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+        return;
+      }
+      callIdRef.current = call.call_id;
+      participationIdRef.current = participationId;
+      setCallId(call.call_id);
+      const result = await issueCallToken(call.call_id, participationId);
+      if (attemptGenerationRef.current !== generation) {
+        void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+        return;
+      }
       await mediaRef.current.connect(
-        { call_id: callId, call_type: "audio" },
+        { call_id: call.call_id, call_type: "audio" },
         result.token,
         result.serverUrl,
       );
+      if (attemptGenerationRef.current !== generation) {
+        void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
+        return;
+      }
       if (attemptGenerationRef.current === generation) {
         if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
         setStatus("active");
       }
     } catch (reconnectError) {
       if (attemptGenerationRef.current !== generation) return;
+      if (admission) {
+        try {
+          await leaveResourceCall(admission.call.call_id, admission.participationId);
+        } catch (compensationError) {
+          if (connectingGenerationRef.current === generation)
+            connectingGenerationRef.current = null;
+          setStatus("error");
+          setErrorOperation("leave");
+          setError("Não foi possível encerrar a participação anterior. Tente novamente.");
+          throw new ResourceJoinCompensationFailedError(
+            admission.call.call_id,
+            admission.participationId,
+            compensationError,
+          );
+        }
+        if (attemptGenerationRef.current !== generation) return;
+        participationIdRef.current = null;
+      }
       if (connectingGenerationRef.current === generation) connectingGenerationRef.current = null;
       setStatus("error");
       setErrorOperation("join");
       setError("Não foi possível recuperar a chamada.");
       throw reconnectError;
     }
-  }, [callId, stopMedia]);
+  }, [stopMedia]);
 
   useEffect(
     () => () => {
@@ -411,6 +575,7 @@ export function useResourceCallSession(
       // never touches state after this point.
       attemptGenerationRef.current += 1;
       activeRef.current = null;
+      participationIdRef.current = null;
       // Best-effort on unmount: nothing left to show a recoverable error to.
       void stopMedia().catch(() => undefined);
     },
@@ -418,9 +583,36 @@ export function useResourceCallSession(
   );
 
   useEffect(() => {
-    if (!presenceEnabled || status !== "active" || !callId) return;
-    const sendPresence = () => handle.send({ type: "call.presence", call_id: callId });
-    const handle = acquireChatSocket({ onOpen: sendPresence });
+    const participationId = participationIdRef.current;
+    if (!presenceEnabled || status !== "active" || !callId || !participationId) return;
+    const sendPresence = () =>
+      handle.send({
+        type: "call.presence",
+        call_id: callId,
+        participation_id: participationId,
+      });
+    const handle = acquireChatSocket({
+      onOpen: sendPresence,
+      onMessage(data) {
+        if (
+          data["type"] !== "call.error" ||
+          data["operation"] !== "call.presence" ||
+          data["call_id"] !== callId ||
+          data["code"] !== "call_participation_stale"
+        ) {
+          return;
+        }
+        attemptGenerationRef.current += 1;
+        stopHeartbeatRef.current?.();
+        activeRef.current = null;
+        callIdRef.current = null;
+        participationIdRef.current = null;
+        setActive(null);
+        setCallId(null);
+        setStatus("idle");
+        void stopMedia().catch(() => undefined);
+      },
+    });
     sendPresence();
     const heartbeat = window.setInterval(sendPresence, 10_000);
     // Idempotent and reusable as both leave()'s synchronous stop and React's
@@ -433,7 +625,7 @@ export function useResourceCallSession(
     };
     stopHeartbeatRef.current = stop;
     return stop;
-  }, [callId, presenceEnabled, status]);
+  }, [callId, presenceEnabled, status, stopMedia]);
 
   return {
     active,

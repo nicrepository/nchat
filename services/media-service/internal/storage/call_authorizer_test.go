@@ -15,13 +15,14 @@ func TestPGXResourceAuthorizerRequiresActiveCallParticipant(t *testing.T) {
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
 	mock.ExpectQuery(`(?s)WITH active_session AS.*authorized_resource AS.*chat\.calls.*chat\.workspace_members.*status = 'active'.*target_type = 'user'.*caller_id = active\.user_id.*callee_id = active\.user_id.*target_type = 'channel'.*channel_visible_to_user.*target_type = 'dm'.*chat\.dm_members.*type = 'group'.*SELECT.*session_expires_at.*resource_id.*display_name`).
-		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
+		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource, storageTestParticipation).
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
 			AddRow(expiresAt, storageTestResource, "Ana Lima"))
 
 	result, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 		Kind: domain.ResourceKindCall, ResourceID: storageTestResource,
 		UserID: storageTestUserID, SessionID: storageTestSessionID,
+		ParticipationID: storageTestParticipation,
 	})
 	if err != nil || result.ID != storageTestResource {
 		t.Fatalf("authorize active call: result=%+v err=%v", result, err)
@@ -36,14 +37,15 @@ func TestPGXResourceAuthorizerRequiresActiveCallParticipant(t *testing.T) {
 func TestPGXResourceAuthorizerQueryRequiresLiveLeaseForResourceCalls(t *testing.T) {
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
-	mock.ExpectQuery(`(?s)target_type = 'channel'.*channel_visible_to_user.*chat\.call_participant_leases.*lease\.call_id = c\.id.*lease\.user_id = active\.user_id.*lease\.expires_at > clock_timestamp\(\).*target_type = 'dm'.*chat\.dm_members.*type = 'group'.*chat\.call_participant_leases.*lease\.call_id = c\.id.*lease\.user_id = active\.user_id.*lease\.expires_at > clock_timestamp\(\)`).
-		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
+	mock.ExpectQuery(`(?s)target_type = 'channel'.*channel_visible_to_user.*chat\.call_participant_leases.*lease\.call_id = c\.id.*lease\.user_id = active\.user_id.*lease\.participation_id.*lease\.expires_at > clock_timestamp\(\).*target_type = 'dm'.*chat\.dm_members.*type = 'group'.*chat\.call_participant_leases.*lease\.call_id = c\.id.*lease\.user_id = active\.user_id.*lease\.participation_id.*lease\.expires_at > clock_timestamp\(\)`).
+		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource, storageTestParticipation).
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
 			AddRow(expiresAt, storageTestResource, "Ana Lima"))
 
 	_, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 		Kind: domain.ResourceKindCall, ResourceID: storageTestResource,
 		UserID: storageTestUserID, SessionID: storageTestSessionID,
+		ParticipationID: storageTestParticipation,
 	})
 	if err != nil {
 		t.Fatalf("authorize call: %v", err)
@@ -57,7 +59,7 @@ func TestPGXResourceAuthorizerQueryRequiresLiveLeaseForResourceCalls(t *testing.
 func TestPGXResourceAuthorizerQueryDirectBranchCarriesNoLeaseRequirement(t *testing.T) {
 	mock := newStorageMock(t)
 	mock.ExpectQuery(`(?s)target_type = 'user' AND \(c\.caller_id = active\.user_id OR c\.callee_id = active\.user_id\)\)\s*OR`).
-		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
+		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource, "").
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
 			AddRow(nil, nil, nil))
 
@@ -72,13 +74,14 @@ func TestPGXResourceAuthorizerRejectsNonActiveOrNonParticipantCall(t *testing.T)
 	mock := newStorageMock(t)
 	expiresAt := time.Now().UTC().Add(time.Minute)
 	mock.ExpectQuery(`(?s)WITH active_session AS.*chat\.calls.*status = 'active'`).
-		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource).
+		WithArgs(storageTestSessionID, storageTestUserID, storageTestResource, storageTestParticipation).
 		WillReturnRows(pgxmock.NewRows([]string{"session_expires_at", "resource_id", "display_name"}).
 			AddRow(expiresAt, nil, "Ana Lima"))
 
 	_, err := NewPGXResourceAuthorizer(mock).Authorize(context.Background(), service.AuthorizationInput{
 		Kind: domain.ResourceKindCall, ResourceID: storageTestResource,
 		UserID: storageTestUserID, SessionID: storageTestSessionID,
+		ParticipationID: storageTestParticipation,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("error = %v, want non-enumerating not found", err)

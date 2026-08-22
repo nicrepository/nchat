@@ -173,7 +173,7 @@ func TestResourceSyncObservedAtIsNeverSubstitutedByWallClock(t *testing.T) {
 // ── call.join ────────────────────────────────────────────────────────────────
 
 func TestCallJoinAdmitsAndAcksOnlyTheRequesterCorrelatedByRequestID(t *testing.T) {
-	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 5)}
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 5), participationID: callTestParticipation}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-join-test", WithCallHandler(handler))
 	t.Cleanup(hub.Shutdown)
 	requester := newClient("joiner-client", callTestCaller, callTestWorkspace, &fakeSender{})
@@ -202,7 +202,8 @@ func TestCallJoinAdmitsAndAcksOnlyTheRequesterCorrelatedByRequestID(t *testing.T
 			t.Fatalf("decode: %v", err)
 		}
 		if response.Type != "call.admitted" || response.Operation != "call.join" ||
-			response.ResponseTo != crsTestRequest || response.Call.ID != callTestID {
+			response.ResponseTo != crsTestRequest || response.Call.ID != callTestID ||
+			response.ParticipationID != callTestParticipation {
 			t.Fatalf("unexpected admitted response: %+v", response)
 		}
 	default:
@@ -264,6 +265,7 @@ func TestCallJoinRejectsMalformedOrForeignFields(t *testing.T) {
 		{"call_id not a uuid", ClientMessage{Type: ClientMessageTypeCallJoin, RequestID: crsTestRequest, CallID: "nope", TargetType: TargetTypeChannel, TargetID: crsTestTarget}},
 		{"carries target_user_id", ClientMessage{Type: ClientMessageTypeCallJoin, RequestID: crsTestRequest, CallID: crsTestCallID, TargetType: TargetTypeChannel, TargetID: crsTestTarget, TargetUserID: callTestCallee}},
 		{"carries call_type", ClientMessage{Type: ClientMessageTypeCallJoin, RequestID: crsTestRequest, CallID: crsTestCallID, TargetType: TargetTypeChannel, TargetID: crsTestTarget, CallType: domain.CallTypeAudio}},
+		{"carries participation_id", ClientMessage{Type: ClientMessageTypeCallJoin, RequestID: crsTestRequest, CallID: crsTestCallID, TargetType: TargetTypeChannel, TargetID: crsTestTarget, ParticipationID: callTestParticipation}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -277,7 +279,7 @@ func TestCallJoinRejectsMalformedOrForeignFields(t *testing.T) {
 // ── resource call.start's call.admitted ACK ─────────────────────────────────
 
 func TestResourceCallStartSendsCallAdmittedCorrelatedByRequestID(t *testing.T) {
-	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1)}
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1), participationID: callTestParticipation}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-start-admitted",
 		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
 	t.Cleanup(hub.Shutdown)
@@ -299,7 +301,8 @@ func TestResourceCallStartSendsCallAdmittedCorrelatedByRequestID(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if response.Type != "call.admitted" || response.Operation != "call.start" ||
-		response.ResponseTo != callTestRequest || response.Call.ID != callTestID {
+		response.ResponseTo != callTestRequest || response.Call.ID != callTestID ||
+		response.ParticipationID != callTestParticipation {
 		t.Fatalf("unexpected admitted response: %+v", response)
 	}
 }
@@ -316,7 +319,7 @@ func TestResourceCallStartSendsCallAdmittedCorrelatedByRequestID(t *testing.T) {
 func TestResourceCallStartReuseAcksWithCurrentRequestButHistoricalCallRequestID(t *testing.T) {
 	reused := callProtocolCall(domain.CallStatusActive, 2)
 	reused.RequestID = "00000000-0000-4000-8000-000000000199" // A's historical request_id — distinct from B's below.
-	handler := &fakeCallHandler{call: reused}
+	handler := &fakeCallHandler{call: reused, participationID: callTestParticipation}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-start-reuse-admitted",
 		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
 	t.Cleanup(hub.Shutdown)
@@ -347,6 +350,9 @@ func TestResourceCallStartReuseAcksWithCurrentRequestButHistoricalCallRequestID(
 	if response.Call.RequestID != reused.RequestID {
 		t.Fatalf("admitted.call.request_id = %q, want A's historical request_id %q (never rewritten)",
 			response.Call.RequestID, reused.RequestID)
+	}
+	if response.ParticipationID != callTestParticipation {
+		t.Fatalf("participation_id = %q", response.ParticipationID)
 	}
 	if response.ResponseTo == response.Call.RequestID {
 		t.Fatal("response_to and Call.request_id must never collapse into the same value in this scenario")

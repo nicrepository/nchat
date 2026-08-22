@@ -11,36 +11,41 @@ import (
 )
 
 const (
-	callTestWorkspace = "00000000-0000-4000-8000-000000000101"
-	callTestRequest   = "00000000-0000-4000-8000-000000000102"
-	callTestID        = "00000000-0000-4000-8000-000000000103"
-	callTestCaller    = "00000000-0000-4000-8000-000000000104"
-	callTestCallee    = "00000000-0000-4000-8000-000000000105"
-	callTestOutsider  = "00000000-0000-4000-8000-000000000106"
+	callTestWorkspace     = "00000000-0000-4000-8000-000000000101"
+	callTestRequest       = "00000000-0000-4000-8000-000000000102"
+	callTestID            = "00000000-0000-4000-8000-000000000103"
+	callTestCaller        = "00000000-0000-4000-8000-000000000104"
+	callTestCallee        = "00000000-0000-4000-8000-000000000105"
+	callTestOutsider      = "00000000-0000-4000-8000-000000000106"
+	callTestParticipation = "00000000-0000-4000-8000-000000000107"
 )
 
 type fakeCallHandler struct {
-	call           domain.Call
-	started        StartCallCommand
-	action         ClientMessageType
-	actorID        string
-	callID         string
-	presenceCallID string
-	syncCallID     string
-	leaveActorID   string
-	leaveCallID    string
-	resourceSyncID string
-	found          bool
-	observedAt     time.Time
-	joinCallID     string
-	joinTargetType TargetType
-	joinTargetID   string
-	err            error
+	call                    domain.Call
+	started                 StartCallCommand
+	action                  ClientMessageType
+	actorID                 string
+	callID                  string
+	presenceCallID          string
+	syncCallID              string
+	leaveActorID            string
+	leaveCallID             string
+	resourceSyncID          string
+	found                   bool
+	observedAt              time.Time
+	joinCallID              string
+	joinTargetType          TargetType
+	joinTargetID            string
+	participationID         string
+	presenceParticipationID string
+	leaveParticipationID    string
+	leaveReleased           bool
+	err                     error
 }
 
-func (h *fakeCallHandler) StartCall(_ context.Context, command StartCallCommand) (domain.Call, error) {
+func (h *fakeCallHandler) StartCall(_ context.Context, command StartCallCommand) (domain.Call, string, error) {
 	h.started = command
-	return h.call, h.err
+	return h.call, h.participationID, h.err
 }
 
 func (h *fakeCallHandler) TransitionCall(_ context.Context, workspaceID, actorID, callID string, action ClientMessageType) (domain.Call, error) {
@@ -53,23 +58,23 @@ func (h *fakeCallHandler) CurrentCall(_ context.Context, _, _, callID string) (d
 	return h.call, h.err
 }
 
-func (h *fakeCallHandler) RenewCallPresence(_ context.Context, _ string, actorID, callID string) error {
-	h.actorID, h.presenceCallID = actorID, callID
+func (h *fakeCallHandler) RenewCallPresence(_ context.Context, _ string, actorID, callID, participationID string) error {
+	h.actorID, h.presenceCallID, h.presenceParticipationID = actorID, callID, participationID
 	return h.err
 }
 
-func (h *fakeCallHandler) LeaveCall(_ context.Context, _ string, actorID, callID string) (domain.Call, error) {
-	h.leaveActorID, h.leaveCallID = actorID, callID
-	return h.call, h.err
+func (h *fakeCallHandler) LeaveCall(_ context.Context, _ string, actorID, callID, participationID string) (domain.Call, bool, error) {
+	h.leaveActorID, h.leaveCallID, h.leaveParticipationID = actorID, callID, participationID
+	return h.call, h.leaveReleased, h.err
 }
 
 func (h *fakeCallHandler) ResourceSync(_ context.Context, _, _ string, _ TargetType, _ string) (domain.Call, bool, time.Time, error) {
 	return h.call, h.found, h.observedAt, h.err
 }
 
-func (h *fakeCallHandler) JoinCall(_ context.Context, _, _, callID string, targetType TargetType, targetID string) (domain.Call, error) {
+func (h *fakeCallHandler) JoinCall(_ context.Context, _, _, callID string, targetType TargetType, targetID string) (domain.Call, string, error) {
 	h.joinCallID, h.joinTargetType, h.joinTargetID = callID, targetType, targetID
-	return h.call, h.err
+	return h.call, h.participationID, h.err
 }
 
 type allowCallLimiter struct{ allowed bool }
@@ -137,7 +142,7 @@ func TestCallSyncByIDUsesAuthenticatedIdentityAndRepliesOnlyToRequester(t *testi
 }
 
 func TestResourceCallStartAndPresenceUseAuthenticatedClientIdentity(t *testing.T) {
-	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1)}
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1), participationID: callTestParticipation}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-call-test",
 		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
 	t.Cleanup(hub.Shutdown)
@@ -159,11 +164,12 @@ func TestResourceCallStartAndPresenceUseAuthenticatedClientIdentity(t *testing.T
 	}
 
 	if err := hub.handleClientMessage(context.Background(), client, ClientMessage{
-		Type: ClientMessageTypeCallPresence, CallID: callTestID,
+		Type: ClientMessageTypeCallPresence, CallID: callTestID, ParticipationID: callTestParticipation,
 	}); err != nil {
 		t.Fatalf("presence: %v", err)
 	}
-	if handler.actorID != callTestCaller || handler.presenceCallID != callTestID {
+	if handler.actorID != callTestCaller || handler.presenceCallID != callTestID ||
+		handler.presenceParticipationID != callTestParticipation {
 		t.Fatalf("presence actor=%q call=%q", handler.actorID, handler.presenceCallID)
 	}
 }
@@ -261,7 +267,7 @@ func TestPublishResourceCallUsesAuthorizedTargetSubscription(t *testing.T) {
 }
 
 func TestResourceCallLeaveUsesAuthenticatedIdentityAndAcksOnlyTheRequester(t *testing.T) {
-	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 2)}
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 2), leaveReleased: true}
 	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-leave-test", WithCallHandler(handler))
 	t.Cleanup(hub.Shutdown)
 	requester := newClient("leaver-client", callTestCaller, callTestWorkspace, &fakeSender{})
@@ -273,23 +279,32 @@ func TestResourceCallLeaveUsesAuthenticatedIdentityAndAcksOnlyTheRequester(t *te
 	}
 
 	err := hub.handleClientMessage(context.Background(), requester, ClientMessage{
-		Type: ClientMessageTypeCallLeave, CallID: callTestID,
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation,
 	})
 	if err != nil {
 		t.Fatalf("leave: %v", err)
 	}
-	if handler.leaveActorID != callTestCaller || handler.leaveCallID != callTestID {
+	if handler.leaveActorID != callTestCaller || handler.leaveCallID != callTestID ||
+		handler.leaveParticipationID != callTestParticipation {
 		t.Fatalf("leave actor=%q call=%q", handler.leaveActorID, handler.leaveCallID)
 	}
 
-	// Mirrors call.sync: the ack is addressed to the requester alone. A
-	// leave that does not end the call must never reach anyone else — see
-	// TestPublishCallDeliversOnlyToParticipants for the broadcast path that
-	// fires instead when a leave does end the call.
+	// The requester receives an explicit command result, never a lifecycle
+	// event reused as an ACK. A leave that does not end the call must never
+	// reach anyone else.
 	select {
 	case payload := <-requester.outbox:
-		var event Event
-		if err := json.Unmarshal(payload, &event); err != nil || event.Call == nil || event.Call.ID != callTestID {
+		var response struct {
+			Type       string           `json:"type"`
+			Operation  string           `json:"operation"`
+			ResponseTo string           `json:"response_to"`
+			Released   bool             `json:"released"`
+			Call       CallEventPayload `json:"call"`
+		}
+		if err := json.Unmarshal(payload, &response); err != nil || response.Type != "call.left" ||
+			response.Operation != "call.leave" || response.ResponseTo != callTestRequest ||
+			!response.Released || response.Call.ID != callTestID {
 			t.Fatalf("unexpected leave ack: %s (%v)", payload, err)
 		}
 	default:
@@ -310,7 +325,8 @@ func TestResourceCallLeaveRejectsUnexpectedFields(t *testing.T) {
 	}
 
 	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
-		Type: ClientMessageTypeCallLeave, CallID: callTestID, TargetType: TargetTypeChannel,
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation, TargetType: TargetTypeChannel,
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("error = %v, want invalid input", err)
@@ -334,9 +350,10 @@ func TestResourceCallLeaveUnauthorizedMapsToTheSameGenericNotFoundError(t *testi
 	}
 
 	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
-		Type: ClientMessageTypeCallLeave, CallID: callTestID,
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation,
 	})
-	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallLeave, callTestID, "", err) {
+	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallLeave, callTestID, callTestRequest, err) {
 		t.Fatalf("unexpected error classification: %v", err)
 	}
 	var response clientErrorResponse

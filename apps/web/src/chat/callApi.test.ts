@@ -50,6 +50,20 @@ describe("issueCallToken (RF-23)", () => {
     );
   });
 
+  it("adds the resource admission fence without changing direct calls", async () => {
+    mockAuthFetch.mockResolvedValueOnce(tokenEnvelope);
+    const callId = "00000000-0000-4000-8000-000000000501";
+    const participationId = "00000000-0000-4000-8000-000000000502";
+
+    await issueCallToken(callId, participationId);
+
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    expect(JSON.parse(init.body)).toEqual({
+      call_id: callId,
+      participation_id: participationId,
+    });
+  });
+
   it("never sends a resource_kind or resource_id field", async () => {
     mockAuthFetch.mockResolvedValueOnce(tokenEnvelope);
 

@@ -10,9 +10,10 @@ import (
 )
 
 const (
-	serviceTestUserID    = "11111111-1111-4111-8111-111111111111"
-	serviceTestSessionID = "22222222-2222-4222-8222-222222222222"
-	serviceTestResource  = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+	serviceTestUserID        = "11111111-1111-4111-8111-111111111111"
+	serviceTestSessionID     = "22222222-2222-4222-8222-222222222222"
+	serviceTestResource      = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+	serviceTestParticipation = "33333333-3333-4333-8333-333333333333"
 )
 
 type tokenAuthorizerStub struct {
@@ -53,6 +54,7 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	result, err := svc.Issue(context.Background(), IssueTokenInput{
 		Kind: domain.ResourceKindCall, ResourceID: serviceTestResource,
 		UserID: serviceTestUserID, SessionID: serviceTestSessionID,
+		ParticipationID: serviceTestParticipation,
 		AccessExpiresAt: now.Add(10 * time.Minute),
 	})
 	if err != nil {
@@ -75,6 +77,9 @@ func TestTokenServiceIssuesServerDerivedIdentityRoomAndDeadline(t *testing.T) {
 	}
 	if authorizer.input.UserID != serviceTestUserID || authorizer.input.SessionID != serviceTestSessionID {
 		t.Fatalf("authorization did not receive authenticated principal: %+v", authorizer.input)
+	}
+	if authorizer.input.ParticipationID != serviceTestParticipation {
+		t.Fatalf("authorization did not receive participation fence: %+v", authorizer.input)
 	}
 }
 
@@ -221,6 +226,8 @@ func TestTokenServiceRejectsInvalidConfigurationAndPrincipal(t *testing.T) {
 			edit: func(input *IssueTokenInput) { input.SessionID = "invalid" }, want: domain.ErrUnauthorized},
 		{name: "invalid kind", svc: NewTokenService(validAuthorizer, validSigner, time.Minute, func() time.Time { return now }),
 			edit: func(input *IssueTokenInput) { input.Kind = "group" }, want: domain.ErrInvalidInput},
+		{name: "invalid participation id", svc: NewTokenService(validAuthorizer, validSigner, time.Minute, func() time.Time { return now }),
+			edit: func(input *IssueTokenInput) { input.ParticipationID = "invalid" }, want: domain.ErrInvalidInput},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

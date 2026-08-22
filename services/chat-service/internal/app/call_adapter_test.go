@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	adapterWorkspace = "00000000-0000-4000-8000-000000000021"
-	adapterRequest   = "00000000-0000-4000-8000-000000000022"
-	adapterCallID    = "00000000-0000-4000-8000-000000000023"
-	adapterActor     = "00000000-0000-4000-8000-000000000024"
-	adapterTarget    = "00000000-0000-4000-8000-000000000025"
+	adapterWorkspace     = "00000000-0000-4000-8000-000000000021"
+	adapterRequest       = "00000000-0000-4000-8000-000000000022"
+	adapterCallID        = "00000000-0000-4000-8000-000000000023"
+	adapterActor         = "00000000-0000-4000-8000-000000000024"
+	adapterTarget        = "00000000-0000-4000-8000-000000000025"
+	adapterParticipation = "00000000-0000-4000-8000-000000000026"
 )
 
 type adapterCallStore struct {
@@ -37,9 +38,9 @@ func (s *adapterCallStore) CreateCall(context.Context, storage.CreateCallInput) 
 	return domain.Call{}, false, domain.ErrConflict
 }
 
-func (s *adapterCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, error) {
+func (s *adapterCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, error) {
 	s.resourceInput = input
-	return domain.Call{}, false, domain.ErrConflict
+	return domain.Call{}, false, "", domain.ErrConflict
 }
 
 func (s *adapterCallStore) RenewCallPresence(_ context.Context, input storage.RenewCallPresenceInput) error {
@@ -66,9 +67,9 @@ func (s *adapterCallStore) ExpireDueCalls(context.Context, int) ([]domain.Call, 
 	return nil, domain.ErrConflict
 }
 
-func (s *adapterCallStore) JoinResourceCall(_ context.Context, input storage.JoinResourceCallInput) (domain.Call, error) {
+func (s *adapterCallStore) JoinResourceCall(_ context.Context, input storage.JoinResourceCallInput) (domain.Call, string, error) {
 	s.joinInput = input
-	return domain.Call{}, domain.ErrConflict
+	return domain.Call{}, "", domain.ErrConflict
 }
 
 func (s *adapterCallStore) ActiveResourceCall(_ context.Context, workspaceID, actorID string, targetType domain.CallTargetType, targetID string) (storage.ActiveResourceCallResult, error) {
@@ -81,7 +82,7 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 	svc := service.NewCallService(store, 30*time.Second, nil, nil)
 	adapter := &callHandlerAdapter{service: svc}
 
-	_, err := adapter.StartCall(context.Background(), ws.StartCallCommand{
+	_, _, err := adapter.StartCall(context.Background(), ws.StartCallCommand{
 		WorkspaceID: adapterWorkspace,
 		RequestID:   adapterRequest,
 		CallerID:    adapterActor,
@@ -99,13 +100,14 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 	}
 
 	err = adapter.RenewCallPresence(
-		context.Background(), adapterWorkspace, adapterActor, adapterCallID,
+		context.Background(), adapterWorkspace, adapterActor, adapterCallID, adapterParticipation,
 	)
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("RenewCallPresence error = %v", err)
 	}
 	if store.presenceInput.ActorID != adapterActor ||
-		store.presenceInput.CallID != adapterCallID {
+		store.presenceInput.CallID != adapterCallID ||
+		store.presenceInput.ParticipationID != adapterParticipation {
 		t.Fatalf("presence input = %+v", store.presenceInput)
 	}
 
@@ -146,15 +148,16 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 		t.Fatalf("invalid transition error = %v", err)
 	}
 
-	_, err = adapter.LeaveCall(
-		context.Background(), adapterWorkspace, adapterActor, adapterCallID,
+	_, _, err = adapter.LeaveCall(
+		context.Background(), adapterWorkspace, adapterActor, adapterCallID, adapterParticipation,
 	)
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("LeaveCall error = %v", err)
 	}
 	if store.leaveInput.WorkspaceID != adapterWorkspace ||
 		store.leaveInput.ActorID != adapterActor ||
-		store.leaveInput.CallID != adapterCallID {
+		store.leaveInput.CallID != adapterCallID ||
+		store.leaveInput.ParticipationID != adapterParticipation {
 		t.Fatalf("leave input = %+v", store.leaveInput)
 	}
 
@@ -168,7 +171,7 @@ func TestCallHandlerAdapterDelegatesResourceLifecycle(t *testing.T) {
 		t.Fatalf("current call id = %q", store.currentCallID)
 	}
 
-	_, err = adapter.JoinCall(
+	_, _, err = adapter.JoinCall(
 		context.Background(), adapterWorkspace, adapterActor, adapterCallID, ws.TargetTypeChannel, adapterTarget,
 	)
 	if !errors.Is(err, domain.ErrConflict) {

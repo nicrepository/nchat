@@ -70,6 +70,11 @@ const (
 	pgResourceCallChannelOthersLease  = "96000000-0000-4000-8000-000000000007"
 	pgResourceCallDMWithLease         = "96000000-0000-4000-8000-000000000008"
 	pgResourceCallDMNoLease           = "96000000-0000-4000-8000-000000000009"
+	pgParticipationChannelCurrent     = "97000000-0000-4000-8000-000000000001"
+	pgParticipationChannelStale       = "97000000-0000-4000-8000-000000000002"
+	pgParticipationDMCurrent          = "97000000-0000-4000-8000-000000000003"
+	pgParticipationExpired            = "97000000-0000-4000-8000-000000000004"
+	pgParticipationOtherUser          = "97000000-0000-4000-8000-000000000005"
 	pgMissingResource                 = "99000000-0000-4000-8000-000000000001"
 )
 
@@ -108,12 +113,13 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 	authorizer := NewPGXResourceAuthorizer(pool)
 
 	tests := []struct {
-		name       string
-		kind       domain.ResourceKind
-		resourceID string
-		userID     string
-		sessionID  string
-		wantID     string
+		name            string
+		kind            domain.ResourceKind
+		resourceID      string
+		userID          string
+		sessionID       string
+		participationID string
+		wantID          string
 		// nil means "don't care about display name" for this row — never
 		// used for the three precedence rows below, where "" (both empty)
 		// is itself the assertion and must not be skipped.
@@ -136,11 +142,15 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 		{name: "active call nonparticipant denied", kind: domain.ResourceKindCall, resourceID: pgCallNonParticipant, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		// issue #622/#609: resource call token authorization now requires a
 		// live participant lease, on top of membership/visibility.
-		{name: "channel call + membership + live lease allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgResourceCallChannelWithLease},
+		{name: "channel call current fence allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelCurrent, wantID: pgResourceCallChannelWithLease},
+		{name: "channel call stale fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelStale, wantErr: domain.ErrNotFound},
+		{name: "channel call missing fence cannot use fenced lease", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "channel call wrong-call fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationDMCurrent, wantErr: domain.ErrNotFound},
 		{name: "channel call + membership + no lease denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelNoLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
-		{name: "channel call + expired lease denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelExpiredLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
-		{name: "channel call + lease belongs to another user denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelOthersLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
-		{name: "group DM call + membership + live lease allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMWithLease, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgResourceCallDMWithLease},
+		{name: "channel call + expired current fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelExpiredLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationExpired, wantErr: domain.ErrNotFound},
+		{name: "channel call + fence belongs to another user denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelOthersLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationOtherUser, wantErr: domain.ErrNotFound},
+		{name: "group DM call current fence allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationDMCurrent, wantID: pgResourceCallDMWithLease},
+		{name: "group DM call stale fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelCurrent, wantErr: domain.ErrNotFound},
 		{name: "group DM call + membership + no lease denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMNoLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "revoked session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionRevoked, wantErr: domain.ErrUnauthorized},
 		{name: "idle expired session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionIdleExpired, wantErr: domain.ErrUnauthorized},
@@ -161,6 +171,7 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 			result, err := authorizer.Authorize(context.Background(), service.AuthorizationInput{
 				Kind: tt.kind, ResourceID: tt.resourceID,
 				UserID: tt.userID, SessionID: tt.sessionID,
+				ParticipationID: tt.participationID,
 			})
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -221,6 +232,7 @@ func resetAndMigrateMediaSchemas(t *testing.T, ctx context.Context, conn *pgx.Co
 		// chat.call_participant_leases) would fail against a schema that
 		// simply does not have those columns/tables yet.
 		{domain: "chat", name: "000028_resource_call_lifecycle.up.sql"},
+		{domain: "chat", name: "000035_call_participant_lease_identity.up.sql"},
 	} {
 		if _, err := conn.Exec(ctx, readRepositoryMigration(t, migration.domain, migration.name)); err != nil {
 			t.Fatalf("apply %s/%s: %v", migration.domain, migration.name, err)
@@ -335,11 +347,11 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('96000000-0000-4000-8000-000000000008', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001', NULL, 'dm', '95000000-0000-4000-8000-000000000005', 'audio', 'active', now() + interval '30 seconds'),
 			('96000000-0000-4000-8000-000000000009', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000009', '91000000-0000-4000-8000-000000000001', NULL, 'dm', '95000000-0000-4000-8000-000000000006', 'audio', 'active', now() + interval '30 seconds');
 
-		INSERT INTO chat.call_participant_leases (call_id, user_id, expires_at) VALUES
-			('96000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes'),
-			('96000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001', now() - interval '1 minute'),
-			('96000000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000002', now() + interval '30 minutes'),
-			('96000000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes');
+		INSERT INTO chat.call_participant_leases (call_id, user_id, expires_at, participation_id) VALUES
+			('96000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000001'),
+			('96000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001', now() - interval '1 minute', '97000000-0000-4000-8000-000000000004'),
+			('96000000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000002', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000005'),
+			('96000000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000003');
 		COMMIT;
 	`)
 	if err != nil {

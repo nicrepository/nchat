@@ -5,9 +5,12 @@ import { issueCallToken } from "./callApi";
 import type { Call } from "./callState";
 import { acquireChatSocket } from "./chatSocket";
 import {
+  joinResourceCall,
   leaveResourceCall,
   ResourceCallSignalingError,
   startResourceCall,
+  type ResourceCallAdmission,
+  type ResourceCallLeaveResult,
 } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
 import { useResourceCallSession, type ResourceCallTarget } from "./useResourceCallSession";
@@ -18,6 +21,7 @@ vi.mock("./callApi", () => ({
 vi.mock("./resourceCallSignaling", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./resourceCallSignaling")>()),
   startResourceCall: vi.fn(),
+  joinResourceCall: vi.fn(),
   leaveResourceCall: vi.fn(),
 }));
 vi.mock("./chatSocket", () => ({
@@ -60,10 +64,19 @@ const resourceCall = {
   occurred_at: "2026-08-18T12:00:00Z",
   expires_at: "2026-08-18T12:00:30Z",
 };
+const participationID = "00000000-0000-4000-8000-000000000708";
+const resourceAdmission = (call: Call = resourceCall, participationId = participationID) => ({
+  call,
+  participationId,
+});
+
+const knownCallTarget: ResourceCallTarget = { ...channelTarget, callId: resourceCall.call_id };
 
 beforeEach(() => {
   vi.mocked(startResourceCall).mockReset();
-  vi.mocked(startResourceCall).mockResolvedValue(resourceCall);
+  vi.mocked(startResourceCall).mockResolvedValue(resourceAdmission());
+  vi.mocked(joinResourceCall).mockReset();
+  vi.mocked(joinResourceCall).mockResolvedValue(resourceAdmission());
   vi.mocked(issueCallToken).mockReset();
   vi.mocked(issueCallToken).mockResolvedValue({
     token: "resource-token",
@@ -71,7 +84,10 @@ beforeEach(() => {
     serverUrl: "wss://livekit-dev.nic-labs.com",
   });
   vi.mocked(leaveResourceCall).mockReset();
-  vi.mocked(leaveResourceCall).mockResolvedValue({ ...resourceCall, status: "ended" });
+  vi.mocked(leaveResourceCall).mockResolvedValue({
+    released: true,
+    call: { ...resourceCall, status: "ended" },
+  });
 });
 
 describe("useResourceCallSession", () => {
@@ -83,7 +99,7 @@ describe("useResourceCallSession", () => {
 
     expect(media.startAudio).toHaveBeenCalledOnce();
     expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(channelTarget);
-    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
+    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id, participationID);
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
       { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
@@ -102,7 +118,7 @@ describe("useResourceCallSession", () => {
     await act(() => view.result.current.join(groupTarget));
 
     expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(groupTarget);
-    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
+    expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id, participationID);
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
       { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
@@ -197,10 +213,35 @@ describe("useResourceCallSession", () => {
       expect(presenceHandle.send).toHaveBeenCalledWith({
         type: "call.presence",
         call_id: originalCallId,
+        participation_id: participationID,
       });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("stops stale presence and clears only the local fenced session", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+    const listener = vi.mocked(acquireChatSocket).mock.calls.at(-1)![0];
+    media.stop.mockClear();
+
+    act(() =>
+      listener.onMessage?.(
+        {
+          type: "call.error",
+          operation: "call.presence",
+          call_id: resourceCall.call_id,
+          code: "call_participation_stale",
+        },
+        1,
+      ),
+    );
+
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(view.result.current.status).toBe("idle");
+    expect(view.result.current.callId).toBeNull();
   });
 
   it("keeps a same-target rejoin legitimate", async () => {
@@ -266,7 +307,10 @@ describe("useResourceCallSession", () => {
     await act(() => view.result.current.leave());
 
     expect(media.stop).toHaveBeenCalledOnce();
-    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
+    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
+      resourceCall.call_id,
+      participationID,
+    );
     expect(view.result.current.active).toBeNull();
     expect(view.result.current.status).toBe("idle");
     expect(view.result.current.error).toBeNull();
@@ -338,7 +382,10 @@ describe("useResourceCallSession", () => {
     // in this hook's surface at all, so a passing join+leave already proves
     // leave() never reached for one.
     expect(startResourceCall).toHaveBeenCalledOnce();
-    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id);
+    expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
+      resourceCall.call_id,
+      participationID,
+    );
   });
 
   it("a duplicated/retried leave() is safe: both settle and never leave a stuck pending state", async () => {
@@ -346,8 +393,8 @@ describe("useResourceCallSession", () => {
     const view = renderHook(() => useResourceCallSession(media));
     await act(() => view.result.current.join(channelTarget));
 
-    let first!: Promise<void>;
-    let second!: Promise<void>;
+    let first!: Promise<boolean>;
+    let second!: Promise<boolean>;
     await act(async () => {
       first = view.result.current.leave();
       second = view.result.current.leave();
@@ -378,14 +425,14 @@ describe("useResourceCallSession", () => {
       };
       presenceHandle.send.mockClear();
 
-      let resolveAck!: (value: Call) => void;
+      let resolveAck!: (value: ResourceCallLeaveResult) => void;
       vi.mocked(leaveResourceCall).mockReturnValueOnce(
         new Promise((resolve) => {
           resolveAck = resolve;
         }),
       );
 
-      let leaving!: Promise<void>;
+      let leaving!: Promise<boolean>;
       act(() => {
         leaving = view.result.current.leave();
       });
@@ -401,7 +448,7 @@ describe("useResourceCallSession", () => {
       expect(vi.mocked(acquireChatSocket).mock.results.length).toBe(acquireCallsBeforeLeave);
 
       await act(async () => {
-        resolveAck({ ...resourceCall, status: "ended" });
+        resolveAck({ released: true, call: { ...resourceCall, status: "ended" } });
         await leaving;
       });
 
@@ -431,7 +478,7 @@ describe("useResourceCallSession", () => {
         call_id: "00000000-0000-4000-8000-000000000799",
         target_id: otherTarget.id,
       };
-      vi.mocked(startResourceCall).mockResolvedValueOnce(otherCall);
+      vi.mocked(startResourceCall).mockResolvedValueOnce(resourceAdmission(otherCall));
       await act(() => view.result.current.join(otherTarget));
       expect(view.result.current.status).toBe("active");
 
@@ -446,6 +493,7 @@ describe("useResourceCallSession", () => {
       expect(presenceHandle.send).toHaveBeenCalledWith({
         type: "call.presence",
         call_id: otherCall.call_id,
+        participation_id: participationID,
       });
     } finally {
       vi.useRealTimers();
@@ -737,6 +785,73 @@ describe("useResourceCallSession", () => {
     expect(view.result.current.error).toContain("recuperar");
   });
 
+  it("re-admits on every reclaim and uses the new P2/P3 before each token", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(knownCallTarget));
+
+    const participationP2 = "00000000-0000-4000-8000-000000000721";
+    const participationP3 = "00000000-0000-4000-8000-000000000722";
+    vi.mocked(joinResourceCall).mockResolvedValueOnce(
+      resourceAdmission(resourceCall, participationP2),
+    );
+    await act(() => view.result.current.reconnect());
+    vi.mocked(joinResourceCall).mockResolvedValueOnce(
+      resourceAdmission(resourceCall, participationP3),
+    );
+    await act(() => view.result.current.reconnect());
+
+    expect(joinResourceCall).toHaveBeenCalledTimes(3);
+    expect(issueCallToken).toHaveBeenNthCalledWith(2, resourceCall.call_id, participationP2);
+    expect(issueCallToken).toHaveBeenNthCalledWith(3, resourceCall.call_id, participationP3);
+  });
+
+  it("preserves the reconnect admission P when its compensation leave fails", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(knownCallTarget));
+
+    const participationP2 = "00000000-0000-4000-8000-000000000723";
+    vi.mocked(joinResourceCall).mockResolvedValueOnce(
+      resourceAdmission(resourceCall, participationP2),
+    );
+    vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+    vi.mocked(leaveResourceCall).mockRejectedValueOnce(new Error("compensation failed"));
+
+    await act(() => view.result.current.reconnect().catch(() => undefined));
+
+    expect(view.result.current.status).toBe("error");
+    expect(view.result.current.errorOperation).toBe("leave");
+    expect(view.result.current.callId).toBe(resourceCall.call_id);
+    expect(view.result.current.active).toEqual(knownCallTarget);
+
+    vi.mocked(leaveResourceCall).mockResolvedValueOnce({
+      released: true,
+      call: { ...resourceCall, status: "ended" },
+    });
+    await act(() => view.result.current.leave());
+    expect(leaveResourceCall).toHaveBeenLastCalledWith(resourceCall.call_id, participationP2);
+    expect(view.result.current.status).toBe("idle");
+  });
+
+  it("a stale explicit leave clears only this local session and reports released=false", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+    await act(() => view.result.current.join(channelTarget));
+    vi.mocked(leaveResourceCall).mockResolvedValueOnce({ released: false });
+
+    let released = true;
+    await act(async () => {
+      released = await view.result.current.leave();
+    });
+
+    expect(released).toBe(false);
+    expect(leaveResourceCall).toHaveBeenCalledWith(resourceCall.call_id, participationID);
+    expect(media.stop).toHaveBeenCalled();
+    expect(view.result.current.status).toBe("idle");
+    expect(view.result.current.callId).toBeNull();
+  });
+
   // ── RF-24 × RF-23: a cleanup failure is never mistaken for a completed
   // leave, so a caller relying on "the Room is gone" never proceeds while it
   // actually isn't. ───────────────────────────────────────────────────────
@@ -798,7 +913,7 @@ describe("useResourceCallSession", () => {
     await act(() => view.result.current.join(channelTarget));
     media.connect.mockClear();
 
-    let leaving!: Promise<void>;
+    let leaving!: Promise<boolean | undefined>;
     act(() => {
       leaving = view.result.current.leave().catch(() => undefined);
     });
@@ -1181,6 +1296,319 @@ describe("useResourceCallSession", () => {
       expect(view.result.current.status).toBe("active");
       expect(view.result.current.callId).toBe(resourceCall.call_id);
       expect(media.connect).toHaveBeenCalledOnce();
+    });
+  });
+
+  // ── issue #622 round 2: a known call_id is obligatory admission via
+  // call.join — never a locally-synthesised Call, never a shortcut around
+  // the lease media-service's resource token now requires. ───────────────
+
+  describe("known call_id admission (issue #622 round 2)", () => {
+    it("1. a fresh target (no call_id) uses call.start", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(channelTarget);
+      expect(joinResourceCall).not.toHaveBeenCalled();
+    });
+
+    it("2. a known call_id uses call.join, never call.start", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(knownCallTarget));
+      expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith(
+        resourceCall.call_id,
+        knownCallTarget,
+      );
+      expect(startResourceCall).not.toHaveBeenCalled();
+      expect(view.result.current.status).toBe("active");
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+    });
+
+    it("3. a known call_id never skips admission — a token is never requested before call.join actually resolves", async () => {
+      const media = fakeMedia();
+      let resolveJoin!: (admission: ResourceCallAdmission) => void;
+      vi.mocked(joinResourceCall).mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveJoin = resolve;
+        }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+      const joining = act(() => view.result.current.join(knownCallTarget));
+
+      expect(issueCallToken).not.toHaveBeenCalled();
+      resolveJoin(resourceAdmission());
+      await joining;
+      expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id, participationID);
+    });
+
+    it("4. startAudio runs before the network admission round trip, for both fresh and known targets", async () => {
+      const media = fakeMedia();
+      const order: string[] = [];
+      media.startAudio.mockImplementation(async () => {
+        order.push("startAudio");
+      });
+      vi.mocked(joinResourceCall).mockImplementationOnce(async () => {
+        order.push("call.join");
+        return resourceAdmission();
+      });
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(knownCallTarget));
+      expect(order).toEqual(["startAudio", "call.join"]);
+    });
+
+    it("5. a token is requested only after call.admitted (call.join) resolves", async () => {
+      const media = fakeMedia();
+      const order: string[] = [];
+      vi.mocked(joinResourceCall).mockImplementationOnce(async () => {
+        order.push("call.join");
+        return resourceAdmission();
+      });
+      vi.mocked(issueCallToken).mockImplementationOnce(async () => {
+        order.push("token");
+        return { token: "t", expiresAt: "2026-01-01T00:00:00Z", serverUrl: "wss://x" };
+      });
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(knownCallTarget));
+      expect(order).toEqual(["call.join", "token"]);
+    });
+
+    it("6. media.connect runs only after the token resolves", async () => {
+      const media = fakeMedia();
+      const order: string[] = [];
+      vi.mocked(issueCallToken).mockImplementationOnce(async () => {
+        order.push("token");
+        return { token: "t", expiresAt: "2026-01-01T00:00:00Z", serverUrl: "wss://x" };
+      });
+      media.connect.mockImplementationOnce(async () => {
+        order.push("connect");
+      });
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(knownCallTarget));
+      expect(order).toEqual(["token", "connect"]);
+    });
+
+    it("7. a token failure after admission compensates with call.leave for the admitted call_id", async () => {
+      const media = fakeMedia();
+      vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+      const view = renderHook(() => useResourceCallSession(media));
+
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
+        resourceCall.call_id,
+        participationID,
+      );
+      expect(view.result.current.status).toBe("error");
+      expect(view.result.current.errorOperation).toBe("join");
+      expect(view.result.current.callId).toBeNull();
+      expect(view.result.current.active).toBeNull();
+    });
+
+    it("8. a connect failure after admission compensates with call.leave and stops local media", async () => {
+      const media = fakeMedia();
+      media.connect.mockRejectedValueOnce(new Error("connect failed"));
+      const view = renderHook(() => useResourceCallSession(media));
+
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
+        resourceCall.call_id,
+        participationID,
+      );
+      expect(view.result.current.status).toBe("error");
+      expect(view.result.current.callId).toBeNull();
+      expect(view.result.current.active).toBeNull();
+    });
+
+    it("9. a successful compensation leave never leaves a false active/callId behind", async () => {
+      const media = fakeMedia();
+      vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+      const view = renderHook(() => useResourceCallSession(media));
+
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(view.result.current.callId).toBeNull();
+      expect(view.result.current.active).toBeNull();
+      expect(view.result.current.status).not.toBe("active");
+    });
+
+    it("10. a failed compensation leave preserves callId/active for a retryable leave() — never fakes idle", async () => {
+      const media = fakeMedia();
+      vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
+      vi.mocked(leaveResourceCall).mockRejectedValueOnce(new Error("compensation failed"));
+      const view = renderHook(() => useResourceCallSession(media));
+
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(view.result.current.status).toBe("error");
+      expect(view.result.current.errorOperation).toBe("leave");
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(view.result.current.active).toEqual(knownCallTarget);
+
+      // The preserved errorOperation="leave" lets the existing retry
+      // affordance call leave() again — idempotent server-side — instead of
+      // silently pretending the lease is gone.
+      vi.mocked(leaveResourceCall).mockResolvedValueOnce({
+        released: true,
+        call: { ...resourceCall, status: "ended" },
+      });
+      await act(() => view.result.current.leave());
+      expect(leaveResourceCall).toHaveBeenLastCalledWith(resourceCall.call_id, participationID);
+      expect(view.result.current.status).toBe("idle");
+    });
+
+    it("11. a pre-admission busy rejection never calls call.leave — no lease was ever created", async () => {
+      const media = fakeMedia();
+      vi.mocked(joinResourceCall).mockRejectedValueOnce(
+        new ResourceCallSignalingError("call.join", "call_participant_busy"),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(leaveResourceCall).not.toHaveBeenCalled();
+      expect(view.result.current.error).toBe("Você já está em outra chamada.");
+    });
+
+    it("11b. a pre-admission busy rejection on a same-target rejoin never stops the previously active session", async () => {
+      const media = fakeMedia();
+      const view = renderHook(() => useResourceCallSession(media));
+      await act(() => view.result.current.join(channelTarget));
+      const originalCallId = view.result.current.callId;
+      vi.mocked(joinResourceCall).mockRejectedValueOnce(
+        new ResourceCallSignalingError("call.join", "call_participant_busy"),
+      );
+      media.stop.mockClear();
+
+      // Same kind/id as the already-active session (so the hook's own
+      // pre-#622 different-target guard does not short-circuit before
+      // reaching admission), but rejoining via the known-callId path — e.g.
+      // the discovery indicator handed back a callId while server-side
+      // state now disagrees.
+      await act(() => view.result.current.join(knownCallTarget));
+
+      expect(joinResourceCall).toHaveBeenCalledOnce();
+      expect(view.result.current.callId).toBe(originalCallId);
+      expect(view.result.current.status).toBe("active");
+      expect(leaveResourceCall).not.toHaveBeenCalled();
+      expect(media.stop).not.toHaveBeenCalled();
+    });
+
+    it("13. a failure after this attempt was already superseded by a newer generation never touches the newer attempt's state", async () => {
+      const media = fakeMedia();
+      const participationP1 = "00000000-0000-4000-8000-000000000731";
+      const participationP2 = "00000000-0000-4000-8000-000000000732";
+      let resolveFirstJoin!: (admission: ResourceCallAdmission) => void;
+      vi.mocked(joinResourceCall).mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveFirstJoin = resolve;
+        }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+      let firstJoin!: Promise<string | undefined>;
+      act(() => {
+        firstJoin = view.result.current.join(knownCallTarget);
+      });
+      // Let startAudio() (an already-resolved mock) actually settle, so the
+      // first attempt is genuinely stalled awaiting call.join's admission —
+      // not still behind an earlier step — before it gets superseded.
+      // Mirrors the existing "leaving while ... still pending" tests above.
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(joinResourceCall).toHaveBeenCalledOnce();
+
+      // Supersede via leave() only now that admission is genuinely in
+      // flight — bumps attemptGenerationRef past the first attempt.
+      const secondCallId = "00000000-0000-4000-8000-0000000008aa";
+      await act(() => view.result.current.leave());
+      vi.mocked(joinResourceCall).mockResolvedValueOnce(
+        resourceAdmission({ ...resourceCall, call_id: secondCallId }, participationP2),
+      );
+      const secondTarget: ResourceCallTarget = { ...channelTarget, callId: secondCallId };
+      await act(() => view.result.current.join(secondTarget));
+      expect(view.result.current.callId).toBe(secondCallId);
+
+      // Now let the FIRST (long-superseded) join's admission finally
+      // resolve — it must compensate for its own orphaned lease and must
+      // never touch the second attempt's now-current state.
+      await act(async () => {
+        resolveFirstJoin(resourceAdmission(resourceCall, participationP1));
+        await firstJoin;
+      });
+
+      expect(leaveResourceCall).toHaveBeenCalledWith(resourceCall.call_id, participationP1);
+      expect(view.result.current.callId).toBe(secondCallId);
+      expect(view.result.current.status).toBe("active");
+    });
+
+    // Issue #622 round 2 adversarial audit (section 18, "MAIOR RISCO"): the
+    // exact scenario is a REJOIN of the SAME call_id, not a different one
+    // (test 13 above uses secondCallId, deliberately distinct). Attempt A
+    // admits X, then stalls post-admission (token pending). A newer,
+    // legitimate rejoin of the SAME X (attempt B) supersedes A and reaches
+    // "active" on its own. Only THEN does A's stalled token request finally
+    // reject. The generation guard must be re-checked immediately before
+    // A's own compensating call.leave — never merely at the top of the
+    // catch handler — so A's now-stale failure never sends a second,
+    // redundant (and destructive) leave against the lease B currently holds.
+    it("18. a stale attempt's post-admission failure never compensates against a newer rejoin of the SAME call_id", async () => {
+      const media = fakeMedia();
+      let rejectTokenA!: (error: unknown) => void;
+      vi.mocked(issueCallToken).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectTokenA = reject;
+          }),
+      );
+      const view = renderHook(() => useResourceCallSession(media));
+
+      // Attempt A: admits X immediately, then stalls at issueCallToken.
+      let firstJoin!: Promise<string | undefined>;
+      act(() => {
+        firstJoin = view.result.current.join(knownCallTarget);
+      });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(view.result.current.status).toBe("connecting");
+
+      // Supersede via leave() — this is the ONLY leaveResourceCall call this
+      // test expects to ever see for X.
+      await act(() => view.result.current.leave());
+      expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
+        resourceCall.call_id,
+        participationID,
+      );
+
+      // Attempt B: a legitimate rejoin of the exact same call_id X, which
+      // the server allows (the call is still active) — reaches "active" on
+      // its own, fully independent of A's still-dangling promise chain.
+      vi.mocked(issueCallToken).mockResolvedValueOnce({
+        token: "token-for-b",
+        expiresAt: "2026-01-01T00:00:00Z",
+        serverUrl: "wss://livekit-dev.nic-labs.com",
+      });
+      await act(() => view.result.current.join(knownCallTarget));
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(view.result.current.status).toBe("active");
+
+      // Only NOW does A's long-stalled token request finally reject. A's own
+      // generation is long superseded (by leave(), then by B's join()), so
+      // its post-admission catch must skip compensation entirely — never a
+      // second call.leave against the lease B currently holds.
+      await act(async () => {
+        rejectTokenA(new Error("token unavailable, far too late"));
+        await firstJoin;
+      });
+
+      expect(leaveResourceCall).toHaveBeenCalledOnce();
+      expect(view.result.current.callId).toBe(resourceCall.call_id);
+      expect(view.result.current.status).toBe("active");
     });
   });
 });

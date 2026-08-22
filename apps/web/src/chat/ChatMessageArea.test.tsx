@@ -1006,6 +1006,57 @@ describe("ChatMessageArea — channel header", () => {
     expect(joinResourceCall).not.toHaveBeenCalled();
   });
 
+  // Issue #622 round 2 adversarial audit (section 9): a direct DM's
+  // classification must come from the domain-authoritative `type` field,
+  // never from "counterpart is present/absent" — a legacy or not-yet-
+  // resolved counterpart is a real, reachable shape (see "names the control
+  // after the conversation when no counterpart is known" above) and must
+  // never be misread as a group, which would wrongly route it into the
+  // resource-call flow.
+  it("RF-24/#622: a 1:1 DM with a temporarily unresolved counterpart still never offers resource-call UI or discovery", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const joinResourceCall = vi.fn();
+    const getResourceCall = vi.fn(() => null);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-1",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [],
+                      // counterpart deliberately omitted — a real shape for a
+                      // legacy or not-yet-resolved 1:1 DM.
+                    },
+                  ],
+                  joinResourceCall,
+                  getResourceCall,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByRole("button", { name: "Iniciar chamada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Entrar na chamada" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Chamada ativa")).not.toBeInTheDocument();
+    expect(getResourceCall).not.toHaveBeenCalled();
+    expect(joinResourceCall).not.toHaveBeenCalled();
+  });
+
   it("colours the header fallback deterministically from the counterpart id, matching the sidebar", async () => {
     const dmWithUser = (id: string, userId: string) => ({
       id,

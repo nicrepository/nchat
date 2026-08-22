@@ -16,10 +16,11 @@ var (
 )
 
 type AuthorizationInput struct {
-	Kind       domain.ResourceKind
-	ResourceID string
-	UserID     string
-	SessionID  string
+	Kind            domain.ResourceKind
+	ResourceID      string
+	UserID          string
+	SessionID       string
+	ParticipationID string
 }
 
 type AuthorizedResource struct {
@@ -59,6 +60,7 @@ type IssueTokenInput struct {
 	ResourceID      string
 	UserID          string
 	SessionID       string
+	ParticipationID string
 	AccessExpiresAt time.Time
 }
 
@@ -96,10 +98,19 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 	if !input.Kind.Valid() {
 		return IssuedToken{}, domain.ErrInvalidInput
 	}
+	participationID := ""
+	if input.ParticipationID != "" {
+		parsed, err := uuid.Parse(input.ParticipationID)
+		if err != nil {
+			return IssuedToken{}, domain.ErrInvalidInput
+		}
+		participationID = parsed.String()
+	}
 
 	authorized, err := s.authorizer.Authorize(ctx, AuthorizationInput{
 		Kind: input.Kind, ResourceID: input.ResourceID,
 		UserID: userID.String(), SessionID: sessionID.String(),
+		ParticipationID: participationID,
 	})
 	if err != nil {
 		if !errors.Is(err, domain.ErrInvalidInput) &&

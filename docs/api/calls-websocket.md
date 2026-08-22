@@ -32,15 +32,17 @@ rodada: sem `call.admitted`, sem `response_to`.
 
 ```json
 {"type":"call.start","request_id":"<uuid>","target_type":"channel","target_id":"<uuid>","call_type":"audio"}
-{"type":"call.presence","call_id":"<uuid>"}
-{"type":"call.leave","call_id":"<uuid>"}
+{"type":"call.presence","call_id":"<uuid>","participation_id":"<uuid>"}
+{"type":"call.leave","request_id":"<uuid>","call_id":"<uuid>","participation_id":"<uuid>"}
 {"type":"call.end","call_id":"<uuid>"}
 ```
 
 `call.start` cria a chamada canônica do recurso se não existir, ou reutiliza a
-já ativa. `call.presence` renova o lease do ator na chamada (heartbeat).
-`call.leave` libera a participação do próprio ator sem encerrar a chamada para
-os demais; `call.end` só é aceito do `caller_id` original e encerra para todos.
+já ativa, e sempre faz uma nova admissão. `call.presence` renova somente o lease
+identificado pelo fencing token; nunca insere nem ressuscita uma linha.
+`call.leave` libera somente a admissão identificada pelo mesmo token, sem
+encerrar a chamada para os demais; `call.end` só é aceito do `caller_id`
+original e encerra para todos.
 
 ### `call.resource.sync` — discovery autoritativa (issue #622)
 
@@ -49,7 +51,12 @@ lease e sem token. Serve para o carregamento inicial da tela e para reconexão
 (reload, troca de aba, retomada de rede) — nunca é polling.
 
 ```json
-{"type":"call.resource.sync","sync_id":"<uuid>","target_type":"channel","target_id":"<uuid>"}
+{
+  "type": "call.resource.sync",
+  "sync_id": "<uuid>",
+  "target_type": "channel",
+  "target_id": "<uuid>"
+}
 ```
 
 Resposta, **somente para quem pediu** (nunca broadcast):
@@ -122,7 +129,13 @@ recebido) que existe uma chamada ativa e quer entrar nela — sem criar uma nova
 chamada.
 
 ```json
-{"type":"call.join","request_id":"<uuid>","call_id":"<uuid>","target_type":"channel","target_id":"<uuid>"}
+{
+  "type": "call.join",
+  "request_id": "<uuid>",
+  "call_id": "<uuid>",
+  "target_type": "channel",
+  "target_id": "<uuid>"
+}
 ```
 
 O servidor revalida tudo a partir do zero antes de admitir: a chamada precisa
@@ -147,9 +160,17 @@ observadores recebem via assinatura do canal/DM:
   "type": "call.admitted",
   "operation": "call.join",
   "response_to": "<request_id do comando>",
-  "call": { "call_id": "<uuid>", "status": "active", "version": 3, "...": "..." }
+  "call": { "call_id": "<uuid>", "status": "active", "version": 3, "...": "..." },
+  "participation_id": "<uuid>"
 }
 ```
+
+`participation_id` é um UUID opaco, novo e não reutilizado para cada admissão
+de recurso, inclusive rejoin, reconnect e handoff. É um fencing token privado
+do requisitante: não é `Call.request_id`, não pertence a `Call`, não aparece em
+`call.accepted`, `call.ended`, `call.resource.synced` nem é enviado a observers.
+O cliente deve armazená-lo junto da tentativa que recebeu este ACK e usá-lo em
+presence, leave e token de mídia.
 
 `operation` é `"call.start"` ou `"call.join"`. O broadcast `call.accepted`
 continua existindo para quem apenas observa o canal/DM (compatibilidade e
@@ -157,6 +178,29 @@ discovery via assinatura) — um cliente não deve tratá-lo como confirmação 
 seu próprio comando; `call.admitted` é o único ACK. `call.start` de chamada
 **direta** não muda: continua sem `call.admitted`, só o lifecycle broadcast
 já existente (RF-23).
+
+## ACK de `call.leave` e fencing stale
+
+Um leave que remove a admissão atual responde somente ao requisitante:
+
+```json
+{
+  "type": "call.left",
+  "operation": "call.leave",
+  "response_to": "<request_id>",
+  "released": true,
+  "call": { "call_id": "<uuid>", "status": "active", "...": "..." }
+}
+```
+
+Se o token já foi substituído, nenhuma lease é removida e a resposta é
+`call.error` com `code: "call_participation_stale"`, correlacionada pelo mesmo
+`response_to`. O servidor não revela qual token é atual. Esse resultado não é
+um lifecycle broadcast e não autoriza a aba stale a anunciar globalmente que
+a participação mais nova saiu.
+
+Presence com token stale usa o mesmo código e não altera expiry. Depois que a
+lease atual sai, um presence stale continua sem inserir qualquer linha.
 
 ## Eventos (broadcast de lifecycle)
 
@@ -205,7 +249,7 @@ O cliente aplica somente versões crescentes para o mesmo `call_id`.
 
 Falhas usam `call.error` com `operation`, `call_id` quando aplicável, e
 códigos estáveis: `call_invalid`, `call_not_found`, `call_invalid_state`,
-`call_participant_busy`, `call_rate_limited` ou `call_unavailable`. Elas não
+`call_participant_busy`, `call_participation_stale`, `call_rate_limited` ou `call_unavailable`. Elas não
 fecham a conexão.
 
 Para `call.join`, `call.resource.sync` e o `call.start` de uma chamada de
@@ -213,6 +257,16 @@ recurso, o erro também carrega `response_to` — o `request_id` do comando (ou 
 `sync_id`, no caso de `call.resource.sync`) — para o cliente correlacionar sem
 ambiguidade. `call.start` de chamada **direta** e os demais comandos
 pré-existentes continuam sem `response_to`, inalterados por esta issue.
+
+## Rollout fail-closed
+
+A migration `chat/000035` adiciona `participation_id UUID` nullable. `NULL`
+significa exclusivamente uma lease criada antes do protocolo fenced. Comandos
+legacy sem `participation_id` só podem renovar/remover uma linha cujo valor
+também seja `NULL`; nunca tocam uma lease fenced não nula. Toda nova admissão
+escreve UUID não nulo. Depois que não houver clientes antigos nem linhas NULL,
+uma migration futura poderá aplicar `NOT NULL`. Chamadas diretas permanecem
+inalteradas e não usam este token.
 
 `call_participant_busy` é específico de admissão. Em uma chamada direta, o
 autor ou o destinatário pode estar ocupado por outra chamada incompatível. Ao

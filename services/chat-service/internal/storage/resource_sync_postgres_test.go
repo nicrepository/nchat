@@ -118,7 +118,7 @@ func TestPGXCallStoreActiveResourceCallObservedAtNeverAppearsNewerThanConcurrent
 	}
 	createDone := make(chan createOutcome, 1)
 	go func() {
-		call, _, createErr := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		call, _, _, createErr := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000007a1",
 			CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 			Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -171,7 +171,7 @@ func TestPGXCallStoreActiveResourceCallObservedAtIsConsistentWithFoundCallPostgr
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000007a2",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -201,7 +201,7 @@ func TestPGXCallStoreActiveResourceCallUnauthorizedNeverRevealsExistencePostgreS
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	if _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	if _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000007a3",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -242,7 +242,7 @@ func TestPGXCallStoreActiveResourceCallNeverSeesTornStateAcrossConcurrentEndPost
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000007b1",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -311,7 +311,7 @@ func TestPGXCallStoreActiveResourceCallNeverSeesTornStateAcrossConcurrentMembers
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000007b2",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,

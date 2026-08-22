@@ -279,21 +279,52 @@ function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
   );
 }
 
-interface ResourceCallActionProps {
-  onCall: () => void;
-}
+/**
+ * A channel/group-DM header's resource-call state (issue #622 round 2,
+ * section 14). Discovery ("is there a call") is kept strictly separate from
+ * participation ("am I in it") — neither ever depends on a participant
+ * count, which this issue explicitly does not implement.
+ *
+ * - none: no active call — "Chamada" starts one. `disabled` covers the
+ *   pre-existing RF-23×RF-24 arbitration case where a direct call is busy
+ *   before any resource call even exists yet — the action is unavailable,
+ *   never hidden.
+ * - active: a call exists. `disabled` is false when this user is free to
+ *   join ("Chamada ativa" + enabled "Entrar na chamada") and true when they
+ *   cannot right now — a direct call is active, or they are already in a
+ *   DIFFERENT resource call — which shows the identical indicator with a
+ *   disabled join button, never hidden.
+ * - participating: this user is already in this exact call — nothing extra
+ *   to show here; the floating/dedicated call surface already covers it.
+ */
+export type ResourceCallHeaderState =
+  | { kind: "none"; onCall: () => void; disabled?: boolean }
+  | { kind: "active"; onJoin: () => void; disabled: boolean }
+  | { kind: "participating" };
 
 /**
- * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
- * multiparty call, never separate "audio" and "video" rooms, so there is a
- * single action instead of RF-23's two — camera and microphone are controls
- * within the call, chosen once inside ResourceCallPanel.
+ * RF-24 channel/group entry (issue #540 follow-up; states added by issue
+ * #622 round 2). A resource room is one multiparty call, never separate
+ * "audio" and "video" rooms, so there is a single action instead of RF-23's
+ * two — camera and microphone are controls within the call, chosen once
+ * inside ResourceCallPanel.
  */
-function ResourceCallAction({ onCall }: ResourceCallActionProps) {
+function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
+  if (state.kind === "participating") return null;
   return (
-    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
-      <button type="button" aria-label="Iniciar chamada" onClick={onCall}>
-        Chamada
+    <div className="chat-msg-area__call-actions" aria-label="Chamada">
+      {state.kind === "active" && (
+        <span className="chat-msg-area__call-status" data-testid="resource-call-status">
+          Chamada ativa
+        </span>
+      )}
+      <button
+        type="button"
+        aria-label={state.kind === "active" ? "Entrar na chamada" : "Iniciar chamada"}
+        onClick={state.kind === "active" ? state.onJoin : state.onCall}
+        disabled={Boolean(state.disabled)}
+      >
+        {state.kind === "active" ? "Entrar na chamada" : "Chamada"}
       </button>
     </div>
   );
@@ -302,18 +333,18 @@ function ResourceCallAction({ onCall }: ResourceCallActionProps) {
 interface HeaderChannelProps {
   name: string;
   detailsToggle?: React.ReactNode;
-  /** RF-24: joins the channel's shared call room; absent while unavailable. */
-  onJoinCall?: () => void;
+  /** RF-24/#622: absent only when this header is not showing a resource call at all (never the case for a channel). */
+  resourceCall?: ResourceCallHeaderState;
 }
 
-export function HeaderChannel({ name, detailsToggle, onJoinCall }: HeaderChannelProps) {
+export function HeaderChannel({ name, detailsToggle, resourceCall }: HeaderChannelProps) {
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
       <span className="chat-msg-area__header-icon" aria-hidden="true">
         <IconHash />
       </span>
       <h1 className="chat-msg-area__header-title">{name}</h1>
-      {onJoinCall && <ResourceCallAction onCall={onJoinCall} />}
+      {resourceCall && <ResourceCallAction state={resourceCall} />}
       {detailsToggle}
     </header>
   );
@@ -324,8 +355,12 @@ interface HeaderDMProps {
   /** Same structured counterpart the sidebar uses — never a second request. */
   counterpart?: DMCounterpart;
   onStartCall?: (targetUserId: string, callType: "audio" | "video") => boolean;
-  /** RF-24: joins a group's shared call room. Never used for a 1:1 (counterpart set). */
-  onJoinGroupCall?: () => void;
+  /**
+   * RF-24/#622: a group's shared call room state. Always absent for a 1:1
+   * (counterpart set) — issue #622 round 2 requires a direct DM keep exactly
+   * Áudio/Vídeo and never show resource-call UI.
+   */
+  resourceCall?: ResourceCallHeaderState;
   /** A group opens its details, a 1:1 DM opens the other person's profile. */
   detailsToggle?: React.ReactNode;
   /** The conversation being read; presence is resolved within it (RF-58). */
@@ -336,7 +371,7 @@ export function HeaderDM({
   name,
   counterpart,
   onStartCall,
-  onJoinGroupCall,
+  resourceCall,
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
@@ -397,7 +432,7 @@ export function HeaderDM({
           onVideo={() => onStartCall(counterpart.userId, "video")}
         />
       )}
-      {!counterpart && onJoinGroupCall && <ResourceCallAction onCall={onJoinGroupCall} />}
+      {!counterpart && resourceCall && <ResourceCallAction state={resourceCall} />}
       {detailsToggle}
     </header>
   );
@@ -1328,18 +1363,53 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         : "Abrir perfil da conversa"
       : "Detalhes do grupo";
 
-  // RF-24: join buttons resolve to a resource room only for a channel or a
+  // RF-24/#622 round 2: a resource call room applies only to a channel or a
   // group DM — a 1:1 (detailsKind === "direct") keeps using RF-23's
-  // onStartCall above. ctx.joinResourceCall is undefined while a call of
-  // either kind is already in progress (ChatShell owns that guard).
-  const joinChannelCall =
-    kind === "channel" && targetId && ctx.joinResourceCall
-      ? () => ctx.joinResourceCall!({ kind: "channel", id: targetId, name: resolvedName })
-      : undefined;
-  const joinGroupCall =
-    kind === "dm" && detailsKind === "group" && targetId && ctx.joinResourceCall
-      ? () => ctx.joinResourceCall!({ kind: "dm", id: targetId, name: resolvedName })
-      : undefined;
+  // onStartCall above and never touches discovery at all. Discovery
+  // (getResourceCall) and participation (isParticipatingIn) are independent
+  // of whether the join action is currently available: ctx.joinResourceCall
+  // is undefined exactly while RF-23/RF-24's shared Room is busy elsewhere
+  // (ChatShell's own gate, unchanged since before this issue), so "can I
+  // click this" is read directly off its presence — discovery itself must
+  // never be hidden just because that's the case.
+  const resourceCallKind: "channel" | "dm" | null =
+    kind === "channel" ? "channel" : detailsKind === "group" ? "dm" : null;
+  const discoveredResourceCall =
+    resourceCallKind && targetId
+      ? (ctx.getResourceCall?.(resourceCallKind, targetId) ?? null)
+      : null;
+  const resourceCallExists = discoveredResourceCall?.status === "active";
+  const participatingHere =
+    resourceCallKind && targetId
+      ? (ctx.isParticipatingIn?.(resourceCallKind, targetId) ?? false)
+      : false;
+  const resourceCallHeaderState: ResourceCallHeaderState | undefined =
+    !resourceCallKind || !targetId
+      ? undefined
+      : participatingHere
+        ? { kind: "participating" }
+        : resourceCallExists
+          ? {
+              kind: "active",
+              disabled: !ctx.joinResourceCall,
+              onJoin: () =>
+                ctx.joinResourceCall?.({
+                  kind: resourceCallKind,
+                  id: targetId,
+                  name: resolvedName,
+                  callId: discoveredResourceCall.call_id,
+                }),
+            }
+          : {
+              kind: "none",
+              disabled: !ctx.joinResourceCall,
+              onCall: () =>
+                ctx.joinResourceCall?.({
+                  kind: resourceCallKind,
+                  id: targetId,
+                  name: resolvedName,
+                }),
+            };
 
   return (
     <div
@@ -1356,7 +1426,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         {kind === "channel" ? (
           <HeaderChannel
             name={resolvedName}
-            onJoinCall={joinChannelCall}
+            resourceCall={resourceCallHeaderState}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle
@@ -1374,7 +1444,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             counterpart={activeDM?.counterpart}
             presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
             onStartCall={ctx.startCall}
-            onJoinGroupCall={joinGroupCall}
+            resourceCall={resourceCallHeaderState}
             detailsToggle={
               supportsDetails ? (
                 <DetailsToggle

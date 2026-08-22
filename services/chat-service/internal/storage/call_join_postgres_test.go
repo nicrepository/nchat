@@ -25,7 +25,7 @@ func TestPGXCallStoreJoinXVsJoinYSerializesPerActorPostgreSQL(t *testing.T) {
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000001a1",
 		CallerID: singlePGCounterpart1, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -33,7 +33,7 @@ func TestPGXCallStoreJoinXVsJoinYSerializesPerActorPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed call X: %v", err)
 	}
-	callY, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callY, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000001a2",
 		CallerID: singlePGCounterpart2, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelY,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -52,7 +52,7 @@ func TestPGXCallStoreJoinXVsJoinYSerializesPerActorPostgreSQL(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, results[i] = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+			_, _, results[i] = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 				WorkspaceID: singlePGWorkspace, CallID: calls[i].ID, ActorID: singlePGActor,
 				TargetType: domain.CallTargetChannel, TargetID: targets[i], ExpiresAt: leaseTTL,
 			})
@@ -91,7 +91,7 @@ func TestPGXCallStoreDirectStartVsJoinConcurrentAdmissionSerializesPostgreSQL(t 
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000002a1",
 		CallerID: singlePGCounterpart1, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -116,7 +116,7 @@ func TestPGXCallStoreDirectStartVsJoinConcurrentAdmissionSerializesPostgreSQL(t 
 	go func() {
 		defer wg.Done()
 		<-start
-		_, joinErr = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+		_, _, joinErr = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 			WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
 			TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX, ExpiresAt: leaseTTL,
 		})
@@ -156,7 +156,7 @@ func TestPGXCallStoreLastLeaveVsConcurrentJoinNeverLeavesLeaseOnEndedCallPostgre
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, participationA, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000003a1",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -177,12 +177,13 @@ func TestPGXCallStoreLastLeaveVsConcurrentJoinNeverLeavesLeaseOnEndedCallPostgre
 		<-start
 		leaveResult, leaveErr = store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
 			WorkspaceID: leavePGWorkspace, CallID: call.ID, ActorID: leavePGUserA,
+			ParticipationID: participationA,
 		})
 	}()
 	go func() {
 		defer wg.Done()
 		<-start
-		joinedCall, joinErr = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+		joinedCall, _, joinErr = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 			WorkspaceID: leavePGWorkspace, CallID: call.ID, ActorID: leavePGUserB,
 			TargetType: domain.CallTargetChannel, TargetID: leavePGChannel, ExpiresAt: leaseTTL,
 		})
@@ -238,7 +239,7 @@ func TestPGXCallStoreConcurrentDuplicateJoinsProduceExactlyOneLeasePostgreSQL(t 
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000004a1",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -255,7 +256,7 @@ func TestPGXCallStoreConcurrentDuplicateJoinsProduceExactlyOneLeasePostgreSQL(t 
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, results[i] = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+			_, _, results[i] = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 				WorkspaceID: leavePGWorkspace, CallID: call.ID, ActorID: leavePGUserB,
 				TargetType: domain.CallTargetChannel, TargetID: leavePGChannel, ExpiresAt: leaseTTL,
 			})
@@ -283,7 +284,7 @@ func TestPGXCallStoreJoinFailsAfterMembershipRevokedPostgreSQL(t *testing.T) {
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000005a1",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -298,7 +299,7 @@ func TestPGXCallStoreJoinFailsAfterMembershipRevokedPostgreSQL(t *testing.T) {
 		t.Fatalf("revoke membership: %v", err)
 	}
 
-	_, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+	_, _, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 		WorkspaceID: leavePGWorkspace, CallID: call.ID, ActorID: leavePGUserC,
 		TargetType: domain.CallTargetChannel, TargetID: leavePGChannel, ExpiresAt: leaseTTL,
 	})
@@ -319,7 +320,7 @@ func TestPGXCallStoreJoinRejectsTargetMismatchWithoutMutationPostgreSQL(t *testi
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000006a1",
 		CallerID: singlePGCounterpart1, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -328,7 +329,7 @@ func TestPGXCallStoreJoinRejectsTargetMismatchWithoutMutationPostgreSQL(t *testi
 		t.Fatalf("seed call X: %v", err)
 	}
 
-	_, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+	_, _, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 		WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
 		TargetType: domain.CallTargetChannel, TargetID: singlePGChannelY, ExpiresAt: leaseTTL,
 	})
@@ -364,7 +365,7 @@ func TestPGXCallStoreJoinOldCallNeverSilentlyAdmitsIntoNewCallAfterLastLeavePost
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	old, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	old, _, oldParticipation, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000008a1",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -376,13 +377,14 @@ func TestPGXCallStoreJoinOldCallNeverSilentlyAdmitsIntoNewCallAfterLastLeavePost
 	// A's last leave ends old.
 	leaveResult, err := store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
 		WorkspaceID: leavePGWorkspace, CallID: old.ID, ActorID: leavePGUserA,
+		ParticipationID: oldParticipation,
 	})
 	if err != nil || !leaveResult.Changed || leaveResult.Call.Status != domain.CallStatusEnded {
 		t.Fatalf("A's last leave must end old: result=%+v err=%v", leaveResult, err)
 	}
 
 	// C starts a brand-new call at the same target — a different call_id.
-	newCall, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	newCall, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-0000000008a2",
 		CallerID: leavePGUserC, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: leaseTTL,
@@ -396,7 +398,7 @@ func TestPGXCallStoreJoinOldCallNeverSilentlyAdmitsIntoNewCallAfterLastLeavePost
 
 	// B names the call_id it actually knows: old. It must not be silently
 	// admitted into new.
-	_, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+	_, _, err = store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 		WorkspaceID: leavePGWorkspace, CallID: old.ID, ActorID: leavePGUserB,
 		TargetType: domain.CallTargetChannel, TargetID: leavePGChannel, ExpiresAt: leaseTTL,
 	})
@@ -415,7 +417,7 @@ func TestPGXCallStoreJoinOldCallNeverSilentlyAdmitsIntoNewCallAfterLastLeavePost
 
 	// B must be free to explicitly join new once it resyncs and learns
 	// new's own call_id.
-	joined, err := store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
+	joined, _, err := store.JoinResourceCall(ctx, storage.JoinResourceCallInput{
 		WorkspaceID: leavePGWorkspace, CallID: newCall.ID, ActorID: leavePGUserB,
 		TargetType: domain.CallTargetChannel, TargetID: leavePGChannel, ExpiresAt: leaseTTL,
 	})
