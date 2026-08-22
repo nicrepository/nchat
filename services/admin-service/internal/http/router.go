@@ -30,6 +30,11 @@ type RouterDependencies struct {
 	// answers 503 on those paths instead of serving one of them unguarded — the
 	// same all-or-nothing rule the rest of this router applies.
 	Management *ManagementPorts
+	// Configuration is the issue #580 surface. Separate from Management for the
+	// same reason Management is separate from the foundation: a deployment that
+	// has one and not the other answers 503 on the missing paths rather than
+	// serving any of them without their guards.
+	Configuration ConfigAdmin
 }
 
 // ManagementPorts groups the three management surfaces. They are wired
@@ -137,6 +142,56 @@ func registerAdminAPI(mux *http.ServeMux, cfg config.Config, logger *slog.Logger
 	mux.Handle(RouteAdminAudit, httputil.MethodNotAllowed(http.MethodGet, auditEvents))
 
 	registerManagementAPI(mux, cfg, deps, ready)
+	registerConfigAPI(mux, cfg, deps, ready)
+}
+
+// registerConfigAPI wires the issue #580 surface.
+//
+// Same guard chain, same order, same table shape as the management routes:
+// administrative session, then CSRF and origin for a mutation, then the one
+// capability the route declares. Reading the configuration catalog is guarded
+// exactly like changing it, one capability weaker, because the catalog names
+// every integration and credential the deployment has.
+//
+// admin.config.manage is what the two write routes require. The additional
+// admin.superuser check for a value that weakens the platform lives in the
+// service and not here, because whether a value is dangerous is only knowable
+// after it has been parsed against its definition — a route cannot decide it,
+// and pretending otherwise would put half the rule in a place that never sees
+// the value.
+func registerConfigAPI(mux *http.ServeMux, cfg config.Config, deps RouterDependencies, ready bool) {
+	routes := []configRoute{
+		{RouteAdminConfig, http.MethodGet, domain.CapabilityConfigRead, GetConfiguration},
+		{RouteAdminConfigPreview, http.MethodPost, domain.CapabilityConfigRead, PreviewConfiguration},
+		{RouteAdminConfigApply, http.MethodPost, domain.CapabilityConfigManage, ApplyConfiguration},
+		{RouteAdminConfigVersions, http.MethodGet, domain.CapabilityConfigRead, ListConfigurationVersions},
+		{RouteAdminConfigRollbackPreview, http.MethodPost, domain.CapabilityConfigRead, PreviewConfigurationRollback},
+		{RouteAdminConfigVersionRollback, http.MethodPost, domain.CapabilityConfigManage, RollbackConfiguration},
+	}
+	enabled := ready && deps.Configuration != nil
+	for _, route := range routes {
+		handler := adminUnavailable()
+		if enabled {
+			handler = guardConfig(cfg, deps, route)
+		}
+		mux.Handle(route.path, httputil.MethodNotAllowed(route.method, handler))
+	}
+}
+
+// configRoute is one configuration endpoint as the table above declares it.
+type configRoute struct {
+	path       string
+	method     string
+	capability domain.Capability
+	handler    func(ConfigAdmin) http.Handler
+}
+
+func guardConfig(cfg config.Config, deps RouterDependencies, route configRoute) http.Handler {
+	handler := RequireCapability(route.capability, deps.Audit.Recorder)(route.handler(deps.Configuration))
+	if !isSafeMethod(route.method) {
+		handler = RequireCSRF(deps.CSRF, cfg.AllowedOrigins)(handler)
+	}
+	return RequireAdminSession(deps.Authenticator, sessionCookieName)(handler)
 }
 
 // managedRoute is one management endpoint as the table below declares it.

@@ -342,7 +342,13 @@ func actorFrom(w http.ResponseWriter, r *http.Request) (service.Actor, bool) {
 	}
 	return service.Actor{
 		UserID:        admin.Principal.UserID,
+		SessionID:     admin.Session.ID,
 		CorrelationID: httputil.RequestIDFromContext(r.Context()),
+		// The live capability set, as the session guard loaded it on this
+		// request. It travels with the actor rather than being re-derived,
+		// because a service that needs it must see the same set the route
+		// guard did — never one rebuilt from something the client sent.
+		Capabilities: admin.Principal.Capabilities,
 	}, true
 }
 

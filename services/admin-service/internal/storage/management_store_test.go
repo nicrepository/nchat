@@ -235,6 +235,10 @@ func TestUpdateUserStatus_ValidatesUnderTheLockAndRevokesSessions(t *testing.T) 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	// The authorization anchor: a privileged write in flight must not commit
+	// after this suspension. See mutation_authorization.go.
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`UPDATE auth.users`).WithArgs(userA, "suspended").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectQuery(`UPDATE auth.user_sessions`).WithArgs(userA, "admin_suspension").
@@ -260,6 +264,8 @@ func TestUpdateUserStatus_ActivationRestoresNothing(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`UPDATE auth.users`).WithArgs(userA, "active").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()
@@ -284,6 +290,8 @@ func TestUpdateUserStatus_TransitionOntoTheSameStatusConflicts(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectRollback()
 
 	if _, err := storage.NewPGXUserDirectoryStore(mock).
@@ -309,6 +317,10 @@ func TestRevokeUserSessions_ReportsHowManyEnded(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	// Revoking the login behind an administrative session revokes that
+	// authority too, so it takes the same anchor.
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`UPDATE auth.user_sessions`).WithArgs(userA, "admin_revocation").
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(3))
 	mock.ExpectCommit()
@@ -330,6 +342,10 @@ func TestRevokeAdminRole_RefusesToLeaveThePlatformWithoutAnAdministrator(t *test
 	mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// The authorization anchor, so a privileged write in flight cannot commit
+	// after this role is taken away. See mutation_authorization.go.
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`DELETE FROM auth.admin_principal_roles`).
 		WithArgs(userA, "platform-superuser").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -350,6 +366,10 @@ func TestRevokeAdminRole_CommitsWhenAnotherAdministratorRemains(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// The authorization anchor, so a privileged write in flight cannot commit
+	// after this role is taken away. See mutation_authorization.go.
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`DELETE FROM auth.admin_principal_roles`).
 		WithArgs(userA, "platform-superuser").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -367,6 +387,10 @@ func TestRevokeAdminRole_UnheldRoleIsNotFound(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectBegin()
 	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	// The authorization anchor, so a privileged write in flight cannot commit
+	// after this role is taken away. See mutation_authorization.go.
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectExec(`DELETE FROM auth.admin_principal_roles`).
 		WithArgs(userA, "platform-auditor").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
@@ -386,6 +410,8 @@ func TestGrantAdminRole_RefusesASuspendedTarget(t *testing.T) {
 	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectQuery(`FOR UPDATE`).WithArgs(userA).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("suspended"))
+	mock.ExpectExec(`SELECT 1 FROM auth.admin_principals`).WithArgs(userA).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	mock.ExpectRollback()
 
 	if err := storage.NewPGXUserDirectoryStore(mock).

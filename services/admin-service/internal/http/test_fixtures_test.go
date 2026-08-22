@@ -170,11 +170,19 @@ type harnessSettings struct {
 	// foundation's specs keep exercising a router that serves those paths as
 	// unavailable, which is the deployment state they describe.
 	management *ManagementPorts
-	logger     *slog.Logger
+	// configuration is the issue #580 surface, nil by default for the same
+	// reason: the foundation's specs describe a deployment that serves those
+	// paths as unavailable.
+	configuration ConfigAdmin
+	logger        *slog.Logger
 }
 
 func withManagement(ports *ManagementPorts) harnessOption {
 	return func(s *harnessSettings) { s.management = ports }
+}
+
+func withConfiguration(configuration ConfigAdmin) harnessOption {
+	return func(s *harnessSettings) { s.configuration = configuration }
 }
 
 func withConfig(apply func(*config.Config)) harnessOption {
@@ -210,6 +218,7 @@ func newHarness(t *testing.T, store *stubStore, options ...harnessOption) *testH
 		RateLimiter:     NewIPRateLimiter(1000, 1000, nil),
 		ReadinessPinger: store,
 		Management:      settings.management,
+		Configuration:   settings.configuration,
 	})
 	return &testHarness{router: router, store: store, cfg: cfg, auth: sessions}
 }

@@ -22,6 +22,22 @@ type Recorder interface {
 // self-mutation guards below, which are the reason this type exists at all.
 type Actor struct {
 	UserID string
+	// SessionID is the administrative session this request arrived on.
+	//
+	// Carried so a privileged write can re-prove the session is still live at
+	// the moment it commits, rather than trusting that it was live when the
+	// middleware ran. See domain.MutationAuthorization.
+	SessionID string
+	// Capabilities is the effective set the session guard loaded from the
+	// database for this request.
+	//
+	// It is carried here for the one decision a route cannot make on its own:
+	// the configuration surface refuses a *value* that weakens the platform
+	// unless the actor holds admin.superuser, and whether a value is dangerous
+	// is only knowable after it has been parsed and validated. Everything else
+	// is still decided by the capability the route declares. The zero value
+	// grants nothing, so a service that forgets to populate it denies.
+	Capabilities domain.CapabilitySet
 	// CorrelationID is the server-minted request id. admin-service generates it
 	// rather than accepting one from the caller, so it cannot be forged into
 	// matching somebody else's trail.
@@ -64,7 +80,8 @@ func resultFor(err error) domain.AuditResult {
 }
 
 func isDenial(err error) bool {
-	return errors.Is(err, domain.ErrForbidden) ||
+	return errors.Is(err, domain.ErrUnauthorized) ||
+		errors.Is(err, domain.ErrForbidden) ||
 		errors.Is(err, domain.ErrConflict) ||
 		errors.Is(err, domain.ErrInvalidInput) ||
 		errors.Is(err, domain.ErrNotFound)

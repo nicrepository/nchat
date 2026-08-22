@@ -117,6 +117,12 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 	users := service.NewUserAdminService(storage.NewPGXUserDirectoryStore(pool), audit)
 	channels := service.NewChannelAdminService(storage.NewPGXChannelDirectoryStore(pool), audit)
 	policies := service.NewPolicyService(storage.NewPGXPolicyStore(pool), audit)
+	// The configuration surface reads this pod's own environment to report the
+	// deployment settings and credential status it does not own. That is the
+	// only place it looks outside the database, it is read-only, and it is the
+	// same environment every other service receives from the shared ConfigMap
+	// and Secret.
+	configuration := service.NewConfigService(storage.NewPGXConfigStore(pool), audit)
 	return httpapi.RouterDependencies{
 		TokenValidator:  validator,
 		Sessions:        sessions,
@@ -126,6 +132,7 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 		RateLimiter:     httpapi.NewIPRateLimiter(cfg.SessionRateLimitPerMinute, cfg.SessionRateLimitBurst, httputil.ParseCIDRs(cfg.TrustedProxyCIDRs)),
 		ReadinessPinger: store,
 		Management:      httpapi.NewManagementPorts(users, channels, policies),
+		Configuration:   configuration,
 	}, pool, nil
 }
 
