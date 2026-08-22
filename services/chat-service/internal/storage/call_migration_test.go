@@ -33,3 +33,27 @@ func TestChatMigration_AddsAuthoritativeCallLifecycle(t *testing.T) {
 		t.Fatal("call lifecycle rollback must not drop the schema or cascade")
 	}
 }
+
+func TestChatMigration_AddsNullableResourceParticipationFenceWithoutIndex(t *testing.T) {
+	up := readChatMigration(t, "000035_call_participant_lease_identity.up.sql")
+	statements := strippedComments(up)
+	if !strings.Contains(statements, "ALTER TABLE chat.call_participant_leases") ||
+		!strings.Contains(statements, "ADD COLUMN participation_id UUID") {
+		t.Fatal("participation fencing migration must add the UUID column")
+	}
+	if strings.Contains(statements, "participation_id UUID NOT NULL") {
+		t.Fatal("rollout column must remain nullable while NULL identifies legacy leases")
+	}
+	if strings.Contains(strings.ToUpper(statements), "INDEX") {
+		t.Fatal("the existing (call_id,user_id) primary key already serves fenced mutations")
+	}
+
+	down := readChatMigration(t, "000035_call_participant_lease_identity.down.sql")
+	if !strings.Contains(down, "ALTER TABLE chat.call_participant_leases") ||
+		!strings.Contains(down, "DROP COLUMN participation_id") {
+		t.Fatal("rollback must drop only the participation fence column")
+	}
+	if strings.Contains(strings.ToUpper(down), "CASCADE") || strings.Contains(strings.ToUpper(down), "DROP SCHEMA") {
+		t.Fatal("rollback must stay schema-local and non-cascading")
+	}
+}

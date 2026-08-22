@@ -18,6 +18,8 @@ const (
 	serviceCallCaller    = "00000000-0000-4000-8000-000000000014"
 	serviceCallCallee    = "00000000-0000-4000-8000-000000000015"
 	serviceCallOutsider  = "00000000-0000-4000-8000-000000000016"
+	serviceCallTarget    = "00000000-0000-4000-8000-000000000017"
+	serviceParticipation = "00000000-0000-4000-8000-000000000018"
 )
 
 type fakeCallStore struct {
@@ -38,6 +40,11 @@ type fakeCallStore struct {
 	currentCallID    string
 	expired          []domain.Call
 	expireErr        error
+	joinInput        storage.JoinResourceCallInput
+	joinErr          error
+	participationID  string
+	syncResult       storage.ActiveResourceCallResult
+	syncErr          error
 }
 
 func (f *fakeCallStore) CreateCall(_ context.Context, input storage.CreateCallInput) (domain.Call, bool, error) {
@@ -47,11 +54,11 @@ func (f *fakeCallStore) CreateCall(_ context.Context, input storage.CreateCallIn
 	return f.call, f.createCreated, f.createErr
 }
 
-func (f *fakeCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, error) {
+func (f *fakeCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resourceInput = input
-	return f.call, f.createCreated, f.createErr
+	return f.call, f.createCreated, f.participationID, f.createErr
 }
 
 func (f *fakeCallStore) RenewCallPresence(_ context.Context, input storage.RenewCallPresenceInput) error {
@@ -82,6 +89,17 @@ func (f *fakeCallStore) ExpireDueCalls(context.Context, int) ([]domain.Call, err
 	return f.expired, f.expireErr
 }
 
+func (f *fakeCallStore) JoinResourceCall(_ context.Context, input storage.JoinResourceCallInput) (domain.Call, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.joinInput = input
+	return f.call, f.participationID, f.joinErr
+}
+
+func (f *fakeCallStore) ActiveResourceCall(context.Context, string, string, domain.CallTargetType, string) (storage.ActiveResourceCallResult, error) {
+	return f.syncResult, f.syncErr
+}
+
 type fakeCallPublisher struct {
 	mu    sync.Mutex
 	calls []domain.Call
@@ -109,7 +127,7 @@ func TestCallServiceStartValidatesAndPublishesCreatedCall(t *testing.T) {
 	publisher := &fakeCallPublisher{}
 	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, publisher)
 
-	call, err := svc.Start(context.Background(), StartCallInput{
+	call, participationID, err := svc.Start(context.Background(), StartCallInput{
 		WorkspaceID: serviceCallWorkspace,
 		RequestID:   serviceCallRequest,
 		CallerID:    serviceCallCaller,
@@ -121,6 +139,9 @@ func TestCallServiceStartValidatesAndPublishesCreatedCall(t *testing.T) {
 	}
 	if call.Status != domain.CallStatusRinging || len(publisher.calls) != 1 {
 		t.Fatalf("unexpected start: call=%+v published=%+v", call, publisher.calls)
+	}
+	if participationID != "" {
+		t.Fatalf("direct participation id = %q, want empty", participationID)
 	}
 	if !store.createInput.ExpiresAt.Equal(now.Add(30 * time.Second)) {
 		t.Fatalf("expires_at = %s", store.createInput.ExpiresAt)
@@ -160,7 +181,7 @@ func TestCallServiceStartRejectsInvalidInputBeforeStorage(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &fakeCallStore{}
-			_, err := NewCallService(store, 30*time.Second, nil, nil).Start(context.Background(), test.input)
+			_, _, err := NewCallService(store, 30*time.Second, nil, nil).Start(context.Background(), test.input)
 			if !errors.Is(err, domain.ErrInvalidInput) {
 				t.Fatalf("error = %v, want invalid input", err)
 			}
@@ -177,11 +198,11 @@ func TestCallServiceStartsAuthorizedResourceActiveAndPublishes(t *testing.T) {
 	resource.CalleeID = ""
 	resource.TargetType = domain.CallTargetChannel
 	resource.TargetID = serviceCallCallee
-	store := &fakeCallStore{call: resource, createCreated: true}
+	store := &fakeCallStore{call: resource, createCreated: true, participationID: serviceParticipation}
 	publisher := &fakeCallPublisher{}
 	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, publisher)
 
-	call, err := svc.Start(context.Background(), StartCallInput{
+	call, participationID, err := svc.Start(context.Background(), StartCallInput{
 		WorkspaceID: serviceCallWorkspace,
 		RequestID:   serviceCallRequest,
 		CallerID:    serviceCallCaller,
@@ -195,6 +216,9 @@ func TestCallServiceStartsAuthorizedResourceActiveAndPublishes(t *testing.T) {
 	if call.Status != domain.CallStatusActive || len(publisher.calls) != 1 {
 		t.Fatalf("resource call=%+v published=%d", call, len(publisher.calls))
 	}
+	if participationID != serviceParticipation {
+		t.Fatalf("participation id = %q", participationID)
+	}
 	if store.resourceInput.CallerID != serviceCallCaller ||
 		store.resourceInput.TargetType != domain.CallTargetChannel ||
 		store.resourceInput.TargetID != serviceCallCallee {
@@ -207,10 +231,11 @@ func TestCallServiceRenewsOnlyAuthenticatedResourcePresence(t *testing.T) {
 	store := &fakeCallStore{}
 	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, nil)
 
-	if err := svc.Presence(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID); err != nil {
+	if err := svc.Presence(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID, serviceParticipation); err != nil {
 		t.Fatalf("Presence: %v", err)
 	}
 	if store.presenceInput.ActorID != serviceCallCaller || store.presenceInput.CallID != serviceCallID ||
+		store.presenceInput.ParticipationID != serviceParticipation ||
 		!store.presenceInput.ExpiresAt.Equal(now.Add(30*time.Second)) {
 		t.Fatalf("presence input=%+v", store.presenceInput)
 	}
@@ -271,36 +296,37 @@ func TestCallServiceTransitionsUseAuthenticatedActorAndPublishOnlyChanges(t *tes
 func TestCallServiceLeavePublishesOnlyWhenTheCallActuallyEnds(t *testing.T) {
 	t.Run("other participants remain: not published", func(t *testing.T) {
 		call := serviceCall(domain.CallStatusActive, 2)
-		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: call}}
+		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: call, Released: true}}
 		publisher := &fakeCallPublisher{}
 		svc := NewCallService(store, 30*time.Second, nil, publisher)
 
-		got, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID)
+		got, released, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID, serviceParticipation)
 		if err != nil {
 			t.Fatalf("Leave: %v", err)
 		}
-		if got.Status != domain.CallStatusActive || len(publisher.calls) != 0 {
+		if got.Status != domain.CallStatusActive || !released || len(publisher.calls) != 0 {
 			t.Fatalf("unexpected leave result: call=%+v published=%+v", got, publisher.calls)
 		}
 		if len(store.leaveInputs) != 1 ||
 			store.leaveInputs[0].WorkspaceID != serviceCallWorkspace ||
 			store.leaveInputs[0].ActorID != serviceCallCaller ||
-			store.leaveInputs[0].CallID != serviceCallID {
+			store.leaveInputs[0].CallID != serviceCallID ||
+			store.leaveInputs[0].ParticipationID != serviceParticipation {
 			t.Fatalf("unexpected store input: %+v", store.leaveInputs)
 		}
 	})
 
 	t.Run("last participant: call ends and is published", func(t *testing.T) {
 		ended := serviceCall(domain.CallStatusEnded, 3)
-		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: ended, Changed: true}}
+		store := &fakeCallStore{leaveResult: storage.TransitionCallResult{Call: ended, Changed: true, Released: true}}
 		publisher := &fakeCallPublisher{}
 		svc := NewCallService(store, 30*time.Second, nil, publisher)
 
-		got, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID)
+		got, released, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID, serviceParticipation)
 		if err != nil {
 			t.Fatalf("Leave: %v", err)
 		}
-		if got.Status != domain.CallStatusEnded || len(publisher.calls) != 1 {
+		if got.Status != domain.CallStatusEnded || !released || len(publisher.calls) != 1 {
 			t.Fatalf("unexpected leave result: call=%+v published=%+v", got, publisher.calls)
 		}
 	})
@@ -310,7 +336,7 @@ func TestCallServiceLeavePublishesOnlyWhenTheCallActuallyEnds(t *testing.T) {
 		store := &fakeCallStore{leaveErr: sentinel}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		if _, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID); !errors.Is(err, sentinel) {
+		if _, _, err := svc.Leave(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID, serviceParticipation); !errors.Is(err, sentinel) {
 			t.Fatalf("error = %v, want storage failure", err)
 		}
 	})
@@ -331,7 +357,7 @@ func TestCallServiceLeavePublishesOnlyWhenTheCallActuallyEnds(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.name, func(t *testing.T) {
-				if _, err := svc.Leave(context.Background(), test.workspaceID, test.actorID, test.callID); !errors.Is(err, domain.ErrInvalidInput) {
+				if _, _, err := svc.Leave(context.Background(), test.workspaceID, test.actorID, test.callID, serviceParticipation); !errors.Is(err, domain.ErrInvalidInput) {
 					t.Fatalf("error = %v, want invalid input", err)
 				}
 				if len(store.leaveInputs) != 0 {
@@ -382,7 +408,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 		store := &fakeCallStore{}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		_, err := svc.Start(context.Background(), StartCallInput{
+		_, _, err := svc.Start(context.Background(), StartCallInput{
 			WorkspaceID: serviceCallWorkspace,
 			RequestID:   serviceCallRequest,
 			CallerID:    serviceCallCaller,
@@ -399,7 +425,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 		store := &fakeCallStore{}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		_, err := svc.Start(context.Background(), StartCallInput{
+		_, _, err := svc.Start(context.Background(), StartCallInput{
 			WorkspaceID: serviceCallWorkspace,
 			RequestID:   serviceCallRequest,
 			CallerID:    serviceCallCaller,
@@ -416,7 +442,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 		store := &fakeCallStore{createErr: sentinel}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		_, err := svc.Start(context.Background(), StartCallInput{
+		_, _, err := svc.Start(context.Background(), StartCallInput{
 			WorkspaceID: serviceCallWorkspace,
 			RequestID:   serviceCallRequest,
 			CallerID:    serviceCallCaller,
@@ -433,7 +459,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 		store := &fakeCallStore{}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		_, err := svc.Start(context.Background(), StartCallInput{
+		_, _, err := svc.Start(context.Background(), StartCallInput{
 			WorkspaceID: serviceCallWorkspace,
 			RequestID:   serviceCallRequest,
 			CallerID:    serviceCallCaller,
@@ -451,7 +477,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 		store := &fakeCallStore{createErr: sentinel}
 		svc := NewCallService(store, 30*time.Second, nil, nil)
 
-		_, err := svc.Start(context.Background(), StartCallInput{
+		_, _, err := svc.Start(context.Background(), StartCallInput{
 			WorkspaceID: serviceCallWorkspace,
 			RequestID:   serviceCallRequest,
 			CallerID:    serviceCallCaller,
@@ -484,6 +510,7 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 					test.workspaceID,
 					test.actorID,
 					test.callID,
+					serviceParticipation,
 				)
 				if !errors.Is(err, domain.ErrInvalidInput) {
 					t.Fatalf("error = %v, want invalid input", err)
@@ -553,4 +580,157 @@ func TestCallServiceCoversResourceDirectAndLifecycleErrorPaths(t *testing.T) {
 			})
 		}
 	})
+}
+
+// issue #622: call.join never mutates the call's own lifecycle row (only the
+// lease table), so it must never publish — unlike Start/Leave/transition.
+func TestCallServiceJoinDelegatesWithCanonicalInputsAndNeverPublishes(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	resource := serviceCall(domain.CallStatusActive, 2)
+	resource.CalleeID = ""
+	resource.TargetType = domain.CallTargetChannel
+	resource.TargetID = serviceCallTarget
+	store := &fakeCallStore{call: resource, participationID: serviceParticipation}
+	publisher := &fakeCallPublisher{}
+	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, publisher)
+
+	call, participationID, err := svc.Join(context.Background(), JoinCallInput{
+		WorkspaceID: serviceCallWorkspace,
+		ActorID:     serviceCallCaller,
+		CallID:      serviceCallID,
+		TargetType:  domain.CallTargetChannel,
+		TargetID:    serviceCallTarget,
+	})
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if call.ID != serviceCallID {
+		t.Fatalf("call = %+v", call)
+	}
+	if participationID != serviceParticipation {
+		t.Fatalf("participation id = %q", participationID)
+	}
+	if store.joinInput.WorkspaceID != serviceCallWorkspace || store.joinInput.ActorID != serviceCallCaller ||
+		store.joinInput.CallID != serviceCallID || store.joinInput.TargetType != domain.CallTargetChannel ||
+		store.joinInput.TargetID != serviceCallTarget {
+		t.Fatalf("join input = %+v", store.joinInput)
+	}
+	if !store.joinInput.ExpiresAt.Equal(now.Add(30 * time.Second)) {
+		t.Fatalf("expires_at = %s", store.joinInput.ExpiresAt)
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatalf("Join must never publish, got %d publish(es)", len(publisher.calls))
+	}
+}
+
+func TestCallServiceJoinPropagatesStoreErrorsWithoutPublishing(t *testing.T) {
+	store := &fakeCallStore{joinErr: domain.ErrCallParticipantBusy}
+	publisher := &fakeCallPublisher{}
+	svc := NewCallService(store, 30*time.Second, time.Now, publisher)
+
+	_, _, err := svc.Join(context.Background(), JoinCallInput{
+		WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID,
+		TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget,
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("error = %v, want participant busy", err)
+	}
+	if len(publisher.calls) != 0 {
+		t.Fatal("a failed join must never publish")
+	}
+}
+
+func TestCallServiceJoinRejectsInvalidInputBeforeStorage(t *testing.T) {
+	tests := []struct {
+		name  string
+		input JoinCallInput
+	}{
+		{"invalid workspace", JoinCallInput{WorkspaceID: "bad", ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid actor", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: "bad", CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid call id", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: "bad", TargetType: domain.CallTargetChannel, TargetID: serviceCallTarget}},
+		{"invalid target id", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetChannel, TargetID: "bad"}},
+		{"direct target type", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetType: domain.CallTargetUser, TargetID: serviceCallTarget}},
+		{"empty target type", JoinCallInput{WorkspaceID: serviceCallWorkspace, ActorID: serviceCallCaller, CallID: serviceCallID, TargetID: serviceCallTarget}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{}
+			_, _, err := NewCallService(store, 30*time.Second, nil, nil).Join(context.Background(), test.input)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want invalid input", err)
+			}
+			if store.joinInput.WorkspaceID != "" {
+				t.Fatal("storage called for invalid input")
+			}
+		})
+	}
+}
+
+// issue #622: found=false must cover both "no active call" and "not
+// authorized" identically — ResourceSync just forwards the store's Found,
+// never re-derives anything from Authorized.
+func TestCallServiceResourceSyncForwardsStoreResultVerbatim(t *testing.T) {
+	observedAt := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	resource := serviceCall(domain.CallStatusActive, 4)
+	resource.CalleeID = ""
+	resource.TargetType = domain.CallTargetChannel
+	resource.TargetID = serviceCallTarget
+
+	tests := []struct {
+		name       string
+		syncResult storage.ActiveResourceCallResult
+		wantFound  bool
+	}{
+		{"authorized and found", storage.ActiveResourceCallResult{Call: resource, Found: true, Authorized: true, ObservedAt: observedAt}, true},
+		{"authorized, no active call", storage.ActiveResourceCallResult{Found: false, Authorized: true, ObservedAt: observedAt}, false},
+		{"not authorized", storage.ActiveResourceCallResult{Found: false, Authorized: false, ObservedAt: observedAt}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{syncResult: test.syncResult}
+			svc := NewCallService(store, 30*time.Second, time.Now, nil)
+
+			call, found, gotObservedAt, err := svc.ResourceSync(
+				context.Background(), serviceCallWorkspace, serviceCallCaller, domain.CallTargetChannel, serviceCallTarget,
+			)
+			if err != nil {
+				t.Fatalf("ResourceSync: %v", err)
+			}
+			if found != test.wantFound {
+				t.Fatalf("found = %v, want %v", found, test.wantFound)
+			}
+			if !gotObservedAt.Equal(observedAt) {
+				t.Fatalf("observed_at = %v, want %v", gotObservedAt, observedAt)
+			}
+			if test.wantFound && call.ID != resource.ID {
+				t.Fatalf("call = %+v, want %+v", call, resource)
+			}
+		})
+	}
+}
+
+func TestCallServiceResourceSyncRejectsInvalidInputBeforeStorage(t *testing.T) {
+	tests := []struct {
+		name       string
+		workspace  string
+		actor      string
+		targetType domain.CallTargetType
+		targetID   string
+	}{
+		{"invalid workspace", "bad", serviceCallCaller, domain.CallTargetChannel, serviceCallTarget},
+		{"invalid actor", serviceCallWorkspace, "bad", domain.CallTargetChannel, serviceCallTarget},
+		{"invalid target id", serviceCallWorkspace, serviceCallCaller, domain.CallTargetChannel, "bad"},
+		{"direct target type", serviceCallWorkspace, serviceCallCaller, domain.CallTargetUser, serviceCallTarget},
+		{"empty target type", serviceCallWorkspace, serviceCallCaller, "", serviceCallTarget},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeCallStore{}
+			svc := NewCallService(store, 30*time.Second, nil, nil)
+			_, _, _, err := svc.ResourceSync(context.Background(), test.workspace, test.actor, test.targetType, test.targetID)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("error = %v, want invalid input", err)
+			}
+		})
+	}
 }

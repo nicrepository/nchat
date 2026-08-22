@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { acquireChatSocket, type ChatSocketListener } from "../chat/chatSocket";
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
+import { syncResourceCall } from "../chat/resourceCallSignaling";
 import { useCallMedia } from "../chat/useCallMedia";
 import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
@@ -18,6 +19,19 @@ vi.mock("../chat/chatSocket", () => ({
   acquireChatSocket: vi.fn(),
   setConsumerSubscriptions: vi.fn(),
   releaseConsumerSubscriptions: vi.fn(),
+}));
+// Only syncResourceCall is stubbed — issue #622 round 2's route/reconnect
+// rediscovery effects call it directly, and the provider tests below need to
+// assert exactly which target it was called with and control when it
+// resolves, rather than driving a real request/response round trip through
+// the already-mocked chatSocket.
+vi.mock("../chat/resourceCallSignaling", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../chat/resourceCallSignaling")>()),
+  // Default resolution (never call:null-observed forever) so every describe
+  // block that never touches this mock directly stays unaffected —
+  // vi.clearAllMocks() clears calls/results but not this factory-level
+  // implementation, so no other beforeEach needs to know this mock exists.
+  syncResourceCall: vi.fn(async () => ({ call: null, observedAt: "1970-01-01T00:00:00Z" })),
 }));
 vi.mock("./callOwnership", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./callOwnership")>()),
@@ -138,10 +152,16 @@ const resource = {
   // Mirrors the real hook: resolves with the joined call_id (target.callId
   // is always supplied by every real call site), never rejects.
   join: vi.fn(async (target: { callId?: string }) => target.callId),
-  leave: vi.fn(async () => undefined),
+  leave: vi.fn(async () => true),
   reconnect: vi.fn(async () => undefined),
   convergeRemoteLeave: vi.fn(),
 };
+// Mutable target for "Known join probe" below — issue #622 round 2 removed
+// the resource IncomingCallPopup that used to be these tests' only way to
+// drive a real joinResourceParticipation() with a specific call_id, so the
+// probe reads this instead of a popup's own click. Tests set it right
+// before clicking, exactly like the retired joinViaPopup(targetCallId) did.
+let knownJoinProbeCallId = "";
 
 function Probe() {
   const navigate = useNavigate();
@@ -151,11 +171,29 @@ function Probe() {
       <span data-testid="owner">{session.ownerState}</span>
       <span data-testid="presentation">{session.presentation.mode}</span>
       <span data-testid="dedicated-recovery-failed">{String(session.dedicatedRecoveryFailed)}</span>
+      <span data-testid="discovery-channel-x">
+        {session.getResourceCall("channel", channelId)?.status ?? "none"}
+      </span>
+      <span data-testid="discovery-channel-y">
+        {session.getResourceCall("channel", channelYId)?.status ?? "none"}
+      </span>
+      <span data-testid="discovery-dm-1">
+        {session.getResourceCall("dm", "dm-1")?.status ?? "none"}
+      </span>
       <button type="button" onClick={() => navigate("/profile")}>
         Perfil
       </button>
       <button type="button" onClick={() => navigate("/chat/channel/example")}>
         Canal
+      </button>
+      <button type="button" onClick={() => navigate(`/chat/channel/${channelId}`)}>
+        Canal X
+      </button>
+      <button type="button" onClick={() => navigate("/chat/dm/dm-1")}>
+        DM direta
+      </button>
+      <button type="button" onClick={() => navigate("/chat/dm/dm-group-1")}>
+        DM grupo
       </button>
       <button
         type="button"
@@ -174,11 +212,37 @@ function Probe() {
                 participants: [],
                 counterpart: { userId: userA, displayName: "Ana" },
               },
+              {
+                id: "dm-group-1",
+                name: "Squad",
+                type: "group",
+                participants: [],
+              },
             ],
           })
         }
       >
         Diretório
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          session.registerDirectory({
+            currentUserId: userB,
+            channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
+            dms: [
+              {
+                id: "dm-1",
+                name: "Ana",
+                type: "1:1",
+                participants: [],
+                counterpart: { userId: userA, displayName: "Ana" },
+              },
+            ],
+          })
+        }
+      >
+        Diretório (sem Y)
       </button>
       <button
         type="button"
@@ -221,6 +285,19 @@ function Probe() {
       <button
         type="button"
         onClick={() =>
+          void session.joinResourceParticipation({
+            kind: "channel",
+            id: channelId,
+            name: "Geral",
+            callId: knownJoinProbeCallId,
+          })
+        }
+      >
+        Known join probe
+      </button>
+      <button
+        type="button"
+        onClick={() =>
           void session.activateResourceParticipation({
             kind: "channel",
             id: channelId,
@@ -249,6 +326,7 @@ function providerTree(path = "/chat") {
         >
           <Route path="/chat" element={<p>Chat</p>} />
           <Route path="/chat/channel/:id" element={<p>Canal</p>} />
+          <Route path="/chat/dm/:id" element={<p>DM</p>} />
           <Route path="/profile" element={<p>Perfil</p>} />
           <Route path="/call/:id" element={<p>Dedicated</p>} />
         </Route>
@@ -379,14 +457,20 @@ describe("CallSessionProvider", () => {
     expect(await screen.findByTestId("floating-call-window")).toBeInTheDocument();
   });
 
-  it("handles resource incoming accept, reject, duplicate, and terminal cleanup", async () => {
+  // Issue #622 round 2: resource calls are joinable sessions, never a
+  // ringing call — there is no resource IncomingCallPopup anymore. A
+  // broadcast only ever converges the discovery store; it never shows a
+  // dialog and never calls resource.join on its own.
+  it("converges resource discovery from broadcasts without ever showing a popup or auto-joining", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     const incoming = {
       ...activeDirect(),
+      call_id: callId,
       target_type: "channel",
       target_id: channelId,
       status: "active",
+      version: 1,
     };
     act(() =>
       socketListener.onMessage?.(
@@ -400,29 +484,31 @@ describe("CallSessionProvider", () => {
         1,
       ),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
-    expect(resource.join).toHaveBeenCalledWith(
-      expect.objectContaining({ callId }),
-      expect.any(Function),
-    );
 
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(resource.join).not.toHaveBeenCalled();
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
+
+    // A higher-version terminal event for the SAME call_id hides the
+    // indicator (status is no longer "active") without ever popping a
+    // dialog either.
     act(() =>
       socketListener.onMessage?.(
         {
-          type: "call.accepted",
+          type: "call.ended",
           event_id: "event-2",
           target_type: "channel",
           target_id: channelId,
-          call: { ...incoming, call_id: `${callId.slice(0, -1)}7` },
+          call: { ...incoming, status: "ended", version: 2 },
         },
         1,
       ),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Recusar" }));
     expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("ended");
   });
 
-  it("does not offer incoming resource Y while X is active and keeps same-target continuation valid", async () => {
+  it("discovers resource Y while participating in X — observing is never participating, and X stays untouched", async () => {
     resource.active = { kind: "channel", id: channelId, name: "Produto" };
     resource.callId = callId;
     renderProvider();
@@ -447,7 +533,10 @@ describe("CallSessionProvider", () => {
       ),
     );
 
-    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    // Y is discovered (never suppressed by this user's own participation in
+    // X), but discovery alone never joins/starts anything and X's own
+    // participation is untouched.
+    expect(screen.getByTestId("discovery-channel-y")).toHaveTextContent("active");
     expect(resource.join).not.toHaveBeenCalled();
     expect(resource.active).toEqual({ kind: "channel", id: channelId, name: "Produto" });
 
@@ -455,7 +544,7 @@ describe("CallSessionProvider", () => {
     await waitFor(() => expect(resource.join).toHaveBeenCalledOnce());
   });
 
-  it("does not offer or join an incoming resource while a direct call is active", () => {
+  it("discovers a resource call even while a direct call is active — #609 blocks join/start only, never discovery", () => {
     calls.call = activeDirect();
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
@@ -479,8 +568,74 @@ describe("CallSessionProvider", () => {
       ),
     );
 
-    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("discovery-channel-y")).toHaveTextContent("active");
     expect(resource.join).not.toHaveBeenCalled();
+  });
+
+  // Issue #622 round 2 section 5: rediscovery on navigation/reload. Landing
+  // on (or navigating to) a channel/group-DM route must resync that one
+  // target — recovering whatever this tab missed while it wasn't open.
+  it("navigating to a channel route triggers call.resource.sync for that channel", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await waitFor(() =>
+      expect(syncResourceCall).toHaveBeenCalledWith({ kind: "channel", id: channelId }),
+    );
+  });
+
+  it("reloading directly on a group-DM route triggers call.resource.sync for it", async () => {
+    // Directory registers AFTER the route is already showing — simulates a
+    // reload/deep-link where the route is known before the directory has
+    // loaded; the effect must still fire once the target becomes resolvable.
+    renderProvider("/chat/dm/dm-group-1");
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    await waitFor(() =>
+      expect(syncResourceCall).toHaveBeenCalledWith({ kind: "dm", id: "dm-group-1" }),
+    );
+  });
+
+  it("a direct 1:1 DM route never triggers call.resource.sync", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "DM direta" }));
+    // Give any (incorrect) async sync a chance to fire before asserting its
+    // absence — awaiting a microtask flush rather than a fixed timer.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(syncResourceCall).not.toHaveBeenCalledWith({ kind: "dm", id: "dm-1" });
+  });
+
+  it("a socket reconnect (generation change) resyncs the current route's target", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await waitFor(() =>
+      expect(syncResourceCall).toHaveBeenCalledWith({ kind: "channel", id: channelId }),
+    );
+    // Flush the mocked sync's own resolution before proceeding — the
+    // provider tracks one in-flight sync per target and would otherwise
+    // still consider this target "syncing", silently swallowing the
+    // reconnect-triggered call this test is actually asserting on.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    vi.mocked(syncResourceCall).mockClear();
+
+    // First onOpen only records the generation — it's the initial
+    // connection, already covered by the route effect above, so it must NOT
+    // fire a second, redundant sync on its own.
+    act(() => socketListener.onOpen?.(1));
+    expect(syncResourceCall).not.toHaveBeenCalled();
+
+    // A generation CHANGE means the socket actually reopened — that's the
+    // one that must resync the current route's target.
+    act(() => socketListener.onOpen?.(2));
+    await waitFor(() =>
+      expect(syncResourceCall).toHaveBeenCalledWith({ kind: "channel", id: channelId }),
+    );
   });
 
   it("performs main-to-dedicated handoff, ACK, timeout rollback, and failure rollback", async () => {
@@ -730,7 +885,7 @@ describe("CallSessionProvider", () => {
     vi.useRealTimers();
   });
 
-  it("filters global resource events and clears a matching terminal popup", async () => {
+  it("converges global resource events into discovery, ignores malformed frames, and never shows a popup for them", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
@@ -762,7 +917,8 @@ describe("CallSessionProvider", () => {
         1,
       ),
     );
-    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("discovery-dm-1")).toHaveTextContent("active");
     act(() =>
       socketListener.onMessage?.(
         {
@@ -776,6 +932,7 @@ describe("CallSessionProvider", () => {
       ),
     );
     expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("discovery-dm-1")).toHaveTextContent("ended");
   });
 
   it("recovers direct media through retry, activation, failure, and exception paths", async () => {
@@ -877,6 +1034,27 @@ describe("CallSessionProvider", () => {
     );
   });
 
+  it("a stale server leave never publishes a false cross-tab left", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    resource.leave.mockResolvedValueOnce(false);
+    renderProvider();
+
+    fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
+
+    await waitFor(() => expect(resource.leave).toHaveBeenCalledOnce());
+    expect(ownership.post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "leaving", callId }),
+    );
+    expect(ownership.post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "leave-cancelled", callId }),
+    );
+    expect(ownership.post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "left", callId }),
+    );
+  });
+
   it("shows start failures globally and labels restored audio activation accurately", () => {
     calls.error = "Permissão negada";
     const view = renderProvider();
@@ -887,6 +1065,120 @@ describe("CallSessionProvider", () => {
     view.rerender(providerTree());
     expect(screen.getByRole("button", { name: "Permitir microfone" })).toBeInTheDocument();
     expect(document.querySelector(".call-global-error")).toBeNull();
+  });
+
+  // Issue #622 round 2 adversarial audit (section 20): beginResourceParticipation
+  // is designed to never throw (callOwnership.ts fails open to a safe local
+  // fallback), but joinResourceParticipation must not silently assume that
+  // forever — if it ever did throw, resource.join() already created a real
+  // server-side lease (and possibly connected media) that no tab would then
+  // know to converge or release. Forces the failure via the one function
+  // that could theoretically throw (allocateParticipationGeneration) to
+  // prove the defensive catch actually triggers real cleanup.
+  it("a beginResourceParticipation failure triggers real resource.leave cleanup, never a silently orphaned lease", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    knownJoinProbeCallId = callId;
+    ownership.allocateParticipationGeneration.mockImplementationOnce(() => {
+      throw new Error("storage exploded");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
+
+    await waitFor(() => expect(resource.join).toHaveBeenCalled());
+    await waitFor(() => expect(resource.leave).toHaveBeenCalledOnce());
+    // The participation was never actually registered — no "participating"
+    // broadcast for a lease this tab does not actually believe it holds.
+    expect(ownership.post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "participating", callId }),
+    );
+  });
+
+  // Issue #622 round 2 adversarial audit (section 22): a known-call join
+  // that the server refuses (call_not_found/call_invalid_state, or simply
+  // busy) must resync that target afterward, so a stale pre-click discovery
+  // guess converges to whatever the server now says.
+  it("a failed known-call join resyncs that target's discovery afterward", async () => {
+    resource.join.mockResolvedValueOnce(undefined);
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    knownJoinProbeCallId = callId;
+
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
+
+    await waitFor(() =>
+      expect(syncResourceCall).toHaveBeenCalledWith({ kind: "channel", id: channelId }),
+    );
+  });
+
+  // Issue #622 round 2 adversarial audit (sections 11/27): repeated
+  // navigation between two already-known routes must not accumulate a new
+  // acquireChatSocket consumer (and its paired setConsumerSubscriptions
+  // call) per navigation — the global subscription effect's deps
+  // (applyResourceCallEvent, directory, getOwnership, requestResourceCallSync)
+  // are all stable/unchanged across a route change alone.
+  it("repeated navigation between known routes never accumulates a second global socket subscription", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    const initialAcquireCalls = vi.mocked(acquireChatSocket).mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    fireEvent.click(screen.getByRole("button", { name: "DM grupo" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    fireEvent.click(screen.getByRole("button", { name: "DM grupo" }));
+
+    expect(vi.mocked(acquireChatSocket).mock.calls.length).toBe(initialAcquireCalls);
+  });
+
+  // Issue #622 round 2 adversarial audit (section 27): removing a target
+  // from the directory purges its discovery observation while an unrelated
+  // target already known stays intact — proven here through registerDirectory
+  // itself (not just the reducer in isolation, see resourceCallDiscovery.test.ts).
+  it("directory-driven pruning at the provider level: removing Y purges its discovery while X stays intact", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-prune-x",
+          target_type: "channel",
+          target_id: channelId,
+          call: {
+            ...activeDirect(),
+            target_type: "channel",
+            target_id: channelId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "event-prune-y",
+          target_type: "channel",
+          target_id: channelYId,
+          call: {
+            ...activeDirect(),
+            call_id: "00000000-0000-4000-8000-000000000560",
+            target_type: "channel",
+            target_id: channelYId,
+            status: "active",
+          },
+        },
+        1,
+      ),
+    );
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
+    expect(screen.getByTestId("discovery-channel-y")).toHaveTextContent("active");
+
+    fireEvent.click(screen.getByRole("button", { name: "Diretório (sem Y)" }));
+
+    expect(screen.getByTestId("discovery-channel-y")).toHaveTextContent("none");
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
   });
 });
 
@@ -1464,10 +1756,10 @@ describe("dedicated participant leave converges ownership and main tab state (is
     // elsewhere), the resource-call indicator is what activeCallId gates.
     expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
 
-    // Others are still in call X: a fresh "active" event for the very same
-    // call_id arrives. resource.callId is still X — untouched this whole
-    // time — yet the affordance must still offer to join, because THIS
-    // participation already ended.
+    // Others are still in call X: discovery still shows it active (a fresh
+    // "active" event for the very same call_id arrives). resource.callId is
+    // still X — untouched this whole time — yet the affordance must still
+    // offer to join, because THIS participation already ended.
     const incoming = {
       ...activeDirect(),
       call_id: callId,
@@ -1487,11 +1779,14 @@ describe("dedicated participant leave converges ownership and main tab state (is
         1,
       ),
     );
-    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
 
     // The explicit, real join — resource.join() resolves with call_id X,
-    // exactly like the real hook does when target.callId is supplied.
-    fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    // exactly like the real hook does when target.callId is supplied
+    // (issue #622 round 2: ChatMessageArea's "Entrar na chamada", driven
+    // here through the same probe joinViaPopup() uses).
+    knownJoinProbeCallId = callId;
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
     expect(resource.join).toHaveBeenCalledWith(
       expect.objectContaining({ callId }),
       expect.any(Function),
@@ -1569,11 +1864,14 @@ describe("dedicated participant leave converges ownership and main tab state (is
         1,
       ),
     );
-    expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+    expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
 
     // No automatic recovery is required for this case — only that the
-    // user's explicit join fully recovers the system.
-    fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    // user's explicit join (issue #622 round 2: ChatMessageArea's "Entrar na
+    // chamada", driven here through the same probe joinViaPopup() uses)
+    // fully recovers the system.
+    knownJoinProbeCallId = callId;
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
     await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     ownership.getLease.mockReturnValue(lease);
@@ -1815,33 +2113,18 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     });
   });
 
-  // Drives a real resource.join() through the incoming-call popup — the
-  // same causal path production code uses, never a manual mock mutation.
-  // targetCallId lets a test join a SECOND, distinct resource call (Y)
-  // through the same directory-registered channel, to prove one callId's
-  // activity never disturbs another's own generation history.
+  // Drives a real resource.join() through joinResourceParticipation — the
+  // same causal path production code uses (issue #622 round 2:
+  // ChatMessageArea's "Entrar na chamada" action, never a resource
+  // IncomingCallPopup click, which this issue retired), never a manual mock
+  // mutation. targetCallId lets a test join a SECOND, distinct resource call
+  // (Y) through the same directory-registered channel, to prove one
+  // callId's activity never disturbs another's own generation history.
   async function joinViaPopup(targetCallId: string = callId) {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
-    const incoming = {
-      ...activeDirect(),
-      call_id: targetCallId,
-      target_type: "channel",
-      target_id: channelId,
-      status: "active",
-    };
-    act(() =>
-      socketListener.onMessage?.(
-        {
-          type: "call.accepted",
-          event_id: `join-${Math.random()}`,
-          target_type: "channel",
-          target_id: channelId,
-          call: incoming,
-        },
-        1,
-      ),
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
+    knownJoinProbeCallId = targetCallId;
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
+    await waitFor(() => expect(resource.join).toHaveBeenCalled());
   }
 
   it("cross-tab fresh provider: a brand-new tab's real join allocates strictly past an old participation's generation, never restarting at 1 from its own empty local state", async () => {
@@ -1940,26 +2223,8 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
-    const incoming = {
-      ...activeDirect(),
-      call_id: callId,
-      target_type: "channel",
-      target_id: channelId,
-      status: "active",
-    };
-    act(() =>
-      socketListener.onMessage?.(
-        {
-          type: "call.accepted",
-          event_id: "rejoin-in-flight",
-          target_type: "channel",
-          target_id: channelId,
-          call: incoming,
-        },
-        1,
-      ),
-    );
-    fireEvent.click(await screen.findByRole("button", { name: "Atender com câmera" }));
+    knownJoinProbeCallId = callId;
+    fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
     expect(resource.join).toHaveBeenCalledTimes(2);
 
     // C: a redelivered/late "left" for generation 1 — the OLD participation,

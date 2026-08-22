@@ -1,10 +1,11 @@
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { Outlet } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
 import "./ChatShell.css";
 import ChatSidebar from "./ChatSidebar";
-import type { CallType } from "./callState";
+import type { ResourceCallKind } from "./callApi";
+import type { Call, CallType } from "./callState";
 import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
 import { useChatSidebar } from "./useChatSidebar";
@@ -14,7 +15,27 @@ export interface ChatOutletContext {
   channels: Channel[];
   dms: DMConversation[];
   startCall?: (targetUserId: string, callType: CallType) => boolean;
-  /** RF-24: join the shared call room for a channel or a group DM. */
+  /**
+   * Discovery only (issue #622 round 2): whether a channel/group-DM has an
+   * active call right now, regardless of whether the current user is in it
+   * or busy elsewhere — never gated on participation or #609's join/start
+   * guard, so the header can show "Chamada ativa" for a target this tab is
+   * not currently able to join.
+   */
+  getResourceCall?: (kind: ResourceCallKind, id: string) => Call | null;
+  /** True only when this exact target is the one the user is already in. */
+  isParticipatingIn?: (kind: ResourceCallKind, id: string) => boolean;
+  /**
+   * Joins (known callId) or starts (no callId) the shared call room for a
+   * channel or a group DM. undefined — never omitted from the type, but a
+   * runtime undefined value — while a direct call is busy or a different
+   * resource call is already active: RF-23/RF-24 share one Room, so a
+   * disabled action is exactly "no function to call", the same signal the
+   * header used before discovery existed. Always funnels through
+   * joinResourceParticipation, never resourceCall.join directly, so an old
+   * "left" for whatever this callId's participation used to be can never
+   * abort this brand-new attempt before it registers.
+   */
   joinResourceCall?: (target: ResourceCallTarget) => void;
 }
 
@@ -26,6 +47,7 @@ export default function ChatShell() {
     joinResourceParticipation,
     registerDirectory,
     registerIdentity,
+    getResourceCall,
   } = useCallSession();
   useEffect(() => registerIdentity(state.status, retry), [registerIdentity, retry, state.status]);
   useEffect(() => {
@@ -44,17 +66,26 @@ export default function ChatShell() {
   const directCallBusy =
     calls.call !== null &&
     !["declined", "cancelled", "timed_out", "ended"].includes(calls.call.status);
+  const activeResourceTarget = resourceCall.active;
+  const isParticipatingIn = useCallback(
+    (kind: ResourceCallKind, id: string) =>
+      activeResourceTarget?.kind === kind && activeResourceTarget.id === id,
+    [activeResourceTarget],
+  );
   const outletContext: ChatOutletContext = {
     currentUserId: state.status === "ready" ? state.currentUserId : "",
     channels: state.status === "ready" ? state.channels : [],
     dms: state.status === "ready" ? state.dms : [],
     startCall: resourceCall.active ? undefined : calls.start,
+    getResourceCall,
+    isParticipatingIn,
     // Fresh join/rejoin gesture (issue #594 adversarial follow-up, round
     // 3): must go through joinResourceParticipation, never resourceCall.join
     // directly, so an old "left" for whatever this callId's participation
     // used to be can never abort this brand-new attempt before it registers
-    // — target.callId is undefined here (the server decides/reuses it), a
-    // case joinResourceParticipation is specifically built to still protect.
+    // — target.callId is undefined for a fresh join (the server decides/
+    // reuses it), a case joinResourceParticipation is specifically built to
+    // still protect.
     joinResourceCall:
       directCallBusy || resourceCall.active
         ? undefined

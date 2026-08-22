@@ -207,8 +207,18 @@ const (
 	// resource (channel/group-DM) call without ending it for anyone else —
 	// see CallHandler.LeaveCall (issue #569). It has no direct-call meaning:
 	// a 1:1 call's participants use call.decline/call.cancel/call.end.
-	ClientMessageTypeCallLeave    ClientMessageType = "call.leave"
-	ClientMessageTypeCallSync     ClientMessageType = "call.sync"
+	ClientMessageTypeCallLeave ClientMessageType = "call.leave"
+	ClientMessageTypeCallSync  ClientMessageType = "call.sync"
+	// ClientMessageTypeCallResourceSync asks for the authoritative active call
+	// (if any) of one channel/group-DM target — target-scoped discovery,
+	// distinct from call.sync's own-call-only lookup (issue #622). Always
+	// answered requester-only; never broadcast, never creates a lease, never
+	// issues a token.
+	ClientMessageTypeCallResourceSync ClientMessageType = "call.resource.sync"
+	// ClientMessageTypeCallJoin admits the actor into an already-known,
+	// active resource call — explicit join, distinct from call.start's
+	// create-or-reuse semantics (issue #622). Never creates a call.
+	ClientMessageTypeCallJoin     ClientMessageType = "call.join"
 	ClientMessageTypeCallPresence ClientMessageType = "call.presence"
 	ClientMessageTypeTypingStart  ClientMessageType = "typing.start"
 	ClientMessageTypeTypingStop   ClientMessageType = "typing.stop"
@@ -558,4 +568,14 @@ type ClientMessage struct {
 	CallID       string            `json:"call_id,omitempty"`
 	TargetUserID string            `json:"target_user_id,omitempty"`
 	CallType     domain.CallType   `json:"call_type,omitempty"`
+	// SyncID correlates a call.resource.sync request to its requester-only
+	// call.resource.synced response (issue #622). Client-generated, never
+	// used for authorization.
+	SyncID string `json:"sync_id,omitempty"`
+	// ParticipationID fences a call.leave or call.presence to one specific
+	// resource-call admission (issue #622 round 3) — the value that
+	// admission's own call.admitted response carried. Empty claims the
+	// pre-fencing legacy identity; never used for direct calls, which are
+	// never fenced. See docs/api/calls-websocket.md.
+	ParticipationID string `json:"participation_id,omitempty"`
 }

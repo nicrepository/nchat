@@ -17,14 +17,14 @@ type lifecycleCallHandler struct {
 	call domain.Call
 }
 
-func (h *lifecycleCallHandler) StartCall(ctx context.Context, command StartCallCommand) (domain.Call, error) {
+func (h *lifecycleCallHandler) StartCall(ctx context.Context, command StartCallCommand) (domain.Call, string, error) {
 	h.mu.Lock()
 	h.call = callProtocolCall(domain.CallStatusRinging, 1)
 	h.call.CallerID, h.call.CalleeID = command.CallerID, command.CalleeID
 	call := h.call
 	h.mu.Unlock()
 	h.hub.PublishCall(ctx, call)
-	return call, nil
+	return call, "", nil
 }
 
 func (h *lifecycleCallHandler) TransitionCall(ctx context.Context, _, actorID, _ string, action ClientMessageType) (domain.Call, error) {
@@ -60,17 +60,25 @@ func (h *lifecycleCallHandler) CurrentCall(context.Context, string, string, stri
 	return h.call, nil
 }
 
-func (h *lifecycleCallHandler) RenewCallPresence(context.Context, string, string, string) error {
+func (h *lifecycleCallHandler) RenewCallPresence(context.Context, string, string, string, string) error {
 	return nil
 }
 
-func (h *lifecycleCallHandler) LeaveCall(_ context.Context, _, actorID, _ string) (domain.Call, error) {
+func (h *lifecycleCallHandler) LeaveCall(_ context.Context, _, actorID, _, _ string) (domain.Call, bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.call.ID == "" || (!h.call.IsParticipant(actorID) && h.call.CallerID != actorID) {
-		return domain.Call{}, domain.ErrNotFound
+		return domain.Call{}, false, domain.ErrNotFound
 	}
-	return h.call, nil
+	return h.call, true, nil
+}
+
+func (h *lifecycleCallHandler) ResourceSync(context.Context, string, string, TargetType, string) (domain.Call, bool, time.Time, error) {
+	return domain.Call{}, false, time.Time{}, nil
+}
+
+func (h *lifecycleCallHandler) JoinCall(context.Context, string, string, string, TargetType, string) (domain.Call, string, error) {
+	return domain.Call{}, "", domain.ErrNotFound
 }
 
 func TestCallWebSocketLifecycleNotifiesTwoAuthenticatedClients(t *testing.T) {

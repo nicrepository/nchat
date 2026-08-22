@@ -413,7 +413,7 @@ func readLoop(ctx context.Context, conn *websocket.Conn, hub *Hub, c *Client, lo
 			if handleReactionClientError(c, msgErr) {
 				continue
 			}
-			if isCallClientMessage(msg.Type) && handleCallClientError(c, msg.Type, msg.CallID, msgErr) {
+			if isCallClientMessage(msg.Type) && handleCallClientError(c, msg.Type, msg.CallID, callResponseTo(msg), msgErr) {
 				continue
 			}
 			if isTypingClientMessage(msg.Type) && handleTypingClientError(c, msgErr) {
@@ -472,6 +472,10 @@ type clientErrorResponse struct {
 	Code       string `json:"code"`
 	CallID     string `json:"call_id,omitempty"`
 	RetryAfter int    `json:"retry_after,omitempty"`
+	// ResponseTo correlates this error to the request_id/sync_id of the
+	// command that failed (issue #622). Empty for every call command that
+	// predates that correlation — see callResponseTo.
+	ResponseTo string `json:"response_to,omitempty"`
 }
 
 type subscribeSuccessResponse struct {

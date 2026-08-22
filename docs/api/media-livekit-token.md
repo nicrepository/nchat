@@ -1,8 +1,10 @@
 # Media-service: token de participante LiveKit
 
 O endpoint emite o token de mídia somente para participante autenticado de uma
-chamada RF-23 que o `chat-service` já tenha colocado em `active`. Ele não cria,
-atende, recusa ou encerra chamadas.
+chamada (direta RF-23 ou de recurso RF-24) que o `chat-service` já tenha
+colocado em `active`. Ele não cria, atende, recusa, encerra ou admite ninguém
+em chamada nenhuma — a admissão é sempre feita antes, via `call.start` ou
+`call.join` no WebSocket (ver `docs/api/calls-websocket.md`).
 
 ## Contrato
 
@@ -13,7 +15,8 @@ O corpo tem limite de 4 KiB e rejeita campos desconhecidos.
 
 ```json
 {
-  "call_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  "call_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "participation_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 }
 ```
 
@@ -39,12 +42,35 @@ O media-service valida a assinatura HS256, issuer, audience e claims obrigatorio
 do access token. A mesma consulta PostgreSQL valida usuario ativo, vinculo entre
 `sub` e `sid`, revogacao, expiracao idle e expiracao absoluta da sessao.
 
-Na mesma consulta, o serviço exige workspace e membership ativos, chamada com
-`status = 'active'` e `sub` igual a `caller_id` ou `callee_id`. Uma chamada
-`ringing`, expirada, recusada, cancelada ou encerrada nunca autoriza token.
+Na mesma consulta, o serviço exige workspace e membership ativos e chamada com
+`status = 'active'`. A partir daí, a regra depende do tipo de alvo da chamada:
 
-Chamada ausente e chamada inacessivel retornam o mesmo `404`, sem indicar a
-existencia do UUID. Falha ou inatividade de sessao retorna `401`.
+- **Direta** (`target_type = 'user'`): `sub` precisa ser `caller_id` ou
+  `callee_id`. `participation_id` não é necessário. Sem mudança nesta issue.
+- **Recurso** (`target_type` `channel` ou `dm`, issue #622/#609): além de
+  membership/visibilidade do canal ou DM, o `sub` precisa segurar um
+  **lease de participante vivo** — uma linha em
+  `chat.call_participant_leases` para esta chamada e este usuário, com o
+  **mesmo `participation_id`** e `expires_at > clock_timestamp()`. Um token
+  stale nunca pode aproveitar a lease atual de outra aba. Ver membership sozinha já não é
+  suficiente: um membro do canal que nunca deu `call.start`/`call.join`
+  naquela chamada (ou cujo lease expirou) não recebe token, mesmo enxergando
+  a chamada acontecer. **Observar** uma chamada de recurso — por exemplo via
+  `call.resource.sync` ou por receber o broadcast `call.accepted` — nunca
+  cria lease e nunca equivale a participar dela.
+
+Durante o rollout, a ausência de `participation_id` só pode autorizar uma lease
+legacy cujo valor no banco também seja `NULL`; nunca significa "qualquer lease
+do mesmo usuário". Novas admissões sempre recebem e persistem UUID não nulo.
+O token é requester-only e não faz parte da representação pública de `Call`.
+
+Uma chamada `ringing`, expirada, recusada, cancelada ou encerrada nunca
+autoriza token, em nenhum dos dois casos.
+
+Chamada ausente, chamada inacessivel e chamada de recurso sem lease vivo
+retornam o mesmo `404`, sem indicar a existencia do UUID nem se a causa foi
+falta de acesso ao canal/DM ou apenas ausência de lease. Falha ou inatividade
+de sessao retorna `401`.
 
 ## Token
 
@@ -64,7 +90,7 @@ gateway.
 | Status | Condicao                                               |
 | -----: | ------------------------------------------------------ |
 |    200 | token emitido                                          |
-|    400 | JSON ou `call_id` invalido; campo desconhecido         |
+|    400 | JSON, `call_id` ou `participation_id` invalido         |
 |    401 | Bearer invalido ou sessao inativa                      |
 |    404 | chamada não ativa, ausente ou usuário não participante |
 |    413 | corpo acima de 4 KiB                                   |
@@ -115,7 +141,13 @@ go run ./cmd/media-service
 
 Os predicados reais de sessao e autorizacao podem ser validados em um PostgreSQL
 descartavel. O banco informado deve ter nome terminado em `_test`; a suite aplica
-as migrations reais, incluindo `chat/000019_call_lifecycle`:
+as migrations reais, incluindo `chat/000019_call_lifecycle` (chamada 1:1),
+`chat/000022_workspace_moderator_and_guest_channel_scope` (a função
+`chat.channel_visible_to_user` que a autorização de canal usa) e
+`chat/000028_resource_call_lifecycle` (`target_type`/`target_id` e
+`chat.call_participant_leases`, o lease que a autorização de chamada de
+recurso agora exige) e `chat/000035_call_participant_lease_identity` (fencing
+por admissão):
 
 ```bash
 MEDIA_TEST_DATABASE_URL='postgres://user:password@127.0.0.1:5432/nchat_media_test?sslmode=disable' go test -tags=integration -count=1 ./internal/storage -run TestPGXResourceAuthorizerPostgreSQLPredicates

@@ -12,13 +12,14 @@ interface CallTokenEnvelope {
 
 export async function issueCallToken(
   callId: string,
+  participationId?: string,
 ): Promise<{ token: string; expiresAt: string; serverUrl: string }> {
   const response = await authenticatedFetch<CallTokenEnvelope>(
     `${MEDIA_BASE}/media/livekit/token`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ call_id: callId }),
+      body: JSON.stringify({ call_id: callId, participation_id: participationId }),
     },
   );
   return response.data;

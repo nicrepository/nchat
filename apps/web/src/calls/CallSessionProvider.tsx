@@ -17,6 +17,17 @@ import {
   setConsumerSubscriptions,
 } from "../chat/chatSocket";
 import { parseCallEvent, type Call } from "../chat/callState";
+import type { ResourceCallKind } from "../chat/callApi";
+import {
+  convergeResourceCallEvent,
+  convergeResourceSyncNull,
+  emptyResourceCallDiscovery,
+  pruneResourceCallDiscovery,
+  resourceKey,
+  type ResourceCallDiscoveryState,
+  type ResourceKey,
+} from "../chat/resourceCallDiscovery";
+import { syncResourceCall } from "../chat/resourceCallSignaling";
 import type { Channel, DMConversation } from "../chat/chatTypes";
 import { useCallMedia, type CallMediaSessionController } from "../chat/useCallMedia";
 import {
@@ -95,9 +106,10 @@ export interface CallSessionContextValue {
   beginResourceParticipation: (callId: string) => Promise<void>;
   /**
    * The one real call site every FRESH, user-initiated resource join/rejoin
-   * must go through — ChatShell's "start/join group call" flow and
-   * IncomingCallPopup's accept (issue #594 adversarial follow-up, rounds
-   * 2-3). Wraps resource.join() with a LOCAL-ONLY, causal "this callId has a
+   * must go through — ChatMessageArea's "Chamada"/"Entrar na chamada"
+   * actions (issue #594 adversarial follow-up, rounds 2-3; issue #622 round
+   * 2 replaced the old resource IncomingCallPopup click with these).
+   * Wraps resource.join() with a LOCAL-ONLY, causal "this callId has a
    * fresh attempt in flight" marker, registered synchronously BEFORE join()
    * starts — even when target.callId is still undefined at that instant
    * (the server resolves/reuses it), via join()'s own onCallIdResolved
@@ -129,6 +141,27 @@ export interface CallSessionContextValue {
    * narrower, deliberately-unprotected race this leaves open.
    */
   activateResourceParticipation: (target: ResourceCallTarget) => Promise<string | undefined>;
+  /**
+   * Discovery, never participation (issue #622 round 2) — the authoritative
+   * "is there an active call here" for one channel/group-DM target, derived
+   * purely from lifecycle broadcasts and call.resource.sync answers this
+   * provider has converged. Returns null for "no active call" AND for a
+   * target this tab has simply never observed yet — the same value; a
+   * caller that needs to distinguish "confirmed idle" from "not checked yet"
+   * should call requestResourceCallSync itself and await the next render.
+   * Never reflects whether the CURRENT USER is participating — that is
+   * resource.active/resource.callId, a completely different question.
+   */
+  getResourceCall: (kind: ResourceCallKind, id: string) => Call | null;
+  /**
+   * Explicitly (re)requests call.resource.sync for one target and converges
+   * the result into discovery — e.g. after a known-call join fails (issue
+   * #622 round 2 section 17), so the indicator reflects whatever the server
+   * now says instead of the stale pre-failure guess. Fire-and-forget by
+   * design: callers read the outcome back through getResourceCall on the
+   * next render, never through this function's own return value.
+   */
+  requestResourceCallSync: (kind: ResourceCallKind, id: string) => void;
 }
 
 const CallSessionContext = createContext<CallSessionContextValue | null>(null);
@@ -161,8 +194,79 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     status: "loading" | "ready" | "error";
     retry?: () => Promise<void>;
   }>({ status: "loading" });
-  const [incomingResource, setIncomingResource] = useState<Call | null>(null);
-  const ignoredResourceCalls = useRef(new Set<string>());
+  // Discovery store (issue #622 round 2) — keyed observations of whether a
+  // channel/group-DM has an active call, entirely separate from
+  // participation. Populated by the global resource-events subscription
+  // below (every channel + group DM the directory knows about, regardless
+  // of whether this user is busy elsewhere — #609 only ever blocks this
+  // user's own join/start, never their ability to see that a call exists)
+  // and by explicit call.resource.sync answers (route-scoped rediscovery,
+  // reconnect resync, and post-join-failure reconciliation).
+  const [resourceCallDiscovery, setResourceCallDiscovery] = useState<ResourceCallDiscoveryState>(
+    emptyResourceCallDiscovery,
+  );
+  const applyResourceCallEvent = useCallback((kind: ResourceCallKind, id: string, call: Call) => {
+    setResourceCallDiscovery((current) => convergeResourceCallEvent(current, kind, id, call));
+  }, []);
+  const getResourceCall = useCallback(
+    (kind: ResourceCallKind, id: string): Call | null =>
+      resourceCallDiscovery.get(resourceKey(kind, id))?.call ?? null,
+    [resourceCallDiscovery],
+  );
+  // At most one in-flight call.resource.sync per target at a time — a
+  // duplicate trigger (route effect + reconnect + failure-reconciliation all
+  // landing close together) converges into the same outcome regardless, so
+  // there is nothing to gain from a second concurrent round trip.
+  const syncingResourceCallsRef = useRef<Set<ResourceKey>>(new Set());
+  const requestResourceCallSync = useCallback((kind: ResourceCallKind, id: string) => {
+    const key = resourceKey(kind, id);
+    if (syncingResourceCallsRef.current.has(key)) return;
+    syncingResourceCallsRef.current.add(key);
+    syncResourceCall({ kind, id }).then(
+      (result) => {
+        syncingResourceCallsRef.current.delete(key);
+        setResourceCallDiscovery((current) =>
+          result.call
+            ? convergeResourceCallEvent(current, kind, id, result.call)
+            : convergeResourceSyncNull(current, kind, id, result.observedAt),
+        );
+      },
+      () => {
+        syncingResourceCallsRef.current.delete(key);
+      },
+    );
+  }, []);
+  // The channel/group-DM the current route is showing, if any — direct DMs
+  // are deliberately excluded (issue #622 round 2 section 5: "direct DM não
+  // faz resource sync"). Read inside the reconnect handler below via a ref,
+  // never the state closure, since that handler is registered once and must
+  // still see whichever route is current at the moment the socket reopens.
+  const routeResourceMatch = /^\/chat\/(channel|dm)\/([^/]+)/.exec(location.pathname);
+  const routeResourceTarget = useMemo(() => {
+    if (!routeResourceMatch || !directory) return null;
+    const id = decodeURIComponent(routeResourceMatch[2]);
+    if (routeResourceMatch[1] === "channel") {
+      return directory.channels.some((channel) => channel.id === id)
+        ? { kind: "channel" as const, id }
+        : null;
+    }
+    const dm = directory.dms.find((candidate) => candidate.id === id);
+    return dm?.type === "group" ? { kind: "dm" as const, id } : null;
+  }, [directory, routeResourceMatch]);
+  const routeResourceTargetRef = useRef(routeResourceTarget);
+  useEffect(() => {
+    routeResourceTargetRef.current = routeResourceTarget;
+  }, [routeResourceTarget]);
+  // Rediscovery on navigation (issue #622 round 2 section 5): every time the
+  // route settles on a different channel/group-DM, resync it once — realtime
+  // discovery for every OTHER known target still comes from the global
+  // broadcast subscription below, this is purely to recover from whatever
+  // this tab missed while the target wasn't open (or was never open before).
+  useEffect(() => {
+    if (routeResourceTarget?.kind && routeResourceTarget.id) {
+      requestResourceCallSync(routeResourceTarget.kind, routeResourceTarget.id);
+    }
+  }, [routeResourceTarget?.kind, routeResourceTarget?.id, requestResourceCallSync]);
   const handoffTimer = useRef<number | null>(null);
   const handoffCall = useRef("");
   const handoffEpoch = useRef(0);
@@ -243,8 +347,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // second one still needs.
   //
   // ONLY ever written by a genuinely fresh, user-initiated join/rejoin
-  // gesture (ChatShell's "start/join group call" flow, IncomingCallPopup's
-  // accept) — DedicatedCallPage's activation-effect join() deliberately
+  // gesture (ChatMessageArea's "Chamada"/"Entrar na chamada" actions) —
+  // DedicatedCallPage's activation-effect join() deliberately
   // never writes here (see activateResourceParticipation below): it runs on
   // every successful ownerState -> "local" transition, including a plain
   // handoff continuation reconnecting media for an ALREADY-active
@@ -422,7 +526,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // resource.join is itself permanently stable (useResourceCallSession's own
   // useCallback has `[]` deps) — pulling it out the same way lets
   // joinResourceParticipation below depend on it directly too.
-  const { convergeRemoteLeave, join: joinResourceCall } = resource;
+  const { convergeRemoteLeave, join: joinResourceCall, leave: leaveResourceSession } = resource;
   const directMedia = useMemo<CallMediaBridge>(
     () => ({
       startAudio: ownedMedia.startAudio,
@@ -496,8 +600,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     [commitParticipation, getOwnership, postParticipation],
   );
   // The real call site every FRESH, user-initiated resource join/rejoin must
-  // go through (issue #594 adversarial follow-up, rounds 2-3) — ChatShell's
-  // "start/join group call" flow and IncomingCallPopup's accept, never
+  // go through (issue #594 adversarial follow-up, rounds 2-3) —
+  // ChatMessageArea's "Chamada"/"Entrar na chamada" actions, never
   // DedicatedCallPage (see activateResourceParticipation below and
   // pendingJoinAttemptsRef's own comment). Registers the local-only intent
   // synchronously, BEFORE resource.join() itself starts (never after — that
@@ -540,7 +644,36 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           protectedCallId = resolvedCallId;
           protectJoinAttempt(protectedCallId);
         });
-        if (joinedCallId) await beginResourceParticipation(joinedCallId);
+        if (joinedCallId) {
+          try {
+            await beginResourceParticipation(joinedCallId);
+          } catch {
+            // Defensive (issue #622 round 2 adversarial audit, section 20):
+            // beginResourceParticipation is designed to never throw —
+            // callOwnership.ts's allocateParticipationGeneration/post both
+            // fail open to a safe local fallback rather than propagating —
+            // but that is another module's invariant, not this one's to
+            // assume forever. If it ever did throw, resource.join() has
+            // already created a real server-side lease and possibly a
+            // connected media room with NO participation token registered
+            // anywhere — worse than an ordinary join failure, since no tab
+            // (including this one) would know this participation exists to
+            // converge or release it later. Real cleanup takes precedence
+            // over pretending the join succeeded; matches resource.join()'s
+            // own "never throws" contract by resolving undefined here too.
+            await leaveResourceSession().catch(() => undefined);
+            return undefined;
+          }
+        } else if (target.callId) {
+          // A known-call join failed (issue #622 round 2 section 17): the
+          // call may have ended between discovery and this click, or the
+          // busy check may have rejected it — either way, resync so the
+          // indicator reflects the server's current answer instead of the
+          // stale pre-click guess. Safe for busy too: the target is still
+          // genuinely active, so this resync only re-confirms it, never
+          // clears it.
+          requestResourceCallSync(target.kind, target.id);
+        }
         return joinedCallId;
       } finally {
         if (protectedCallId) unprotectJoinAttempt(protectedCallId);
@@ -550,7 +683,9 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       beginResourceParticipation,
       directCallBusy,
       joinResourceCall,
+      leaveResourceSession,
       protectJoinAttempt,
+      requestResourceCallSync,
       resource.active,
       unprotectJoinAttempt,
     ],
@@ -610,15 +745,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // "leaving" is posted immediately, before the server round trip, so no
   // tab (including this one) can reconnect/take over while the leave is
   // still pending. "left" only follows once resource.leave() actually
-  // resolves; if it rejects instead, "leave-cancelled" restores this exact
-  // participation to "participating" everywhere and the rejection
-  // propagates so the caller's own retry affordance still fires.
+  // resolves with released=true. A stale fence resolves released=false:
+  // local stale media is already cleared, but "leave-cancelled" prevents
+  // the speculative leaving phase from suppressing the newer tab's lease.
   const endResourceParticipation = useCallback(async (): Promise<void> => {
     if (!resource.active) return;
     const callId = resource.callId;
     if (callId) continueResourceParticipation(callId, "leaving", "leaving");
     try {
-      await resource.leave();
+      const released = await resource.leave();
+      if (!released) {
+        if (callId) continueResourceParticipation(callId, "participating", "leave-cancelled");
+        return;
+      }
     } catch (error) {
       if (callId) continueResourceParticipation(callId, "participating", "leave-cancelled");
       throw error;
@@ -860,6 +999,30 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     resource.status,
   ]);
 
+  // Discovery is directory-purged (issue #622 round 2 section 6): a
+  // resource that stopped existing or became inaccessible must not keep a
+  // stale "call ativa" indicator forever, since it will never again receive
+  // a subscription/broadcast to correct it. Purely cache eviction — the
+  // server remains sole authority for whether a join is actually allowed.
+  //
+  // Adjusted during render (React's "adjust state when a prop changes"
+  // pattern, same one HeaderDM's avatar fallback uses below) rather than in
+  // an effect: pruning is a pure function of `directory` alone, so deriving
+  // it synchronously avoids an extra commit-then-cascade render for every
+  // directory update.
+  const [prunedForDirectory, setPrunedForDirectory] = useState(directory);
+  if (directory !== prunedForDirectory) {
+    setPrunedForDirectory(directory);
+    if (directory) {
+      const known = new Set<ResourceKey>([
+        ...directory.channels.map((channel) => resourceKey("channel", channel.id)),
+        ...directory.dms.filter((dm) => dm.type === "group").map((dm) => resourceKey("dm", dm.id)),
+      ]);
+      setResourceCallDiscovery((current) => pruneResourceCallDiscovery(current, known));
+    }
+  }
+
+  const lastSocketGenerationRef = useRef<number | null>(null);
   useEffect(() => {
     if (!directory) return;
     const consumerId = `global-calls:${getOwnership().tabId}`;
@@ -870,39 +1033,38 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         .map((dm) => ({ kind: "dm" as const, targetId: dm.id })),
     ]);
     const handle = acquireChatSocket({
+      onOpen(generation) {
+        // Rediscovery on reconnect (issue #622 round 2 section 5): a new
+        // generation means the socket actually reopened (the very first
+        // connection's generation is recorded here too, but the route
+        // effect above already covers that initial sync, so only a CHANGE
+        // triggers a resync here). Whatever this tab missed while
+        // disconnected is exactly what call.resource.sync recovers —
+        // never a broadcast this tab could have relied on instead, since it
+        // was, by definition, not connected to receive one.
+        const previous = lastSocketGenerationRef.current;
+        lastSocketGenerationRef.current = generation;
+        const target = routeResourceTargetRef.current;
+        if (previous !== null && previous !== generation && target) {
+          requestResourceCallSync(target.kind, target.id);
+        }
+      },
       onMessage(value) {
         const event = parseCallEvent(value);
         if (!event || event.target_type === "user") return;
-        if (terminal.has(event.call.status)) {
-          setIncomingResource((current) =>
-            current?.call_id === event.call.call_id ? null : current,
-          );
-        } else if (
-          event.call.status === "active" &&
-          // Never gated on resource.callId equality (issue #570 follow-up):
-          // a stale resource.callId — left set on purpose after a handoff so
-          // a legitimate later reclaim can still reconnect — must not
-          // permanently suppress this affordance for a callId this tab's
-          // current participation has actually left. What matters is
-          // whether THIS tab is presently participating, which the
-          // synchronous ref (this runs in a socket callback, not render —
-          // see the participationRecordsRef comment above) answers.
-          participationRecordsRef.current.get(event.call.call_id)?.phase !== "participating" &&
-          event.call.caller_id !== directory.currentUserId &&
-          !ignoredResourceCalls.current.has(event.call.call_id)
-        ) {
-          setIncomingResource((current) => {
-            if (current?.call_id !== event.call.call_id) emitCallTechnicalEvent("incoming-shown");
-            return event.call;
-          });
-        }
+        // Discovery only — never gated on busy/participation/caller
+        // identity (issue #622 round 2): observing a resource call is never
+        // participating in it, and #609 only ever blocks this user's own
+        // join/start, never their ability to see that X exists. The
+        // reducer itself owns every ordering/staleness decision.
+        applyResourceCallEvent(event.target_type, event.target_id, event.call);
       },
     });
     return () => {
       handle.release();
       releaseConsumerSubscriptions(consumerId);
     };
-  }, [directory, getOwnership]);
+  }, [applyResourceCallEvent, directory, getOwnership, requestResourceCallSync]);
 
   // Timers only: the coordinator's own close() lives exclusively in the
   // lifecycle effect above.
@@ -1066,6 +1228,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       beginResourceParticipation,
       joinResourceParticipation,
       activateResourceParticipation,
+      getResourceCall,
+      requestResourceCallSync,
     }),
     [
       acknowledgeDedicated,
@@ -1076,6 +1240,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       dedicatedRecoveryFailed,
       enableMedia,
       expand,
+      getResourceCall,
       joinResourceParticipation,
       leaveDedicated,
       media,
@@ -1084,6 +1249,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       registerDirectory,
       registerIdentity,
       releaseDedicated,
+      requestResourceCallSync,
       resource,
       takeOver,
     ],
@@ -1145,19 +1311,6 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         : media.status === "error" || media.status === "permission-denied"
           ? "failed"
           : "connecting";
-  const incomingTarget = incomingResource
-    ? incomingResource.target_type === "channel"
-      ? directory?.channels.find((channel) => channel.id === incomingResource.target_id)
-      : directory?.dms.find((dm) => dm.id === incomingResource.target_id)
-    : null;
-  const incomingResourceBusy =
-    directCallBusy ||
-    Boolean(
-      incomingResource &&
-      resource.active &&
-      (resource.active.kind !== incomingResource.target_type ||
-        resource.active.id !== incomingResource.target_id),
-    );
   const globalCallError = calls.error ?? resource.error;
 
   return (
@@ -1181,39 +1334,6 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           onRetryIdentity={() => identity.retry?.()}
         />
       )}
-      {!dedicated &&
-        !directIncoming &&
-        !incomingResourceBusy &&
-        incomingResource &&
-        incomingTarget && (
-          <IncomingCallPopup
-            name={incomingTarget.name}
-            targetKind={incomingResource.target_type as "channel" | "dm"}
-            callType={incomingResource.call_type}
-            participantCount={1}
-            onAccept={() => {
-              emitCallTechnicalEvent("accepted");
-              setIncomingResource(null);
-              // joinResourceParticipation both runs the real join() and — only
-              // once it actually confirms success (issue #570 follow-up) —
-              // registers the new participation; it also protects this
-              // attempt, from before join() even starts, against an old
-              // "left" for the participation it supersedes (issue #594
-              // adversarial follow-up).
-              void joinResourceParticipation({
-                kind: incomingResource.target_type as "channel" | "dm",
-                id: incomingResource.target_id!,
-                name: incomingTarget.name,
-                callId: incomingResource.call_id,
-              });
-            }}
-            onReject={() => {
-              emitCallTechnicalEvent("rejected");
-              ignoredResourceCalls.current.add(incomingResource.call_id);
-              setIncomingResource(null);
-            }}
-          />
-        )}
       {!dedicated && activeCallId && ownerState === "remote" && (
         <GlobalCallIndicator
           title={title}

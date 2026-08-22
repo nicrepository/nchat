@@ -37,7 +37,11 @@ func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.Aut
 	var sessionExpiresAt pgtype.Timestamptz
 	var resourceID pgtype.Text
 	var displayName pgtype.Text
-	if err := a.pool.QueryRow(ctx, query, input.SessionID, input.UserID, input.ResourceID).
+	args := []any{input.SessionID, input.UserID, input.ResourceID}
+	if input.Kind == domain.ResourceKindCall {
+		args = append(args, input.ParticipationID)
+	}
+	if err := a.pool.QueryRow(ctx, query, args...).
 		Scan(&sessionExpiresAt, &resourceID, &displayName); err != nil {
 		return service.AuthorizedResource{}, fmt.Errorf("authorize media resource: %w", err)
 	}
@@ -104,6 +108,16 @@ const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
 	)
 	` + authorizedResourceSelect
 
+// callAuthorizationQuery authorizes a LiveKit token request scoped to one
+// call. Direct (target_type = 'user') calls are authorized by caller/callee
+// identity alone, unchanged. Resource (channel/group-DM) calls additionally
+// require a live chat.call_participant_leases row for this call and this
+// user (issue #622/#609): membership/visibility of the channel or DM is
+// necessary but no longer sufficient — a workspace member who can see the
+// room but never actually joined the call (no call.join/call.start ever
+// admitted them, or their lease already expired) must not receive a token.
+// Observing a resource call (e.g. via call.resource.sync) never grants a
+// lease and so never grants a token either.
 const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 	authorized_resource AS (
 		SELECT c.id
@@ -125,6 +139,12 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 				  AND channel.workspace_id = c.workspace_id
 				  AND channel.status = 'active'
 				  AND chat.channel_visible_to_user(channel.id, active.user_id)
+			) AND EXISTS (
+				SELECT 1 FROM chat.call_participant_leases AS lease
+				WHERE lease.call_id = c.id
+				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
+				  AND lease.expires_at > clock_timestamp()
 			))
 			OR
 			(c.target_type = 'dm' AND EXISTS (
@@ -137,6 +157,12 @@ const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
 				  AND conversation.workspace_id = c.workspace_id
 				  AND conversation.status = 'active'
 				  AND conversation.type = 'group'
+			) AND EXISTS (
+				SELECT 1 FROM chat.call_participant_leases AS lease
+				WHERE lease.call_id = c.id
+				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
+				  AND lease.expires_at > clock_timestamp()
 			))
 		  )
 	)

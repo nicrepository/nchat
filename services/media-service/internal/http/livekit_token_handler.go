@@ -30,37 +30,49 @@ type LiveKitTokenIssuer interface {
 }
 
 type liveKitTokenRequest struct {
-	CallID       string `json:"call_id"`
-	ResourceKind string `json:"resource_kind"`
-	ResourceID   string `json:"resource_id"`
+	CallID          string `json:"call_id"`
+	ParticipationID string `json:"participation_id"`
+	ResourceKind    string `json:"resource_kind"`
+	ResourceID      string `json:"resource_id"`
 }
 
 // parseLiveKitTokenTarget resolves the request into exactly one resource
 // target. call_id (RF-23) and resource_kind/resource_id (RF-24) are mutually
 // exclusive; resource_kind only ever accepts "channel" or "dm" — never
 // "call", which stays reachable exclusively through call_id.
-func parseLiveKitTokenTarget(request liveKitTokenRequest) (domain.ResourceKind, string, error) {
+func parseLiveKitTokenTarget(request liveKitTokenRequest) (domain.ResourceKind, string, string, error) {
 	hasCall := request.CallID != ""
 	hasResource := request.ResourceKind != "" || request.ResourceID != ""
 	if hasCall == hasResource {
-		return "", "", domain.ErrInvalidInput
+		return "", "", "", domain.ErrInvalidInput
 	}
 	if hasCall {
 		id, err := uuid.Parse(request.CallID)
 		if err != nil {
-			return "", "", domain.ErrInvalidInput
+			return "", "", "", domain.ErrInvalidInput
 		}
-		return domain.ResourceKindCall, id.String(), nil
+		participationID := ""
+		if request.ParticipationID != "" {
+			participation, err := uuid.Parse(request.ParticipationID)
+			if err != nil {
+				return "", "", "", domain.ErrInvalidInput
+			}
+			participationID = participation.String()
+		}
+		return domain.ResourceKindCall, id.String(), participationID, nil
+	}
+	if request.ParticipationID != "" {
+		return "", "", "", domain.ErrInvalidInput
 	}
 	kind := domain.ResourceKind(request.ResourceKind)
 	if kind != domain.ResourceKindChannel && kind != domain.ResourceKindDM {
-		return "", "", domain.ErrInvalidInput
+		return "", "", "", domain.ErrInvalidInput
 	}
 	id, err := uuid.Parse(request.ResourceID)
 	if err != nil {
-		return "", "", domain.ErrInvalidInput
+		return "", "", "", domain.ErrInvalidInput
 	}
-	return kind, id.String(), nil
+	return kind, id.String(), "", nil
 }
 
 type liveKitTokenResponse struct {
@@ -102,7 +114,7 @@ func LiveKitToken(issuer LiveKitTokenIssuer, serverURL string, logger *slog.Logg
 			writeLiveKitTokenDecodeError(w, r, logger, startedAt, err)
 			return
 		}
-		kind, resourceID, err := parseLiveKitTokenTarget(request)
+		kind, resourceID, participationID, err := parseLiveKitTokenTarget(request)
 		if err != nil {
 			writeLiveKitTokenError(w, r, logger, startedAt, "unknown", domain.ErrInvalidInput)
 			return
@@ -113,6 +125,7 @@ func LiveKitToken(issuer LiveKitTokenIssuer, serverURL string, logger *slog.Logg
 			ResourceID:      resourceID,
 			UserID:          principal.UserID,
 			SessionID:       principal.SessionID,
+			ParticipationID: participationID,
 			AccessExpiresAt: principal.AccessExpiresAt,
 		})
 		if err != nil {

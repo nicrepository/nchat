@@ -10,9 +10,11 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
 )
 
+var _ ws.CallHandler = (*callHandlerAdapter)(nil)
+
 type callHandlerAdapter struct{ service *service.CallService }
 
-func (a *callHandlerAdapter) StartCall(ctx context.Context, command ws.StartCallCommand) (domain.Call, error) {
+func (a *callHandlerAdapter) StartCall(ctx context.Context, command ws.StartCallCommand) (domain.Call, string, error) {
 	return a.service.Start(ctx, service.StartCallInput{
 		WorkspaceID: command.WorkspaceID, RequestID: command.RequestID,
 		CallerID: command.CallerID, CalleeID: command.CalleeID, Type: command.Type,
@@ -20,8 +22,8 @@ func (a *callHandlerAdapter) StartCall(ctx context.Context, command ws.StartCall
 	})
 }
 
-func (a *callHandlerAdapter) RenewCallPresence(ctx context.Context, workspaceID, actorID, callID string) error {
-	return a.service.Presence(ctx, workspaceID, actorID, callID)
+func (a *callHandlerAdapter) RenewCallPresence(ctx context.Context, workspaceID, actorID, callID, participationID string) error {
+	return a.service.Presence(ctx, workspaceID, actorID, callID, participationID)
 }
 
 func (a *callHandlerAdapter) TransitionCall(ctx context.Context, workspaceID, actorID, callID string, action ws.ClientMessageType) (domain.Call, error) {
@@ -43,8 +45,19 @@ func (a *callHandlerAdapter) CurrentCall(ctx context.Context, workspaceID, actor
 	return a.service.Current(ctx, workspaceID, actorID, callID)
 }
 
-func (a *callHandlerAdapter) LeaveCall(ctx context.Context, workspaceID, actorID, callID string) (domain.Call, error) {
-	return a.service.Leave(ctx, workspaceID, actorID, callID)
+func (a *callHandlerAdapter) LeaveCall(ctx context.Context, workspaceID, actorID, callID, participationID string) (domain.Call, bool, error) {
+	return a.service.Leave(ctx, workspaceID, actorID, callID, participationID)
+}
+
+func (a *callHandlerAdapter) ResourceSync(ctx context.Context, workspaceID, actorID string, targetType ws.TargetType, targetID string) (domain.Call, bool, time.Time, error) {
+	return a.service.ResourceSync(ctx, workspaceID, actorID, domain.CallTargetType(targetType), targetID)
+}
+
+func (a *callHandlerAdapter) JoinCall(ctx context.Context, workspaceID, actorID, callID string, targetType ws.TargetType, targetID string) (domain.Call, string, error) {
+	return a.service.Join(ctx, service.JoinCallInput{
+		WorkspaceID: workspaceID, ActorID: actorID, CallID: callID,
+		TargetType: domain.CallTargetType(targetType), TargetID: targetID,
+	})
 }
 
 func runCallExpiryWorker(ctx context.Context, calls *service.CallService, logger *slog.Logger) {

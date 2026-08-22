@@ -127,6 +127,25 @@
   gap: 4px;
 }
 
+/* RF-24/#622 round 2: the channel/group-DM resource call indicator + join
+   action. No participant count is ever shown here, by design. */
+.chat-msg-area__call-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-msg-area__call-status {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-msg-area__call-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .chat-msg-area__header-btn {
   display: inline-flex;
   align-items: center;

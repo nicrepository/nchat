@@ -50,7 +50,32 @@ const (
 	pgCallActive              = "96000000-0000-4000-8000-000000000001"
 	pgCallRinging             = "96000000-0000-4000-8000-000000000002"
 	pgCallNonParticipant      = "96000000-0000-4000-8000-000000000003"
-	pgMissingResource         = "99000000-0000-4000-8000-000000000001"
+	// Resource (channel/group-DM) call token fixtures (issue #622/#609): a
+	// resource call now requires a live chat.call_participant_leases row in
+	// addition to membership/visibility. Each scenario needs its own target
+	// (chat.calls has at most one active row per workspace+target_type+
+	// target_id — calls_one_active_resource_idx), so each lease state below
+	// gets its own private channel/group-DM, all with pgUserActive as a
+	// member, mirroring pgChannelAllowed/pgDMAllowed exactly.
+	pgChannelWithLease    = "94000000-0000-4000-8000-000000000005"
+	pgChannelNoLease      = "94000000-0000-4000-8000-000000000006"
+	pgChannelExpiredLease = "94000000-0000-4000-8000-000000000007"
+	pgChannelOthersLease  = "94000000-0000-4000-8000-000000000008"
+	pgDMWithLease         = "95000000-0000-4000-8000-000000000005"
+	pgDMNoLease           = "95000000-0000-4000-8000-000000000006"
+
+	pgResourceCallChannelWithLease    = "96000000-0000-4000-8000-000000000004"
+	pgResourceCallChannelNoLease      = "96000000-0000-4000-8000-000000000005"
+	pgResourceCallChannelExpiredLease = "96000000-0000-4000-8000-000000000006"
+	pgResourceCallChannelOthersLease  = "96000000-0000-4000-8000-000000000007"
+	pgResourceCallDMWithLease         = "96000000-0000-4000-8000-000000000008"
+	pgResourceCallDMNoLease           = "96000000-0000-4000-8000-000000000009"
+	pgParticipationChannelCurrent     = "97000000-0000-4000-8000-000000000001"
+	pgParticipationChannelStale       = "97000000-0000-4000-8000-000000000002"
+	pgParticipationDMCurrent          = "97000000-0000-4000-8000-000000000003"
+	pgParticipationExpired            = "97000000-0000-4000-8000-000000000004"
+	pgParticipationOtherUser          = "97000000-0000-4000-8000-000000000005"
+	pgMissingResource                 = "99000000-0000-4000-8000-000000000001"
 )
 
 func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
@@ -88,12 +113,13 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 	authorizer := NewPGXResourceAuthorizer(pool)
 
 	tests := []struct {
-		name       string
-		kind       domain.ResourceKind
-		resourceID string
-		userID     string
-		sessionID  string
-		wantID     string
+		name            string
+		kind            domain.ResourceKind
+		resourceID      string
+		userID          string
+		sessionID       string
+		participationID string
+		wantID          string
 		// nil means "don't care about display name" for this row — never
 		// used for the three precedence rows below, where "" (both empty)
 		// is itself the assertion and must not be skipped.
@@ -114,6 +140,18 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 		{name: "active call participant allowed", kind: domain.ResourceKindCall, resourceID: pgCallActive, userID: pgUserActive, sessionID: pgSessionActive, wantID: pgCallActive},
 		{name: "ringing call denied", kind: domain.ResourceKindCall, resourceID: pgCallRinging, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "active call nonparticipant denied", kind: domain.ResourceKindCall, resourceID: pgCallNonParticipant, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		// issue #622/#609: resource call token authorization now requires a
+		// live participant lease, on top of membership/visibility.
+		{name: "channel call current fence allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelCurrent, wantID: pgResourceCallChannelWithLease},
+		{name: "channel call stale fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelStale, wantErr: domain.ErrNotFound},
+		{name: "channel call missing fence cannot use fenced lease", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "channel call wrong-call fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationDMCurrent, wantErr: domain.ErrNotFound},
+		{name: "channel call + membership + no lease denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelNoLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
+		{name: "channel call + expired current fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelExpiredLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationExpired, wantErr: domain.ErrNotFound},
+		{name: "channel call + fence belongs to another user denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallChannelOthersLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationOtherUser, wantErr: domain.ErrNotFound},
+		{name: "group DM call current fence allowed", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationDMCurrent, wantID: pgResourceCallDMWithLease},
+		{name: "group DM call stale fence denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMWithLease, userID: pgUserActive, sessionID: pgSessionActive, participationID: pgParticipationChannelCurrent, wantErr: domain.ErrNotFound},
+		{name: "group DM call + membership + no lease denied", kind: domain.ResourceKindCall, resourceID: pgResourceCallDMNoLease, userID: pgUserActive, sessionID: pgSessionActive, wantErr: domain.ErrNotFound},
 		{name: "revoked session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionRevoked, wantErr: domain.ErrUnauthorized},
 		{name: "idle expired session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionIdleExpired, wantErr: domain.ErrUnauthorized},
 		{name: "absolute expired session unauthorized", kind: domain.ResourceKindChannel, resourceID: pgChannelAllowed, userID: pgUserActive, sessionID: pgSessionAbsolute, wantErr: domain.ErrUnauthorized},
@@ -133,6 +171,7 @@ func TestPGXResourceAuthorizerPostgreSQLPredicates(t *testing.T) {
 			result, err := authorizer.Authorize(context.Background(), service.AuthorizationInput{
 				Kind: tt.kind, ResourceID: tt.resourceID,
 				UserID: tt.userID, SessionID: tt.sessionID,
+				ParticipationID: tt.participationID,
 			})
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -180,6 +219,20 @@ func resetAndMigrateMediaSchemas(t *testing.T, ctx context.Context, conn *pgx.Co
 		{domain: "chat", name: "000002_chat_enforce_channel_workspace_isolation.up.sql"},
 		{domain: "chat", name: "000003_chat_dm_conversations.up.sql"},
 		{domain: "chat", name: "000019_call_lifecycle.up.sql"},
+		// chat.channel_visible_to_user, which every channel/resource-call
+		// authorization query in this file depends on, is (re)defined here
+		// as a CREATE OR REPLACE — it needs no other migration between this
+		// one and 000003 above.
+		{domain: "chat", name: "000022_workspace_moderator_and_guest_channel_scope.up.sql"},
+		// issue #622/#609: chat.calls.target_type/target_id and
+		// chat.call_participant_leases (the resource-call token's lease
+		// requirement) were both added here. Without this migration, every
+		// resource-call fixture and the authorization query itself
+		// (callAuthorizationQuery references c.target_type and
+		// chat.call_participant_leases) would fail against a schema that
+		// simply does not have those columns/tables yet.
+		{domain: "chat", name: "000028_resource_call_lifecycle.up.sql"},
+		{domain: "chat", name: "000035_call_participant_lease_identity.up.sql"},
 	} {
 		if _, err := conn.Exec(ctx, readRepositoryMigration(t, migration.domain, migration.name)); err != nil {
 			t.Fatalf("apply %s/%s: %v", migration.domain, migration.name, err)
@@ -235,7 +288,14 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('94000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', 'allowed', 'Allowed', 'private', 'active', false),
 			('94000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', 'hidden', 'Hidden', 'private', 'active', false),
 			('94000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'cross', 'Cross', 'public', 'active', false),
-			('94000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'archived', 'Archived', 'private', 'archived', false);
+			('94000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'archived', 'Archived', 'private', 'archived', false),
+			-- issue #622/#609: one private channel per resource-call lease
+			-- scenario below — each needs its own target (calls_one_active_
+			-- resource_idx allows only one active call per target).
+			('94000000-0000-4000-8000-000000000005', '93000000-0000-4000-8000-000000000001', 'with-lease', 'With Lease', 'private', 'active', false),
+			('94000000-0000-4000-8000-000000000006', '93000000-0000-4000-8000-000000000001', 'no-lease', 'No Lease', 'private', 'active', false),
+			('94000000-0000-4000-8000-000000000007', '93000000-0000-4000-8000-000000000001', 'expired-lease', 'Expired Lease', 'private', 'active', false),
+			('94000000-0000-4000-8000-000000000008', '93000000-0000-4000-8000-000000000001', 'others-lease', 'Others Lease', 'private', 'active', false);
 		INSERT INTO chat.workspace_members (workspace_id, user_id, status) VALUES
 			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', 'active'),
 			('93000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'active'),
@@ -247,13 +307,20 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 		INSERT INTO chat.channel_members (channel_id, user_id) VALUES
 			('94000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
 			('94000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000003'),
-			('94000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001');
+			('94000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001'),
+			('94000000-0000-4000-8000-000000000005', '91000000-0000-4000-8000-000000000001'),
+			('94000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001'),
+			('94000000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000001'),
+			('94000000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001');
 
 		INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by, direct_pair_key) VALUES
 			('95000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000001', NULL),
 			('95000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
 			('95000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000002', 'group', 'active', '91000000-0000-4000-8000-000000000002', NULL),
-			('95000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'direct', 'active', '91000000-0000-4000-8000-000000000001', '2:1-user:2:2-user');
+			('95000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', 'direct', 'active', '91000000-0000-4000-8000-000000000001', '2:1-user:2:2-user'),
+			-- issue #622/#609: one group DM per resource-call lease scenario.
+			('95000000-0000-4000-8000-000000000005', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000001', NULL),
+			('95000000-0000-4000-8000-000000000006', '93000000-0000-4000-8000-000000000001', 'group', 'active', '91000000-0000-4000-8000-000000000001', NULL);
 		INSERT INTO chat.dm_members (conversation_id, user_id) VALUES
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001'),
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000004'),
@@ -261,11 +328,30 @@ func seedAuthorizerFixtures(t *testing.T, ctx context.Context, conn *pgx.Conn) {
 			('95000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000006'),
 			('95000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000002'),
 			('95000000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000001'),
-			('95000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001');
-		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, call_type, status, expires_at) VALUES
-			('96000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'video', 'active', now() + interval '30 seconds'),
-			('96000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'audio', 'ringing', now() + interval '30 seconds'),
-			('96000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000003', 'audio', 'active', now() + interval '30 seconds');
+			('95000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001'),
+			('95000000-0000-4000-8000-000000000005', '91000000-0000-4000-8000-000000000001'),
+			('95000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001');
+		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, target_type, target_id, call_type, status, expires_at) VALUES
+			('96000000-0000-4000-8000-000000000001', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'user', '91000000-0000-4000-8000-000000000002', 'video', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000002', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000001', '91000000-0000-4000-8000-000000000002', 'user', '91000000-0000-4000-8000-000000000002', 'audio', 'ringing', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000003', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000003', '91000000-0000-4000-8000-000000000002', '91000000-0000-4000-8000-000000000003', 'user', '91000000-0000-4000-8000-000000000003', 'audio', 'active', now() + interval '30 seconds');
+
+		-- issue #622/#609: resource (channel/group-DM) call token fixtures —
+		-- each call row pairs with the lease state its scenario needs, on
+		-- its own dedicated target.
+		INSERT INTO chat.calls (id, workspace_id, request_id, caller_id, callee_id, target_type, target_id, call_type, status, expires_at) VALUES
+			('96000000-0000-4000-8000-000000000004', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001', NULL, 'channel', '94000000-0000-4000-8000-000000000005', 'audio', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000005', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000005', '91000000-0000-4000-8000-000000000001', NULL, 'channel', '94000000-0000-4000-8000-000000000006', 'audio', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000006', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001', NULL, 'channel', '94000000-0000-4000-8000-000000000007', 'audio', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000007', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000001', NULL, 'channel', '94000000-0000-4000-8000-000000000008', 'audio', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000008', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001', NULL, 'dm', '95000000-0000-4000-8000-000000000005', 'audio', 'active', now() + interval '30 seconds'),
+			('96000000-0000-4000-8000-000000000009', '93000000-0000-4000-8000-000000000001', '96100000-0000-4000-8000-000000000009', '91000000-0000-4000-8000-000000000001', NULL, 'dm', '95000000-0000-4000-8000-000000000006', 'audio', 'active', now() + interval '30 seconds');
+
+		INSERT INTO chat.call_participant_leases (call_id, user_id, expires_at, participation_id) VALUES
+			('96000000-0000-4000-8000-000000000004', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000001'),
+			('96000000-0000-4000-8000-000000000006', '91000000-0000-4000-8000-000000000001', now() - interval '1 minute', '97000000-0000-4000-8000-000000000004'),
+			('96000000-0000-4000-8000-000000000007', '91000000-0000-4000-8000-000000000002', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000005'),
+			('96000000-0000-4000-8000-000000000008', '91000000-0000-4000-8000-000000000001', now() + interval '30 minutes', '97000000-0000-4000-8000-000000000003');
 		COMMIT;
 	`)
 	if err != nil {

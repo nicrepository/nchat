@@ -136,7 +136,7 @@ func TestPGXCallStoreResourceVsResourceConcurrentJoinsSerializePerActorPostgreSQ
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+			call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 				WorkspaceID: singlePGWorkspace,
 				RequestID:   requestIDs[i],
 				CallerID:    singlePGActor,
@@ -219,7 +219,7 @@ func TestPGXCallStoreDirectVsResourceConcurrentAdmissionSerializesPostgreSQL(t *
 	go func() {
 		defer wg.Done()
 		<-start
-		_, _, resourceErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		_, _, _, resourceErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: singlePGWorkspace,
 			RequestID:   "c6090000-0000-4000-8000-0000000002a2",
 			CallerID:    singlePGActor,
@@ -285,7 +285,7 @@ func TestPGXCallStoreLeaveThenImmediateResourceJoinNeverWaitsForTTLPostgreSQL(t 
 	ctx := t.Context()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, participationX, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000003a1",
 		CallerID:    singlePGActor,
@@ -300,11 +300,12 @@ func TestPGXCallStoreLeaveThenImmediateResourceJoinNeverWaitsForTTLPostgreSQL(t 
 
 	if _, err := store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
 		WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
+		ParticipationID: participationX,
 	}); err != nil {
 		t.Fatalf("actor leaves X: %v", err)
 	}
 
-	callY, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callY, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000003a2",
 		CallerID:    singlePGActor,
@@ -333,7 +334,7 @@ func TestPGXCallStoreConcurrentLeaveXThenJoinYSerializesPerActorPostgreSQL(t *te
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, participationX, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000003b1",
 		CallerID:    singlePGActor,
@@ -363,6 +364,7 @@ func TestPGXCallStoreConcurrentLeaveXThenJoinYSerializesPerActorPostgreSQL(t *te
 	go func() {
 		result, err := store.LeaveResourceCall(ctx, storage.LeaveResourceCallInput{
 			WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
+			ParticipationID: participationX,
 		})
 		leaveDone <- leaveOutcome{result: result, err: err}
 	}()
@@ -374,7 +376,7 @@ func TestPGXCallStoreConcurrentLeaveXThenJoinYSerializesPerActorPostgreSQL(t *te
 	}
 	joinDone := make(chan joinOutcome, 1)
 	go func() {
-		call, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: singlePGWorkspace,
 			RequestID:   "c6090000-0000-4000-8000-0000000003b2",
 			CallerID:    singlePGActor,
@@ -438,7 +440,7 @@ func TestPGXCallStoreExpiredResourceLeaseNeverBlocksAnotherResourceJoinPostgreSQ
 	ctx := t.Context()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000004a1",
 		CallerID:    singlePGActor,
@@ -457,7 +459,7 @@ func TestPGXCallStoreExpiredResourceLeaseNeverBlocksAnotherResourceJoinPostgreSQ
 		t.Fatalf("expire X's lease: %v", err)
 	}
 
-	callY, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callY, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000004a2",
 		CallerID:    singlePGActor,
@@ -485,7 +487,7 @@ func TestPGXCallStoreSameResourceRejoinNeverBusyPostgreSQL(t *testing.T) {
 	ctx := t.Context()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	first, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	first, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000005a1",
 		CallerID:    singlePGActor,
@@ -498,7 +500,7 @@ func TestPGXCallStoreSameResourceRejoinNeverBusyPostgreSQL(t *testing.T) {
 		t.Fatalf("actor joins X: %v", err)
 	}
 
-	rejoin, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	rejoin, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000005a2",
 		CallerID:    singlePGActor,
@@ -516,7 +518,7 @@ func TestPGXCallStoreSameResourceRejoinNeverBusyPostgreSQL(t *testing.T) {
 	if got := countActorLiveLeases(t, pool, singlePGActor); got != 1 {
 		t.Fatalf("actor live leases after rejoin = %d, want 1", got)
 	}
-	if _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	if _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000005a3",
 		CallerID:    singlePGActor,
@@ -538,7 +540,7 @@ func TestPGXCallStoreActiveResourceBlocksFreshDirectStartPostgreSQL(t *testing.T
 	ctx := t.Context()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	if _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	if _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000006a1",
 		CallerID:    singlePGActor,
@@ -584,7 +586,7 @@ func TestPGXCallStoreRingingDirectBlocksResourceJoinPostgreSQL(t *testing.T) {
 		t.Fatalf("actor starts ringing direct call: %v", err)
 	}
 
-	_, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	_, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace,
 		RequestID:   "c6090000-0000-4000-8000-0000000007a2",
 		CallerID:    singlePGActor,
@@ -623,7 +625,7 @@ func TestPGXCallStoreActiveDirectBlocksResourceJoinPostgreSQL(t *testing.T) {
 		t.Fatalf("accept direct call: %v", err)
 	}
 
-	_, _, err = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	_, _, _, err = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000007b2",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -671,7 +673,7 @@ func TestPGXCallStoreExpiredResourceLeaseDoesNotBlockDirectPostgreSQL(t *testing
 	ctx := t.Context()
 	expiresAt := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000009a1",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -721,7 +723,7 @@ func TestPGXCallStoreEndedDirectCallDoesNotBlockResourceAdmissionPostgreSQL(t *t
 	}); err != nil {
 		t.Fatalf("end direct: %v", err)
 	}
-	if _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	if _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000009b2",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -736,7 +738,7 @@ func TestPGXCallStorePresenceCannotResurrectOldParticipationPostgreSQL(t *testin
 	ctx := t.Context()
 	expiresAt := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, participationX, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000010a1",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -750,7 +752,7 @@ func TestPGXCallStorePresenceCannotResurrectOldParticipationPostgreSQL(t *testin
 	); err != nil {
 		t.Fatalf("expire X lease: %v", err)
 	}
-	callY, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callY, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000010a2",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelY,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -761,7 +763,8 @@ func TestPGXCallStorePresenceCannotResurrectOldParticipationPostgreSQL(t *testin
 
 	err = store.RenewCallPresence(ctx, storage.RenewCallPresenceInput{
 		WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
-		ExpiresAt: expiresAt.Add(30 * time.Second),
+		ParticipationID: participationX,
+		ExpiresAt:       expiresAt.Add(30 * time.Second),
 	})
 	if !errors.Is(err, domain.ErrCallParticipantBusy) {
 		t.Fatalf("stale X presence error = %v, want participant-busy", err)
@@ -783,7 +786,7 @@ func TestPGXCallStoreSameCallExpiredPresenceCanRenewPostgreSQL(t *testing.T) {
 	ctx := t.Context()
 	expiresAt := time.Now().UTC().Add(30 * time.Second)
 
-	callX, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	callX, _, participationX, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: singlePGWorkspace, RequestID: "c6090000-0000-4000-8000-0000000010b1",
 		CallerID: singlePGActor, TargetType: domain.CallTargetChannel, TargetID: singlePGChannelX,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -799,7 +802,8 @@ func TestPGXCallStoreSameCallExpiredPresenceCanRenewPostgreSQL(t *testing.T) {
 	}
 	if err := store.RenewCallPresence(ctx, storage.RenewCallPresenceInput{
 		WorkspaceID: singlePGWorkspace, CallID: callX.ID, ActorID: singlePGActor,
-		ExpiresAt: expiresAt.Add(30 * time.Second),
+		ParticipationID: participationX,
+		ExpiresAt:       expiresAt.Add(30 * time.Second),
 	}); err != nil {
 		t.Fatalf("renew same-call presence: %v", err)
 	}

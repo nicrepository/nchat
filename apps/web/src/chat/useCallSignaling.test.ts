@@ -71,10 +71,10 @@ class FakeWebSocket {
       const callID = message.call_id;
       queueMicrotask(() => {
         this.simulateMessage({
-          type: "call.ended",
-          event_id: `call-leave-ack-${callID}`,
-          target_type: "channel",
-          target_id: "00000000-0000-4000-8000-000000000710",
+          type: "call.left",
+          operation: "call.leave",
+          response_to: message.request_id,
+          released: true,
           call: {
             call_id: callID,
             request_id: "00000000-0000-4000-8000-000000000712",
@@ -2843,6 +2843,52 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       callId: "00000000-0000-4000-8000-000000000711",
     };
 
+    // channelTarget already carries a known callId, so join() takes the
+    // obligatory call.join admission path (issue #622 round 2) — it
+    // resolves solely on this requester's own call.admitted, correlated by
+    // response_to, never on a call.accepted broadcast. join() is fired
+    // without being awaited directly (mirroring the real click-handler
+    // callers), so the test can observe the sent command and answer it
+    // before the promise chain (token issuance, media.connect) proceeds.
+    async function joinResourceChannel(
+      view: ReturnType<typeof resourceCallHarness>["view"],
+      socket: FakeWebSocket,
+    ) {
+      act(() => {
+        void view.result.current.resourceCall.join(channelTarget);
+      });
+      let requestID = "";
+      await waitFor(() => {
+        const command = sentMessages(socket).find(
+          (message) => message.type === "call.join" && typeof message.request_id === "string",
+        );
+        expect(command).toBeDefined();
+        requestID = command!.request_id as string;
+      });
+      act(() =>
+        socket.simulateMessage({
+          type: "call.admitted",
+          operation: "call.join",
+          response_to: requestID,
+          participation_id: "00000000-0000-4000-8000-000000000712",
+          call: {
+            call_id: channelTarget.callId,
+            request_id: requestID,
+            caller_id: baseCall.caller_id,
+            callee_id: "",
+            target_type: channelTarget.kind,
+            target_id: channelTarget.id,
+            call_type: "audio",
+            status: "active",
+            version: 1,
+            created_at: "2026-08-21T00:00:00Z",
+            occurred_at: "2026-08-21T00:00:00Z",
+            expires_at: "2026-08-21T00:01:00Z",
+          },
+        }),
+      );
+    }
+
     async function driveCallToActive(
       view: { result: { current: { calls: ReturnType<typeof useCallSignaling> } } },
       socket: FakeWebSocket,
@@ -2869,11 +2915,11 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       // resource room's own startAudio() call actually reaches the Room
       // instead of only queuing the import.
       await act(() => view.result.current.media.prepare());
-      await act(() => view.result.current.resourceCall.join(channelTarget));
-      expect(rooms).toHaveLength(1);
+      await joinResourceChannel(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(1));
       const roomA = rooms[0];
-      expect(roomA.connect).toHaveBeenCalledOnce();
-      expect(roomA.startAudio).toHaveBeenCalledOnce();
+      await waitFor(() => expect(roomA.connect).toHaveBeenCalledOnce());
+      await waitFor(() => expect(roomA.startAudio).toHaveBeenCalledOnce());
 
       await driveCallToActive(view, socket);
 
@@ -2897,7 +2943,8 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       });
       const socket = FakeWebSocket.instances[0];
       act(() => socket.simulateOpen());
-      await act(() => view.result.current.resourceCall.join(channelTarget));
+      await joinResourceChannel(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(1));
 
       await driveCallToActive(view, socket);
       await waitFor(() => expect(rooms).toHaveLength(2));
@@ -2913,7 +2960,8 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       const socket = FakeWebSocket.instances[0];
       act(() => socket.simulateOpen());
 
-      await act(() => view.result.current.resourceCall.join(channelTarget));
+      await joinResourceChannel(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(1));
       const roomA = rooms[0];
       vi.mocked(issueCallToken).mockClear();
       roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
@@ -2940,7 +2988,8 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       const socket = FakeWebSocket.instances[0];
       act(() => socket.simulateOpen());
 
-      await act(() => view.result.current.resourceCall.join(channelTarget));
+      await joinResourceChannel(view, socket);
+      await waitFor(() => expect(rooms).toHaveLength(1));
       const roomA = rooms[0];
       roomA.disconnect.mockRejectedValueOnce(new Error("disconnect failed"));
 

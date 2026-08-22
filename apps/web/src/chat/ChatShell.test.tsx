@@ -50,10 +50,10 @@ class FakeWebSocket {
       const callID = message.call_id;
       queueMicrotask(() => {
         this.simulateMessage({
-          type: "call.ended",
-          event_id: `call-leave-ack-${callID}`,
-          target_type: "channel",
-          target_id: "chan-1",
+          type: "call.left",
+          operation: "call.leave",
+          response_to: message.request_id,
+          released: true,
           call: {
             ...call,
             call_id: callID,
@@ -486,12 +486,16 @@ async function joinResource(user: ReturnType<typeof userEvent.setup>, socket: Fa
     expect(command).toBeDefined();
     requestID = command!.request_id!;
   });
+  // Issue #622 round 2: startResourceCall resolves solely on this
+  // requester's own call.admitted, correlated by response_to — never on a
+  // call.accepted broadcast matched by request_id (the historical bug this
+  // issue fixed).
   act(() =>
     socket.simulateMessage({
-      type: "call.accepted",
-      event_id: crypto.randomUUID(),
-      target_type: "channel",
-      target_id: "chan-1",
+      type: "call.admitted",
+      operation: "call.start",
+      response_to: requestID,
+      participation_id: "00000000-0000-4000-8000-000000000709",
       call: {
         ...call,
         call_id: "00000000-0000-4000-8000-000000000550",
