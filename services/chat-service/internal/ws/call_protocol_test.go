@@ -30,7 +30,6 @@ type fakeCallHandler struct {
 	syncCallID              string
 	leaveActorID            string
 	leaveCallID             string
-	resourceSyncID          string
 	found                   bool
 	observedAt              time.Time
 	joinCallID              string
