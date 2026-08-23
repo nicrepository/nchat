@@ -163,6 +163,7 @@ beforeEach(() => {
     remoteScreenShare: null,
     bindLocalMedia: vi.fn(),
     bindRemoteMedia: vi.fn(),
+    bindLocalScreenShare: vi.fn(),
     participants: [],
     bindRemoteAudio: vi.fn(),
     toggleMicrophone: vi.fn(async () => undefined),

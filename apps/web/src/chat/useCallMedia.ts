@@ -62,6 +62,10 @@ export interface CallMediaController {
   remoteScreenShare: RemoteScreenShare | null;
   bindLocalMedia: RefCallback<HTMLDivElement>;
   bindRemoteMedia: RefCallback<HTMLDivElement>;
+  // Local screen-share preview only — deliberately separate from
+  // bindLocalMedia (camera). Only ever has content once an attached local
+  // screen-share element exists (see screenShareEnabled).
+  bindLocalScreenShare: RefCallback<HTMLDivElement>;
   // RF-24 grid API. Populated from the same event stream as the legacy
   // fields above but kept independent: a resource room never touches
   // bindRemoteMedia's flat container, and a direct call never touches these.
@@ -188,9 +192,25 @@ export function useCallMedia(
   const participantsMapRef = useRef(new Map<string, ParticipantMediaEntry>());
   const participantOrderRef = useRef<string[]>([]);
   const participantBindRef = useRef(new Map<string, RefCallback<HTMLDivElement>>());
-  const remoteScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
+  const localScreenShareContainerRef = useRef<HTMLDivElement | null>(null);
+  const localScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
+  // Registry of every currently-active remote screen-share publication,
+  // keyed by LiveKit trackSid (never participant identity alone — the same
+  // participant can unpublish and republish, producing a new trackSid before
+  // the old publication's removal event arrives). trackSid alone is still
+  // not enough to key a REMOVAL safely — see onRemoteScreenShareChanged's
+  // own comment below — so every entry's stored element is compared against
+  // the removal's element before anything is deleted. remoteScreenShareOrderRef
+  // is start order (oldest -> newest); the "presented" share is the last
+  // (most recently started) entry still in the registry (issue #611 policy:
+  // most-recently-started-among-active, falling back to the next most
+  // recent when the presented one ends).
+  const remoteScreenSharesRef = useRef(
+    new Map<string, { identity: string; element: HTMLMediaElement }>(),
+  );
+  const remoteScreenShareOrderRef = useRef<string[]>([]);
   const remoteScreenShareContainerRef = useRef<HTMLDivElement | null>(null);
-  const remoteScreenShareIdentityRef = useRef<string | null>(null);
+  const presentedRemoteScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
 
   const update = useCallback((patch: Partial<MediaState>) => {
     if (mountedRef.current) setState((current) => ({ ...current, ...patch }));
@@ -210,21 +230,56 @@ export function useCallMedia(
     participantsMapRef.current.clear();
     participantOrderRef.current = [];
     participantBindRef.current.clear();
-    remoteScreenShareElementRef.current?.remove();
-    remoteScreenShareElementRef.current = null;
+    localScreenShareElementRef.current?.remove();
+    localScreenShareElementRef.current = null;
+    localScreenShareContainerRef.current?.replaceChildren();
+    for (const entry of remoteScreenSharesRef.current.values()) entry.element.remove();
+    remoteScreenSharesRef.current.clear();
+    remoteScreenShareOrderRef.current = [];
+    presentedRemoteScreenShareElementRef.current = null;
     remoteScreenShareContainerRef.current?.replaceChildren();
-    remoteScreenShareIdentityRef.current = null;
     if (speakerTimerRef.current !== null) clearTimeout(speakerTimerRef.current);
     speakerTimerRef.current = null;
     speakerStateRef.current = null;
   }, []);
 
-  const bindRemoteScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
-    remoteScreenShareContainerRef.current = element;
-    if (element && remoteScreenShareElementRef.current) {
-      element.replaceChildren(remoteScreenShareElementRef.current);
+  const bindLocalScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    localScreenShareContainerRef.current = element;
+    if (element && localScreenShareElementRef.current) {
+      element.replaceChildren(localScreenShareElementRef.current);
     }
   }, []);
+
+  const bindRemoteScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    remoteScreenShareContainerRef.current = element;
+    if (element && presentedRemoteScreenShareElementRef.current) {
+      element.replaceChildren(presentedRemoteScreenShareElementRef.current);
+    }
+  }, []);
+
+  // Derives which registry entry is "presented" (the most recently started
+  // entry still active — last in remoteScreenShareOrderRef) and rebinds the
+  // container/React state only when the presented element actually changed,
+  // so an add/remove of some OTHER (non-presented) share never touches the
+  // visible tile.
+  const syncPresentedRemoteScreenShare = useCallback(() => {
+    const order = remoteScreenShareOrderRef.current;
+    const presentedTrackSid = order.length > 0 ? order[order.length - 1] : undefined;
+    const presented = presentedTrackSid
+      ? remoteScreenSharesRef.current.get(presentedTrackSid)
+      : undefined;
+    const presentedElement = presented?.element ?? null;
+    if (presentedRemoteScreenShareElementRef.current === presentedElement) return;
+    presentedRemoteScreenShareElementRef.current = presentedElement;
+    remoteScreenShareContainerRef.current?.replaceChildren(
+      ...(presentedElement ? [presentedElement] : []),
+    );
+    update({
+      remoteScreenShare: presented
+        ? { identity: presented.identity, bindMedia: bindRemoteScreenShare }
+        : null,
+    });
+  }, [bindRemoteScreenShare, update]);
 
   const bindVideoFor = useCallback((identity: string): RefCallback<HTMLDivElement> => {
     let bind = participantBindRef.current.get(identity);
@@ -378,11 +433,6 @@ export function useCallMedia(
           }
           remoteElementsRef.current.delete(element);
           remoteAudioElementsRef.current.delete(element);
-          if (remoteScreenShareElementRef.current === element) {
-            remoteScreenShareElementRef.current = null;
-            remoteScreenShareIdentityRef.current = null;
-            update({ remoteScreenShare: null });
-          }
           element.remove();
           syncRemoteState();
 
@@ -503,29 +553,55 @@ export function useCallMedia(
           screenShareEnabledRef.current = enabled;
           update({ screenShareEnabled: enabled });
         },
-        onRemoteScreenShareChanged(identity, element) {
+        onLocalScreenShareChanged(element) {
           if (!current()) return;
           if (!element) {
-            if (remoteScreenShareIdentityRef.current !== identity) return;
-            remoteScreenShareElementRef.current = null;
-            remoteScreenShareIdentityRef.current = null;
-            remoteScreenShareContainerRef.current?.replaceChildren();
-            update({ remoteScreenShare: null });
+            localScreenShareElementRef.current?.remove();
+            localScreenShareElementRef.current = null;
+            localScreenShareContainerRef.current?.replaceChildren();
             return;
           }
-          remoteScreenShareElementRef.current = element;
-          remoteScreenShareIdentityRef.current = identity;
-          remoteScreenShareContainerRef.current?.replaceChildren(element);
-          update({ remoteScreenShare: { identity, bindMedia: bindRemoteScreenShare } });
+          localScreenShareElementRef.current = element;
+          localScreenShareContainerRef.current?.replaceChildren(element);
+        },
+        onRemoteScreenShareChanged(identity, trackSid, element, active) {
+          if (!current()) return;
+          if (!active) {
+            // trackSid alone is NOT sufficient to key a removal safely: the
+            // adapter can in principle carry the same trackSid across two
+            // distinct subscription instances (a rebind/replay around
+            // reconnect can deliver a new element for an already-known
+            // trackSid before the OLD instance's own stale removal arrives).
+            // A removal must only ever delete the entry it is actually
+            // about — verified by comparing the exact element, never by
+            // trackSid/identity alone — so a stale removal for an instance
+            // already superseded by a newer add can never clear the newer
+            // one.
+            const existing = remoteScreenSharesRef.current.get(trackSid);
+            if (!existing || existing.element !== element) return;
+            remoteScreenSharesRef.current.delete(trackSid);
+            remoteScreenShareOrderRef.current = remoteScreenShareOrderRef.current.filter(
+              (sid) => sid !== trackSid,
+            );
+            syncPresentedRemoteScreenShare();
+            return;
+          }
+          // A replay of an already-known trackSid overwrites the entry in
+          // place without moving its start-order position.
+          if (!remoteScreenSharesRef.current.has(trackSid)) {
+            remoteScreenShareOrderRef.current.push(trackSid);
+          }
+          remoteScreenSharesRef.current.set(trackSid, { identity, element });
+          syncPresentedRemoteScreenShare();
         },
       };
     },
     [
-      bindRemoteScreenShare,
       ensureParticipant,
       invalidateDeadSession,
       removeParticipant,
       syncParticipants,
+      syncPresentedRemoteScreenShare,
       update,
     ],
   );
@@ -939,6 +1015,7 @@ export function useCallMedia(
     ...state,
     bindLocalMedia,
     bindRemoteMedia,
+    bindLocalScreenShare,
     bindRemoteAudio,
     toggleMicrophone,
     toggleCamera,
