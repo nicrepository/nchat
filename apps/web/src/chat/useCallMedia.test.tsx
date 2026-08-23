@@ -1,6 +1,7 @@
 import { act, render, renderHook, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { MediaIntent } from "../calls/callOwnership";
 import type { LiveKitSessionFactory, LiveKitSessionLoader } from "../media/liveKitSession";
 import { useCallMedia } from "./useCallMedia";
 
@@ -84,7 +85,8 @@ function setup(makeLoader?: (factory: LiveKitSessionFactory) => LiveKitSessionLo
           call: Parameters<typeof current.connect>[0],
           token: Parameters<typeof current.connect>[1],
           serverUrl = liveKitServerUrl,
-        ) => current.connect(call, token, serverUrl),
+          initialIntent?: Parameters<typeof current.connect>[3],
+        ) => current.connect(call, token, serverUrl, initialIntent),
       };
     },
   };
@@ -161,6 +163,74 @@ describe("useCallMedia", () => {
     expect(view.getSession().enableCamera).not.toHaveBeenCalled();
     expect(view.getSession().enableMicrophone).toHaveBeenCalledOnce();
     expect(view.result.current.cameraEnabled).toBe(false);
+  });
+
+  describe("recovery connect with a restored media intent (issue #610)", () => {
+    const combos: MediaIntent[] = [
+      { microphone: true, camera: true },
+      { microphone: true, camera: false },
+      { microphone: false, camera: true },
+      { microphone: false, camera: false },
+    ];
+
+    it.each(combos)(
+      "applies the exact restored snapshot %o via the boolean setters, never enable/disable",
+      async (intent) => {
+        const view = setup();
+
+        const applied = await act(() =>
+          view.result.current.connect(videoCall, "participant-token", liveKitServerUrl, intent),
+        );
+
+        const session = view.getSession();
+        expect(session.enableCamera).not.toHaveBeenCalled();
+        expect(session.enableMicrophone).not.toHaveBeenCalled();
+        expect(session.setCameraEnabled).toHaveBeenCalledExactlyOnceWith(intent.camera);
+        expect(session.setMicrophoneEnabled).toHaveBeenCalledExactlyOnceWith(intent.microphone);
+        expect(view.result.current.cameraEnabled).toBe(intent.camera);
+        expect(view.result.current.microphoneEnabled).toBe(intent.microphone);
+        expect(applied).toEqual(intent);
+      },
+    );
+
+    it("resolves undefined when stop() invalidates the attempt before a recovery connect settles", async () => {
+      const loading = deferred<LiveKitSessionFactory>();
+      const view = setup(() => vi.fn(() => loading.promise));
+
+      let connecting!: Promise<MediaIntent | undefined>;
+      act(() => {
+        connecting = view.result.current.connect(videoCall, "participant-token", liveKitServerUrl, {
+          microphone: true,
+          camera: false,
+        });
+      });
+      await act(() => view.result.current.stop());
+      await act(async () => {
+        loading.resolve(view.factory);
+        expect(await connecting).toBeUndefined();
+      });
+
+      expect(view.factory).not.toHaveBeenCalled();
+      expect(view.result.current.status).toBe("idle");
+    });
+
+    it("resolves the fresh-default snapshot when no initialIntent is supplied", async () => {
+      const view = setup();
+      const appliedVideo = await act(() =>
+        view.result.current.connect(videoCall, "participant-token", liveKitServerUrl),
+      );
+      expect(appliedVideo).toEqual({ microphone: true, camera: true });
+
+      const audioView = setup();
+      const appliedAudio = await act(() =>
+        audioView.result.current.connect(
+          { ...videoCall, call_type: "audio" },
+          "participant-token",
+          liveKitServerUrl,
+        ),
+      );
+      expect(appliedAudio).toEqual({ microphone: true, camera: false });
+    });
   });
 
   it("never starts screen share on connect and toggles only from explicit intent", async () => {
@@ -265,8 +335,8 @@ describe("useCallMedia", () => {
         }),
     );
 
-    let first!: Promise<void>;
-    let duplicate!: Promise<void>;
+    let first!: Promise<boolean | undefined>;
+    let duplicate!: Promise<boolean | undefined>;
     act(() => {
       first = view.result.current.toggleMicrophone();
       duplicate = view.result.current.toggleMicrophone();
@@ -281,6 +351,75 @@ describe("useCallMedia", () => {
     expect(session.setCameraEnabled).toHaveBeenCalledExactlyOnceWith(false);
     expect(view.result.current.microphoneEnabled).toBe(false);
     expect(view.result.current.cameraEnabled).toBe(false);
+  });
+
+  describe("toggle result semantics (issue #610)", () => {
+    it("resolves the applied boolean on a normal successful toggle", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+
+      const mic = await act(() => view.result.current.toggleMicrophone());
+      expect(mic).toBe(false);
+      const camera = await act(() => view.result.current.toggleCamera());
+      expect(camera).toBe(false);
+    });
+
+    it("resolves undefined when the SDK rejects the toggle", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      session.setMicrophoneEnabled.mockRejectedValueOnce(new Error("device busy"));
+
+      const mic = await act(() => view.result.current.toggleMicrophone());
+      expect(mic).toBeUndefined();
+      expect(view.result.current.error).not.toBeNull();
+    });
+
+    it("resolves undefined for a stale toggle superseded by stop() before it settles", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const pending = deferred<void>();
+      session.setMicrophoneEnabled.mockImplementationOnce(() => pending.promise);
+
+      let toggle!: Promise<boolean | undefined>;
+      act(() => {
+        toggle = view.result.current.toggleMicrophone();
+      });
+      await act(() => view.result.current.stop());
+      await act(async () => {
+        pending.resolve();
+        expect(await toggle).toBeUndefined();
+      });
+    });
+
+    it("resolves undefined for a duplicate in-flight toggle that never became the pending operation", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      let resolveMicrophone!: () => void;
+      session.setMicrophoneEnabled.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveMicrophone = () => {
+              session.callbacks.onMicrophoneStateChanged(false);
+              resolve();
+            };
+          }),
+      );
+
+      let first!: Promise<boolean | undefined>;
+      let duplicate!: Promise<boolean | undefined>;
+      act(() => {
+        first = view.result.current.toggleMicrophone();
+        duplicate = view.result.current.toggleMicrophone();
+      });
+      await act(async () => {
+        resolveMicrophone();
+        expect(await duplicate).toBeUndefined();
+        expect(await first).toBe(false);
+      });
+    });
   });
 
   it("reports permission denial without exposing the SDK error", async () => {
@@ -601,7 +740,7 @@ describe("useCallMedia", () => {
     const loading = deferred<LiveKitSessionFactory>();
     const view = setup(() => vi.fn(() => loading.promise));
 
-    let connecting!: Promise<void>;
+    let connecting!: Promise<MediaIntent | undefined>;
     act(() => {
       connecting = view.result.current.connect(videoCall, "participant-token");
     });
@@ -619,7 +758,7 @@ describe("useCallMedia", () => {
     const loading = deferred<LiveKitSessionFactory>();
     const view = setup(() => vi.fn(() => loading.promise));
 
-    let connecting!: Promise<void>;
+    let connecting!: Promise<MediaIntent | undefined>;
     act(() => {
       connecting = view.result.current.connect(videoCall, "participant-token");
     });
@@ -637,8 +776,8 @@ describe("useCallMedia", () => {
     await act(() => view.result.current.startAudio());
     view.getSession().connect.mockImplementationOnce(() => connecting.promise);
 
-    let first!: Promise<void>;
-    let duplicate!: Promise<void>;
+    let first!: Promise<MediaIntent | undefined>;
+    let duplicate!: Promise<MediaIntent | undefined>;
     act(() => {
       first = view.result.current.connect(videoCall, "participant-token");
       duplicate = view.result.current.connect(videoCall, "participant-token");
@@ -756,7 +895,7 @@ describe("useCallMedia", () => {
       const toggling = deferred<void>();
       session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
 
-      let toggle!: Promise<void>;
+      let toggle!: Promise<boolean | undefined>;
       act(() => {
         toggle = view.result.current.toggleMicrophone();
       });
@@ -795,7 +934,7 @@ describe("useCallMedia", () => {
       const toggling = deferred<void>();
       sessionA.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
 
-      let staleToggle!: Promise<void>;
+      let staleToggle!: Promise<boolean | undefined>;
       act(() => {
         staleToggle = view.result.current.toggleMicrophone();
       });
@@ -864,7 +1003,7 @@ describe("useCallMedia", () => {
       const toggling = deferred<void>();
       session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
 
-      let toggle!: Promise<void>;
+      let toggle!: Promise<boolean | undefined>;
       act(() => {
         toggle = view.result.current.toggleMicrophone();
       });
@@ -913,7 +1052,7 @@ describe("useCallMedia", () => {
       const togglingA = deferred<void>();
       sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
 
-      let toggleA!: Promise<void>;
+      let toggleA!: Promise<boolean | undefined>;
       act(() => {
         toggleA = view.result.current.toggleMicrophone();
       });
@@ -930,7 +1069,7 @@ describe("useCallMedia", () => {
 
       const togglingB = deferred<void>();
       sessionB.setMicrophoneEnabled.mockReturnValueOnce(togglingB.promise);
-      let toggleB!: Promise<void>;
+      let toggleB!: Promise<boolean | undefined>;
       act(() => {
         toggleB = view.result.current.toggleMicrophone();
       });
@@ -965,7 +1104,7 @@ describe("useCallMedia", () => {
       const togglingA = deferred<void>();
       sessionA.setCameraEnabled.mockReturnValueOnce(togglingA.promise);
 
-      let toggleA!: Promise<void>;
+      let toggleA!: Promise<boolean | undefined>;
       act(() => {
         toggleA = view.result.current.toggleCamera();
       });
@@ -982,7 +1121,7 @@ describe("useCallMedia", () => {
 
       const togglingB = deferred<void>();
       sessionB.setCameraEnabled.mockReturnValueOnce(togglingB.promise);
-      let toggleB!: Promise<void>;
+      let toggleB!: Promise<boolean | undefined>;
       act(() => {
         toggleB = view.result.current.toggleCamera();
       });
@@ -1014,7 +1153,7 @@ describe("useCallMedia", () => {
       const togglingA = deferred<void>();
       sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
 
-      let toggleA!: Promise<void>;
+      let toggleA!: Promise<boolean | undefined>;
       act(() => {
         toggleA = view.result.current.toggleMicrophone();
       });
@@ -1029,7 +1168,7 @@ describe("useCallMedia", () => {
       const sessionB = view.getSession();
       const togglingB = deferred<void>();
       sessionB.setMicrophoneEnabled.mockReturnValueOnce(togglingB.promise);
-      let toggleB!: Promise<void>;
+      let toggleB!: Promise<boolean | undefined>;
       act(() => {
         toggleB = view.result.current.toggleMicrophone();
       });
@@ -1059,7 +1198,7 @@ describe("useCallMedia", () => {
       const toggling = deferred<void>();
       session.setMicrophoneEnabled.mockReturnValueOnce(toggling.promise);
 
-      let toggle!: Promise<void>;
+      let toggle!: Promise<boolean | undefined>;
       act(() => {
         toggle = view.result.current.toggleMicrophone();
       });
@@ -1082,7 +1221,7 @@ describe("useCallMedia", () => {
       const togglingA = deferred<void>();
       sessionA.setMicrophoneEnabled.mockReturnValueOnce(togglingA.promise);
 
-      let toggleA!: Promise<void>;
+      let toggleA!: Promise<boolean | undefined>;
       act(() => {
         toggleA = view.result.current.toggleMicrophone();
       });

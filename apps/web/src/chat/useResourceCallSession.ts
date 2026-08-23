@@ -9,6 +9,7 @@ import {
   startResourceCall,
 } from "./resourceCallSignaling";
 import type { CallMediaBridge } from "./useCallSignaling";
+import type { MediaConnectionMode } from "../calls/callOwnership";
 
 export type ResourceCallStatus = "idle" | "connecting" | "active" | "error";
 export type ResourceCallErrorOperation = "join" | "leave" | null;
@@ -78,8 +79,16 @@ export interface ResourceCallController {
    * before any cross-tab message has a chance to interleave — waiting for
    * this promise to resolve would already be too late.
    */
+  /**
+   * `mode` (issue #610) is explicit, never inferred from `target.callId`: a
+   * user clicking "Chamada"/"Entrar na chamada" for their own participation
+   * is FRESH for media-intent purposes even when the resource call already
+   * exists and `target.callId` is known. Only a dedicated-tab activation/
+   * handoff passes "recovery".
+   */
   join: (
     target: ResourceCallTarget,
+    mode: MediaConnectionMode,
     onCallIdResolved?: (callId: string) => void,
   ) => Promise<string | undefined>;
   /** Reacquires a token and Room after this tab regains ownership. */
@@ -161,9 +170,28 @@ export function useResourceCallSession(
   // then-rejoin-same-target would find this still-cached stale entry and
   // hand back the superseded (soon-to-be-no-op) promise instead of starting
   // a real new attempt.
+  // `mode` (issue #610 audit) is part of the dedup identity, not just
+  // target: `joinResourceParticipation` (always "fresh") and
+  // `activateResourceParticipation` (always "recovery") are both exposed on
+  // the SAME CallSessionContextValue from the SAME useResourceCallSession
+  // instance, and CallSessionProvider stays mounted across an in-tab SPA
+  // route change — role flips from "dedicated" to "main" (or back) on the
+  // very next render, but an ALREADY-STARTED join() promise keeps running.
+  // If a caller navigated away mid-activation and a fresh join() for the
+  // very same target lands while that recovery attempt is still in flight,
+  // deduping on target alone would hand the fresh caller back the
+  // recovery attempt's promise — silently applying the WRONG media preset
+  // (§12: mode belongs to the connection ATTEMPT). Matching on mode too
+  // means a mode-mismatched concurrent call is never merged: it starts a
+  // real new attempt, which supersedes the old one through the EXACT same
+  // attemptGenerationRef/post-admission-compensation machinery already
+  // covering "join() then a same-target rejoin" (see the "a rejoin
+  // superseded by a different target while cleanup is still pending"
+  // test) — no new mechanism, just extending the identity comparison.
   const joinPromiseRef = useRef<{
     generation: number;
     target: ResourceCallTarget;
+    mode: MediaConnectionMode;
     promise: Promise<string | undefined>;
   } | null>(null);
   // A rejoin of the exact same target reuses the exact same ResourceCallTarget
@@ -261,6 +289,7 @@ export function useResourceCallSession(
   const join = useCallback(
     (
       target: ResourceCallTarget,
+      mode: MediaConnectionMode,
       onCallIdResolved?: (callId: string) => void,
     ): Promise<string | undefined> => {
       const previousActive = activeRef.current;
@@ -278,7 +307,8 @@ export function useResourceCallSession(
         pending &&
         pending.generation === attemptGenerationRef.current &&
         pending.target.kind === target.kind &&
-        pending.target.id === target.id
+        pending.target.id === target.id &&
+        pending.mode === mode
       ) {
         // The already-in-flight attempt this dedups into may already have
         // resolved its own callId (synchronously, before its next await) —
@@ -368,6 +398,7 @@ export function useResourceCallSession(
             { call_id: call.call_id, call_type: "audio" },
             result.token,
             result.serverUrl,
+            mode,
           );
           if (attemptGenerationRef.current !== generation) {
             void leaveResourceCall(call.call_id, participationId).catch(() => undefined);
@@ -452,7 +483,7 @@ export function useResourceCallSession(
         setError("Não foi possível entrar na chamada.");
         return undefined;
       });
-      joinPromiseRef.current = { generation, target, promise: attempt };
+      joinPromiseRef.current = { generation, target, mode, promise: attempt };
       void attempt.finally(() => {
         if (joinPromiseRef.current?.promise === attempt) joinPromiseRef.current = null;
       });
@@ -532,6 +563,7 @@ export function useResourceCallSession(
         { call_id: call.call_id, call_type: "audio" },
         result.token,
         result.serverUrl,
+        "recovery",
       );
       if (attemptGenerationRef.current !== generation) {
         void leaveResourceCall(call.call_id, participationId).catch(() => undefined);

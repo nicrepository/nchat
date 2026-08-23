@@ -54,6 +54,7 @@ import {
  */
 
 const LEASE_KEY = "nchat.call.owner.v1";
+const MEDIA_INTENT_KEY_PREFIX = "nchat.call.media-intent.v1.";
 
 interface OwnerLease {
   v: 1;
@@ -64,11 +65,39 @@ interface OwnerLease {
   expiresAt: number;
 }
 
+interface MediaIntentEntry {
+  v: 1;
+  ownershipEpoch: number;
+  revision: number;
+  microphone: boolean;
+  camera: boolean;
+}
+
 async function readLease(page: Page): Promise<OwnerLease | null> {
   return page.evaluate((key) => {
     const raw = localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as OwnerLease) : null;
   }, LEASE_KEY);
+}
+
+// No real LiveKit here (see file header), so this can only exercise the
+// storage half of issue #610's crash/reload guarantee: a durable media-intent
+// snapshot written by a previous "owner" must survive a reload untouched —
+// there is no transaction between LiveKit and localStorage, so this is the
+// only part of that guarantee provable without a real media-service.
+async function readMediaIntent(page: Page, callId: string): Promise<MediaIntentEntry | null> {
+  return page.evaluate(
+    ({ prefix, id }) => {
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i);
+        if (!key?.startsWith(`${prefix}${encodeURIComponent(id)}:`)) continue;
+        const raw = localStorage.getItem(key);
+        if (raw) return JSON.parse(raw) as MediaIntentEntry;
+      }
+      return null;
+    },
+    { prefix: MEDIA_INTENT_KEY_PREFIX, id: callId },
+  );
 }
 
 function resourceCallEvent(fixture: {
@@ -208,6 +237,44 @@ test.describe("dedicated tab ownership lease — deterministic, no LiveKit requi
     expect(finalLease?.callId).toBe(callId);
     expect(finalLease?.tabId).not.toBe("stale-tab-from-before-reload");
     await expect(page.getByText("Chamada aberta em outra aba")).toHaveCount(0);
+  });
+
+  test("a durable media-intent snapshot from a previous owner survives a reload untouched (issue #610)", async ({
+    page,
+  }, testInfo) => {
+    const { callId } = await openDedicatedDirectly(page, testInfo, "media-intent-reload");
+    await expect(page.getByRole("main", { name: /Chamada/ })).toBeVisible();
+
+    // Seed a durable snapshot as if a previous owner (this tab's own earlier
+    // life, or a main tab before handoff) already persisted confirmed user
+    // intent — the exact shape callOwnership.ts's writeMediaIntent writes.
+    await page.evaluate(
+      ({ prefix, id }) => {
+        localStorage.setItem(
+          `${prefix}${encodeURIComponent(id)}:previous-owner`,
+          JSON.stringify({
+            v: 1,
+            ownershipEpoch: 3,
+            revision: 2,
+            microphone: true,
+            camera: false,
+          }),
+        );
+      },
+      { prefix: MEDIA_INTENT_KEY_PREFIX, id: callId },
+    );
+
+    await page.reload();
+    await expect(page.getByRole("main", { name: /Chamada/ })).toBeVisible();
+
+    const entry = await readMediaIntent(page, callId);
+    expect(entry).toEqual({
+      v: 1,
+      ownershipEpoch: 3,
+      revision: 2,
+      microphone: true,
+      camera: false,
+    });
   });
 });
 
