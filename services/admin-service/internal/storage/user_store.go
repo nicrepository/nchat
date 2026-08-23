@@ -397,15 +397,9 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var current string
-	if err := tx.QueryRow(ctx, lockUserQuery, userID).Scan(&current); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.UserStatusChange{}, domain.ErrNotFound
-		}
-		return domain.UserStatusChange{}, fmt.Errorf("lock user for status update: %w", err)
-	}
-	if !domain.ValidUserStatusTransition(current, newStatus) {
-		return domain.UserStatusChange{}, domain.ErrConflict
+	current, err := lockUserForStatusChange(ctx, tx, userID, newStatus)
+	if err != nil {
+		return domain.UserStatusChange{}, err
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -417,17 +411,62 @@ func (s *PGXUserDirectoryStore) UpdateUserStatus(ctx context.Context, userID str
 
 	change := domain.UserStatusChange{TargetUserID: userID, FromStatus: current, ToStatus: newStatus}
 	if newStatus == domain.UserStatusSuspended {
-		if err := tx.QueryRow(ctx, revokeSessionsCTE, userID, "admin_suspension").Scan(&change.RevokedSessions); err != nil {
-			return domain.UserStatusChange{}, fmt.Errorf("revoke sessions on suspension: %w", err)
+		revoked, err := closeOutSuspendedAccess(ctx, tx, userID)
+		if err != nil {
+			return domain.UserStatusChange{}, err
 		}
-		if _, err := tx.Exec(ctx, invalidateExchangeCodes, userID); err != nil {
-			return domain.UserStatusChange{}, fmt.Errorf("invalidate oidc exchange codes: %w", err)
-		}
+		change.RevokedSessions = revoked
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.UserStatusChange{}, fmt.Errorf("commit status transaction: %w", err)
 	}
 	return change, nil
+}
+
+// lockUserForStatusChange takes both locks this change needs and answers with
+// the status it is replacing.
+//
+// The user row first, because that is what serializes two status changes and
+// what a login re-validates against. Then the administrative anchor: suspending
+// an administrator takes their authority away, and a privileged write already
+// in flight must not be able to commit after it. The anchor is always the last
+// lock this service acquires — see mutation_authorization.go for the order.
+//
+// The transition is checked under the user lock, so a status read here cannot
+// be stale by the time it is written.
+func lockUserForStatusChange(ctx context.Context, tx pgx.Tx, userID, newStatus string) (string, error) {
+	var current string
+	if err := tx.QueryRow(ctx, lockUserQuery, userID).Scan(&current); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrNotFound
+		}
+		return "", fmt.Errorf("lock user for status update: %w", err)
+	}
+	if !domain.ValidUserStatusTransition(current, newStatus) {
+		return "", domain.ErrConflict
+	}
+	if err := lockAdminPrincipalTx(ctx, tx, userID); err != nil {
+		return "", err
+	}
+	return current, nil
+}
+
+// closeOutSuspendedAccess takes away what a suspended account is still holding:
+// its live sessions, and any OIDC exchange code that could be redeemed into a
+// new one.
+//
+// Both belong to the suspension transaction. Leaving either for a later step
+// would let a suspended account keep working until that step ran, and the count
+// returned is what the audit trail reports.
+func closeOutSuspendedAccess(ctx context.Context, tx pgx.Tx, userID string) (int, error) {
+	var revoked int
+	if err := tx.QueryRow(ctx, revokeSessionsCTE, userID, "admin_suspension").Scan(&revoked); err != nil {
+		return 0, fmt.Errorf("revoke sessions on suspension: %w", err)
+	}
+	if _, err := tx.Exec(ctx, invalidateExchangeCodes, userID); err != nil {
+		return 0, fmt.Errorf("invalidate oidc exchange codes: %w", err)
+	}
+	return revoked, nil
 }
 
 // RevokeUserSessions signs one account out everywhere without changing its
@@ -452,6 +491,12 @@ func (s *PGXUserDirectoryStore) RevokeUserSessions(ctx context.Context, userID s
 			return 0, domain.ErrNotFound
 		}
 		return 0, fmt.Errorf("lock user for revocation: %w", err)
+	}
+	// An administrative session is only valid while the login behind it is, so
+	// revoking that login revokes administrative authority too, and must
+	// serialize with privileged writes the same way.
+	if err := lockAdminPrincipalTx(ctx, tx, userID); err != nil {
+		return 0, err
 	}
 	var revoked int
 	if err := tx.QueryRow(ctx, revokeSessionsCTE, userID, "admin_revocation").Scan(&revoked); err != nil {
@@ -588,6 +633,28 @@ func (s *PGXUserDirectoryStore) RevokeAdminRole(ctx context.Context, targetUserI
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, adminRoleLockKey); err != nil {
 		return fmt.Errorf("lock admin roles: %w", err)
 	}
+	// The authorization anchor, after the advisory lock and before the change.
+	// A privileged write already holding this row finishes first and this
+	// revocation waits; if this commits first, that write re-reads the roles
+	// under the same lock and is refused. See mutation_authorization.go.
+	if err := lockAdminPrincipalTx(ctx, tx, targetUserID); err != nil {
+		return err
+	}
+	if err := deleteRoleGrantTx(ctx, tx, targetUserID, roleSlug); err != nil {
+		return err
+	}
+	if err := requireRemainingSuperuserTx(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit role revoke: %w", err)
+	}
+	return nil
+}
+
+// deleteRoleGrantTx removes one role binding, and reports a grant that was not
+// there as not found rather than as a success.
+func deleteRoleGrantTx(ctx context.Context, tx pgx.Tx, targetUserID, roleSlug string) error {
 	tag, err := tx.Exec(ctx,
 		`DELETE FROM auth.admin_principal_roles WHERE user_id = $1::uuid AND role_slug = $2`,
 		targetUserID, roleSlug,
@@ -598,15 +665,22 @@ func (s *PGXUserDirectoryStore) RevokeAdminRole(ctx context.Context, targetUserI
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound
 	}
+	return nil
+}
+
+// requireRemainingSuperuserTx enforces the invariant that the platform is never
+// left without administration.
+//
+// Counted after the delete and inside the same transaction, under the advisory
+// lock the caller holds, so two revocations cannot each observe the other's
+// administrator and both commit.
+func requireRemainingSuperuserTx(ctx context.Context, tx pgx.Tx) error {
 	var remaining int
 	if err := tx.QueryRow(ctx, countSuperusersQuery, string(domain.CapabilitySuperuser)).Scan(&remaining); err != nil {
 		return fmt.Errorf("count remaining administrators: %w", err)
 	}
 	if remaining == 0 {
 		return domain.ErrConflict
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit role revoke: %w", err)
 	}
 	return nil
 }

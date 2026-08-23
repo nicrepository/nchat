@@ -3,6 +3,7 @@ package domain_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/nicrepository/nchat/services/auth-service/internal/domain"
 )
@@ -140,5 +141,58 @@ func TestValidateStatusTransition(t *testing.T) {
 				t.Fatalf("expected ErrStatusTransitionNotAllowed, got %v", err)
 			}
 		})
+	}
+}
+
+// The expiry boundary, asserted exactly. A password set N days ago must still
+// work on its last day: expiring one day early would lock people out of a
+// window the policy told them they had.
+func TestPasswordExpired_BoundaryIsTheLastDayOfTheWindow(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	policy := domain.PolicySettings{PasswordExpirationDays: 90}
+
+	cases := []struct {
+		name    string
+		age     time.Duration
+		expired bool
+	}{
+		{"just set", 0, false},
+		{"one day short of the window", 89 * 24 * time.Hour, false},
+		{"exactly at the window", 90 * 24 * time.Hour, false},
+		{"one second past the window", 90*24*time.Hour + time.Second, true},
+		{"long past the window", 400 * 24 * time.Hour, true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			changedAt := now.Add(-testCase.age)
+			if got := domain.PasswordExpired(changedAt, now, policy); got != testCase.expired {
+				t.Fatalf("age %s: expected expired=%t, got %t", testCase.age, testCase.expired, got)
+			}
+		})
+	}
+}
+
+// Zero days is the platform default and means passwords do not expire. A
+// password of any age must keep working, or enabling the feature by accident
+// would be indistinguishable from disabling every account.
+func TestPasswordExpired_ZeroDaysNeverExpires(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	for _, days := range []int{0, -1} {
+		policy := domain.PolicySettings{PasswordExpirationDays: days}
+		if domain.PasswordExpired(now.Add(-10*365*24*time.Hour), now, policy) {
+			t.Fatalf("expiration_days=%d must never expire a password", days)
+		}
+	}
+}
+
+// An unknown password age must not be read as infinitely old. Treating the zero
+// time as expired would refuse every login the moment an expiry is configured.
+func TestPasswordExpired_UnknownAgeIsNotExpired(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	policy := domain.PolicySettings{PasswordExpirationDays: 1}
+
+	if domain.PasswordExpired(time.Time{}, now, policy) {
+		t.Fatal("a password with no recorded change time must not be treated as expired")
 	}
 }

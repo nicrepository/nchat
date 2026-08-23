@@ -168,17 +168,36 @@ Regras de avaliacao (`services/admin-service/internal/domain/capability.go`):
 
 Onde essas capabilities decidem hoje (issue #579 fechou a maior parte da lacuna):
 
-| Capability                               | Rotas que ela decide                                                                                                                                     |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `admin.audit.read`                       | `GET /api/admin/audit/events` — a trilha global, e com `user_id` o historico de uma conta                                                                |
-| `admin.users.read`                       | `GET /api/admin/users`, `GET /api/admin/users/{id}` — inclui o filtro `workspace_role`                                                                   |
-| `admin.users.manage`                     | `PATCH /api/admin/users/{id}/status`, `DELETE /api/admin/users/{id}/sessions`                                                                            |
-| `admin.superuser`                        | `POST` e `DELETE /api/admin/users/{id}/admin-roles[/{slug}]` — alem de implicar as demais                                                                |
-| `admin.channels.read`                    | `GET /api/admin/channels` (com o filtro `administered_by`), `GET /api/admin/channels/{id}`, `GET /api/admin/conversations`                               |
-| `admin.channels.manage`                  | `PATCH /api/admin/channels/{id}/status`, `POST` e `DELETE /api/admin/channels/{id}/members[/{userID}]`, `GET /api/admin/channels/{id}/member-candidates` |
-| `admin.security.read/manage`             | `GET` e `PATCH /api/admin/policies/anti-spam[/{workspaceID}]`                                                                                            |
-| `admin.infrastructure.read/manage`       | `GET` e `PATCH /api/admin/policies/upload[/{workspaceID}]`                                                                                               |
-| `admin.integrations.*`, `admin.config.*` | ainda sem endpoint                                                                                                                                       |
+| Capability                         | Rotas que ela decide                                                                                                                                     |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `admin.audit.read`                 | `GET /api/admin/audit/events` — a trilha global, e com `user_id` o historico de uma conta                                                                |
+| `admin.users.read`                 | `GET /api/admin/users`, `GET /api/admin/users/{id}` — inclui o filtro `workspace_role`                                                                   |
+| `admin.users.manage`               | `PATCH /api/admin/users/{id}/status`, `DELETE /api/admin/users/{id}/sessions`                                                                            |
+| `admin.superuser`                  | `POST` e `DELETE /api/admin/users/{id}/admin-roles[/{slug}]` — alem de implicar as demais                                                                |
+| `admin.channels.read`              | `GET /api/admin/channels` (com o filtro `administered_by`), `GET /api/admin/channels/{id}`, `GET /api/admin/conversations`                               |
+| `admin.channels.manage`            | `PATCH /api/admin/channels/{id}/status`, `POST` e `DELETE /api/admin/channels/{id}/members[/{userID}]`, `GET /api/admin/channels/{id}/member-candidates` |
+| `admin.security.read/manage`       | `GET` e `PATCH /api/admin/policies/anti-spam[/{workspaceID}]`                                                                                            |
+| `admin.infrastructure.read/manage` | `GET` e `PATCH /api/admin/policies/upload[/{workspaceID}]`                                                                                               |
+| `admin.config.read`                | `GET /api/admin/config`, `POST /api/admin/config/preview`, `GET /api/admin/config/versions`                                                              |
+| `admin.config.manage`              | `POST /api/admin/config/apply`, `POST /api/admin/config/versions/{versionID}/rollback`                                                                   |
+| `admin.integrations.*`             | ainda sem endpoint                                                                                                                                       |
+
+**Uma alteracao de configuracao que enfraquece a plataforma exige
+`admin.superuser`, alem de `admin.config.manage`.** A decisao e sobre o valor
+resultante, nao sobre o campo: baixar o tamanho minimo de senha abaixo do padrao,
+desligar um requisito de complexidade, elevar o limite de tentativas de login,
+encurtar o bloqueio ou esticar a sessao ociosa mudam quem consegue entrar na
+plataforma, e a capability que confere toda a autoridade e a que responde por
+isso. A regra vale igual no rollback: desfazer um endurecimento e produzir um
+enfraquecimento. O predicado por definicao esta em
+`internal/domain/config_catalog.go`; o inventario completo esta em
+[`config-inventory.md`](config-inventory.md).
+
+A configuracao editavel pelo console e apenas a **classe A** —
+`auth.auth_policy_settings`, lida pelo auth-service na propria requisicao que a
+aplica. Nao existe classe B (credencial editavel em runtime): credenciais vem de
+Sealed Secrets e nao ha backend de secret que a Admin API possa escrever. Um
+secret ja armazenado nunca e devolvido: a API responde apenas `configured`.
 
 **Alterar quem administra a plataforma exige `admin.superuser`, e nao
 `admin.users.manage`.** Um principal so pode conferir autoridade que ja detem por

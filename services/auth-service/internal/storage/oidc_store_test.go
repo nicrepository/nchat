@@ -143,7 +143,8 @@ func expectOIDCPolicyQuery(mock pgxmock.PgxPoolIface) {
 			"failed_login_window_minutes", "failed_login_lockout_minutes",
 			"session_idle_timeout_minutes", "max_devices_per_user",
 			"password_reset_token_ttl_minutes", "invite_token_ttl_hours",
-		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5, 60, 72))
+			"password_expiration_days",
+		}).AddRow(12, true, true, true, true, 5, 15, 15, 60, 5, 60, 72, 0))
 }
 
 // expectOIDCProfileSync matches the profile refresh that every returning OIDC

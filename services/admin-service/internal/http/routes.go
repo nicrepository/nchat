@@ -47,4 +47,26 @@ const (
 	RouteAdminAntiSpamUpdate    = "/policies/anti-spam/{workspaceID}"
 	RouteAdminUploadPolicy      = "/policies/upload"
 	RouteAdminUploadPolicyOne   = "/policies/upload/{workspaceID}"
+
+	// Configuration routes (issue #580).
+	//
+	// Semantic, and none of them takes the thing being changed as a path
+	// parameter. There is no PATCH /config/{key}: the key travels in a body
+	// that is resolved against a server-side registry, so an unregistered key
+	// is refused rather than reaching a store that would take it literally.
+	//
+	// The apply route is separate from the read rather than being a second
+	// method on it. That keeps every route in this service exactly one method
+	// with exactly one capability, which is the property that makes the guard
+	// table above reviewable at a glance.
+	RouteAdminConfig                = "/config"
+	RouteAdminConfigPreview         = "/config/preview"
+	RouteAdminConfigApply           = "/config/apply"
+	RouteAdminConfigVersions        = "/config/versions"
+	RouteAdminConfigVersionRollback = "/config/versions/{versionID}/rollback"
+	// The rollback preview is its own route rather than a flag on the generic
+	// preview, because a rollback is not an edit that happens to carry old
+	// values: the change set and the preconditions are derived from the
+	// recorded version, server-side, and a client names only which version.
+	RouteAdminConfigRollbackPreview = "/config/versions/{versionID}/rollback/preview"
 )
