@@ -1438,6 +1438,82 @@ func TestMessageService_MessageSecuritySnapshots_RefusesAnInvisibleTargetBeforeR
 	}
 }
 
+// Both batch endpoints re-check the target before reading any message, and both
+// accept a DM as well as a channel. Every case above uses the channel target, so
+// the DM half of that re-check was never exercised — the half where the caller
+// asks about a conversation they are not in.
+
+func TestMessageService_MessageSecuritySnapshots_RefusesAnInvisibleDMBeforeReadingMessages(t *testing.T) {
+	store := &fakeMessageStore{}
+	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
+	svc := service.NewMessageService(&fakeChannelStore{}, dms, store)
+
+	_, err := svc.MessageSecuritySnapshots(t.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: "ws-1", DMConversationID: "conv-1", CallerID: user1,
+		MessageIDs: []string{uuid.NewString()},
+	})
+
+	// ErrNotFound rather than a forbidden: the answer must not reveal that the
+	// conversation exists.
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+	if dms.getVisibleCalls != 1 {
+		t.Fatalf("DM visibility checked %d time(s), want exactly 1", dms.getVisibleCalls)
+	}
+	if store.getByIDCalls != 0 {
+		t.Fatalf("messages were read despite the refusal: %d call(s)", store.getByIDCalls)
+	}
+}
+
+func TestMessageService_ResolveMessageReferenceBatch_RefusesAnInvisibleDMBeforeReadingReferences(t *testing.T) {
+	destination := uuid.NewString()
+	// A reference the store would happily return, to prove the refusal happens
+	// before the read rather than after it.
+	store := &fakeMessageStore{
+		referencedMessageIDs: map[string]string{destination: user2},
+		messageReferences: map[string]domain.MessageReference{user2: {
+			Available: true, MessageID: user2, BodyText: "must not leak",
+		}},
+	}
+	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
+	svc := service.NewMessageService(&fakeChannelStore{}, dms, store)
+
+	resolved, err := svc.ResolveMessageReferenceBatch(t.Context(), service.ResolveMessageReferencesInput{
+		WorkspaceID: "ws-1", DMConversationID: "conv-1", CallerID: user1,
+		MessageIDs: []string{destination},
+	})
+
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+	if resolved != nil {
+		t.Fatalf("a refused batch still returned %+v", resolved)
+	}
+	if dms.getVisibleCalls != 1 {
+		t.Fatalf("DM visibility checked %d time(s), want exactly 1", dms.getVisibleCalls)
+	}
+}
+
+// The mirror case: a DM the caller *can* see is authorized through the DM store,
+// and never through the channel store.
+func TestMessageService_MessageSecuritySnapshots_VisibleDMIsAuthorizedByTheDMStore(t *testing.T) {
+	channels := &fakeChannelStore{getVisibleErr: domain.ErrNotFound}
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{ID: "conv-1", WorkspaceID: "ws-1"}}
+	svc := service.NewMessageService(channels, dms, &fakeMessageStore{})
+
+	_, err := svc.MessageSecuritySnapshots(t.Context(), service.MessageSecuritySnapshotsInput{
+		WorkspaceID: "ws-1", DMConversationID: "conv-1", CallerID: user1,
+		MessageIDs: []string{uuid.NewString()},
+	})
+	if err != nil {
+		t.Fatalf("a visible DM was refused: %v", err)
+	}
+	if dms.getVisibleCalls != 1 {
+		t.Fatalf("DM visibility checked %d time(s), want exactly 1", dms.getVisibleCalls)
+	}
+}
+
 func TestMessageService_CreateChannelMessage_RefMessageInvalidUUIDDenied(t *testing.T) {
 	ch := publicActiveChannel("ws-1", "ch-1")
 	channels := &fakeChannelStore{visibleChannel: ch}

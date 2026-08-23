@@ -71,6 +71,17 @@ type fakeMessageProvider struct {
 	lastReferenceInput     service.ResolveMessageReferencesInput
 	lastSecurityInput      service.MessageSecuritySnapshotsInput
 	lastForwardInput       service.ForwardChannelMessageInput
+
+	// Call counters for the read methods whose guards are asserted in
+	// message_read_guards_test.go. They exist because the captured inputs above
+	// cannot answer "was this called": an unauthenticated request reaching the
+	// service passes CallerID "", which is indistinguishable from never having
+	// been called. Counting is the only thing that separates the two, and it
+	// counts rather than flags so a happy path can also prove exactly one call.
+	getChannelMessageCalls int
+	getDMMessageCalls      int
+	resolveReferencesCalls int
+	securitySnapshotsCalls int
 }
 
 func (f *fakeMessageProvider) EditMessage(_ context.Context, in service.EditMessageInput) (domain.Message, error) {
@@ -209,21 +220,25 @@ func (f *fakeMessageProvider) CreateDMMessage(_ context.Context, in service.Crea
 
 func (f *fakeMessageProvider) GetChannelMessage(_ context.Context, in service.GetChannelMessageInput) (domain.Message, error) {
 	f.lastGetChannelInput = in
+	f.getChannelMessageCalls++
 	return f.channelMsg, f.channelMsgErr
 }
 
 func (f *fakeMessageProvider) GetDMMessage(_ context.Context, in service.GetDMMessageInput) (domain.Message, error) {
 	f.lastGetDMInput = in
+	f.getDMMessageCalls++
 	return f.dmMsg, f.dmMsgErr
 }
 
 func (f *fakeMessageProvider) ResolveMessageReferenceBatch(_ context.Context, in service.ResolveMessageReferencesInput) ([]service.MessageReferenceResolution, error) {
 	f.lastReferenceInput = in
+	f.resolveReferencesCalls++
 	return f.referenceOut, f.referenceErr
 }
 
 func (f *fakeMessageProvider) MessageSecuritySnapshots(_ context.Context, in service.MessageSecuritySnapshotsInput) ([]service.MessageSecuritySnapshot, error) {
 	f.lastSecurityInput = in
+	f.securitySnapshotsCalls++
 	return f.securitySnapshots, f.securitySnapshotErr
 }
 
