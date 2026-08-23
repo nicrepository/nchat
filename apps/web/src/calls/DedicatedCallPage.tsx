@@ -197,6 +197,8 @@ export default function DedicatedCallPage() {
         controls={controls}
         bindLocalMedia={media.bindLocalMedia}
         bindRemoteAudio={media.bindRemoteAudio}
+        localScreenShareActive={media.screenShareEnabled}
+        bindLocalScreenShare={media.bindLocalScreenShare}
         screenShareName={
           media.remoteScreenShare
             ? (media.participants.find(

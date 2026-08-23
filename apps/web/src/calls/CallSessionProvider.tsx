@@ -666,19 +666,6 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     return result;
   }, [getOwnership, media, stopAndReleaseOnStorageFailure]);
 
-  // Every external consumer (context value's `media`, the floating/dedicated
-  // `controls` object) must read toggles through here — never the raw
-  // useCallMedia() functions — so a call UI can never bypass persistence
-  // (issue #610 §10). Internal choke points above (ownedMedia.connect,
-  // directMedia.stop) keep using the raw `media` object directly.
-  const wrappedMedia = useMemo<CallMediaSessionController>(
-    () => ({
-      ...media,
-      toggleMicrophone: wrappedToggleMicrophone,
-      toggleCamera: wrappedToggleCamera,
-    }),
-    [media, wrappedToggleMicrophone, wrappedToggleCamera],
-  );
   const resource = useResourceCallSession(ownedMedia, ownerState === "local");
   // Pulled out as its own binding so the ownership-subscribe effect below
   // can depend on this specific, permanently-stable callback (issue #594
@@ -941,6 +928,41 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     resourceParticipationPhase !== "leaving" && resourceParticipationPhase !== "left";
   const activeCallId =
     directActive?.call_id ?? (resource.callId && resourceCallReconnectable ? resource.callId : "");
+
+  // Ownership fence for screen-share START only (issue #611) — requirements
+  // traceability that only the CURRENT owner of THIS specific call may begin
+  // capture, never a fix for the (already-safe, see useCallMedia's
+  // PendingMediaOperation/generation guards) late-resolution race. Never
+  // treats a lease for some OTHER call as authorization: lease.callId must
+  // match this tab's own activeCallId. STOP is never gated — an already-
+  // active share must always be stoppable for privacy even if ownership was
+  // just lost, since media.stop() (ownership-loss/handoff paths) already
+  // tears the whole session down independently of this wrapper. No
+  // writeMediaIntent, no storage revision, no recovery snapshot: screen
+  // share is never persisted (issue #611 explicitly forbids auto-resume).
+  const wrappedToggleScreenShare = useCallback(async (): Promise<void> => {
+    if (!media.screenShareEnabled) {
+      const lease = getOwnership().getLease();
+      if (ownerStateRef.current !== "local" || !lease || lease.callId !== activeCallId) return;
+    }
+    await media.toggleScreenShare();
+  }, [activeCallId, getOwnership, media]);
+
+  // Every external consumer (context value's `media`, the floating/dedicated
+  // `controls` object) must read toggles through here — never the raw
+  // useCallMedia() functions — so a call UI can never bypass persistence
+  // (issue #610 §10) or the screen-share ownership fence above. Internal
+  // choke points above (ownedMedia.connect, directMedia.stop) keep using the
+  // raw `media` object directly.
+  const wrappedMedia = useMemo<CallMediaSessionController>(
+    () => ({
+      ...media,
+      toggleMicrophone: wrappedToggleMicrophone,
+      toggleCamera: wrappedToggleCamera,
+      toggleScreenShare: wrappedToggleScreenShare,
+    }),
+    [media, wrappedToggleMicrophone, wrappedToggleCamera, wrappedToggleScreenShare],
+  );
 
   const reconnectLocal = useCallback(async (): Promise<boolean> => {
     try {
@@ -1482,6 +1504,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       ? "Você"
       : participants.find((participant) => participant.identity === media.activeSpeakerId)
           ?.displayName;
+  // Compact floating status text (issue #611) — local always takes
+  // precedence over remote (matching the dedicated primary-tile tie-break),
+  // reusing the same participant displayName lookup already used above for
+  // activeSpeakerName. No preview, no second grid — text only.
+  const screenShareLabel = media.screenShareEnabled
+    ? "Você está compartilhando a tela"
+    : media.remoteScreenShare
+      ? `${
+          participants.find(
+            (participant) => participant.identity === media.remoteScreenShare?.identity,
+          )?.displayName ?? "Participante"
+        } está compartilhando a tela`
+      : undefined;
   const controls = {
     microphoneEnabled: media.microphoneEnabled,
     cameraEnabled: media.cameraEnabled,
@@ -1489,7 +1524,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     pendingControl: media.pendingControl,
     onMicrophone: wrappedToggleMicrophone,
     onCamera: wrappedToggleCamera,
-    onScreenShare: media.toggleScreenShare,
+    onScreenShare: wrappedToggleScreenShare,
     onEnd: directActive
       ? calls.end
       : () => {
@@ -1541,7 +1576,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           status={floatingStatus}
           participantCount={participantCount}
           activeSpeakerName={activeSpeakerName}
-          screenShareActive={media.screenShareEnabled || Boolean(media.remoteScreenShare)}
+          screenShareLabel={screenShareLabel}
           hasRemoteVideo={media.hasRemoteVideo}
           remoteSeed={remoteSeed}
           hasLocalVideo={media.hasLocalVideo}

@@ -26,7 +26,13 @@ interface SessionCallbacks {
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
   onActiveSpeakersChanged(identities: string[]): void;
   onScreenShareChanged(enabled: boolean): void;
-  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
+  onLocalScreenShareChanged(element: HTMLMediaElement | null): void;
+  onRemoteScreenShareChanged(
+    identity: string,
+    trackSid: string,
+    element: HTMLMediaElement,
+    active: boolean,
+  ): void;
 }
 
 function remoteVideoFor(identity: string): HTMLVideoElement {
@@ -269,15 +275,251 @@ describe("useCallMedia", () => {
     await act(() => view.result.current.connect(videoCall, "participant-token"));
     const element = remoteVideoFor("identity-a");
 
-    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", element));
+    act(() =>
+      view
+        .getSession()
+        .callbacks.onRemoteScreenShareChanged("identity-a", "track-a", element, true),
+    );
     expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
     render(
       <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
     );
     expect(screen.getByTestId("screen-share")).toContainElement(element);
 
-    act(() => view.getSession().callbacks.onRemoteScreenShareChanged("identity-a", null));
+    act(() =>
+      view
+        .getSession()
+        .callbacks.onRemoteScreenShareChanged("identity-a", "track-a", element, false),
+    );
     expect(view.result.current.remoteScreenShare).toBeNull();
+  });
+
+  it("binds the local screen-share preview separately from the camera preview", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const element = document.createElement("video");
+    render(<div ref={view.result.current.bindLocalScreenShare} data-testid="local-screen-share" />);
+
+    act(() => view.getSession().callbacks.onLocalScreenShareChanged(element));
+    expect(screen.getByTestId("local-screen-share")).toContainElement(element);
+
+    act(() => view.getSession().callbacks.onLocalScreenShareChanged(null));
+    expect(screen.getByTestId("local-screen-share")).toBeEmptyDOMElement();
+  });
+
+  describe("remote screen-share registry (issue #611)", () => {
+    it("A start -> B start -> B stop => A becomes visible again", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+      const elementB = remoteVideoFor("identity-b");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, true),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-b");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, false),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+    });
+
+    it("A start -> B start -> A stop => B remains visible", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+      const elementB = remoteVideoFor("identity-b");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, true),
+      );
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, false),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-b");
+    });
+
+    it("a same-participant true republish (new trackSid) keeps the newest element visible; the old track's removal cannot clear it", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementOld = remoteVideoFor("identity-a");
+      const elementNew = remoteVideoFor("identity-a");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-old", elementOld, true),
+      );
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-new", elementNew, true),
+      );
+      expect(view.result.current.remoteScreenShare).not.toBeNull();
+
+      // The OLD publication's removal arrives after the new one already
+      // started — it must only ever remove "track-old", never clear the
+      // newer, currently-presented "track-new" entry for the same identity.
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-old", elementOld, false),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+      render(
+        <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+      );
+      expect(screen.getByTestId("screen-share")).toContainElement(elementNew);
+    });
+
+    // Issue #611 pre-commit review: trackSid ALONE is not a safe removal
+    // key. The adapter's own dedup guard (onTrackSubscribed's
+    // `remoteTracks.has(track)`) is keyed by RemoteTrack object identity,
+    // not trackSid — so a rebind/replay around reconnect can legitimately
+    // deliver a second "add" for the SAME trackSid under a new element
+    // before the OLD instance's own stale "remove" (still carrying that
+    // same trackSid) arrives. The registry must key removal on the exact
+    // element, never on trackSid/identity alone, or a stale removal for the
+    // superseded instance would delete the newer one.
+    it("a stale removal carrying the SAME trackSid as a superseded element cannot clear the newer one", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementOld = remoteVideoFor("identity-a");
+      const elementNew = remoteVideoFor("identity-a");
+
+      // add T1/E1
+      act(() => session.callbacks.onRemoteScreenShareChanged("identity-a", "T1", elementOld, true));
+      // reconnect/rebind/replay: add T1/E2 (same trackSid, new element)
+      act(() => session.callbacks.onRemoteScreenShareChanged("identity-a", "T1", elementNew, true));
+      expect(view.result.current.remoteScreenShare).not.toBeNull();
+
+      // stale removal belonging to the OLD RemoteTrack/E1, still carrying T1
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "T1", elementOld, false),
+      );
+      // E2 must still be presented — the stale removal must not have
+      // deleted the registry entry a newer add just wrote under the same
+      // trackSid.
+      expect(view.result.current.remoteScreenShare).not.toBeNull();
+      render(
+        <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+      );
+      expect(screen.getByTestId("screen-share")).toContainElement(elementNew);
+
+      // The real removal for E2 (same trackSid) now correctly clears it.
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "T1", elementNew, false),
+      );
+      expect(view.result.current.remoteScreenShare).toBeNull();
+    });
+
+    it("presenter disconnect (its screen-share removal) falls back to the remaining active share", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+      const elementB = remoteVideoFor("identity-b");
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, true),
+      );
+
+      // Adapter emits the removal as part of participant-disconnect cleanup.
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, false),
+      );
+
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+    });
+
+    it("clears to null once every active remote screen share has stopped", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, false),
+      );
+
+      expect(view.result.current.remoteScreenShare).toBeNull();
+    });
+
+    it("a duplicate/replayed add or remove callback is idempotent", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      expect(view.result.current.remoteScreenShare?.identity).toBe("identity-a");
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, false),
+      );
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, false),
+      );
+      expect(view.result.current.remoteScreenShare).toBeNull();
+    });
+
+    it("swaps the bound container to the newly selected element cleanly", async () => {
+      const view = setup();
+      await act(() => view.result.current.connect(videoCall, "participant-token"));
+      const session = view.getSession();
+      const elementA = remoteVideoFor("identity-a");
+      const elementB = remoteVideoFor("identity-b");
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-a", "track-a", elementA, true),
+      );
+      const { rerender } = render(
+        <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+      );
+      expect(screen.getByTestId("screen-share")).toContainElement(elementA);
+
+      act(() =>
+        session.callbacks.onRemoteScreenShareChanged("identity-b", "track-b", elementB, true),
+      );
+      rerender(
+        <div ref={view.result.current.remoteScreenShare?.bindMedia} data-testid="screen-share" />,
+      );
+
+      expect(screen.getByTestId("screen-share")).toContainElement(elementB);
+      expect(screen.getByTestId("screen-share")).not.toContainElement(elementA);
+    });
+  });
+
+  it("mic/camera stay unaffected when screen-share toggling fails", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    session.setScreenShareEnabled.mockRejectedValueOnce(new Error("publish failed"));
+
+    await act(() => view.result.current.toggleScreenShare());
+
+    expect(view.result.current.microphoneEnabled).toBe(true);
+    expect(view.result.current.cameraEnabled).toBe(true);
+    expect(view.result.current.screenShareEnabled).toBe(false);
+    expect(view.result.current.pendingControl).toBeNull();
+    expect(view.result.current.error).not.toBeNull();
   });
 
   it("attaches and removes local and remote media without storing SDK objects in React state", async () => {

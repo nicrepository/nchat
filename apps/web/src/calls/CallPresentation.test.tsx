@@ -120,7 +120,7 @@ describe("FloatingCallWindow", () => {
         status="reconnecting"
         participantCount={2}
         activeSpeakerName="Ana"
-        screenShareActive
+        screenShareLabel="Você está compartilhando a tela"
         controls={controls}
         onExpand={noop}
         {...videoPresent}
@@ -130,11 +130,40 @@ describe("FloatingCallWindow", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Reconectando");
     expect(screen.getByText("2 participantes")).toBeInTheDocument();
     expect(screen.getByText("Ana está falando")).toBeInTheDocument();
-    expect(screen.getByText("Compartilhando tela")).toBeInTheDocument();
+    expect(screen.getByText("Você está compartilhando a tela")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Ativar microfone" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Desativar câmera" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Compartilhar tela" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Expandir em nova aba" })).toBeInTheDocument();
+  });
+
+  it("shows the remote presenter's display name when someone else is sharing (issue #611)", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        screenShareLabel="Ana está compartilhando a tela"
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    expect(screen.getByText("Ana está compartilhando a tela")).toBeInTheDocument();
+  });
+
+  it("shows no share indicator when screenShareLabel is absent", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+      />,
+    );
+    expect(document.querySelector(".floating-call__share")).toBeNull();
   });
 
   it("drags only from its handle and has no preset position selector", () => {
@@ -524,7 +553,7 @@ describe("FloatingCallWindow", () => {
         title="Ana"
         status="connected"
         participantCount={3}
-        screenShareActive
+        screenShareLabel="Você está compartilhando a tela"
         controls={controls}
         onExpand={noop}
         {...videoPresent}
@@ -532,7 +561,7 @@ describe("FloatingCallWindow", () => {
     );
     expect(document.querySelector(".floating-call__count")).toBe(countBefore);
     expect(document.querySelector(".floating-call__share")).toHaveTextContent(
-      "Compartilhando tela",
+      "Você está compartilhando a tela",
     );
 
     view.rerender(
@@ -556,7 +585,7 @@ describe("FloatingCallWindow", () => {
         status="connected"
         participantCount={3}
         activeSpeakerName="Ana"
-        screenShareActive
+        screenShareLabel="Você está compartilhando a tela"
         controls={controls}
         onExpand={noop}
         {...videoPresent}
@@ -607,6 +636,105 @@ describe("global and dedicated presentation", () => {
     expect(
       screen.getByRole("button", { name: "Minimizar para janela flutuante" }),
     ).toBeInTheDocument();
+  });
+
+  it("renders the local screen share as the primary tile, labeled 'Sua tela' (issue #611)", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={1}
+        participants={[]}
+        controls={controls}
+        onMinimize={noop}
+        localScreenShareActive
+        bindLocalScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(screen.getByText("Sua tela")).toBeInTheDocument();
+    expect(document.querySelectorAll(".dedicated-call__tile--screen")).toHaveLength(1);
+  });
+
+  it("local screen share wins the primary tile over a simultaneously active remote share", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        localScreenShareActive
+        bindLocalScreenShare={noop}
+        screenShareName="Ana"
+        bindScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    // Never two simultaneous screen tiles — only the local one.
+    expect(document.querySelectorAll(".dedicated-call__tile--screen")).toHaveLength(1);
+    expect(screen.getByText("Sua tela")).toBeInTheDocument();
+    expect(screen.queryByText("Tela de Ana")).not.toBeInTheDocument();
+  });
+
+  it("reveals the remote share as primary immediately once local sharing ends", () => {
+    const view = render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        localScreenShareActive
+        bindLocalScreenShare={noop}
+        screenShareName="Ana"
+        bindScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(screen.getByText("Sua tela")).toBeInTheDocument();
+
+    view.rerender(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        localScreenShareActive={false}
+        screenShareName="Ana"
+        bindScreenShare={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(screen.queryByText("Sua tela")).not.toBeInTheDocument();
+    expect(screen.getByText("Tela de Ana")).toBeInTheDocument();
+    expect(document.querySelectorAll(".dedicated-call__tile--screen")).toHaveLength(1);
+  });
+
+  it("shows no screen tile and normal participant markup when no share is active", () => {
+    render(
+      <DedicatedCallStage
+        title="Produto"
+        status="connected"
+        participantCount={2}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        controls={controls}
+        onMinimize={noop}
+        hasLocalVideo
+        localSeed="current-user"
+      />,
+    );
+    expect(document.querySelector(".dedicated-call__tile--screen")).toBeNull();
+    expect(screen.getByText("Ana")).toBeInTheDocument();
+    expect(screen.getByText("Você")).toBeInTheDocument();
   });
 
   it("renders reconnecting video participants without avatar fallback", () => {

@@ -61,7 +61,40 @@ export interface LiveKitSpikeSessionCallbacks {
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
   onActiveSpeakersChanged(identities: string[]): void;
   onScreenShareChanged(enabled: boolean): void;
-  onRemoteScreenShareChanged(identity: string, element: HTMLMediaElement | null): void;
+  // Local screen-share preview only — deliberately separate from
+  // onLocalElement (camera) so a consumer can never conflate the two local
+  // preview surfaces. Fired with the attached preview element after a
+  // successful local enable/reconnect-resync, and with null on explicit
+  // stop, native LocalTrackUnpublished, or teardown.
+  onLocalScreenShareChanged(element: HTMLMediaElement | null): void;
+  // trackSid identifies the specific LiveKit publication a remote
+  // screen-share subscription belongs to — finer-grained than `identity`,
+  // since the same participant can unpublish and republish (a new trackSid)
+  // before the old publication's removal event arrives.
+  //
+  // trackSid ALONE is still not sufficient to key a removal safely: LiveKit
+  // can in principle deliver a second TrackSubscribed for the very same
+  // publication (same trackSid) under a brand-new RemoteTrack wrapper object
+  // around a reconnect/rebind/replay, without the old wrapper's own
+  // TrackUnsubscribed having arrived yet — this adapter's own dedup guard
+  // (onTrackSubscribed's `this.remoteTracks.has(track)`) is keyed by
+  // RemoteTrack object identity, not trackSid, so two such entries can
+  // legitimately coexist with an identical trackSid for a window. A stale
+  // removal for the OLD wrapper must never be mistaken for a removal of the
+  // NEW one just because they share a trackSid.
+  //
+  // `element` is therefore always the concrete, already-attached element
+  // this specific subscription instance owns — passed on BOTH the add
+  // (`active: true`) and the matching remove (`active: false`) — so a
+  // consumer can verify a removal refers to the exact instance its own
+  // corresponding add created (e.g. `registry.get(trackSid)?.element ===
+  // element`) before ever deleting anything, never trusting trackSid alone.
+  onRemoteScreenShareChanged(
+    identity: string,
+    trackSid: string,
+    element: HTMLMediaElement,
+    active: boolean,
+  ): void;
 }
 
 export interface LiveKitSpikeSession {
@@ -83,10 +116,21 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   private readonly room = new Room({ adaptiveStream: true, dynacast: true });
   private readonly remoteTracks = new Map<
     RemoteTrack,
-    { participantSid: string; elements: Set<HTMLMediaElement>; screenShareIdentity?: string }
+    {
+      participantSid: string;
+      elements: Set<HTMLMediaElement>;
+      screenShareIdentity?: string;
+      screenShareTrackSid?: string;
+      // The exact element THIS subscription instance attached — carried
+      // through to the matching removal so a consumer can verify a removal
+      // belongs to this instance rather than trusting trackSid alone (see
+      // onRemoteScreenShareChanged's own doc comment).
+      screenShareElement?: HTMLMediaElement;
+    }
   >();
   private readonly callbacks: LiveKitSpikeSessionCallbacks;
   private localVideoElement: HTMLMediaElement | null = null;
+  private localScreenShareElement: HTMLMediaElement | null = null;
   private disposed = false;
   // Distinct from `disposed`: `disposed` commits every other method to
   // rejecting/no-op'ing forever the moment disconnect() is first called,
@@ -213,10 +257,17 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
 
   async setScreenShareEnabled(enabled: boolean): Promise<void> {
     if (this.disposed) return;
-    await this.room.localParticipant.setScreenShareEnabled(enabled);
+    const publication = await this.room.localParticipant.setScreenShareEnabled(enabled);
     if (this.disposed) {
       if (enabled) await this.disableScreenShareAfterInterruptedEnable();
       return;
+    }
+    if (enabled) {
+      // Attach ONLY the already-created local screen track LiveKit just
+      // published — never a second getDisplayMedia/createScreenTracks call.
+      this.attachLocalScreenShare(publication?.track);
+    } else {
+      this.removeLocalScreenShare();
     }
     this.callbacks.onScreenShareChanged(enabled);
   }
@@ -263,10 +314,21 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     this.remoteTracks.set(track, {
       participantSid: participant.sid,
       elements,
-      ...(screenShare ? { screenShareIdentity: participant.identity } : {}),
+      ...(screenShare
+        ? {
+            screenShareIdentity: participant.identity,
+            screenShareTrackSid: publication.trackSid,
+            screenShareElement: element,
+          }
+        : {}),
     });
     if (screenShare) {
-      this.callbacks.onRemoteScreenShareChanged(participant.identity, element);
+      this.callbacks.onRemoteScreenShareChanged(
+        participant.identity,
+        publication.trackSid,
+        element,
+        true,
+      );
     } else {
       this.callbacks.onRemoteElement(element);
     }
@@ -318,6 +380,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     // matches the SDK after Reconnected.
     this.notifyMicrophoneState();
     this.syncRemoteVideoAvailability();
+    this.syncLocalScreenShareState();
     this.callbacks.onReconnected();
   };
 
@@ -333,6 +396,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
 
   private readonly onLocalTrackUnpublished = (publication: LocalTrackPublication): void => {
     if (!this.disposed && publication.source === Track.Source.ScreenShare) {
+      this.removeLocalScreenShare();
       this.callbacks.onScreenShareChanged(false);
     }
   };
@@ -347,6 +411,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       return;
     }
     if (this.isLocalScreenShare(publication, participant)) {
+      // LiveKit unpublishes rather than muting local screen share (see
+      // setTrackEnabled's disable branch), so this is defensive/idempotent
+      // rather than an expected transition in normal operation.
+      this.removeLocalScreenShare();
       this.callbacks.onScreenShareChanged(false);
       return;
     }
@@ -431,6 +499,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     } finally {
       this.removeAdapterListeners();
       this.removeLocalVideo();
+      this.removeLocalScreenShare();
       for (const track of [...this.remoteTracks.keys()]) this.removeRemoteTrack(track);
     }
   }
@@ -455,8 +524,20 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     const remoteTrack = this.remoteTracks.get(track);
     if (!remoteTrack) return;
     this.remoteTracks.delete(track);
-    if (remoteTrack.screenShareIdentity) {
-      this.callbacks.onRemoteScreenShareChanged(remoteTrack.screenShareIdentity, null);
+    if (
+      remoteTrack.screenShareIdentity &&
+      remoteTrack.screenShareTrackSid &&
+      remoteTrack.screenShareElement
+    ) {
+      // Always the exact element THIS instance attached — never a
+      // placeholder — so a consumer can verify this removal belongs to the
+      // entry it currently has for this trackSid before deleting it.
+      this.callbacks.onRemoteScreenShareChanged(
+        remoteTrack.screenShareIdentity,
+        remoteTrack.screenShareTrackSid,
+        remoteTrack.screenShareElement,
+        false,
+      );
     }
     const elements = new Set([...remoteTrack.elements, ...track.detach()]);
     for (const element of elements) this.callbacks.onElementRemoved(element);
@@ -504,6 +585,50 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     if (!this.localVideoElement) return;
     this.callbacks.onElementRemoved(this.localVideoElement);
     this.localVideoElement = null;
+  }
+
+  // Deliberately separate from attachLocalVideo/removeLocalVideo (camera):
+  // this owns its own dedicated callback (onLocalScreenShareChanged) rather
+  // than routing through onElementRemoved, so a consumer can never conflate
+  // the local camera preview with the local screen-share preview.
+  private attachLocalScreenShare(track: { attach(): HTMLMediaElement } | undefined): void {
+    if (this.disposed || !track || this.localScreenShareElement) return;
+    const element = track.attach();
+    if (this.disposed) {
+      element.remove();
+      return;
+    }
+    element.autoplay = true;
+    element.muted = true;
+    if (element instanceof HTMLVideoElement) element.playsInline = true;
+    this.localScreenShareElement = element;
+    this.callbacks.onLocalScreenShareChanged(element);
+  }
+
+  private removeLocalScreenShare(): void {
+    if (!this.localScreenShareElement) return;
+    this.localScreenShareElement.remove();
+    this.localScreenShareElement = null;
+    this.callbacks.onLocalScreenShareChanged(null);
+  }
+
+  // Reconnect resync only — never calls setScreenShareEnabled/
+  // createScreenTracks/getDisplayMedia. Reads whatever the SDK's own
+  // publication state already is after Reconnected and reattaches the
+  // already-existing track if it survived (attachLocalScreenShare no-ops if
+  // already attached), or converges to false/cleared if the publication
+  // disappeared or its underlying capture ended while disconnected.
+  private syncLocalScreenShareState(): void {
+    if (this.disposed) return;
+    const publication = this.room.localParticipant.getTrackPublication(Track.Source.ScreenShare);
+    const track = publication?.track;
+    if (!track || track.mediaStreamTrack.readyState === "ended") {
+      this.removeLocalScreenShare();
+      this.callbacks.onScreenShareChanged(false);
+      return;
+    }
+    this.attachLocalScreenShare(track);
+    this.callbacks.onScreenShareChanged(true);
   }
 }
 
