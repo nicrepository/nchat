@@ -397,7 +397,12 @@ describe("DedicatedCallPage", () => {
     renderPage();
 
     expect(await screen.findByText("Tela de Participante")).toBeInTheDocument();
-    expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, false);
+    // The screen-share tile renders straight from session.media, but the
+    // acknowledgement only fires once the activation effect has recorded this
+    // callId — a separate async chain. Awaiting the tile says nothing about
+    // that chain, so this has to wait for the acknowledgement itself, the same
+    // way every other test here waits on join() before asserting it.
+    await waitFor(() => expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, false));
   });
 
   it("ignores asynchronous resolution after unmount", async () => {

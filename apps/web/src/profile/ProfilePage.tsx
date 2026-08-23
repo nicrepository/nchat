@@ -34,12 +34,21 @@ import {
 } from "./profileApi";
 import { refreshSelfProfile } from "./selfProfile";
 
-// Computed once at module load, not per render: the set of IANA time zones a
-// browser supports does not change during a session, so recomputing it (and
-// rebuilding ~419 <option> elements) on every keystroke anywhere on the page
-// — which is what calling supportedTimezones() inline in JSX would do, since
-// any state change re-renders this whole component — is pure waste.
-const TIMEZONE_OPTIONS = supportedTimezones();
+// Built once at module load, not per render: the set of IANA time zones a
+// browser supports does not change during a session, so recomputing it — and
+// rebuilding its ~419 <option> elements — on every keystroke anywhere on the
+// page is pure waste. Any state change re-renders this whole component, so
+// both the list and the elements have to be hoisted: keeping only the strings
+// out of render still handed React 419 freshly created elements each time,
+// which it then reconciled one by one. Holding the elements at a stable
+// reference lets React bail out of that subtree instead. Nothing here depends
+// on props or state — the selected value lives on the <select>, not on the
+// options — so module scope is the correct lifetime.
+const TIMEZONE_OPTION_ELEMENTS = supportedTimezones().map((tz) => (
+  <option key={tz} value={tz}>
+    {tz}
+  </option>
+));
 
 /**
  * ProfilePage — lets the signed-in user edit their display name, cargo
@@ -676,11 +685,7 @@ export default function ProfilePage() {
             onChange={onDetailsChange(setTimezoneDraft)}
           >
             <option value="">Não definido</option>
-            {TIMEZONE_OPTIONS.map((tz) => (
-              <option key={tz} value={tz}>
-                {tz}
-              </option>
-            ))}
+            {TIMEZONE_OPTION_ELEMENTS}
           </select>
           {timezoneError && (
             <p id="profile-timezone-error" className="profile-page__error" role="alert">
