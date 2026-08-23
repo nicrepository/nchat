@@ -1,5 +1,7 @@
 package storage
 
+import "github.com/nicrepository/nchat/services/admin-service/internal/domain"
+
 // ReauthorizeQueryForTest exposes the per-request authorization SQL so a test
 // can assert which clauses it does and does not carry. The difference between
 // this query and the handshake one is a deliberate security decision, and a
@@ -38,3 +40,19 @@ func MemberCandidateQueryForTest() string { return listMemberCandidatesQuery }
 // LockChannelQueryForTest exposes the membership lock so a test can assert it
 // still obeys the shared serialization protocol.
 func LockChannelQueryForTest() string { return lockChannelQuery }
+
+// AuthPolicyUpdateForTest exposes the configuration compare-and-swap so a test
+// can assert that the revision predicate is still in it and that every value is
+// bound rather than inlined. The statement is the security boundary of the
+// write path, so its text is what the regression guard has to read.
+func AuthPolicyUpdateForTest(changes []domain.ConfigChange, preconditions ...domain.ConfigPrecondition) string {
+	statement, _, err := authPolicyUpdate(domain.ConfigApplyInput{
+		ExpectedRevision: 1,
+		Changes:          changes,
+		Preconditions:    preconditions,
+	})
+	if err != nil {
+		return ""
+	}
+	return statement
+}

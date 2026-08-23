@@ -74,7 +74,8 @@ func (s *PGXUserStore) GetPolicySettings(ctx context.Context) (domain.PolicySett
 		       require_number, require_symbol, failed_login_limit,
 		       failed_login_window_minutes, failed_login_lockout_minutes,
 		       session_idle_timeout_minutes, max_devices_per_user,
-		       password_reset_token_ttl_minutes, invite_token_ttl_hours
+		       password_reset_token_ttl_minutes, invite_token_ttl_hours,
+		       COALESCE(password_expiration_days, 0)
 		FROM auth.auth_policy_settings
 		WHERE id = 1`).Scan(
 		&p.MinPasswordLength, &p.RequireUppercase, &p.RequireLowercase,
@@ -82,6 +83,7 @@ func (s *PGXUserStore) GetPolicySettings(ctx context.Context) (domain.PolicySett
 		&p.FailedLoginWindowMinutes, &p.FailedLoginLockoutMinutes,
 		&p.SessionIdleTimeoutMinutes, &p.MaxDevicesPerUser,
 		&p.PasswordResetTokenTTLMinutes, &p.InviteTokenTTLHours,
+		&p.PasswordExpirationDays,
 	)
 	if err != nil {
 		return domain.PolicySettings{}, fmt.Errorf("get policy settings: %w", err)

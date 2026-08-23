@@ -105,6 +105,13 @@ type PolicySettings struct {
 	MaxDevicesPerUser            int
 	PasswordResetTokenTTLMinutes int
 	InviteTokenTTLHours          int
+	// PasswordExpirationDays is how long a local password stays usable.
+	//
+	// Zero means passwords do not expire, which is the platform default and
+	// what the column's NULL reads as. It cannot collide with a configured
+	// value: auth_policy_settings constrains the column to be either NULL or
+	// greater than zero, so no deployment can store an expiry of zero days.
+	PasswordExpirationDays int
 }
 
 type CreateUserInput struct {

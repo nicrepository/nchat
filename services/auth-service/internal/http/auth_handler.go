@@ -15,6 +15,7 @@ import (
 const (
 	errCodeInvalidRefreshToken       = "invalid_refresh_token"
 	errCodeInvalidCredentials        = "invalid_credentials" //nolint:gosec // G101: error code string, not a credential value
+	errCodePasswordExpired           = "password_expired"    //nolint:gosec // G101: error code string, not a credential value
 	errCodeRequestTooLarge           = "request_too_large"
 	maxAuthRequestBodyBytes    int64 = 4 * 1024
 
@@ -244,9 +245,16 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 }
 
 // writeLoginError maps login service errors to HTTP responses.
-// All credential-related errors (including lockout) map to a generic 401 to prevent enumeration.
+//
+// All credential-related errors (including lockout) map to a generic 401 to
+// prevent enumeration. An expired password is the one 401 that says more, and
+// it can: it is only reachable once the password has already been verified, so
+// nobody learns it without holding the password. Withholding it would leave the
+// owner retrying a correct password against a wall.
 func writeLoginError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrPasswordExpired):
+		httputil.WriteError(w, http.StatusUnauthorized, errCodePasswordExpired, "password expired")
 	case errors.Is(err, domain.ErrInvalidCredentials):
 		httputil.WriteError(w, http.StatusUnauthorized, errCodeInvalidCredentials, "invalid credentials")
 	case errors.Is(err, domain.ErrInvalidInput):

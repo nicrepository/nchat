@@ -10,6 +10,7 @@ describe("ADMIN_NAV", () => {
       "channels",
       "security",
       "files",
+      "configuration",
       "authentication",
       "email",
       "calls",
@@ -25,7 +26,15 @@ describe("ADMIN_NAV", () => {
   // how a placeholder becomes a control that looks like it works.
   it("only routes the sections that exist", () => {
     const routed = ADMIN_NAV.filter((item) => item.path !== undefined).map((item) => item.id);
-    expect(routed).toEqual(["overview", "users", "channels", "security", "files", "audit"]);
+    expect(routed).toEqual([
+      "overview",
+      "users",
+      "channels",
+      "security",
+      "files",
+      "configuration",
+      "audit",
+    ]);
   });
 
   it("declares a capability for every section", () => {

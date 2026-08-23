@@ -25,6 +25,15 @@ var ErrInvalidRefreshToken = errors.New("invalid refresh token")
 
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
+// ErrPasswordExpired means the password was correct and is too old to be used.
+//
+// Deliberately distinct from ErrInvalidCredentials. It is only ever reachable
+// after the password has already been verified, so it reveals nothing to
+// somebody who does not hold the password — and the person who does hold it
+// needs to be told, or they will keep retrying a correct password until the
+// lockout closes the account on them.
+var ErrPasswordExpired = errors.New("password expired")
+
 var ErrInviteAlreadyPending = errors.New("active invite already exists for this email")
 
 var ErrNotFound = errors.New("not found")

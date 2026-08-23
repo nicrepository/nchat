@@ -35,6 +35,38 @@ type AuthenticatedAdmin struct {
 	Principal AdminPrincipal
 }
 
+// MutationAuthorization is the identity a privileged write re-proves inside its
+// own transaction, and the capability it must still hold to be allowed.
+//
+// It carries identity, never authority. The capability set the middleware
+// loaded is a snapshot from before the request body was even read; between that
+// moment and the commit, a role can be revoked, a principal suspended or the
+// session ended, and all three would leave the snapshot saying yes. So the
+// write re-derives the answer from the database, under a lock the revocation
+// paths contend for, in the transaction that performs the write.
+//
+// The middleware is not replaced by this. It stays the first barrier — it
+// refuses early, it keeps unauthorized work out of the handlers, and it is what
+// produces the identity below. This is the second one, at the only point where
+// "still allowed" and "already written" cannot be separated.
+type MutationAuthorization struct {
+	// SessionID is the administrative session row, not the chat one.
+	SessionID string
+	UserID    string
+	// Capability is the one the mutation actually demands, which for a
+	// configuration change may be stricter than the route's — a value that
+	// weakens the platform requires admin.superuser.
+	Capability Capability
+}
+
+// Valid reports whether this authorization names enough to be checkable.
+//
+// A zero value must never authorize anything: a caller that forgot to populate
+// it is refused rather than silently checked against nothing.
+func (a MutationAuthorization) Valid() bool {
+	return a.SessionID != "" && a.UserID != "" && IsKnownCapability(a.Capability)
+}
+
 // AuditResult classifies the outcome recorded for an audit event.
 type AuditResult string
 

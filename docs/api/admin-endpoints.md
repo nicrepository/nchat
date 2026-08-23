@@ -1,12 +1,13 @@
 # Admin Service — Admin API
 
-> **Scope:** the Admin Console foundation (issue #578) plus the management
-> surface (issue #579). This document covers the endpoints that exist today: the
-> administrative session handshake, the console bootstrap, the audit trail, the
-> platform user directory, the channel and conversation directories, and the two
-> operational policies that are configurable at runtime. Integrations,
-> infrastructure administration and a Health Center are **not** implemented and
-> are not described here.
+> **Scope:** the Admin Console foundation (issue #578), the management surface
+> (issue #579) and configuration management (issue #580). This document covers
+> the endpoints that exist today: the administrative session handshake, the
+> console bootstrap, the audit trail, the platform user directory, the channel
+> and conversation directories, the two operational policies that are
+> configurable at runtime, and the platform configuration catalogue. Integrations
+> administration and a Health Center are **not** implemented and are not
+> described here.
 
 Public base: `/api/admin`. The gateways rewrite `/api/admin/<rest>` to
 `/<rest>` before the request reaches the pod, so the paths admin-service
@@ -29,13 +30,14 @@ Every response uses the platform envelope: `{"data": …}` on success,
 
 ## Contents
 
-| #   | Method | Path                      | Auth                              |
-| --- | ------ | ------------------------- | --------------------------------- |
-| 1   | POST   | `/api/admin/session`      | NChat access token (Bearer)       |
-| 2   | DELETE | `/api/admin/session`      | Admin session cookie + CSRF token |
-| 3   | GET    | `/api/admin/bootstrap`    | Admin session cookie              |
-| 4   | GET    | `/api/admin/audit/events` | Admin session cookie + capability |
-| 5   | —      | Management (issue #579)   | Admin session cookie + capability |
+| #   | Method | Path                       | Auth                              |
+| --- | ------ | -------------------------- | --------------------------------- |
+| 1   | POST   | `/api/admin/session`       | NChat access token (Bearer)       |
+| 2   | DELETE | `/api/admin/session`       | Admin session cookie + CSRF token |
+| 3   | GET    | `/api/admin/bootstrap`     | Admin session cookie              |
+| 4   | GET    | `/api/admin/audit/events`  | Admin session cookie + capability |
+| 5   | —      | Management (issue #579)    | Admin session cookie + capability |
+| 6   | —      | Configuration (issue #580) | Admin session cookie + capability |
 
 Every management route below is guarded in the same order: the administrative
 session, then — for a mutation — the origin and CSRF checks, then the one
@@ -858,18 +860,20 @@ Every mutation above writes one row to `auth.admin_audit_events` through the
 existing audit service, with the actor taken from the session and the
 correlation id minted by this service — never accepted from a header.
 
-| Action                         | Written by                                  |
-| ------------------------------ | ------------------------------------------- |
-| `admin.user.status.update`     | `PATCH /users/{id}/status`                  |
-| `admin.user.sessions.revoke`   | `DELETE /users/{id}/sessions`               |
-| `admin.user.role.grant`        | `POST /users/{id}/admin-roles`              |
-| `admin.user.role.revoke`       | `DELETE /users/{id}/admin-roles/{slug}`     |
-| `admin.channel.status.update`  | `PATCH /channels/{id}/status`               |
-| `admin.channel.member.add`     | `POST /channels/{id}/members`               |
-| `admin.channel.member.remove`  | `DELETE /channels/{id}/members/{userID}`    |
-| `admin.policy.antispam.update` | `PATCH /policies/anti-spam/{workspaceID}`   |
-| `admin.policy.upload.update`   | `PATCH /policies/upload/{workspaceID}`      |
-| `admin.authorization.deny`     | Any capability refusal on any guarded route |
+| Action                         | Written by                                   |
+| ------------------------------ | -------------------------------------------- |
+| `admin.user.status.update`     | `PATCH /users/{id}/status`                   |
+| `admin.user.sessions.revoke`   | `DELETE /users/{id}/sessions`                |
+| `admin.user.role.grant`        | `POST /users/{id}/admin-roles`               |
+| `admin.user.role.revoke`       | `DELETE /users/{id}/admin-roles/{slug}`      |
+| `admin.channel.status.update`  | `PATCH /channels/{id}/status`                |
+| `admin.channel.member.add`     | `POST /channels/{id}/members`                |
+| `admin.channel.member.remove`  | `DELETE /channels/{id}/members/{userID}`     |
+| `admin.policy.antispam.update` | `PATCH /policies/anti-spam/{workspaceID}`    |
+| `admin.policy.upload.update`   | `PATCH /policies/upload/{workspaceID}`       |
+| `admin.config.update`          | `POST /config/apply`                         |
+| `admin.config.rollback`        | `POST /config/versions/{versionID}/rollback` |
+| `admin.authorization.deny`     | Any capability refusal on any guarded route  |
 
 Refusals are recorded too, and `result` distinguishes them: `denied` is the
 platform saying no, `error` is the platform breaking. Collapsing the two would
@@ -884,3 +888,311 @@ were added, how many were already members, and — for a removal — whether
 anything was actually removed, so the trail never claims a removal that did not
 happen. No token, header, cookie, password, client secret or message content is
 reachable from any producer.
+
+---
+
+## 6. Configuration (issue #580)
+
+The platform configuration catalogue: what exists, where each value comes from,
+and which part of it this API can change.
+
+Five routes, each one method and one capability:
+
+| Method | Path                                                      | Capability            |
+| ------ | --------------------------------------------------------- | --------------------- |
+| GET    | `/api/admin/config`                                       | `admin.config.read`   |
+| POST   | `/api/admin/config/preview`                               | `admin.config.read`   |
+| POST   | `/api/admin/config/apply`                                 | `admin.config.manage` |
+| GET    | `/api/admin/config/versions`                              | `admin.config.read`   |
+| POST   | `/api/admin/config/versions/{versionID}/rollback/preview` | `admin.config.read`   |
+| POST   | `/api/admin/config/versions/{versionID}/rollback`         | `admin.config.manage` |
+
+There is deliberately no `PATCH /config/{key}`. A key travels in a body and is
+resolved against a server-side registry
+(`internal/domain/config_catalog.go`); a key the registry does not declare is a
+`400`, and one it declares as read-only is a `400` as well. Nothing in a request
+names a service, an environment variable, a Secret, a file path, a namespace or
+a Kubernetes resource.
+
+### What is editable, and what is not
+
+Every setting carries an explicit class. The full inventory, including the
+settings this API does not expose, is
+[`docs/security/config-inventory.md`](../security/config-inventory.md).
+
+| Class | Meaning                        | Editable       |
+| ----- | ------------------------------ | -------------- |
+| A     | Runtime                        | **yes**        |
+| B     | Runtime with a credential      | does not exist |
+| C     | Read at boot; needs a rollout  | no             |
+| D     | Infrastructure and credentials | no             |
+
+Class A is exactly `auth.auth_policy_settings`, the single row auth-service
+reads on the request that enforces it, so **persisting is applying**: there is
+no rollout to follow, no "applying" state and no apply/rollback state machine —
+a setting that needed one would not be editable at all.
+
+There is no class B, because NChat has no secret backend this API can write.
+Credentials arrive as environment variables from Sealed Secrets and rotate
+through [`sealed-secrets-rotation.md`](../runbooks/sealed-secrets-rotation.md).
+
+### Credentials
+
+A stored credential is **never** returned. `GET /config` reports a sensitive
+setting as a status and omits `value` entirely:
+
+```json
+{
+  "key": "secret.smtp_password",
+  "sensitive": true,
+  "editable": false,
+  "observable": true,
+  "configured": true,
+  "read_only_reason": "Credencial em Sealed Secret; a rotacao segue docs/runbooks/sealed-secrets-rotation.md."
+}
+```
+
+`observable: false` means this pod does not receive the variable at all — a
+Secret scoped to another workload — which is a different fact from
+`configured: false` and is reported as such.
+
+Because no sensitive setting is editable, none can appear in a change set, in a
+diff or in the version history. The history table enforces that structurally:
+`value_from` and `value_to` are JSONB constrained by CHECK to `number`,
+`boolean` or `null`, so a string cannot be stored there at all.
+
+### `GET /api/admin/config`
+
+```json
+{
+  "data": {
+    "documents": [{ "key": "auth.policy", "revision": 3 }],
+    "settings": [
+      {
+        "key": "auth.password.min_length",
+        "label": "Tamanho minimo da senha",
+        "description": "…",
+        "category": "authentication",
+        "owner_service": "auth-service",
+        "class": "A",
+        "source": "database",
+        "apply": "runtime",
+        "type": "int",
+        "unit": "caracteres",
+        "min": 8,
+        "max": 128,
+        "nullable": false,
+        "default": 12,
+        "editable": true,
+        "sensitive": false,
+        "document": "auth.policy",
+        "manage_capability": "admin.config.manage",
+        "danger_note": "…",
+        "rollbackable": true,
+        "observable": true,
+        "value": 12
+      }
+    ]
+  }
+}
+```
+
+`revision` is the concurrency token. It is echoed back on every write.
+
+### `POST /api/admin/config/preview`
+
+```json
+{
+  "document": "auth.policy",
+  "expected_revision": 3,
+  "changes": { "auth.password.min_length": 16 }
+}
+```
+
+Writes nothing and answers `200` with the plan the server would act on:
+
+```json
+{
+  "data": {
+    "plan": {
+      "document": "auth.policy",
+      "revision": 3,
+      "stale": false,
+      "changes": [
+        {
+          "key": "auth.password.min_length",
+          "label": "Tamanho minimo da senha",
+          "category": "authentication",
+          "owner_service": "auth-service",
+          "apply": "runtime",
+          "unit": "caracteres",
+          "dangerous": false,
+          "from": 12,
+          "to": 16
+        }
+      ],
+      "dangerous": false,
+      "required_capability": "admin.config.manage",
+      "authorized": true,
+      "reason_required": false,
+      "warnings": [],
+      "errors": [],
+      "affected_services": ["auth-service"],
+      "apply": "runtime"
+    }
+  }
+}
+```
+
+Field-level validation messages live here, in `errors`, and every invalid field
+is reported at once. `stale: true` means the document moved since the form was
+loaded. Values equal to what is stored are dropped from `changes`, so a form
+that submits every field it rendered produces a diff of what actually changed.
+
+### `POST /api/admin/config/apply`
+
+Same body as the preview, plus an optional `reason`. Requires
+`admin.config.manage`, and **additionally `admin.superuser`** when any resulting
+value is dangerous — a change that weakens authentication is a change to who can
+reach the platform. A dangerous change also requires a non-empty `reason`.
+
+The write is a compare-and-swap:
+
+```sql
+UPDATE auth.auth_policy_settings
+SET … , revision = revision + 1
+WHERE id = 1 AND revision = $expected
+```
+
+so the check and the write are one statement and one snapshot. Two
+administrators saving at once produce one write and one `409`; there is no
+last-write-wins path and nothing is merged.
+
+| Status | Meaning                                                               |
+| ------ | --------------------------------------------------------------------- |
+| `200`  | Applied, or nothing to apply.                                         |
+| `400`  | Unknown key, read-only key, wrong type, out of range, missing reason. |
+| `403`  | The capability the resulting value demands is not held.               |
+| `409`  | The document moved since the form was loaded. Nothing was written.    |
+
+Failures use the platform error envelope and carry no plan: the detailed,
+per-field answer is what the preview endpoint exists to produce.
+
+```json
+{
+  "data": {
+    "applied": true,
+    "document": "auth.policy",
+    "revision": 4,
+    "values": { "auth.password.min_length": 16 },
+    "plan": { "…": "the plan that was applied" },
+    "version": { "id": "8", "revision": 4, "reverts_revision": 0, "…": "…" }
+  }
+}
+```
+
+`applied: false` with `200` is the idempotent case: the requested values are
+already the stored values, so nothing is written, no version is recorded and no
+audit event is raised. A resubmitted form lands here instead of creating a
+second version that changed nothing.
+
+`values` and `revision` describe the row the write itself returned, not a
+re-read of it. Once the transaction commits, the response, the audit event and
+the recorded version all describe that commit; nothing that happens afterwards
+can turn `applied` back to false or lose the version id. A client told a
+mutation failed would send it again, so a committed change is never reported as
+one that did not happen.
+
+### `GET /api/admin/config/versions`
+
+`?document=auth.policy&limit=25`. Newest first, limit clamped to 100. An unknown
+document is a `400`, never an empty list.
+
+Each version records the revision it produced, the actor, the correlation id,
+the operator's stated reason, the fields it changed with their previous and new
+values, and `reverts_revision` when it was a rollback. `rollbackable` says
+whether the platform can still undo it.
+
+### `POST /api/admin/config/versions/{versionID}/rollback/preview`
+
+```json
+{ "expected_revision": 12 }
+```
+
+Writes nothing, and answers `200` with the same `plan` shape the ordinary
+preview returns.
+
+A rollback has its own preview because it is not an edit that happens to carry
+old values. The request names **only** the version and the revision this client
+last read; the values to restore, the preconditions, the eligibility and the
+verdict are all derived server-side from the recorded version, by the same code
+the confirmed rollback runs. A client does not send `changes`, `from`, `to`,
+preconditions or `superseded` — a body carrying any of them is a `400`.
+
+The diff describes the version's own transition (`version.To -> version.From`),
+not a diff against whatever the document holds now. While the version is still
+in force the two are identical; when it is not, describing it against the
+current value would present a different operation than the one requested.
+
+### `POST /api/admin/config/versions/{versionID}/rollback`
+
+```json
+{ "expected_revision": 4, "reason": "reverter" }
+```
+
+Restores the values the named version replaced, as a **new** version that names
+the one it reverts. The history is append-only: an apply/rollback sequence reads
+as three changes rather than as a change that vanished.
+
+A rollback is refused when the previous value is no longer acceptable under
+today's registry, when a key no longer exists, or when the resulting value is
+dangerous and the actor does not hold `admin.superuser`. Undoing a hardening is
+producing a weakening, and is judged as one.
+
+**A superseded version cannot be reverted.** `plan.superseded` is `true` when at
+least one field of the target version no longer holds the value that version
+set. The preview reports it in advance, the console shows why and refuses to
+offer the confirmation, and the apply revalidates it atomically regardless — a
+preview is informative and never an authorization to write, because the document
+can move between the two requests.
+
+Every field the version changed must still hold the value that version set. Reverting `10 -> 20` after somebody
+has since moved the value to `30` would discard their change, and the revision
+cannot catch it — the console loaded _after_ they wrote, so its revision is
+current. The write asserts both, in the same statement:
+
+```sql
+UPDATE auth.auth_policy_settings
+SET … , revision = revision + 1
+WHERE id = 1
+  AND revision = $expected
+  AND max_devices_per_user IS NOT DISTINCT FROM $precondition
+```
+
+so the check and the write are one step with no window between them. A
+superseded rollback matches no row, writes nothing, records no version and
+answers `409`.
+
+`plan.superseded` and `plan.stale` are different fields because they are
+different facts with different remedies:
+
+| Field        | Means                                                 | Remedy                        |
+| ------------ | ----------------------------------------------------- | ----------------------------- |
+| `stale`      | The document moved since **this client** read it.     | Reload and review again.      |
+| `superseded` | The **target version** is no longer the one in force. | Revert a more recent version. |
+
+A superseded rollback usually has `stale: false`: the console loaded _after_ the
+change that superseded the version, so its revision is perfectly current. That
+is precisely why optimistic locking alone cannot catch it.
+
+Rollback is all or nothing. If one field of the version has moved on, the whole
+rollback is refused rather than restoring the fields that still match.
+
+### Audit
+
+`admin.config.update` and `admin.config.rollback` carry, in metadata built field
+by field: the document, both revisions, the version id, the changed keys with
+their `from -> to`, whether the change was dangerous, the capability it
+required, the validation outcome, and whether a reason was given. The reason
+_text_ is deliberately not copied there — it is operator prose, it is already
+persisted on the version row, and the version id is how the two are joined.

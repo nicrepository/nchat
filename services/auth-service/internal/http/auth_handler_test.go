@@ -360,6 +360,31 @@ func TestAuthLogin_InvalidCredentialsReturns401(t *testing.T) {
 	}
 }
 
+// An expired password is a 401 that says which 401 it is. It is only reachable
+// once the password has already been verified, so it tells nobody anything they
+// did not already hold — and the owner needs it, or they retry a correct
+// password until something else stops them.
+func TestAuthLogin_ExpiredPasswordReturnsItsOwn401(t *testing.T) {
+	handler := httpapi.AuthLogin(&fakeLoginService{err: domain.ErrPasswordExpired}, nil, 0)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, httpapi.RouteAuthLogin,
+		strings.NewReader(`{"email":"user@example.com","password":"correct"}`))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "password_expired") {
+		t.Fatalf("expected password_expired code in body: %s", body)
+	}
+	// Not an internal error, and not silently folded into the generic refusal.
+	if strings.Contains(body, "internal") || strings.Contains(body, "invalid_credentials") {
+		t.Fatalf("expired password must not be reported as another failure: %s", body)
+	}
+}
+
 func TestAuthLogin_InvalidJSONReturns400(t *testing.T) {
 	handler := httpapi.AuthLogin(&fakeLoginService{}, nil, 0)
 	rec := httptest.NewRecorder()

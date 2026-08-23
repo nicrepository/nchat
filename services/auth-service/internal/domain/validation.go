@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -22,6 +23,27 @@ func ValidateEmail(email string) error {
 
 func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// PasswordExpired reports whether a password set at changedAt is too old to
+// authenticate with at the instant now.
+//
+// The rule is a pure function of three inputs and reads no clock of its own, so
+// the boundary is testable exactly rather than approximately.
+//
+// Two states are never expired, and both matter:
+//   - a policy of zero days, which is "passwords do not expire";
+//   - a zero changedAt, which means the caller does not know when the password
+//     was set. Treating an unknown age as infinitely old would lock out every
+//     account the moment an expiry is configured.
+func PasswordExpired(changedAt time.Time, now time.Time, policy PolicySettings) bool {
+	if policy.PasswordExpirationDays <= 0 || changedAt.IsZero() {
+		return false
+	}
+	// The password stops working once it is strictly older than the configured
+	// window, so a password set exactly N days ago still authenticates on its
+	// last day rather than one day early.
+	return now.Sub(changedAt) > time.Duration(policy.PasswordExpirationDays)*24*time.Hour
 }
 
 func ValidatePassword(password string, policy PolicySettings) error {
