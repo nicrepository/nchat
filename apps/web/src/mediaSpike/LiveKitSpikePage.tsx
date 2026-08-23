@@ -173,6 +173,7 @@ export default function LiveKitSpikePage({
       onRemoteVideoAvailabilityChanged: () => undefined,
       onActiveSpeakersChanged: () => undefined,
       onScreenShareChanged: () => undefined,
+      onLocalScreenShareChanged: () => undefined,
       onRemoteScreenShareChanged: () => undefined,
     };
   }

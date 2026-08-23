@@ -148,6 +148,7 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onRemoteVideoAvailabilityChanged: vi.fn(),
     onActiveSpeakersChanged: vi.fn(),
     onScreenShareChanged: vi.fn(),
+    onLocalScreenShareChanged: vi.fn(),
     onRemoteScreenShareChanged: vi.fn(),
   };
 }
@@ -287,19 +288,176 @@ describe("createLiveKitSpikeSession", () => {
     expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
   });
 
-  it("keeps remote screen share separate from participant camera video", () => {
+  it("keeps remote screen share separate from participant camera video, carrying trackSid", () => {
     const { handlers, room } = setup();
     const participant = { sid: "participant-a", identity: "identity-a" };
     const element = document.createElement("video");
     const track = createTrack("video", element);
-    const publication = { source: liveKitMock.sources.ScreenShare };
+    const publication = { source: liveKitMock.sources.ScreenShare, trackSid: "track-sid-1" };
 
     room.emit(liveKitMock.events.TrackSubscribed, track, publication, participant);
-    expect(handlers.onRemoteScreenShareChanged).toHaveBeenCalledWith("identity-a", element);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenCalledWith(
+      "identity-a",
+      "track-sid-1",
+      element,
+      true,
+    );
     expect(handlers.onRemoteElement).not.toHaveBeenCalled();
 
     room.emit(liveKitMock.events.TrackUnsubscribed, track, publication, participant);
-    expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith("identity-a", null);
+    expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith(
+      "identity-a",
+      "track-sid-1",
+      element,
+      false,
+    );
+  });
+
+  describe("local screen-share preview (issue #611)", () => {
+    it("attaches only the already-created LiveKit local screen track, never a second capture", async () => {
+      const { handlers, room, session } = setup();
+      const element = document.createElement("video");
+      const track = createTrack("video", element);
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+
+      await session.setScreenShareEnabled(true);
+
+      expect(track.attach).toHaveBeenCalledOnce();
+      expect(element.autoplay).toBe(true);
+      expect(element.muted).toBe(true);
+      expect(element.playsInline).toBe(true);
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledExactlyOnceWith(element);
+      expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(true);
+    });
+
+    it("clears the local preview on explicit stop", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+      await session.setScreenShareEnabled(true);
+      vi.mocked(handlers.onLocalScreenShareChanged).mockClear();
+
+      await session.setScreenShareEnabled(false);
+
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledExactlyOnceWith(null);
+      expect(handlers.onScreenShareChanged).toHaveBeenLastCalledWith(false);
+    });
+
+    it("clears the local preview on native LocalTrackUnpublished", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+      await session.setScreenShareEnabled(true);
+      vi.mocked(handlers.onLocalScreenShareChanged).mockClear();
+
+      room.emit(
+        liveKitMock.events.LocalTrackUnpublished,
+        { source: liveKitMock.sources.ScreenShare },
+        room.localParticipant,
+      );
+
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledExactlyOnceWith(null);
+      expect(handlers.onScreenShareChanged).toHaveBeenLastCalledWith(false);
+    });
+
+    it("does not attach a local preview when enable resolves after disposal, and leaves no share behind", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      const publication = deferredValue<unknown>();
+      room.localParticipant.setScreenShareEnabled.mockReturnValueOnce(publication.promise);
+
+      const enabling = session.setScreenShareEnabled(true);
+      await session.disconnect();
+      publication.resolve({ track });
+      await enabling;
+
+      expect(track.attach).not.toHaveBeenCalled();
+      expect(handlers.onLocalScreenShareChanged).not.toHaveBeenCalled();
+      expect(room.localParticipant.setScreenShareEnabled.mock.calls).toEqual([[true], [false]]);
+      expect(room.localParticipant.setScreenShareEnabled).toHaveBeenLastCalledWith(false);
+    });
+
+    it("clears an already-attached local preview on teardown", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+      await session.setScreenShareEnabled(true);
+      vi.mocked(handlers.onLocalScreenShareChanged).mockClear();
+
+      await session.disconnect();
+
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledExactlyOnceWith(null);
+    });
+
+    it("reconnect resync reattaches the surviving local publication without calling enable/getDisplayMedia", () => {
+      const { handlers, room } = setup();
+      const track = createTrack("video");
+      Object.assign(track, { mediaStreamTrack: { readyState: "live" } });
+      room.localParticipant.getTrackPublication.mockReturnValue({ track });
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(track.attach).toHaveBeenCalledOnce();
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledWith(expect.any(HTMLElement));
+      expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(true);
+      expect(room.localParticipant.setScreenShareEnabled).not.toHaveBeenCalled();
+    });
+
+    it("reconnect resync converges to false and clears the preview when the publication disappeared", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+      await session.setScreenShareEnabled(true);
+      vi.mocked(handlers.onLocalScreenShareChanged).mockClear();
+      vi.mocked(handlers.onScreenShareChanged).mockClear();
+      room.localParticipant.getTrackPublication.mockReturnValue(undefined);
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledWith(null);
+      expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
+      // Only the earlier explicit enable — reconnect resync never calls the
+      // SDK again, it only reads existing publication state.
+      expect(room.localParticipant.setScreenShareEnabled).toHaveBeenCalledTimes(1);
+    });
+
+    it("reconnect resync converges to false and clears an attached preview when the underlying capture track already ended", async () => {
+      const { handlers, room, session } = setup();
+      const track = createTrack("video");
+      room.localParticipant.setScreenShareEnabled.mockResolvedValueOnce({ track });
+      await session.setScreenShareEnabled(true);
+      vi.mocked(handlers.onLocalScreenShareChanged).mockClear();
+      vi.mocked(handlers.onScreenShareChanged).mockClear();
+      Object.assign(track, { mediaStreamTrack: { readyState: "ended" } });
+      room.localParticipant.getTrackPublication.mockReturnValue({ track });
+
+      room.emit(liveKitMock.events.Reconnected);
+
+      expect(track.attach).toHaveBeenCalledOnce();
+      expect(handlers.onLocalScreenShareChanged).toHaveBeenCalledWith(null);
+      expect(handlers.onScreenShareChanged).toHaveBeenCalledWith(false);
+      expect(room.localParticipant.setScreenShareEnabled).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("remote screen-share participant disconnect (issue #611)", () => {
+    it("removes a presenting participant's screen share, carrying its trackSid and element, on disconnect", () => {
+      const { handlers, room } = setup();
+      const participant = { sid: "participant-a", identity: "identity-a" };
+      const element = document.createElement("video");
+      const track = createTrack("video", element);
+      const publication = { source: liveKitMock.sources.ScreenShare, trackSid: "track-sid-a" };
+
+      room.emit(liveKitMock.events.TrackSubscribed, track, publication, participant);
+      room.emit(liveKitMock.events.ParticipantDisconnected, participant);
+
+      expect(handlers.onRemoteScreenShareChanged).toHaveBeenLastCalledWith(
+        "identity-a",
+        "track-sid-a",
+        element,
+        false,
+      );
+    });
   });
 
   it("attaches remote video and audio once per track", async () => {

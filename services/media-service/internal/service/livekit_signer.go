@@ -83,7 +83,7 @@ func encodeLiveKitToken(apiKey, apiSecret, identity, displayName, room string, t
 	grant := &auth.VideoGrant{
 		RoomJoin:          true,
 		Room:              room,
-		CanPublishSources: []string{"camera", "microphone"},
+		CanPublishSources: []string{"camera", "microphone", "screen_share"},
 	}
 	grant.SetCanPublish(true)
 	grant.SetCanSubscribe(true)

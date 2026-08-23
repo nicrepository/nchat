@@ -25,7 +25,14 @@ interface FloatingCallWindowProps {
   status: "connecting" | "connected" | "reconnecting" | "failed";
   participantCount: number;
   activeSpeakerName?: string;
-  screenShareActive?: boolean;
+  /**
+   * Compact screen-share status text (issue #611) — "Você está
+   * compartilhando a tela" or "<displayName> está compartilhando a tela".
+   * Undefined/absent renders no indicator at all. Deliberately just text:
+   * no preview, no second grid — kept identical in shape/position to the
+   * previous boolean indicator so there is no layout jump.
+   */
+  screenShareLabel?: string;
   startedAt?: string;
   controls: CallControlProps;
   onExpand: () => unknown;
@@ -75,7 +82,7 @@ export default function FloatingCallWindow({
   status,
   participantCount,
   activeSpeakerName,
-  screenShareActive = false,
+  screenShareLabel,
   controls,
   onExpand,
   bindLocalMedia,
@@ -246,7 +253,7 @@ export default function FloatingCallWindow({
         {activeSpeakerName && (
           <span className="floating-call__speaker">{activeSpeakerName} está falando</span>
         )}
-        {screenShareActive && <span className="floating-call__share">Compartilhando tela</span>}
+        {screenShareLabel && <span className="floating-call__share">{screenShareLabel}</span>}
       </div>
       <CallControls {...controls} />
       {identityStatus === "loading" && (

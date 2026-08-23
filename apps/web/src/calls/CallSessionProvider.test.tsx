@@ -339,6 +339,9 @@ function Probe() {
       <button type="button" onClick={() => void session.media.toggleCamera()}>
         Toggle camera probe
       </button>
+      <button type="button" onClick={() => void session.media.toggleScreenShare()}>
+        Toggle screen share probe
+      </button>
       <button
         type="button"
         onClick={() =>
@@ -1877,6 +1880,179 @@ describe("releaseDedicated stops media before releasing ownership (achado #4)", 
     await act(async () => vi.advanceTimersByTime(1_500));
     expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     expect(resource.reconnect).toHaveBeenCalled();
+  });
+});
+
+// Issue #611: only the current owner of the ACTIVE call may start screen
+// share; stop must always be allowed through so an active share can never
+// get stuck when the lease vanishes; and no ownership transition may ever
+// auto-resume a share on the new/recovered owner (screen share is never
+// persisted, unlike #610's mic/camera MediaIntent).
+describe("screen-share ownership fence and non-resumption (issue #611)", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+    participationStorage = {};
+    calls.call = null;
+    calls.error = null;
+    calls.mediaActivationRequired = false;
+    resource.active = null;
+    resource.callId = null;
+    resource.status = "idle";
+    resource.error = null;
+    media.status = "connected";
+    media.error = null;
+    media.participants = [];
+    media.screenShareEnabled = false;
+    ownership.getLease.mockReturnValue(null);
+    ownership.getOwner.mockReturnValue(null);
+    ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
+    vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
+    vi.mocked(useCallMedia).mockReturnValue(media as never);
+    vi.mocked(useCallSignaling).mockReturnValue(calls as never);
+    vi.mocked(useResourceCallSession).mockReturnValue(resource as never);
+    vi.mocked(acquireChatSocket).mockImplementation((listener) => {
+      socketListener = listener;
+      return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
+    });
+  });
+
+  it("a tab with no current lease cannot start screen share", () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Toggle screen share probe" }));
+    expect(media.toggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  it("a lease for a different call cannot authorize screen-share START", async () => {
+    renderProvider();
+    const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    expect(screen.getByTestId("owner")).toHaveTextContent("local");
+
+    // This tab's own active call is now a DIFFERENT call than the lease it
+    // holds (e.g. a stale lease from a prior call) — force a re-render so
+    // activeCallId is recomputed before probing. ownership.getLease is set
+    // to the ORIGINAL lease (matching the fixture `callId`), so this
+    // specifically exercises the callId-mismatch branch, never "no lease".
+    ownership.getLease.mockReturnValue(lease);
+    calls.call = { ...activeDirect(), call_id: "00000000-0000-4000-8000-000000000999" };
+    fireEvent.click(screen.getByRole("button", { name: "Perfil" }));
+    fireEvent.click(screen.getByRole("button", { name: "Toggle screen share probe" }));
+
+    expect(media.toggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  it("the current owner can start screen share on a direct call", async () => {
+    renderProvider();
+    const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    expect(screen.getByTestId("owner")).toHaveTextContent("local");
+
+    // ownedMedia.connect() only claims the lease — it never drives
+    // useCallSignaling's own `calls.call`/getLease() mocks, which the test
+    // must keep in sync itself (same pattern as the "claims media once..."
+    // test above) so activeCallId/getLease() reflect this tab's real call.
+    calls.call = activeDirect();
+    ownership.getLease.mockReturnValue(lease);
+    fireEvent.click(screen.getByRole("button", { name: "Perfil" }));
+    fireEvent.click(screen.getByRole("button", { name: "Toggle screen share probe" }));
+
+    await waitFor(() => expect(media.toggleScreenShare).toHaveBeenCalledOnce());
+  });
+
+  it("the current owner can start screen share on a resource/group call", async () => {
+    renderProvider();
+    const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    expect(screen.getByTestId("owner")).toHaveTextContent("local");
+
+    // Switch this tab's active call to the resource-call fixture (same
+    // callId as the held lease) so activeCallId is derived from the
+    // resource branch instead of the direct-call branch.
+    calls.call = null;
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    ownership.getLease.mockReturnValue(lease);
+    fireEvent.click(screen.getByRole("button", { name: "Perfil" }));
+    fireEvent.click(screen.getByRole("button", { name: "Toggle screen share probe" }));
+
+    await waitFor(() => expect(media.toggleScreenShare).toHaveBeenCalledOnce());
+  });
+
+  it("stop is allowed through even when ownership/lease has just been lost", async () => {
+    media.screenShareEnabled = true;
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Toggle screen share probe" }));
+    await waitFor(() => expect(media.toggleScreenShare).toHaveBeenCalledOnce());
+  });
+
+  it("ownership loss stops media, tearing down an active screen share", async () => {
+    media.screenShareEnabled = true;
+    renderProvider();
+    act(() => ownershipLost());
+    await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
+    expect(screen.getByTestId("owner")).toHaveTextContent("remote");
+  });
+
+  it("floating -> dedicated handoff stops media and never restarts screen share on the outgoing tab", async () => {
+    media.screenShareEnabled = true;
+    calls.call = activeDirect();
+    ownership.getLease.mockReturnValue(lease);
+    renderProvider();
+
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+
+    await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
+    expect(media.toggleScreenShare).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
+  });
+
+  it("dedicated minimize (releaseDedicated) stops media and never restarts screen share", async () => {
+    media.screenShareEnabled = true;
+    renderProvider(`/call/${callId}`);
+
+    fireEvent.click(screen.getByRole("button", { name: "Release probe" }));
+
+    await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
+    expect(media.toggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  it("ownership recovery reconnects media without auto-resuming screen share", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "connecting";
+    ownership.getLease.mockReturnValue(lease);
+    vi.useFakeTimers();
+    renderProvider();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    ownership.getOwner.mockReturnValue(null);
+    await act(async () => vi.advanceTimersByTime(1_500));
+
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
+    expect(resource.reconnect).toHaveBeenCalled();
+    expect(media.toggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  it("ordinary chat route navigation does not stop an active screen share", () => {
+    media.screenShareEnabled = true;
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Perfil" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal" }));
+    expect(screen.getByText("Canal", { selector: "p" })).toBeInTheDocument();
+    expect(media.stop).not.toHaveBeenCalled();
+    expect(media.screenShareEnabled).toBe(true);
   });
 });
 

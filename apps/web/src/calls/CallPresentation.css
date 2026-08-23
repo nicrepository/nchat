@@ -355,6 +355,19 @@
   border-radius: 0.85rem;
   background: #111827;
 }
+/*
+ * Primary screen-share tile (issue #611): spans every column of the
+ * existing auto-fit grid so it reads as the primary content area, with a
+ * clearly taller aspect than a participant tile. Every other tile (camera
+ * previews/avatars) stays exactly where it already is in the same grid,
+ * which — once this tile claims the full row above them — is what forms the
+ * secondary strip, with no separate layout system to keep in sync.
+ */
+.dedicated-call__tile--screen {
+  grid-column: 1 / -1;
+  min-height: min(60vh, 34rem);
+  aspect-ratio: 16 / 9;
+}
 .dedicated-call__tile > span {
   position: absolute;
   bottom: 0.5rem;
