@@ -1,13 +1,13 @@
 # Admin Service — Admin API
 
 > **Scope:** the Admin Console foundation (issue #578), the management surface
-> (issue #579) and configuration management (issue #580). This document covers
-> the endpoints that exist today: the administrative session handshake, the
-> console bootstrap, the audit trail, the platform user directory, the channel
-> and conversation directories, the two operational policies that are
-> configurable at runtime, and the platform configuration catalogue. Integrations
-> administration and a Health Center are **not** implemented and are not
-> described here.
+> (issue #579), configuration management (issue #580) and platform observability
+> (issue #581). This document covers the endpoints that exist today: the
+> administrative session handshake, the console bootstrap, the audit trail, the
+> platform user directory, the channel and conversation directories, the two
+> operational policies that are configurable at runtime, the platform
+> configuration catalogue, and the operational dashboard and Health Center.
+> Integrations administration is **not** implemented and is not described here.
 
 Public base: `/api/admin`. The gateways rewrite `/api/admin/<rest>` to
 `/<rest>` before the request reaches the pod, so the paths admin-service
@@ -38,6 +38,7 @@ Every response uses the platform envelope: `{"data": …}` on success,
 | 4   | GET    | `/api/admin/audit/events`  | Admin session cookie + capability |
 | 5   | —      | Management (issue #579)    | Admin session cookie + capability |
 | 6   | —      | Configuration (issue #580) | Admin session cookie + capability |
+| 7   | —      | Observability (issue #581) | Admin session cookie + capability |
 
 Every management route below is guarded in the same order: the administrative
 session, then — for a mutation — the origin and CSRF checks, then the one
@@ -1196,3 +1197,266 @@ their `from -> to`, whether the change was dangerous, the capability it
 required, the validation outcome, and whether a reason was given. The reason
 _text_ is deliberately not copied there — it is operator prose, it is already
 persisted on the version row, and the version id is how the two are joined.
+
+---
+
+## 7. Observability — Dashboard and Health Center (issue #581)
+
+| Method | Path                         | Capability                  |
+| ------ | ---------------------------- | --------------------------- |
+| GET    | `/api/admin/overview`        | `admin.infrastructure.read` |
+| GET    | `/api/admin/health/services` | `admin.infrastructure.read` |
+| POST   | `/api/admin/health/refresh`  | `admin.infrastructure.read` |
+
+No new capability was introduced. `admin.infrastructure.read` already exists in
+the platform, in the `CHECK` on `auth.admin_role_capabilities` (migration 000008) and in the console's navigation map, where it has named the Health
+Center and the system section since the foundation issue. The refresh is a
+`POST`, so it also passes the origin and CSRF guards like every other non-safe
+method.
+
+Reads are guarded exactly like writes here, for the same reason the audit trail
+and the configuration catalogue are: the dashboard reports how many people are
+signed in and how much traffic the platform carries, and the Health Center names
+every dependency the deployment has. Both are reconnaissance for anyone who
+should not be holding this session.
+
+### What these endpoints do not accept
+
+**No request to this surface names a destination.** There is no field, no query
+parameter and no body anywhere in it that carries a URL, a hostname, an IP
+address, a port, a DSN, a namespace or a path, and there is no
+`/health/{service}` route. The refresh takes no body at all.
+
+The listing accepts exactly one optional parameter, `?service=<id>`, and it is
+resolved against a compile-time registry
+(`services/admin-service/internal/domain/health.go`) before anything reads it:
+an identifier the platform does not declare is a `400`, never a filter that
+matches nothing and never — under any circumstance — an address. The addresses
+the service is willing to contact come from the pod's own environment, resolved
+at collection time from the ConfigMap and Secrets the deployment chose to mount.
+
+That is what keeps a detailed health check from becoming an SSRF primitive, and
+it is a property of the design rather than of a validator: there is no code path
+from an HTTP request to a dial target.
+
+Two further rules hold on the outbound side: TLS verification is never relaxed
+(there is no `InsecureSkipVerify` in the service), and redirects are never
+followed, so a dependency that answers `302` does not get to nominate a second
+address for the pod to connect to.
+
+### `GET /api/admin/overview`
+
+The whole dashboard in one request. There is deliberately no per-card endpoint.
+
+```json
+{
+  "data": {
+    "summary": {
+      "collected_at": "2026-08-22T12:00:00Z",
+      "overall": "degraded",
+      "state_counts": {
+        "healthy": 5,
+        "degraded": 1,
+        "unavailable": 1,
+        "disabled": 2,
+        "unknown": 1
+      },
+      "metrics": [
+        {
+          "key": "users.active_now",
+          "label": "Usuários ativos agora",
+          "definition": "Contas distintas com ao menos uma sessão de chat viva…",
+          "window": "instant",
+          "unit": "count",
+          "value": 3,
+          "available": true
+        }
+      ],
+      "metrics_available": true,
+      "alerts": [
+        {
+          "service_id": "livekit",
+          "severity": "warning",
+          "title": "LiveKit indisponível",
+          "impact": "Servidor de mídia das chamadas…",
+          "action": "Verifique se a dependência está de pé…",
+          "since": "2026-08-22T12:00:00Z",
+          "runbook_path": "docs/runbooks/task-livekit-coturn-dev.md",
+          "config_key": "calls.livekit.enabled"
+        }
+      ]
+    }
+  }
+}
+```
+
+`collected_at` describes the **data**, not the request: it is when the health
+snapshot was taken, which is what the console shows as "última atualização".
+
+**`value` is absent when `available` is false.** A counter the aggregate could
+not produce is never sent as `0`: "nothing happened" and "we could not find out"
+look identical on a card and mean opposite things. `metrics_available` is a
+single flag for the whole set because the counters come from one query — either
+it ran or it did not.
+
+Every metric carries its own `definition` and `window`. The full table, with the
+source and cost of each counter, is in
+[`../runbooks/task-admin-observability.md`](../runbooks/task-admin-observability.md).
+
+The counters are aggregates only. No identifier, no message body, no filename,
+no e-mail address and no URL is selected by the query that produces them, so the
+endpoint reveals volume and never content.
+
+A failing counter query does **not** fail the request: the summary is returned
+with `metrics_available: false`, because the health section is what would tell
+an operator that the database is the problem. A failing health collection _does_
+fail the request, since without it there is no overall state, no counters by
+state and no alerts.
+
+### `GET /api/admin/health/services`
+
+```json
+{
+  "data": {
+    "collected_at": "2026-08-22T12:00:00Z",
+    "overall": "degraded",
+    "services": [
+      {
+        "id": "livekit",
+        "display_name": "LiveKit",
+        "category": "realtime",
+        "impact": "Servidor de mídia das chamadas…",
+        "state": "unavailable",
+        "enabled": true,
+        "observable": true,
+        "critical": false,
+        "latency_ms": 3001,
+        "checked_at": "2026-08-22T12:00:00Z",
+        "error_category": "connection_timeout",
+        "detail": "A dependência não respondeu dentro do tempo limite do check.",
+        "runbook_path": "docs/runbooks/task-livekit-coturn-dev.md",
+        "config_key": "calls.livekit.enabled"
+      }
+    ]
+  }
+}
+```
+
+Rows arrive ordered by how much attention each demands. The console re-sorts and
+filters locally — the payload is a dozen rows, so a round trip to hide three of
+them would add a parameter and save nothing.
+
+`latency_ms` is **absent** when no round trip was measured. It is never `0` as a
+stand-in: a disabled integration has no latency, and reporting one would claim a
+check that did not happen. `checked_at` is always present.
+
+### The five states
+
+| State         | Means                                                           |
+| ------------- | --------------------------------------------------------------- |
+| `healthy`     | The check ran and the dependency answered correctly.            |
+| `degraded`    | It answered, and something about the answer warrants attention. |
+| `unavailable` | The check ran and it did not answer.                            |
+| `disabled`    | The deployment switched the integration off. **Not** a failure. |
+| `unknown`     | No check ran, so the platform knows nothing. **Not** healthy.   |
+
+Three invariants the API upholds and the tests pin:
+
+- **`configured` is not `healthy`.** A dependency with complete configuration
+  and no reachable process comes back `unavailable`. The state is produced by a
+  connection attempt, never by the presence of a value.
+- **`unknown` is never `healthy`.** It is what `enabled: true, observable:
+false` produces, and the overall state degrades to `degraded` when any row is
+  unknown rather than staying `healthy`.
+- **`disabled` is not `unavailable`.** It raises no alert and contributes
+  nothing to the overall state.
+
+`enabled` and `observable` are two different facts, reported alongside the state
+and never instead of it:
+
+| `enabled` | `observable` | State                   | Why                                                       |
+| --------- | ------------ | ----------------------- | --------------------------------------------------------- |
+| `false`   | —            | `disabled`              | The deployment turned it off.                             |
+| `true`    | `false`      | `unknown`               | This pod does not receive the config naming the endpoint. |
+| `true`    | `true`       | the result of the check | It was really contacted.                                  |
+
+The second row is not a defect: `admin-service` mounts the shared ConfigMap and
+only the two Secrets it needs, so a target scoped to another workload is
+genuinely invisible from here. That is the same `observable` / `configured`
+distinction issue #580 established in the configuration catalogue, and reporting
+it as `unknown` is the honest answer.
+
+### `error_category`
+
+A closed set. **No library error text, driver message, remote response body or
+stack trace ever reaches a client** — a failure is classified into one of these
+and the original is discarded, and `detail` is a hand-written sentence, not
+something a dependency produced.
+
+| Category                 | Means                                                    |
+| ------------------------ | -------------------------------------------------------- |
+| `connection_timeout`     | It did not answer in time.                               |
+| `authentication_failed`  | It answered and refused the credential this pod holds.   |
+| `tls_error`              | The transport could not be secured. Never worked around. |
+| `dependency_unavailable` | Connection refused or reset, or a server error.          |
+| `invalid_configuration`  | The deployment describes something unusable.             |
+| `capacity_warning`       | It answered close to a limit, or well past its budget.   |
+| `not_observable`         | No check ran; this pod cannot see the target.            |
+| `protocol_error`         | It answered something this build cannot interpret.       |
+
+The only field carrying text a dependency produced is `version`, and it passes a
+character allowlist and a length cap first.
+
+### `POST /api/admin/health/refresh`
+
+No body. Answers with the same payload as the listing, from a freshly forced
+collection.
+
+Abuse is bounded server-side rather than by the button being disabled:
+
+- concurrent requests share **one** in-flight collection;
+- a forced collection below a minimum interval returns the current snapshot
+  instead of recollecting;
+- an ordinary read is served from a short-lived cached snapshot.
+
+So a held-down refresh, or a dashboard open in ten tabs, costs one collection per
+interval regardless of how many requests arrive.
+
+### Checks, timeouts and isolation
+
+Each dependency has its own short timeout — there is no single large budget for
+the whole collection, because one stuck dependency would then consume everyone
+else's. Concurrency is bounded, and the collection runs under a context detached
+from the request that started it, so a browser tab that closes cannot cancel a
+computation other waiters are sharing.
+
+A probe that fails, times out or panics becomes **that service's row**. Nothing
+propagates: the response is still `200` describing what was learned.
+
+What the probes deliberately do not do: no real user login against the identity
+provider, no e-mail sent through the relay, no persistent LiveKit room, no EICAR
+sample written to the antimalware daemon, no listing of stored objects, and no
+call that would spend a third party's quota.
+
+### Errors
+
+| Status | Meaning                                                               |
+| ------ | --------------------------------------------------------------------- |
+| `200`  | Collected. Individual dependencies may be in any of the five states.  |
+| `400`  | `?service=` names an identifier the registry does not declare.        |
+| `401`  | No live administrative session.                                       |
+| `403`  | Missing `admin.infrastructure.read`, or a rejected origin/CSRF token. |
+| `503`  | The observability surface is not wired on this pod.                   |
+
+### Metrics exported by this surface
+
+`nchat_admin_health_check_duration_seconds{service}`,
+`nchat_admin_health_check_results_total{service,state}`,
+`nchat_admin_health_cache_events_total{result}` and
+`nchat_admin_dashboard_build_duration_seconds{outcome}`.
+
+Every label value comes from a closed set declared in code — a registry service
+id, one of the five states — so the series count is bounded by the size of two
+literals. No user id, e-mail, URL, request id, channel id or file id appears in
+a label. They are registered into the shared registry, so they are exported only
+when `PROMETHEUS_METRICS_ENABLED` is set, exactly like the rest of the platform's.

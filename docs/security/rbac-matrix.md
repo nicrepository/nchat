@@ -80,6 +80,7 @@ executam.
 | Alterar limite de upload (RF-32)            | nao          | sim                | **nao**   | nao     | nao   | idem                                                                                |
 | Listar/convidar/suspender usuarios          | sim          | sim                | **nao**   | nao     | nao   | `/auth/admin/*` resolve o workspace pela sessao; `/admin/*` pelo token de bootstrap |
 | Abrir o Admin Console                       | **sim**      | nao                | **nao**   | nao     | nao   | `auth.admin_principals` ativo com ao menos uma capability                           |
+| Ver o painel operacional e o Health Center  | **sim**      | nao                | **nao**   | nao     | nao   | `admin.infrastructure.read`; agregados de plataforma, nunca conteudo                |
 | Ler a auditoria administrativa              | **sim**      | nao                | **nao**   | nao     | nao   | capability `admin.audit.read`                                                       |
 | Listar usuarios da plataforma               | **sim**      | nao                | **nao**   | nao     | nao   | capability `admin.users.read`; escopo de plataforma, nao de workspace               |
 | Ativar/desativar conta pela plataforma      | **sim**      | nao                | **nao**   | nao     | nao   | `admin.users.manage`; nunca a propria conta                                         |
@@ -178,6 +179,7 @@ Onde essas capabilities decidem hoje (issue #579 fechou a maior parte da lacuna)
 | `admin.channels.manage`            | `PATCH /api/admin/channels/{id}/status`, `POST` e `DELETE /api/admin/channels/{id}/members[/{userID}]`, `GET /api/admin/channels/{id}/member-candidates` |
 | `admin.security.read/manage`       | `GET` e `PATCH /api/admin/policies/anti-spam[/{workspaceID}]`                                                                                            |
 | `admin.infrastructure.read/manage` | `GET` e `PATCH /api/admin/policies/upload[/{workspaceID}]`                                                                                               |
+| `admin.infrastructure.read`        | `GET /api/admin/overview`, `GET /api/admin/health/services`, `POST /api/admin/health/refresh`                                                            |
 | `admin.config.read`                | `GET /api/admin/config`, `POST /api/admin/config/preview`, `GET /api/admin/config/versions`                                                              |
 | `admin.config.manage`              | `POST /api/admin/config/apply`, `POST /api/admin/config/versions/{versionID}/rollback`                                                                   |
 | `admin.integrations.*`             | ainda sem endpoint                                                                                                                                       |
@@ -198,6 +200,41 @@ A configuracao editavel pelo console e apenas a **classe A** —
 aplica. Nao existe classe B (credencial editavel em runtime): credenciais vem de
 Sealed Secrets e nao ha backend de secret que a Admin API possa escrever. Um
 secret ja armazenado nunca e devolvido: a API responde apenas `configured`.
+
+### Observabilidade (issue #581)
+
+O painel operacional e o Health Center exigem `admin.infrastructure.read`, e
+**nenhuma capability nova foi criada para eles**. A capability ja existia no
+`CHECK` de `auth.admin_role_capabilities` (migration 000008) e ja era a
+declarada pelo mapa de navegacao do console para as secoes "Sistema" e "Health
+Center" desde a #578. Criar uma capability para o que uma existente ja cobre
+ampliaria o modelo sem necessidade; ampliar `admin.superuser` seria pior.
+
+Leitura e guardada com o mesmo rigor de escrita, pelo mesmo motivo da trilha de
+auditoria e do catalogo de configuracao: o painel informa quantas pessoas estao
+autenticadas e quanto trafego a plataforma carrega, e o Health Center nomeia
+todas as dependencias do deployment. Os dois sao reconhecimento para quem nao
+deveria estar com essa sessao.
+
+O que a superficie **nao** concede, em nenhum caso:
+
+- **nenhum conteudo.** As metricas sao agregados — `count` e `sum` — e a consulta
+  que as produz nao seleciona identificador, corpo de mensagem, nome de arquivo,
+  e-mail nem URL. Nao existe caminho dela para uma mensagem;
+- **nenhum destino.** Nenhuma rota aceita URL, host, IP, porta, DSN, namespace
+  ou path. O unico parametro aceito e `?service=<id>`, resolvido contra um
+  registro fechado em codigo antes de qualquer leitura; os enderecos vem
+  exclusivamente do ambiente do proprio pod. E o que impede o health detalhado
+  de virar um SSRF autenticado;
+- **nenhum segredo.** Erro de biblioteca, corpo de resposta externa, stack trace
+  e mensagem de driver sao classificados numa categoria sanitizada de conjunto
+  fechado e descartados. A unica informacao vinda de uma dependencia que sai na
+  resposta e `version`, que passa por allowlist de caracteres e limite de tamanho.
+
+O `POST /api/admin/health/refresh` e uma mutacao para efeito de guarda — passa
+por origem e CSRF como qualquer metodo nao seguro — ainda que nao escreva nada.
+O limite de abuso e do servidor: coletas concorrentes compartilham uma unica
+execucao e ha intervalo minimo entre coletas forcadas.
 
 **Alterar quem administra a plataforma exige `admin.superuser`, e nao
 `admin.users.manage`.** Um principal so pode conferir autoridade que ja detem por
