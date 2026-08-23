@@ -15,8 +15,25 @@ import {
 import { requestMediaPermission } from "./mediaPermission";
 import type { CallMediaSessionController } from "./useCallMedia";
 import { randomId } from "../lib/randomId";
+import type { MediaConnectionMode } from "../calls/callOwnership";
 
-export type CallMediaBridge = Pick<CallMediaSessionController, "startAudio" | "connect" | "stop">;
+// A distinct type from CallMediaSessionController's own `connect` (see
+// useCallMedia): that one takes an already-resolved `initialIntent` snapshot
+// and knows nothing about ownership/mode. This bridge is the layer
+// CallSessionProvider's ownedMedia implements — it takes the causal
+// fresh/recovery mode instead, since only the caller here (call.start/
+// accept/activateMedia/retryMedia below) knows which one applies; ownedMedia
+// resolves `mode` into the actual stored intent (issue #610).
+export type CallMediaBridge = {
+  startAudio: CallMediaSessionController["startAudio"];
+  connect: (
+    call: { call_id: string; call_type: CallType },
+    token: string,
+    serverUrl: string,
+    mode: MediaConnectionMode,
+  ) => Promise<void>;
+  stop: CallMediaSessionController["stop"];
+};
 
 type CallOperation = "call.start" | "call.accept" | "call.decline" | "call.cancel" | "call.end";
 
@@ -118,6 +135,19 @@ export function useCallSignaling(
   const mediaEnabledRef = useRef(mediaEnabled);
   const localAuthorizationRef = useRef<LocalMediaAuthorization | null>(null);
   const activateMediaPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
+  // Causal fresh/recovery classification (issue #610) for the media
+  // connection ATTEMPT — never inferred from call_type or generic SDK
+  // state. Keyed by call_id so a new call never inherits a stale mode (the
+  // callId check at every read site makes this self-invalidating).
+  const attemptModeRef = useRef<{ callId: string; mode: MediaConnectionMode } | null>(null);
+  // Survives invalidateMediaRequest()/stopMedia() — unlike every other
+  // per-call media ref in this file — because "did this call EVER connect
+  // successfully before" must outlive a single connect/disconnect cycle for
+  // retryMedia's Caso A/B/C classification (§13) to work. Never evicted: a
+  // call_id is a UUID never reused, so this only grows for the lifetime of
+  // one hook instance (same accepted trade-off as callOwnership.ts's
+  // per-writer key spaces).
+  const everConnectedRef = useRef<Set<string>>(new Set());
   const [mediaActivationRequired, setMediaActivationRequired] = useState(false);
 
   useEffect(() => {
@@ -160,8 +190,11 @@ export function useCallSignaling(
       if (!current()) return;
       const result = await issueCallToken(call.call_id);
       if (!current()) return;
-      await mediaRef.current?.connect(call, result.token, result.serverUrl);
+      const mode: MediaConnectionMode =
+        attemptModeRef.current?.callId === call.call_id ? attemptModeRef.current.mode : "fresh";
+      await mediaRef.current?.connect(call, result.token, result.serverUrl, mode);
       if (!current()) return;
+      everConnectedRef.current.add(call.call_id);
       // The gesture-time startAudio() in accept() may have unlocked a
       // session that onBeforeDirectMedia above just tore down (a resource
       // room's Room A): the browser's autoplay-unlock is per-Room, so the
@@ -309,6 +342,7 @@ export function useCallSignaling(
                 callId: event.call.call_id,
                 callType: event.call.call_type,
               };
+              attemptModeRef.current = { callId: event.call.call_id, mode: "fresh" };
             }
             pendingRef.current = null;
             setPending(false);
@@ -633,6 +667,7 @@ export function useCallSignaling(
         }
       }
       localAuthorizationRef.current = { callId: call.call_id, callType: call.call_type };
+      attemptModeRef.current = { callId: call.call_id, mode: "recovery" };
       setMediaActivationRequired(false);
       await requestMedia(call);
     })().finally(() => {
@@ -708,6 +743,19 @@ export function useCallSignaling(
           // other piece of media state; retrying is itself the explicit
           // gesture that re-authorizes this exact call for this attempt.
           localAuthorizationRef.current = { callId: call.call_id, callType: call.call_type };
+          // §13 Caso A/B/C: once this call has EVER connected successfully,
+          // every subsequent retry is a recovery, regardless of how the
+          // attempt being retried was itself classified. Otherwise (never
+          // connected yet) the retry keeps whatever mode the attempt being
+          // retried already had — fresh if its first fresh connect never
+          // completed, recovery if a recovery attempt failed before
+          // connecting.
+          const previousMode =
+            attemptModeRef.current?.callId === call.call_id ? attemptModeRef.current.mode : "fresh";
+          attemptModeRef.current = {
+            callId: call.call_id,
+            mode: everConnectedRef.current.has(call.call_id) ? "recovery" : previousMode,
+          };
           return requestMedia(call);
         })
         .finally(() => {

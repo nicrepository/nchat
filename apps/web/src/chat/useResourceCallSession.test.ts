@@ -95,7 +95,7 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
 
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     expect(media.startAudio).toHaveBeenCalledOnce();
     expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(channelTarget);
@@ -104,6 +104,7 @@ describe("useResourceCallSession", () => {
       { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
+      "fresh",
     );
     expect(view.result.current.status).toBe("active");
     expect(view.result.current.active).toEqual(channelTarget);
@@ -115,7 +116,7 @@ describe("useResourceCallSession", () => {
     const view = renderHook(() => useResourceCallSession(media));
     const groupTarget: ResourceCallTarget = { ...channelTarget, kind: "dm" };
 
-    await act(() => view.result.current.join(groupTarget));
+    await act(() => view.result.current.join(groupTarget, "fresh"));
 
     expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(groupTarget);
     expect(issueCallToken).toHaveBeenCalledExactlyOnceWith(resourceCall.call_id, participationID);
@@ -123,6 +124,7 @@ describe("useResourceCallSession", () => {
       { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
+      "fresh",
     );
   });
 
@@ -130,12 +132,13 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
 
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     expect(media.connect).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ call_type: "audio" }),
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
+      "fresh",
     );
   });
 
@@ -144,7 +147,7 @@ describe("useResourceCallSession", () => {
     vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("unauthorized"));
     const view = renderHook(() => useResourceCallSession(media));
 
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     expect(view.result.current.status).toBe("error");
     expect(view.result.current.error).not.toBeNull();
@@ -164,8 +167,8 @@ describe("useResourceCallSession", () => {
     let first!: Promise<string | undefined>;
     let second!: Promise<string | undefined>;
     act(() => {
-      first = view.result.current.join(channelTarget);
-      second = view.result.current.join(channelTarget);
+      first = view.result.current.join(channelTarget, "fresh");
+      second = view.result.current.join(channelTarget, "fresh");
     });
     await act(async () => {
       resolveToken({ token: "t", expiresAt: "2026-01-01T00:00:00Z", serverUrl: "wss://x" });
@@ -175,12 +178,46 @@ describe("useResourceCallSession", () => {
     expect(issueCallToken).toHaveBeenCalledOnce();
   });
 
+  it("does not dedup a concurrent join for the same target across mismatched modes — no caller silently inherits another's snapshot mode (issue #610 audit)", async () => {
+    const media = fakeMedia();
+    const view = renderHook(() => useResourceCallSession(media));
+
+    let recovery!: Promise<string | undefined>;
+    let fresh!: Promise<string | undefined>;
+    act(() => {
+      recovery = view.result.current.join(channelTarget, "recovery");
+      fresh = view.result.current.join(channelTarget, "fresh");
+    });
+
+    // Deduping on target alone (the pre-fix behavior) would return the
+    // exact same promise to both callers here.
+    expect(recovery).not.toBe(fresh);
+
+    await act(async () => {
+      await Promise.all([recovery, fresh]);
+    });
+
+    // The superseded "recovery" attempt never reaches its own connect() —
+    // only the current ("fresh") attempt does, and with its own mode. If
+    // dedup had merged them, this would instead be called once with
+    // "recovery", and `fresh` would have resolved to whatever the
+    // recovery attempt resolved to.
+    expect(media.connect).toHaveBeenCalledExactlyOnceWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      "fresh",
+    );
+    expect(await recovery).toBeUndefined();
+    expect(await fresh).toBe(resourceCall.call_id);
+  });
+
   it("rejects a different local join without touching the active resource session", async () => {
     vi.useFakeTimers();
     try {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       const originalCallId = view.result.current.callId;
       const acquireCount = vi.mocked(acquireChatSocket).mock.results.length;
       const presenceHandle = vi.mocked(acquireChatSocket).mock.results.at(-1)!.value as {
@@ -193,11 +230,14 @@ describe("useResourceCallSession", () => {
       media.stop.mockClear();
 
       await act(() =>
-        view.result.current.join({
-          kind: "channel",
-          id: "00000000-0000-4000-8000-000000000702",
-          name: "outro",
-        }),
+        view.result.current.join(
+          {
+            kind: "channel",
+            id: "00000000-0000-4000-8000-000000000702",
+            name: "outro",
+          },
+          "fresh",
+        ),
       );
 
       expect(startResourceCall).not.toHaveBeenCalled();
@@ -223,7 +263,7 @@ describe("useResourceCallSession", () => {
   it("stops stale presence and clears only the local fenced session", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     const listener = vi.mocked(acquireChatSocket).mock.calls.at(-1)![0];
     media.stop.mockClear();
 
@@ -247,10 +287,10 @@ describe("useResourceCallSession", () => {
   it("keeps a same-target rejoin legitimate", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     vi.mocked(startResourceCall).mockClear();
 
-    await act(() => view.result.current.join({ ...channelTarget }));
+    await act(() => view.result.current.join({ ...channelTarget }, "fresh"));
 
     expect(startResourceCall).toHaveBeenCalledExactlyOnceWith({ ...channelTarget });
     expect(view.result.current.active).toEqual(channelTarget);
@@ -264,7 +304,7 @@ describe("useResourceCallSession", () => {
     );
     const view = renderHook(() => useResourceCallSession(media));
 
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     expect(view.result.current.active).toBeNull();
     expect(view.result.current.callId).toBeNull();
@@ -277,7 +317,7 @@ describe("useResourceCallSession", () => {
   it("restores an existing same-target session when stale server state rejects its rejoin as busy", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     const originalCallId = view.result.current.callId;
     vi.mocked(startResourceCall).mockRejectedValueOnce(
       new ResourceCallSignalingError("call.start", "call_participant_busy"),
@@ -285,7 +325,7 @@ describe("useResourceCallSession", () => {
     media.connect.mockClear();
     media.stop.mockClear();
 
-    await act(() => view.result.current.join({ ...channelTarget }));
+    await act(() => view.result.current.join({ ...channelTarget }, "fresh"));
 
     expect(view.result.current.active).toEqual(channelTarget);
     expect(view.result.current.callId).toBe(originalCallId);
@@ -302,7 +342,7 @@ describe("useResourceCallSession", () => {
   it("leave() stops media locally and releases this participant's own server-side presence", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     await act(() => view.result.current.leave());
 
@@ -328,7 +368,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     await act(() => view.result.current.leave());
 
@@ -344,7 +384,7 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     vi.mocked(leaveResourceCall).mockRejectedValueOnce(new Error("release failed"));
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     let caught: unknown;
     await act(async () => {
@@ -373,7 +413,7 @@ describe("useResourceCallSession", () => {
   it("never turns leave() into ending the call: nothing beyond call.leave's own signaling is ever sent", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     await act(() => view.result.current.leave());
 
@@ -391,7 +431,7 @@ describe("useResourceCallSession", () => {
   it("a duplicated/retried leave() is safe: both settle and never leave a stuck pending state", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     let first!: Promise<boolean>;
     let second!: Promise<boolean>;
@@ -416,7 +456,7 @@ describe("useResourceCallSession", () => {
     try {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       expect(view.result.current.status).toBe("active");
 
       const acquireCallsBeforeLeave = vi.mocked(acquireChatSocket).mock.results.length;
@@ -465,7 +505,7 @@ describe("useResourceCallSession", () => {
     try {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       await act(() => view.result.current.leave());
       expect(view.result.current.status).toBe("idle");
 
@@ -479,7 +519,7 @@ describe("useResourceCallSession", () => {
         target_id: otherTarget.id,
       };
       vi.mocked(startResourceCall).mockResolvedValueOnce(resourceAdmission(otherCall));
-      await act(() => view.result.current.join(otherTarget));
+      await act(() => view.result.current.join(otherTarget, "fresh"));
       expect(view.result.current.status).toBe("active");
 
       const presenceHandle = vi.mocked(acquireChatSocket).mock.results.at(-1)!.value as {
@@ -503,7 +543,7 @@ describe("useResourceCallSession", () => {
   it("unmount stops media without requiring an explicit leave()", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     media.stop.mockClear();
 
     view.unmount();
@@ -523,7 +563,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     act(() => {
       view.result.current.leave();
@@ -546,7 +586,7 @@ describe("useResourceCallSession", () => {
       }),
     );
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     media.connect.mockClear();
 
     act(() => {
@@ -554,7 +594,7 @@ describe("useResourceCallSession", () => {
     });
     let rejoining!: Promise<string | undefined>;
     act(() => {
-      rejoining = view.result.current.join(channelTarget);
+      rejoining = view.result.current.join(channelTarget, "fresh");
     });
 
     // The previous leave()'s stop() has not resolved yet: connect() must not
@@ -583,7 +623,7 @@ describe("useResourceCallSession", () => {
       }),
     );
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     media.connect.mockClear();
 
     act(() => {
@@ -591,7 +631,7 @@ describe("useResourceCallSession", () => {
     });
     act(() => {
       // Stale: superseded by the switch below before cleanup ever resolves.
-      void view.result.current.join(channelTarget);
+      void view.result.current.join(channelTarget, "fresh");
     });
     const otherTarget: ResourceCallTarget = {
       ...channelTarget,
@@ -599,7 +639,7 @@ describe("useResourceCallSession", () => {
     };
     let switching!: Promise<string | undefined>;
     act(() => {
-      switching = view.result.current.join(otherTarget);
+      switching = view.result.current.join(otherTarget, "fresh");
     });
 
     await act(async () => {
@@ -611,6 +651,7 @@ describe("useResourceCallSession", () => {
       { call_id: resourceCall.call_id, call_type: "audio" },
       "resource-token",
       "wss://livekit-dev.nic-labs.com",
+      "fresh",
     );
     expect(view.result.current.active).toEqual(otherTarget);
   });
@@ -627,7 +668,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     // Let startAudio(), startResourceCall(), and issueCallToken() (all already-resolved
     // mocks) actually settle, so the attempt is genuinely stalled awaiting
@@ -669,7 +710,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     await act(async () => {
       resolveStartAudio();
@@ -704,7 +745,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     await act(async () => {
       await Promise.resolve();
@@ -731,10 +772,10 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     expect(view.result.current.status).toBe("error");
 
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     expect(issueCallToken).toHaveBeenCalledTimes(2);
     expect(media.connect).toHaveBeenCalledOnce();
@@ -754,7 +795,7 @@ describe("useResourceCallSession", () => {
 
     let joining!: Promise<string | undefined>;
     act(() => {
-      joining = view.result.current.join(channelTarget);
+      joining = view.result.current.join(channelTarget, "fresh");
     });
     await act(() => view.result.current.reconnect());
     await act(async () => {
@@ -769,6 +810,14 @@ describe("useResourceCallSession", () => {
     expect(media.stop).toHaveBeenCalledOnce();
     expect(media.startAudio).toHaveBeenCalledOnce();
     expect(media.connect).toHaveBeenCalledOnce();
+    // §14: resource.reconnect() is unconditionally "recovery" — never a
+    // parameter, never inferred from anything else.
+    expect(media.connect).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      "recovery",
+    );
     expect(view.result.current.status).toBe("active");
 
     media.stop.mockRejectedValueOnce(new Error("reconnect failed"));
@@ -788,7 +837,7 @@ describe("useResourceCallSession", () => {
   it("re-admits on every reclaim and uses the new P2/P3 before each token", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(knownCallTarget));
+    await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
     const participationP2 = "00000000-0000-4000-8000-000000000721";
     const participationP3 = "00000000-0000-4000-8000-000000000722";
@@ -809,7 +858,7 @@ describe("useResourceCallSession", () => {
   it("preserves the reconnect admission P when its compensation leave fails", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(knownCallTarget));
+    await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
     const participationP2 = "00000000-0000-4000-8000-000000000723";
     vi.mocked(joinResourceCall).mockResolvedValueOnce(
@@ -837,7 +886,7 @@ describe("useResourceCallSession", () => {
   it("a stale explicit leave clears only this local session and reports released=false", async () => {
     const media = fakeMedia();
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     vi.mocked(leaveResourceCall).mockResolvedValueOnce({ released: false });
 
     let released = true;
@@ -874,7 +923,7 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     media.stop.mockRejectedValueOnce(new Error("stop failed"));
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
 
     const caught = await leaveExpectingFailure(view);
 
@@ -889,7 +938,7 @@ describe("useResourceCallSession", () => {
     const media = fakeMedia();
     media.stop.mockRejectedValueOnce(new Error("stop failed"));
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     await leaveExpectingFailure(view);
     expect(view.result.current.active).toEqual(channelTarget);
 
@@ -910,7 +959,7 @@ describe("useResourceCallSession", () => {
       }),
     );
     const view = renderHook(() => useResourceCallSession(media));
-    await act(() => view.result.current.join(channelTarget));
+    await act(() => view.result.current.join(channelTarget, "fresh"));
     media.connect.mockClear();
 
     let leaving!: Promise<boolean | undefined>;
@@ -919,7 +968,7 @@ describe("useResourceCallSession", () => {
     });
     let rejoining!: Promise<string | undefined>;
     act(() => {
-      rejoining = view.result.current.join(channelTarget);
+      rejoining = view.result.current.join(channelTarget, "fresh");
     });
 
     await act(async () => {
@@ -948,14 +997,14 @@ describe("useResourceCallSession", () => {
     const view = renderHook(() => useResourceCallSession(media));
 
     act(() => {
-      void view.result.current.join(channelTarget);
+      void view.result.current.join(channelTarget, "fresh");
     });
     act(() => {
       void view.result.current.leave();
     });
     let rejoining!: Promise<string | undefined>;
     act(() => {
-      rejoining = view.result.current.join(channelTarget);
+      rejoining = view.result.current.join(channelTarget, "fresh");
     });
 
     await act(async () => {
@@ -979,7 +1028,7 @@ describe("useResourceCallSession", () => {
     const view = renderHook(() => useResourceCallSession(media));
 
     act(() => {
-      void view.result.current.join(channelTarget);
+      void view.result.current.join(channelTarget, "fresh");
     });
     act(() => {
       void view.result.current.leave();
@@ -987,7 +1036,7 @@ describe("useResourceCallSession", () => {
     const sameTargetNewObject: ResourceCallTarget = { ...channelTarget };
     let rejoining!: Promise<string | undefined>;
     act(() => {
-      rejoining = view.result.current.join(sameTargetNewObject);
+      rejoining = view.result.current.join(sameTargetNewObject, "fresh");
     });
 
     await act(async () => {
@@ -1012,14 +1061,14 @@ describe("useResourceCallSession", () => {
 
     let staleJoin!: Promise<string | undefined>;
     act(() => {
-      staleJoin = view.result.current.join(channelTarget);
+      staleJoin = view.result.current.join(channelTarget, "fresh");
     });
     act(() => {
       void view.result.current.leave();
     });
     let latestJoin!: Promise<string | undefined>;
     act(() => {
-      latestJoin = view.result.current.join(channelTarget);
+      latestJoin = view.result.current.join(channelTarget, "fresh");
     });
 
     await act(async () => {
@@ -1047,11 +1096,11 @@ describe("useResourceCallSession", () => {
       vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       expect(view.result.current.status).toBe("error");
       expect(view.result.current.errorOperation).toBe("join");
 
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       expect(view.result.current.status).toBe("active");
       expect(view.result.current.errorOperation).toBeNull();
     });
@@ -1060,7 +1109,7 @@ describe("useResourceCallSession", () => {
       const media = fakeMedia();
       media.stop.mockRejectedValueOnce(new Error("stop failed"));
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
 
       await act(async () => {
         await view.result.current.leave().catch(() => undefined);
@@ -1084,7 +1133,7 @@ describe("useResourceCallSession", () => {
     it("clears active/callId/status to idle without ever calling leaveResourceCall or stopping media again (already-settled participation)", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       expect(view.result.current.status).toBe("active");
       media.stop.mockClear();
 
@@ -1107,7 +1156,7 @@ describe("useResourceCallSession", () => {
     it("no-ops for a callId that doesn't match this hook's own current participation", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
 
       act(() => view.result.current.convergeRemoteLeave("00000000-0000-4000-8000-000000000999"));
 
@@ -1147,7 +1196,7 @@ describe("useResourceCallSession", () => {
 
       let joining!: Promise<string | undefined>;
       act(() => {
-        joining = view.result.current.join(channelTarget);
+        joining = view.result.current.join(channelTarget, "fresh");
       });
       expect(view.result.current.callId).toBeNull();
 
@@ -1178,7 +1227,7 @@ describe("useResourceCallSession", () => {
 
       let joining!: Promise<string | undefined>;
       act(() => {
-        joining = view.result.current.join(channelTarget);
+        joining = view.result.current.join(channelTarget, "fresh");
       });
       // Only startAudio() (an already-resolved mock) has had a chance to
       // settle — callId was just claimed synchronously in that same
@@ -1223,7 +1272,7 @@ describe("useResourceCallSession", () => {
 
       let joining!: Promise<string | undefined>;
       act(() => {
-        joining = view.result.current.join(channelTarget);
+        joining = view.result.current.join(channelTarget, "fresh");
       });
       // Let startResourceCall/issueCallToken (already-resolved mocks) settle
       // so callId is known and the attempt is genuinely stalled at connect().
@@ -1255,7 +1304,7 @@ describe("useResourceCallSession", () => {
     it("invalidates a reconnect() still in flight, tears down its still-pending media.connect() (no ghost Room), and never resurrects on late resolution", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
 
       let resolveConnect!: () => void;
       media.connect.mockReturnValueOnce(
@@ -1286,12 +1335,12 @@ describe("useResourceCallSession", () => {
     it("a second join() for the SAME callId after convergence starts a real new attempt, unaffected by the prior convergence's now-superseded generation", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       act(() => view.result.current.convergeRemoteLeave(resourceCall.call_id));
       expect(view.result.current.status).toBe("idle");
       media.connect.mockClear();
 
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
 
       expect(view.result.current.status).toBe("active");
       expect(view.result.current.callId).toBe(resourceCall.call_id);
@@ -1307,7 +1356,7 @@ describe("useResourceCallSession", () => {
     it("1. a fresh target (no call_id) uses call.start", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       expect(startResourceCall).toHaveBeenCalledExactlyOnceWith(channelTarget);
       expect(joinResourceCall).not.toHaveBeenCalled();
     });
@@ -1315,7 +1364,7 @@ describe("useResourceCallSession", () => {
     it("2. a known call_id uses call.join, never call.start", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
       expect(joinResourceCall).toHaveBeenCalledExactlyOnceWith(
         resourceCall.call_id,
         knownCallTarget,
@@ -1323,6 +1372,34 @@ describe("useResourceCallSession", () => {
       expect(startResourceCall).not.toHaveBeenCalled();
       expect(view.result.current.status).toBe("active");
       expect(view.result.current.callId).toBe(resourceCall.call_id);
+    });
+
+    it("3. mode is passed through as given, independent of whether target.callId is known (issue #610)", async () => {
+      // A known target.callId (the common re-entry case: "Chamada"/"Entrar
+      // na chamada" on a resource that already has an active call) must
+      // still be classified FRESH when the caller says so — never inferred
+      // from target.callId's mere presence.
+      const freshMedia = fakeMedia();
+      const freshView = renderHook(() => useResourceCallSession(freshMedia));
+      await act(() => freshView.result.current.join(knownCallTarget, "fresh"));
+      expect(freshMedia.connect).toHaveBeenCalledExactlyOnceWith(
+        { call_id: resourceCall.call_id, call_type: "audio" },
+        "resource-token",
+        "wss://livekit-dev.nic-labs.com",
+        "fresh",
+      );
+
+      // Conversely, a dedicated-tab activation passes "recovery" for the
+      // exact same knownCallTarget.
+      const recoveryMedia = fakeMedia();
+      const recoveryView = renderHook(() => useResourceCallSession(recoveryMedia));
+      await act(() => recoveryView.result.current.join(knownCallTarget, "recovery"));
+      expect(recoveryMedia.connect).toHaveBeenCalledExactlyOnceWith(
+        { call_id: resourceCall.call_id, call_type: "audio" },
+        "resource-token",
+        "wss://livekit-dev.nic-labs.com",
+        "recovery",
+      );
     });
 
     it("3. a known call_id never skips admission — a token is never requested before call.join actually resolves", async () => {
@@ -1334,7 +1411,7 @@ describe("useResourceCallSession", () => {
         }),
       );
       const view = renderHook(() => useResourceCallSession(media));
-      const joining = act(() => view.result.current.join(knownCallTarget));
+      const joining = act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(issueCallToken).not.toHaveBeenCalled();
       resolveJoin(resourceAdmission());
@@ -1353,7 +1430,7 @@ describe("useResourceCallSession", () => {
         return resourceAdmission();
       });
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
       expect(order).toEqual(["startAudio", "call.join"]);
     });
 
@@ -1369,7 +1446,7 @@ describe("useResourceCallSession", () => {
         return { token: "t", expiresAt: "2026-01-01T00:00:00Z", serverUrl: "wss://x" };
       });
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
       expect(order).toEqual(["call.join", "token"]);
     });
 
@@ -1384,7 +1461,7 @@ describe("useResourceCallSession", () => {
         order.push("connect");
       });
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
       expect(order).toEqual(["token", "connect"]);
     });
 
@@ -1393,7 +1470,7 @@ describe("useResourceCallSession", () => {
       vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
         resourceCall.call_id,
@@ -1410,7 +1487,7 @@ describe("useResourceCallSession", () => {
       media.connect.mockRejectedValueOnce(new Error("connect failed"));
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(leaveResourceCall).toHaveBeenCalledExactlyOnceWith(
         resourceCall.call_id,
@@ -1426,7 +1503,7 @@ describe("useResourceCallSession", () => {
       vi.mocked(issueCallToken).mockRejectedValueOnce(new Error("token unavailable"));
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(view.result.current.callId).toBeNull();
       expect(view.result.current.active).toBeNull();
@@ -1439,7 +1516,7 @@ describe("useResourceCallSession", () => {
       vi.mocked(leaveResourceCall).mockRejectedValueOnce(new Error("compensation failed"));
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(view.result.current.status).toBe("error");
       expect(view.result.current.errorOperation).toBe("leave");
@@ -1465,7 +1542,7 @@ describe("useResourceCallSession", () => {
       );
       const view = renderHook(() => useResourceCallSession(media));
 
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(leaveResourceCall).not.toHaveBeenCalled();
       expect(view.result.current.error).toBe("Você já está em outra chamada.");
@@ -1474,7 +1551,7 @@ describe("useResourceCallSession", () => {
     it("11b. a pre-admission busy rejection on a same-target rejoin never stops the previously active session", async () => {
       const media = fakeMedia();
       const view = renderHook(() => useResourceCallSession(media));
-      await act(() => view.result.current.join(channelTarget));
+      await act(() => view.result.current.join(channelTarget, "fresh"));
       const originalCallId = view.result.current.callId;
       vi.mocked(joinResourceCall).mockRejectedValueOnce(
         new ResourceCallSignalingError("call.join", "call_participant_busy"),
@@ -1486,7 +1563,7 @@ describe("useResourceCallSession", () => {
       // reaching admission), but rejoining via the known-callId path — e.g.
       // the discovery indicator handed back a callId while server-side
       // state now disagrees.
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
 
       expect(joinResourceCall).toHaveBeenCalledOnce();
       expect(view.result.current.callId).toBe(originalCallId);
@@ -1508,7 +1585,7 @@ describe("useResourceCallSession", () => {
       const view = renderHook(() => useResourceCallSession(media));
       let firstJoin!: Promise<string | undefined>;
       act(() => {
-        firstJoin = view.result.current.join(knownCallTarget);
+        firstJoin = view.result.current.join(knownCallTarget, "fresh");
       });
       // Let startAudio() (an already-resolved mock) actually settle, so the
       // first attempt is genuinely stalled awaiting call.join's admission —
@@ -1528,7 +1605,7 @@ describe("useResourceCallSession", () => {
         resourceAdmission({ ...resourceCall, call_id: secondCallId }, participationP2),
       );
       const secondTarget: ResourceCallTarget = { ...channelTarget, callId: secondCallId };
-      await act(() => view.result.current.join(secondTarget));
+      await act(() => view.result.current.join(secondTarget, "fresh"));
       expect(view.result.current.callId).toBe(secondCallId);
 
       // Now let the FIRST (long-superseded) join's admission finally
@@ -1568,7 +1645,7 @@ describe("useResourceCallSession", () => {
       // Attempt A: admits X immediately, then stalls at issueCallToken.
       let firstJoin!: Promise<string | undefined>;
       act(() => {
-        firstJoin = view.result.current.join(knownCallTarget);
+        firstJoin = view.result.current.join(knownCallTarget, "fresh");
       });
       await act(async () => {
         await Promise.resolve();
@@ -1593,7 +1670,7 @@ describe("useResourceCallSession", () => {
         expiresAt: "2026-01-01T00:00:00Z",
         serverUrl: "wss://livekit-dev.nic-labs.com",
       });
-      await act(() => view.result.current.join(knownCallTarget));
+      await act(() => view.result.current.join(knownCallTarget, "fresh"));
       expect(view.result.current.callId).toBe(resourceCall.call_id);
       expect(view.result.current.status).toBe("active");
 

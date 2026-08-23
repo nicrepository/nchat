@@ -43,6 +43,7 @@ import {
 import {
   compareParticipationTokens,
   createOwnershipCoordinator,
+  type MediaIntent,
   type OwnershipCoordinator,
   type OwnershipMessage,
   type ParticipationMessageType,
@@ -270,6 +271,17 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const handoffTimer = useRef<number | null>(null);
   const handoffCall = useRef("");
   const handoffEpoch = useRef(0);
+  // User/recovery mic+camera intent (issue #610) — never SDK state. Updated
+  // only after a durable writeMediaIntent succeeds, following either a
+  // successful ownedMedia.connect or a confirmed user toggle (see
+  // wrappedToggleMicrophone/wrappedToggleCamera below). Never cleared on a
+  // handoff stop/release, and never touched by server mute, SDK reconnect,
+  // or MediaState effects — only replaced when callId genuinely changes.
+  const confirmedIntentRef = useRef<{
+    callId: string;
+    microphone: boolean;
+    camera: boolean;
+  } | null>(null);
   // The dedicated tab's epoch the current outstanding handoff attempt
   // expects back in an "ack"/"failure" reply. Cleared whenever the attempt
   // reaches a terminal state (ack, failure, or timeout) so a late reply from
@@ -483,10 +495,33 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     [getOwnership, setOwner],
   );
 
+  // Storage-failure teardown shared by both toggle wrappers' CONFIRMED-write
+  // failure branch (issue #610 privacy-blocker follow-up). By the time this
+  // runs, a durable "pending" marker already protects recovery (see
+  // wrappedToggleMicrophone/Camera below) regardless of whether ownership
+  // is released — so, unlike the previous design, release is now always
+  // safe and never conditional/withheld: no future reader can ever treat a
+  // "pending" winner as a specific preset (readMediaIntentForLease always
+  // maps it to OFF/OFF), so holding the lease hostage buys nothing.
+  const stopAndReleaseOnStorageFailure = useCallback(
+    async (callId: string) => {
+      const ownership = getOwnership();
+      await media.stop();
+      emitCallTechnicalEvent("track-cleanup");
+      ownership.release(callId);
+      setOwner("none");
+      emitCallTechnicalEvent("join-failure");
+    },
+    [getOwnership, media, setOwner],
+  );
+
   const ownedMedia = useMemo<CallMediaBridge>(
     () => ({
       startAudio: media.startAudio,
-      connect: async (call, token, serverUrl) => {
+      connect: async (call, token, serverUrl, mode) => {
+        if (confirmedIntentRef.current && confirmedIntentRef.current.callId !== call.call_id) {
+          confirmedIntentRef.current = null;
+        }
         const ownership = getOwnership();
         const current = ownership.getLease();
         const lease =
@@ -496,15 +531,58 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           throw new Error("call media is owned by another tab");
         }
         setOwner("local");
+        // §16 absolute rule: recovery with no valid snapshot degrades to
+        // OFF/OFF — never a call_type/active-call fallback. Fresh never
+        // restores a historical snapshot as a preset (existing entry
+        // defaults apply, handled inside media.connect itself).
+        // readMediaIntentForLease (issue #610 audit) only ever resolves this
+        // coordinator's own currently-held lease's PROVEN predecessor — a
+        // same-epoch or otherwise-unproven writer (a transient concurrent
+        // claimant, reachable without Web Locks) is never substituted in.
+        const initialIntent: MediaIntent | undefined =
+          mode === "recovery"
+            ? (ownership.readMediaIntentForLease(call.call_id) ?? {
+                microphone: false,
+                camera: false,
+              })
+            : undefined;
+        let applied: MediaIntent | undefined;
         try {
-          await media.connect(call, token, serverUrl);
-          emitCallTechnicalEvent("join-success");
+          applied = await media.connect(call, token, serverUrl, initialIntent);
         } catch (error) {
           emitCallTechnicalEvent("join-failure");
           ownership.release(call.call_id);
           setOwner("none");
           throw error;
         }
+        if (!applied) {
+          // Superseded before this attempt's connect settled — not a
+          // failure of ownership/storage, just stale.
+          emitCallTechnicalEvent("join-failure");
+          ownership.release(call.call_id);
+          setOwner("none");
+          throw new Error("media connection was superseded before it completed");
+        }
+        // No write-ahead/pending step is needed here (issue #610 audit,
+        // documented conclusion): a connect's applied snapshot is either a
+        // fresh default (no prior confirmed baseline it could contradict)
+        // or a re-persistence of the SAME value recovery just read back
+        // from a causally-valid predecessor — never a NEW divergence from
+        // a just-confirmed device change the way a mid-call user toggle
+        // is. If this write fails, the previous predecessor entry (or
+        // nothing) simply remains in place, which is still safe to read
+        // later — so the plain §11 fail-closed teardown is sufficient.
+        const wrote = ownership.writeMediaIntent(call.call_id, lease, applied, "confirmed");
+        if (!wrote.ok) {
+          await media.stop();
+          emitCallTechnicalEvent("track-cleanup");
+          emitCallTechnicalEvent("join-failure");
+          ownership.release(call.call_id);
+          setOwner("none");
+          throw new Error("failed to persist media intent for handoff");
+        }
+        confirmedIntentRef.current = { callId: call.call_id, ...applied };
+        emitCallTechnicalEvent("join-success");
       },
       stop: async () => {
         await media.stop();
@@ -512,6 +590,94 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       },
     }),
     [getOwnership, media, role, setOwner],
+  );
+
+  // Write-ahead safety marker (issue #610 privacy-blocker follow-up): a
+  // user toggle is the one moment a device can diverge from the last
+  // DURABLE confirmed intent, so a "pending" entry describing the desired
+  // change is written SYNCHRONOUSLY, fenced by the causal lease, BEFORE
+  // the SDK is ever asked to touch the device. If that pre-write fails —
+  // for any reason, including the lease no longer being valid — the SDK is
+  // never called and the device stays exactly as last confirmed. Once the
+  // SDK genuinely applies the change, a "confirmed" write settles it,
+  // fenced additionally by the pending write's own revision so a stale,
+  // superseded operation can never overwrite a newer one's entry. If the
+  // SDK fails/is superseded, or the confirmed commit itself fails, the
+  // already-durable "pending" marker is by itself sufficient: any future
+  // recovery (readMediaIntentForLease) treats a winning "pending" entry as
+  // OFF/OFF, never as a specific preset — safe with or without this tab's
+  // OwnerLease surviving the same failure (issue #610 audit: heartbeat
+  // writes use the same storage and can fail together with this write).
+  const wrappedToggleMicrophone = useCallback(async (): Promise<boolean | undefined> => {
+    const lease = getOwnership().getLease();
+    const callId = lease?.callId;
+    if (!lease || !callId) return undefined;
+    const camera =
+      confirmedIntentRef.current?.callId === callId
+        ? confirmedIntentRef.current.camera
+        : media.cameraEnabled;
+    const desired: MediaIntent = { microphone: !media.microphoneEnabled, camera };
+    const pending = getOwnership().writeMediaIntent(callId, lease, desired, "pending");
+    if (!pending.ok) return undefined;
+
+    const result = await media.toggleMicrophone();
+    if (result === undefined) return undefined;
+
+    const finalIntent: MediaIntent = { microphone: result, camera };
+    const confirmed = getOwnership().writeMediaIntent(callId, lease, finalIntent, "confirmed", {
+      expectedRevision: pending.revision,
+    });
+    if (confirmed.ok) {
+      confirmedIntentRef.current = { callId, ...finalIntent };
+    } else if (confirmed.reason === "storage-error") {
+      await stopAndReleaseOnStorageFailure(callId);
+    }
+    // confirmed.reason === "stale" means a newer operation already
+    // advanced the revision — that operation now owns confirming intent;
+    // this one's own SDK result is still returned to the caller, but
+    // nothing further is written or torn down here.
+    return result;
+  }, [getOwnership, media, stopAndReleaseOnStorageFailure]);
+
+  const wrappedToggleCamera = useCallback(async (): Promise<boolean | undefined> => {
+    const lease = getOwnership().getLease();
+    const callId = lease?.callId;
+    if (!lease || !callId) return undefined;
+    const microphone =
+      confirmedIntentRef.current?.callId === callId
+        ? confirmedIntentRef.current.microphone
+        : media.microphoneEnabled;
+    const desired: MediaIntent = { microphone, camera: !media.cameraEnabled };
+    const pending = getOwnership().writeMediaIntent(callId, lease, desired, "pending");
+    if (!pending.ok) return undefined;
+
+    const result = await media.toggleCamera();
+    if (result === undefined) return undefined;
+
+    const finalIntent: MediaIntent = { microphone, camera: result };
+    const confirmed = getOwnership().writeMediaIntent(callId, lease, finalIntent, "confirmed", {
+      expectedRevision: pending.revision,
+    });
+    if (confirmed.ok) {
+      confirmedIntentRef.current = { callId, ...finalIntent };
+    } else if (confirmed.reason === "storage-error") {
+      await stopAndReleaseOnStorageFailure(callId);
+    }
+    return result;
+  }, [getOwnership, media, stopAndReleaseOnStorageFailure]);
+
+  // Every external consumer (context value's `media`, the floating/dedicated
+  // `controls` object) must read toggles through here — never the raw
+  // useCallMedia() functions — so a call UI can never bypass persistence
+  // (issue #610 §10). Internal choke points above (ownedMedia.connect,
+  // directMedia.stop) keep using the raw `media` object directly.
+  const wrappedMedia = useMemo<CallMediaSessionController>(
+    () => ({
+      ...media,
+      toggleMicrophone: wrappedToggleMicrophone,
+      toggleCamera: wrappedToggleCamera,
+    }),
+    [media, wrappedToggleMicrophone, wrappedToggleCamera],
   );
   const resource = useResourceCallSession(ownedMedia, ownerState === "local");
   // Pulled out as its own binding so the ownership-subscribe effect below
@@ -638,7 +804,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         protectJoinAttempt(protectedCallId);
       }
       try {
-        const joinedCallId = await joinResourceCall(target, (resolvedCallId) => {
+        const joinedCallId = await joinResourceCall(target, "fresh", (resolvedCallId) => {
           if (protectedCallId === resolvedCallId) return;
           if (protectedCallId) unprotectJoinAttempt(protectedCallId);
           protectedCallId = resolvedCallId;
@@ -701,7 +867,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // refresh" behavior for a plain continuation is unaffected either way.
   const activateResourceParticipation = useCallback(
     async (target: ResourceCallTarget): Promise<string | undefined> => {
-      const joinedCallId = await joinResourceCall(target);
+      const joinedCallId = await joinResourceCall(target, "recovery");
       if (joinedCallId) await beginResourceParticipation(joinedCallId);
       return joinedCallId;
     },
@@ -791,11 +957,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   }, [calls, resource, resourceCallReconnectable]);
 
   const restoreOwnership = useCallback(
-    (callId: string, afterEpoch = 0): Promise<boolean> => {
+    (
+      callId: string,
+      afterEpoch = 0,
+      predecessorHint?: { tabId: string; epoch: number },
+    ): Promise<boolean> => {
       if (recovery.current) return recovery.current;
       const attempt = (async () => {
         dispatchPresentation({ type: "OWNER_LOST" });
-        const lease = await getOwnership().claim(callId, "main", afterEpoch);
+        const lease = await getOwnership().claim(callId, "main", afterEpoch, predecessorHint);
         if (!lease) return false;
         emitCallTechnicalEvent("ownership-takeover");
         setOwner("local");
@@ -899,22 +1069,29 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         message.targetTabId === ownership.tabId
       ) {
         handoffEpoch.current = message.epoch;
-        void ownership.claim(callId, "dedicated", message.epoch).then((lease) => {
-          if (lease) {
-            if (dedicatedReadyTimer.current !== null) {
-              window.clearTimeout(dedicatedReadyTimer.current);
-              dedicatedReadyTimer.current = null;
-            }
-            setOwner("local");
-          } else
-            ownership.post({
-              v: 1,
-              type: "failure",
-              callId,
-              tabId: ownership.tabId,
-              epoch: message.epoch,
-            });
-        });
+        // The "handoff" message IS main's own live report of the lease
+        // it just gave up ({tabId: message.tabId, epoch: message.epoch}) —
+        // exact, provable predecessor identity (issue #610 audit), so the
+        // dedicated tab's recovery connect can restore main's snapshot
+        // precisely instead of degrading to OFF/OFF.
+        void ownership
+          .claim(callId, "dedicated", message.epoch, { tabId: message.tabId, epoch: message.epoch })
+          .then((lease) => {
+            if (lease) {
+              if (dedicatedReadyTimer.current !== null) {
+                window.clearTimeout(dedicatedReadyTimer.current);
+                dedicatedReadyTimer.current = null;
+              }
+              setOwner("local");
+            } else
+              ownership.post({
+                v: 1,
+                type: "failure",
+                callId,
+                tabId: ownership.tabId,
+                epoch: message.epoch,
+              });
+          });
       } else if (role === "main" && message.type === "ack") {
         if (message.epoch !== expectedAckEpoch.current) return;
         expectedAckEpoch.current = null;
@@ -931,6 +1108,23 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         handoffCall.current = "";
         emitCallTechnicalEvent("handoff-failure");
         void restoreOwnership(callId, handoffEpoch.current);
+      } else if (
+        role === "main" &&
+        message.type === "released" &&
+        ownerStateRef.current !== "local"
+      ) {
+        // A dedicated tab minimizing back (releaseDedicated) never sends an
+        // explicit targeted handoff — this "released" broadcast (posted by
+        // release() itself) is the only live signal main gets, and it
+        // already carries the exact predecessor identity (issue #610
+        // audit) the poll-based restoreOwnership fallback below has no way
+        // to prove on its own. restoreOwnership's own in-flight dedup
+        // (recovery.current) makes this safe to fire eagerly alongside
+        // that poll without ever double-claiming.
+        void restoreOwnership(callId, message.epoch, {
+          tabId: message.tabId,
+          epoch: message.epoch,
+        });
       }
     });
   }, [
@@ -1210,7 +1404,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
 
   const value = useMemo(
     () => ({
-      media,
+      media: wrappedMedia,
       calls,
       resource,
       ownerState,
@@ -1243,7 +1437,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       getResourceCall,
       joinResourceParticipation,
       leaveDedicated,
-      media,
+      wrappedMedia,
       ownerState,
       presentation,
       registerDirectory,
@@ -1293,8 +1487,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     cameraEnabled: media.cameraEnabled,
     screenShareEnabled: media.screenShareEnabled,
     pendingControl: media.pendingControl,
-    onMicrophone: media.toggleMicrophone,
-    onCamera: media.toggleCamera,
+    onMicrophone: wrappedToggleMicrophone,
+    onCamera: wrappedToggleCamera,
     onScreenShare: media.toggleScreenShare,
     onEnd: directActive
       ? calls.end
