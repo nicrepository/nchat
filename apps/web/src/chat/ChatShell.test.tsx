@@ -108,7 +108,12 @@ const call = {
 } as const;
 
 const prepareMedia = vi.fn(async () => undefined);
-const connectMedia = vi.fn(async () => undefined);
+const connectMedia = vi.fn(
+  async (): Promise<{ microphone: boolean; camera: boolean } | undefined> => ({
+    microphone: true,
+    camera: true,
+  }),
+);
 const stopMedia = vi.fn(async () => undefined);
 const OriginalWebSocket = global.WebSocket;
 
@@ -914,8 +919,8 @@ describe("ChatShell RF-24 fresh join — issue #594 adversarial follow-up (round
 
     let resolveConnect!: () => void;
     connectMedia.mockReturnValueOnce(
-      new Promise<undefined>((resolve) => {
-        resolveConnect = () => resolve(undefined);
+      new Promise<{ microphone: boolean; camera: boolean }>((resolve) => {
+        resolveConnect = () => resolve({ microphone: true, camera: true });
       }),
     );
 

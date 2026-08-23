@@ -76,6 +76,40 @@ function maxParticipationToken(id: string): { generation: number; writerId: stri
   }
   return best;
 }
+// Issue #610 (privacy blocker follow-up): a small real implementation, not
+// a dumb stub — the pending/confirmed write-ahead algorithm's revision
+// fencing (expectedRevision) needs realistic revision bookkeeping for most
+// tests to behave sensibly without each one hand-managing revision numbers.
+// Reset in each describe's own beforeEach, exactly like participationStorage.
+let mediaIntentStorage: Record<
+  string,
+  { revision: number; phase: "confirmed" | "pending"; microphone: boolean; camera: boolean }
+> = {};
+type WriteMediaIntentOutcome =
+  | { ok: true; revision: number }
+  | { ok: false; reason: "stale" | "storage-error" };
+function defaultWriteMediaIntent(
+  id: string,
+  _capturedLease: unknown,
+  intent: { microphone: boolean; camera: boolean },
+  phase: "confirmed" | "pending",
+  options?: { expectedRevision?: number },
+): WriteMediaIntentOutcome {
+  const previous = mediaIntentStorage[id];
+  if (options?.expectedRevision !== undefined && previous?.revision !== options.expectedRevision) {
+    return { ok: false, reason: "stale" };
+  }
+  const revision = (previous?.revision ?? 0) + 1;
+  mediaIntentStorage[id] = { revision, phase, ...intent };
+  return { ok: true, revision };
+}
+function defaultReadMediaIntentForLease(id: string, currentLease?: unknown) {
+  void currentLease;
+  const entry = mediaIntentStorage[id];
+  if (!entry) return null;
+  if (entry.phase === "pending") return { microphone: false, camera: false };
+  return { microphone: entry.microphone, camera: entry.camera };
+}
 const ownership = {
   tabId: "tab-main",
   claim: vi.fn<() => Promise<typeof lease | null>>(async () => lease),
@@ -102,6 +136,16 @@ const ownership = {
     return { generation, writerId: "tab-main" };
   }),
   getParticipationToken: vi.fn((id: string) => maxParticipationToken(id)),
+  // Issue #610: mirrors production's expectedRevision fencing and
+  // pending-means-OFF/OFF-on-read semantics against the in-memory
+  // mediaIntentStorage above — never the real per-writer-key storage or
+  // lease-scoped eligibility rules (those are exhaustively covered at the
+  // callOwnership.ts level); tests that specifically exercise a distinct
+  // outcome override these per-case via mockReturnValueOnce/mockImplementationOnce.
+  // Re-armed (not just cleared) in every describe's own beforeEach — see
+  // that reset for why a plain vi.clearAllMocks() isn't enough here.
+  writeMediaIntent: vi.fn(defaultWriteMediaIntent),
+  readMediaIntentForLease: vi.fn(defaultReadMediaIntentForLease),
   close: vi.fn(),
 };
 
@@ -109,7 +153,12 @@ const media = {
   status: "connected",
   prepare: vi.fn(async () => undefined),
   startAudio: vi.fn(async () => undefined),
-  connect: vi.fn(async () => undefined),
+  connect: vi.fn(
+    async (): Promise<{ microphone: boolean; camera: boolean } | undefined> => ({
+      microphone: true,
+      camera: true,
+    }),
+  ),
   stop: vi.fn(async () => undefined),
   participants: [] as Array<{
     identity: string;
@@ -151,7 +200,17 @@ const resource = {
   error: null as string | null,
   // Mirrors the real hook: resolves with the joined call_id (target.callId
   // is always supplied by every real call site), never rejects.
-  join: vi.fn(async (target: { callId?: string }) => target.callId),
+  join: vi.fn(
+    async (
+      target: { callId?: string },
+      mode: "fresh" | "recovery",
+      onCallIdResolved?: (callId: string) => void,
+    ) => {
+      void mode;
+      void onCallIdResolved;
+      return target.callId;
+    },
+  ),
   leave: vi.fn(async () => true),
   reconnect: vi.fn(async () => undefined),
   convergeRemoteLeave: vi.fn(),
@@ -274,6 +333,12 @@ function Probe() {
       <button type="button" onClick={() => void session.beginResourceParticipation(callId)}>
         Begin participation probe
       </button>
+      <button type="button" onClick={() => void session.media.toggleMicrophone()}>
+        Toggle microphone probe
+      </button>
+      <button type="button" onClick={() => void session.media.toggleCamera()}>
+        Toggle camera probe
+      </button>
       <button
         type="button"
         onClick={() =>
@@ -373,6 +438,12 @@ describe("CallSessionProvider", () => {
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -394,18 +465,18 @@ describe("CallSessionProvider", () => {
   it("claims media once, reuses its lease, and releases on connect failure", async () => {
     renderProvider();
     const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     expect(ownership.claim).toHaveBeenCalledWith(callId, "main");
     expect(screen.getByTestId("owner")).toHaveTextContent("local");
 
     ownership.getLease.mockReturnValue(lease);
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     expect(ownership.claim).toHaveBeenCalledOnce();
 
     media.connect.mockRejectedValueOnce(new Error("connect"));
-    await expect(owned.connect(activeDirect() as never, "token", "wss://livekit")).rejects.toThrow(
-      "connect",
-    );
+    await expect(
+      owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
+    ).rejects.toThrow("connect");
     expect(ownership.release).toHaveBeenCalledWith(callId);
     await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("none"));
   });
@@ -416,12 +487,317 @@ describe("CallSessionProvider", () => {
     const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
     await act(async () => {
       await expect(
-        owned.connect(activeDirect() as never, "token", "wss://livekit"),
+        owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
       ).rejects.toThrow("another tab");
     });
     expect(screen.getByTestId("owner")).toHaveTextContent("remote");
     await act(() => owned.stop());
     expect(media.stop).toHaveBeenCalledOnce();
+  });
+
+  describe("media-intent recovery/persistence at the ownedMedia choke point (issue #610)", () => {
+    it("fresh connect never reads stored media intent", async () => {
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+      expect(ownership.readMediaIntentForLease).not.toHaveBeenCalled();
+      expect(media.connect).toHaveBeenCalledWith(
+        expect.anything(),
+        "token",
+        "wss://livekit",
+        undefined,
+      );
+    });
+
+    it.each([
+      { microphone: true, camera: true },
+      { microphone: true, camera: false },
+      { microphone: false, camera: true },
+      { microphone: false, camera: false },
+    ])("recovery connect applies the stored snapshot %o exactly (§17/§18 2x2)", async (intent) => {
+      ownership.readMediaIntentForLease.mockReturnValueOnce(intent);
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "recovery"));
+      expect(ownership.readMediaIntentForLease).toHaveBeenCalledWith(callId);
+      expect(media.connect).toHaveBeenCalledWith(
+        expect.anything(),
+        "token",
+        "wss://livekit",
+        intent,
+      );
+    });
+
+    it("recovery connect with no valid snapshot degrades to OFF/OFF, never a call_type fallback (§16)", async () => {
+      ownership.readMediaIntentForLease.mockReturnValueOnce(null);
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "recovery"));
+      expect(media.connect).toHaveBeenCalledWith(expect.anything(), "token", "wss://livekit", {
+        microphone: false,
+        camera: false,
+      });
+    });
+
+    it('persists the applied snapshot via writeMediaIntent(..., "confirmed") using the acquired lease, only then declares success', async () => {
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      media.connect.mockResolvedValueOnce({ microphone: true, camera: false });
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+      expect(ownership.writeMediaIntent).toHaveBeenCalledWith(
+        callId,
+        lease,
+        { microphone: true, camera: false },
+        "confirmed",
+      );
+    });
+
+    // §12 audit conclusion (documented): connect never risks resurrecting a
+    // stale snapshot as WRONG the way a mid-call toggle can — a fresh
+    // connect has no prior confirmed baseline for this device intent to
+    // contradict, and a recovery connect only ever re-persists the SAME
+    // value it just read back from a causally-valid predecessor (or
+    // nothing). A failed write-back here just leaves that predecessor (or
+    // nothing) in storage, which stays safe to read later — so connect
+    // uses the plain §11 fail-closed teardown, never the toggle's
+    // write-ahead pending/confirmed protocol.
+    it("write failure: stops media, releases ownership (no write-ahead protocol needed), rejects (§11)", async () => {
+      ownership.writeMediaIntent.mockReturnValueOnce({ ok: false, reason: "storage-error" });
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await expect(
+        owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
+      ).rejects.toThrow();
+      expect(media.stop).toHaveBeenCalled();
+      expect(ownership.writeMediaIntent).toHaveBeenCalledOnce();
+      expect(ownership.release).toHaveBeenCalledWith(callId);
+      await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("none"));
+    });
+
+    it("stop happens strictly before release on write failure (ordering)", async () => {
+      ownership.writeMediaIntent.mockReturnValueOnce({ ok: false, reason: "storage-error" });
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await expect(
+        owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
+      ).rejects.toThrow();
+      const stopOrder = media.stop.mock.invocationCallOrder[0]!;
+      const releaseOrder = ownership.release.mock.invocationCallOrder[0]!;
+      expect(stopOrder).toBeLessThan(releaseOrder);
+    });
+
+    it("rejects and releases ownership without writing when media.connect resolves undefined (superseded)", async () => {
+      media.connect.mockResolvedValueOnce(undefined);
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await expect(
+        owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
+      ).rejects.toThrow();
+      expect(ownership.writeMediaIntent).not.toHaveBeenCalled();
+      expect(ownership.release).toHaveBeenCalledWith(callId);
+    });
+  });
+
+  describe("toggle wrappers: write-ahead pending/confirmed protocol (issue #610 privacy blocker follow-up)", () => {
+    beforeEach(() => {
+      ownership.getLease.mockReturnValue(lease);
+    });
+
+    it("wrappedToggleMicrophone: writes PENDING before the SDK call, then CONFIRMED after it applies", async () => {
+      media.toggleMicrophone.mockResolvedValueOnce(true);
+      media.microphoneEnabled = false;
+      media.cameraEnabled = false;
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(ownership.writeMediaIntent).toHaveBeenNthCalledWith(
+        1,
+        callId,
+        lease,
+        { microphone: true, camera: false },
+        "pending",
+      );
+      expect(ownership.writeMediaIntent).toHaveBeenNthCalledWith(
+        2,
+        callId,
+        lease,
+        { microphone: true, camera: false },
+        "confirmed",
+        { expectedRevision: 1 },
+      );
+      // Pending was written BEFORE the SDK call, not after.
+      const pendingOrder = ownership.writeMediaIntent.mock.invocationCallOrder[0]!;
+      const sdkOrder = media.toggleMicrophone.mock.invocationCallOrder[0]!;
+      expect(pendingOrder).toBeLessThan(sdkOrder);
+    });
+
+    it("wrappedToggleCamera: writes PENDING before the SDK call, then CONFIRMED after it applies", async () => {
+      media.toggleCamera.mockResolvedValueOnce(true);
+      media.microphoneEnabled = true;
+      media.cameraEnabled = false;
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle camera probe" }));
+      });
+      expect(ownership.writeMediaIntent).toHaveBeenNthCalledWith(
+        1,
+        callId,
+        lease,
+        { microphone: true, camera: true },
+        "pending",
+      );
+      expect(ownership.writeMediaIntent).toHaveBeenNthCalledWith(
+        2,
+        callId,
+        lease,
+        { microphone: true, camera: true },
+        "confirmed",
+        { expectedRevision: 1 },
+      );
+    });
+
+    it("1. pending pre-write failure: the SDK is NEVER called, device stays at its last confirmed state", async () => {
+      ownership.writeMediaIntent.mockReturnValueOnce({ ok: false, reason: "storage-error" });
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(media.toggleMicrophone).not.toHaveBeenCalled();
+      expect(ownership.writeMediaIntent).toHaveBeenCalledOnce();
+    });
+
+    it("a stale toggle (SDK resolves undefined after pending was durably written) leaves the pending marker as-is and confirms nothing", async () => {
+      media.toggleMicrophone.mockResolvedValueOnce(undefined);
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(ownership.writeMediaIntent).toHaveBeenCalledOnce(); // pending only
+      expect(mediaIntentStorage[callId]?.phase).toBe("pending");
+    });
+
+    describe("2/3. confirmed write fails after a successful SDK toggle — recovery must see OFF/OFF, never promote either direction", () => {
+      it("2. mic durable ON -> toggle OFF -> SDK applies OFF -> confirmed write fails -> recovery reads OFF/OFF", async () => {
+        media.toggleMicrophone.mockResolvedValueOnce(false);
+        media.microphoneEnabled = true;
+        media.cameraEnabled = false;
+        renderProvider();
+        // Force ONLY the second (confirmed) write to fail; pending succeeds.
+        ownership.writeMediaIntent
+          .mockImplementationOnce(defaultWriteMediaIntent) // pending
+          .mockReturnValueOnce({ ok: false, reason: "storage-error" }); // confirmed
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+        });
+
+        expect(media.stop).toHaveBeenCalledOnce(); // defense-in-depth teardown
+        expect(ownership.readMediaIntentForLease(callId, lease)).toEqual({
+          microphone: false,
+          camera: false,
+        });
+      });
+
+      it("3. mic durable OFF -> toggle ON -> SDK applies ON -> confirmed write fails -> recovery reads OFF/OFF (never promotes ON)", async () => {
+        media.toggleMicrophone.mockResolvedValueOnce(true);
+        media.microphoneEnabled = false;
+        media.cameraEnabled = false;
+        renderProvider();
+        ownership.writeMediaIntent
+          .mockImplementationOnce(defaultWriteMediaIntent) // pending
+          .mockReturnValueOnce({ ok: false, reason: "storage-error" }); // confirmed
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+        });
+
+        expect(media.stop).toHaveBeenCalledOnce();
+        expect(ownership.readMediaIntentForLease(callId, lease)).toEqual({
+          microphone: false,
+          camera: false,
+        });
+      });
+    });
+
+    it("4. ownership moves on between pending and confirmed — confirmed is rejected as stale, no teardown escalation, recovery still OFF/OFF", async () => {
+      media.toggleMicrophone.mockResolvedValueOnce(true);
+      media.microphoneEnabled = false;
+      media.cameraEnabled = false;
+      renderProvider();
+      // The pending write captured `lease`; before the SDK resolves,
+      // ownership moves on — the confirmed write's fencing (a lease/epoch
+      // mismatch in real production) naturally rejects it as "stale", not
+      // "storage-error", so no stop/release escalation is warranted here.
+      ownership.writeMediaIntent
+        .mockImplementationOnce(defaultWriteMediaIntent) // pending, succeeds
+        .mockReturnValueOnce({ ok: false, reason: "stale" }); // confirmed, ownership moved on
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+
+      expect(media.stop).not.toHaveBeenCalled();
+      expect(ownership.release).not.toHaveBeenCalled();
+      // The pending entry from before the loss is what a future recovery
+      // (now under whoever actually owns it) would see — OFF/OFF either way.
+      expect(defaultReadMediaIntentForLease(callId)).toEqual({ microphone: false, camera: false });
+    });
+
+    it("7. full pending -> confirmed success path updates confirmedIntentRef for the NEXT toggle's merge", async () => {
+      media.toggleMicrophone.mockResolvedValueOnce(true);
+      media.microphoneEnabled = false;
+      media.cameraEnabled = false;
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(mediaIntentStorage[callId]).toMatchObject({
+        phase: "confirmed",
+        microphone: true,
+        camera: false,
+      });
+
+      // The next toggle (camera) merges confirmedIntentRef's mic value
+      // (true), not a stale media.microphoneEnabled read.
+      media.toggleCamera.mockResolvedValueOnce(true);
+      media.microphoneEnabled = false; // deliberately stale/wrong at the SDK layer
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle camera probe" }));
+      });
+      expect(ownership.writeMediaIntent).toHaveBeenCalledWith(
+        callId,
+        lease,
+        { microphone: true, camera: true },
+        "pending",
+      );
+    });
+
+    it("does not touch the device at all when there is no current ownership lease", async () => {
+      media.toggleMicrophone.mockResolvedValueOnce(true);
+      ownership.getLease.mockReturnValue(null);
+      renderProvider();
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(media.toggleMicrophone).not.toHaveBeenCalled();
+      expect(ownership.writeMediaIntent).not.toHaveBeenCalled();
+    });
+
+    it("a server/SDK mute that flips media state WITHOUT going through the wrapper never persists (§20)", async () => {
+      renderProvider();
+      // Simulates onMicrophoneStateChanged/server-mute flipping the raw
+      // media object's own state directly — never wrappedToggleMicrophone.
+      media.microphoneEnabled = false;
+      expect(ownership.writeMediaIntent).not.toHaveBeenCalled();
+
+      // A subsequent REAL user toggle still behaves normally afterward.
+      media.toggleMicrophone.mockResolvedValueOnce(true);
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Toggle microphone probe" }));
+      });
+      expect(ownership.writeMediaIntent).toHaveBeenCalledTimes(2); // pending + confirmed
+    });
   });
 
   it("keeps direct media from stopping an active resource room and releases it before direct media", async () => {
@@ -657,7 +1033,7 @@ describe("CallSessionProvider", () => {
       ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 3 } as never),
     );
     await act(async () => vi.advanceTimersByTime(6000));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     act(() =>
       ownershipListener({
         v: 1,
@@ -697,7 +1073,12 @@ describe("CallSessionProvider", () => {
         epoch: 2,
       } as never),
     );
-    await waitFor(() => expect(ownership.claim).toHaveBeenCalledWith(callId, "dedicated", 2));
+    await waitFor(() =>
+      expect(ownership.claim).toHaveBeenCalledWith(callId, "dedicated", 2, {
+        tabId: "tab-main",
+        epoch: 2,
+      }),
+    );
     ownership.claim.mockResolvedValueOnce(null);
     act(() =>
       ownershipListener({
@@ -747,7 +1128,7 @@ describe("CallSessionProvider", () => {
     media.remoteScreenShare = { identity: userA, bindMedia: vi.fn() };
     view.rerender(providerTree());
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     await screen.findByTestId("floating-call-window");
 
     fireEvent.click(screen.getByRole("button", { name: "Expandir probe" }));
@@ -779,7 +1160,7 @@ describe("CallSessionProvider", () => {
     calls.call = activeDirect();
     view.rerender(providerTree());
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     await screen.findByTestId("floating-call-window");
     expect(screen.getByTestId("owner")).toHaveTextContent("local");
 
@@ -800,7 +1181,7 @@ describe("CallSessionProvider", () => {
     media.hasRemoteVideo = false;
     view.rerender(providerTree());
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     await screen.findByTestId("floating-call-window");
 
     // Peer is "Ana" (userA) per the registered directory — never an index or
@@ -817,7 +1198,7 @@ describe("CallSessionProvider", () => {
     media.hasLocalVideo = false;
     view.rerender(providerTree());
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
-    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit"));
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     await screen.findByTestId("floating-call-window");
 
     const avatar = document.querySelector(".floating-call__local-avatar")!;
@@ -876,7 +1257,7 @@ describe("CallSessionProvider", () => {
     await act(async () => vi.advanceTimersByTime(1500));
     ownership.getOwner.mockReturnValue(null);
     await act(async () => vi.advanceTimersByTime(1500));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     expect(resource.reconnect).toHaveBeenCalled();
 
     ownership.claim.mockResolvedValueOnce(null);
@@ -1027,7 +1408,7 @@ describe("CallSessionProvider", () => {
     const view = renderProvider(`/call/${callId}`);
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
-    await act(() => owned.connect(calls.call as never, "token", "wss://livekit"));
+    await act(() => owned.connect(calls.call as never, "token", "wss://livekit", "fresh"));
     view.rerender(providerTree(`/call/${callId}`));
     await waitFor(() =>
       expect(screen.getByTestId("presentation")).toHaveTextContent("active_dedicated_tab"),
@@ -1193,6 +1574,12 @@ describe("dedicated tab reload/reopen recovery (achado #1)", () => {
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -1265,7 +1652,10 @@ describe("dedicated tab reload/reopen recovery (achado #1)", () => {
       } as never),
     );
     await act(async () => undefined);
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "dedicated", lease.epoch);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "dedicated", lease.epoch, {
+      tabId: "tab-main",
+      epoch: lease.epoch,
+    });
     expect(ownership.claim).toHaveBeenCalledTimes(1);
     // The recovery timer must have been cancelled: advancing past its
     // window never produces a second, redundant claim.
@@ -1315,6 +1705,12 @@ describe("stale handoff replies never move ownership after HANDOFF_TIMEOUT (acha
     ownership.getLease.mockReturnValue(lease);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -1337,7 +1733,7 @@ describe("stale handoff replies never move ownership after HANDOFF_TIMEOUT (acha
     startHandoff();
     await act(async () => undefined);
     await act(async () => vi.advanceTimersByTime(6_000));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     const claimsBeforeAck = ownership.claim.mock.calls.length;
 
     // The dedicated tab's epoch for this (now-abandoned) attempt.
@@ -1392,7 +1788,7 @@ describe("stale handoff replies never move ownership after HANDOFF_TIMEOUT (acha
     await act(async () => undefined);
     // Recovery (timeout-triggered restoreOwnership) begins first...
     await act(async () => vi.advanceTimersByTime(6_000));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     // ...then the ACK for the original attempt finally shows up. It must
     // not flip presentation back to "active_dedicated_tab" once the main
     // tab has already moved into recovery for this call.
@@ -1409,7 +1805,7 @@ describe("stale handoff replies never move ownership after HANDOFF_TIMEOUT (acha
     startHandoff();
     await act(async () => undefined);
     await act(async () => vi.advanceTimersByTime(6_000));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     vi.useRealTimers();
   });
 });
@@ -1425,6 +1821,12 @@ describe("releaseDedicated stops media before releasing ownership (achado #4)", 
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -1473,7 +1875,7 @@ describe("releaseDedicated stops media before releasing ownership (achado #4)", 
     // recovery interval must reclaim ownership on its own next tick.
     ownership.getOwner.mockReturnValue(null);
     await act(async () => vi.advanceTimersByTime(1_500));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     expect(resource.reconnect).toHaveBeenCalled();
   });
 });
@@ -1494,6 +1896,12 @@ describe("dedicated participant leave converges ownership and main tab state (is
     ownership.getLease.mockReturnValue(lease);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -1620,7 +2028,16 @@ describe("dedicated participant leave converges ownership and main tab state (is
     );
     ownership.getOwner.mockReturnValue(null);
     await act(async () => vi.advanceTimersByTime(1_500));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    // The "released" message itself (issue #610 audit) already carries
+    // dedicated's own {tabId, epoch} as a provable predecessor hint, so
+    // the eager message-triggered reclaim (not the slower 1.5s poll,
+    // deduped away by restoreOwnership's own in-flight guard) is what
+    // actually claims here.
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, {
+      tabId: "tab-dedicated",
+      epoch: 2,
+    });
+    expect(ownership.claim).toHaveBeenCalledTimes(1);
     expect(resource.reconnect).toHaveBeenCalled();
     // Minimize/handoff is never a leave (issue #594): it must never
     // converge/clear resource.active or resource.callId.
@@ -1710,7 +2127,7 @@ describe("dedicated participant leave converges ownership and main tab state (is
 
     ownership.getOwner.mockReturnValue(null);
     await act(async () => vi.advanceTimersByTime(1_500));
-    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
     expect(resource.reconnect).toHaveBeenCalled();
     // "leave-cancelled" restores the participation — it must never converge
     // the local resource session (issue #594): there is nothing to undo.
@@ -1789,6 +2206,7 @@ describe("dedicated participant leave converges ownership and main tab state (is
     fireEvent.click(screen.getByRole("button", { name: "Known join probe" }));
     expect(resource.join).toHaveBeenCalledWith(
       expect.objectContaining({ callId }),
+      "fresh",
       expect.any(Function),
     );
 
@@ -1897,6 +2315,12 @@ describe("participation ordering is causal, not wall-clock (issue #570 follow-up
     ownership.getLease.mockReturnValue(lease);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -2103,6 +2527,12 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);
     ownership.claim.mockResolvedValue(lease);
+    mediaIntentStorage = {};
+    ownership.writeMediaIntent.mockReset();
+    ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
+    ownership.readMediaIntentForLease.mockReset();
+    ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
     vi.mocked(useCallSignaling).mockReturnValue(calls as never);
@@ -2311,7 +2741,7 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     let resolveJoin!: (value: string | undefined) => void;
     let onCallIdResolved: ((resolvedCallId: string) => void) | undefined;
     resource.join.mockImplementationOnce(
-      (_target: unknown, callback?: (resolvedCallId: string) => void) => {
+      (_target: unknown, _mode: unknown, callback?: (resolvedCallId: string) => void) => {
         onCallIdResolved = callback;
         return new Promise<string | undefined>((resolve) => {
           resolveJoin = resolve;
@@ -2322,6 +2752,7 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     fireEvent.click(screen.getByRole("button", { name: "Fresh join probe (no callId)" }));
     expect(resource.join).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "channel", id: channelId }),
+      "fresh",
       expect.any(Function),
     );
     expect((resource.join.mock.calls[0]![0] as { callId?: string }).callId).toBeUndefined();
@@ -2400,7 +2831,7 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Activate participation probe" }));
-    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }));
+    expect(resource.join).toHaveBeenCalledWith(expect.objectContaining({ callId }), "recovery");
 
     // The REAL, current participation (generation 1) genuinely ends now,
     // while activateResourceParticipation's own join() is still connecting.
@@ -2968,7 +3399,12 @@ describe("React StrictMode ownership coordinator lifecycle (CALLS-546 regression
         epoch: 4,
       } as never),
     );
-    await waitFor(() => expect(second.instance.claim).toHaveBeenCalledWith(callId, "dedicated", 4));
+    await waitFor(() =>
+      expect(second.instance.claim).toHaveBeenCalledWith(callId, "dedicated", 4, {
+        tabId: "tab-main",
+        epoch: 4,
+      }),
+    );
 
     // release: releaseDedicated always resolves the active instance too.
     fireEvent.click(screen.getByRole("button", { name: "Release probe" }));
