@@ -272,15 +272,18 @@ export interface OwnershipCoordinator {
   readonly tabId: string;
   /**
    * `predecessorHint`, when the caller already knows it from a live signal
-   * (e.g. a "handoff"/"released" message's own {tabId, epoch}), is trusted
-   * as the causal predecessor for readMediaIntentForLease below — never
-   * derived from scanning media-intent entries themselves (issue #610
-   * audit: a same-epoch entry from a writer that lost the ownership race
-   * without Web Locks is never proof of having been the real predecessor,
-   * no matter how it compares to other entries). Without a hint, the
-   * predecessor is derived from whatever this coordinator itself observes
-   * at claim time — see readMediaIntentForLease's own doc for the full
-   * precedence.
+   * (e.g. a "handoff"/"released" message's own {tabId, epoch}), feeds the
+   * causal predecessor for readMediaIntentForLease below — never derived
+   * from scanning media-intent entries themselves (issue #610 audit: a
+   * same-epoch entry from a writer that lost the ownership race without
+   * Web Locks is never proof of having been the real predecessor, no
+   * matter how it compares to other entries). The hint is validated, not
+   * trusted blindly — see resolvePredecessor: it is rejected if its epoch
+   * doesn't match `afterEpoch`, and can never regress behind a newer
+   * OwnerLease this coordinator directly observes in storage. Without a
+   * usable hint, the predecessor is derived only from that directly
+   * observed OwnerLease (existingForCall) — see readMediaIntentForLease's
+   * own doc for the full precedence.
    */
   claim(
     callId: string,
@@ -374,13 +377,17 @@ export interface OwnershipCoordinator {
    *      key, and only trusted if the entry found there still reports
    *      exactly that predecessor epoch (never "whatever that writer's
    *      key currently holds", which could since have moved on).
-   *      Predecessor identity is: the explicit `predecessorHint` given to
-   *      claim(), else the OwnerLease this coordinator observed in
-   *      storage immediately before winning (even if expired — the crash
-   *      case), else — only within this same coordinator instance's own
-   *      lifetime, never derived from BroadcastChannel history, which a
-   *      reload can never replay — the epoch this same tabId itself most
-   *      recently released for callId, if nothing else has claimed since.
+   *      Predecessor identity comes ONLY from resolvePredecessor: a
+   *      `predecessorHint` given to claim() (validated against
+   *      `afterEpoch` and never allowed to regress behind newer storage
+   *      evidence — see that function's own doc), or else the OwnerLease
+   *      this coordinator observed in storage immediately before winning
+   *      (even if expired — the crash case). There is deliberately no
+   *      other fallback: this tab's own memory of a callId it previously
+   *      released is never used (removed after a formal audit — an empty
+   *      LEASE_KEY never proves no intermediate owner claimed and
+   *      released it in between), and BroadcastChannel history is never
+   *      used either, since a reload can never replay it.
    *   3. Predecessor unknown/unprovable → null (privacy-safe: the caller
    *      degrades to OFF/OFF, never a global-max approximation).
    * Once a causal entry is selected this way, phase decides the returned
