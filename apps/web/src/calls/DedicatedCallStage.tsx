@@ -22,6 +22,8 @@ export default function DedicatedCallStage({
   onMinimize,
   bindLocalMedia,
   bindRemoteAudio,
+  localScreenShareActive = false,
+  bindLocalScreenShare,
   screenShareName,
   bindScreenShare,
   hasLocalVideo,
@@ -35,6 +37,13 @@ export default function DedicatedCallStage({
   onMinimize: () => unknown;
   bindLocalMedia?: RefCallback<HTMLDivElement>;
   bindRemoteAudio?: RefCallback<HTMLDivElement>;
+  /**
+   * Whether THIS tab is currently sharing its own screen (issue #611). When
+   * true, the local screen share always wins the single primary tile over
+   * any remote share — never a second, simultaneous screen tile.
+   */
+  localScreenShareActive?: boolean;
+  bindLocalScreenShare?: RefCallback<HTMLDivElement>;
   screenShareName?: string;
   bindScreenShare?: RefCallback<HTMLDivElement>;
   /**
@@ -63,12 +72,26 @@ export default function DedicatedCallStage({
         </button>
       </header>
       <section className="dedicated-call__grid" aria-label="Participantes">
-        {bindScreenShare && (
+        {localScreenShareActive && (
           <article className="dedicated-call__tile dedicated-call__tile--screen">
-            <div ref={bindScreenShare} className="dedicated-call__media" />
-            <span>Tela de {screenShareName ?? "Participante"}</span>
+            <div ref={bindLocalScreenShare} className="dedicated-call__media" />
+            <span>Sua tela</span>
           </article>
         )}
+        {
+          // Primary source (issue #611): local share if active, otherwise
+          // the selected remote share, otherwise no screen tile at all.
+          // Never both — ending local sharing while a remote share is still
+          // active immediately reveals it as primary with no extra state,
+          // since this is derived fresh every render from the same
+          // media.remoteScreenShare the hook already keeps current.
+          !localScreenShareActive && bindScreenShare && (
+            <article className="dedicated-call__tile dedicated-call__tile--screen">
+              <div ref={bindScreenShare} className="dedicated-call__media" />
+              <span>Tela de {screenShareName ?? "Participante"}</span>
+            </article>
+          )
+        }
         <article className="dedicated-call__tile">
           <div ref={bindLocalMedia} className="dedicated-call__media" />
           {!hasLocalVideo && (

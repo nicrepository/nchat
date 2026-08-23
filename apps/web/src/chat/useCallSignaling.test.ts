@@ -350,6 +350,7 @@ describe("useCallSignaling", () => {
       expect.objectContaining({ call_id: baseCall.call_id }),
       "media-token",
       liveKitServerUrl,
+      "fresh",
     );
 
     act(() =>
@@ -948,6 +949,12 @@ describe("useCallSignaling", () => {
     await act(async () => result.current.activateMedia());
 
     expect(media.connect).toHaveBeenCalledTimes(2);
+    expect(media.connect).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      "recovery",
+    );
     expect(result.current.mediaActivationRequired).toBe(false);
   });
 
@@ -1524,6 +1531,7 @@ describe("useCallSignaling", () => {
         expect.objectContaining({ ...baseCall, status: "active" }),
         "media-token",
         liveKitServerUrl,
+        "fresh",
       ),
     );
     await waitFor(() => expect(result.current.mediaReady).toBe(true));
@@ -1652,6 +1660,7 @@ describe("useCallSignaling", () => {
       expect.objectContaining({ call_id: nextCallId }),
       "media-token",
       liveKitServerUrl,
+      "recovery",
     );
   });
 
@@ -1735,6 +1744,7 @@ describe("useCallSignaling", () => {
       expect.objectContaining({ call_id: baseCall.call_id }),
       "media-token",
       liveKitServerUrl,
+      "fresh",
     );
     expect(result.current.error).toBeNull();
   });
@@ -1793,6 +1803,83 @@ describe("useCallSignaling", () => {
     await act(async () => result.current.retryMedia());
     expect(issueCallToken).toHaveBeenCalledTimes(2);
     expect(media.connect).toHaveBeenCalledTimes(2);
+  });
+
+  describe("retryMedia fresh/recovery classification (issue #610, §13)", () => {
+    it("Caso A: stays fresh when the first fresh connect never completed", async () => {
+      const media = mediaBridge();
+      vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+      const { result } = renderHook(() => useCallSignaling(media));
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await authorizeActiveCall(result, socket, 2);
+      await waitFor(() => expect(media.connect).toHaveBeenCalledTimes(1));
+
+      await act(async () => result.current.retryMedia());
+
+      expect(media.connect).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        "fresh",
+      );
+    });
+
+    it("Caso B: becomes recovery once this call has connected successfully before", async () => {
+      const media = mediaBridge();
+      const { result } = renderHook(() => useCallSignaling(media));
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await authorizeActiveCall(result, socket, 2);
+      await waitFor(() => expect(result.current.mediaReady).toBe(true));
+      expect(media.connect).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        "fresh",
+      );
+
+      await act(async () => result.current.retryMedia());
+
+      expect(media.connect).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        "recovery",
+      );
+    });
+
+    it("Caso C: stays recovery when a recovery attempt failed before ever connecting", async () => {
+      const media = mediaBridge();
+      vi.mocked(media.connect).mockRejectedValueOnce(new Error("unavailable"));
+      const { result } = renderHook(() => useCallSignaling(media));
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      // A call this hook never itself started/accepted — restored, never
+      // authorized, never connected — matching §13/§14's "restored active
+      // call" case that only an explicit activateMedia() can move.
+      act(() => socket.simulateMessage(activeEvent(2)));
+      expect(result.current.mediaActivationRequired).toBe(true);
+
+      await act(async () => result.current.activateMedia());
+      expect(media.connect).toHaveBeenCalledTimes(1);
+      expect(media.connect).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        "recovery",
+      );
+      expect(result.current.error).not.toBeNull();
+
+      await act(async () => result.current.retryMedia());
+
+      expect(media.connect).toHaveBeenLastCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        "recovery",
+      );
+    });
   });
 
   it("restarts disconnected media with a fresh token", async () => {
@@ -1858,6 +1945,7 @@ describe("useCallSignaling", () => {
       expect.objectContaining({ call_id: baseCall.call_id }),
       "fresh-media-token",
       liveKitServerUrl,
+      "fresh",
     );
     expect(result.current.error).toBeNull();
     expect(result.current.mediaReady).toBe(true);
@@ -2817,10 +2905,19 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
 
       const view = renderHook(() => {
         const media = useCallMedia(loader as unknown as Parameters<typeof useCallMedia>[0]);
-        const resourceCall = useResourceCallSession(media);
+        const resourceMedia: CallMediaBridge = {
+          startAudio: media.startAudio,
+          connect: async (call, token, serverUrl) => {
+            await media.connect(call, token, serverUrl);
+          },
+          stop: media.stop,
+        };
+        const resourceCall = useResourceCallSession(resourceMedia);
         const directCallMedia: CallMediaBridge = {
           startAudio: media.startAudio,
-          connect: media.connect,
+          connect: async (call, token, serverUrl) => {
+            await media.connect(call, token, serverUrl);
+          },
           stop: async () => {
             if (resourceCall.active) return;
             await media.stop();
@@ -2855,7 +2952,7 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       socket: FakeWebSocket,
     ) {
       act(() => {
-        void view.result.current.resourceCall.join(channelTarget);
+        void view.result.current.resourceCall.join(channelTarget, "fresh");
       });
       let requestID = "";
       await waitFor(() => {

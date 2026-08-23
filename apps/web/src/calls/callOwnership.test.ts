@@ -1,12 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  compareOwnershipClaims,
   compareParticipationTokens,
   createOwnershipCoordinator,
   isLeaseExpired,
   parseOwnerLease,
   parseOwnershipMessage,
   resolveLeaseConflict,
+  resolvePredecessor,
+  type MediaIntent,
   type OwnerLease,
 } from "./callOwnership";
 
@@ -1205,5 +1208,1084 @@ describe("call ownership", () => {
     };
     expect(() => release.release(callId)).not.toThrow();
     release.close();
+  });
+
+  describe("compareOwnershipClaims", () => {
+    it("orders strictly by epoch regardless of tabId", () => {
+      expect(
+        compareOwnershipClaims({ epoch: 2, tabId: "z" }, { epoch: 1, tabId: "a" }),
+      ).toBeGreaterThan(0);
+      expect(
+        compareOwnershipClaims({ epoch: 1, tabId: "z" }, { epoch: 2, tabId: "a" }),
+      ).toBeLessThan(0);
+    });
+
+    it("breaks an epoch tie by tabId, symmetrically and deterministically, matching resolveLeaseConflict", () => {
+      const a = { epoch: 5, tabId: "tab-a" };
+      const b = { epoch: 5, tabId: "tab-b" };
+      const forward = compareOwnershipClaims(a, b);
+      expect(forward).toBeGreaterThan(0); // "tab-a" <= "tab-b" lexicographically -> a wins
+      expect(compareOwnershipClaims(b, a)).toBe(-forward);
+      expect(compareOwnershipClaims(a, a)).toBe(0);
+    });
+
+    it("is the exact rule resolveLeaseConflict now delegates to", () => {
+      const a: OwnerLease = {
+        v: 1,
+        callId,
+        tabId: "tab-a",
+        epoch: 2,
+        role: "main",
+        expiresAt: 2000,
+      };
+      const b: OwnerLease = {
+        v: 1,
+        callId,
+        tabId: "tab-b",
+        epoch: 3,
+        role: "dedicated",
+        expiresAt: 2000,
+      };
+      expect(resolveLeaseConflict(a, b)).toBe(compareOwnershipClaims(a, b) >= 0 ? a : b);
+      expect(resolveLeaseConflict(a, { ...b, epoch: 2 })).toBe(
+        compareOwnershipClaims(a, { ...b, epoch: 2 }) >= 0 ? a : { ...b, epoch: 2 },
+      );
+    });
+  });
+
+  describe("claim epoch floor over media-intent (issue #610)", () => {
+    const floorOptions = () => ({
+      now: () => 1000,
+      settle: () => Promise.resolve(),
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+      leaseMs: 100,
+    });
+
+    it("floors the next epoch above the highest media-intent epoch even after release() removed the lease", async () => {
+      const storage = new SharedStorage();
+      const options = { ...floorOptions(), storage };
+      const main = createOwnershipCoordinator({ ...options, tabId: "tab-main" });
+      const lease = await main.claim(callId, "main");
+      expect(lease?.epoch).toBe(1);
+      expect(
+        main.writeMediaIntent(callId, lease!, { microphone: true, camera: false }, "confirmed"),
+      ).toEqual({ ok: true, revision: 1 });
+      main.release(callId);
+      main.close();
+
+      // No OwnerLease remains, but the media-intent entry (epoch 1) does.
+      const dedicated = createOwnershipCoordinator({ ...options, tabId: "tab-dedicated" });
+      const reclaimed = await dedicated.claim(callId, "dedicated");
+      expect(reclaimed?.epoch).toBeGreaterThan(1);
+      dedicated.close();
+    });
+
+    it("floors above a lower afterEpoch too when media-intent recorded a higher epoch", async () => {
+      const storage = new SharedStorage();
+      const options = { ...floorOptions(), storage };
+      const a = createOwnershipCoordinator({ ...options, tabId: "tab-a" });
+      let lease = await a.claim(callId, "main");
+      for (let i = 0; i < 4; i += 1) {
+        lease = await a.claim(callId, "main", lease!.epoch);
+      }
+      expect(lease!.epoch).toBeGreaterThanOrEqual(5);
+      expect(
+        a.writeMediaIntent(callId, lease!, { microphone: false, camera: false }, "confirmed"),
+      ).toEqual({ ok: true, revision: 1 });
+      a.release(callId);
+      a.close();
+
+      const b = createOwnershipCoordinator({ ...options, tabId: "tab-b" });
+      const claimed = await b.claim(callId, "dedicated", 1);
+      expect(claimed?.epoch).toBeGreaterThan(lease!.epoch);
+      b.close();
+    });
+
+    it("fails closed (returns null) when the epoch floor has reached Number.MAX_SAFE_INTEGER", async () => {
+      const storage = new SharedStorage();
+      storage.setItem(
+        `nchat.call.media-intent.v1.${encodeURIComponent(callId)}:ancient-writer`,
+        JSON.stringify({
+          v: 1,
+          ownershipEpoch: Number.MAX_SAFE_INTEGER,
+          revision: 1,
+          phase: "confirmed",
+          microphone: false,
+          camera: false,
+        }),
+      );
+      const coordinator = createOwnershipCoordinator({
+        ...floorOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      expect(await coordinator.claim(callId, "main")).toBeNull();
+      coordinator.close();
+    });
+  });
+
+  describe("media intent (issue #610)", () => {
+    const intentOptions = () => ({
+      now: () => 1000,
+      settle: () => Promise.resolve(),
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+      leaseMs: 5000,
+    });
+    const mediaIntentKey = (id: string, writerId: string) =>
+      `nchat.call.media-intent.v1.${encodeURIComponent(id)}:${writerId}`;
+    const rawEntry = (
+      ownershipEpoch: number,
+      revision: number,
+      phase: "confirmed" | "pending",
+      microphone: boolean,
+      camera: boolean,
+    ) => JSON.stringify({ v: 1, ownershipEpoch, revision, phase, microphone, camera });
+
+    it("round-trips all four microphone/camera combinations as confirmed", async () => {
+      const combos: MediaIntent[] = [
+        { microphone: true, camera: true },
+        { microphone: true, camera: false },
+        { microphone: false, camera: true },
+        { microphone: false, camera: false },
+      ];
+      for (const intent of combos) {
+        const storage = new SharedStorage();
+        const coordinator = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "tab-a",
+        });
+        const lease = await coordinator.claim(callId, "main");
+        const outcome = coordinator.writeMediaIntent(callId, lease!, intent, "confirmed");
+        expect(outcome).toEqual({ ok: true, revision: 1 });
+        // Own entry at the own current epoch — always valid, no predecessor
+        // lookup needed (§7 same-owner reconnect).
+        expect(coordinator.readMediaIntentForLease(callId)).toEqual(intent);
+        coordinator.close();
+      }
+    });
+
+    it("a winning PENDING entry is never exposed as a specific preset — always OFF/OFF regardless of its stored booleans", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const lease = await coordinator.claim(callId, "main");
+      const outcome = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: true, camera: true },
+        "pending",
+      );
+      expect(outcome).toEqual({ ok: true, revision: 1 });
+      expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+        microphone: false,
+        camera: false,
+      });
+      coordinator.close();
+    });
+
+    it("readMediaIntentForLease returns null when this coordinator holds no lease for callId", () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      expect(coordinator.readMediaIntentForLease(callId)).toBeNull();
+      coordinator.close();
+    });
+
+    it("rejects a write whose captured lease tabId is not this coordinator's own (stale)", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const lease = await coordinator.claim(callId, "main");
+      const foreign: OwnerLease = { ...lease!, tabId: "tab-other" };
+      expect(
+        coordinator.writeMediaIntent(
+          callId,
+          foreign,
+          { microphone: true, camera: true },
+          "confirmed",
+        ),
+      ).toEqual({ ok: false, reason: "stale" });
+      expect(coordinator.readMediaIntentForLease(callId)).toBeNull();
+      coordinator.close();
+    });
+
+    it("rejects a write when the coordinator's current lease no longer matches the captured one (stale)", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const captured = await coordinator.claim(callId, "main");
+      coordinator.release(callId);
+      expect(
+        coordinator.writeMediaIntent(
+          callId,
+          captured!,
+          { microphone: true, camera: true },
+          "confirmed",
+        ),
+      ).toEqual({ ok: false, reason: "stale" });
+      coordinator.close();
+    });
+
+    it("rejects a stale same-writer write from a superseded epoch (E1 -> E3 -> delayed E1)", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const e1 = await coordinator.claim(callId, "main");
+      expect(
+        coordinator.writeMediaIntent(callId, e1!, { microphone: true, camera: false }, "confirmed"),
+      ).toEqual({ ok: true, revision: 1 });
+
+      coordinator.release(callId);
+      const e3 = await coordinator.claim(callId, "main");
+      expect(e3!.epoch).toBeGreaterThan(e1!.epoch);
+      expect(
+        coordinator.writeMediaIntent(callId, e3!, { microphone: false, camera: true }, "confirmed"),
+      ).toEqual({ ok: true, revision: 1 });
+
+      expect(
+        coordinator.writeMediaIntent(callId, e1!, { microphone: true, camera: true }, "confirmed"),
+      ).toEqual({ ok: false, reason: "stale" });
+      expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+        microphone: false,
+        camera: true,
+      });
+      coordinator.close();
+    });
+
+    it("increments revision monotonically for sequential same-epoch writes from the same writer, across phases", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const lease = await coordinator.claim(callId, "main");
+      coordinator.writeMediaIntent(callId, lease!, { microphone: true, camera: false }, "pending");
+      coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: true, camera: false },
+        "confirmed",
+      );
+      const third = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: false, camera: true },
+        "pending",
+      );
+      expect(third).toEqual({ ok: true, revision: 3 });
+      const raw = storage.getItem(mediaIntentKey(callId, "tab-a"));
+      expect(JSON.parse(raw!)).toMatchObject({
+        ownershipEpoch: lease!.epoch,
+        revision: 3,
+        phase: "pending",
+      });
+      // The latest write (pending) governs the read, regardless of what an
+      // earlier confirmed write at a lower revision said — there is only
+      // ever one stored value per writer key (issue #610 audit: "pending
+      // newer que confirmed antigo não ressuscita confirmed").
+      expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+        microphone: false,
+        camera: false,
+      });
+      coordinator.close();
+    });
+
+    describe("expectedRevision fencing (issue #610 privacy blocker: old operation cannot confirm a newer pending)", () => {
+      it("a confirmed write with the correct expectedRevision succeeds and advances revision", async () => {
+        const storage = new SharedStorage();
+        const coordinator = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "tab-a",
+        });
+        const lease = await coordinator.claim(callId, "main");
+        const pending = coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: false, camera: false },
+          "pending",
+        );
+        expect(pending).toEqual({ ok: true, revision: 1 });
+        const confirmed = coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: false, camera: false },
+          "confirmed",
+          { expectedRevision: (pending as { ok: true; revision: number }).revision },
+        );
+        expect(confirmed).toEqual({ ok: true, revision: 2 });
+        expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+          microphone: false,
+          camera: false,
+        });
+        coordinator.close();
+      });
+
+      it("an old operation's confirmed write is rejected once a newer pending already advanced the revision", async () => {
+        const storage = new SharedStorage();
+        const coordinator = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "tab-a",
+        });
+        const lease = await coordinator.claim(callId, "main");
+        // Operation 1 (mic) writes its own pending at revision 1.
+        const op1Pending = coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: false, camera: false },
+          "pending",
+        );
+        expect(op1Pending).toEqual({ ok: true, revision: 1 });
+        // Operation 2 (camera, newer) writes its own pending, advancing to
+        // revision 2 — overwriting the same per-writer key.
+        const op2Pending = coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: false, camera: true },
+          "pending",
+        );
+        expect(op2Pending).toEqual({ ok: true, revision: 2 });
+        // Operation 1's SDK call finally resolves and tries to confirm —
+        // still holding its OWN captured revision (1) — must be rejected.
+        const op1Confirm = coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: true, camera: false },
+          "confirmed",
+          { expectedRevision: 1 },
+        );
+        expect(op1Confirm).toEqual({ ok: false, reason: "stale" });
+        // Storage must still reflect operation 2's (pending) entry — never
+        // operation 1's stale confirm.
+        const raw = storage.getItem(mediaIntentKey(callId, "tab-a"));
+        expect(JSON.parse(raw!)).toMatchObject({ revision: 2, phase: "pending" });
+        coordinator.close();
+      });
+    });
+
+    it("distinguishes a genuine storage failure from a stale write", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const lease = await coordinator.claim(callId, "main");
+      storage.setItem = () => {
+        throw new Error("quota exceeded");
+      };
+      const outcome = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: false, camera: false },
+        "pending",
+      );
+      expect(outcome).toEqual({ ok: false, reason: "storage-error" });
+      coordinator.close();
+    });
+
+    it("full pending -> confirmed path: recovery only sees the confirmed value once settled", async () => {
+      const storage = new SharedStorage();
+      const coordinator = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const lease = await coordinator.claim(callId, "main");
+      const pending = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: true, camera: false },
+        "pending",
+      );
+      expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+        microphone: false,
+        camera: false,
+      });
+      const confirmed = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: true, camera: false },
+        "confirmed",
+        { expectedRevision: (pending as { ok: true; revision: number }).revision },
+      );
+      expect(confirmed.ok).toBe(true);
+      expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+        microphone: true,
+        camera: false,
+      });
+      coordinator.close();
+    });
+
+    it("a corrupt own-entry falls through to the predecessor instead of crashing", async () => {
+      const storage = new SharedStorage();
+      // Predecessor L, epoch 1, valid confirmed entry.
+      const l = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "L",
+      });
+      const lLease = await l.claim(callId, "main");
+      l.writeMediaIntent(callId, lLease!, { microphone: true, camera: false }, "confirmed");
+
+      // New owner claims past L, then its OWN key is corrupted directly.
+      const owner = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "owner",
+      });
+      await owner.claim(callId, "main", lLease!.epoch);
+      storage.setItem(mediaIntentKey(callId, "owner"), "not-json");
+      expect(owner.readMediaIntentForLease(callId)).toEqual({ microphone: true, camera: false });
+      l.close();
+      owner.close();
+    });
+
+    it("never reads across callIds even when percent-encoding could textually resemble another boundary", async () => {
+      const trickyCallId = "call%3Aimpersonator";
+      const storage = new SharedStorage();
+      const other = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+      });
+      const otherLease = await other.claim(trickyCallId, "main");
+      other.writeMediaIntent(
+        trickyCallId,
+        otherLease!,
+        { microphone: true, camera: true },
+        "confirmed",
+      );
+      const reader = createOwnershipCoordinator({
+        ...intentOptions(),
+        storage,
+        channel: new TestChannel(),
+        tabId: "reader",
+      });
+      await reader.claim(callId, "main");
+      expect(reader.readMediaIntentForLease(callId)).toBeNull();
+      other.close();
+      reader.close();
+    });
+
+    describe("predecessor provenance (issue #610 audit — historical loser blocker)", () => {
+      it("1. mic: a loser's stray confirmed ON at E is never used — the legitimate E-1 predecessor's OFF wins, even though the true E-winner never wrote anything", async () => {
+        const storage = new SharedStorage();
+        const l = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "L",
+        });
+        const lLease = await l.claim(callId, "main"); // E-1
+        l.writeMediaIntent(callId, lLease!, { microphone: false, camera: false }, "confirmed");
+
+        // A wins epoch E (supersedes L, which is still "live" from A's
+        // point of view — exactly how a real handoff claims past a known
+        // epoch) but never writes media-intent (its connect/toggle never
+        // got that far before closing).
+        const a = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease = await a.claim(callId, "main", lLease!.epoch);
+        expect(aLease!.epoch).toBeGreaterThan(lLease!.epoch);
+
+        // B, a concurrent loser without Web Locks, still manages to write a
+        // stray confirmed entry at the SAME epoch E before observing its
+        // own defeat — simulated directly, since reproducing the exact
+        // runClaim race deterministically isn't the point of this test;
+        // what matters is that this entry, once present, is provably never
+        // read as a predecessor by anyone.
+        storage.setItem(
+          mediaIntentKey(callId, "B"),
+          rawEntry(aLease!.epoch, 1, "confirmed", true, true),
+        );
+
+        // A never releases or writes media-intent — it just goes silent
+        // (crash), leaving its lease sitting in storage exactly as any
+        // crashed tab would. C reclaims past it using the known epoch
+        // (mirroring a real handoff/dead-owner-poll claim).
+        const c = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "C",
+        });
+        const cLease = await c.claim(callId, "main", aLease!.epoch);
+        expect(cLease!.epoch).toBeGreaterThan(aLease!.epoch);
+
+        // C's predecessor is A:E (existingForCall, still readable from A's
+        // never-released lease) — A never wrote, so the read finds nothing
+        // there and must NOT fall back to B's entry.
+        expect(c.readMediaIntentForLease(callId)).toBeNull();
+
+        l.close();
+        a.close();
+        c.close();
+      });
+
+      it("2. camera: same shape, predecessor lookup finds nothing for A:E, loser B:E is never consulted", async () => {
+        const storage = new SharedStorage();
+        const l = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "L",
+        });
+        const lLease = await l.claim(callId, "main");
+        l.writeMediaIntent(callId, lLease!, { microphone: false, camera: false }, "confirmed");
+
+        const a = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease = await a.claim(callId, "main", lLease!.epoch);
+        storage.setItem(
+          mediaIntentKey(callId, "B"),
+          rawEntry(aLease!.epoch, 1, "confirmed", true, true),
+        );
+
+        const c = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "C",
+        });
+        await c.claim(callId, "main", aLease!.epoch);
+        expect(c.readMediaIntentForLease(callId)).toBeNull();
+
+        l.close();
+        a.close();
+        c.close();
+      });
+
+      it("3. winner E OFF + loser E ON (both wrote): a future owner uses the winner's OFF, never the loser's ON", async () => {
+        const storage = new SharedStorage();
+        const a = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease = await a.claim(callId, "main");
+        a.writeMediaIntent(callId, aLease!, { microphone: false, camera: false }, "confirmed");
+        // Loser B also manages to write, at the SAME epoch, the opposite
+        // value.
+        storage.setItem(
+          mediaIntentKey(callId, "B"),
+          rawEntry(aLease!.epoch, 1, "confirmed", true, true),
+        );
+
+        const c = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "C",
+        });
+        await c.claim(callId, "main", aLease!.epoch);
+        expect(c.readMediaIntentForLease(callId)).toEqual({ microphone: false, camera: false });
+        a.close();
+        c.close();
+      });
+
+      it("4. predecessor known via an explicit handoff hint: the exact snapshot is preserved, independent of storage's own existingForCall", async () => {
+        const storage = new SharedStorage();
+        const main = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "main-tab",
+        });
+        const mainLease = await main.claim(callId, "main");
+        main.writeMediaIntent(callId, mainLease!, { microphone: true, camera: true }, "confirmed");
+        // Main releases (as the real handoff-start flow does) BEFORE the
+        // dedicated tab ever claims — so existingForCall alone would see
+        // nothing. Only the explicit predecessorHint (mirroring the
+        // "handoff" message's own {tabId, epoch}) can recover it.
+        main.release(callId);
+
+        const dedicated = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "dedicated-tab",
+        });
+        await dedicated.claim(callId, "dedicated", mainLease!.epoch, {
+          tabId: "main-tab",
+          epoch: mainLease!.epoch,
+        });
+        expect(dedicated.readMediaIntentForLease(callId)).toEqual({
+          microphone: true,
+          camera: true,
+        });
+        main.close();
+        dedicated.close();
+      });
+
+      it("5. predecessor known via a crashed/expired OwnerLease still in storage: snapshot preserved", async () => {
+        let now = 1000;
+        const storage = new SharedStorage();
+        const crashed = createOwnershipCoordinator({
+          storage,
+          channel: new TestChannel(),
+          tabId: "crashed-tab",
+          now: () => now,
+          settle: () => Promise.resolve(),
+          setInterval: vi.fn(() => 1),
+          clearInterval: vi.fn(),
+          leaseMs: 100,
+        });
+        const crashedLease = await crashed.claim(callId, "main");
+        crashed.writeMediaIntent(
+          callId,
+          crashedLease!,
+          { microphone: false, camera: true },
+          "confirmed",
+        );
+        // Never released — simulates the tab/process dying outright. Its
+        // lease just sits in storage, now expired.
+        now = 5000;
+
+        const recoverer = createOwnershipCoordinator({
+          storage,
+          channel: new TestChannel(),
+          tabId: "recoverer",
+          now: () => now,
+          settle: () => Promise.resolve(),
+          setInterval: vi.fn(() => 1),
+          clearInterval: vi.fn(),
+          leaseMs: 100,
+        });
+        const recovererLease = await recoverer.claim(callId, "main");
+        expect(recovererLease!.epoch).toBeGreaterThan(crashedLease!.epoch);
+        expect(recoverer.readMediaIntentForLease(callId)).toEqual({
+          microphone: false,
+          camera: true,
+        });
+        crashed.close();
+        recoverer.close();
+      });
+
+      it("6. predecessor unknown/unprovable (a genuinely first-ever claim): null, never a global-max approximation", async () => {
+        const storage = new SharedStorage();
+        // Some UNRELATED writer's entry at a lower epoch for the SAME
+        // callId, with no OwnerLease evidence connecting it to this claim
+        // at all (no existingForCall, no hint, no same-instance memory) —
+        // must never be picked up as a fallback predecessor.
+        storage.setItem(
+          mediaIntentKey(callId, "unrelated"),
+          rawEntry(1, 1, "confirmed", true, true),
+        );
+        const coordinator = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "first-ever",
+        });
+        await coordinator.claim(callId, "main");
+        expect(coordinator.readMediaIntentForLease(callId)).toBeNull();
+        coordinator.close();
+      });
+
+      it("7. current owner + own entry at the current epoch is always valid (same-lease reconnect, no new claim)", async () => {
+        const storage = new SharedStorage();
+        const coordinator = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "owner",
+        });
+        const lease = await coordinator.claim(callId, "main");
+        coordinator.writeMediaIntent(
+          callId,
+          lease!,
+          { microphone: true, camera: false },
+          "confirmed",
+        );
+        // Re-reading without any new claim() call — same lease, same epoch.
+        expect(coordinator.readMediaIntentForLease(callId)).toEqual({
+          microphone: true,
+          camera: false,
+        });
+        coordinator.close();
+      });
+
+      it("8. a same-epoch foreign loser is never consulted even when it is the ONLY other entry present", async () => {
+        const storage = new SharedStorage();
+        const owner = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "owner",
+        });
+        const lease = await owner.claim(callId, "main"); // fresh claim, no predecessor at all
+        storage.setItem(
+          mediaIntentKey(callId, "loser"),
+          rawEntry(lease!.epoch, 1, "confirmed", true, true),
+        );
+        expect(owner.readMediaIntentForLease(callId)).toBeNull();
+        owner.close();
+      });
+
+      it("9. a PENDING entry at the legitimate predecessor's epoch degrades to OFF/OFF, never the booleans it carries", async () => {
+        const storage = new SharedStorage();
+        const l = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "L",
+        });
+        const lLease = await l.claim(callId, "main");
+        l.writeMediaIntent(callId, lLease!, { microphone: true, camera: true }, "pending");
+
+        const a = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        await a.claim(callId, "main", lLease!.epoch);
+        expect(a.readMediaIntentForLease(callId)).toEqual({ microphone: false, camera: false });
+        l.close();
+        a.close();
+      });
+
+      it("10. a PENDING entry from a non-predecessor loser is completely ignored, not merely degraded", async () => {
+        const storage = new SharedStorage();
+        const l = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "L",
+        });
+        const lLease = await l.claim(callId, "main");
+        l.writeMediaIntent(callId, lLease!, { microphone: false, camera: false }, "confirmed");
+
+        const a = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease = await a.claim(callId, "main", lLease!.epoch);
+        // Loser's stray write is PENDING this time, not confirmed — must
+        // still never be looked up at all, exactly like test 1/3.
+        storage.setItem(
+          mediaIntentKey(callId, "B"),
+          rawEntry(aLease!.epoch, 1, "pending", true, true),
+        );
+
+        const c = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "C",
+        });
+        await c.claim(callId, "main", aLease!.epoch);
+        // C's predecessor is A:E, which never wrote anything — the read
+        // stops there (deliberately single-hop, never walking further back
+        // to L) and returns null, regardless of B's stray pending entry.
+        expect(c.readMediaIntentForLease(callId)).toBeNull();
+        l.close();
+        a.close();
+        c.close();
+      });
+    });
+
+    describe("resolvePredecessor (issue #610 audit — final blocker: lastReleasedByCallId removed)", () => {
+      it("3. same-tab immediate reclaim with an explicit hint for the exact epoch just released is trusted", () => {
+        expect(resolvePredecessor(null, { tabId: "A", epoch: 1 }, 1)).toEqual({
+          tabId: "A",
+          epoch: 1,
+        });
+      });
+
+      it("4. a stale hint never overrides a newer existingForCall", () => {
+        const existing = { tabId: "B", epoch: 2 };
+        const staleHint = { tabId: "A", epoch: 1 };
+        expect(resolvePredecessor(existing, staleHint, 1)).toEqual(existing);
+      });
+
+      it("5. same epoch, different tabId: the winner is exactly resolveLeaseConflict's own tie-break", () => {
+        const existing = { tabId: "B", epoch: 2 };
+        const hint = { tabId: "A", epoch: 2 };
+        const expected = compareOwnershipClaims(existing, hint) > 0 ? existing : hint;
+        expect(resolvePredecessor(existing, hint, 2)).toEqual(expected);
+        // Sanity: this is genuinely exercising the tie-break, not a no-op —
+        // prove it against resolveLeaseConflict directly on equivalent
+        // OwnerLease objects.
+        const asLease = (c: { tabId: string; epoch: number }): OwnerLease => ({
+          v: 1,
+          callId,
+          tabId: c.tabId,
+          epoch: c.epoch,
+          role: "main",
+          expiresAt: 0,
+        });
+        expect(resolveLeaseConflict(asLease(existing), asLease(hint)).tabId).toBe(expected.tabId);
+      });
+
+      it("6. a hint whose epoch does not match afterEpoch is rejected, falling back to existingForCall", () => {
+        const existing = { tabId: "B", epoch: 2 };
+        const mismatchedHint = { tabId: "A", epoch: 1 };
+        expect(resolvePredecessor(existing, mismatchedHint, 5)).toEqual(existing);
+        expect(resolvePredecessor(null, mismatchedHint, 5)).toBeNull();
+      });
+
+      it("7. no hint and no existingForCall: predecessor is unknown", () => {
+        expect(resolvePredecessor(null, undefined, undefined)).toBeNull();
+        expect(resolvePredecessor(null, undefined, 5)).toBeNull();
+      });
+
+      it("no hint at all: existingForCall alone governs, whatever it is", () => {
+        const existing = { tabId: "B", epoch: 2 };
+        expect(resolvePredecessor(existing, undefined, 2)).toEqual(existing);
+        expect(resolvePredecessor(null, undefined, 2)).toBeNull();
+      });
+    });
+
+    describe("missed cross-tab message: lastReleasedByCallId must never substitute for real provenance (issue #610 audit — final blocker)", () => {
+      it("1. mic: A:E1 ON releases, B:E2 OFF claims+writes+releases, A never sees B's message and reclaims E3 with empty storage — predecessor is UNKNOWN, never A's own stale A:E1", async () => {
+        const storage = new SharedStorage();
+        const a1 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease1 = await a1.claim(callId, "main");
+        a1.writeMediaIntent(callId, aLease1!, { microphone: true, camera: false }, "confirmed");
+        a1.release(callId); // storage now empty; A privately "remembers" A:E1, but must never use it
+
+        // B claims past A, changes the intent, and cleanly releases too —
+        // exactly the intermediate owner A never learns about.
+        const b = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "B",
+        });
+        const bLease = await b.claim(callId, "main", aLease1!.epoch);
+        b.writeMediaIntent(callId, bLease!, { microphone: false, camera: false }, "confirmed");
+        b.release(callId); // storage empty again
+
+        // A reclaims — new coordinator instance stands in for "A resumed
+        // after being suspended", but even the SAME instance (a1) must
+        // never fall back to its own release-time memory here.
+        const a2 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease3 = await a2.claim(callId, "main", bLease!.epoch);
+        expect(aLease3!.epoch).toBeGreaterThan(bLease!.epoch);
+        expect(a2.readMediaIntentForLease(callId)).toBeNull();
+
+        a1.close();
+        b.close();
+        a2.close();
+      });
+
+      it("2. camera: same shape as test 1", async () => {
+        const storage = new SharedStorage();
+        const a1 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        const aLease1 = await a1.claim(callId, "main");
+        a1.writeMediaIntent(callId, aLease1!, { microphone: false, camera: true }, "confirmed");
+        a1.release(callId);
+
+        const b = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "B",
+        });
+        const bLease = await b.claim(callId, "main", aLease1!.epoch);
+        b.writeMediaIntent(callId, bLease!, { microphone: false, camera: false }, "confirmed");
+        b.release(callId);
+
+        const a2 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "A",
+        });
+        await a2.claim(callId, "main", bLease!.epoch);
+        expect(a2.readMediaIntentForLease(callId)).toBeNull();
+
+        a1.close();
+        b.close();
+        a2.close();
+      });
+
+      it("10. dedicated->main with the 'released' message lost: OFF/OFF, never an old ancestor's confirmed value", async () => {
+        // Mirrors CallSessionProvider's own shape: main (M) hands off to
+        // dedicated (D) via an explicit hint (handoff message always
+        // arrives — it targets a specific tab and the flow depends on it).
+        // D changes intent and later releases cleanly (minimize), but the
+        // "released" broadcast is the one message that can legitimately be
+        // missed (no targeted delivery guarantee, no ack). M's own
+        // fallback poll then reclaims with NO hint at all.
+        const storage = new SharedStorage();
+        const m1 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "M",
+        });
+        const mLease = await m1.claim(callId, "main");
+        m1.writeMediaIntent(callId, mLease!, { microphone: true, camera: true }, "confirmed");
+        m1.release(callId);
+
+        const d = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "D",
+        });
+        const dLease = await d.claim(callId, "dedicated", mLease!.epoch, {
+          tabId: "M",
+          epoch: mLease!.epoch,
+        });
+        d.writeMediaIntent(callId, dLease!, { microphone: false, camera: false }, "confirmed");
+        d.release(callId); // the "released" message this produces is the one M misses
+
+        // M's poll-based reclaim: no hint (the message never arrived).
+        const m2 = createOwnershipCoordinator({
+          ...intentOptions(),
+          storage,
+          channel: new TestChannel(),
+          tabId: "M",
+        });
+        await m2.claim(callId, "main", dLease!.epoch);
+        expect(m2.readMediaIntentForLease(callId)).toBeNull();
+
+        m1.close();
+        d.close();
+        m2.close();
+      });
+    });
+
+    it("heartbeat write failure and media-intent write failure can coexist — a durable pending marker written before both broke still governs recovery", async () => {
+      const now = 1000;
+      const storage = new SharedStorage();
+      const lost = vi.fn();
+      let heartbeat!: () => void;
+      const coordinator = createOwnershipCoordinator({
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-a",
+        now: () => now,
+        settle: () => Promise.resolve(),
+        setInterval: (callback) => {
+          heartbeat = callback;
+          return 1;
+        },
+        clearInterval: vi.fn(),
+        leaseMs: 100,
+        onOwnershipLost: lost,
+      });
+      const lease = await coordinator.claim(callId, "main");
+      const pending = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: false, camera: false },
+        "pending",
+      );
+      expect(pending.ok).toBe(true);
+
+      // Storage breaks AFTER the pending write already landed — the SAME
+      // failure mode affects the heartbeat's own writeLease call.
+      storage.setItem = () => {
+        throw new Error("storage unavailable");
+      };
+      const confirmed = coordinator.writeMediaIntent(
+        callId,
+        lease!,
+        { microphone: true, camera: false },
+        "confirmed",
+        { expectedRevision: (pending as { ok: true; revision: number }).revision },
+      );
+      expect(confirmed).toEqual({ ok: false, reason: "storage-error" });
+      heartbeat();
+      expect(lost).toHaveBeenCalledOnce();
+
+      // A brand-new coordinator (another tab, or this one after storage
+      // recovers) reclaims the callId — storage.setItem works again for
+      // this fresh instance's own writes. loseOwnership()'s own cleanup
+      // (storage.removeItem, which never throws even when setItem does)
+      // already erased the crashed lease, so unlike a true hard crash
+      // (browser closes, nothing runs, the lease just sits there until it
+      // expires — see the "expired OwnerLease" predecessor test) there is
+      // no OwnerLease left in storage for this claim to read as
+      // existingForCall. The predecessor is therefore UNKNOWN here, not
+      // "known but pending" — readMediaIntentForLease returns null, which
+      // is exactly as safe: CallSessionProvider's own
+      // `readMediaIntentForLease(...) ?? {microphone:false,camera:false}`
+      // still degrades to OFF/OFF either way. The already-durable pending
+      // entry from before the outage is never read as a stale ON/confirmed
+      // value regardless of which of these two null-shaped outcomes it is.
+      storage.setItem = SharedStorage.prototype.setItem.bind(storage);
+      const recovering = createOwnershipCoordinator({
+        storage,
+        channel: new TestChannel(),
+        tabId: "tab-b",
+        now: () => now,
+        settle: () => Promise.resolve(),
+        setInterval: vi.fn(() => 1),
+        clearInterval: vi.fn(),
+        leaseMs: 100,
+      });
+      const nextLease = await recovering.claim(callId, "main");
+      expect(nextLease?.epoch).toBeGreaterThan(lease!.epoch);
+      expect(recovering.readMediaIntentForLease(callId)).toBeNull();
+      coordinator.close();
+      recovering.close();
+    });
   });
 });

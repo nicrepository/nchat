@@ -8,6 +8,7 @@ import {
   type LiveKitSessionLoader,
 } from "../media/liveKitSession";
 import { nextStableSpeaker, type StableSpeakerState } from "../calls/activeSpeaker";
+import type { MediaIntent } from "../calls/callOwnership";
 import type { CallType } from "./callState";
 
 export type CallMediaStatus =
@@ -61,13 +62,17 @@ export interface CallMediaController {
   remoteScreenShare: RemoteScreenShare | null;
   bindLocalMedia: RefCallback<HTMLDivElement>;
   bindRemoteMedia: RefCallback<HTMLDivElement>;
+  // Local screen-share preview only — deliberately separate from
+  // bindLocalMedia (camera). Only ever has content once an attached local
+  // screen-share element exists (see screenShareEnabled).
+  bindLocalScreenShare: RefCallback<HTMLDivElement>;
   // RF-24 grid API. Populated from the same event stream as the legacy
   // fields above but kept independent: a resource room never touches
   // bindRemoteMedia's flat container, and a direct call never touches these.
   participants: ParticipantMedia[];
   bindRemoteAudio: RefCallback<HTMLDivElement>;
-  toggleMicrophone: () => Promise<void>;
-  toggleCamera: () => Promise<void>;
+  toggleMicrophone: () => Promise<boolean | undefined>;
+  toggleCamera: () => Promise<boolean | undefined>;
   toggleScreenShare: () => Promise<void>;
   activateAudio: () => Promise<void>;
 }
@@ -79,7 +84,8 @@ export interface CallMediaSessionController extends CallMediaController {
     call: { call_id: string; call_type: CallType },
     token: string,
     serverUrl: string,
-  ) => Promise<void>;
+    initialIntent?: MediaIntent,
+  ) => Promise<MediaIntent | undefined>;
   stop: () => Promise<void>;
 }
 
@@ -146,7 +152,10 @@ export function useCallMedia(
   const factoryPromiseRef = useRef<Promise<LiveKitSessionFactory> | null>(null);
   const sessionRef = useRef<LiveKitSession | null>(null);
   const sessionPromiseRef = useRef<Promise<LiveKitSession | null> | null>(null);
-  const connectPromiseRef = useRef<{ callId: string; promise: Promise<void> } | null>(null);
+  const connectPromiseRef = useRef<{
+    callId: string;
+    promise: Promise<MediaIntent | undefined>;
+  } | null>(null);
   const audioStartPromiseRef = useRef<{
     generation: number;
     session: LiveKitSession;
@@ -183,9 +192,25 @@ export function useCallMedia(
   const participantsMapRef = useRef(new Map<string, ParticipantMediaEntry>());
   const participantOrderRef = useRef<string[]>([]);
   const participantBindRef = useRef(new Map<string, RefCallback<HTMLDivElement>>());
-  const remoteScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
+  const localScreenShareContainerRef = useRef<HTMLDivElement | null>(null);
+  const localScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
+  // Registry of every currently-active remote screen-share publication,
+  // keyed by LiveKit trackSid (never participant identity alone — the same
+  // participant can unpublish and republish, producing a new trackSid before
+  // the old publication's removal event arrives). trackSid alone is still
+  // not enough to key a REMOVAL safely — see onRemoteScreenShareChanged's
+  // own comment below — so every entry's stored element is compared against
+  // the removal's element before anything is deleted. remoteScreenShareOrderRef
+  // is start order (oldest -> newest); the "presented" share is the last
+  // (most recently started) entry still in the registry (issue #611 policy:
+  // most-recently-started-among-active, falling back to the next most
+  // recent when the presented one ends).
+  const remoteScreenSharesRef = useRef(
+    new Map<string, { identity: string; element: HTMLMediaElement }>(),
+  );
+  const remoteScreenShareOrderRef = useRef<string[]>([]);
   const remoteScreenShareContainerRef = useRef<HTMLDivElement | null>(null);
-  const remoteScreenShareIdentityRef = useRef<string | null>(null);
+  const presentedRemoteScreenShareElementRef = useRef<HTMLMediaElement | null>(null);
 
   const update = useCallback((patch: Partial<MediaState>) => {
     if (mountedRef.current) setState((current) => ({ ...current, ...patch }));
@@ -205,21 +230,56 @@ export function useCallMedia(
     participantsMapRef.current.clear();
     participantOrderRef.current = [];
     participantBindRef.current.clear();
-    remoteScreenShareElementRef.current?.remove();
-    remoteScreenShareElementRef.current = null;
+    localScreenShareElementRef.current?.remove();
+    localScreenShareElementRef.current = null;
+    localScreenShareContainerRef.current?.replaceChildren();
+    for (const entry of remoteScreenSharesRef.current.values()) entry.element.remove();
+    remoteScreenSharesRef.current.clear();
+    remoteScreenShareOrderRef.current = [];
+    presentedRemoteScreenShareElementRef.current = null;
     remoteScreenShareContainerRef.current?.replaceChildren();
-    remoteScreenShareIdentityRef.current = null;
     if (speakerTimerRef.current !== null) clearTimeout(speakerTimerRef.current);
     speakerTimerRef.current = null;
     speakerStateRef.current = null;
   }, []);
 
-  const bindRemoteScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
-    remoteScreenShareContainerRef.current = element;
-    if (element && remoteScreenShareElementRef.current) {
-      element.replaceChildren(remoteScreenShareElementRef.current);
+  const bindLocalScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    localScreenShareContainerRef.current = element;
+    if (element && localScreenShareElementRef.current) {
+      element.replaceChildren(localScreenShareElementRef.current);
     }
   }, []);
+
+  const bindRemoteScreenShare = useCallback<RefCallback<HTMLDivElement>>((element) => {
+    remoteScreenShareContainerRef.current = element;
+    if (element && presentedRemoteScreenShareElementRef.current) {
+      element.replaceChildren(presentedRemoteScreenShareElementRef.current);
+    }
+  }, []);
+
+  // Derives which registry entry is "presented" (the most recently started
+  // entry still active — last in remoteScreenShareOrderRef) and rebinds the
+  // container/React state only when the presented element actually changed,
+  // so an add/remove of some OTHER (non-presented) share never touches the
+  // visible tile.
+  const syncPresentedRemoteScreenShare = useCallback(() => {
+    const order = remoteScreenShareOrderRef.current;
+    const presentedTrackSid = order.length > 0 ? order[order.length - 1] : undefined;
+    const presented = presentedTrackSid
+      ? remoteScreenSharesRef.current.get(presentedTrackSid)
+      : undefined;
+    const presentedElement = presented?.element ?? null;
+    if (presentedRemoteScreenShareElementRef.current === presentedElement) return;
+    presentedRemoteScreenShareElementRef.current = presentedElement;
+    remoteScreenShareContainerRef.current?.replaceChildren(
+      ...(presentedElement ? [presentedElement] : []),
+    );
+    update({
+      remoteScreenShare: presented
+        ? { identity: presented.identity, bindMedia: bindRemoteScreenShare }
+        : null,
+    });
+  }, [bindRemoteScreenShare, update]);
 
   const bindVideoFor = useCallback((identity: string): RefCallback<HTMLDivElement> => {
     let bind = participantBindRef.current.get(identity);
@@ -373,11 +433,6 @@ export function useCallMedia(
           }
           remoteElementsRef.current.delete(element);
           remoteAudioElementsRef.current.delete(element);
-          if (remoteScreenShareElementRef.current === element) {
-            remoteScreenShareElementRef.current = null;
-            remoteScreenShareIdentityRef.current = null;
-            update({ remoteScreenShare: null });
-          }
           element.remove();
           syncRemoteState();
 
@@ -498,29 +553,55 @@ export function useCallMedia(
           screenShareEnabledRef.current = enabled;
           update({ screenShareEnabled: enabled });
         },
-        onRemoteScreenShareChanged(identity, element) {
+        onLocalScreenShareChanged(element) {
           if (!current()) return;
           if (!element) {
-            if (remoteScreenShareIdentityRef.current !== identity) return;
-            remoteScreenShareElementRef.current = null;
-            remoteScreenShareIdentityRef.current = null;
-            remoteScreenShareContainerRef.current?.replaceChildren();
-            update({ remoteScreenShare: null });
+            localScreenShareElementRef.current?.remove();
+            localScreenShareElementRef.current = null;
+            localScreenShareContainerRef.current?.replaceChildren();
             return;
           }
-          remoteScreenShareElementRef.current = element;
-          remoteScreenShareIdentityRef.current = identity;
-          remoteScreenShareContainerRef.current?.replaceChildren(element);
-          update({ remoteScreenShare: { identity, bindMedia: bindRemoteScreenShare } });
+          localScreenShareElementRef.current = element;
+          localScreenShareContainerRef.current?.replaceChildren(element);
+        },
+        onRemoteScreenShareChanged(identity, trackSid, element, active) {
+          if (!current()) return;
+          if (!active) {
+            // trackSid alone is NOT sufficient to key a removal safely: the
+            // adapter can in principle carry the same trackSid across two
+            // distinct subscription instances (a rebind/replay around
+            // reconnect can deliver a new element for an already-known
+            // trackSid before the OLD instance's own stale removal arrives).
+            // A removal must only ever delete the entry it is actually
+            // about — verified by comparing the exact element, never by
+            // trackSid/identity alone — so a stale removal for an instance
+            // already superseded by a newer add can never clear the newer
+            // one.
+            const existing = remoteScreenSharesRef.current.get(trackSid);
+            if (!existing || existing.element !== element) return;
+            remoteScreenSharesRef.current.delete(trackSid);
+            remoteScreenShareOrderRef.current = remoteScreenShareOrderRef.current.filter(
+              (sid) => sid !== trackSid,
+            );
+            syncPresentedRemoteScreenShare();
+            return;
+          }
+          // A replay of an already-known trackSid overwrites the entry in
+          // place without moving its start-order position.
+          if (!remoteScreenSharesRef.current.has(trackSid)) {
+            remoteScreenShareOrderRef.current.push(trackSid);
+          }
+          remoteScreenSharesRef.current.set(trackSid, { identity, element });
+          syncPresentedRemoteScreenShare();
         },
       };
     },
     [
-      bindRemoteScreenShare,
       ensureParticipant,
       invalidateDeadSession,
       removeParticipant,
       syncParticipants,
+      syncPresentedRemoteScreenShare,
       update,
     ],
   );
@@ -732,13 +813,14 @@ export function useCallMedia(
       call: { call_id: string; call_type: CallType },
       token: string,
       serverUrl: string,
-    ): Promise<void> => {
-      if (connectedCallIdRef.current === call.call_id) return Promise.resolve();
+      initialIntent?: MediaIntent,
+    ): Promise<MediaIntent | undefined> => {
+      if (connectedCallIdRef.current === call.call_id) return Promise.resolve(undefined);
       if (connectPromiseRef.current?.callId === call.call_id) {
         return connectPromiseRef.current.promise;
       }
       const generation = generationRef.current;
-      const connecting = (async () => {
+      const connecting = (async (): Promise<MediaIntent | undefined> => {
         let session: LiveKitSession | null = null;
         microphoneEnabledRef.current = false;
         update({
@@ -749,20 +831,48 @@ export function useCallMedia(
         });
         try {
           session = await ensureSession();
-          if (!session || generationRef.current !== generation) return;
+          if (!session || generationRef.current !== generation) return undefined;
           await session.connect(serverUrl, token);
-          if (sessionRef.current !== session || generationRef.current !== generation) return;
+          if (sessionRef.current !== session || generationRef.current !== generation) {
+            return undefined;
+          }
+          if (initialIntent) {
+            // Recovery (issue #610): apply the restored snapshot EXACTLY —
+            // never enable-then-disable, never getUserMedia for a device
+            // whose restored intent is false. Both setters take the target
+            // boolean directly, unlike enableCamera/enableMicrophone below.
+            await session.setCameraEnabled(initialIntent.camera);
+            if (sessionRef.current !== session || generationRef.current !== generation) {
+              return undefined;
+            }
+            update({ cameraEnabled: initialIntent.camera });
+            await session.setMicrophoneEnabled(initialIntent.microphone);
+            if (sessionRef.current !== session || generationRef.current !== generation) {
+              return undefined;
+            }
+            connectedCallIdRef.current = call.call_id;
+            update({ status: "connected", error: null });
+            return { microphone: initialIntent.microphone, camera: initialIntent.camera };
+          }
+          // Fresh (issue #610): unchanged entry defaults.
+          let cameraEnabled = false;
           if (call.call_type === "video") {
             await session.enableCamera();
-            if (sessionRef.current !== session || generationRef.current !== generation) return;
+            if (sessionRef.current !== session || generationRef.current !== generation) {
+              return undefined;
+            }
             update({ cameraEnabled: true });
+            cameraEnabled = true;
           }
           await session.enableMicrophone();
-          if (sessionRef.current !== session || generationRef.current !== generation) return;
+          if (sessionRef.current !== session || generationRef.current !== generation) {
+            return undefined;
+          }
           connectedCallIdRef.current = call.call_id;
           // microphoneEnabled itself was already confirmed by
           // onMicrophoneStateChanged as part of enableMicrophone() above.
           update({ status: "connected", error: null });
+          return { microphone: true, camera: cameraEnabled };
         } catch (error) {
           if (generationRef.current === generation) {
             if (session && sessionRef.current === session) {
@@ -805,9 +915,9 @@ export function useCallMedia(
     [clearElements, ensureSession, trackedDisconnect, update],
   );
 
-  const toggleMicrophone = useCallback(async () => {
+  const toggleMicrophone = useCallback(async (): Promise<boolean | undefined> => {
     const session = sessionRef.current;
-    if (!session || pendingControlRef.current) return;
+    if (!session || pendingControlRef.current) return undefined;
     const operation: PendingMediaOperation = {
       control: "microphone",
       session,
@@ -815,17 +925,21 @@ export function useCallMedia(
     };
     pendingControlRef.current = operation;
     update({ pendingControl: "microphone", error: null });
+    const next = !microphoneEnabledRef.current;
     try {
       // Intent is the inverse of the last SDK-confirmed state (ref), never a
       // stale React closure: onMicrophoneStateChanged keeps the ref current,
       // including corrections from reconnection or a remote/server mute.
-      await session.setMicrophoneEnabled(!microphoneEnabledRef.current);
+      await session.setMicrophoneEnabled(next);
       // The confirmed value itself is applied by onMicrophoneStateChanged,
       // which fires synchronously inside setMicrophoneEnabled above.
+      if (pendingControlRef.current !== operation) return undefined;
+      return microphoneEnabledRef.current;
     } catch (error) {
       if (pendingControlRef.current === operation) {
         update({ error: mediaErrorMessage(error, "microphone") });
       }
+      return undefined;
     } finally {
       if (pendingControlRef.current === operation) {
         pendingControlRef.current = null;
@@ -834,9 +948,9 @@ export function useCallMedia(
     }
   }, [update]);
 
-  const toggleCamera = useCallback(async () => {
+  const toggleCamera = useCallback(async (): Promise<boolean | undefined> => {
     const session = sessionRef.current;
-    if (!session || pendingControlRef.current) return;
+    if (!session || pendingControlRef.current) return undefined;
     const operation: PendingMediaOperation = {
       control: "camera",
       session,
@@ -844,14 +958,17 @@ export function useCallMedia(
     };
     pendingControlRef.current = operation;
     update({ pendingControl: "camera", error: null });
+    const enabled = !state.cameraEnabled;
     try {
-      const enabled = !state.cameraEnabled;
       await session.setCameraEnabled(enabled);
-      if (pendingControlRef.current === operation) update({ cameraEnabled: enabled });
+      if (pendingControlRef.current !== operation) return undefined;
+      update({ cameraEnabled: enabled });
+      return enabled;
     } catch (error) {
       if (pendingControlRef.current === operation) {
         update({ error: mediaErrorMessage(error, "camera") });
       }
+      return undefined;
     } finally {
       if (pendingControlRef.current === operation) {
         pendingControlRef.current = null;
@@ -898,6 +1015,7 @@ export function useCallMedia(
     ...state,
     bindLocalMedia,
     bindRemoteMedia,
+    bindLocalScreenShare,
     bindRemoteAudio,
     toggleMicrophone,
     toggleCamera,

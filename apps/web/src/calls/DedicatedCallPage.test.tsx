@@ -61,6 +61,7 @@ const session = {
     toggleCamera: vi.fn(),
     toggleScreenShare: vi.fn(),
     bindLocalMedia: vi.fn(),
+    bindLocalScreenShare: vi.fn(),
     bindRemoteAudio: vi.fn(),
   },
 };
@@ -100,6 +101,7 @@ describe("DedicatedCallPage", () => {
     session.media.status = "connected";
     session.media.participants = [];
     session.media.remoteScreenShare = null;
+    session.media.screenShareEnabled = false;
     session.media.hasLocalVideo = true;
     vi.mocked(useCallSession).mockReturnValue(session as never);
     vi.mocked(resolveCall).mockResolvedValue(resolvedCall);
@@ -276,6 +278,48 @@ describe("DedicatedCallPage", () => {
     expect(session.calls.end).toHaveBeenCalledOnce();
   });
 
+  it("wires local screen share as primary over a simultaneously active remote share (issue #611)", async () => {
+    const direct = {
+      call_id: callId,
+      request_id: "request",
+      caller_id: "caller",
+      callee_id: "current-user",
+      target_type: "user" as const,
+      call_type: "video" as const,
+      status: "active" as const,
+      version: 1,
+      created_at: "2026-08-18T12:00:00Z",
+      occurred_at: "2026-08-18T12:00:00Z",
+      expires_at: "2026-08-18T13:00:00Z",
+    };
+    vi.mocked(resolveCall).mockResolvedValueOnce(direct);
+    vi.mocked(fetchSidebarData).mockResolvedValueOnce({
+      currentUserId: "current-user",
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [
+        {
+          id: "dm-direct",
+          name: "Ana",
+          type: "1:1",
+          participants: [],
+          counterpart: { userId: "caller", displayName: "Ana" },
+        },
+      ],
+      categories: [],
+    });
+    session.calls.call = direct;
+    session.media.participants = [
+      { identity: "caller", displayName: "Ana", hasVideo: true, bindVideo: vi.fn() },
+    ];
+    session.media.remoteScreenShare = { identity: "caller", bindMedia: vi.fn() };
+    session.media.screenShareEnabled = true;
+    renderPage();
+
+    expect(await screen.findByText("Sua tela")).toBeInTheDocument();
+    expect(screen.queryByText("Tela de Ana")).not.toBeInTheDocument();
+  });
+
   it("wires the local fallback avatar's seed to directory.currentUserId, never a fetched profile", async () => {
     const direct = {
       call_id: callId,
@@ -397,7 +441,12 @@ describe("DedicatedCallPage", () => {
     renderPage();
 
     expect(await screen.findByText("Tela de Participante")).toBeInTheDocument();
-    expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, false);
+    // The screen-share tile renders straight from session.media, but the
+    // acknowledgement only fires once the activation effect has recorded this
+    // callId — a separate async chain. Awaiting the tile says nothing about
+    // that chain, so this has to wait for the acknowledgement itself, the same
+    // way every other test here waits on join() before asserting it.
+    await waitFor(() => expect(acknowledgeDedicated).toHaveBeenCalledWith(callId, false));
   });
 
   it("ignores asynchronous resolution after unmount", async () => {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -46,8 +47,18 @@ func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.
 		video.RoomAdmin || video.RoomCreate || video.RoomList || video.RoomRecord {
 		t.Fatalf("token has administrative or excessive grants: %+v", video)
 	}
-	if got := video.CanPublishSources; len(got) != 2 || got[0] != "camera" || got[1] != "microphone" {
+	got := video.CanPublishSources
+	wantSources := []string{"camera", "microphone", "screen_share"}
+	if len(got) != len(wantSources) {
 		t.Fatalf("unexpected publish sources: %v", got)
+	}
+	for _, source := range wantSources {
+		if !slices.Contains(got, source) {
+			t.Fatalf("expected publish source %q, got %v", source, got)
+		}
+	}
+	if slices.Contains(got, "screen_share_audio") {
+		t.Fatalf("screen_share_audio must never be granted: %v", got)
 	}
 	if grants.SIP != nil || grants.Agent != nil || grants.Inference != nil || grants.Observability != nil {
 		t.Fatalf("unexpected non-video grants: %+v", grants)
