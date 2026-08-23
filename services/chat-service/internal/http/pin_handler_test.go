@@ -80,6 +80,50 @@ func TestMessageHandler_Pin_WithoutServiceReturns503(t *testing.T) {
 	}
 }
 
+// Only PinMessage had this guard exercised, yet every pin route reaches the
+// pin service through the same nil-checked field. A route that skipped the
+// check would not answer 503 — it would dereference a nil interface and take
+// the process down, which is a far worse outcome than the unavailability it is
+// meant to report. Each verb is listed separately because the guard is written
+// out once per handler, not shared.
+func TestMessageHandler_PinRoutes_WithoutServiceReturn503(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		call   func(*httpapi.MessageHandler, *httptest.ResponseRecorder)
+		method string
+	}{
+		{name: "pin channel message", method: http.MethodPost, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.PinMessage(rec, pinRequest(http.MethodPost))
+		}},
+		{name: "pin dm message", method: http.MethodPost, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.PinDMMessage(rec, dmPinRequest(http.MethodPost))
+		}},
+		{name: "unpin channel message", method: http.MethodDelete, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.UnpinMessage(rec, pinRequest(http.MethodDelete))
+		}},
+		{name: "unpin dm message", method: http.MethodDelete, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.UnpinDMMessage(rec, dmPinRequest(http.MethodDelete))
+		}},
+		{name: "list channel pins", method: http.MethodGet, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.ListPins(rec, pinRequest(http.MethodGet))
+		}},
+		{name: "list dm pins", method: http.MethodGet, call: func(h *httpapi.MessageHandler, rec *httptest.ResponseRecorder) {
+			h.ListDMPins(rec, dmPinRequest(http.MethodGet))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, nil)
+			rec := httptest.NewRecorder()
+
+			test.call(h, rec)
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503 without a pin service, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestMessageHandler_Pin_Success204AndBroadcasts(t *testing.T) {
 	spy := &spyPinBroadcaster{}
 	h := pinHandler(&fakePinProvider{}, spy)

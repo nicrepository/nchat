@@ -135,6 +135,70 @@ func TestSidebarHandler_PinAndUnpinUseAuthenticatedUser(t *testing.T) {
 	}
 }
 
+// The DM pin route has four verbs across two handlers and they differ only in
+// the target kind, the path parameter and the pinned flag — the shape a
+// copy-paste gets wrong silently. UnpinDM is the one no other test reaches, so
+// a body that unpinned a *channel*, or that read {channelID} from a route that
+// only carries {conversationID}, would ship without a failing test.
+func TestSidebarHandler_UnpinDMTargetsTheConversationAndUnpins(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &pinningSidebarProvider{}
+	router := sidebarRouter(v, svc)
+	conversationID := "22222222-2222-2222-2222-222222222222"
+	path := "/api/chat/dm/" + conversationID + "/sidebar-pin"
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authSidebarPinRequest(t, http.MethodDelete, path))
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got, want := strings.Join(svc.unpinArgs, ","), strings.Join([]string{testUserID, service.PinTargetDM, conversationID}, ","); got != want {
+		t.Fatalf("unpin args = %q, want %q", got, want)
+	}
+	// Unpinning must not reach the pin path at all: a flipped flag would leave
+	// the conversation pinned while answering 204.
+	if svc.pinArgs != nil {
+		t.Fatalf("DELETE reached PinConversation with %v", svc.pinArgs)
+	}
+}
+
+// The DM route carries no channelID, so a handler reading the wrong parameter
+// would send an empty target through to the service instead of being refused.
+func TestSidebarHandler_UnpinDMRejectsAMalformedConversationID(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &pinningSidebarProvider{}
+	router := sidebarRouter(v, svc)
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, authSidebarPinRequest(t, http.MethodDelete, "/api/chat/dm/not-a-uuid/sidebar-pin"))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if svc.unpinArgs != nil {
+		t.Fatalf("a malformed id still reached the service: %v", svc.unpinArgs)
+	}
+}
+
+// Unauthenticated unpin must be refused before the service is consulted.
+func TestSidebarHandler_UnpinDMUnauthenticatedDoesNotReachTheService(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &pinningSidebarProvider{}
+	router := sidebarRouter(v, svc)
+	path := "/api/chat/dm/22222222-2222-2222-2222-222222222222/sidebar-pin"
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, httptest.NewRequest(http.MethodDelete, path, nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if svc.unpinArgs != nil {
+		t.Fatalf("an unauthenticated request reached the service: %v", svc.unpinArgs)
+	}
+}
+
 func TestSidebarHandler_PinInaccessibleConversationReturnsGenericNotFound(t *testing.T) {
 	v := makeTestValidator(t)
 	svc := &pinningSidebarProvider{err: domain.ErrNotFound}
@@ -287,6 +351,75 @@ func TestSidebarHandler_MarkReadRejectsUnauthorizedInvalidAndInaccessibleRequest
 
 // ISSUE #414 — the sidebar publishes two ordering keys per item, and nothing
 // else about the message it points at.
+// last_read_message_id is caller-supplied and ends up in a read-state write, so
+// it is validated like any other id rather than forwarded on trust.
+func TestSidebarHandler_MarkReadRejectsAMalformedLastReadMessageID(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &readingSidebarProvider{}
+	channelID := "11111111-1111-4111-8111-111111111111"
+	req := authSidebarPinRequest(t, http.MethodPost, "/api/chat/channels/"+channelID+"/read")
+	body := `{"last_read_message_id":"not-a-uuid"}`
+	req.Body = io.NopCloser(strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+
+	rr := httptest.NewRecorder()
+	sidebarRouter(v, svc).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "last_read_message_id") {
+		t.Fatalf("error does not name the offending field: %s", rr.Body.String())
+	}
+	if svc.args != nil {
+		t.Fatalf("a malformed message id reached the service: %v", svc.args)
+	}
+}
+
+func TestSidebarHandler_MarkReadRejectsAMalformedTargetID(t *testing.T) {
+	v := makeTestValidator(t)
+	svc := &readingSidebarProvider{}
+
+	rr := httptest.NewRecorder()
+	sidebarRouter(v, svc).ServeHTTP(rr, authSidebarPinRequest(t, http.MethodPost, "/api/chat/dm/not-a-uuid/read"))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if svc.args != nil {
+		t.Fatalf("a malformed target id reached the service: %v", svc.args)
+	}
+}
+
+// The read and pin routes reach the sidebar service through an optional
+// interface. A deployment wiring only the plain sidebar provider must answer
+// "unavailable" rather than dereference an interface it never received.
+func TestSidebarHandler_ReadAndPinRoutesWithoutTheirProviderReturn503(t *testing.T) {
+	v := makeTestValidator(t)
+	channelID := "11111111-1111-4111-8111-111111111111"
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "mark channel read", method: http.MethodPost, path: "/api/chat/channels/" + channelID + "/read"},
+		{name: "mark dm read", method: http.MethodPost, path: "/api/chat/dm/" + channelID + "/read"},
+		{name: "pin channel", method: http.MethodPost, path: "/api/chat/channels/" + channelID + "/sidebar-pin"},
+		{name: "unpin dm", method: http.MethodDelete, path: "/api/chat/dm/" + channelID + "/sidebar-pin"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// stubSidebarProvider serves GetSidebar only — it implements
+			// neither the read nor the pin interface.
+			rr := httptest.NewRecorder()
+			sidebarRouter(v, &stubSidebarProvider{}).ServeHTTP(rr, authSidebarPinRequest(t, test.method, test.path))
+
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestSidebarHandler_SerializesActivityTimestamps(t *testing.T) {
 	v := makeTestValidator(t)
 	// Microseconds, because chat.messages.created_at is a TIMESTAMPTZ and holds

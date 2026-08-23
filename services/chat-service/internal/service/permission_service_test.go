@@ -186,6 +186,48 @@ func TestPermissionService_CanManageWorkspace_OnlyActiveOwnerOrAdmin(t *testing.
 	}
 }
 
+// The role matrix above only reaches CanManageWorkspace when a membership row
+// exists. The two remaining answers are what an administrative endpoint is
+// actually guarded by, and they must not be the same answer: somebody with no
+// membership at all is simply refused, while a store that could not answer is
+// an error — never a quiet "false" that a caller could mistake for a decision,
+// and never a "true".
+func TestPermissionService_CanManageWorkspace_NonMemberIsRefusedWithoutAnError(t *testing.T) {
+	members := newFakeMemberStore() // no membership row for user-1
+
+	got, err := service.NewPermissionService(members, &fakeChannelStore{}).
+		CanManageWorkspace(context.Background(), "ws-1", "user-1")
+
+	if err != nil {
+		t.Fatalf("a non-member must be a decision, not an error: %v", err)
+	}
+	if got {
+		t.Fatal("CanManageWorkspace authorized a user with no membership")
+	}
+}
+
+func TestPermissionService_CanManageWorkspace_StoreFailureIsReportedNotDecided(t *testing.T) {
+	storeErr := errors.New("connection reset")
+	members := newFakeMemberStore()
+	members.getWMErr = storeErr
+	// A row that would authorize, to prove the failure is what is answered and
+	// not the row behind it.
+	members.workspaceMembers[wmKey("ws-1", "user-1")] = domain.WorkspaceMember{
+		WorkspaceID: "ws-1", UserID: "user-1",
+		Role: domain.WorkspaceRoleOwner, Status: domain.MemberStatusActive,
+	}
+
+	got, err := service.NewPermissionService(members, &fakeChannelStore{}).
+		CanManageWorkspace(context.Background(), "ws-1", "user-1")
+
+	if !errors.Is(err, storeErr) {
+		t.Fatalf("error = %v, want the store's error wrapped", err)
+	}
+	if got {
+		t.Fatal("a failed membership lookup authorized the caller")
+	}
+}
+
 func TestPermissionService_ListVisibleChannels_UsesSQLVisibilityFiltering(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", "user-1")] = activeMembership("ws-1", "user-1")
