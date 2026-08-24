@@ -199,9 +199,17 @@ const media = {
 };
 const calls = {
   call: null as null | Record<string, unknown>,
+  pending: false,
+  // Distinct from `pending` on purpose (issue #615 blocker follow-up): the
+  // real hook's `cancelling` is true only while THIS call's own cancel() is
+  // pending, never merely because `pending` is (which also covers reconnect/
+  // call.sync reconciliation) — tests below drive them independently to
+  // prove the provider never conflates the two.
+  cancelling: false,
   start: vi.fn(),
   accept: vi.fn(),
   decline: vi.fn(),
+  cancel: vi.fn(() => true),
   end: vi.fn(),
   activateMedia: vi.fn(async () => undefined),
   retryMedia: vi.fn(async () => undefined),
@@ -465,6 +473,19 @@ function mockActiveDirectResolution(id = callId) {
   return { ...activeDirect(), call_id: id };
 }
 
+// The CURRENT user (userB, per the "Diretório" probe button) as CALLER —
+// activeDirect()'s roles swapped, ringing — for issue #615's outgoing popup.
+// Ana (userA) is the existing "dm-1" counterpart fixture, so the peer lookup
+// resolves exactly like every other direct-call test in this file.
+function outgoingRinging() {
+  return {
+    ...activeDirect(),
+    caller_id: userB,
+    callee_id: userA,
+    status: "ringing",
+  } satisfies Call;
+}
+
 vi.mocked(resolveCall).mockImplementation(async (id) => mockActiveDirectResolution(id));
 
 describe("CallSessionProvider", () => {
@@ -477,6 +498,8 @@ describe("CallSessionProvider", () => {
     mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "" });
     participationStorage = {};
     calls.call = null;
+    calls.pending = false;
+    calls.cancelling = false;
     calls.error = null;
     calls.mediaActivationRequired = false;
     resource.active = null;
@@ -900,6 +923,189 @@ describe("CallSessionProvider", () => {
       </MemoryRouter>,
     );
     expect(await screen.findByTestId("floating-call-window")).toBeInTheDocument();
+  });
+
+  // Issue #615: the CALLER's own global, non-modal surface for a direct
+  // call.ringing it started — IncomingCallPopup's counterpart for the other
+  // end of the exact same lifecycle state, gated ENTIRELY on the
+  // authoritative calls.call (never on calls.pending, never a second
+  // lifecycle/local model).
+  describe("outgoing call popup (issue #615)", () => {
+    it("A: renders the outgoing popup (caller=current user, callee=peer), never the incoming one", async () => {
+      calls.call = outgoingRinging();
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      expect(await screen.findByRole("region", { name: "Ligando para Ana" })).toBeInTheDocument();
+      expect(screen.getByText("Ana")).toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: "Chamada recebida" })).not.toBeInTheDocument();
+    });
+
+    it("B: an incoming ringing call keeps its existing behavior and never renders the outgoing popup", async () => {
+      calls.call = { ...activeDirect(), status: "ringing" };
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: /Ligando para/ })).not.toBeInTheDocument();
+    });
+
+    it("C: accept transitions ringing outgoing -> active; the outgoing popup disappears and floating takes over", async () => {
+      calls.call = outgoingRinging();
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      expect(await screen.findByRole("region", { name: "Ligando para Ana" })).toBeInTheDocument();
+
+      calls.call = { ...outgoingRinging(), status: "active", version: 2 };
+      view.rerender(providerTree());
+
+      expect(screen.queryByRole("region", { name: "Ligando para Ana" })).not.toBeInTheDocument();
+      expect(await screen.findByTestId("floating-call-window")).toBeInTheDocument();
+    });
+
+    it("D: caller cancel calls calls.cancel() only — never calls.end, decline, or resource lifecycle", async () => {
+      calls.call = outgoingRinging();
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancelar chamada para Ana" }));
+
+      expect(calls.cancel).toHaveBeenCalledOnce();
+      expect(calls.end).not.toHaveBeenCalled();
+      expect(calls.decline).not.toHaveBeenCalled();
+      expect(resource.join).not.toHaveBeenCalled();
+      expect(resource.leave).not.toHaveBeenCalled();
+    });
+
+    it("emits the cancelled technical event only when calls.cancel() actually sent a command", async () => {
+      const events: string[] = [];
+      const listener = (event: Event) =>
+        events.push((event as CustomEvent<{ event: string }>).detail.event);
+      window.addEventListener("nchat:call-technical-event", listener);
+      calls.call = outgoingRinging();
+      calls.cancel.mockReturnValueOnce(false);
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancelar chamada para Ana" }));
+      expect(calls.cancel).toHaveBeenCalledOnce();
+      expect(events).not.toContain("cancelled");
+
+      window.removeEventListener("nchat:call-technical-event", listener);
+    });
+
+    it("emits the cancelled technical event when calls.cancel() actually sends a command", async () => {
+      const events: string[] = [];
+      const listener = (event: Event) =>
+        events.push((event as CustomEvent<{ event: string }>).detail.event);
+      window.addEventListener("nchat:call-technical-event", listener);
+      calls.call = outgoingRinging();
+      calls.cancel.mockReturnValueOnce(true);
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancelar chamada para Ana" }));
+      expect(events).toContain("cancelled");
+
+      window.removeEventListener("nchat:call-technical-event", listener);
+    });
+
+    it("shows the normal ringing status when nothing is pending", async () => {
+      calls.call = outgoingRinging();
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+      expect(screen.getByRole("status")).toHaveTextContent("Ligando…");
+      expect(screen.getByRole("button", { name: "Cancelar chamada para Ana" })).toBeEnabled();
+    });
+
+    // Issue #615 blocker follow-up: useCallSignaling's `pending` also covers
+    // reconnect/call.sync reconciliation (every reconnect sets pending=true
+    // regardless of any real command in flight — see useCallSignaling.ts's
+    // onOpen). The popup must key off the hook's dedicated `cancelling`
+    // field, never off `pending` directly, or a mere reconnect would show
+    // "Cancelando…"/disable the button for a cancel the user never asked
+    // for.
+    it("does not show a cancelling state during reconnect/call.sync reconciliation (calls.pending=true, calls.cancelling=false)", async () => {
+      calls.call = outgoingRinging();
+      calls.pending = true;
+      calls.cancelling = false;
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+      expect(screen.getByRole("status")).toHaveTextContent("Ligando…");
+      expect(screen.queryByText("Cancelando…")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Cancelar chamada para Ana" })).toBeEnabled();
+    });
+
+    it("shows a disabled, cancelling-labeled button only while calls.cancelling reflects this call's own cancel in flight", async () => {
+      calls.call = outgoingRinging();
+      calls.pending = true;
+      calls.cancelling = true;
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      const button = await screen.findByRole("button", { name: "Cancelar chamada para Ana" });
+      expect(button).toBeDisabled();
+      expect(screen.getByRole("status")).toHaveTextContent("Cancelando…");
+    });
+
+    it.each([
+      ["E", "declined"],
+      ["F", "timed_out"],
+      ["G", "cancelled"],
+    ] as const)("%s: a %s terminal clears the outgoing popup", async (_, status) => {
+      calls.call = outgoingRinging();
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      calls.call = { ...outgoingRinging(), status, version: 2 };
+      view.rerender(providerTree());
+
+      expect(screen.queryByRole("region", { name: "Ligando para Ana" })).not.toBeInTheDocument();
+    });
+
+    it("H: a stale/duplicate ringing push never renders a second outgoing popup", async () => {
+      calls.call = outgoingRinging();
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      // A duplicate/stale re-delivery of the exact same ringing snapshot —
+      // this component derives the popup purely from calls.call, so there is
+      // structurally only ever at most one to find, never a second one
+      // accumulated from the redundant push.
+      calls.call = { ...outgoingRinging() };
+      view.rerender(providerTree());
+      expect(screen.getAllByRole("region", { name: "Ligando para Ana" })).toHaveLength(1);
+    });
+
+    it("I: stays global and unique across a route change while the same direct call keeps ringing", async () => {
+      calls.call = outgoingRinging();
+      const view = renderProvider("/chat");
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await screen.findByRole("region", { name: "Ligando para Ana" });
+
+      view.rerender(providerTree(`/chat/channel/${channelId}`));
+
+      expect(screen.getAllByRole("region", { name: "Ligando para Ana" })).toHaveLength(1);
+    });
+
+    it("J: a resource (channel/group DM) call never renders the outgoing popup", async () => {
+      resource.active = { kind: "channel", id: channelId, name: "Produto" };
+      resource.callId = callId;
+      resource.status = "connecting";
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+      expect(screen.queryByRole("region", { name: /Ligando para/ })).not.toBeInTheDocument();
+    });
   });
 
   // Issue #622 round 2: resource calls are joinable sessions, never a
@@ -2326,6 +2532,8 @@ describe("screen-share ownership fence and non-resumption (issue #611)", () => {
     vi.clearAllMocks();
     participationStorage = {};
     calls.call = null;
+    calls.pending = false;
+    calls.cancelling = false;
     calls.error = null;
     calls.mediaActivationRequired = false;
     resource.active = null;
@@ -3212,6 +3420,8 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     vi.clearAllMocks();
     participationStorage = {};
     calls.call = null;
+    calls.pending = false;
+    calls.cancelling = false;
     calls.error = null;
     calls.mediaActivationRequired = false;
     resource.active = null;

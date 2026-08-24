@@ -27,8 +27,12 @@ Duas famílias de chamada compartilham o mesmo protocolo:
 `call_type` aceita `audio` ou `video`. `request_id` torna o início idempotente
 para o originador. Campos desconhecidos, identidade, participantes, sala, token
 ou estado escolhidos pelo cliente são rejeitados. `call.start` direta continua
-sem `call.admitted`; `response_to` só aparece no `call.error` de `call.sync`
-quando o cliente fornece `sync_id`, conforme documentado abaixo.
+sem `call.admitted` em caso de sucesso — o sucesso continua sendo
+exclusivamente o broadcast de lifecycle `call.ringing`, cujo `call.request_id`
+já ecoa este `request_id` (inalterado desde antes da issue #622). A partir da
+issue #615, o `call.error` de um `call.start` **direto** que falha também
+correlaciona por `request_id`, exatamente como o de recurso já fazia — ver
+"Erros correlacionados" abaixo.
 
 ### `call.sync` — resync autoritativo, `sync_id` opcional (issue #614)
 
@@ -303,12 +307,24 @@ códigos estáveis: `call_invalid`, `call_not_found`, `call_invalid_state`,
 `call_participant_busy`, `call_participation_stale`, `call_rate_limited` ou `call_unavailable`. Elas não
 fecham a conexão.
 
-Para `call.join`, `call.resource.sync`, `call.sync` com `sync_id` e o
-`call.start` de uma chamada de recurso, o erro também carrega `response_to` —
-o `request_id` do comando (ou o `sync_id`, no caso de `call.resource.sync` e
-de `call.sync`) — para o cliente correlacionar sem ambiguidade. `call.start`
-de chamada **direta**, `call.sync` sem `sync_id` (legacy) e os demais comandos
-pré-existentes continuam sem `response_to`, inalterados por esta issue.
+Para `call.join`, `call.leave`, `call.resource.sync`, `call.sync` com
+`sync_id` e `call.start` (**direta ou de recurso** — issue #615 estendeu a
+direta, que antes não tinha esta correlação), o erro também carrega
+`response_to` — o `request_id` do comando (ou o `sync_id`, no caso de
+`call.resource.sync` e de `call.sync`) — para o cliente correlacionar sem
+ambiguidade. `call.sync` sem `sync_id` (legacy) e os demais comandos
+pré-existentes continuam sem `response_to`, inalterados.
+
+Extensão backward-compatible (issue #615): um cliente anterior à #615 nunca
+lê `response_to` no `call.error` de um `call.start` direto, então o campo
+extra é inofensivo para ele; um cliente atualizado, ao enviar `call.start`
+direto, sempre recebe seu próprio `request_id` de volta em qualquer
+`call.error` correlacionado a esse comando. Sucesso é inalterado — `call.start`
+direto nunca ganhou `call.admitted`, continua exclusivamente via
+`call.ringing`. Nenhuma autorização, participante, mídia ou token novo foi
+adicionado; `user_id`/`workspace_id` continuam vindo exclusivamente da sessão
+autenticada, nunca do payload — `request_id` é apenas correlação/idempotência,
+nunca prova de identidade.
 
 ## Rollout fail-closed
 

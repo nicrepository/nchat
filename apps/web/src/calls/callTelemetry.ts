@@ -2,6 +2,7 @@ export type CallTechnicalEvent =
   | "incoming-shown"
   | "accepted"
   | "rejected"
+  | "cancelled"
   | "join-success"
   | "join-failure"
   | "reconnect"

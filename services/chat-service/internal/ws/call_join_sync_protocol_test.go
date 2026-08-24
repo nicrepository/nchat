@@ -388,9 +388,17 @@ func TestDirectCallStartNeverSendsCallAdmitted(t *testing.T) {
 	}
 }
 
-// Resource call.start errors correlate by request_id; direct call.start
-// errors keep carrying none, unchanged from before #622.
-func TestCallStartErrorCorrelationDependsOnResourceVsDirect(t *testing.T) {
+// Resource AND direct call.start errors both correlate by request_id (issue
+// #615): direct call.start's own call.error used to carry none at all —
+// eventCompletesPending's success-side correlation (call.ringing echoing
+// request_id) already existed, but a FAILED call.start had no equivalent,
+// so useCallSignaling's errorMatchesPending could only correlate a direct
+// call.start error by "is there a call.start currently pending" — a stale
+// call.error from an abandoned attempt A could be mistaken for a
+// later, still-pending attempt B's own failure. See
+// TestDirectCallStartErrorCorrelatesByRequestID below for the end-to-end
+// wire proof.
+func TestCallStartErrorAlwaysCorrelatesByRequestID(t *testing.T) {
 	resourceMsg := ClientMessage{
 		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
 		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
@@ -402,8 +410,46 @@ func TestCallStartErrorCorrelationDependsOnResourceVsDirect(t *testing.T) {
 		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
 		TargetUserID: callTestCallee, CallType: domain.CallTypeVideo,
 	}
-	if got := callResponseTo(directMsg); got != "" {
-		t.Fatalf("direct call.start response_to = %q, want empty", got)
+	if got := callResponseTo(directMsg); got != callTestRequest {
+		t.Fatalf("direct call.start response_to = %q, want %q", got, callTestRequest)
+	}
+}
+
+// End-to-end wire proof for issue #615: a DIRECT call.start's own call.error
+// carries response_to == the command's request_id — the same shape a
+// resource call.start's error already had (see
+// TestResourceCallStartBusyProducesParticipantBusyCallError, unaffected by
+// this change). Success is untouched: direct call.start still never gets a
+// call.admitted ACK (TestDirectCallStartNeverSendsCallAdmitted above), only
+// the pre-existing call.ringing lifecycle broadcast.
+func TestDirectCallStartErrorCorrelatesByRequestID(t *testing.T) {
+	handler := &fakeCallHandler{err: domain.ErrCallParticipantBusy}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "direct-start-busy-correlated",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("caller-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register caller")
+	}
+
+	msg := ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetUserID: callTestCallee, CallType: domain.CallTypeVideo,
+	}
+	err := hub.handleClientMessage(context.Background(), client, msg)
+	if !errors.Is(err, domain.ErrCallParticipantBusy) {
+		t.Fatalf("start direct call: %v", err)
+	}
+	if !handleCallClientError(client, msg.Type, "", callResponseTo(msg), err) {
+		t.Fatal("expected direct call.start error to be handled")
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode call error: %v", err)
+	}
+	if response.Type != "call.error" || response.Operation != "call.start" ||
+		response.Code != "call_participant_busy" || response.ResponseTo != callTestRequest {
+		t.Fatalf("unexpected direct call error: %+v", response)
 	}
 }
 

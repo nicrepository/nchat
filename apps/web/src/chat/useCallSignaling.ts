@@ -81,14 +81,32 @@ function errorMatchesPending(
   value: Record<string, unknown>,
 ): boolean {
   if (!pending || value["operation"] !== pending.operation) return false;
-  // Transition errors carry call_id. call.start errors do not echo request_id,
-  // so the single in-flight operation is the strongest available correlation.
+  if (pending.operation === "call.start") {
+    // The backend now echoes request_id via response_to for a direct
+    // call.start's own call.error too (issue #615's call_protocol.go
+    // callResponseTo change) — the same correlation call.ringing's success
+    // path already had (Call.request_id, matched by eventCompletesPending
+    // above). Without this, "operation === call.start" was the only
+    // available correlation, and this hook only ever tracks one pending
+    // command at a time — so a stale call.error from an abandoned earlier
+    // start attempt could be mistaken for a different, later pending
+    // attempt's own failure purely because both were "call.start".
+    return pending.requestId !== undefined && value["response_to"] === pending.requestId;
+  }
+  // Transition errors carry call_id.
   return pending.callId === undefined || value["call_id"] === pending.callId;
 }
 
 export interface CallController {
   call: Call | null;
   pending: boolean;
+  // True SPECIFICALLY while the currently pending command is this call's own
+  // cancel() (issue #615 follow-up) — never merely because `pending` is,
+  // which also covers reconnect/call.sync reconciliation (see this hook's
+  // onOpen: every reconnect sets pending=true regardless of any real command
+  // in flight). A UI that shows "Cancelando…"/disables its cancel button
+  // must key off this, never off `pending` directly.
+  cancelling: boolean;
   error: string | null;
   mediaReady: boolean;
   mediaActivationRequired: boolean;
@@ -117,6 +135,27 @@ export function useCallSignaling(
 ): CallController {
   const [state, setState] = useState<CallState>(initialCallState);
   const [pending, setPending] = useState(false);
+  // True only while THIS call's own cancel() command is pending (issue #615
+  // blocker follow-up) — deliberately its own piece of state, never derived
+  // from `pending` alone: `pending` also covers reconnect/call.sync
+  // reconciliation (see the onOpen handler below, which sets it regardless
+  // of any real command in flight), and reading pendingRef during render to
+  // disambiguate is disallowed here (react-hooks/refs). Set exactly once,
+  // in the returned cancel() wrapper below, the moment its own send actually
+  // succeeds; cleared by the effect right after it the instant `pending`
+  // itself goes false for ANY reason — release/error/reconnect/replaced-by-
+  // a-new-call all funnel through the same `pending` transition, so there is
+  // nothing else this needs to watch.
+  const [cancelling, setCancelling] = useState(false);
+  // Adjust-during-render reset (same pattern as CallSessionProvider's
+  // prunedForDirectory) rather than an effect — the moment `pending` itself
+  // goes false for ANY reason, `cancelling` must never survive it, and
+  // there is no reason to wait an extra commit to say so. Safe against
+  // re-render loops: once this fires, `cancelling` is already false, so the
+  // condition cannot re-trigger.
+  if (!pending && cancelling) {
+    setCancelling(false);
+  }
   const [error, setError] = useState<string | null>(null);
   const [mediaReady, setMediaReady] = useState(false);
   const socketRef = useRef<ChatSocketHandle | null>(null);
@@ -305,6 +344,30 @@ export function useCallSignaling(
         // owner for the same call_id.
         if (event && event.target_type !== "user") return;
         if (event) {
+          // Fence (issue #615 blocker follow-up): while THIS hook's own
+          // call.start is pending, a stale/unrelated direct lifecycle for a
+          // DIFFERENT request_id — delivered to this connection as the
+          // CALLER's own copy of a DIFFERENT call — must never touch this
+          // attempt's state. PublishCall always sends a direct event to the
+          // caller and callee as two separate, envelope-scoped copies (see
+          // services/chat-service/internal/ws/call_protocol.go's
+          // publishCallToUser): the caller's own copy always carries
+          // target_id === call.caller_id, the callee's always
+          // target_id === call.callee_id — and this connection only ever
+          // receives events addressed to its own identity, so that
+          // comparison alone tells us which role THIS copy represents,
+          // without needing this hook to know its own user id. A genuinely
+          // incoming call — delivered as the CALLEE — is a completely
+          // unrelated, legitimate event and must never be caught by this
+          // fence merely for carrying a different request_id.
+          if (
+            pendingRef.current?.operation === "call.start" &&
+            pendingRef.current.requestId !== undefined &&
+            event.target_id === event.call.caller_id &&
+            event.call.request_id !== pendingRef.current.requestId
+          ) {
+            return;
+          }
           const currentCall = callRef.current;
           const reconciliation =
             syncReconciliationRef.current?.generation === generation
@@ -682,6 +745,7 @@ export function useCallSignaling(
   return {
     call: state.call,
     pending,
+    cancelling,
     error,
     mediaReady,
     mediaActivationRequired,
@@ -708,7 +772,10 @@ export function useCallSignaling(
     },
     cancel: () => {
       const cancelled = transition("call.cancel");
-      if (cancelled) void stopMedia();
+      if (cancelled) {
+        setCancelling(true);
+        void stopMedia();
+      }
       return cancelled;
     },
     end: () => {

@@ -527,11 +527,11 @@ func canonicalCallUUID(value string) (string, error) {
 }
 
 // handleCallClientError writes the requester-only call.error for a failed
-// call command. responseTo is non-empty only for the commands issue #622
-// added correlation to (call.resource.sync via sync_id; call.join, a
-// RESOURCE call.start and, since round 3, call.leave, all via request_id) —
-// see callResponseTo. Direct call.start and every other pre-existing call
-// command keep responseTo empty, unchanged.
+// call command. responseTo is non-empty for every command call.start
+// (direct or resource, issue #615) — call.join and call.leave (issue #622
+// round 3) — and call.resource.sync/call.sync (via sync_id) have
+// correlation for. Every other pre-existing call command keeps responseTo
+// empty, unchanged. See callResponseTo.
 func handleCallClientError(c *Client, operation ClientMessageType, callID string, responseTo string, callErr error) bool {
 	response := clientErrorResponse{Type: "call.error", Operation: string(operation), CallID: callID, ResponseTo: responseTo}
 	switch {
@@ -567,19 +567,25 @@ func handleCallClientError(c *Client, operation ClientMessageType, callID string
 }
 
 // callResponseTo derives the response_to a failed call command's call.error
-// should carry (issue #622; call.leave added by round 3). Only the
-// newly-correlated commands get one: a RESOURCE call.start, call.join and
-// call.leave all reuse their own request_id, and call.resource.sync uses its
-// sync_id. A direct call.start (identified by carrying target_user_id, which
-// no resource command ever does) and every other existing call command carry
-// none, unchanged.
+// should carry (issue #622; call.leave added by round 3; direct call.start
+// added by issue #615). call.start now reuses its own request_id for BOTH
+// direct and resource — previously only resource call.start did (identified
+// by carrying target_user_id, which no resource command ever does), and a
+// direct call.start's own error carried no correlation at all. Without it,
+// useCallSignaling's errorMatchesPending could only correlate a direct
+// call.start error by "is a call.start currently pending" (there is at most
+// one in flight per hook instance), which let a stale call.error from an
+// abandoned attempt A be mistaken for a different, later attempt B's own
+// failure — exactly the race issue #615 requires closed, mirroring the
+// success path's existing correlation (call.ringing already echoes
+// request_id via Call.RequestID, used by eventCompletesPending). call.join
+// and call.leave reuse their own request_id, and call.resource.sync/
+// call.sync (when the client supplies sync_id) use it instead. Every other
+// existing call command carries none, unchanged.
 func callResponseTo(msg ClientMessage) string {
 	switch msg.Type {
 	case ClientMessageTypeCallStart:
-		if msg.TargetUserID == "" {
-			return msg.RequestID
-		}
-		return ""
+		return msg.RequestID
 	case ClientMessageTypeCallJoin, ClientMessageTypeCallLeave:
 		return msg.RequestID
 	case ClientMessageTypeCallResourceSync:
