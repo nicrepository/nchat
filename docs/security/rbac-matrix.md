@@ -182,7 +182,8 @@ Onde essas capabilities decidem hoje (issue #579 fechou a maior parte da lacuna)
 | `admin.infrastructure.read`        | `GET /api/admin/overview`, `GET /api/admin/health/services`, `POST /api/admin/health/refresh`                                                            |
 | `admin.config.read`                | `GET /api/admin/config`, `POST /api/admin/config/preview`, `GET /api/admin/config/versions`                                                              |
 | `admin.config.manage`              | `POST /api/admin/config/apply`, `POST /api/admin/config/versions/{versionID}/rollback`                                                                   |
-| `admin.integrations.*`             | ainda sem endpoint                                                                                                                                       |
+| `admin.integrations.read`          | `GET /api/admin/integrations` — o inventario de integracoes com estado passivo                                                                           |
+| `admin.integrations.manage`        | `POST /api/admin/integrations/{id}/diagnose`, `POST /api/admin/integrations/smtp/test-email`                                                             |
 
 **Uma alteracao de configuracao que enfraquece a plataforma exige
 `admin.superuser`, alem de `admin.config.manage`.** A decisao e sobre o valor
@@ -368,11 +369,27 @@ e nao aceita nenhum valor do cliente. Um Moderador recebe `403` ali.
    decidiu como o primeiro administrador de plataforma nasce (concessao no banco,
    ver acima), mas nao substituiu essas tres rotas de provisionamento de contas —
    isso e trabalho proprio.
-3. **`admin.integrations.*` e `admin.config.*` ainda nao tem endpoint.** As
-   demais capabilities passaram a decidir rotas reais com a issue #579 (ver a
-   tabela acima). Essas duas continuam definidas para que o modelo de papeis
-   permaneca estavel entre as issues administrativas seguintes; ate la, conceder
-   uma nao abre nenhuma rota.
+3. **`admin.integrations.manage` autoriza conexao de saida, nao escrita.** A
+   issue #582 fechou a ultima lacuna da tabela acima: `admin.integrations.read`
+   decide a leitura do inventario e `admin.integrations.manage` decide o
+   diagnostico ativo e o e-mail de teste. Nenhuma das duas escreve configuracao —
+   toda chave de integracao e classe C ou D, e a escrita continua sendo commit +
+   rollout ou o runbook de Sealed Secrets.
+
+   A manage e exigida mesmo sem escrita porque um diagnostico faz este pod abrir
+   conexao de saida, assinar uma credencial do LiveKit e, no caso do e-mail de
+   teste, entregar mensagem a um relay. Isso tem custo, e a capability que
+   autoriza deve ser concedida deliberadamente. Nenhuma capability foi criada:
+   as duas ja existiam no `CHECK` da migration 000008 e ja estavam nesta matriz.
+
+   O destino do e-mail de teste **nao e parametro**: e o endereco da propria
+   conta administrativa autenticada, lido da sessao. Nao ha campo de
+   destinatario em lugar nenhum, entao uma sessao roubada so consegue enviar
+   e-mail para a propria vitima.
+
+   O inventario de configuracao dentro de uma integracao continua exigindo
+   `admin.config.read` separadamente: quem tem so `admin.integrations.read` ve
+   estado e diagnostico, nao a lista de endpoints e credenciais.
 
 4. **A auditoria filtra por pessoa, mas nao por ator.**
    `GET /api/admin/audit/events?user_id=<uuid>` devolve os eventos realizados

@@ -342,6 +342,7 @@ func actorFrom(w http.ResponseWriter, r *http.Request) (service.Actor, bool) {
 	}
 	return service.Actor{
 		UserID:        admin.Principal.UserID,
+		Email:         admin.Principal.Email,
 		SessionID:     admin.Session.ID,
 		CorrelationID: httputil.RequestIDFromContext(r.Context()),
 		// The live capability set, as the session guard loaded it on this

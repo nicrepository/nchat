@@ -174,6 +174,45 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, target any) bool {
 	return true
 }
 
+// requireEmptyBody enforces the contract of a POST that takes no body.
+//
+// Two routes declare "request body: none" — the integration diagnostic and the
+// SMTP test message — and neither has a field a caller could send. Silently
+// accepting `{"unexpected":"payload"}` would make the documented contract a
+// suggestion, and would leave a future field free to arrive from a client that
+// was never reviewed.
+//
+// The rule is the **absence of a body**, not the absence of meaningful JSON, so
+// `{}` is refused too. That is also why this cannot be a JSON decoder: a decoder
+// accepts `{}` and would have to be taught to reject it.
+//
+// It reads through io.ReadFull over a one-byte limit rather than consulting
+// Content-Length, which is unset for a chunked request and is a claim rather
+// than a fact in any case. The three outcomes are exactly the three questions:
+//
+//	io.EOF  nothing to read — the request is empty, as promised
+//	nil     a byte was read — there is a body, whatever it holds
+//	other   the body could not be read — the request is broken
+//
+// At most one byte is ever read, so an oversized payload is refused without
+// being buffered.
+func requireEmptyBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil {
+		return true
+	}
+	var probe [1]byte
+	_, err := io.ReadFull(io.LimitReader(r.Body, 1), probe[:])
+	switch {
+	case errors.Is(err, io.EOF):
+		return true
+	case err == nil:
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "this endpoint accepts no request body")
+	default:
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request body")
+	}
+	return false
+}
+
 // integerField reads a required JSON integer out of a request type.
 //
 // The field is captured as raw JSON and parsed as a base-10 integer literal,

@@ -2014,3 +2014,87 @@
   font-size: 11px;
   color: var(--color-danger-strong, #b91c1c);
 }
+
+/* Large image/GIF preview (issue #491). AttachmentImagePreview's own box,
+   drawn above the row instead of the 32px thumbnail for the raster types it
+   covers — everything else keeps the row/thumbnail layout above unchanged.
+   Height is fixed, not min/max-height driven by content: the attachment
+   contract carries no width/height, so the skeleton cannot know the real
+   image's aspect ratio ahead of load. A min/max pair would let the skeleton
+   collapse to the floor (percentage heights need a definite parent height to
+   resolve, and an auto-height flex container is not one) while the loaded
+   image grows toward the ceiling — precisely the scroll jump this box exists
+   to avoid. A fixed height sidesteps that: the footprint never changes, the
+   image is letterboxed inside it via object-fit, and img's own
+   max-height: 100% has an actual number to resolve against. */
+.chat-msg-area__attachment-preview {
+  position: relative;
+  flex: 1 0 100%;
+  max-width: 100%;
+  height: 260px;
+  margin-top: 8px;
+  border-radius: var(--radius-md, 10px);
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.chat-msg-area__attachment-preview-trigger {
+  all: unset;
+  cursor: zoom-in;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.chat-msg-area__attachment-preview-trigger:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px; /* all: unset drops the native ring; this puts one back
+                            inside the box instead of outside its rounded corner */
+}
+
+.chat-msg-area__attachment-preview-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain; /* never cover: cropping a message attachment without
+                           being asked is the one thing this box must not do */
+}
+
+.chat-msg-area__attachment-preview-skeleton {
+  width: 100%;
+  height: 100%;
+  background: var(--color-border, #e8e3f0);
+  animation: chat-skel-pulse 1.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__attachment-preview-skeleton {
+    animation: none;
+  }
+}
+
+.chat-msg-area__attachment-gif-toggle {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-msg-area__attachment-gif-toggle:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+@media (max-width: 480px) {
+  .chat-msg-area__attachment-preview {
+    height: 200px;
+  }
+}

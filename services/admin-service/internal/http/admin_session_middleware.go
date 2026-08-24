@@ -83,6 +83,9 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
 	case errors.Is(err, domain.ErrNotFound):
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrTooManyRequests):
+		w.Header().Set("Retry-After", "60")
+		httputil.WriteError(w, http.StatusTooManyRequests, httputil.ErrCodeRateLimited, "too many requests")
 	case errors.Is(err, domain.ErrConflict):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflicting state")
 	case errors.Is(err, domain.ErrUnavailable):

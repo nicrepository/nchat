@@ -40,6 +40,11 @@ type RouterDependencies struct {
 	// Observability is the issue #581 surface: the dashboard summary and the
 	// Health Center. Separate for the same all-or-nothing reason as the others.
 	Observability *ObservabilityPorts
+	// Integrations is the issue #582 surface: the integration inventory and the
+	// active diagnostics. Separate for the same all-or-nothing reason as the
+	// others — a deployment missing it answers 503 on those paths rather than
+	// serving a diagnostic without its guards.
+	Integrations IntegrationAdmin
 	// HealthCollectors are the Prometheus collectors the health surface
 	// exports. They are handed in already built so the router only decides
 	// whether to register them, which is the same decision it makes about
@@ -158,6 +163,53 @@ func registerAdminAPI(mux *http.ServeMux, cfg config.Config, logger *slog.Logger
 	registerManagementAPI(mux, cfg, deps, ready)
 	registerConfigAPI(mux, cfg, deps, ready)
 	registerObservabilityAPI(mux, cfg, deps, ready)
+	registerIntegrationAPI(mux, cfg, deps, ready)
+}
+
+// integrationRoute is one integration endpoint as the table below declares it.
+type integrationRoute struct {
+	path       string
+	method     string
+	capability domain.Capability
+	handler    func(IntegrationAdmin) http.Handler
+}
+
+// registerIntegrationAPI wires the issue #582 surface.
+//
+// Same guard chain and same order as every other surface: administrative
+// session, then — for the two POSTs — the origin and CSRF checks, then the one
+// capability the route declares.
+//
+// The split is deliberate and is the whole authorization story of this issue.
+// Reading the inventory requires admin.integrations.read, which the seeded
+// auditor role already holds. Running a diagnostic requires
+// admin.integrations.manage, because it makes this pod open outbound
+// connections, sign a LiveKit credential and — for the test message — hand mail
+// to a relay. Nothing was minted for either: both capabilities have existed in
+// the platform, in the database CHECK of migration 000008 and in the RBAC
+// matrix since the foundation issue, waiting for exactly this surface.
+func registerIntegrationAPI(mux *http.ServeMux, cfg config.Config, deps RouterDependencies, ready bool) {
+	routes := []integrationRoute{
+		{RouteAdminIntegrations, http.MethodGet, domain.CapabilityIntegrationsRead, ListIntegrations},
+		{RouteAdminIntegrationDiagnose, http.MethodPost, domain.CapabilityIntegrationsManage, DiagnoseIntegration},
+		{RouteAdminIntegrationTestEmail, http.MethodPost, domain.CapabilityIntegrationsManage, SendIntegrationTestEmail},
+	}
+	enabled := ready && deps.Integrations != nil
+	for _, route := range routes {
+		handler := adminUnavailable()
+		if enabled {
+			handler = guardIntegration(cfg, deps, route)
+		}
+		mux.Handle(route.path, httputil.MethodNotAllowed(route.method, handler))
+	}
+}
+
+func guardIntegration(cfg config.Config, deps RouterDependencies, route integrationRoute) http.Handler {
+	handler := RequireCapability(route.capability, deps.Audit.Recorder)(route.handler(deps.Integrations))
+	if !isSafeMethod(route.method) {
+		handler = RequireCSRF(deps.CSRF, cfg.AllowedOrigins)(handler)
+	}
+	return RequireAdminSession(deps.Authenticator, sessionCookieName)(handler)
 }
 
 // observabilityRoute is one observability endpoint as the table below declares
