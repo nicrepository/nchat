@@ -25,6 +25,11 @@ type fakeChannelProvider struct {
 	detailsErr       error
 	lastDetailsInput service.ChannelDetailsInput
 	detailsCalls     int
+
+	callParticipantProfiles    []domain.CallParticipantProfile
+	callParticipantProfilesErr error
+	lastCallParticipantsInput  service.ChannelCallParticipantProfilesInput
+	callParticipantsCalls      int
 }
 
 func (f *fakeChannelProvider) CreateChannel(_ context.Context, input service.CreateChannelInput) (domain.Channel, error) {
@@ -39,6 +44,14 @@ func (f *fakeChannelProvider) GetChannelDetails(
 	f.detailsCalls++
 	f.lastDetailsInput = input
 	return f.details, f.detailsErr
+}
+
+func (f *fakeChannelProvider) GetCallParticipantProfiles(
+	_ context.Context, input service.ChannelCallParticipantProfilesInput,
+) ([]domain.CallParticipantProfile, error) {
+	f.callParticipantsCalls++
+	f.lastCallParticipantsInput = input
+	return f.callParticipantProfiles, f.callParticipantProfilesErr
 }
 
 func channelTestHandler(provider *fakeChannelProvider) *httpapi.ChannelHandler {

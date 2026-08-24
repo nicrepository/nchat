@@ -132,6 +132,12 @@ var (
 	// ErrNoMembersRequested reports an empty or all-blank user list. An add that
 	// adds nobody is a client bug, not a no-op success.
 	ErrNoMembersRequested = fmt.Errorf("%w: user_ids must contain at least one user", ErrInvalidInput)
+	// ErrTooManyCallParticipantsRequested reports a batch above
+	// MaxCallParticipantProfileIDs (issue #612).
+	ErrTooManyCallParticipantsRequested = fmt.Errorf("%w: at most %d participant ids may be requested per call", ErrInvalidInput, MaxCallParticipantProfileIDs)
+	// ErrNoCallParticipantsRequested reports an empty or all-blank
+	// call-participant id list.
+	ErrNoCallParticipantsRequested = fmt.Errorf("%w: user_ids must contain at least one user", ErrInvalidInput)
 	// ErrInvalidChannelCategoryOrder reports a reorder payload that is not
 	// exactly the workspace's category set: a duplicate ID, a missing one, or one
 	// belonging to another workspace. It says which rule was broken but never

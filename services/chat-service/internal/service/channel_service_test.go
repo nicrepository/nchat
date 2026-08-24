@@ -7,6 +7,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -941,5 +943,140 @@ func TestWorkspaceService_CreateChannel_EnforcesDisplayNameCap(t *testing.T) {
 	}
 	if channels.lastCreateInput.Slug != "" {
 		t.Fatalf("an oversized name reached storage: %+v", channels.lastCreateInput)
+	}
+}
+
+func TestChannelService_GetCallParticipantProfiles_ResolvesOnlyRequestedActiveMembers(t *testing.T) {
+	userA := uuid.NewString()
+	userMissing := uuid.NewString()
+	members := detailsMemberStore()
+	members.callParticipantProfiles = map[string]domain.CallParticipantProfile{
+		userA: {UserID: userA, DisplayName: "Ana Souza", AvatarURL: "https://x/a.png"},
+	}
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), members)
+
+	got, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: []string{userA, userMissing},
+	})
+	if err != nil {
+		t.Fatalf("GetCallParticipantProfiles: %v", err)
+	}
+	if len(got) != 1 || got[0].UserID != userA {
+		t.Fatalf("unexpected profiles: %#v", got)
+	}
+}
+
+func TestChannelService_GetCallParticipantProfiles_RejectsOversizedBatch(t *testing.T) {
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), detailsMemberStore())
+	ids := make([]string, domain.MaxCallParticipantProfileIDs+1)
+	for i := range ids {
+		ids[i] = uuid.NewString()
+	}
+	_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: ids,
+	})
+	if !errors.Is(err, domain.ErrTooManyCallParticipantsRequested) {
+		t.Fatalf("want ErrTooManyCallParticipantsRequested, got %v", err)
+	}
+}
+
+func TestChannelService_GetCallParticipantProfiles_UnauthorizedCallerIsRejected(t *testing.T) {
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), newFakeMemberStore())
+	_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: []string{uuid.NewString()},
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("want ErrForbidden for a caller with no workspace membership, got %v", err)
+	}
+}
+
+// TestChannelService_GetCallParticipantProfiles_InvisibleChannelIsRejected proves
+// a caller cannot use this endpoint against a channel they cannot already see —
+// a private channel from another workspace, or one this caller never joined —
+// exactly the same visibility gate GetChannelDetails enforces, so the batch
+// contract cannot be used as a side door into a channel's membership.
+func TestChannelService_GetCallParticipantProfiles_InvisibleChannelIsRejected(t *testing.T) {
+	members := detailsMemberStore()
+	// A channel the store does not vouch for as visible to this caller —
+	// detailsChannelStore's fixture is "ch-1"; asking about "ch-2" must fail.
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), members)
+	_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-2", UserIDs: []string{uuid.NewString()},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for a channel outside the caller's visibility, got %v", err)
+	}
+	if members.lastCallParticipantIDs != nil {
+		t.Fatalf("store must never be reached for a caller failing the visibility gate, got %v", members.lastCallParticipantIDs)
+	}
+}
+
+// TestChannelService_GetCallParticipantProfiles_RejectsMalformedUUID proves a
+// non-UUID (or the nil UUID) in the batch fails safely as invalid input,
+// before ever reaching the store — never a 500 from a malformed SQL array
+// literal, and never silently dropped as "just another unresolved id".
+func TestChannelService_GetCallParticipantProfiles_RejectsMalformedUUID(t *testing.T) {
+	for name, ids := range map[string][]string{
+		"not a uuid at all":         {"not-a-uuid"},
+		"nil uuid":                  {"00000000-0000-0000-0000-000000000000"},
+		"valid uuid plus malformed": {uuid.NewString(), "<script>alert(1)</script>"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			members := detailsMemberStore()
+			svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), members)
+			_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+				WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: ids,
+			})
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("want ErrInvalidInput, got %v", err)
+			}
+			if members.lastCallParticipantIDs != nil {
+				t.Fatalf("a malformed id must never reach the store, got %v", members.lastCallParticipantIDs)
+			}
+		})
+	}
+}
+
+// TestChannelService_GetCallParticipantProfiles_RejectsEmptyBatch documents and
+// proves the intentional behavior for an empty/all-blank id list: a resolve
+// with nothing to resolve is a client bug, not a silent no-op success — the
+// same rule normalizeAddMemberIDs applies to add-members.
+func TestChannelService_GetCallParticipantProfiles_RejectsEmptyBatch(t *testing.T) {
+	for name, ids := range map[string][]string{
+		"nil":            nil,
+		"empty slice":    {},
+		"only blank ids": {"   ", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), detailsMemberStore())
+			_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+				WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: ids,
+			})
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("want ErrInvalidInput (empty batch), got %v", err)
+			}
+		})
+	}
+}
+
+// TestChannelService_GetCallParticipantProfiles_DeduplicatesDeterministically
+// proves a batch naming the same user twice (including two different letter
+// cases of the same UUID) reaches the store exactly once, sorted — so a retry
+// is byte-identical and the store is never asked to do duplicate work.
+func TestChannelService_GetCallParticipantProfiles_DeduplicatesDeterministically(t *testing.T) {
+	id := uuid.New()
+	lower := id.String()
+	upper := strings.ToUpper(lower)
+	members := detailsMemberStore()
+	svc := service.NewChannelService(activeWorkspaceStore("ws-1"), detailsChannelStore(), members)
+
+	_, err := svc.GetCallParticipantProfiles(context.Background(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: "user-1", ChannelID: "ch-1", UserIDs: []string{upper, lower, lower},
+	})
+	if err != nil {
+		t.Fatalf("GetCallParticipantProfiles: %v", err)
+	}
+	if len(members.lastCallParticipantIDs) != 1 || members.lastCallParticipantIDs[0] != lower {
+		t.Fatalf("want exactly one canonical lowercase id reaching the store, got %v", members.lastCallParticipantIDs)
 	}
 }

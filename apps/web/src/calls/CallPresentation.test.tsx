@@ -467,13 +467,17 @@ describe("FloatingCallWindow", () => {
         {...videoPresent}
         hasLocalVideo={false}
         localSeed="current-user"
+        localName="Você"
       />,
     );
     const avatar = document.querySelector(".floating-call__local-avatar");
     expect(avatar).not.toBeNull();
     expect(avatar).toHaveTextContent(initialsFrom("Você"));
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
-    expect(avatar).toHaveAttribute("aria-hidden", "true");
+    // Unlike a remote/resource fallback (name shown adjacent), the floating
+    // local preview has no other visible name anywhere — the avatar itself
+    // must carry the accessible identity (issue #612).
+    expect(avatar).toHaveAttribute("aria-label", "Você");
   });
 
   it("hides the local avatar fallback in the floating preview once local video is usable", () => {
@@ -487,6 +491,7 @@ describe("FloatingCallWindow", () => {
         {...videoPresent}
         hasLocalVideo
         localSeed="current-user"
+        localName="Você"
       />,
     );
     expect(document.querySelector(".floating-call__local-avatar")).toBeNull();
@@ -628,6 +633,7 @@ describe("global and dedicated presentation", () => {
         bindScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.getByRole("main", { name: "Chamada Produto" })).toBeInTheDocument();
@@ -651,6 +657,7 @@ describe("global and dedicated presentation", () => {
         bindLocalScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.getByText("Sua tela")).toBeInTheDocument();
@@ -672,6 +679,7 @@ describe("global and dedicated presentation", () => {
         bindScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     // Never two simultaneous screen tiles — only the local one.
@@ -695,6 +703,7 @@ describe("global and dedicated presentation", () => {
         bindScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.getByText("Sua tela")).toBeInTheDocument();
@@ -712,6 +721,7 @@ describe("global and dedicated presentation", () => {
         bindScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.queryByText("Sua tela")).not.toBeInTheDocument();
@@ -730,6 +740,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(document.querySelector(".dedicated-call__tile--screen")).toBeNull();
@@ -748,6 +759,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Reconectando");
@@ -766,6 +778,7 @@ describe("global and dedicated presentation", () => {
         bindScreenShare={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(screen.getByText("Tela de Participante")).toBeInTheDocument();
@@ -782,6 +795,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     const avatar = document.querySelector(".dedicated-call__avatar");
@@ -804,6 +818,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(document.querySelector(".dedicated-call__avatar")).toHaveTextContent("Z");
@@ -820,6 +835,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo={false}
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     const avatars = document.querySelectorAll(".dedicated-call__avatar");
@@ -839,6 +855,7 @@ describe("global and dedicated presentation", () => {
         onMinimize={noop}
         hasLocalVideo
         localSeed="current-user"
+        localDisplayName="Você"
       />,
     );
     expect(document.querySelector(".dedicated-call__avatar")).toBeNull();

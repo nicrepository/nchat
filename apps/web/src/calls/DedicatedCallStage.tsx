@@ -1,16 +1,17 @@
 import type { RefCallback } from "react";
 
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
+import { PersonAvatarImage } from "../chat/PersonAvatarImage";
 import CallControls, { type CallControlProps } from "./CallControls";
 import "./CallPresentation.css";
-
-const localDisplayName = "Você";
 
 interface DedicatedParticipant {
   identity: string;
   displayName: string;
   hasVideo: boolean;
   bindVideo?: RefCallback<HTMLDivElement>;
+  /** This participant's own configured avatar, resolved server-side (issue #612) — never a resource-level avatar. */
+  avatarUrl?: string;
 }
 
 export default function DedicatedCallStage({
@@ -28,6 +29,9 @@ export default function DedicatedCallStage({
   bindScreenShare,
   hasLocalVideo,
   localSeed,
+  localDisplayName,
+  localAvatarUrl,
+  headerAvatar,
 }: {
   title: string;
   status: "connecting" | "connected" | "reconnecting" | "failed";
@@ -55,15 +59,56 @@ export default function DedicatedCallStage({
   hasLocalVideo: boolean;
   /** Stable seed (the current user's id) for the local fallback avatar's color. */
   localSeed: string;
+  /**
+   * The local participant's call-presentation name (issue #612) — the real
+   * profile name plus "(você)", or a bare "Você" fallback. Computed by
+   * DedicatedCallPage via localParticipantDisplayName.
+   */
+  localDisplayName: string;
+  /** The local participant's configured avatar, when available. */
+  localAvatarUrl?: string;
+  /**
+   * The header identity avatar for a direct ("user"-targeted) call only
+   * (issue #612) — `title` already carries the peer's real display name for
+   * that case (DedicatedCallPage's `target.name`), so this adds only the
+   * matching avatar/initials next to it. Undefined for a channel/group
+   * resource call: the header must never wear an individual's avatar next to
+   * a room name, and title there is the channel/group name, not a person's,
+   * so there is nothing to attach a person's picture to.
+   *
+   * Deliberately not a new media/video tile — DedicatedCallStage has no
+   * remote-video binding for a direct call today (that pipeline is
+   * unchanged), so this is presentation-only, in the one non-media identity
+   * surface the dedicated view already has: its header.
+   */
+  headerAvatar?: { seed: string; avatarUrl?: string };
 }) {
   return (
     <main className="dedicated-call" aria-label={`Chamada ${title}`}>
       <header className="dedicated-call__header">
-        <div>
-          <strong>{title}</strong>
-          <span role="status">
-            {status === "reconnecting" ? "Reconectando" : `${participantCount} participantes`}
-          </span>
+        <div className="dedicated-call__header-identity">
+          {headerAvatar && (
+            // Decorative: `title` right beside it already carries the same
+            // real name, so the image itself needs no separate accessible
+            // text (issue #612 accessibility rule — visible adjacent name
+            // means the avatar may be aria-hidden).
+            <div
+              className={`dedicated-call__header-avatar call-avatar call-avatar--${avatarColorFor(headerAvatar.seed)}`}
+              aria-hidden="true"
+            >
+              <PersonAvatarImage
+                src={headerAvatar.avatarUrl}
+                initials={initialsFrom(title)}
+                imgClassName="call-avatar__img"
+              />
+            </div>
+          )}
+          <div>
+            <strong>{title}</strong>
+            <span role="status">
+              {status === "reconnecting" ? "Reconectando" : `${participantCount} participantes`}
+            </span>
+          </div>
         </div>
         <button type="button" aria-label="Minimizar para janela flutuante" onClick={onMinimize}>
           <span className="material-symbols-outlined" aria-hidden="true">
@@ -99,7 +144,11 @@ export default function DedicatedCallStage({
               className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(localSeed)}`}
               aria-hidden="true"
             >
-              {initialsFrom(localDisplayName)}
+              <PersonAvatarImage
+                src={localAvatarUrl}
+                initials={initialsFrom(localDisplayName)}
+                imgClassName="call-avatar__img"
+              />
             </div>
           )}
           <span>{localDisplayName}</span>
@@ -112,7 +161,11 @@ export default function DedicatedCallStage({
                 className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(participant.identity)}`}
                 aria-hidden="true"
               >
-                {initialsFrom(participant.displayName)}
+                <PersonAvatarImage
+                  src={participant.avatarUrl}
+                  initials={initialsFrom(participant.displayName)}
+                  imgClassName="call-avatar__img"
+                />
               </div>
             )}
             <span>{participant.displayName}</span>

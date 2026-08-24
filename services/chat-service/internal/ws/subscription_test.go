@@ -81,6 +81,10 @@ func (f *fakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ 
 	return storage.DMParticipantPage{}, nil
 }
 
+func (f *fakeDMStore) ListParticipantProfilesByIDs(_ context.Context, _, _ string, _ []string) ([]domain.CallParticipantProfile, error) {
+	return nil, nil
+}
+
 func (f *fakeDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {
 	return domain.DMConversation{}, nil
 }

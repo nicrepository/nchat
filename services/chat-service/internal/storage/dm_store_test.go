@@ -649,3 +649,28 @@ func TestPGXDMStore_FilterUsersInConversation_SQLVisibility(t *testing.T) {
 		t.Fatalf("expectations: %v", err)
 	}
 }
+
+func TestPGXDMStore_ListParticipantProfilesByIDs_ScopesToActiveParticipants(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dc\.workspace_id = \$1::uuid.*wm\.status = 'active'.*u\.status = 'active'.*dm\.conversation_id = \$2::uuid.*dm\.status = 'active'.*user_id = ANY\(\$3::uuid\[\]\)`).
+		WithArgs("ws-1", "conv-1", []string{"user-a", "user-b"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name", "avatar_url"}).
+			AddRow("user-a", "Ana Souza", ""))
+
+	got, err := storage.NewPGXDMStore(mock).ListParticipantProfilesByIDs(
+		context.Background(), "ws-1", "conv-1", []string{"user-a", "user-b"},
+	)
+	if err != nil {
+		t.Fatalf("ListParticipantProfilesByIDs: %v", err)
+	}
+	if len(got) != 1 || got[0].UserID != "user-a" {
+		t.Fatalf("unexpected profiles: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}

@@ -37,6 +37,54 @@ func TestPGXMemberStore_SearchChannelMembers_ScopesWorkspaceChannelAndActiveMemb
 	}
 }
 
+func TestPGXMemberStore_ListChannelMemberProfilesByIDs_ScopesToChannelMembership(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.channel_members cm.*c\.workspace_id = \$1::uuid.*wm\.status = 'active'.*u\.status = 'active'.*cm\.channel_id = \$2::uuid.*user_id = ANY\(\$3::uuid\[\]\)`).
+		WithArgs("ws-1", "ch-1", []string{"user-a", "user-b"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name", "avatar_url"}).
+			AddRow("user-a", "Ana Souza", "https://x/a.png"))
+
+	got, err := storage.NewPGXMemberStore(mock).ListChannelMemberProfilesByIDs(
+		context.Background(), "ws-1", "ch-1", []string{"user-a", "user-b"},
+	)
+	if err != nil {
+		t.Fatalf("ListChannelMemberProfilesByIDs: %v", err)
+	}
+	// user-b is not a member of the channel and must not appear — no
+	// invented identity for an id the join could not resolve.
+	if len(got) != 1 || got[0].UserID != "user-a" || got[0].DisplayName != "Ana Souza" || got[0].AvatarURL != "https://x/a.png" {
+		t.Fatalf("unexpected profiles: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_ListChannelMemberProfilesByIDs_EmptyIDsSelectsNoRows(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.channel_members`).
+		WithArgs("ws-1", "ch-1", []string{}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name", "avatar_url"}))
+
+	got, err := storage.NewPGXMemberStore(mock).ListChannelMemberProfilesByIDs(
+		context.Background(), "ws-1", "ch-1", nil,
+	)
+	if err != nil {
+		t.Fatalf("ListChannelMemberProfilesByIDs: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("nil ids must select nothing, got %#v", got)
+	}
+}
+
 func TestPGXMemberStore_SearchDMCandidates_ScopesEligibilityAndOrdersResults(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

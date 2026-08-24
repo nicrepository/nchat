@@ -65,6 +65,9 @@ func (f *sidebarFakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _
 func (f *sidebarFakeMemberStore) ListOnlineChannelMemberProfiles(_ context.Context, _, _ string, _ []string, _ int) (storage.ChannelMemberPage, error) {
 	return storage.ChannelMemberPage{}, nil
 }
+func (f *sidebarFakeMemberStore) ListChannelMemberProfilesByIDs(_ context.Context, _, _ string, _ []string) ([]domain.CallParticipantProfile, error) {
+	return nil, nil
+}
 func (f *sidebarFakeMemberStore) SearchDMCandidates(_ context.Context, _, _, _ string, _ int) ([]domain.DMCandidate, error) {
 	return nil, nil
 }
@@ -181,6 +184,9 @@ func (f *sidebarFakeDMStore) AddGroupParticipants(_ context.Context, _ storage.A
 
 func (f *sidebarFakeDMStore) ListParticipantProfiles(_ context.Context, _, _ string, _ int) (storage.DMParticipantPage, error) {
 	return storage.DMParticipantPage{}, nil
+}
+func (f *sidebarFakeDMStore) ListParticipantProfilesByIDs(_ context.Context, _, _ string, _ []string) ([]domain.CallParticipantProfile, error) {
+	return nil, nil
 }
 
 func (f *sidebarFakeDMStore) CreateGroupConversation(_ context.Context, _ storage.CreateGroupConversationInput) (domain.DMConversation, error) {

@@ -2,15 +2,36 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchSidebarData } from "../chat/chatApi";
+import {
+  fetchChannelCallParticipantProfiles,
+  fetchGroupCallParticipantProfiles,
+  fetchSidebarData,
+} from "../chat/chatApi";
 import { avatarColorFor } from "../chat/messageDisplay";
 import { resolveCall } from "../chat/resourceCallSignaling";
+import { _resetSelfProfile } from "../profile/selfProfile";
+import type { SelfProfile } from "../profile/profileApi";
 import DedicatedCallPage from "./DedicatedCallPage";
 import { useCallSession } from "./CallSessionProvider";
 
-vi.mock("../chat/chatApi", () => ({ fetchSidebarData: vi.fn() }));
+vi.mock("../chat/chatApi", () => ({
+  fetchSidebarData: vi.fn(),
+  fetchChannelCallParticipantProfiles: vi.fn(),
+  fetchGroupCallParticipantProfiles: vi.fn(),
+}));
 vi.mock("../chat/resourceCallSignaling", () => ({ resolveCall: vi.fn() }));
 vi.mock("./CallSessionProvider", () => ({ useCallSession: vi.fn() }));
+
+// ── Mock profileApi (the local participant's identity source, issue #612) ────
+
+const { mockFetchMyProfile } = vi.hoisted(() => ({
+  mockFetchMyProfile: vi.fn<(signal?: AbortSignal) => Promise<SelfProfile>>(),
+}));
+
+vi.mock("../profile/profileApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../profile/profileApi")>();
+  return { ...actual, fetchMyProfile: (signal?: AbortSignal) => mockFetchMyProfile(signal) };
+});
 
 const callId = "00000000-0000-4000-8000-000000000546";
 const registerDirectory = vi.fn();
@@ -66,15 +87,19 @@ const session = {
   },
 };
 
-function renderPage(id = callId) {
-  return render(
+function pageTree(id = callId) {
+  return (
     <MemoryRouter initialEntries={[`/call/${id}`]}>
       <Routes>
         <Route path="/call/:callId" element={<DedicatedCallPage />} />
         <Route path="/chat" element={<p>Chat</p>} />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderPage(id = callId) {
+  return render(pageTree(id));
 }
 
 const resolvedCall = {
@@ -95,6 +120,10 @@ const resolvedCall = {
 describe("DedicatedCallPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    _resetSelfProfile();
+    mockFetchMyProfile.mockResolvedValue({ id: "current-user", displayName: "" });
+    vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([]);
+    vi.mocked(fetchGroupCallParticipantProfiles).mockResolvedValue([]);
     session.ownerState = "local";
     session.dedicatedRecoveryFailed = false;
     session.calls.call = null;
@@ -483,5 +512,488 @@ describe("DedicatedCallPage", () => {
     expect(message).toHaveTextContent("Não foi possível recuperar esta chamada");
     fireEvent.click(screen.getByRole("button", { name: "Voltar para o chat" }));
     expect(await screen.findByText("Chat")).toBeInTheDocument();
+  });
+
+  it("shows the local participant's real profile name with (você)", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "current-user", displayName: "Ana Souza" });
+    renderPage();
+    await waitFor(() => screen.getByText("Ana Souza (você)"));
+  });
+
+  it("resolves each resource participant's own name and avatar in one batch request, not one per tile", async () => {
+    session.media.participants = [
+      { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+    ]);
+    renderPage();
+    await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+    expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledWith(
+      "channel-1",
+      expect.arrayContaining(["user-a", "user-b"]),
+    );
+  });
+
+  it("two distinct participants never share one resolved identity", async () => {
+    session.media.participants = [
+      { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "https://x/b.png" },
+    ]);
+    const { container } = renderPage();
+    await waitFor(() => {
+      const imgs = container.querySelectorAll(".dedicated-call__tile img");
+      expect(imgs.length).toBeGreaterThanOrEqual(2);
+    });
+    const imgs = Array.from(container.querySelectorAll(".dedicated-call__tile img"));
+    expect(imgs.map((img) => img.getAttribute("src"))).toEqual(
+      expect.arrayContaining(["https://x/a.png", "https://x/b.png"]),
+    );
+  });
+
+  it("degrades safely when a participant's identity cannot be resolved", async () => {
+    session.media.participants = [
+      {
+        identity: "00000000-0000-4000-8000-000000000999",
+        displayName: "Participante",
+        hasVideo: false,
+        bindVideo: vi.fn(),
+      },
+    ];
+    vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([]);
+    const { container } = renderPage();
+    await waitFor(() => screen.getByText("Participante"));
+    expect(container.querySelector(".dedicated-call__tile")).not.toHaveTextContent(
+      /[0-9a-f]{8}-[0-9a-f]{4}/,
+    );
+  });
+
+  describe("batch-fetch lifecycle (issue #612 blocker review)", () => {
+    it("does not re-fetch when the participant array is recreated but the identity set is unchanged", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      ]);
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      // A brand-new ParticipantMedia array/object for the SAME identity —
+      // exactly what a hasVideo/hasAudio change produces upstream — must not
+      // be read as "the roster changed".
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: true, bindVideo: vi.fn() },
+      ];
+      view.rerender(pageTree());
+      await waitFor(() => screen.getByText("Ana Souza"));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not re-fetch when the SAME roster arrives in a different order (SDK/event reorder)", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+        { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+        { userId: "user-b", displayName: "Bruno Lima", avatarUrl: "https://x/b.png" },
+      ]);
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      // Same two identities, reversed order — no membership change at all.
+      session.media.participants = [
+        { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      view.rerender(pageTree());
+      await waitFor(() => screen.getByText("Bruno Lima"));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not re-fetch on camera, microphone, screen-share, or active-speaker changes alone", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      ]);
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      session.media.hasLocalVideo = !session.media.hasLocalVideo;
+      view.rerender(pageTree());
+      session.media.microphoneEnabled = !session.media.microphoneEnabled;
+      view.rerender(pageTree());
+      session.media.cameraEnabled = !session.media.cameraEnabled;
+      view.rerender(pageTree());
+      session.media.screenShareEnabled = !session.media.screenShareEnabled;
+      view.rerender(pageTree());
+      (session.media as unknown as Record<string, unknown>).activeSpeakerId = "user-a";
+      view.rerender(pageTree());
+
+      await waitFor(() => screen.getByText("Ana Souza"));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not re-fetch when only a participant's displayName changes and the identity set is unchanged", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Participante", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      ]);
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      session.media.participants = [
+        {
+          identity: "user-a",
+          displayName: "Ana Souza (LiveKit)",
+          hasVideo: false,
+          bindVideo: vi.fn(),
+        },
+      ];
+      view.rerender(pageTree());
+      await waitFor(() => screen.getByText("Ana Souza (LiveKit)"));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-fetches once when the identity set actually changes (a participant joins)", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([]);
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+        { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      view.rerender(pageTree());
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenLastCalledWith(
+        "channel-1",
+        expect.arrayContaining(["user-a", "user-b"]),
+      );
+    });
+
+    it("fences a stale in-flight response: a late-resolving old request must not clobber a fresher one", async () => {
+      // Request A (for user-a) is deliberately left unresolved while the
+      // roster changes to user-c and request B resolves first — the
+      // realistic ordering when a caller leaves right after joining.
+      let resolveFirst!: (
+        profiles: { userId: string; displayName: string; avatarUrl?: string }[],
+      ) => void;
+      const firstRequest = new Promise<
+        { userId: string; displayName: string; avatarUrl?: string }[]
+      >((resolve) => {
+        resolveFirst = resolve;
+      });
+      vi.mocked(fetchChannelCallParticipantProfiles).mockReturnValueOnce(firstRequest);
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValueOnce([
+        { userId: "user-c", displayName: "Carla Dias", avatarUrl: "https://x/c.png" },
+      ]);
+      session.media.participants = [
+        { identity: "user-c", displayName: "Carla Dias", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      view.rerender(pageTree());
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+
+      // Request B has already resolved and applied Carla's avatar.
+      const { container } = view;
+      await waitFor(() => {
+        expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
+          "src",
+          "https://x/c.png",
+        );
+      });
+
+      // Now the STALE request A finally resolves, naming a user (user-a)
+      // who is no longer in the roster at all. An unfenced implementation
+      // would call setParticipantProfiles with a map containing only
+      // user-a, replacing (not merging into) the current map and wiping out
+      // Carla's already-applied avatar.
+      resolveFirst([{ userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" }]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
+        "src",
+        "https://x/c.png",
+      );
+    });
+  });
+
+  describe("batch chunking beyond MaxCallParticipantProfileIDs (issue #612 blocker B)", () => {
+    function participantsOf(count: number) {
+      return Array.from({ length: count }, (_, i) => ({
+        identity: `user-${String(i).padStart(3, "0")}`,
+        displayName: `Participante ${i}`,
+        hasVideo: false,
+        bindVideo: vi.fn(),
+      }));
+    }
+
+    function profilesFor(ids: string[]) {
+      return ids.map((id) => ({ userId: id, displayName: id, avatarUrl: `https://x/${id}.png` }));
+    }
+
+    it("50 participants -> exactly one batch request", async () => {
+      const participants = participantsOf(50);
+      session.media.participants = participants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) =>
+        Promise.resolve(profilesFor(ids)),
+      );
+      renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+      expect(vi.mocked(fetchChannelCallParticipantProfiles).mock.calls[0]![1]).toHaveLength(50);
+    });
+
+    it("51 participants -> exactly two batch requests, never a single oversized one", async () => {
+      const participants = participantsOf(51);
+      session.media.participants = participants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) =>
+        Promise.resolve(profilesFor(ids)),
+      );
+      renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+      const callSizes = vi
+        .mocked(fetchChannelCallParticipantProfiles)
+        .mock.calls.map(([, ids]) => ids.length)
+        .sort((a, b) => a - b);
+      // Two chunks, neither of which is ever the full 51 (never exceeds the
+      // server's MaxCallParticipantProfileIDs=50 cap) and together they
+      // cover every participant exactly once.
+      expect(callSizes).toEqual([1, 50]);
+      const allIDsSent = vi
+        .mocked(fetchChannelCallParticipantProfiles)
+        .mock.calls.flatMap(([, ids]) => ids);
+      expect(new Set(allIDsSent).size).toBe(51);
+    });
+
+    it("every resolvable participant from both chunks receives its own avatar (no N+1, no cross-contamination)", async () => {
+      const participants = participantsOf(51);
+      session.media.participants = participants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) =>
+        Promise.resolve(profilesFor(ids)),
+      );
+      const { container } = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+      await waitFor(() => {
+        const imgs = container.querySelectorAll(".dedicated-call__tile img");
+        expect(imgs.length).toBe(51);
+      });
+      const srcs = new Set(
+        Array.from(container.querySelectorAll(".dedicated-call__tile img")).map((img) =>
+          img.getAttribute("src"),
+        ),
+      );
+      expect(srcs.size).toBe(51); // every tile has its OWN avatar, none shared/duplicated
+      for (const participant of participants) {
+        expect(srcs.has(`https://x/${participant.identity}.png`)).toBe(true);
+      }
+    });
+
+    it("the same 51 identities in a different order do not trigger a new request", async () => {
+      const participants = participantsOf(51);
+      session.media.participants = participants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) =>
+        Promise.resolve(profilesFor(ids)),
+      );
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+
+      session.media.participants = [...participants].reverse();
+      view.rerender(pageTree());
+      await waitFor(() => screen.getByText("Participante 0"));
+      expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2);
+    });
+
+    it("one chunk failing degrades only that chunk to initials, never discards the sibling chunk's results", async () => {
+      const participants = participantsOf(51);
+      session.media.participants = participants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) => {
+        // The chunk containing user-050 (the 51st, lone id) fails; the
+        // 50-sized chunk succeeds.
+        if (ids.includes("user-050")) return Promise.reject(new Error("network"));
+        return Promise.resolve(profilesFor(ids));
+      });
+      const { container } = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+      await waitFor(() => {
+        const imgs = container.querySelectorAll(".dedicated-call__tile img");
+        expect(imgs.length).toBe(50); // the failed chunk's 1 participant has no avatar...
+      });
+      const tiles = Array.from(container.querySelectorAll(".dedicated-call__tile"));
+      const failedTile = tiles.find((tile) => tile.textContent?.includes("Participante 50"));
+      expect(failedTile?.querySelector("img")).toBeNull(); // ...degrades to initials, not a crash
+      expect(failedTile).toHaveTextContent(/P/); // deterministic initials still render
+    });
+
+    it("fences a stale delayed response from an old multi-chunk roster: it cannot overwrite the current call's identities", async () => {
+      // The old call has 51 participants (2 chunks); one of those chunk
+      // requests is deliberately left unresolved.
+      let resolveStaleChunk!: (
+        profiles: { userId: string; displayName: string; avatarUrl?: string }[],
+      ) => void;
+      const staleChunk = new Promise<{ userId: string; displayName: string; avatarUrl?: string }[]>(
+        (resolve) => {
+          resolveStaleChunk = resolve;
+        },
+      );
+      const oldParticipants = participantsOf(51);
+      session.media.participants = oldParticipants;
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) => {
+        if (ids.includes("user-050")) return staleChunk;
+        return Promise.resolve(profilesFor(ids));
+      });
+      const view = renderPage();
+      await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2));
+
+      // Switch to a brand-new, unrelated roster before the stale chunk ever
+      // resolves.
+      vi.mocked(fetchChannelCallParticipantProfiles).mockImplementation((_, ids) =>
+        Promise.resolve(profilesFor(ids)),
+      );
+      session.media.participants = [
+        { identity: "user-c", displayName: "Carla Dias", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      view.rerender(pageTree());
+      const { container } = view;
+      await waitFor(() => {
+        expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
+          "src",
+          "https://x/user-c.png",
+        );
+      });
+
+      // Now the stale chunk from the OLD 51-participant roster resolves.
+      // It must not resurrect any of the old roster's tiles or otherwise
+      // corrupt the new, single-participant call's state.
+      resolveStaleChunk([
+        { userId: "user-050", displayName: "Participante 50", avatarUrl: "https://x/stale.png" },
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(
+        Array.from(container.querySelectorAll(".dedicated-call__tile")).some((tile) =>
+          tile.textContent?.includes("Participante 50"),
+        ),
+      ).toBe(false);
+      expect(container.querySelector(".dedicated-call__tile img")).toHaveAttribute(
+        "src",
+        "https://x/user-c.png",
+      );
+    });
+  });
+
+  it("does not fetch resource participant identities for a direct call", async () => {
+    session.calls.call = { call_id: callId, status: "active" };
+    const directResolvedCall = {
+      ...resolvedCall,
+      target_type: "user" as const,
+      target_id: undefined,
+      caller_id: "current-user",
+      callee_id: "peer-1",
+    };
+    vi.mocked(resolveCall).mockResolvedValue(directResolvedCall);
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId: "current-user",
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [
+        {
+          id: "dm-1",
+          name: "Peer",
+          type: "1:1",
+          participants: [],
+          counterpart: { userId: "peer-1", displayName: "Peer" },
+        },
+      ],
+      categories: [],
+    });
+    session.media.participants = [];
+    renderPage();
+    await screen.findByRole("main", { name: "Chamada Peer" });
+    expect(fetchChannelCallParticipantProfiles).not.toHaveBeenCalled();
+    expect(fetchGroupCallParticipantProfiles).not.toHaveBeenCalled();
+  });
+
+  describe("dedicated direct header identity (issue #612 blocker fix)", () => {
+    function setUpDirectCall(counterpart: {
+      userId: string;
+      displayName: string;
+      avatarUrl?: string;
+    }) {
+      session.calls.call = { call_id: callId, status: "active" };
+      vi.mocked(resolveCall).mockResolvedValue({
+        ...resolvedCall,
+        target_type: "user" as const,
+        target_id: undefined,
+        caller_id: "current-user",
+        callee_id: counterpart.userId,
+      });
+      vi.mocked(fetchSidebarData).mockResolvedValue({
+        currentUserId: "current-user",
+        workspaceId: "workspace-1",
+        channels: [],
+        dms: [
+          { id: "dm-1", name: counterpart.displayName, type: "1:1", participants: [], counterpart },
+        ],
+        categories: [],
+      });
+      session.media.participants = [];
+    }
+
+    it("shows the direct peer's real name and avatar in the dedicated header", async () => {
+      setUpDirectCall({
+        userId: "peer-1",
+        displayName: "Ana Souza",
+        avatarUrl: "https://x/peer.png",
+      });
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+
+      await waitFor(() => {
+        const headerAvatar = container.querySelector(".dedicated-call__header-avatar");
+        expect(headerAvatar?.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+      });
+    });
+
+    it("falls back to deterministic initials in the header when the peer has no avatar", async () => {
+      setUpDirectCall({ userId: "peer-1", displayName: "Ana Souza" });
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+
+      const headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
+      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
+      expect(headerAvatar).toHaveTextContent("AS");
+    });
+
+    it("never shows a header avatar for a channel resource call", async () => {
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Produto" });
+      expect(container.querySelector(".dedicated-call__header-avatar")).not.toBeInTheDocument();
+    });
+
+    it("does not change existing dedicated resource header/media behavior", async () => {
+      renderPage();
+      const main = await screen.findByRole("main", { name: "Chamada Produto" });
+      expect(main.querySelector(".dedicated-call__header strong")).toHaveTextContent("Produto");
+      expect(registerDirectory).toHaveBeenCalledOnce();
+    });
   });
 });

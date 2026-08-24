@@ -64,6 +64,13 @@ type DMStore interface {
 	// participants, in one round trip. The caller's access to the conversation
 	// must already have been settled.
 	ListParticipantProfiles(ctx context.Context, workspaceID, conversationID string, limit int) (DMParticipantPage, error)
+	// ListParticipantProfilesByIDs resolves the subset of userIDs that are
+	// active participants of conversationID, for the call-participant
+	// avatar/name lookup (issue #612). Unlike ListParticipantProfiles this is
+	// not capped/ordered — the caller already knows exactly which identities
+	// it wants (a LiveKit room's current participant list, bounded by
+	// MaxCallParticipantProfileIDs).
+	ListParticipantProfilesByIDs(ctx context.Context, workspaceID, conversationID string, userIDs []string) ([]domain.CallParticipantProfile, error)
 	// SearchGroupParticipantCandidates returns active workspace members who are
 	// not already active participants of conversationID (issue #398). The
 	// exclusion is a NOT EXISTS in the same statement, so the panel's capped
@@ -174,6 +181,61 @@ func (s *PGXDMStore) ListParticipantProfiles(
 		return DMParticipantPage{}, fmt.Errorf("iterate dm participant profiles: %w", err)
 	}
 	return page, nil
+}
+
+// ListParticipantProfilesByIDs resolves presentation identities for a
+// specific set of user IDs against one conversation's active participants
+// (issue #612). Same active-membership predicate as ListParticipantProfiles
+// — active conversation in this workspace, active dm_members row, active
+// workspace membership, active non-deleted user — so identity resolution
+// cannot see further than the details panel already can. No ORDER BY/LIMIT:
+// the caller named the exact set, bounded by MaxCallParticipantProfileIDs
+// before this is ever called.
+func (s *PGXDMStore) ListParticipantProfilesByIDs(
+	ctx context.Context, workspaceID, conversationID string, userIDs []string,
+) ([]domain.CallParticipantProfile, error) {
+	if userIDs == nil {
+		userIDs = []string{}
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text,
+		       COALESCE(
+		           NULLIF(BTRIM(u.full_name), ''),
+		           NULLIF(BTRIM(u.display_name), ''),
+		           ''
+		       ) AS display_name,
+		       COALESCE(u.avatar_url, '') AS avatar_url
+		FROM chat.dm_members dm
+		JOIN chat.dm_conversations dc
+		  ON dc.id = dm.conversation_id
+		 AND dc.workspace_id = $1::uuid
+		 AND dc.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dm.conversation_id = $2::uuid
+		  AND dm.status = 'active'
+		  AND dm.user_id = ANY($3::uuid[])`,
+		workspaceID, conversationID, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list dm participant profiles by ids: %w", err)
+	}
+	defer rows.Close()
+
+	profiles := make([]domain.CallParticipantProfile, 0, len(userIDs))
+	for rows.Next() {
+		var profile domain.CallParticipantProfile
+		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL); err != nil {
+			return nil, fmt.Errorf("scan dm participant profile: %w", err)
+		}
+		profiles = append(profiles, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dm participant profiles: %w", err)
+	}
+	return profiles, nil
 }
 
 // GetDirectCounterpartProfile authorises the caller and resolves who the other
