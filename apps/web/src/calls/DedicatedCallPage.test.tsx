@@ -61,6 +61,7 @@ const session = {
   activateResourceParticipation,
   takeOver,
   releaseDedicated: vi.fn(async () => undefined),
+  releaseDirectTerminal: vi.fn(async () => undefined),
   leaveDedicated: vi.fn(async () => undefined),
   dedicatedRecoveryFailed: false,
   presentation: { mode: "active_dedicated_tab" },
@@ -120,6 +121,14 @@ const resolvedCall = {
   expires_at: "2026-08-18T13:00:00Z",
 };
 
+const directResolvedCall = {
+  ...resolvedCall,
+  target_type: "user" as const,
+  target_id: undefined,
+  caller_id: "current-user",
+  callee_id: "peer",
+};
+
 describe("DedicatedCallPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -137,6 +146,10 @@ describe("DedicatedCallPage", () => {
     session.media.screenShareEnabled = false;
     session.media.hasLocalVideo = true;
     session.media.hasRemoteVideo = false;
+    session.calls.end.mockReset();
+    session.releaseDedicated.mockReset().mockResolvedValue(undefined);
+    session.releaseDirectTerminal.mockReset().mockResolvedValue(undefined);
+    session.leaveDedicated.mockReset().mockResolvedValue(undefined);
     vi.mocked(useCallSession).mockReturnValue(session as never);
     vi.mocked(resolveCall).mockResolvedValue(resolvedCall);
     vi.mocked(fetchSidebarData).mockResolvedValue({
@@ -147,6 +160,18 @@ describe("DedicatedCallPage", () => {
       categories: [],
     });
   });
+
+  function setUpDirectPage() {
+    vi.mocked(resolveCall).mockResolvedValueOnce(directResolvedCall);
+    vi.mocked(fetchSidebarData).mockResolvedValueOnce({
+      currentUserId: "current-user",
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [],
+      categories: [],
+    });
+    session.calls.call = directResolvedCall;
+  }
 
   it("reauthorizes by call id, joins as owner, and ACKs only after media connects", async () => {
     renderPage();
@@ -312,6 +337,244 @@ describe("DedicatedCallPage", () => {
     await waitFor(() => expect(session.calls.activateMedia).toHaveBeenCalledOnce());
     fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
     expect(session.calls.end).toHaveBeenCalledOnce();
+  });
+
+  it("waits for the matching authoritative direct terminal and media/ownership convergence before closing", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    Object.defineProperty(window, "closed", { configurable: true, value: false });
+    const direct = directResolvedCall;
+    vi.mocked(resolveCall).mockResolvedValueOnce(direct);
+    vi.mocked(fetchSidebarData).mockResolvedValueOnce({
+      currentUserId: "current-user",
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [
+        {
+          id: "dm-direct",
+          name: "Ana",
+          type: "1:1",
+          participants: [],
+          counterpart: { userId: "peer", displayName: "Ana" },
+        },
+      ],
+      categories: [],
+    });
+    session.calls.call = direct;
+    session.calls.end.mockReturnValueOnce(true);
+    let finishConvergence!: () => void;
+    session.releaseDirectTerminal.mockImplementationOnce(
+      () =>
+        new Promise<undefined>((resolve) => {
+          finishConvergence = () => resolve(undefined);
+        }),
+    );
+    const view = renderPage();
+    await screen.findByRole("main", { name: "Chamada Ana" });
+
+    const technicalEvent = vi.fn();
+    window.addEventListener("nchat:call-technical-event", technicalEvent);
+    fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
+    window.removeEventListener("nchat:call-technical-event", technicalEvent);
+    expect(session.calls.end).toHaveBeenCalledOnce();
+    expect(technicalEvent).not.toHaveBeenCalled();
+    expect(session.releaseDirectTerminal).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+
+    session.calls.call = { ...direct, status: "ended", version: 2 };
+    view.rerender(pageTree());
+    await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledWith(callId));
+    expect(close).not.toHaveBeenCalled();
+
+    await act(async () => finishConvergence());
+    expect(close).toHaveBeenCalledOnce();
+    expect(await screen.findByText("Chat")).toBeInTheDocument();
+  });
+
+  it.each(["ended", "cancelled"] as const)(
+    "closes automatically after a remote %s terminal without sending call.end",
+    async (status) => {
+      const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+      Object.defineProperty(window, "closed", { configurable: true, value: true });
+      setUpDirectPage();
+      const view = renderPage();
+      await screen.findByRole("main", { name: "Chamada Participante" });
+
+      session.calls.call = { ...directResolvedCall, status, version: 2 };
+      view.rerender(pageTree());
+
+      await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledWith(callId));
+      await waitFor(() => expect(close).toHaveBeenCalledOnce());
+      expect(session.calls.end).not.toHaveBeenCalled();
+    },
+  );
+
+  it("ignores a terminal from another call and an unconfirmed local end", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    setUpDirectPage();
+    session.calls.end.mockReturnValueOnce(false);
+    const view = renderPage();
+    await screen.findByRole("main", { name: "Chamada Participante" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Encerrar chamada" }));
+    session.calls.call = {
+      ...directResolvedCall,
+      call_id: "00000000-0000-4000-8000-000000000999",
+      status: "ended",
+      version: 2,
+    };
+    view.rerender(pageTree());
+    await act(async () => undefined);
+
+    expect(session.calls.end).toHaveBeenCalledOnce();
+    expect(session.releaseDirectTerminal).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("handles duplicate terminal renders idempotently", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    Object.defineProperty(window, "closed", { configurable: true, value: true });
+    setUpDirectPage();
+    let finishConvergence!: () => void;
+    session.releaseDirectTerminal.mockImplementationOnce(
+      () =>
+        new Promise<undefined>((resolve) => {
+          finishConvergence = () => resolve(undefined);
+        }),
+    );
+    const view = renderPage();
+    await screen.findByRole("main", { name: "Chamada Participante" });
+
+    session.calls.call = { ...directResolvedCall, status: "ended", version: 2 };
+    view.rerender(pageTree());
+    await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledOnce());
+    session.calls.call = { ...directResolvedCall, status: "ended", version: 3 };
+    view.rerender(pageTree());
+    expect(session.releaseDirectTerminal).toHaveBeenCalledOnce();
+
+    await act(async () => finishConvergence());
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("does not close or mark terminal convergence completed after cleanup fails", async () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    Object.defineProperty(window, "closed", { configurable: true, value: true });
+    setUpDirectPage();
+    session.releaseDirectTerminal
+      .mockRejectedValueOnce(new Error("cleanup failed"))
+      .mockResolvedValueOnce(undefined);
+    const view = renderPage();
+    await screen.findByRole("main", { name: "Chamada Participante" });
+
+    session.calls.call = { ...directResolvedCall, status: "ended", version: 2 };
+    view.rerender(pageTree());
+
+    expect(await screen.findByText("Não foi possível liberar a mídia da chamada.")).toHaveAttribute(
+      "role",
+      "alert",
+    );
+    expect(session.releaseDirectTerminal).toHaveBeenCalledOnce();
+    expect(close).not.toHaveBeenCalled();
+
+    session.calls.call = { ...directResolvedCall, status: "ended", version: 3 };
+    view.rerender(pageTree());
+    await act(async () => undefined);
+    expect(session.releaseDirectTerminal).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Tentar fechar novamente" }));
+    await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(close).toHaveBeenCalledOnce());
+  });
+
+  // Issue #614 follow-up blocker: the terminal-close effect used to gate on
+  // `resolved`, which the initial resolveCall(callId)/fetchSidebarData
+  // request may never populate — either because it is still in flight, or
+  // because it rejects (e.g. call_not_found) once CurrentCallForUser can no
+  // longer find the call as ringing/active after it already went terminal.
+  // The authoritative terminal state is calls.call, populated independently
+  // by useCallSignaling's own reconnect sync — convergence must key off that
+  // and the route's own callId, never `resolved`.
+  describe("terminal convergence never depends on the initial resolveCall settling (issue #614 follow-up)", () => {
+    it("closes automatically on a matching terminal even while resolveCall/fetchSidebarData are still pending", async () => {
+      const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+      Object.defineProperty(window, "closed", { configurable: true, value: true });
+      vi.mocked(resolveCall).mockReturnValueOnce(new Promise(() => undefined));
+      const view = renderPage();
+      expect(await screen.findByRole("status")).toHaveTextContent("Preparando chamada");
+
+      session.calls.call = { ...directResolvedCall, status: "ended", version: 2 };
+      view.rerender(pageTree());
+
+      await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledWith(callId));
+      await waitFor(() => expect(close).toHaveBeenCalledOnce());
+    });
+
+    it("ignores a terminal for a different call_id while the initial resolution is still pending", async () => {
+      const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+      vi.mocked(resolveCall).mockReturnValueOnce(new Promise(() => undefined));
+      const view = renderPage();
+      expect(await screen.findByRole("status")).toHaveTextContent("Preparando chamada");
+
+      session.calls.call = {
+        ...directResolvedCall,
+        call_id: "00000000-0000-4000-8000-000000000999",
+        status: "ended",
+        version: 2,
+      };
+      view.rerender(pageTree());
+      await act(async () => undefined);
+
+      expect(session.releaseDirectTerminal).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+    });
+
+    it("a later call_not_found from the initial resolveCall never masks an already-started terminal convergence or its retry UI", async () => {
+      const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+      let rejectInitial!: (error: Error) => void;
+      vi.mocked(resolveCall).mockReturnValueOnce(
+        new Promise((_resolve, reject) => {
+          rejectInitial = reject;
+        }),
+      );
+      session.releaseDirectTerminal
+        .mockRejectedValueOnce(new Error("cleanup failed"))
+        .mockResolvedValueOnce(undefined);
+      const view = renderPage();
+      expect(await screen.findByRole("status")).toHaveTextContent("Preparando chamada");
+
+      session.calls.call = { ...directResolvedCall, status: "ended", version: 2 };
+      view.rerender(pageTree());
+      await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledWith(callId));
+
+      // The ORIGINAL request, in flight since before the terminal arrived,
+      // now rejects — the call already went terminal before
+      // CurrentCallForUser could still find it as ringing/active.
+      rejectInitial(new Error("call_not_found"));
+      await act(async () => undefined);
+
+      // The terminal cleanup-failed retry screen must win — never the
+      // generic "could not open this call" error masking it.
+      expect(
+        await screen.findByText("Não foi possível liberar a mídia da chamada."),
+      ).toHaveAttribute("role", "alert");
+      expect(screen.queryByText("Não foi possível abrir esta chamada.")).not.toBeInTheDocument();
+      expect(close).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Tentar fechar novamente" }));
+      await waitFor(() => expect(session.releaseDirectTerminal).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(close).toHaveBeenCalledOnce());
+    });
+  });
+
+  it("does not end or release an active direct call when the dedicated page unmounts manually", async () => {
+    setUpDirectPage();
+    const view = renderPage();
+    await screen.findByRole("main", { name: "Chamada Participante" });
+
+    view.unmount();
+
+    expect(session.calls.end).not.toHaveBeenCalled();
+    expect(session.releaseDedicated).not.toHaveBeenCalled();
+    expect(session.releaseDirectTerminal).not.toHaveBeenCalled();
   });
 
   it("wires local screen share as primary over a simultaneously active remote share (issue #611)", async () => {

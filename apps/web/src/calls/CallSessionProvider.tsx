@@ -27,7 +27,7 @@ import {
   type ResourceCallDiscoveryState,
   type ResourceKey,
 } from "../chat/resourceCallDiscovery";
-import { syncResourceCall } from "../chat/resourceCallSignaling";
+import { resolveCall, syncResourceCall } from "../chat/resourceCallSignaling";
 import type { Channel, DMConversation } from "../chat/chatTypes";
 import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
 import { useSelfProfile } from "../profile/selfProfile";
@@ -83,6 +83,7 @@ export interface CallSessionContextValue {
   announceDedicated: (callId: string) => void;
   acknowledgeDedicated: (callId: string, connected: boolean) => void;
   releaseDedicated: (callId: string) => Promise<void>;
+  releaseDirectTerminal: (callId: string) => Promise<void>;
   /**
    * The dedicated tab's actual exit from a resource/group call (issue
    * #570) — never for RF-23 direct calls, which keep using calls.end().
@@ -294,6 +295,22 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     microphone: boolean;
     camera: boolean;
   } | null>(null);
+  const reportedMediaCleanupCallRef = useRef("");
+  // Which call_id ownedMedia.stop() belongs to, for when NEITHER of stop's
+  // two normal sources still knows: getLease() can already be cleared (a
+  // connect() failure/supersession releases the lease from inside its own
+  // catch, synchronously, before stop() ever runs) and confirmedIntentRef is
+  // never set until AFTER a connect fully succeeds — so a terminal event
+  // racing a still-in-flight or just-failed connect can reach stop() with
+  // both empty. Set at the very start of connect(), before anything that
+  // could fail or be superseded, so it survives exactly the failure modes
+  // those two don't; never cleared, since a call_id is a UUID never reused
+  // (same accepted trade-off as everConnectedRef in useCallSignaling.ts) —
+  // only ever overwritten by a later call's own connect(). Without this,
+  // ownedMedia.stop() silently fell back to "", and releaseDirectTerminal's
+  // own `reportedMediaCleanupCallRef.current !== callId` dedup could never
+  // match, double-reporting a track-cleanup that only happened once.
+  const stopFallbackCallIdRef = useRef("");
   // The dedicated tab's epoch the current outstanding handoff attempt
   // expects back in an "ack"/"failure" reply. Cleared whenever the attempt
   // reaches a terminal state (ack, failure, or timeout) so a late reply from
@@ -534,6 +551,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         if (confirmedIntentRef.current && confirmedIntentRef.current.callId !== call.call_id) {
           confirmedIntentRef.current = null;
         }
+        stopFallbackCallIdRef.current = call.call_id;
         const ownership = getOwnership();
         const current = ownership.getLease();
         const lease =
@@ -594,11 +612,17 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           throw new Error("failed to persist media intent for handoff");
         }
         confirmedIntentRef.current = { callId: call.call_id, ...applied };
+        reportedMediaCleanupCallRef.current = "";
         emitCallTechnicalEvent("join-success");
       },
       stop: async () => {
+        const callId =
+          getOwnership().getLease()?.callId ??
+          confirmedIntentRef.current?.callId ??
+          stopFallbackCallIdRef.current;
         await media.stop();
         emitCallTechnicalEvent("track-cleanup");
+        reportedMediaCleanupCallRef.current = callId;
       },
     }),
     [getOwnership, media, role, setOwner],
@@ -707,6 +731,11 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     if (resource.active) await resource.leave();
   }, [resource]);
   const calls = useCallSignaling(directMedia, mediaEnabled, releaseResource);
+  const callsRef = useRef(calls);
+  const terminalDirectRecoveryCallRef = useRef("");
+  useEffect(() => {
+    callsRef.current = calls;
+  }, [calls]);
   const directCallBusy = calls.call !== null && !terminal.has(calls.call.status);
 
   const postParticipation = useCallback(
@@ -999,8 +1028,45 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       if (recovery.current) return recovery.current;
       const attempt = (async () => {
         dispatchPresentation({ type: "OWNER_LOST" });
+        const localCall = callsRef.current.call;
+        const recoveringDirect = localCall?.call_id === callId && localCall.target_type === "user";
+        if (recoveringDirect) {
+          if (terminalDirectRecoveryCallRef.current === callId) return false;
+          let authoritative: Call;
+          try {
+            authoritative = await resolveCall(callId);
+          } catch {
+            return false;
+          }
+          if (authoritative.call_id !== callId || authoritative.status !== "active") {
+            terminalDirectRecoveryCallRef.current = callId;
+            return false;
+          }
+          const currentCall = callsRef.current.call;
+          if (
+            currentCall?.call_id !== callId ||
+            currentCall.target_type !== "user" ||
+            currentCall.status !== "active"
+          ) {
+            return false;
+          }
+        }
         const lease = await getOwnership().claim(callId, "main", afterEpoch, predecessorHint);
         if (!lease) return false;
+        if (recoveringDirect) {
+          const currentCall = callsRef.current.call;
+          if (
+            currentCall?.call_id !== callId ||
+            currentCall.target_type !== "user" ||
+            currentCall.status !== "active"
+          ) {
+            if (currentCall?.call_id === callId && terminal.has(currentCall.status)) {
+              terminalDirectRecoveryCallRef.current = callId;
+            }
+            getOwnership().release(callId);
+            return false;
+          }
+        }
         emitCallTechnicalEvent("ownership-takeover");
         setOwner("local");
         const connected = await reconnectLocal();
@@ -1407,18 +1473,35 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     },
     [getOwnership, setOwner],
   );
-  const releaseDedicated = useCallback(
-    async (callId: string) => {
+  const releaseDedicatedOwnership = useCallback(
+    async (callId: string, emitCleanup: boolean) => {
       // Stop-before-release: the dedicated tab's own Room/tracks must be
       // torn down before it stops being the owner, so a window.close()
       // fallback (SPA navigate in this same tab) never leaves residual
       // media running alongside whatever tab recovers ownership next.
       await mediaRef.current.stop();
-      emitCallTechnicalEvent("track-cleanup");
+      if (emitCleanup) emitCallTechnicalEvent("track-cleanup");
       getOwnership().release(callId);
       setOwner("remote");
     },
     [getOwnership, setOwner],
+  );
+  const releaseDedicated = useCallback(
+    (callId: string) => releaseDedicatedOwnership(callId, true),
+    [releaseDedicatedOwnership],
+  );
+  const releaseDirectTerminal = useCallback(
+    async (callId: string) => {
+      // useCallSignaling normally completed and reported this cleanup first.
+      // A retry after disconnect failure has not, so report the first
+      // successful convergence here without duplicating the normal path.
+      await releaseDedicatedOwnership(callId, false);
+      if (reportedMediaCleanupCallRef.current !== callId) {
+        emitCallTechnicalEvent("track-cleanup");
+        reportedMediaCleanupCallRef.current = callId;
+      }
+    },
+    [releaseDedicatedOwnership],
   );
   // The dedicated tab's actual "sair" (issue #570) — distinct from
   // releaseDedicated above, which only ever moves ownership (minimize) and
@@ -1452,6 +1535,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       announceDedicated,
       acknowledgeDedicated,
       releaseDedicated,
+      releaseDirectTerminal,
       leaveDedicated,
       beginResourceParticipation,
       joinResourceParticipation,
@@ -1477,6 +1561,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       registerDirectory,
       registerIdentity,
       releaseDedicated,
+      releaseDirectTerminal,
       requestResourceCallSync,
       resource,
       takeOver,
@@ -1581,13 +1666,16 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           onRetryIdentity={() => identity.retry?.()}
         />
       )}
-      {!dedicated && activeCallId && ownerState === "remote" && (
-        <GlobalCallIndicator
-          title={title}
-          participantCount={participantCount}
-          onReturn={() => void takeOver()}
-        />
-      )}
+      {!dedicated &&
+        activeCallId &&
+        ownerState === "remote" &&
+        !(directActive && presentation.mode === "recovering_to_floating") && (
+          <GlobalCallIndicator
+            title={title}
+            participantCount={participantCount}
+            onReturn={() => void takeOver()}
+          />
+        )}
       {!dedicated && activeCallId && ownerState !== "remote" && (
         <FloatingCallWindow
           title={title}

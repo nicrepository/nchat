@@ -122,3 +122,120 @@ describe("message attachments", () => {
     expect(mockContent).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The image branch (issue #491): a large preview instead of the 32px
+ * thumbnail, a lightbox that opens without downloading, and focus returning
+ * to the real trigger button on close — the one piece AttachmentLightbox
+ * itself deliberately does not own (see MessageAttachments.tsx's own
+ * comment). Per-state and per-format behaviour is AttachmentImagePreview's
+ * and AttachmentLightbox's own suites; this only checks the wiring.
+ */
+describe("message attachments — image preview and lightbox", () => {
+  function imageAttachment(overrides: Partial<ChannelAttachment> = {}): ChannelAttachment {
+    return {
+      id: "img-1",
+      filename: "foto.png",
+      contentType: "image/png",
+      size: 4096,
+      status: "clean",
+      previewStatus: "ready",
+      createdAt: "",
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    mockPreview.mockResolvedValue(new Blob(["preview-bytes"]));
+    const createObjectURL = vi.fn(() => "blob:img-1");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("shows the large preview instead of the 32px thumbnail", async () => {
+    render(<MessageAttachments attachments={[imageAttachment()]} />);
+
+    expect(await screen.findByTestId("chat-message-attachment-image-img-1")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-file-thumb")).not.toBeInTheDocument();
+  });
+
+  it("opens the lightbox on click without downloading, and returns focus to the trigger on close", async () => {
+    const user = userEvent.setup();
+    render(<MessageAttachments attachments={[imageAttachment()]} />);
+
+    const trigger = await screen.findByRole("button", { name: "Ampliar foto.png" });
+    await user.click(trigger);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    // The lightbox fetching the full-resolution original for the enlarged
+    // view is expected — what must not happen is the *download* flow, whose
+    // own visible signal is the Baixar button's loading state.
+    expect(screen.getByTestId("chat-message-attachment-download-img-1")).toHaveTextContent(
+      "Baixar",
+    );
+
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+  });
+
+  it("wires a GIF attachment through to the animated inline preview", async () => {
+    render(
+      <MessageAttachments
+        attachments={[
+          imageAttachment({ id: "gif-1", filename: "reacao.gif", contentType: "image/gif" }),
+        ]}
+      />,
+    );
+
+    await screen.findByTestId("chat-message-attachment-image-gif-1");
+    expect(mockContent).toHaveBeenCalledWith("gif-1", expect.any(AbortSignal));
+    expect(mockPreview).not.toHaveBeenCalled();
+  });
+
+  it("wires a WebP attachment through to the original — there is no server preview for it", async () => {
+    render(
+      <MessageAttachments
+        attachments={[
+          imageAttachment({ id: "webp-1", filename: "banner.webp", contentType: "image/webp" }),
+        ]}
+      />,
+    );
+
+    await screen.findByTestId("chat-message-attachment-image-webp-1");
+    expect(mockContent).toHaveBeenCalledWith("webp-1", expect.any(AbortSignal));
+  });
+
+  it("respects prefers-reduced-motion end to end: a GIF shows the static preview, not the animated original", async () => {
+    mockPreview.mockResolvedValue(new Blob(["preview-bytes"]));
+    window.matchMedia = ((query: string) =>
+      ({
+        matches: query.includes("reduce"),
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }) as unknown as MediaQueryList) as typeof window.matchMedia;
+
+    render(
+      <MessageAttachments
+        attachments={[
+          imageAttachment({ id: "gif-2", filename: "reacao.gif", contentType: "image/gif" }),
+        ]}
+      />,
+    );
+
+    await screen.findByTestId("chat-message-attachment-image-gif-2");
+    expect(mockPreview).toHaveBeenCalledWith("gif-2", expect.any(AbortSignal));
+    expect(mockContent).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Reproduzir animação" })).toBeInTheDocument();
+
+    // @ts-expect-error -- restore jsdom's absence of matchMedia for other tests.
+    delete window.matchMedia;
+  });
+});
