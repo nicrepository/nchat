@@ -1695,6 +1695,90 @@ export async function fetchGroupDetails(
   };
 }
 
+// ── Call-participant profiles (issue #612) ───────────────────────────────────
+
+export interface CallParticipantProfile {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe http(s) target. */
+  avatarUrl?: string;
+}
+
+interface CallParticipantProfileResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+}
+
+interface CallParticipantProfilesEnvelope {
+  data: { profiles?: unknown };
+}
+
+function mapCallParticipantProfile(raw: unknown): CallParticipantProfile | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const profile = raw as CallParticipantProfileResponse;
+  if (typeof profile.user_id !== "string" || profile.user_id === "") return undefined;
+  return {
+    userId: profile.user_id,
+    displayName: typeof profile.display_name === "string" ? profile.display_name : "",
+    avatarUrl: safeAvatarUrl(profile.avatar_url),
+  };
+}
+
+function mapCallParticipantProfiles(
+  envelope: CallParticipantProfilesEnvelope,
+): CallParticipantProfile[] {
+  return Array.isArray(envelope.data.profiles)
+    ? envelope.data.profiles
+        .map(mapCallParticipantProfile)
+        .filter((profile): profile is CallParticipantProfile => profile !== undefined)
+    : [];
+}
+
+/**
+ * Resolves presentation identities (name, avatar) for a set of call
+ * participants in one round trip, scoped to a channel the caller can see
+ * (issue #612). A user ID that is not an active member of the channel is
+ * simply absent from the result — the caller degrades that tile to initials,
+ * never to the raw UUID.
+ */
+export async function fetchChannelCallParticipantProfiles(
+  channelId: string,
+  userIds: string[],
+  signal?: AbortSignal,
+): Promise<CallParticipantProfile[]> {
+  const res = await authenticatedFetch<CallParticipantProfilesEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/call-participants`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: userIds }),
+      signal,
+    },
+  );
+  return mapCallParticipantProfiles(res);
+}
+
+/**
+ * Same as fetchChannelCallParticipantProfiles, scoped to a group conversation.
+ */
+export async function fetchGroupCallParticipantProfiles(
+  conversationId: string,
+  userIds: string[],
+  signal?: AbortSignal,
+): Promise<CallParticipantProfile[]> {
+  const res = await authenticatedFetch<CallParticipantProfilesEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/call-participants`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: userIds }),
+      signal,
+    },
+  );
+  return mapCallParticipantProfiles(res);
+}
+
 // ── Direct profile (issue #443) ──────────────────────────────────────────────
 
 interface DirectProfileEnvelope {

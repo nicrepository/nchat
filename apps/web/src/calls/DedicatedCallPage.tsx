@@ -1,15 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
-import { fetchSidebarData } from "../chat/chatApi";
+import {
+  fetchChannelCallParticipantProfiles,
+  fetchGroupCallParticipantProfiles,
+  fetchSidebarData,
+  type CallParticipantProfile,
+} from "../chat/chatApi";
+import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
 import type { Call } from "../chat/callState";
 import { resolveCall } from "../chat/resourceCallSignaling";
+import { useSelfProfile } from "../profile/selfProfile";
 import DedicatedCallStage from "./DedicatedCallStage";
 import { useCallSession } from "./CallSessionProvider";
 import { emitCallTechnicalEvent } from "./callTelemetry";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 
 const callIDPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Must stay <= the server's domain.MaxCallParticipantProfileIDs (issue #612):
+// a resource call room has no enforced participant ceiling, so a roster can
+// exceed one batch request's cap. Chunking here — rather than raising the
+// server cap — keeps that cap as a real abuse-control boundary.
+const CALL_PARTICIPANT_CHUNK_SIZE = 50;
 
 export default function DedicatedCallPage() {
   const { callId = "" } = useParams();
@@ -34,6 +47,22 @@ export default function DedicatedCallPage() {
   const acknowledged = useRef(false);
   const invalidCallID = !callIDPattern.test(callId);
 
+  // Local call-presentation identity (issue #612), reused from the shared
+  // session-scoped profile cache — never a second GET /auth/me just for calls.
+  const selfProfile = useSelfProfile();
+  const selfDisplayName = selfProfile.status === "ready" ? selfProfile.profile.displayName : "";
+  const selfAvatarUrl = selfProfile.status === "ready" ? selfProfile.profile.avatarUrl : undefined;
+  const localDisplayName = localParticipantDisplayName(selfDisplayName);
+  // Initials must come from the raw name, never from the "(você)"-suffixed
+  // display label (issue #612 blocker) — initialsFrom would otherwise take
+  // "(" as a second "word" for a one-word name like "Ana". Empty/loading
+  // falls back to "Você" (the same visual fallback as localDisplayName),
+  // never to "?".
+  const localInitials = initialsFrom(selfDisplayName || "Você");
+  const [participantProfiles, setParticipantProfiles] = useState<
+    Map<string, CallParticipantProfile>
+  >(new Map());
+
   useEffect(() => {
     if (invalidCallID) return;
     let active = true;
@@ -56,17 +85,72 @@ export default function DedicatedCallPage() {
     if (!resolved || !directory) return null;
     if (resolved.target_type === "channel") {
       const channel = directory.channels.find((candidate) => candidate.id === resolved.target_id);
-      return channel ? { id: channel.id, name: channel.name } : null;
+      // A channel/group name is never an individual's identity (issue #612)
+      // — avatarUrl stays undefined here, never a room-level picture.
+      return channel ? { id: channel.id, name: channel.name, avatarUrl: undefined } : null;
     }
     if (resolved.target_type === "dm") {
       const dm = directory.dms.find((candidate) => candidate.id === resolved.target_id);
-      return dm ? { id: dm.id, name: dm.name } : null;
+      return dm ? { id: dm.id, name: dm.name, avatarUrl: undefined } : null;
     }
     const peerID =
       resolved.caller_id === directory.currentUserId ? resolved.callee_id : resolved.caller_id;
     const peer = directory.dms.find((dm) => dm.counterpart?.userId === peerID)?.counterpart;
-    return { id: peerID, name: peer?.displayName ?? "Participante" };
+    // The direct peer's real avatar (issue #612), already resolved by the
+    // existing DMCounterpart contract — reused here rather than fetched
+    // again, and only ever attached to the header when the call actually is
+    // one specific person (this branch), never for a channel/group above.
+    return { id: peerID, name: peer?.displayName ?? "Participante", avatarUrl: peer?.avatarUrl };
   }, [directory, resolved]);
+
+  // Batch-resolves every currently-known resource participant's identity
+  // (issue #612) — never one request per tile. Direct calls have no
+  // resourceTarget and skip this entirely, since the counterpart contract
+  // already carries their identity.
+  //
+  // The dependency key is canonical and set-like — deduplicated and sorted —
+  // so [A, B] and [B, A] (an SDK/event reorder with no membership change)
+  // produce the identical string and never re-fire the effect. This never
+  // reads or writes media.participants itself beyond one .map(); the
+  // original array/objects are untouched.
+  const participantIdentityKey = Array.from(new Set(media.participants.map((p) => p.identity)))
+    .sort()
+    .join(",");
+  useEffect(() => {
+    if (!resolved || (resolved.target_type !== "channel" && resolved.target_type !== "dm")) return;
+    const ids = participantIdentityKey ? participantIdentityKey.split(",") : [];
+    if (ids.length === 0) return;
+    let active = true;
+    const target =
+      resolved.target_type === "channel"
+        ? { fetch: fetchChannelCallParticipantProfiles, id: resolved.target_id! }
+        : { fetch: fetchGroupCallParticipantProfiles, id: resolved.target_id! };
+    // Chunked to stay within MaxCallParticipantProfileIDs (issue #612): a
+    // room can exceed the batch cap, so this issues one request per
+    // CALL_PARTICIPANT_CHUNK_SIZE-sized slice of the (already deduplicated,
+    // sorted) id list rather than ever sending an oversized batch. Chunks
+    // are independent requests — completion order does not matter, since
+    // each chunk's result is merged by canonical user ID rather than
+    // replacing the whole map.
+    const chunks: string[][] = [];
+    for (let i = 0; i < ids.length; i += CALL_PARTICIPANT_CHUNK_SIZE) {
+      chunks.push(ids.slice(i, i + CALL_PARTICIPANT_CHUNK_SIZE));
+    }
+    Promise.allSettled(chunks.map((chunk) => target.fetch(target.id, chunk))).then((results) => {
+      if (!active) return;
+      const resolvedProfiles = results.flatMap((result) =>
+        result.status === "fulfilled" ? result.value : [],
+      );
+      // One request failing (network, transient 5xx) degrades only the
+      // chunk it covered to initials — it must never discard profiles a
+      // sibling chunk already resolved, and never falls back to an
+      // obsolete/partial map from a previous generation.
+      setParticipantProfiles(new Map(resolvedProfiles.map((profile) => [profile.userId, profile])));
+    });
+    return () => {
+      active = false;
+    };
+  }, [resolved, participantIdentityKey]);
 
   useEffect(() => {
     if (
@@ -139,7 +223,25 @@ export default function DedicatedCallPage() {
   }
 
   const title = target.name;
-  const participantCount = Math.max(1, media.participants.length + 1);
+  // A direct call is always exactly 2 people (issue #612 blocker): it never
+  // routes through media.participants (resource-room-only), so the local +
+  // remoteDirect tiles are the whole roster. Resource/group calls keep the
+  // existing media.participants + local count.
+  const participantCount = resolved.target_type === "user" ? 2 : media.participants.length + 1;
+  // Canonical per-participant presentation (issue #612 blocker): the batch
+  // profile's real name/avatar wins when present, falling back to LiveKit's
+  // displayName only when the profile is absent or empty. Derived once here
+  // and reused for both the tile list and screenShareName below, so the two
+  // surfaces never disagree about who's who.
+  const presentedParticipants = media.participants.map((participant) => {
+    const profile = participantProfiles.get(participant.identity);
+    const profileName = profile?.displayName.trim();
+    return {
+      ...participant,
+      displayName: profileName ? profileName : participant.displayName,
+      avatarUrl: profile?.avatarUrl,
+    };
+  });
   const controls = {
     microphoneEnabled: media.microphoneEnabled,
     cameraEnabled: media.cameraEnabled,
@@ -193,7 +295,7 @@ export default function DedicatedCallPage() {
                 : "connecting"
         }
         participantCount={participantCount}
-        participants={media.participants}
+        participants={presentedParticipants}
         controls={controls}
         bindLocalMedia={media.bindLocalMedia}
         bindRemoteAudio={media.bindRemoteAudio}
@@ -201,7 +303,7 @@ export default function DedicatedCallPage() {
         bindLocalScreenShare={media.bindLocalScreenShare}
         screenShareName={
           media.remoteScreenShare
-            ? (media.participants.find(
+            ? (presentedParticipants.find(
                 (participant) => participant.identity === media.remoteScreenShare?.identity,
               )?.displayName ?? "Participante")
             : undefined
@@ -209,6 +311,25 @@ export default function DedicatedCallPage() {
         bindScreenShare={media.remoteScreenShare?.bindMedia}
         hasLocalVideo={media.hasLocalVideo}
         localSeed={directory.currentUserId}
+        localDisplayName={localDisplayName}
+        localInitials={localInitials}
+        localAvatarUrl={selfAvatarUrl}
+        headerAvatar={
+          resolved.target_type === "user"
+            ? { seed: target.id, avatarUrl: target.avatarUrl }
+            : undefined
+        }
+        remoteDirect={
+          resolved.target_type === "user"
+            ? {
+                seed: target.id,
+                displayName: target.name,
+                avatarUrl: target.avatarUrl,
+                hasVideo: media.hasRemoteVideo,
+                bindVideo: media.bindRemoteMedia,
+              }
+            : undefined
+        }
         onMinimize={() => {
           void session.releaseDedicated(resolved.call_id).then(() => {
             window.close();

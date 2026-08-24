@@ -17,6 +17,9 @@ import (
 type channelProvider interface {
 	CreateChannel(ctx context.Context, input service.CreateChannelInput) (domain.Channel, error)
 	GetChannelDetails(ctx context.Context, input service.ChannelDetailsInput) (service.ChannelDetails, error)
+	// GetCallParticipantProfiles resolves presentation identities for a set
+	// of call-participant user IDs, scoped to this channel (issue #612).
+	GetCallParticipantProfiles(ctx context.Context, input service.ChannelCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
 }
 
 // presenceLookup answers "who in this workspace is online right now" for the
@@ -341,6 +344,120 @@ func channelDetailsBody(details service.ChannelDetails) channelDetailsResponse {
 		OnlineMemberCount: details.OnlineCount,
 		OnlineMembers:     members,
 		CanManageMembers:  details.CanManageMembers,
+	}
+}
+
+// ── Call-participant profiles (issue #612) ───────────────────────────────────
+
+type callParticipantProfilesRequest struct {
+	UserIDs []string `json:"user_ids"`
+}
+
+type callParticipantProfileJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url"`
+}
+
+type callParticipantProfilesResponse struct {
+	Profiles []callParticipantProfileJSON `json:"profiles"`
+}
+
+func callParticipantProfilesBody(profiles []domain.CallParticipantProfile) callParticipantProfilesResponse {
+	out := make([]callParticipantProfileJSON, 0, len(profiles))
+	for _, profile := range profiles {
+		out = append(out, callParticipantProfileJSON{
+			UserID:      profile.UserID,
+			DisplayName: profile.DisplayName,
+			AvatarURL:   profile.AvatarURL,
+		})
+	}
+	return callParticipantProfilesResponse{Profiles: out}
+}
+
+// callParticipantsRateLimit caps identity-resolution requests: a call joins
+// and leaves change the room roster far less often than this allows, so the
+// budget exists only to bound abuse, not to constrain real usage.
+const callParticipantsRateLimit = 30
+
+// callParticipantsAction is the shared limiter namespace for both
+// call-participants routes (channel and group), mirroring addMembersAction.
+const callParticipantsAction = "call_participants"
+
+// CallParticipants handles POST /api/chat/channels/{channelID}/call-participants
+// (issue #612).
+//
+// Transport concerns only: batch validation, the cap and de-duplication all
+// live in ChannelService.GetCallParticipantProfiles. A user ID that is not
+// an active member of this channel is silently absent from the response —
+// never a 403/404 for that one ID — so the client's per-participant fallback
+// (initials) is the only thing that ever surfaces an unresolved identity.
+func (h *ChannelHandler) CallParticipants(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.channels == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	allowed, err := h.limiter.AllowActionWithLimit(r.Context(), callerID, callParticipantsAction, callParticipantsRateLimit, channelRateLimitWindowSeconds)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	var request callParticipantProfilesRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+		} else {
+			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+		}
+		return
+	}
+	profiles, err := h.channels.GetCallParticipantProfiles(r.Context(), service.ChannelCallParticipantProfilesInput{
+		WorkspaceID: workspace.ID,
+		CallerID:    callerID,
+		ChannelID:   channelID,
+		UserIDs:     request.UserIDs,
+	})
+	if err != nil {
+		writeCallParticipantProfilesError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, callParticipantProfilesBody(profiles))
+}
+
+// writeCallParticipantProfilesError mirrors writeChannelDetailsError's
+// not-found folding (an unauthorized caller and a nonexistent/foreign
+// channel are indistinguishable) plus writeAddMembersError's 400 for a
+// malformed batch. Shared by both call-participants routes (channel and
+// group DM).
+func writeCallParticipantProfilesError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
 }
 

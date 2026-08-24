@@ -29,6 +29,8 @@ import {
 } from "../chat/resourceCallDiscovery";
 import { syncResourceCall } from "../chat/resourceCallSignaling";
 import type { Channel, DMConversation } from "../chat/chatTypes";
+import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
+import { useSelfProfile } from "../profile/selfProfile";
 import { useCallMedia, type CallMediaSessionController } from "../chat/useCallMedia";
 import {
   useCallSignaling,
@@ -184,6 +186,16 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const dedicated = location.pathname.startsWith("/call/");
   const role = dedicated ? "dedicated" : "main";
   const media = useCallMedia();
+  // Local call-presentation identity (issue #612), reused from the shared
+  // session-scoped profile cache — never a second GET /auth/me just for calls.
+  const selfProfile = useSelfProfile();
+  const selfDisplayName = selfProfile.status === "ready" ? selfProfile.profile.displayName : "";
+  const selfAvatarUrl = selfProfile.status === "ready" ? selfProfile.profile.avatarUrl : undefined;
+  const localName = localParticipantDisplayName(selfDisplayName);
+  // Initials from the raw name, never the "(você)"-suffixed label (issue
+  // #612 blocker) — see DedicatedCallPage's identical derivation. Empty/
+  // loading falls back to "Você", never "?".
+  const localInitials = initialsFrom(selfDisplayName || "Você");
   const [mediaEnabled, setMediaEnabled] = useState(false);
   const [ownerState, setOwnerState] = useState<OwnerState>("none");
   const ownerStateRef = useRef<OwnerState>("none");
@@ -1579,8 +1591,12 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           screenShareLabel={screenShareLabel}
           hasRemoteVideo={media.hasRemoteVideo}
           remoteSeed={remoteSeed}
+          avatarUrl={peer?.avatarUrl}
           hasLocalVideo={media.hasLocalVideo}
           localSeed={localSeed}
+          localName={localName}
+          localInitials={localInitials}
+          localAvatarUrl={selfAvatarUrl}
           controls={controls}
           onExpand={expand}
           bindLocalMedia={media.bindLocalMedia}

@@ -1,5 +1,7 @@
 import { useRef, useState } from "react";
 
+import { initialsFrom } from "../chat/messageDisplay";
+import { PersonAvatarImage } from "../chat/PersonAvatarImage";
 import "./CallPresentation.css";
 
 interface IncomingCallPopupProps {
@@ -46,7 +48,11 @@ export default function IncomingCallPopup({
     <aside className="incoming-call" role="dialog" aria-modal="false" aria-label="Chamada recebida">
       <div className="incoming-call__identity">
         <div className="incoming-call__avatar" aria-hidden="true">
-          {avatarUrl ? <img src={avatarUrl} alt="" referrerPolicy="no-referrer" /> : name.at(0)}
+          <PersonAvatarImage
+            src={avatarUrl}
+            initials={initialsFrom(name)}
+            imgClassName="incoming-call__avatar-img"
+          />
         </div>
         <div>
           <strong>{name}</strong>

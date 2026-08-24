@@ -34,8 +34,13 @@ const (
 	// because "who can still be added" depends on who is already in it, and the
 	// panel's capped preview is not a membership list. Same prefix convention as
 	// /details and /members; the workspace is resolved from the session.
-	RouteChannelMemberCandidates  = "/api/chat/channels/{channelID}/member-candidates"
-	RouteDMMemberCandidates       = "/api/chat/dm/{conversationID}/member-candidates"
+	RouteChannelMemberCandidates = "/api/chat/channels/{channelID}/member-candidates"
+	RouteDMMemberCandidates      = "/api/chat/dm/{conversationID}/member-candidates"
+	// Issue #612 call-participant identity resolution. POST because the body
+	// carries a batch of LiveKit participant-identity UUIDs — same reasoning
+	// as RouteMessageLinkSafetyStatus being POST despite being a read.
+	RouteChannelCallParticipants  = "/api/chat/channels/{channelID}/call-participants"
+	RouteDMCallParticipants       = "/api/chat/dm/{conversationID}/call-participants"
 	RouteDMMembers                = "/api/chat/dm/{conversationID}/members"
 	RouteChannelMessages          = "/api/chat/channels/{channelID}/messages"
 	RouteChannelMessageForward    = "/api/chat/channels/{channelID}/messages/forward"

@@ -340,6 +340,18 @@
   color: #94a3b8;
   font-size: 0.85rem;
 }
+.dedicated-call__header-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+.dedicated-call__header-avatar {
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+}
 .dedicated-call__grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
@@ -396,9 +408,15 @@
 .call-avatar {
   display: grid;
   place-items: center;
+  overflow: hidden;
   border-radius: 50%;
   color: #f8fafc;
   font-weight: 700;
+}
+.call-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 .call-avatar--purple {
   background: linear-gradient(135deg, #7b43e8, #b485f4);

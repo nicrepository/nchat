@@ -11,6 +11,8 @@ import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
 import { compareParticipationTokens, createOwnershipCoordinator } from "./callOwnership";
 import CallSessionProvider, { useCallSession } from "./CallSessionProvider";
+import { _resetSelfProfile } from "../profile/selfProfile";
+import type { SelfProfile } from "../profile/profileApi";
 
 vi.mock("../chat/useCallMedia", () => ({ useCallMedia: vi.fn() }));
 vi.mock("../chat/useCallSignaling", () => ({ useCallSignaling: vi.fn() }));
@@ -37,6 +39,17 @@ vi.mock("./callOwnership", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./callOwnership")>()),
   createOwnershipCoordinator: vi.fn(),
 }));
+
+// ── Mock profileApi (the local participant's identity source, issue #612) ────
+
+const { mockFetchMyProfile } = vi.hoisted(() => ({
+  mockFetchMyProfile: vi.fn<(signal?: AbortSignal) => Promise<SelfProfile>>(),
+}));
+
+vi.mock("../profile/profileApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../profile/profileApi")>();
+  return { ...actual, fetchMyProfile: (signal?: AbortSignal) => mockFetchMyProfile(signal) };
+});
 
 const callId = "00000000-0000-4000-8000-000000000546";
 const userA = "00000000-0000-4000-8000-000000000547";
@@ -305,6 +318,26 @@ function Probe() {
       </button>
       <button
         type="button"
+        onClick={() =>
+          session.registerDirectory({
+            currentUserId: userB,
+            channels: [{ id: channelId, name: "Produto", type: "public", canWrite: true }],
+            dms: [
+              {
+                id: "dm-1",
+                name: "Ana",
+                type: "1:1",
+                participants: [],
+                counterpart: { userId: userA, displayName: "Ana", avatarUrl: "https://x/peer.png" },
+              },
+            ],
+          })
+        }
+      >
+        Diretório (com avatar do par)
+      </button>
+      <button
+        type="button"
         onClick={() => session.registerIdentity("ready", async () => undefined)}
       >
         Identidade
@@ -427,6 +460,10 @@ describe("CallSessionProvider", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    _resetSelfProfile();
+    mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "" });
+    _resetSelfProfile();
+    mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "" });
     participationStorage = {};
     calls.call = null;
     calls.error = null;
@@ -1205,10 +1242,79 @@ describe("CallSessionProvider", () => {
     await screen.findByTestId("floating-call-window");
 
     const avatar = document.querySelector(".floating-call__local-avatar")!;
+    // Empty/loading profile name falls back to "Você" for initials too
+    // (issue #612 blocker) — same visual fallback as the display label,
+    // never "?" and never derived from a "(você)"-suffixed string.
     expect(avatar).toHaveTextContent(initialsFrom("Você"));
     // currentUserId (userB) — the registered directory's own id, never a
     // fetched profile just for this fallback.
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userB)}`);
+  });
+
+  it("shows the local participant's real profile name with (você), never a bare Você replacing it", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "Ana Souza" });
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    await screen.findByTestId("floating-call-window");
+
+    await waitFor(() => {
+      expect(document.querySelector(".floating-call__local-avatar")).toHaveAttribute(
+        "aria-label",
+        "Ana Souza (você)",
+      );
+    });
+  });
+
+  it("derives the local floating fallback's initials from the raw one-word name, never 'A(' from the (você) suffix (issue #612 blocker)", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "Ana" });
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasLocalVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    await screen.findByTestId("floating-call-window");
+
+    await waitFor(() => {
+      const avatar = document.querySelector(".floating-call__local-avatar")!;
+      expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+      expect(avatar.textContent).not.toContain("(");
+    });
+  });
+
+  it("passes the direct peer's avatarUrl through to FloatingCallWindow's remote fallback", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório (com avatar do par)" }));
+    calls.call = activeDirect();
+    media.hasRemoteVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    await screen.findByTestId("floating-call-window");
+
+    const img = document.querySelector(".floating-call__avatar img");
+    expect(img).toHaveAttribute("src", "https://x/peer.png");
+  });
+
+  it("never uses the resource-level avatar as an individual's identity in the floating window", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    media.hasRemoteVideo = false;
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    // No avatarUrl exists for a resource/group target — the fallback must stay
+    // on initials, never borrow a channel/group picture as if it belonged to
+    // one person.
+    expect(document.querySelector(".floating-call__avatar img")).not.toBeInTheDocument();
   });
 
   it("floats a resource call's remote fallback using the room's own identity, never a specific participant", async () => {

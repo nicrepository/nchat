@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
@@ -794,6 +796,14 @@ type fakeDMStore struct {
 	addParticipantsErr    error
 	addParticipantsCalls  int
 	lastAddParticipants   storage.AddGroupParticipantsInput
+
+	// callParticipantProfiles models the conversation's active participants by
+	// user ID (issue #612); ListParticipantProfilesByIDs returns only the
+	// requested IDs present here, mirroring the real store's join silently
+	// omitting a non-participant.
+	callParticipantProfiles    map[string]domain.CallParticipantProfile
+	callParticipantProfilesErr error
+	lastCallParticipantIDs     []string
 }
 
 // groupCandidateCall records the scope the service handed the store.
@@ -891,6 +901,22 @@ type dmCounterpartCall struct {
 	callerID       string
 }
 
+func (f *fakeDMStore) ListParticipantProfilesByIDs(
+	_ context.Context, _, _ string, userIDs []string,
+) ([]domain.CallParticipantProfile, error) {
+	f.lastCallParticipantIDs = append([]string(nil), userIDs...)
+	if f.callParticipantProfilesErr != nil {
+		return nil, f.callParticipantProfilesErr
+	}
+	var out []domain.CallParticipantProfile
+	for _, id := range userIDs {
+		if profile, ok := f.callParticipantProfiles[id]; ok {
+			out = append(out, profile)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeDMStore) GetVisibleConversationByID(_ context.Context, _, _, _ string) (domain.DMConversation, error) {
 	f.getVisibleCalls++
 	if f.getVisibleErr != nil {
@@ -920,4 +946,122 @@ func longString(length int) string {
 		b.WriteByte('x')
 	}
 	return b.String()
+}
+
+func TestDMService_GetGroupCallParticipantProfiles_ResolvesOnlyRequestedActiveParticipants(t *testing.T) {
+	dms := &fakeDMStore{
+		visibleConversation: domain.DMConversation{
+			ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+		},
+		callParticipantProfiles: map[string]domain.CallParticipantProfile{
+			user1: {UserID: user1, DisplayName: "Ana Souza", AvatarURL: "https://x/a.png"},
+		},
+	}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+
+	got, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: []string{user1, user3},
+	})
+	if err != nil {
+		t.Fatalf("GetGroupCallParticipantProfiles: %v", err)
+	}
+	if len(got) != 1 || got[0].UserID != user1 {
+		t.Fatalf("unexpected profiles: %#v", got)
+	}
+}
+
+func TestDMService_GetGroupCallParticipantProfiles_RejectsOversizedBatch(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{
+		ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+	}}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	ids := make([]string, domain.MaxCallParticipantProfileIDs+1)
+	for i := range ids {
+		ids[i] = uuid.NewString()
+	}
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: ids,
+	})
+	if !errors.Is(err, domain.ErrTooManyCallParticipantsRequested) {
+		t.Fatalf("want ErrTooManyCallParticipantsRequested, got %v", err)
+	}
+}
+
+func TestDMService_GetGroupCallParticipantProfiles_RejectsA1To1Conversation(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{
+		ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeDirect, Status: domain.DMConversationStatusActive,
+	}}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: []string{user1},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for a 1:1 conversation, got %v", err)
+	}
+}
+
+func TestDMService_GetGroupCallParticipantProfiles_UnauthorizedCallerGetsNotFound(t *testing.T) {
+	dms := &fakeDMStore{getVisibleErr: domain.ErrNotFound}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: []string{user1},
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for an unauthorized caller, got %v", err)
+	}
+}
+
+// TestDMService_GetGroupCallParticipantProfiles_RejectsMalformedUUID mirrors the
+// channel-side proof: a non-UUID never reaches the store, never becomes a raw
+// SQL array literal, and is reported as ordinary invalid input.
+func TestDMService_GetGroupCallParticipantProfiles_RejectsMalformedUUID(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{
+		ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+	}}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: []string{"not-a-uuid"},
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("want ErrInvalidInput, got %v", err)
+	}
+	if dms.lastCallParticipantIDs != nil {
+		t.Fatalf("a malformed id must never reach the store, got %v", dms.lastCallParticipantIDs)
+	}
+}
+
+// TestDMService_GetGroupCallParticipantProfiles_RejectsEmptyBatch documents the
+// intentional empty-input behavior for the group side, matching the channel
+// side: a resolve with nothing to resolve is invalid input, not a silent
+// empty success.
+func TestDMService_GetGroupCallParticipantProfiles_RejectsEmptyBatch(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{
+		ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+	}}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: nil,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("want ErrInvalidInput (empty batch), got %v", err)
+	}
+}
+
+// TestDMService_GetGroupCallParticipantProfiles_DeduplicatesDeterministically
+// mirrors the channel-side proof: the same UUID named twice, in different
+// letter cases, reaches the store exactly once.
+func TestDMService_GetGroupCallParticipantProfiles_DeduplicatesDeterministically(t *testing.T) {
+	dms := &fakeDMStore{visibleConversation: domain.DMConversation{
+		ID: "conv-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup, Status: domain.DMConversationStatusActive,
+	}}
+	svc := service.NewDMService(dms, newFakeMemberStore())
+	_, err := svc.GetGroupCallParticipantProfiles(context.Background(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID: "ws-1", CallerID: user2, ConversationID: "conv-1", UserIDs: []string{user1Up, user1, user1},
+	})
+	if err != nil {
+		t.Fatalf("GetGroupCallParticipantProfiles: %v", err)
+	}
+	if len(dms.lastCallParticipantIDs) != 1 || dms.lastCallParticipantIDs[0] != user1 {
+		t.Fatalf("want exactly one canonical lowercase id reaching the store, got %v", dms.lastCallParticipantIDs)
+	}
 }

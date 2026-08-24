@@ -217,6 +217,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteChannelDetails, authMiddleware(
 			msgListLimiter.Middleware(http.HandlerFunc(channels.Details)),
 		))
+		// Call-participant identity resolution (issue #612) carries its own
+		// budget inside the handler, like add-members.
+		mux.Handle("POST "+RouteChannelCallParticipants, authMiddleware(http.HandlerFunc(channels.CallParticipants)))
 		// Add members (issue #398) carries its own budget inside the handler, like
 		// the category mutations. Registered only when the member service is wired
 		// so a partially built service answers 404 for a route it cannot honour.
@@ -259,6 +262,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		mux.Handle("GET "+RouteDMProfile, authMiddleware(
 			msgListLimiter.Middleware(http.HandlerFunc(directMessages.DirectProfile)),
 		))
+		// Call-participant identity resolution (issue #612), group-DM side.
+		// Same budget shape as the channel route above.
+		mux.Handle("POST "+RouteDMCallParticipants, authMiddleware(http.HandlerFunc(directMessages.GroupCallParticipants)))
 	}
 
 	// DM message endpoints: GET list, POST create, GET single.

@@ -206,6 +206,44 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 	}, nil
 }
 
+// ChannelCallParticipantProfilesInput asks for presentation identities of a
+// specific set of call participants (issue #612). UserIDs is the caller's
+// own LiveKit room roster — never trusted as "these are real members", only
+// as "resolve these if they are".
+type ChannelCallParticipantProfilesInput struct {
+	WorkspaceID string
+	CallerID    string
+	ChannelID   string
+	UserIDs     []string
+}
+
+// GetCallParticipantProfiles resolves display name and avatar for the
+// requested user IDs, scoped to one channel's active membership (issue
+// #612). Visibility is settled first, exactly like GetChannelDetails: an
+// invisible or foreign channel is ErrNotFound before any identity is read,
+// so this cannot be used to probe channel existence or membership. UserIDs
+// that are not active members of the channel are silently omitted from the
+// result rather than erroring — an unresolvable participant is a client-side
+// "degrade to initials" case, not a request failure.
+func (s *ChannelService) GetCallParticipantProfiles(ctx context.Context, input ChannelCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error) {
+	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+		return nil, err
+	}
+	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
+	if err != nil {
+		return nil, err
+	}
+	userIDs, err := normalizeCallParticipantIDs(input.UserIDs)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := s.members.ListChannelMemberProfilesByIDs(ctx, input.WorkspaceID, channel.ID, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list channel member profiles by ids: %w", err)
+	}
+	return profiles, nil
+}
+
 // GetChannel returns one visibility-bound active channel by ID or slug.
 func (s *ChannelService) GetChannel(ctx context.Context, input GetChannelInput) (domain.Channel, error) {
 	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {

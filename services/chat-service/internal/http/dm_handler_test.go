@@ -50,6 +50,11 @@ type fakeDMProvider struct {
 	addMembersErr             error
 	addMembersCalls           int
 	lastAddMembers            service.AddGroupParticipantsInput
+
+	callParticipantProfiles    []domain.CallParticipantProfile
+	callParticipantProfilesErr error
+	lastCallParticipantsInput  service.GroupCallParticipantProfilesInput
+	callParticipantsCalls      int
 }
 
 type fakeDMRateLimiter struct {
@@ -96,6 +101,14 @@ func (f *fakeDMProvider) AddGroupParticipants(_ context.Context, input service.A
 	f.addMembersCalls++
 	f.lastAddMembers = input
 	return f.addMembersResult, f.addMembersErr
+}
+
+func (f *fakeDMProvider) GetGroupCallParticipantProfiles(
+	_ context.Context, input service.GroupCallParticipantProfilesInput,
+) ([]domain.CallParticipantProfile, error) {
+	f.callParticipantsCalls++
+	f.lastCallParticipantsInput = input
+	return f.callParticipantProfiles, f.callParticipantProfilesErr
 }
 
 func (f *fakeDMProvider) CreateGroupConversation(_ context.Context, input service.CreateGroupConversationInput) (domain.DMConversation, error) {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
+import { PersonAvatarImage } from "../chat/PersonAvatarImage";
 import CallControls, { type CallControlProps } from "./CallControls";
 import {
   clampPosition,
@@ -47,10 +48,28 @@ interface FloatingCallWindowProps {
   hasRemoteVideo: boolean;
   /** Stable seed (peer/group id) for the remote fallback avatar's color. */
   remoteSeed: string;
+  /** Direct-call peer's avatar; absent for a resource/group call or a peer with no configured avatar. */
+  avatarUrl?: string;
   /** Whether the local preview currently has a usable video track. Same no-default rule as hasRemoteVideo. */
   hasLocalVideo: boolean;
   /** Stable seed (the current user's id) for the local fallback avatar's color. */
   localSeed: string;
+  /**
+   * The local participant's call-presentation name (issue #612) — the real
+   * profile name plus "(você)", or a bare "Você" fallback. Computed by the
+   * caller (CallSessionProvider) via localParticipantDisplayName, since only
+   * the caller knows the self-profile state.
+   */
+  localName: string;
+  /**
+   * Initials for the local fallback avatar, derived from the raw profile
+   * name — never from localName's "(você)" suffix (issue #612 blocker),
+   * which would otherwise feed "(" in as a second initial for a one-word
+   * name.
+   */
+  localInitials: string;
+  /** The local participant's configured avatar, when available. */
+  localAvatarUrl?: string;
   testId?: string;
   activationRequired?: boolean;
   activationLabel?: string;
@@ -89,8 +108,12 @@ export default function FloatingCallWindow({
   bindRemoteMedia,
   hasRemoteVideo,
   remoteSeed,
+  avatarUrl,
   hasLocalVideo,
   localSeed,
+  localName,
+  localInitials,
+  localAvatarUrl,
   testId = "floating-call-window",
   activationRequired = false,
   activationLabel = "Permitir câmera e microfone",
@@ -232,7 +255,11 @@ export default function FloatingCallWindow({
               className={`floating-call__avatar call-avatar call-avatar--${avatarColorFor(remoteSeed)}`}
               aria-hidden="true"
             >
-              {initialsFrom(title)}
+              <PersonAvatarImage
+                src={avatarUrl}
+                initials={initialsFrom(title)}
+                imgClassName="call-avatar__img"
+              />
             </div>
           </div>
         )}
@@ -241,9 +268,14 @@ export default function FloatingCallWindow({
           {!hasLocalVideo && (
             <div
               className={`floating-call__local-avatar call-avatar call-avatar--${avatarColorFor(localSeed)}`}
-              aria-hidden="true"
+              role="img"
+              aria-label={localName}
             >
-              {initialsFrom("Você")}
+              <PersonAvatarImage
+                src={localAvatarUrl}
+                initials={localInitials}
+                imgClassName="call-avatar__img"
+              />
             </div>
           )}
         </div>
