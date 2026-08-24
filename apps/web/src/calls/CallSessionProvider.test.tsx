@@ -4,8 +4,9 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { acquireChatSocket, type ChatSocketListener } from "../chat/chatSocket";
+import type { Call } from "../chat/callState";
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
-import { syncResourceCall } from "../chat/resourceCallSignaling";
+import { resolveCall, syncResourceCall } from "../chat/resourceCallSignaling";
 import { useCallMedia } from "../chat/useCallMedia";
 import { useCallSignaling } from "../chat/useCallSignaling";
 import { useResourceCallSession } from "../chat/useResourceCallSession";
@@ -34,6 +35,7 @@ vi.mock("../chat/resourceCallSignaling", async (importOriginal) => ({
   // vi.clearAllMocks() clears calls/results but not this factory-level
   // implementation, so no other beforeEach needs to know this mock exists.
   syncResourceCall: vi.fn(async () => ({ call: null, observedAt: "1970-01-01T00:00:00Z" })),
+  resolveCall: vi.fn(),
 }));
 vi.mock("./callOwnership", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./callOwnership")>()),
@@ -360,6 +362,9 @@ function Probe() {
       <button type="button" onClick={() => session.releaseDedicated(callId)}>
         Release probe
       </button>
+      <button type="button" onClick={() => session.releaseDirectTerminal(callId)}>
+        Direct terminal release probe
+      </button>
       <button type="button" onClick={() => void session.leaveDedicated(callId)}>
         Leave dedicated probe
       </button>
@@ -453,8 +458,14 @@ function activeDirect() {
     created_at: "2026-08-18T12:00:00Z",
     occurred_at: "2026-08-18T12:00:00Z",
     expires_at: "2026-08-18T13:00:00Z",
-  };
+  } satisfies Call;
 }
+
+function mockActiveDirectResolution(id = callId) {
+  return { ...activeDirect(), call_id: id };
+}
+
+vi.mocked(resolveCall).mockImplementation(async (id) => mockActiveDirectResolution(id));
 
 describe("CallSessionProvider", () => {
   beforeEach(() => {
@@ -484,6 +495,8 @@ describe("CallSessionProvider", () => {
     ownership.writeMediaIntent.mockImplementation(defaultWriteMediaIntent);
     ownership.readMediaIntentForLease.mockReset();
     ownership.readMediaIntentForLease.mockImplementation(defaultReadMediaIntentForLease);
+    vi.mocked(resolveCall).mockReset();
+    vi.mocked(resolveCall).mockImplementation(async (id) => mockActiveDirectResolution(id));
     media.connect.mockResolvedValue({ microphone: true, camera: true });
     vi.mocked(createOwnershipCoordinator).mockReturnValue(ownership as never);
     vi.mocked(useCallMedia).mockReturnValue(media as never);
@@ -494,6 +507,21 @@ describe("CallSessionProvider", () => {
       return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
     });
   });
+
+  async function handoffActiveDirectToDedicated() {
+    calls.call = activeDirect();
+    ownership.getLease.mockReturnValue(lease);
+    const view = renderProvider();
+    await screen.findByTestId("floating-call-window");
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
+    act(() =>
+      ownershipListener({ v: 1, type: "ack", callId, tabId: "tab-dedicated", epoch: 3 } as never),
+    );
+    return view;
+  }
 
   it("keeps one media/signaling controller across authenticated route navigation", () => {
     renderProvider();
@@ -1198,6 +1226,256 @@ describe("CallSessionProvider", () => {
     calls.call = { ...activeDirect(), status: "ended" };
     view.rerender(providerTree());
     await waitFor(() => expect(screen.getByTestId("presentation")).toHaveTextContent("ended"));
+  });
+
+  it("reconciles before recovery when released arrives while main still sees the direct call as active", async () => {
+    vi.mocked(resolveCall).mockResolvedValueOnce({
+      ...activeDirect(),
+      status: "ended",
+      version: 2,
+    });
+    const view = await handoffActiveDirectToDedicated();
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+    ownership.claim.mockClear();
+    calls.retryMedia.mockClear();
+    calls.activateMedia.mockClear();
+    media.connect.mockClear();
+
+    // Dedicated already observed the authoritative terminal and releases;
+    // this main tab has deliberately NOT received its own call.ended yet.
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+      } as never),
+    );
+    await act(async () => undefined);
+
+    expect(ownership.claim).not.toHaveBeenCalled();
+    expect(calls.retryMedia).not.toHaveBeenCalled();
+    expect(calls.activateMedia).not.toHaveBeenCalled();
+    expect(media.connect).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("floating-call-window")).not.toBeInTheDocument();
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+
+    calls.call = { ...activeDirect(), status: "ended", version: 2 };
+    view.rerender(providerTree());
+    await waitFor(() => expect(screen.getByTestId("presentation")).toHaveTextContent("ended"));
+  });
+
+  it("fences the owner-loss poll while main still locally sees a server-terminal direct call as active", async () => {
+    vi.useFakeTimers();
+    vi.mocked(resolveCall).mockResolvedValueOnce({
+      ...activeDirect(),
+      status: "ended",
+      version: 2,
+    });
+    calls.call = activeDirect();
+    ownership.getLease.mockReturnValue(lease);
+    renderProvider();
+    await act(async () => undefined);
+    expect(screen.getByTestId("floating-call-window")).toBeInTheDocument();
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    expect(screen.getByTestId("owner")).toHaveTextContent("remote");
+    act(() =>
+      ownershipListener({ v: 1, type: "ack", callId, tabId: "tab-dedicated", epoch: 3 } as never),
+    );
+    ownership.claim.mockClear();
+    calls.retryMedia.mockClear();
+    calls.activateMedia.mockClear();
+    ownership.getOwner.mockReturnValue(null);
+
+    await act(async () => vi.advanceTimersByTime(1_500));
+
+    expect(ownership.claim).not.toHaveBeenCalled();
+    expect(calls.retryMedia).not.toHaveBeenCalled();
+    expect(calls.activateMedia).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("floating-call-window")).not.toBeInTheDocument();
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("still lets the owner-loss poll recover a direct call after manual dedicated close", async () => {
+    vi.useFakeTimers();
+    calls.call = activeDirect();
+    ownership.getLease.mockReturnValue(lease);
+    renderProvider();
+    await act(async () => undefined);
+    act(() =>
+      ownershipListener({ v: 1, type: "ready", callId, tabId: "tab-dedicated", epoch: 2 } as never),
+    );
+    await act(async () => undefined);
+    act(() =>
+      ownershipListener({ v: 1, type: "ack", callId, tabId: "tab-dedicated", epoch: 3 } as never),
+    );
+    ownership.claim.mockClear();
+    calls.retryMedia.mockClear();
+    ownership.getOwner.mockReturnValue(null);
+
+    await act(async () => vi.advanceTimersByTime(1_500));
+
+    expect(resolveCall).toHaveBeenCalledWith(callId);
+    expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 2, undefined);
+    expect(calls.retryMedia).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("floating-call-window")).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("still recovers a direct call after manual dedicated close when authoritative sync says active", async () => {
+    await handoffActiveDirectToDedicated();
+    ownership.claim.mockClear();
+    calls.retryMedia.mockClear();
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+      } as never),
+    );
+
+    await waitFor(() => expect(resolveCall).toHaveBeenCalledWith(callId));
+    await waitFor(() =>
+      expect(ownership.claim).toHaveBeenCalledWith(callId, "main", 3, {
+        tabId: "tab-dedicated",
+        epoch: 3,
+      }),
+    );
+    expect(calls.retryMedia).toHaveBeenCalledOnce();
+    expect(await screen.findByTestId("floating-call-window")).toBeInTheDocument();
+  });
+
+  it("fails direct recovery closed while sync is offline and allows a later authoritative retry", async () => {
+    vi.mocked(resolveCall).mockRejectedValueOnce(new Error("offline"));
+    await handoffActiveDirectToDedicated();
+    ownership.claim.mockClear();
+    calls.retryMedia.mockClear();
+    const released = {
+      v: 1,
+      type: "released",
+      callId,
+      tabId: "tab-dedicated",
+      epoch: 3,
+    } as const;
+
+    act(() => ownershipListener(released as never));
+    await waitFor(() => expect(resolveCall).toHaveBeenCalledOnce());
+    await act(async () => undefined);
+    expect(ownership.claim).not.toHaveBeenCalled();
+    expect(calls.retryMedia).not.toHaveBeenCalled();
+
+    act(() => ownershipListener(released as never));
+    await waitFor(() => expect(resolveCall).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(ownership.claim).toHaveBeenCalledOnce());
+    expect(calls.retryMedia).toHaveBeenCalledOnce();
+  });
+
+  it("releases a just-claimed lease instead of reconnecting when main becomes terminal during claim", async () => {
+    let finishClaim!: () => void;
+    ownership.claim.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishClaim = () => resolve(lease);
+        }),
+    );
+    const view = await handoffActiveDirectToDedicated();
+    ownership.release.mockClear();
+    calls.retryMedia.mockClear();
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+      } as never),
+    );
+    await waitFor(() => expect(ownership.claim).toHaveBeenCalled());
+
+    calls.call = { ...activeDirect(), status: "ended", version: 2 };
+    view.rerender(providerTree());
+    await waitFor(() => expect(screen.getByTestId("presentation")).toHaveTextContent("ended"));
+    await act(async () => finishClaim());
+
+    expect(ownership.release).toHaveBeenCalledWith(callId);
+    expect(calls.retryMedia).not.toHaveBeenCalled();
+    expect(screen.getByTestId("owner")).not.toHaveTextContent("local");
+  });
+
+  it("does not let a terminal fence for call X block recovery of active call Y", async () => {
+    const callY = "00000000-0000-4000-8000-000000000999";
+    vi.mocked(resolveCall)
+      .mockResolvedValueOnce({ ...activeDirect(), status: "ended", version: 2 })
+      .mockResolvedValueOnce(mockActiveDirectResolution(callY));
+    const view = await handoffActiveDirectToDedicated();
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+      } as never),
+    );
+    await waitFor(() => expect(resolveCall).toHaveBeenCalledWith(callId));
+    expect(ownership.claim).not.toHaveBeenCalled();
+
+    calls.call = { ...activeDirect(), call_id: callY };
+    view.rerender(providerTree());
+    await act(async () => undefined);
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId: callY,
+        tabId: "tab-dedicated-y",
+        epoch: 8,
+      } as never),
+    );
+
+    await waitFor(() => expect(resolveCall).toHaveBeenCalledWith(callY));
+    await waitFor(() =>
+      expect(ownership.claim).toHaveBeenCalledWith(callY, "main", 8, {
+        tabId: "tab-dedicated-y",
+        epoch: 8,
+      }),
+    );
+    expect(calls.retryMedia).toHaveBeenCalledOnce();
+  });
+
+  it("does not recover or render a stale indicator when a dedicated owner releases after direct terminal", async () => {
+    calls.call = activeDirect();
+    const view = renderProvider();
+    await screen.findByTestId("floating-call-window");
+
+    calls.call = { ...activeDirect(), status: "ended", version: 2 };
+    view.rerender(providerTree());
+    await waitFor(() => expect(screen.getByTestId("presentation")).toHaveTextContent("ended"));
+    expect(screen.queryByTestId("floating-call-window")).not.toBeInTheDocument();
+    ownership.claim.mockClear();
+
+    act(() =>
+      ownershipListener({
+        v: 1,
+        type: "released",
+        callId,
+        tabId: "tab-dedicated",
+        epoch: 3,
+      } as never),
+    );
+
+    expect(ownership.claim).not.toHaveBeenCalled();
+    expect(screen.queryByText("Chamada aberta em outra aba")).not.toBeInTheDocument();
   });
 
   it("does not treat a popup-blocked window.open as a loss of ownership", async () => {
@@ -2179,6 +2457,94 @@ describe("screen-share ownership fence and non-resumption (issue #611)", () => {
 
     await waitFor(() => expect(media.stop).toHaveBeenCalledOnce());
     expect(media.toggleScreenShare).not.toHaveBeenCalled();
+  });
+
+  it("reports one track cleanup when direct terminal ownership release follows signaling cleanup", async () => {
+    const events: string[] = [];
+    const listener = (event: Event) =>
+      events.push((event as CustomEvent<{ event: string }>).detail.event);
+    window.addEventListener("nchat:call-technical-event", listener);
+    ownership.getLease.mockReturnValue(lease);
+    renderProvider(`/call/${callId}`);
+    const directMedia = vi.mocked(useCallSignaling).mock.calls.at(-1)![0]!;
+
+    await act(() => directMedia.stop());
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Direct terminal release probe" }));
+    await waitFor(() => expect(media.stop).toHaveBeenCalledTimes(2));
+    expect(ownership.release).toHaveBeenCalledWith(callId);
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(1);
+    window.removeEventListener("nchat:call-technical-event", listener);
+  });
+
+  it("reports the eventual track cleanup when direct signaling cleanup failed first", async () => {
+    const events: string[] = [];
+    const listener = (event: Event) =>
+      events.push((event as CustomEvent<{ event: string }>).detail.event);
+    window.addEventListener("nchat:call-technical-event", listener);
+    ownership.getLease.mockReturnValue(lease);
+    media.stop.mockRejectedValueOnce(new Error("disconnect failed"));
+    renderProvider(`/call/${callId}`);
+    const directMedia = vi.mocked(useCallSignaling).mock.calls.at(-1)![0]!;
+
+    await expect(directMedia.stop()).rejects.toThrow("disconnect failed");
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Direct terminal release probe" }));
+    await waitFor(() => expect(media.stop).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(ownership.release).toHaveBeenCalledWith(callId));
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(1);
+    window.removeEventListener("nchat:call-technical-event", listener);
+  });
+
+  // Adversarial case flagged by #614's review of this newly-added dedup
+  // mechanism: a connect() failure racing the terminal-triggered stop BEFORE
+  // confirmedIntentRef is ever set. ownedMedia.connect's own catch releases
+  // the lease it just (re)used the instant media.connect() rejects — so by
+  // the time useCallSignaling's terminal handling calls stopMedia(), neither
+  // getLease() nor confirmedIntentRef has this call's id anymore, and
+  // ownedMedia.stop()'s callId derivation must not silently fall through to
+  // "" and defeat releaseDirectTerminal's own dedup below it.
+  it("never double-reports track-cleanup when a connect failure releases the lease before confirmedIntent is ever set", async () => {
+    const events: string[] = [];
+    const listener = (event: Event) =>
+      events.push((event as CustomEvent<{ event: string }>).detail.event);
+    window.addEventListener("nchat:call-technical-event", listener);
+    ownership.getLease.mockReturnValue(lease);
+    media.connect.mockRejectedValueOnce(new Error("connect failed"));
+    renderProvider(`/call/${callId}`);
+    const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+    const directMedia = vi.mocked(useCallSignaling).mock.calls.at(-1)![0]!;
+
+    // ownedMedia.connect() reuses the already-held lease (getLease already
+    // matches call_id), then media.connect() itself fails: its own catch
+    // releases that lease and never reaches the writeMediaIntent that would
+    // set confirmedIntentRef — exactly like a connect failure racing a
+    // terminal event before media ever fully established.
+    await expect(
+      owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"),
+    ).rejects.toThrow("connect failed");
+    expect(ownership.release).toHaveBeenCalledWith(callId);
+    // This fake ownership mock doesn't track its own release() call —
+    // reflect what a real coordinator would now report.
+    ownership.getLease.mockReturnValue(null);
+
+    // useCallSignaling's own terminal handling now runs its stopMedia() —
+    // this is the one real cleanup for this call.
+    await act(() => directMedia.stop());
+    expect(media.stop).toHaveBeenCalledOnce();
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(1);
+
+    // The dedicated tab's terminal-close effect converges next; it must
+    // recognize the cleanup above already happened for THIS call, not emit
+    // a second one just because neither lease nor confirmedIntent survived
+    // to say so.
+    fireEvent.click(screen.getByRole("button", { name: "Direct terminal release probe" }));
+    await waitFor(() => expect(media.stop).toHaveBeenCalledTimes(2));
+    expect(events.filter((event) => event === "track-cleanup")).toHaveLength(1);
+    window.removeEventListener("nchat:call-technical-event", listener);
   });
 
   it("ownership recovery reconnects media without auto-resuming screen share", async () => {

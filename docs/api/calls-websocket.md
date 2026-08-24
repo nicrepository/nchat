@@ -6,8 +6,9 @@ nunca do payload.
 
 Duas famílias de chamada compartilham o mesmo protocolo:
 
-- **Direta (1:1)**: `target_user_id`, ringing/accept/decline/cancel/end. Sem
-  mudanças nesta rodada.
+- **Direta (1:1)**: `target_user_id`, ringing/accept/decline/cancel/end. A
+  issue #614 adiciona correlação opcional ao `call.sync`, preservando o
+  comportamento legacy sem `sync_id`.
 - **Recurso (canal ou DM em grupo)**: `target_type`/`target_id`, admissão
   multi-participante via lease. É aqui que a issue #622 adiciona discovery e
   join explícitos.
@@ -25,8 +26,58 @@ Duas famílias de chamada compartilham o mesmo protocolo:
 
 `call_type` aceita `audio` ou `video`. `request_id` torna o início idempotente
 para o originador. Campos desconhecidos, identidade, participantes, sala, token
-ou estado escolhidos pelo cliente são rejeitados. Esta família não muda nesta
-rodada: sem `call.admitted`, sem `response_to`.
+ou estado escolhidos pelo cliente são rejeitados. `call.start` direta continua
+sem `call.admitted`; `response_to` só aparece no `call.error` de `call.sync`
+quando o cliente fornece `sync_id`, conforme documentado abaixo.
+
+### `call.sync` — resync autoritativo, `sync_id` opcional (issue #614)
+
+`call_id` é opcional (vazio = "minha chamada atual"); ambas as formas
+reautorizam pelo `CurrentCall`/`CurrentCallForUser` existente — identidade e
+workspace continuam vindo exclusivamente da sessão, nunca do payload. Nenhum
+participante, token, mídia ou outro dado novo é retornado em nenhuma das duas
+formas; `call.sync` nunca vira broadcast.
+
+**Legacy** (sem `sync_id` — todo cliente anterior à issue #614, incluindo o
+resync automático de reconexão do `useCallSignaling`):
+
+```json
+{ "type": "call.sync", "call_id": "<uuid opcional>" }
+```
+
+Resposta: o mesmo formato de evento de lifecycle (`call.accepted`,
+`call.ended`, ...) usado nos broadcasts abaixo — **sem** `sync_id` nem
+`response_to`. Continua funcionando exatamente como antes; não é
+correlacionável a uma requisição específica, por isso nunca deve ser usado
+quando duas tentativas de sync da mesma chamada podem estar em voo ao mesmo
+tempo.
+
+**Correlacionado** (com `sync_id` — usado por `resolveCall` em
+`apps/web/src/chat/resourceCallSignaling.ts`, por exemplo pelo fence de
+recuperação de ownership em `CallSessionProvider.tsx`):
+
+```json
+{ "type": "call.sync", "call_id": "<uuid opcional>", "sync_id": "<uuid>" }
+```
+
+Resposta, **somente para quem pediu** (nunca broadcast):
+
+```json
+{
+  "type": "call.synced",
+  "sync_id": "<mesmo uuid>",
+  "call": { "call_id": "<uuid>", "status": "active", "...": "..." }
+}
+```
+
+`call.synced` nunca é enviado a observers nem a outra aba/conexão do mesmo
+usuário. Duas chamadas a `call.sync` concorrentes, cada uma com seu próprio
+`sync_id`, produzem duas respostas independentes — cada uma correlacionável
+apenas pelo seu próprio `sync_id`, nunca pelo `call_id` (que pode ser o
+mesmo nas duas). Um erro (`call_not_found`, por exemplo, quando a chamada já
+não está mais `ringing`/`active`) carrega `response_to` igual ao `sync_id`
+fornecido; se o cliente não enviou `sync_id`, o erro não carrega
+`response_to`, igual ao comportamento legacy.
 
 ## Comandos — chamada de recurso (canal / DM em grupo)
 
@@ -252,10 +303,11 @@ códigos estáveis: `call_invalid`, `call_not_found`, `call_invalid_state`,
 `call_participant_busy`, `call_participation_stale`, `call_rate_limited` ou `call_unavailable`. Elas não
 fecham a conexão.
 
-Para `call.join`, `call.resource.sync` e o `call.start` de uma chamada de
-recurso, o erro também carrega `response_to` — o `request_id` do comando (ou o
-`sync_id`, no caso de `call.resource.sync`) — para o cliente correlacionar sem
-ambiguidade. `call.start` de chamada **direta** e os demais comandos
+Para `call.join`, `call.resource.sync`, `call.sync` com `sync_id` e o
+`call.start` de uma chamada de recurso, o erro também carrega `response_to` —
+o `request_id` do comando (ou o `sync_id`, no caso de `call.resource.sync` e
+de `call.sync`) — para o cliente correlacionar sem ambiguidade. `call.start`
+de chamada **direta**, `call.sync` sem `sync_id` (legacy) e os demais comandos
 pré-existentes continuam sem `response_to`, inalterados por esta issue.
 
 ## Rollout fail-closed

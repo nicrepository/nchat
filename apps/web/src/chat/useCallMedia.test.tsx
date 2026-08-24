@@ -786,6 +786,17 @@ describe("useCallMedia", () => {
     expect(session.disconnect).toHaveBeenCalledOnce();
   });
 
+  it("does not disconnect physical tracks twice across sequential stop convergence", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    await act(() => view.result.current.stop());
+    await act(() => view.result.current.stop());
+
+    expect(session.disconnect).toHaveBeenCalledOnce();
+  });
+
   it("disconnects and removes media when the owner unmounts", async () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));
