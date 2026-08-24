@@ -33,6 +33,7 @@ describe("ADMIN_NAV", () => {
       "security",
       "files",
       "configuration",
+      "integrations",
       "health",
       "audit",
     ]);

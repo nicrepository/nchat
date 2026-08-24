@@ -612,3 +612,106 @@ describe("ConfigurationPage rollback preview", () => {
     expect(within(dialog).queryByTestId("config-superseded")).not.toBeInTheDocument();
   });
 });
+
+/**
+ * The configuration search (issue #582).
+ *
+ * The rule it exists to enforce is that no value is indexed, so the specs check
+ * that a term matching only a value finds nothing — and that the metadata an
+ * operator would actually type finds the field.
+ */
+describe("ConfigurationPage search", () => {
+  const READER = ["admin.config.read"];
+
+  it("counts what is declared before anything is typed", async () => {
+    defaultRoutes();
+    renderWithSession(<ConfigurationPage />, READER);
+
+    await screen.findByTestId("config-auth.password.min_length");
+    expect(screen.getByTestId("config-search-count")).toHaveTextContent(
+      "4 configurações declaradas.",
+    );
+  });
+
+  it("filters to the integration an operator is looking for", async () => {
+    defaultRoutes();
+    renderWithSession(<ConfigurationPage />, READER);
+    await screen.findByTestId("config-auth.password.min_length");
+
+    await userEvent.type(screen.getByLabelText("Buscar configuração"), "livekit");
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("config-auth.password.min_length")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("config-secret.livekit_api_secret")).toBeInTheDocument();
+    expect(screen.getByTestId("config-search-count")).toHaveTextContent(
+      "1 de 4 configurações correspondem.",
+    );
+  });
+
+  // A match inside a collapsed section must not be hidden by the fold.
+  it("opens the read-only sections while a term is active", async () => {
+    defaultRoutes();
+    renderWithSession(<ConfigurationPage />, READER);
+    await screen.findByTestId("config-auth.password.min_length");
+
+    await userEvent.type(screen.getByLabelText("Buscar configuração"), "livekit");
+    await waitFor(() =>
+      expect(screen.getByTestId("config-secret.livekit_api_secret")).toBeVisible(),
+    );
+    expect(screen.getByText(/Credenciais/).closest("details")).toHaveAttribute("open");
+  });
+
+  // The security property: a term that only occurs in a value finds nothing.
+  it("does not index values", async () => {
+    defaultRoutes();
+    renderWithSession(<ConfigurationPage />, READER);
+    await screen.findByTestId("config-auth.password.min_length");
+
+    await userEvent.type(screen.getByLabelText("Buscar configuração"), "configurado");
+    await waitFor(() =>
+      expect(screen.getByTestId("config-search-count")).toHaveTextContent(
+        "0 de 4 configurações correspondem.",
+      ),
+    );
+  });
+
+  it("seeds the term from the link that opened the page", async () => {
+    defaultRoutes();
+    renderWithSession(<ConfigurationPage />, READER, ["/configuration?q=LiveKit"]);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("config-secret.livekit_api_secret")).toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("Buscar configuração")).toHaveValue("LiveKit");
+    expect(screen.queryByTestId("config-auth.password.min_length")).not.toBeInTheDocument();
+  });
+
+  // A field edited before the search was typed is still an edit. Hiding it must
+  // not drop it from the change set.
+  it("keeps an edit hidden by the filter in the change set", async () => {
+    const fetchMock = defaultRoutes();
+    renderWithSession(<ConfigurationPage />, ["admin.config.read", "admin.config.manage"]);
+
+    const input = await screen.findByLabelText("Tamanho mínimo da senha");
+    await userEvent.clear(input);
+    await userEvent.type(input, "16");
+
+    await userEvent.type(screen.getByLabelText("Buscar configuração"), "livekit");
+    await waitFor(() =>
+      expect(screen.queryByTestId("config-auth.password.min_length")).not.toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Revisar alterações" }));
+    await screen.findByRole("dialog");
+
+    const preview = fetchMock.mock.calls.find((call) =>
+      String(call[0]).includes("/config/preview"),
+    );
+    expect(preview).toBeDefined();
+    const body = JSON.parse(String((preview?.[1] as RequestInit).body)) as {
+      changes: Record<string, unknown>;
+    };
+    expect(body.changes).toEqual({ "auth.password.min_length": 16 });
+  });
+});

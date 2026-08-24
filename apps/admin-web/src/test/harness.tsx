@@ -59,9 +59,20 @@ export function sessionValue(capabilities: string[]): AdminSessionValue {
   };
 }
 
-export function renderWithSession(ui: ReactElement, capabilities: string[]): RenderResult {
+/**
+ * Renders a screen inside a router and a session.
+ *
+ * `initialEntries` exists so a spec can describe a deep link — the integrations
+ * cards link into the configuration screen with a search term — without
+ * building a second harness for it.
+ */
+export function renderWithSession(
+  ui: ReactElement,
+  capabilities: string[],
+  initialEntries: string[] = ["/"],
+): RenderResult {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={initialEntries}>
       <AdminSessionContext.Provider value={sessionValue(capabilities)}>
         {ui}
       </AdminSessionContext.Provider>

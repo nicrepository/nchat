@@ -112,6 +112,7 @@ describe("AdminLayout", () => {
       "Segurança e políticas",
       "Arquivos e armazenamento",
       "Configurações",
+      "Integrações",
       "Health Center",
       "Auditoria",
     ]);

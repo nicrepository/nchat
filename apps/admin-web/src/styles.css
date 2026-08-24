@@ -1055,3 +1055,142 @@ a {
   margin: 0;
   color: var(--admin-muted);
 }
+
+/* Integrations and diagnostics (issue #582).
+ *
+ * The grid below is what makes a diagnostic readable at a glance and still
+ * readable at 200% zoom or on a tablet: it collapses to a single column instead
+ * of scrolling sideways, because a result an operator has to pan across is a
+ * result they stop reading. Every status carries a mark and a word as well as a
+ * colour, so none of these rules is load bearing for meaning. */
+
+.admin-integration__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.admin-integration__header h2 {
+  margin: 0;
+  flex: 1 1 12rem;
+}
+
+.admin-integration__impact {
+  color: var(--admin-muted);
+  margin: 0.25rem 0 0;
+}
+
+.admin-integration__section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--admin-border);
+}
+
+.admin-integration__section h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.admin-integration__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.admin-diagnostic {
+  margin-top: 0.75rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  padding: 0.75rem;
+}
+
+.admin-diagnostic__summary {
+  margin: 0 0 0.5rem;
+}
+
+.admin-diagnostic__summary--ok {
+  color: var(--admin-ok);
+}
+
+.admin-diagnostic__summary--warn {
+  color: var(--admin-warn);
+}
+
+.admin-diagnostic__summary--danger {
+  color: var(--admin-danger);
+}
+
+.admin-diagnostic__summary--neutral {
+  color: var(--admin-muted);
+}
+
+.admin-diagnostic__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.admin-diagnostic__steps > li {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(8rem, 1fr) auto auto;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--admin-border);
+}
+
+.admin-diagnostic__mark--ok {
+  color: var(--admin-ok);
+}
+
+.admin-diagnostic__mark--warn {
+  color: var(--admin-warn);
+}
+
+.admin-diagnostic__mark--danger {
+  color: var(--admin-danger);
+}
+
+.admin-diagnostic__mark--neutral {
+  color: var(--admin-muted);
+}
+
+.admin-diagnostic__stage {
+  font-weight: 600;
+}
+
+.admin-diagnostic__verdict,
+.admin-diagnostic__latency {
+  color: var(--admin-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.admin-diagnostic__detail,
+.admin-diagnostic__category {
+  grid-column: 2 / -1;
+  color: var(--admin-muted);
+}
+
+.admin-config-search {
+  margin: 1rem 0 1.5rem;
+}
+
+.admin-config-search input {
+  width: 100%;
+  max-width: 32rem;
+}
+
+@media (max-width: 40rem) {
+  .admin-diagnostic__steps > li {
+    grid-template-columns: 1.5rem 1fr;
+  }
+
+  .admin-diagnostic__verdict,
+  .admin-diagnostic__latency {
+    grid-column: 2;
+  }
+}
