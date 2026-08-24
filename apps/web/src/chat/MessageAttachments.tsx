@@ -19,12 +19,23 @@
  *
  * No URL is ever built from a filename, and no address outlives the click that
  * created it: the download's object URL is revoked in the same task.
+ *
+ * Images and GIFs (issue #491) are the one exception to "a row per
+ * attachment": AttachmentImagePreview draws a large preview above the same
+ * name/size/status/Baixar footer every other type shows in its row, and a
+ * click on it opens AttachmentLightbox. This component owns the one lightbox
+ * that can be open at a time and the focus-return-on-close that goes with it,
+ * the same way ConversationDetailsPanel owns focus return for AddMembersDialog
+ * — the dialog itself only ever calls onClose.
  */
 
 import { useState } from "react";
 
+import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
+import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
+import { isImageAttachment } from "./attachmentImageRules";
 import { fetchAttachmentContent } from "./filesApi";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import type { ChannelAttachment } from "./chatTypes";
@@ -99,7 +110,61 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
   );
 }
 
-function MessageAttachment({ attachment }: { attachment: ChannelAttachment }) {
+interface MessageAttachmentProps {
+  attachment: ChannelAttachment;
+  onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
+}
+
+function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) {
+  const icon = (
+    <span className="chat-msg-area__attachment-icon" aria-hidden="true">
+      <span className="material-symbols-outlined">{fileIconFor(attachment.contentType)}</span>
+    </span>
+  );
+  const meta = (
+    <span className="chat-msg-area__attachment-text">
+      {/* A filename is text. It is never a URL and never markup. */}
+      <span className="chat-msg-area__attachment-name">{attachment.filename}</span>
+      <span className="chat-msg-area__attachment-meta">
+        {formatFileSize(attachment.size)}
+        <span
+          className={`chat-msg-area__attachment-status chat-msg-area__attachment-status--${attachment.status}`}
+          data-testid={`chat-message-attachment-status-${attachment.id}`}
+        >
+          {attachment.status === "pending_scan" && "Verificando arquivo…"}
+          {attachment.status === "clean" && "Verificado"}
+          {attachment.status === "rejected" && "Bloqueado pela verificação de segurança"}
+        </span>
+      </span>
+    </span>
+  );
+  const download = attachment.status === "clean" && (
+    <AttachmentDownloadButton attachment={attachment} />
+  );
+
+  // Image and GIF attachments (RF-32/#491) get a large preview above the same
+  // name/size/status/Baixar footer every other type shows beside its
+  // thumbnail — everything else keeps the row layout untouched, PDF's own
+  // server preview included.
+  if (isImageAttachment(attachment)) {
+    return (
+      <li
+        className="chat-msg-area__attachment"
+        data-testid={`chat-message-attachment-${attachment.id}`}
+      >
+        <AttachmentImagePreview
+          attachment={attachment}
+          fallback={icon}
+          onOpen={(payload) => onOpenImage(attachment, payload)}
+        />
+        <div className="chat-msg-area__attachment-row">
+          {meta}
+          {download}
+        </div>
+      </li>
+    );
+  }
+
   return (
     <li
       className="chat-msg-area__attachment"
@@ -108,32 +173,9 @@ function MessageAttachment({ attachment }: { attachment: ChannelAttachment }) {
       <div className="chat-msg-area__attachment-row">
         {/* The thumbnail draws itself only for an approved file with a ready
             preview; everything else falls back to the type icon. */}
-        <AttachmentThumbnail
-          attachment={attachment}
-          fallback={
-            <span className="chat-msg-area__attachment-icon" aria-hidden="true">
-              <span className="material-symbols-outlined">
-                {fileIconFor(attachment.contentType)}
-              </span>
-            </span>
-          }
-        />
-        <span className="chat-msg-area__attachment-text">
-          {/* A filename is text. It is never a URL and never markup. */}
-          <span className="chat-msg-area__attachment-name">{attachment.filename}</span>
-          <span className="chat-msg-area__attachment-meta">
-            {formatFileSize(attachment.size)}
-            <span
-              className={`chat-msg-area__attachment-status chat-msg-area__attachment-status--${attachment.status}`}
-              data-testid={`chat-message-attachment-status-${attachment.id}`}
-            >
-              {attachment.status === "pending_scan" && "Verificando arquivo…"}
-              {attachment.status === "clean" && "Verificado"}
-              {attachment.status === "rejected" && "Bloqueado pela verificação de segurança"}
-            </span>
-          </span>
-        </span>
-        {attachment.status === "clean" && <AttachmentDownloadButton attachment={attachment} />}
+        <AttachmentThumbnail attachment={attachment} fallback={icon} />
+        {meta}
+        {download}
       </div>
       {/* Draws a player only for a clean, playable video, and nothing at all
           otherwise — including for a file still being scanned. */}
@@ -142,17 +184,56 @@ function MessageAttachment({ attachment }: { attachment: ChannelAttachment }) {
   );
 }
 
+interface OpenLightbox {
+  attachment: ChannelAttachment;
+  trigger: HTMLButtonElement;
+  url: string;
+  isOriginal: boolean;
+}
+
 export default function MessageAttachments({
   attachments,
 }: {
   attachments: ChannelAttachment[] | undefined;
 }) {
+  const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
+
   if (!attachments || attachments.length === 0) return null;
+
+  function closeLightbox() {
+    // The control that opened it gets focus back on close — this component
+    // owns that button, the same way ConversationDetailsPanel owns it for
+    // AddMembersDialog, so AttachmentLightbox itself never needs to know it.
+    lightbox?.trigger.focus();
+    setLightbox(null);
+  }
+
   return (
-    <ul className="chat-msg-area__attachments" aria-label="Anexos da mensagem">
-      {attachments.map((attachment) => (
-        <MessageAttachment key={attachment.id} attachment={attachment} />
-      ))}
-    </ul>
+    <>
+      <ul className="chat-msg-area__attachments" aria-label="Anexos da mensagem">
+        {attachments.map((attachment) => (
+          <MessageAttachment
+            key={attachment.id}
+            attachment={attachment}
+            onOpenImage={(openedAttachment, payload) =>
+              setLightbox({
+                attachment: openedAttachment,
+                trigger: payload.trigger,
+                url: payload.url,
+                isOriginal: payload.isOriginal,
+              })
+            }
+          />
+        ))}
+      </ul>
+      {lightbox && (
+        <AttachmentLightbox
+          attachment={lightbox.attachment}
+          inlineUrl={lightbox.url}
+          inlineIsOriginal={lightbox.isOriginal}
+          onClose={closeLightbox}
+        />
+      )}
+    </>
   );
 }
