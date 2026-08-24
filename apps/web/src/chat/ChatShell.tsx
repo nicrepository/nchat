@@ -40,7 +40,7 @@ export interface ChatOutletContext {
 }
 
 export default function ChatShell() {
-  const { state, retry, setPinned } = useChatSidebar();
+  const { state, retry, setPinned, markRead, renameChannel } = useChatSidebar();
   const {
     calls,
     resource: resourceCall,
@@ -94,7 +94,13 @@ export default function ChatShell() {
 
   return (
     <div className="chat-app" data-testid="chat-shell">
-      <ChatSidebar state={state} retry={retry} setPinned={setPinned} />
+      <ChatSidebar
+        state={state}
+        retry={retry}
+        setPinned={setPinned}
+        markRead={markRead}
+        renameChannel={renameChannel}
+      />
       <main className="chat-app__main" aria-label="Área de mensagens">
         <Outlet context={outletContext} />
       </main>

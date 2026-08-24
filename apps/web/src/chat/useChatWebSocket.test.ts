@@ -924,6 +924,132 @@ describe("useChatWebSocket", () => {
     expect(onMembersAdded).not.toHaveBeenCalled();
   });
 
+  // ── channel.updated (issue #527) ─────────────────────────────────────────
+  //
+  // A rename is an invalidation signal for the channel's subscribers. It carries
+  // no payload at all, so these assert routing and the boundary and nothing else.
+
+  it("routes channel.updated for a subscribed channel exactly once", () => {
+    const onChannelUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onChannelUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "channel.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+
+    expect(onChannelUpdated).toHaveBeenCalledOnce();
+    expect(onChannelUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "channel.updated", target_id: "ch-1" }),
+    );
+  });
+
+  // Renaming a channel this client does not watch is none of its business: the
+  // subscription set is the boundary, exactly as for members.added.
+  it("ignores channel.updated for a target it does not watch", () => {
+    const onChannelUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onChannelUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "channel.updated",
+        target_type: "channel",
+        target_id: "ch-other",
+      }),
+    );
+
+    expect(onChannelUpdated).not.toHaveBeenCalled();
+  });
+
+  // It reaches every subscribed target, not only the primary one: a rename
+  // performed by someone else lands while this reader is looking elsewhere, and
+  // that row still has to converge.
+  it("routes channel.updated for an additional subscribed channel", () => {
+    const onChannelUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        additionalTargets: [{ kind: "channel", targetId: "ch-2" }],
+        onMessageCreated: vi.fn(),
+        onChannelUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "channel.updated",
+        target_type: "channel",
+        target_id: "ch-2",
+      }),
+    );
+
+    expect(onChannelUpdated).toHaveBeenCalledOnce();
+  });
+
+  // Only a channel can be renamed. An event claiming another target type is not
+  // one this protocol produces, so it is dropped rather than forwarded.
+  it("ignores a channel.updated that claims a DM target", () => {
+    const onChannelUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "dm",
+        targetId: "dm-1",
+        onMessageCreated: vi.fn(),
+        onChannelUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "channel.updated",
+        target_type: "dm",
+        target_id: "dm-1",
+      }),
+    );
+
+    expect(onChannelUpdated).not.toHaveBeenCalled();
+  });
+
+  // The callback belongs to one event type: nothing else may reach it.
+  it("does not hand another event type to onChannelUpdated", () => {
+    const onChannelUpdated = vi.fn();
+    const onMembersAdded = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onChannelUpdated,
+        onMembersAdded,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "members.added",
+        target_type: "channel",
+        target_id: "ch-1",
+        members: { actor_user_id: "user-1", added_count: 1, member_count: 3 },
+      }),
+    );
+
+    expect(onMembersAdded).toHaveBeenCalledOnce();
+    expect(onChannelUpdated).not.toHaveBeenCalled();
+  });
+
   // ── attachment.status (RF-22) ────────────────────────────────────────────
 
   it("routes attachment.status for the active target", () => {

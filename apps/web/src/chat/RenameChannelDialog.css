@@ -1,0 +1,124 @@
+/*
+ * RenameChannelDialog styles (issue #527).
+ *
+ * The same modal language as "Adicionar membros" — backdrop, card, footer —
+ * restated under its own class prefix rather than by borrowing
+ * .add-members__* selectors, for the reason that file states: sharing class
+ * names couples two dialogs that are edited for different reasons. The tokens
+ * are the same, so the two stay visually identical.
+ *
+ * Focus is always visible: the last rule applies to every control in the card.
+ */
+
+.rename-channel__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 420;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.rename-channel {
+  --rename-channel-primary: #6d28d9;
+  --rename-channel-primary-strong: #5b21b6;
+  --rename-channel-border: #e8e3f0;
+  --rename-channel-muted: #7c7390;
+  --rename-channel-danger: #b42318;
+  width: min(440px, 100%);
+  padding: 22px 24px 20px;
+  border: 1px solid var(--rename-channel-border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+  color: #16121f;
+}
+
+.rename-channel__title {
+  margin: 0 0 16px;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.rename-channel__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--rename-channel-muted);
+}
+
+.rename-channel__input {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  color: inherit;
+  border: 1px solid var(--rename-channel-border);
+  border-radius: 10px;
+  background: #fff;
+}
+
+.rename-channel__input:disabled {
+  background: #f6f4fa;
+  color: var(--rename-channel-muted);
+}
+
+/* The invalid state is not carried by colour alone: the message below the field
+   is associated with it through aria-describedby and is what actually says
+   what is wrong. */
+.rename-channel__input[aria-invalid="true"] {
+  border-color: var(--rename-channel-danger);
+}
+
+.rename-channel__error {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--rename-channel-danger);
+}
+
+.rename-channel__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.rename-channel__cancel,
+.rename-channel__submit {
+  min-height: 38px;
+  padding: 0 16px;
+  font: inherit;
+  font-weight: 600;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.rename-channel__cancel {
+  border: 1px solid var(--rename-channel-border);
+  background: #fff;
+  color: #16121f;
+}
+
+.rename-channel__submit {
+  border: 0;
+  background: var(--rename-channel-primary);
+  color: #fff;
+}
+
+.rename-channel__submit:hover:not(:disabled) {
+  background: var(--rename-channel-primary-strong);
+}
+
+.rename-channel__cancel:disabled,
+.rename-channel__submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.rename-channel button:focus-visible,
+.rename-channel input:focus-visible {
+  outline: 2px solid var(--rename-channel-primary);
+  outline-offset: 2px;
+}

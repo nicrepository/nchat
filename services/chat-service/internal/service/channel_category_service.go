@@ -120,9 +120,15 @@ func (s *ChannelCategoryService) ListGroupedChannels(ctx context.Context, worksp
 	}
 
 	for _, access := range accesses {
+		// Both capabilities come from the same predicates SidebarService.GetSidebar
+		// uses, on the membership already loaded above. A channel must not offer
+		// different actions depending on whether it happens to sit in a category:
+		// this endpoint is what the client reads for categorized channels, and
+		// omitting CanRename here hid "Renomear canal" from owners and admins.
 		channel := SidebarChannel{
-			Channel:  access.Channel,
-			CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			Channel:   access.Channel,
+			CanWrite:  domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			CanRename: domain.CanRenameChannel(&member, access.Channel),
 		}
 		// An unknown category ID cannot happen while the composite FK holds — it
 		// keeps a channel's category inside the channel's own workspace — but

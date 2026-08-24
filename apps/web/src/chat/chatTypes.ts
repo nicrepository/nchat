@@ -33,6 +33,15 @@ export interface Channel extends ConversationActivity {
   type: ChannelType;
   /** Server-derived permission. The forwarding endpoint remains authoritative. */
   canWrite: boolean;
+  /**
+   * Whether the server would accept a rename of this channel from the current
+   * viewer (issue #527). Presentation only: it decides whether the row's action
+   * menu offers "Renomear canal", and PATCH /api/chat/channels/{id} re-derives
+   * the same decision from the session on every call. Optional so a payload
+   * from a server that predates the field parses unchanged, and absent is read
+   * as "no".
+   */
+  canRename?: boolean;
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;

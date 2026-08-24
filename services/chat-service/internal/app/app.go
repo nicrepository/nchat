@@ -468,6 +468,11 @@ func New(cfg config.Config) (*App, error) {
 	if memberSvc != nil && channels != nil {
 		channels = channels.WithMembers(memberSvc, &hubBroadcaster{hub: hub})
 	}
+	// Rename (issue #527) broadcasts over the same hub. Wired separately from
+	// WithMembers because the rename route does not need the member service.
+	if channels != nil {
+		channels = channels.WithChannelUpdates(&hubBroadcaster{hub: hub})
+	}
 	if directMessages != nil {
 		directMessages = directMessages.WithMembersBroadcast(&hubBroadcaster{hub: hub})
 		// The details panel reports participant presence from the same tracker
@@ -794,6 +799,13 @@ func (b *hubBroadcaster) PublishMessageLinkSafetyChanged(
 ) {
 	b.hub.PublishMessageLinkSafetyChanged(
 		ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, state, updatedAt)
+}
+
+// PublishChannelUpdated adapts the hub for the issue #527 rename signal. The
+// target type is always a channel, so unlike the members adapter there is no
+// string to convert.
+func (b *hubBroadcaster) PublishChannelUpdated(ctx context.Context, workspaceID, channelID string) {
+	b.hub.PublishChannelUpdated(ctx, workspaceID, channelID)
 }
 
 // PublishConversationAvailable adapts the hub's user-scoped signal (issue #398).

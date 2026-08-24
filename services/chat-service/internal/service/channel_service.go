@@ -269,6 +269,13 @@ func (s *ChannelService) GetChannel(ctx context.Context, input GetChannelInput) 
 }
 
 // UpdateChannel updates mutable fields for a non-general channel.
+//
+// Two authorization checks, and they are not redundant. This one runs before
+// anything is read or written so a caller with no business in this workspace
+// gets a plain ErrForbidden instead of learning, from a validation error,
+// whether a channel or a category exists in it. The one that *decides* is
+// PGXChannelStore.UpdateChannel's, taken inside the write transaction with the
+// membership row locked — a role revoked after this line still stops the write.
 func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
 	if _, err := s.requireManagePermission(ctx, input.WorkspaceID, input.CallerID); err != nil {
 		return domain.Channel{}, err
@@ -283,6 +290,12 @@ func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelI
 	}
 
 	next := storage.UpdateChannelInput{
+		// The actor, not a decision about the actor. requireManagePermission
+		// above is a fail-fast for a legible error; the authorization that
+		// governs the write is re-derived from the database inside the store's
+		// transaction, holding the membership row, so a role revoked between the
+		// two cannot be outrun. See PGXChannelStore.UpdateChannel.
+		CallerID:    input.CallerID,
 		WorkspaceID: input.WorkspaceID,
 		ChannelID:   input.ChannelID,
 		CategoryID:  current.CategoryID,

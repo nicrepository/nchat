@@ -118,6 +118,21 @@ const (
 	// nothing.
 	EventTypeConversationAvailable EventType = "conversation.available"
 
+	// EventTypeChannelUpdated tells the subscribers of a channel that its
+	// metadata changed — today, that it was renamed (issue #527).
+	//
+	// Route-only, exactly like pin.updated minus the flag: it names the channel
+	// and says nothing else. No name, no actor, no old value. A subscriber who
+	// receives it refetches the sidebar, which re-derives visibility server-side,
+	// so the event grants nothing and cannot be used to read a channel's new name
+	// without the authorization the sidebar endpoint applies anyway.
+	//
+	// Carrying no payload is also what makes it idempotent for free: two copies
+	// of the same event, or one arriving alongside a refetch that already has the
+	// new name, cost one extra refetch and can never produce a second row for the
+	// same channel_id.
+	EventTypeChannelUpdated EventType = "channel.updated"
+
 	// EventTypeAttachmentStatus is emitted after an attachment's antimalware
 	// verdict has been persisted (RF-22).
 	//

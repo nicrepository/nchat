@@ -16,6 +16,7 @@ const {
   mockFetchSidebarData,
   mockMarkConversationRead,
   mockSetSidebarConversationPinned,
+  mockRenameChannel,
   mockPlayMessageSound,
   mockGetSoundNotificationMode,
   mockShowBrowserMessageNotification,
@@ -24,6 +25,7 @@ const {
   mockFetchSidebarData: vi.fn(),
   mockMarkConversationRead: vi.fn(),
   mockSetSidebarConversationPinned: vi.fn(),
+  mockRenameChannel: vi.fn(),
   mockPlayMessageSound: vi.fn(),
   mockGetSoundNotificationMode: vi.fn(
     () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
@@ -37,6 +39,7 @@ const {
   websocket: {
     onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     onConversationAvailable: null as (() => void) | null,
+    onChannelUpdated: null as (() => void) | null,
   },
 }));
 
@@ -44,6 +47,7 @@ vi.mock("./chatApi", () => ({
   fetchSidebarData: mockFetchSidebarData,
   markConversationRead: mockMarkConversationRead,
   setSidebarConversationPinned: mockSetSidebarConversationPinned,
+  renameChannel: mockRenameChannel,
 }));
 vi.mock("./messageSound", () => ({
   playMessageSound: mockPlayMessageSound,
@@ -59,12 +63,15 @@ vi.mock("./useChatWebSocket", () => ({
     ({
       onMessageCreated,
       onConversationAvailable,
+      onChannelUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onConversationAvailable?: () => void;
+      onChannelUpdated?: () => void;
     }) => {
       websocket.onMessageCreated = onMessageCreated;
       websocket.onConversationAvailable = onConversationAvailable ?? null;
+      websocket.onChannelUpdated = onChannelUpdated ?? null;
       return { toggleReaction: vi.fn() };
     },
   ),
@@ -2144,5 +2151,138 @@ describe("useChatSidebar — badge persistence", () => {
     const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     expect(unreadCounts(result.current.state).channelA).toBe(0);
+  });
+});
+
+// ── Menu actions (ISSUE #527) ────────────────────────────────────────────────
+//
+// Marking read and renaming are the two actions the row menu adds. Both must
+// converge on the same canonical state every other source uses, and neither may
+// invent a rule of its own.
+
+describe("useChatSidebar — ações do menu de conversa", () => {
+  const channel = (overrides: Record<string, unknown> = {}) => ({
+    id: channelA,
+    name: "infra",
+    type: "public",
+    canWrite: true,
+    canRename: true,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    mockFetchSidebarData.mockReset();
+    mockMarkConversationRead.mockReset();
+    mockRenameChannel.mockReset();
+    websocket.onChannelUpdated = null;
+    mockMarkConversationRead.mockResolvedValue(undefined);
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [channel({ unreadCount: 5 })],
+      dms: [{ id: dmC, type: "1:1", name: "Juliane", participants: [], unreadCount: 3 }],
+    });
+  });
+
+  it("clears the badge and sends the receipt without navigating", async () => {
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.markRead({ kind: "channel", targetId: channelA }));
+
+    expect(unreadCounts(result.current.state).channelA).toBe(0);
+    // The conversation that was not named keeps its badge.
+    expect(unreadCounts(result.current.state).dmC).toBe(3);
+    expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA);
+  });
+
+  // A failed receipt is not a UI failure: the badge stays cleared locally and
+  // the next refetch reconciles, exactly as on navigation.
+  it("survives a failed read receipt", async () => {
+    mockMarkConversationRead.mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      result.current.markRead({ kind: "channel", targetId: channelA });
+    });
+
+    expect(result.current.state.status).toBe("ready");
+    expect(unreadCounts(result.current.state).channelA).toBe(0);
+  });
+
+  // No optimistic rename: a name the server never accepted must not appear, so
+  // the new one arrives only through the canonical refetch.
+  it("converges on the persisted name through a refetch, keeping the same row", async () => {
+    mockRenameChannel.mockResolvedValue({ id: channelA, name: "Plataforma" });
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [channel({ name: "Plataforma", unreadCount: 5, pinnedAt: "2026-08-12T10:00:00Z" })],
+      dms: [{ id: dmC, type: "1:1", name: "Juliane", participants: [], unreadCount: 3 }],
+    });
+
+    await act(async () => {
+      await result.current.renameChannel(channelA, "Plataforma");
+    });
+
+    expect(mockRenameChannel).toHaveBeenCalledWith(channelA, "Plataforma");
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels).toHaveLength(1);
+      expect(result.current.state.channels[0]).toMatchObject({
+        id: channelA,
+        name: "Plataforma",
+        pinnedAt: "2026-08-12T10:00:00Z",
+      });
+    });
+  });
+
+  // The dialog needs the failure to stay open and recoverable.
+  it("propagates a refused rename and leaves the list untouched", async () => {
+    mockRenameChannel.mockRejectedValue(new Error("forbidden"));
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      await expect(result.current.renameChannel(channelA, "Plataforma")).rejects.toThrow(
+        "forbidden",
+      );
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]).toMatchObject({ id: channelA, name: "infra" });
+  });
+
+  // Someone else renamed the channel. The event names it and nothing else, so
+  // the only correct response is the canonical refetch.
+  it("refetches when a channel.updated event arrives, without duplicating the row", async () => {
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(websocket.onChannelUpdated).toBeTypeOf("function");
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [channel({ name: "Plataforma", unreadCount: 5 })],
+      dms: [{ id: dmC, type: "1:1", name: "Juliane", participants: [], unreadCount: 3 }],
+    });
+
+    // Twice: a repeated event must be indistinguishable from one.
+    await act(async () => {
+      websocket.onChannelUpdated?.();
+      websocket.onChannelUpdated?.();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels).toHaveLength(1);
+      expect(result.current.state.channels[0]).toMatchObject({ id: channelA, name: "Plataforma" });
+      expect(unreadCounts(result.current.state).channelA).toBe(5);
+    });
   });
 });

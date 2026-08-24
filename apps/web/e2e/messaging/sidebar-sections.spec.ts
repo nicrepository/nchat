@@ -270,13 +270,25 @@ test.describe("sidebar — ordenação por atividade", () => {
       await page.keyboard.press("Tab");
       await expect(names(page, "Canais").filter({ hasText: expected })).toBeFocused();
       await page.keyboard.press("Tab");
-      await expect(page.getByLabel(`Fixar ${expected} no topo`)).toBeFocused();
+      // Since issue #527 the row's second tab stop is the actions menu, not a
+      // pin: the pin became state and takes no tab stop at all.
+      await expect(
+        page.getByRole("button", { name: `Mais opções para canal ${expected}` }),
+      ).toBeFocused();
     }
   });
 });
 
+/**
+ * ISSUE #527 — "…" means actions and a pin means pinned. Fixing and unfixing
+ * moved into the row's action menu; the pin is no longer clickable.
+ */
+function rowMenu(page: Page, name: string) {
+  return page.getByRole("button", { name: `Mais opções para ${name}` });
+}
+
 test.describe("sidebar — conversas fixadas", () => {
-  test("fixa e desafixa em sua própria categoria, preservando a seleção", async ({
+  test("fixa e desafixa pelo menu, em sua própria categoria e preservando a seleção", async ({
     page,
   }, testInfo) => {
     const { scenario, targetId } = await openChatWithAllThreeCategories(page, testInfo);
@@ -294,7 +306,11 @@ test.describe("sidebar — conversas fixadas", () => {
     await page.reload();
     const channels = optionsIn(page, "Canais");
     await expect(channels).toHaveText([/Canal Fixável/, new RegExp(channel.display_name)]);
-    await page.getByLabel(`Fixar ${channel.display_name} no topo`).click();
+    // The pin is not an action any more, on any row.
+    await expect(page.getByRole("button", { name: /^Fixar .* no topo$/ })).toHaveCount(0);
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Fixar no topo" }).click();
     await expect
       .poll(() => scenario.requests.sidebarPins)
       .toEqual([{ targetId: channel.id, action: "add" }]);
@@ -304,14 +320,117 @@ test.describe("sidebar — conversas fixadas", () => {
     ]);
     await expect(section(page, "Mensagens diretas").getByRole("option")).toHaveCount(1);
     await expect(section(page, "Grupos").getByRole("option")).toHaveCount(1);
+    // Neither opening the menu nor running an action changed the conversation.
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
 
-    await page.getByLabel(`Desafixar ${channel.display_name}`).click();
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Desafixar" }).click();
     await expect.poll(() => scenario.requests.sidebarPins).toHaveLength(2);
     await expect(optionsIn(page, "Canais")).toHaveText([
       /Canal Fixável/,
       new RegExp(channel.display_name),
     ]);
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+  });
+
+  test("abre o menu pelo teclado e fixa sem sair da conversa", async ({ page }, testInfo) => {
+    const { scenario, targetId } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+
+    await rowMenu(page, `canal ${channel.display_name}`).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("menu")).toBeVisible();
+    await page.keyboard.press("Enter");
+
+    await expect
+      .poll(() => scenario.requests.sidebarPins)
+      .toEqual([{ targetId: channel.id, action: "add" }]);
+    await expect(page.getByRole("menu")).toHaveCount(0);
+    // Focus came back to the trigger, and nothing navigated.
+    await expect(rowMenu(page, `canal ${channel.display_name}`)).toBeFocused();
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+  });
+
+  test("não oferece Sair em uma conversa direta nem em um grupo", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    for (const name of [`conversa com ${OTHER_USER_NAME}`, `grupo ${GROUP_DM_NAME}`]) {
+      await rowMenu(page, name).click();
+      await expect(page.getByRole("menu")).toBeVisible();
+      await expect(page.getByRole("menuitem", { name: /sair/i })).toHaveCount(0);
+      await expect(page.getByRole("menuitem", { name: /arquivar|silenciar/i })).toHaveCount(0);
+      await page.keyboard.press("Escape");
+    }
+  });
+});
+
+/**
+ * ISSUE #527 — renaming a channel. The capability decides only what the menu
+ * offers; the endpoint decides whether the write lands.
+ */
+test.describe("sidebar — renomear canal", () => {
+  test("renomeia pelo menu e o novo nome persiste após recarregar", async ({ page }, testInfo) => {
+    const { scenario, targetId } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+    channel.can_rename = true;
+    await page.reload();
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Renomear canal" }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByLabel("Nome do canal")).toHaveValue(channel.display_name);
+    await dialog.getByLabel("Nome do canal").fill("Plataforma");
+    await dialog.getByRole("button", { name: "Salvar" }).click();
+
+    await expect
+      .poll(() => scenario.requests.channelRenames)
+      .toEqual([{ channelId: channel.id, displayName: "Plataforma" }]);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(optionsIn(page, "Canais").filter({ hasText: "Plataforma" })).toHaveCount(1);
+    // The rename did not open the renamed channel.
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+
+    await page.reload();
+    await expect(optionsIn(page, "Canais").filter({ hasText: "Plataforma" })).toHaveCount(1);
+  });
+
+  test("não oferece renomear quando o servidor não concede a permissão", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await expect(page.getByRole("menu")).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Renomear canal" })).toHaveCount(0);
+  });
+
+  // The menu is presentation. A caller the server refuses is refused, and the
+  // sidebar keeps showing the persisted name rather than the attempted one.
+  test("mantém o nome persistido quando o servidor recusa a renomeação", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+    channel.can_rename = true;
+    await page.reload();
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Renomear canal" }).click();
+    // The server revokes the capability between the menu opening and the submit.
+    channel.can_rename = false;
+
+    const dialog = page.getByRole("dialog");
+    await dialog.getByLabel("Nome do canal").fill("Plataforma");
+    await dialog.getByRole("button", { name: "Salvar" }).click();
+
+    await expect(dialog.getByRole("alert")).toContainText(/permissão/i);
+    await expect(dialog).toBeVisible();
+    await expect(optionsIn(page, "Canais").filter({ hasText: "Plataforma" })).toHaveCount(0);
+    await expect(optionsIn(page, "Canais").filter({ hasText: channel.display_name })).toHaveCount(
+      1,
+    );
   });
 });
 

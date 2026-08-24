@@ -1351,15 +1351,17 @@ describe("ChatSidebar — section classification", () => {
     const trigger = await screen.findByRole("button", { name: "Nova conversa" });
     trigger.focus();
 
+    // Since issue #527 the second stop on every row is the actions menu's
+    // trigger, not a pin: the pin is state and no longer takes a tab stop.
     const expected = [
       ["option", "Canal geral"],
-      ["button", "Fixar geral no topo"],
+      ["button", "Mais opções para canal geral"],
       ["option", "Canal privado projetos"],
-      ["button", "Fixar projetos no topo"],
+      ["button", "Mais opções para canal projetos"],
       ["option", "Mensagem direta com Juliane Lino"],
-      ["button", "Fixar Juliane Lino no topo"],
+      ["button", "Mais opções para conversa com Juliane Lino"],
       ["option", "Grupo Equipe Infra"],
-      ["button", "Fixar Equipe Infra no topo"],
+      ["button", "Mais opções para grupo Equipe Infra"],
     ] as const;
     for (const [role, label] of expected) {
       await user.tab();
@@ -1486,7 +1488,10 @@ describe("ChatSidebar — activity ordering", () => {
     expect(optionNamesIn("Canais")).toEqual(["Canal agitado", "Canal medio", "Canal quieto"]);
   });
 
-  it("exposes a named pin action and preserves the item's original category", async () => {
+  // Since issue #527 unpinning is a menu action, not a click on the pin. The
+  // conversation must stay where it is: unpinning a channel is not a way to move
+  // a group into "Canais".
+  it("unpins from the menu and preserves the item's original category", async () => {
     const user = userEvent.setup();
     const setPinned = vi.fn().mockResolvedValue(undefined);
     renderState(
@@ -1496,16 +1501,21 @@ describe("ChatSidebar — activity ordering", () => {
       setPinned,
     );
 
-    expect(within(section("Canais")).getByLabelText("Desafixar geral")).toBeInTheDocument();
-    expect(within(section("Canais")).getByLabelText("Desafixar geral")).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    expect(
+      within(section("Canais")).getByRole("option", { name: "Canal geral, fixado" }),
+    ).toBeInTheDocument();
     expect(
       within(section("Grupos")).getByRole("option", { name: "Grupo projeto" }),
     ).toBeInTheDocument();
-    await user.click(within(section("Canais")).getByLabelText("Desafixar geral"));
+
+    await user.click(
+      within(section("Canais")).getByRole("button", { name: "Mais opções para canal geral" }),
+    );
+    await user.click(screen.getByRole("menuitem", { name: "Desafixar" }));
     expect(setPinned).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" }, false);
+    expect(
+      within(section("Grupos")).getByRole("option", { name: "Grupo projeto" }),
+    ).toBeInTheDocument();
   });
 
   it("orders direct messages independently of every other section", () => {
@@ -1701,9 +1711,9 @@ describe("ChatSidebar — activity ordering", () => {
 
     for (const [role, label] of [
       ["option", "Canal canal-novo"],
-      ["button", "Fixar canal-novo no topo"],
+      ["button", "Mais opções para canal canal-novo"],
       ["option", "Canal canal-antigo"],
-      ["button", "Fixar canal-antigo no topo"],
+      ["button", "Mais opções para canal canal-antigo"],
       ["option", "Mensagem direta com Juliane"],
     ] as const) {
       await user.tab();
@@ -2527,5 +2537,673 @@ describe("ChatSidebar — collapsible categories", () => {
     await user.click(headerBtn);
     expect(headerBtn).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("option", { name: /canal-1/i })).toBeInTheDocument();
+  });
+});
+
+// ── Row action menu (ISSUE #527) ─────────────────────────────────────────────
+//
+// The visual contract this issue establishes: "…" means actions, a white pin
+// means pinned, and an unpinned row carries no pin at all. Pinning stopped being
+// a click on the pin and became a menu item; nothing in the menu may select a
+// conversation, navigate, or change what is read.
+
+describe("ChatSidebar — row action menu", () => {
+  const channel = (id: string, overrides: Partial<Channel> = {}): Channel => ({
+    id,
+    name: id,
+    type: "public",
+    canWrite: true,
+    ...overrides,
+  });
+  const dm = (
+    id: string,
+    type: "1:1" | "group",
+    overrides: Partial<DMConversation> = {},
+  ): DMConversation => ({
+    id,
+    type,
+    name: id,
+    participants: [],
+    ...overrides,
+  });
+
+  const readyState = (channels: Channel[], dms: DMConversation[]) => ({
+    status: "ready" as const,
+    currentUserId: "user-a",
+    workspaceId: "workspace-1",
+    channels,
+    dms,
+    categories: [] as ChannelCategory[],
+  });
+
+  interface RenderOptions {
+    channels?: Channel[];
+    dms?: DMConversation[];
+    path?: string;
+    setPinned?: (
+      target: { kind: "channel" | "dm"; targetId: string },
+      pinned: boolean,
+    ) => Promise<void>;
+    markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
+    renameChannel?: (channelId: string, displayName: string) => Promise<void>;
+  }
+
+  const renderSidebar = ({
+    channels = [],
+    dms = [],
+    path = "/chat",
+    setPinned = vi.fn().mockResolvedValue(undefined),
+    markRead = vi.fn(),
+    renameChannel = vi.fn().mockResolvedValue(undefined),
+  }: RenderOptions = {}) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <ChatSidebar
+          state={readyState(channels, dms)}
+          retry={() => {}}
+          setPinned={setPinned}
+          markRead={markRead}
+          renameChannel={renameChannel}
+        />
+      </MemoryRouter>,
+    );
+
+  const trigger = (name: string) =>
+    screen.getByRole("button", { name: `Mais opções para ${name}` });
+
+  // ── The pin is state, not an action ────────────────────────────────────────
+
+  it("draws no pin at all on an unpinned row", () => {
+    renderSidebar({ channels: [channel("geral")], dms: [dm("Juliane", "1:1")] });
+
+    expect(screen.queryAllByTestId("chat-sidebar-pinned")).toHaveLength(0);
+    expect(screen.getByRole("option", { name: "Canal geral" })).toBeInTheDocument();
+  });
+
+  it("draws a pin on a pinned row and says so in the row's accessible name", () => {
+    renderSidebar({ channels: [channel("geral", { pinnedAt: "2026-08-12T10:00:00Z" })] });
+
+    expect(screen.getAllByTestId("chat-sidebar-pinned")).toHaveLength(1);
+    expect(screen.getByRole("option", { name: "Canal geral, fixado" })).toBeInTheDocument();
+  });
+
+  // The pin used to be the way to unpin. It must not be reachable as a control
+  // any more — not by role, and not by tabbing.
+  it("leaves the pin out of the accessibility tree as a control", () => {
+    renderSidebar({ channels: [channel("geral", { pinnedAt: "2026-08-12T10:00:00Z" })] });
+
+    expect(screen.queryByRole("button", { name: /desafixar/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /fixar/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-sidebar-pinned")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  // ── The trigger ────────────────────────────────────────────────────────────
+
+  it("names the trigger after the conversation and declares its popup", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral")] });
+
+    const button = trigger("canal geral");
+    expect(button).toHaveAttribute("aria-haspopup", "menu");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(button).not.toHaveAccessibleName("...");
+
+    await user.click(button);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(button).toHaveAttribute("aria-controls", screen.getByRole("menu").id);
+  });
+
+  it("keeps at most one menu open across rows", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral"), channel("infra")] });
+
+    await user.click(trigger("canal geral"));
+    await user.click(trigger("canal infra"));
+
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+    expect(trigger("canal geral")).toHaveAttribute("aria-expanded", "false");
+    expect(trigger("canal infra")).toHaveAttribute("aria-expanded", "true");
+  });
+
+  // ── The menu's contents ────────────────────────────────────────────────────
+
+  it("offers Fixar no topo on an unpinned row and Desafixar on a pinned one", async () => {
+    const user = userEvent.setup();
+    const setPinned = vi.fn().mockResolvedValue(undefined);
+    const { unmount } = renderSidebar({ channels: [channel("geral")], setPinned });
+
+    await user.click(trigger("canal geral"));
+    expect(screen.getByRole("menuitem", { name: "Fixar no topo" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Desafixar" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Fixar no topo" }));
+    expect(setPinned).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" }, true);
+    unmount();
+
+    const unpin = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({
+      channels: [channel("geral", { pinnedAt: "2026-08-12T10:00:00Z" })],
+      setPinned: unpin,
+    });
+    await user.click(trigger("canal geral"));
+    expect(screen.getByRole("menuitem", { name: "Desafixar" })).toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Desafixar" }));
+    expect(unpin).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" }, false);
+  });
+
+  // A group is a chat.dm_conversations row: its pin goes to the DM endpoint.
+  it("pins a group through the DM endpoint", async () => {
+    const user = userEvent.setup();
+    const setPinned = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({ dms: [dm("Equipe Infra", "group")], setPinned });
+
+    await user.click(trigger("grupo Equipe Infra"));
+    await user.click(screen.getByRole("menuitem", { name: "Fixar no topo" }));
+
+    expect(setPinned).toHaveBeenCalledWith({ kind: "dm", targetId: "Equipe Infra" }, true);
+  });
+
+  it("never offers Sair on a 1:1 conversation", async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      dms: [dm("Juliane", "1:1", { unreadCount: 4, pinnedAt: "2026-08-12T10:00:00Z" })],
+    });
+
+    await user.click(trigger("conversa com Juliane"));
+
+    expect(screen.queryByRole("menuitem", { name: /sair/i })).not.toBeInTheDocument();
+  });
+
+  // Nothing the backend cannot do may appear, on any kind of row.
+  it("offers no action the backend does not implement", async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      channels: [channel("geral", { canRename: true, unreadCount: 2 })],
+      dms: [dm("Equipe", "group", { unreadCount: 1 }), dm("Juliane", "1:1", { unreadCount: 1 })],
+    });
+
+    for (const name of ["canal geral", "grupo Equipe", "conversa com Juliane"]) {
+      await user.click(trigger(name));
+      for (const absent of [/sair/i, /arquivar/i, /silenciar/i, /detalhes/i]) {
+        expect(screen.queryByRole("menuitem", { name: absent })).not.toBeInTheDocument();
+      }
+      await user.keyboard("{Escape}");
+    }
+  });
+
+  it("shows Renomear canal only when the server said this caller may rename", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral", { canRename: true }), channel("infra")] });
+
+    await user.click(trigger("canal geral"));
+    expect(screen.getByRole("menuitem", { name: "Renomear canal" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+
+    await user.click(trigger("canal infra"));
+    expect(screen.queryByRole("menuitem", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  // ISSUE #527 — a categorized channel comes from the categories endpoint, whose
+  // payload once omitted can_rename entirely. The row must offer the same menu
+  // wherever the channel is filed.
+  it("shows Renomear canal on a categorized channel too", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            workspaceId: "workspace-1",
+            channels: [channel("infra", { canRename: true, categoryId: "cat-1" })],
+            dms: [],
+            categories: [{ id: "cat-1", name: "Projetos", kind: "category" }],
+          }}
+          retry={() => {}}
+          setPinned={vi.fn().mockResolvedValue(undefined)}
+          markRead={vi.fn()}
+          renameChannel={vi.fn().mockResolvedValue(undefined)}
+        />
+      </MemoryRouter>,
+    );
+
+    // The channel really is rendered under its category, not in a flat list.
+    expect(screen.getByRole("button", { name: /Projetos/ })).toBeInTheDocument();
+
+    await user.click(trigger("canal infra"));
+    expect(screen.getByRole("menuitem", { name: "Renomear canal" })).toBeInTheDocument();
+  });
+
+  // The same categorized row, for a caller the server did not authorize. The
+  // capability is the only thing that decides what the menu shows — the category
+  // never grants or withholds it.
+  it("omits Renomear canal on a categorized channel the server did not authorize", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            workspaceId: "workspace-1",
+            channels: [channel("infra", { canRename: false, categoryId: "cat-1" })],
+            dms: [],
+            categories: [{ id: "cat-1", name: "Projetos", kind: "category" }],
+          }}
+          retry={() => {}}
+          setPinned={vi.fn().mockResolvedValue(undefined)}
+          markRead={vi.fn()}
+          renameChannel={vi.fn().mockResolvedValue(undefined)}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("button", { name: /Projetos/ })).toBeInTheDocument();
+
+    await user.click(trigger("canal infra"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  it("offers Marcar como lido only when the row has unread messages", async () => {
+    const user = userEvent.setup();
+    const markRead = vi.fn();
+    renderSidebar({ channels: [channel("geral", { unreadCount: 3 }), channel("infra")], markRead });
+
+    await user.click(trigger("canal infra"));
+    expect(screen.queryByRole("menuitem", { name: "Marcar como lido" })).not.toBeInTheDocument();
+    await user.keyboard("{Escape}");
+
+    await user.click(trigger("canal geral"));
+    await user.click(screen.getByRole("menuitem", { name: "Marcar como lido" }));
+    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" });
+  });
+
+  // ── Nothing here selects, navigates or reads ───────────────────────────────
+
+  it("does not select the conversation when the trigger is used", async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      channels: [channel("geral"), channel("infra")],
+      path: "/chat/channel/infra",
+    });
+
+    await user.click(trigger("canal geral"));
+
+    expect(screen.getByRole("option", { name: "Canal infra" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("option", { name: "Canal geral" })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+  });
+
+  it("does not select the conversation when a menu action runs", async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      channels: [channel("geral"), channel("infra")],
+      path: "/chat/channel/infra",
+    });
+
+    await user.click(trigger("canal geral"));
+    await user.click(screen.getByRole("menuitem", { name: "Fixar no topo" }));
+
+    expect(screen.getByRole("option", { name: "Canal infra" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  // Opening a menu is not reading a conversation. The badge is what would betray
+  // it, and markRead is the only thing allowed to clear it.
+  it("leaves the unread badge alone while the menu is merely open", async () => {
+    const user = userEvent.setup();
+    const markRead = vi.fn();
+    renderSidebar({ channels: [channel("geral", { unreadCount: 7 })], markRead });
+
+    await user.click(trigger("canal geral"));
+
+    expect(screen.getByLabelText("7 não lidas")).toBeInTheDocument();
+    expect(markRead).not.toHaveBeenCalled();
+  });
+
+  // ── Keyboard ───────────────────────────────────────────────────────────────
+
+  it("opens with Enter and with Space, and closes on Escape returning focus", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral")] });
+    const button = trigger("canal geral");
+
+    button.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(button).toHaveFocus();
+
+    await user.keyboard(" ");
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(button).toHaveFocus();
+  });
+
+  it("moves between items with the arrow keys and runs one with Enter", async () => {
+    const user = userEvent.setup();
+    const setPinned = vi.fn().mockResolvedValue(undefined);
+    const markRead = vi.fn();
+    renderSidebar({ channels: [channel("geral", { unreadCount: 2 })], setPinned, markRead });
+
+    trigger("canal geral").focus();
+    await user.keyboard("{Enter}");
+    // Focus opens on the first item.
+    expect(screen.getByRole("menuitem", { name: "Fixar no topo" })).toHaveFocus();
+
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByRole("menuitem", { name: "Marcar como lido" })).toHaveFocus();
+    await user.keyboard("{ArrowUp}");
+    expect(screen.getByRole("menuitem", { name: "Fixar no topo" })).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    expect(setPinned).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" }, true);
+    expect(markRead).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the trigger after an action runs", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral")] });
+    const button = trigger("canal geral");
+
+    button.focus();
+    await user.keyboard("{Enter}");
+    await user.keyboard("{Enter}");
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(button).toHaveFocus();
+  });
+
+  // The menu is not a focus trap: Tab out of it closes it and focus moves on.
+  it("does not trap Tab inside the menu", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("geral"), channel("infra")] });
+
+    trigger("canal geral").focus();
+    await user.keyboard("{Enter}");
+    await user.tab();
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  // ── Reordering (#474 is preserved) ─────────────────────────────────────────
+
+  it("reorders on pin and on unpin, without duplicating the row", async () => {
+    const user = userEvent.setup();
+    const older = { lastMessageAt: "2026-07-01T00:00:00Z" };
+    const newer = { lastMessageAt: "2026-07-31T00:00:00Z" };
+    const { rerender } = renderSidebar({
+      channels: [channel("antigo", older), channel("novo", newer)],
+    });
+
+    expect(
+      within(screen.getByRole("region", { name: "Canais" }))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("aria-label")),
+    ).toEqual(["Canal novo", "Canal antigo"]);
+
+    // What the hook's optimistic pin_changed produces.
+    rerender(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={readyState(
+            [
+              channel("antigo", { ...older, pinnedAt: "0001-01-01T00:00:00Z" }),
+              channel("novo", newer),
+            ],
+            [],
+          )}
+          retry={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const pinnedOrder = within(screen.getByRole("region", { name: "Canais" }))
+      .getAllByRole("option")
+      .map((option) => option.getAttribute("aria-label"));
+    expect(pinnedOrder).toEqual(["Canal antigo, fixado", "Canal novo"]);
+    expect(screen.getAllByTestId("chat-sidebar-pinned")).toHaveLength(1);
+
+    // And back, on unpin.
+    rerender(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={readyState([channel("antigo", older), channel("novo", newer)], [])}
+          retry={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Canais" }))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("aria-label")),
+    ).toEqual(["Canal novo", "Canal antigo"]);
+    expect(screen.queryAllByTestId("chat-sidebar-pinned")).toHaveLength(0);
+    await user.click(trigger("canal novo"));
+    expect(screen.getByRole("menuitem", { name: "Fixar no topo" })).toBeInTheDocument();
+  });
+
+  // A rejected pin must not leave the row claiming a state the server refused.
+  // The hook owns the rollback; the sidebar's job is to surface the failure.
+  it("reports a failed pin instead of leaving the row pinned", async () => {
+    const user = userEvent.setup();
+    const setPinned = vi.fn().mockRejectedValue(new Error("nope"));
+    renderSidebar({ channels: [channel("geral")], setPinned });
+
+    await user.click(trigger("canal geral"));
+    await user.click(screen.getByRole("menuitem", { name: "Fixar no topo" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/fixac/i);
+    expect(screen.queryAllByTestId("chat-sidebar-pinned")).toHaveLength(0);
+  });
+});
+
+// ── Rename dialog (ISSUE #527) ───────────────────────────────────────────────
+
+describe("ChatSidebar — renaming a channel", () => {
+  const renameable = (overrides: Partial<Channel> = {}): Channel => ({
+    id: "ch-1",
+    name: "infra",
+    type: "public",
+    canWrite: true,
+    canRename: true,
+    ...overrides,
+  });
+
+  const renderWithRename = (
+    renameChannel: (channelId: string, displayName: string) => Promise<void>,
+    channels: Channel[] = [renameable()],
+    path = "/chat",
+  ) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <ChatSidebar
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            workspaceId: "workspace-1",
+            channels,
+            dms: [],
+            categories: [],
+          }}
+          retry={() => {}}
+          setPinned={vi.fn().mockResolvedValue(undefined)}
+          markRead={vi.fn()}
+          renameChannel={renameChannel}
+        />
+      </MemoryRouter>,
+    );
+
+  const openDialog = async (user: ReturnType<typeof userEvent.setup>, name = "canal infra") => {
+    await user.click(screen.getByRole("button", { name: `Mais opções para ${name}` }));
+    await user.click(screen.getByRole("menuitem", { name: "Renomear canal" }));
+  };
+
+  it("opens seeded with the current name, without selecting or navigating", async () => {
+    const user = userEvent.setup();
+    renderWithRename(
+      vi.fn().mockResolvedValue(undefined),
+      [renameable(), renameable({ id: "ch-2", name: "geral" })],
+      "/chat/channel/ch-2",
+    );
+
+    await openDialog(user);
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByLabelText("Nome do canal")).toHaveValue("infra");
+    expect(within(dialog).getByLabelText("Nome do canal")).toHaveFocus();
+    // The menu closed, and the open conversation did not change.
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Canal geral" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("submits the typed name and closes", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    const field = screen.getByLabelText("Nome do canal");
+    await user.clear(field);
+    await user.type(field, "  Plataforma  ");
+    await user.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(renameChannel).toHaveBeenCalledWith("ch-1", "Plataforma");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("cancels without calling the server", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    await user.click(screen.getByRole("button", { name: "Cancelar" }));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(renameChannel).not.toHaveBeenCalled();
+  });
+
+  it("closes on Escape without calling the server", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(renameChannel).not.toHaveBeenCalled();
+  });
+
+  it("refuses an empty name locally and associates the message with the field", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    const field = screen.getByLabelText("Nome do canal");
+    await user.clear(field);
+    await user.type(field, "   ");
+    await user.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(renameChannel).not.toHaveBeenCalled();
+    const error = screen.getByRole("alert");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  // A refusal keeps the dialog open, recoverable, and showing the typed name —
+  // never the UI claiming a name the server did not persist.
+  it("keeps the dialog usable when the server refuses", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi
+      .fn()
+      .mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    const field = screen.getByLabelText("Nome do canal");
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    await user.click(screen.getByRole("button", { name: "Salvar" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/permissão/i);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByLabelText("Nome do canal")).toHaveValue("Plataforma");
+    // The sidebar still shows the persisted name.
+    expect(screen.getByRole("option", { name: "Canal infra" })).toBeInTheDocument();
+  });
+
+  it("submits once however many times Salvar is pressed", async () => {
+    const user = userEvent.setup();
+    let release: (() => void) | undefined;
+    const renameChannel = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = () => resolve();
+        }),
+    );
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    const field = screen.getByLabelText("Nome do canal");
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    const save = screen.getByRole("button", { name: "Salvar" });
+    await user.click(save);
+
+    // While in flight the controls are disabled and announced as busy.
+    const busy = screen.getByRole("button", { name: "Salvando…" });
+    expect(busy).toBeDisabled();
+    expect(busy).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled();
+    await user.click(busy);
+    expect(renameChannel).toHaveBeenCalledTimes(1);
+
+    release?.();
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  // A refetch that drops the channel — access revoked, archived — must not leave
+  // a dialog open over a conversation that no longer exists.
+  it("closes when the channel disappears from the canonical list", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = renderWithRename(renameChannel);
+
+    await openDialog(user);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar
+          state={{
+            status: "ready",
+            currentUserId: "user-a",
+            workspaceId: "workspace-1",
+            channels: [],
+            dms: [],
+            categories: [],
+          }}
+          retry={() => {}}
+          renameChannel={renameChannel}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 });

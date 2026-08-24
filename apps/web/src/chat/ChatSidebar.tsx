@@ -4,6 +4,15 @@ import { Link, useLocation, useNavigate } from "react-router";
 import "./ChatSidebar.css";
 import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
+import ConversationActionsMenu from "./ConversationActionsMenu";
+import {
+  actionsTriggerLabel,
+  conversationActions,
+  pinTargetKind,
+  type ConversationActionId,
+  type ConversationTarget,
+} from "./conversationActions";
+import RenameChannelDialog from "./RenameChannelDialog";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
 import { PersonAvatarImage } from "./PersonAvatarImage";
@@ -12,18 +21,24 @@ import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } fro
 import { sortByActivity } from "./sidebarOrder";
 import type { SidebarState } from "./useChatSidebar";
 
-function IconPin() {
+/**
+ * The pinned indicator (issue #527).
+ *
+ * A pin is now *state* and never an action: it is drawn only on a pinned row,
+ * it is filled white so it reads as "on" without depending on colour alone, and
+ * it is `aria-hidden` because the row's own accessible name already says
+ * "fixado". Unpinning happens in the "…" menu, like every other action.
+ *
+ * An unpinned row draws nothing here — no ghost pin, no reserved outline — which
+ * is what makes "has a pin" mean exactly one thing on screen.
+ */
+function PinnedIndicator() {
   return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      className="chat-sidebar__icon"
-      aria-hidden="true"
-    >
-      <path d="M12 17v5M7 3h10l-2 5v4l3 3H6l3-3V8L7 3Z" />
-    </svg>
+    <span className="chat-sidebar__pinned" aria-hidden="true" data-testid="chat-sidebar-pinned">
+      <svg viewBox="0 0 24 24" fill="currentColor" className="chat-sidebar__icon" focusable="false">
+        <path d="M12 17v5M7 3h10l-2 5v4l3 3H6l3-3V8L7 3Z" />
+      </svg>
+    </span>
   );
 }
 
@@ -295,6 +310,71 @@ function unreadBadgeLabel(count: number, hasMentionUnread?: boolean): string {
   return hasMentionUnread ? `${count} não lidas, incluindo menção` : `${count} não lidas`;
 }
 
+// ── Row actions ───────────────────────────────────────────────────────────────
+
+/**
+ * What every row needs to draw its "…" menu, threaded through the two list
+ * components unchanged.
+ *
+ * `openTargetKey` is the identity of the single open menu — `type:id` — held by
+ * the sidebar rather than by each row, so at most one popup exists in the tree
+ * at a time and a reorder or a category collapse cannot leave an orphan one
+ * behind: the row that owns it simply stops matching.
+ */
+interface RowActionsProps {
+  openTargetKey: string | null;
+  onOpenChange: (key: string, open: boolean) => void;
+  onAction: (target: ConversationTarget, action: ConversationActionId) => void;
+}
+
+function targetKey(target: ConversationTarget): string {
+  return `${target.kind}:${target.id}`;
+}
+
+/**
+ * One row's trailing controls: the pinned state, then the actions menu.
+ *
+ * Both live outside the row's `role="option"` button — a control inside an
+ * option is neither valid nor reachable — and the container reserves its width
+ * unconditionally, so a menu appearing on hover cannot shift the name, the
+ * avatar or the unread badge by a pixel.
+ */
+function RowActions({
+  target,
+  openTargetKey,
+  onOpenChange,
+  onAction,
+}: RowActionsProps & { target: ConversationTarget }) {
+  const key = targetKey(target);
+  return (
+    <>
+      {target.pinned && <PinnedIndicator />}
+      <ConversationActionsMenu
+        triggerLabel={actionsTriggerLabel(target)}
+        actions={conversationActions(target)}
+        open={openTargetKey === key}
+        onOpenChange={(open) => onOpenChange(key, open)}
+        onAction={(action) => onAction(target, action)}
+      />
+    </>
+  );
+}
+
+function hasUnread(count: number | undefined): boolean {
+  return count != null && count > 0;
+}
+
+/**
+ * The row's accessible name carries the pinned state in words.
+ *
+ * That is what lets the pin itself stay decorative: a screen-reader user hears
+ * "Canal geral, fixado" from the one element that is actually in the listbox,
+ * instead of meeting a second focusable control whose only job is to say so.
+ */
+function withPinnedSuffix(label: string, pinned: boolean): string {
+  return pinned ? `${label}, fixado` : label;
+}
+
 // ── Channel list ──────────────────────────────────────────────────────────────
 
 interface ChannelListProps {
@@ -302,10 +382,10 @@ interface ChannelListProps {
   activeChannelId: string | undefined;
   onSelect: (id: string) => void;
   labelId: string;
-  onPin: (id: string, pinned: boolean) => void;
+  actions: RowActionsProps;
 }
 
-function ChannelList({ channels, activeChannelId, onSelect, labelId, onPin }: ChannelListProps) {
+function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: ChannelListProps) {
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -318,13 +398,24 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, onPin }: Ch
     <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
       {channels.map((ch) => {
         const isActive = ch.id === activeChannelId;
+        const target: ConversationTarget = {
+          kind: "channel",
+          id: ch.id,
+          name: ch.name,
+          pinned: Boolean(ch.pinnedAt),
+          canRename: ch.canRename,
+          hasUnread: hasUnread(ch.unreadCount),
+        };
         return (
           <div key={ch.id} className="chat-sidebar__item-row">
             <button
               type="button"
               role="option"
               aria-selected={isActive}
-              aria-label={`Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`}
+              aria-label={withPinnedSuffix(
+                `Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`,
+                target.pinned,
+              )}
               className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
               onClick={() => onSelect(ch.id)}
             >
@@ -349,16 +440,7 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, onPin }: Ch
                 </span>
               )}
             </button>
-            <button
-              type="button"
-              className="chat-sidebar__pin-action"
-              aria-pressed={Boolean(ch.pinnedAt)}
-              aria-label={ch.pinnedAt ? `Desafixar ${ch.name}` : `Fixar ${ch.name} no topo`}
-              title={ch.pinnedAt ? "Desafixar" : "Fixar no topo"}
-              onClick={() => onPin(ch.id, Boolean(ch.pinnedAt))}
-            >
-              <IconPin />
-            </button>
+            <RowActions target={target} {...actions} />
           </div>
         );
       })}
@@ -375,7 +457,7 @@ interface DMListProps {
   onSelect: (id: string) => void;
   labelId: string;
   emptyMessage: string;
-  onPin: (id: string, pinned: boolean) => void;
+  actions: RowActionsProps;
 }
 
 /**
@@ -391,12 +473,12 @@ function DMRow({
   dm,
   isActive,
   onSelect,
-  onPin,
+  actions,
 }: {
   dm: DMConversation;
   isActive: boolean;
   onSelect: (id: string) => void;
-  onPin: (id: string, pinned: boolean) => void;
+  actions: RowActionsProps;
 }) {
   const isGroup = dm.type === "group";
   const counterpart = dm.counterpart;
@@ -412,6 +494,16 @@ function DMRow({
   // and it is why the avatar does not need to become a focusable control to
   // make the state reachable by keyboard.
   const label = presence === "unknown" ? baseLabel : `${baseLabel}, ${presenceLabel(presence)}`;
+  // A group is a group and a 1:1 is a 1:1, from the server's own discriminator —
+  // the same value partitionDMs filed this row under. It is what keeps "Sair"
+  // out of a direct conversation structurally rather than by a check at the end.
+  const target: ConversationTarget = {
+    kind: isGroup ? "group" : "dm",
+    id: dm.id,
+    name: dm.name,
+    pinned: Boolean(dm.pinnedAt),
+    hasUnread: hasUnread(dm.unreadCount),
+  };
 
   return (
     <div className="chat-sidebar__item-row">
@@ -419,7 +511,7 @@ function DMRow({
         type="button"
         role="option"
         aria-selected={isActive}
-        aria-label={label}
+        aria-label={withPinnedSuffix(label, target.pinned)}
         className={`chat-sidebar__dm-item${isActive ? " chat-sidebar__dm-item--active" : ""}`}
         onClick={() => onSelect(dm.id)}
       >
@@ -455,21 +547,12 @@ function DMRow({
           </span>
         )}
       </button>
-      <button
-        type="button"
-        className="chat-sidebar__pin-action"
-        aria-pressed={Boolean(dm.pinnedAt)}
-        aria-label={dm.pinnedAt ? `Desafixar ${dm.name}` : `Fixar ${dm.name} no topo`}
-        title={dm.pinnedAt ? "Desafixar" : "Fixar no topo"}
-        onClick={() => onPin(dm.id, Boolean(dm.pinnedAt))}
-      >
-        <IconPin />
-      </button>
+      <RowActions target={target} {...actions} />
     </div>
   );
 }
 
-function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onPin }: DMListProps) {
+function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: DMListProps) {
   if (dms.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -486,10 +569,51 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, onPin }: DML
           dm={dm}
           isActive={dm.id === activeDMId}
           onSelect={onSelect}
-          onPin={onPin}
+          actions={actions}
         />
       ))}
     </div>
+  );
+}
+
+// ── Rename dialog host ────────────────────────────────────────────────────────
+
+/**
+ * Resolves the channel a rename dialog is open for, and renders nothing when
+ * there is none (issue #527).
+ *
+ * The name is read from the canonical list rather than captured when the menu
+ * item was chosen, so the field is seeded from the same value the row shows —
+ * and a channel the refetch removed (access revoked, archived) closes its dialog
+ * instead of leaving a stale one open over a conversation that no longer exists.
+ *
+ * Its own component so ChatSidebar keeps one element here instead of a
+ * three-way conditional, which is the shape that turns a container into a God
+ * component one action at a time.
+ */
+function SidebarRenameDialog({
+  channels,
+  channelId,
+  onClose,
+  onRename,
+}: {
+  channels: Channel[] | undefined;
+  channelId: string | null;
+  onClose: () => void;
+  onRename?: (channelId: string, displayName: string) => Promise<void>;
+}) {
+  const channel = channels?.find((candidate) => candidate.id === channelId);
+  if (!channel || !onRename) return null;
+  return (
+    <RenameChannelDialog
+      // Keyed by channel so switching targets remounts with the right name
+      // rather than keeping the previous edit in the field.
+      key={channel.id}
+      channelId={channel.id}
+      currentName={channel.name}
+      onClose={onClose}
+      onRename={onRename}
+    />
   );
 }
 
@@ -589,6 +713,10 @@ interface ChatSidebarProps {
     target: { kind: "channel" | "dm"; targetId: string },
     pinned: boolean,
   ) => Promise<void>;
+  /** Clears a conversation's unread badge without opening it (issue #527). */
+  markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
+  /** Persists a channel's new name; rejects with the API error (issue #527). */
+  renameChannel?: (channelId: string, displayName: string) => Promise<void>;
 }
 
 // Static because the sidebar is mounted once per app; each heading owns the id
@@ -597,7 +725,13 @@ const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
 const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
 const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
 
-export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProps) {
+export default function ChatSidebar({
+  state,
+  retry,
+  setPinned,
+  markRead,
+  renameChannel,
+}: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
   // One dialog, one trigger, one piece of open state: two of them could be open
@@ -615,6 +749,16 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
   const [pinError, setPinError] = useState("");
+  // One open menu for the whole sidebar, identified by `type:id` (issue #527).
+  // Holding it here rather than per row is what keeps forty rows from mounting
+  // forty popovers and forty document listeners, and it makes "the anchor stopped
+  // existing" — a reorder, a collapsed category, a conversation the refetch
+  // dropped — resolve itself: no row matches the key any more, so nothing renders.
+  const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
+  // The channel a rename dialog is open for, by id. The name is read from the
+  // canonical list at render time rather than captured here, so the field is
+  // seeded from the same value the row shows.
+  const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
@@ -701,6 +845,37 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
     );
   }
 
+  function handleMenuOpenChange(key: string, open: boolean) {
+    // A single slot, so opening one row's menu closes any other by construction.
+    setOpenMenuKey(open ? key : (current) => (current === key ? null : current));
+  }
+
+  /**
+   * Runs one menu action against one target.
+   *
+   * A table rather than a cascade of ifs, and deliberately the only place that
+   * maps an action id to an effect. None of these navigates, changes the
+   * selection or touches the composer: pinning is the #474 hook's own optimistic
+   * write and rollback, marking read is the same pair the navigation effect
+   * performs, and renaming only opens a dialog.
+   */
+  function handleAction(target: ConversationTarget, action: ConversationActionId) {
+    const pinTarget = { kind: pinTargetKind(target.kind), targetId: target.id };
+    const effects: Record<ConversationActionId, () => void> = {
+      pin: () => handlePin(pinTarget.kind, target.id, false),
+      unpin: () => handlePin(pinTarget.kind, target.id, true),
+      "mark-read": () => markRead?.(pinTarget),
+      rename: () => setRenamingChannelId(target.id),
+    };
+    effects[action]();
+  }
+
+  const rowActions: RowActionsProps = {
+    openTargetKey: openMenuKey,
+    onOpenChange: handleMenuOpenChange,
+    onAction: handleAction,
+  };
+
   function closeNewConversation() {
     restoreFocusRef.current = true;
     setNewConversationOpen(false);
@@ -780,7 +955,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
                   activeChannelId={activeChannelId}
                   onSelect={handleChannelSelect}
                   labelId={CHANNELS_LABEL_ID}
-                  onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                  actions={rowActions}
                 />
               ) : (
                 <div className="chat-sidebar__categories-list">
@@ -811,7 +986,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
                               activeChannelId={activeChannelId}
                               onSelect={handleChannelSelect}
                               labelId={headerId}
-                              onPin={(id, pinned) => handlePin("channel", id, pinned)}
+                              actions={rowActions}
                             />
                           </div>
                         )}
@@ -829,7 +1004,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
                 onSelect={handleDMSelect}
                 labelId={DIRECTS_LABEL_ID}
                 emptyMessage="Nenhuma mensagem direta."
-                onPin={(id, pinned) => handlePin("dm", id, pinned)}
+                actions={rowActions}
               />
             </Section>
 
@@ -840,7 +1015,7 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
                 onSelect={handleDMSelect}
                 labelId={GROUPS_LABEL_ID}
                 emptyMessage="Nenhum grupo."
-                onPin={(id, pinned) => handlePin("dm", id, pinned)}
+                actions={rowActions}
               />
             </Section>
           </>
@@ -868,6 +1043,12 @@ export default function ChatSidebar({ state, retry, setPinned }: ChatSidebarProp
         </Link>
         <SidebarUser />
       </div>
+      <SidebarRenameDialog
+        channels={channels}
+        channelId={renamingChannelId}
+        onClose={() => setRenamingChannelId(null)}
+        onRename={renameChannel}
+      />
       {newConversationOpen && state.status === "ready" && (
         <NewConversationDialog
           currentUserId={state.currentUserId}

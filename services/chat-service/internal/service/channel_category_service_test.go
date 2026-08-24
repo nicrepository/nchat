@@ -738,3 +738,128 @@ func TestChannelCategoryService_ListPropagatesStorageFailures(t *testing.T) {
 		}
 	})
 }
+
+// ── Rename capability on categorized channels (issue #527) ───────────────────
+//
+// The grouped listing is what the client reads for every channel that sits in a
+// category, so a capability the sidebar publishes and this endpoint omits is a
+// capability the user never sees. These assert the two listings answer with the
+// one predicate, for every role.
+
+func TestChannelCategoryService_GroupedChannelsCarryTheRenameCapability(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		userID string
+		want   bool
+	}{
+		{name: "owner", userID: categoryOwnerID, want: true},
+		{name: "admin", userID: categoryAdminID, want: true},
+		// RF-74's workspace moderator moderates structure and membership;
+		// changing what a channel *is* stays administration.
+		{name: "moderator", userID: categoryModeratorID},
+		{name: "member", userID: categoryMemberID},
+		{name: "guest", userID: categoryGuestID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			channels := &fakeVisibleChannelStore{accesses: []storage.VisibleChannelAccess{
+				visibleChannel("ch-cat", "infra", "cat-1", domain.ChannelTypePublic, nil),
+				visibleChannel("ch-flat", "avulso", "", domain.ChannelTypePublic, nil),
+			}}
+			categories := &fakeCategoryStore{
+				categories: []domain.ChannelCategory{{ID: "cat-1", WorkspaceID: categoryWorkspaceID, Name: "Projetos"}},
+			}
+			groups, err := newCategoryService(categories, channels).
+				ListGroupedChannels(context.Background(), categoryWorkspaceID, test.userID)
+			if err != nil {
+				t.Fatalf("ListGroupedChannels: %v", err)
+			}
+			categorized := findGroupedChannel(t, groups, "ch-cat")
+			if categorized.CanRename != test.want {
+				t.Fatalf("categorized CanRename = %v for %s, want %v", categorized.CanRename, test.name, test.want)
+			}
+			// The uncategorized group travels through the same computation, so
+			// the two must not disagree about the same caller.
+			uncategorized := findGroupedChannel(t, groups, "ch-flat")
+			if uncategorized.CanRename != test.want {
+				t.Fatalf("uncategorized CanRename = %v for %s, want %v", uncategorized.CanRename, test.name, test.want)
+			}
+		})
+	}
+}
+
+// Adding the rename capability must not have disturbed what the grouped listing
+// already published: the channel identity, its category placement and the write
+// eligibility all still come through, from the same single computation.
+func TestChannelCategoryService_GroupedChannelsKeepTheirOtherAttributes(t *testing.T) {
+	private := visibleChannel("ch-priv", "privado", "cat-1", domain.ChannelTypePrivate, nil)
+	public := visibleChannel("ch-pub", "publico", "cat-1", domain.ChannelTypePublic, nil)
+	channels := &fakeVisibleChannelStore{accesses: []storage.VisibleChannelAccess{private, public}}
+	categories := &fakeCategoryStore{
+		categories: []domain.ChannelCategory{{ID: "cat-1", WorkspaceID: categoryWorkspaceID, Name: "Projetos"}},
+	}
+
+	groups, err := newCategoryService(categories, channels).
+		ListGroupedChannels(context.Background(), categoryWorkspaceID, categoryAdminID)
+	if err != nil {
+		t.Fatalf("ListGroupedChannels: %v", err)
+	}
+
+	// A private channel an admin holds no channel_members row for stays
+	// unwritable — CanRename is a different question with a different answer, and
+	// adding it must not have widened this one.
+	priv := findGroupedChannel(t, groups, "ch-priv")
+	if priv.CanWrite {
+		t.Fatal("CanWrite = true for a private channel the caller does not belong to")
+	}
+	if !priv.CanRename {
+		t.Fatal("CanRename = false for an admin; the two capabilities are independent")
+	}
+	if priv.Channel.Slug != "privado" || priv.Channel.Type != domain.ChannelTypePrivate {
+		t.Fatalf("channel projection lost attributes: %+v", priv.Channel)
+	}
+
+	pub := findGroupedChannel(t, groups, "ch-pub")
+	if !pub.CanWrite || !pub.CanRename {
+		t.Fatalf("public channel = %+v, want both capabilities", pub)
+	}
+	// Placement is still the grouped listing's own job.
+	if groups[1].Category == nil || groups[1].Category.ID != "cat-1" || len(groups[1].Channels) != 2 {
+		t.Fatalf("categorized group = %+v", groups[1])
+	}
+	if len(groups[0].Channels) != 0 {
+		t.Fatalf("uncategorized group should be empty, got %+v", groups[0].Channels)
+	}
+}
+
+// #geral is immutable in the write path, so no role renames it — in either
+// listing.
+func TestChannelCategoryService_GroupedGeneralChannelIsNeverRenameable(t *testing.T) {
+	access := visibleChannel("ch-geral", "geral", "cat-1", domain.ChannelTypePublic, nil)
+	access.Channel.IsGeneral = true
+	channels := &fakeVisibleChannelStore{accesses: []storage.VisibleChannelAccess{access}}
+	categories := &fakeCategoryStore{
+		categories: []domain.ChannelCategory{{ID: "cat-1", WorkspaceID: categoryWorkspaceID, Name: "Projetos"}},
+	}
+
+	groups, err := newCategoryService(categories, channels).
+		ListGroupedChannels(context.Background(), categoryWorkspaceID, categoryOwnerID)
+	if err != nil {
+		t.Fatalf("ListGroupedChannels: %v", err)
+	}
+	if findGroupedChannel(t, groups, "ch-geral").CanRename {
+		t.Fatal("CanRename = true for #geral, which the write path refuses for every role")
+	}
+}
+
+func findGroupedChannel(t *testing.T, groups []service.ChannelCategoryGroup, id string) service.SidebarChannel {
+	t.Helper()
+	for _, group := range groups {
+		for _, channel := range group.Channels {
+			if channel.Channel.ID == id {
+				return channel
+			}
+		}
+	}
+	t.Fatalf("channel %q not present in any group", id)
+	return service.SidebarChannel{}
+}

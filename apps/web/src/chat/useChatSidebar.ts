@@ -2,7 +2,12 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { showBrowserMessageNotification } from "./browserNotification";
-import { fetchSidebarData, markConversationRead, setSidebarConversationPinned } from "./chatApi";
+import {
+  fetchSidebarData,
+  markConversationRead,
+  renameChannel as renameChannelRequest,
+  setSidebarConversationPinned,
+} from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
 import { playMessageSound } from "./messageSound";
@@ -419,6 +424,12 @@ export function useChatSidebar() {
     // A conversation the user was just added to. They are not subscribed to it,
     // so this is the only way they hear about it before a reload.
     onConversationAvailable: refreshSidebar,
+    // A channel was renamed somewhere else (issue #527). The event names the
+    // channel and nothing else, so the only correct response is the same
+    // coalescing refetch membership changes use: the server re-derives what this
+    // user may see, and the row keeps its identity, its pin and its unread badge
+    // because the reducer replaces items by id.
+    onChannelUpdated: refreshSidebar,
     onMessageCreated: (event: WSMessageCreatedEvent) => {
       if (seenRealtimeMessageIds.current.has(event.message_id)) return;
       seenRealtimeMessageIds.current.add(event.message_id);
@@ -540,5 +551,43 @@ export function useChatSidebar() {
     [refreshSidebar, state],
   );
 
-  return { state, retry: load, setPinned };
+  /**
+   * Marks a conversation read without opening it (issue #527).
+   *
+   * Deliberately the same pair the navigation effect above performs — the local
+   * `target_opened` transition plus the server receipt — rather than a second
+   * rule: "this conversation has no unread messages" has one meaning, and a
+   * menu action must not invent another. Nothing here navigates, changes the
+   * selection or touches the composer.
+   *
+   * The receipt is fire-and-forget for the same reason it is on navigation: a
+   * failed write leaves the badge cleared locally until the next refetch
+   * reconciles it, and must never break the sidebar.
+   */
+  const markRead = useCallback((target: WSSubscriptionTarget) => {
+    dispatch({ type: "target_opened", target });
+    void Promise.resolve(markConversationRead(target.kind, target.targetId)).catch(() => {
+      // See above: a failed read receipt is not a UI failure.
+    });
+  }, []);
+
+  /**
+   * Renames a channel and converges every surface that renders its name.
+   *
+   * No optimistic write: unlike a pin — a private preference this user owns —
+   * a rename is a workspace-wide change the server may refuse, and showing a
+   * name that was never persisted is exactly the divergence issue #527 forbids.
+   * The refetch after a confirmed 200 is what updates the sidebar, the open
+   * conversation's header and the outlet context, from the one canonical
+   * source. The error is re-thrown so the dialog can stay open and actionable.
+   */
+  const renameChannel = useCallback(
+    async (channelId: string, displayName: string) => {
+      await renameChannelRequest(channelId, displayName);
+      refreshSidebar();
+    },
+    [refreshSidebar],
+  );
+
+  return { state, retry: load, setPinned, markRead, renameChannel };
 }

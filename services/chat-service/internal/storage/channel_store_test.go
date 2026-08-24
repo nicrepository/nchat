@@ -14,6 +14,21 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
+// expectUpdateChannelPreamble sets up the two statements every UpdateChannel now
+// takes before the write (issue #527 security review): the canonical channel
+// lock — channelmembership.LockChannelSQL, the same first step every membership
+// mutation obeys — and then the actor's workspace-management membership, held
+// FOR SHARE so a concurrent revocation is serialised against the update rather
+// than racing it.
+func expectUpdateChannelPreamble(mock pgxmock.PgxPoolIface, channelID, workspaceID, callerID string) {
+	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+		WithArgs(channelID).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(channelID))
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin'\).*FOR SHARE OF wm`).
+		WithArgs(workspaceID, callerID).
+		WillReturnRows(pgxmock.NewRows([]string{"authorized"}).AddRow(true))
+}
+
 func channelCols() []string {
 	return []string{
 		"id", "workspace_id", "category_id", "slug", "display_name",
@@ -623,13 +638,17 @@ func TestPGXChannelStore_UpdateChannel_WorkspaceBound(t *testing.T) {
 	defer mock.Close()
 
 	now := time.Now()
+	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "ch-1", "ws-1", "owner-1")
 	mock.ExpectQuery(`(?s)UPDATE chat\.channels.*WHERE workspace_id = \$1.*id = \$2.*status = 'active'.*is_general = false`).
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team-updates", "Team Updates", "public", 20).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "cat-1", "team-updates", "Team Updates", "public", "active", false, 20, "owner-1", now, now))
+	mock.ExpectCommit()
 
 	store := storage.NewPGXChannelStore(mock)
 	ch, err := store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", CategoryID: "cat-1", Slug: "team-updates",
 		DisplayName: "Team Updates", Type: domain.ChannelTypePublic, Position: 20,
 	})
@@ -653,6 +672,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateEnsuresMembershipInTransac
 
 	now := time.Now()
 	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "ch-1", "ws-1", "owner-1")
 	mock.ExpectQuery(`UPDATE chat\.channels`).
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
@@ -664,6 +684,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateEnsuresMembershipInTransac
 
 	store := storage.NewPGXChannelStore(mock)
 	ch, err := store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
 		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
 	})
@@ -687,6 +708,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateRollsBackWhenMembershipFai
 
 	now := time.Now()
 	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "ch-1", "ws-1", "owner-1")
 	mock.ExpectQuery(`UPDATE chat\.channels`).
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
@@ -698,6 +720,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateRollsBackWhenMembershipFai
 
 	store := storage.NewPGXChannelStore(mock)
 	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
 		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
 	})
@@ -709,7 +732,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateRollsBackWhenMembershipFai
 	}
 }
 
-func TestPGXChannelStore_UpdateChannel_BeginErrorWhenEnsuringMembership(t *testing.T) {
+func TestPGXChannelStore_UpdateChannel_BeginError(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("pgxmock: %v", err)
@@ -720,6 +743,7 @@ func TestPGXChannelStore_UpdateChannel_BeginErrorWhenEnsuringMembership(t *testi
 
 	store := storage.NewPGXChannelStore(mock)
 	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team",
 		Type: domain.ChannelTypePrivate, EnsureMemberUserID: "owner-1",
 	})
@@ -735,12 +759,15 @@ func TestPGXChannelStore_UpdateChannel_DuplicateSlug(t *testing.T) {
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "ch-1", "ws-1", "owner-1")
 	mock.ExpectQuery(`UPDATE chat\.channels`).
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "existing", "Existing", "public", 0).
 		WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: "channels_workspace_slug_unique"})
 
 	store := storage.NewPGXChannelStore(mock)
 	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "existing", DisplayName: "Existing", Type: domain.ChannelTypePublic,
 	})
 	if !errors.Is(err, domain.ErrDuplicateSlug) {
@@ -755,12 +782,15 @@ func TestPGXChannelStore_UpdateChannel_NotFound(t *testing.T) {
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "missing", "ws-1", "owner-1")
 	mock.ExpectQuery(`UPDATE chat\.channels`).
 		WithArgs("ws-1", "missing", pgxmock.AnyArg(), "team", "Team", "public", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()))
 
 	store := storage.NewPGXChannelStore(mock)
 	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "missing", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
 	})
 	if !errors.Is(err, domain.ErrNotFound) {
@@ -775,16 +805,147 @@ func TestPGXChannelStore_UpdateChannel_CrossWorkspaceCategoryMapsInvalidInput(t 
 	}
 	defer mock.Close()
 
+	mock.ExpectBegin()
+	expectUpdateChannelPreamble(mock, "ch-1", "ws-1", "owner-1")
 	mock.ExpectQuery(`UPDATE chat\.channels`).
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "public", 0).
 		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "channels_workspace_category_fk"})
 
 	store := storage.NewPGXChannelStore(mock)
 	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
 		WorkspaceID: "ws-1", ChannelID: "ch-1", CategoryID: "cat-other", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) {
 		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
+// ── Rename authorization is re-derived at the write (issue #527) ─────────────
+//
+// The service authorizes before the transaction opens. These prove the store
+// does not take that on trust: the membership is read again, inside the
+// transaction, and no row there means no UPDATE.
+
+func TestPGXChannelStore_UpdateChannel_RefusesWithoutACaller(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	// No ExpectBegin: an input with no actor cannot be authorized against
+	// anything, so the transaction never opens.
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The revocation case: the actor was a manager when the service checked and is
+// not one by the time the transaction reads the row again. The UPDATE is never
+// issued and the transaction rolls back, so nothing partial survives.
+func TestPGXChannelStore_UpdateChannel_RefusesWhenAuthorityWasRevoked(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+		WithArgs("ch-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-1"))
+	// No row: the role was demoted, the membership suspended or removed, or the
+	// workspace disabled. The query does not say which.
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*FOR SHARE OF wm`).
+		WithArgs("ws-1", "owner-1").
+		WillReturnRows(pgxmock.NewRows([]string{"authorized"}))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got %v", err)
+	}
+	// ExpectationsWereMet is the assertion that matters: no UPDATE was expected,
+	// so issuing one would fail here.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The channel is pinned first, before the membership is read: a channel that
+// does not exist is not-found, and the actor's authority is never disclosed by
+// the ordering.
+func TestPGXChannelStore_UpdateChannel_NotFoundBeforeAuthorizing(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+		WithArgs("missing").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXChannelStore(mock)
+	_, err = store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
+		WorkspaceID: "ws-1", ChannelID: "missing", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	})
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The allowlist is owner/admin and it is spelled out in SQL, never as
+// `role != 'guest'`: an unrecognised role must fail closed.
+func TestPGXChannelStore_UpdateChannel_AuthorizationSQLIsAnOwnerAdminAllowlist(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+		WithArgs("ch-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-1"))
+	// The pattern is the assertion: an active membership, an active workspace,
+	// the two roles, and the row held FOR SHARE.
+	mock.ExpectQuery(`(?s)wm\.status = 'active'.*wm\.role IN \('owner', 'admin'\).*FOR SHARE OF wm`).
+		WithArgs("ws-1", "owner-1").
+		WillReturnRows(pgxmock.NewRows([]string{"authorized"}).AddRow(true))
+	mock.ExpectQuery(`UPDATE chat\.channels`).
+		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "public", 0).
+		WillReturnRows(pgxmock.NewRows(channelCols()).
+			AddRow("ch-1", "ws-1", "", "team", "Team", "public", "active", false, 0, "owner-1", time.Now(), time.Now()))
+	mock.ExpectCommit()
+
+	store := storage.NewPGXChannelStore(mock)
+	if _, err := store.UpdateChannel(context.Background(), storage.UpdateChannelInput{
+		CallerID:    "owner-1",
+		WorkspaceID: "ws-1", ChannelID: "ch-1", Slug: "team", DisplayName: "Team", Type: domain.ChannelTypePublic,
+	}); err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
