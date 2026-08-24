@@ -6,6 +6,7 @@ import { useSelfProfile } from "../profile/selfProfile";
 import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
+import { PersonAvatarImage } from "./PersonAvatarImage";
 import PresenceDot from "./PresenceDot";
 import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import { sortByActivity } from "./sidebarOrder";
@@ -173,36 +174,12 @@ interface AvatarProps {
 }
 
 function Avatar({ initials, src, color = "purple", status, size = "sm" }: AvatarProps) {
-  // A load failure is scoped to the URL that was current when it happened, so a
-  // change of src must clear it — otherwise an A → B → A cycle would never retry
-  // A. This uses React's "adjust state when a prop changes" pattern (reset during
-  // render, guarded so it runs ONLY when src actually changes, never every
-  // render); an effect would trip react-hooks/set-state-in-effect. An unchanged
-  // src that keeps failing stays on the initials fallback.
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  const [trackedSrc, setTrackedSrc] = useState(src);
-  if (src !== trackedSrc) {
-    setTrackedSrc(src);
-    setFailedSrc(null);
-  }
-  const showImage = Boolean(src) && failedSrc !== src;
-
   return (
     <span
       className={`chat-sidebar__avatar chat-sidebar__avatar--${color} chat-sidebar__avatar--${size}`}
       aria-hidden="true"
     >
-      {showImage ? (
-        <img
-          className="chat-sidebar__avatar-img"
-          src={src}
-          alt=""
-          referrerPolicy="no-referrer"
-          onError={() => setFailedSrc(src ?? null)}
-        />
-      ) : (
-        initials
-      )}
+      <PersonAvatarImage src={src} initials={initials} imgClassName="chat-sidebar__avatar-img" />
       {status && <PresenceDot state={status} size={size} ringColor="var(--cs-sidebar-bg)" />}
     </span>
   );

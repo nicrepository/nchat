@@ -320,6 +320,27 @@ type DMDirectProfile struct {
 // gets this many.
 const MaxDMDetailsParticipants = 30
 
+// CallParticipantProfile is the presentation-only identity of one call
+// participant: canonical user ID, display name, avatar URL. Deliberately
+// slimmer than ChannelMemberProfile/DMParticipantProfile — it carries no
+// role and no presence, because a call tile needs neither and the batch
+// response should return only what issue #612 asks for.
+type CallParticipantProfile struct {
+	UserID      string
+	DisplayName string
+	AvatarURL   string
+}
+
+// MaxCallParticipantProfileIDs bounds one call-participant-profile batch
+// request (issue #612).
+//
+// A LiveKit room in this product has no enforced participant ceiling, so
+// this is a defensive cap on the request payload, not a room-size limit:
+// it stops a caller from turning "resolve who's already in the room" into
+// an unbounded IN-list. 50 comfortably covers any real call while staying
+// far below anything that could be used to fish for identities.
+const MaxCallParticipantProfileIDs = 50
+
 // DMMember represents membership in a DM conversation.
 // LeftAt is zero when NULL in the database.
 type DMMember struct {

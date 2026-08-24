@@ -382,6 +382,76 @@ func (s *DMService) GetGroupDetails(ctx context.Context, input GroupDetailsInput
 	}, nil
 }
 
+// GroupCallParticipantProfilesInput asks for presentation identities of a
+// specific set of group-call participants (issue #612).
+type GroupCallParticipantProfilesInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	UserIDs        []string
+}
+
+// GetGroupCallParticipantProfiles resolves display name and avatar for the
+// requested user IDs, scoped to one group conversation's active
+// participants (issue #612). Same access gate as GetGroupDetails — a 1:1
+// conversation and one the caller does not participate in both come back as
+// ErrNotFound — and unresolvable IDs are silently omitted rather than
+// erroring, for the same reason GetCallParticipantProfiles omits them.
+func (s *DMService) GetGroupCallParticipantProfiles(ctx context.Context, input GroupCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error) {
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	conversation, err := s.dms.GetVisibleConversationByID(
+		ctx, workspaceID, strings.TrimSpace(input.ConversationID), strings.TrimSpace(input.CallerID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if conversation.Type != domain.DMConversationTypeGroup {
+		return nil, domain.ErrNotFound
+	}
+	userIDs, err := normalizeCallParticipantIDs(input.UserIDs)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := s.dms.ListParticipantProfilesByIDs(ctx, workspaceID, conversation.ID, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("list dm participant profiles by ids: %w", err)
+	}
+	return profiles, nil
+}
+
+// normalizeCallParticipantIDs canonicalises, de-duplicates and bounds a
+// requested call-participant ID list (issue #612), the same shape
+// normalizeAddMemberIDs applies to add-members but against the call cap
+// instead of the add-members cap — the two batches answer different
+// questions (who to add vs. whose identity to resolve) and must not share
+// one error message.
+func normalizeCallParticipantIDs(raw []string) ([]string, error) {
+	if len(raw) > domain.MaxCallParticipantProfileIDs {
+		return nil, domain.ErrTooManyCallParticipantsRequested
+	}
+	unique := make(map[string]struct{}, len(raw))
+	for _, rawID := range raw {
+		trimmed := strings.TrimSpace(rawID)
+		if trimmed == "" {
+			return nil, fmt.Errorf("%w: user_ids cannot contain empty user IDs", domain.ErrInvalidInput)
+		}
+		userID, err := canonicalizeUserID(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		unique[userID] = struct{}{}
+	}
+	if len(unique) == 0 {
+		return nil, domain.ErrNoCallParticipantsRequested
+	}
+	userIDs := make([]string, 0, len(unique))
+	for userID := range unique {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Strings(userIDs)
+	return userIDs, nil
+}
+
 // SearchGroupParticipantCandidatesInput asks who could still be added to a group
 // (issue #398).
 type SearchGroupParticipantCandidatesInput struct {

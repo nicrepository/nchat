@@ -27,6 +27,8 @@ import {
   fetchChannelMessage,
   fetchChannelMessageSecuritySnapshots,
   fetchChannelMessages,
+  fetchChannelCallParticipantProfiles,
+  fetchGroupCallParticipantProfiles,
   fetchPins,
   fetchFavorites,
   fetchAllowedReactionEmojis,
@@ -2850,6 +2852,67 @@ describe("fetchGroupDetails (issue #441)", () => {
     });
 
     expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(false);
+  });
+});
+
+describe("fetchChannelCallParticipantProfiles (issue #612)", () => {
+  it("posts the requested user ids and maps the response", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        profiles: [{ user_id: "user-a", display_name: "Ana Souza", avatar_url: "/media/a.png" }],
+      },
+    });
+
+    const profiles = await fetchChannelCallParticipantProfiles("ch-1", ["user-a"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/call-participants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["user-a"] }),
+      signal: undefined,
+    });
+    expect(profiles).toEqual([
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/media/a.png" },
+    ]);
+  });
+
+  it("omits avatarUrl when the server sends none", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { profiles: [{ user_id: "user-a", display_name: "Ana Souza" }] },
+    });
+
+    const [profile] = await fetchChannelCallParticipantProfiles("ch-1", ["user-a"]);
+
+    expect(profile!.avatarUrl).toBeUndefined();
+  });
+
+  it("omits an entry with no user_id rather than inventing one", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { profiles: [{ display_name: "Ana Souza" }] },
+    });
+
+    expect(await fetchChannelCallParticipantProfiles("ch-1", ["user-a"])).toEqual([]);
+  });
+
+  it("returns an empty list when the server sends no profiles field", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: {} });
+
+    expect(await fetchChannelCallParticipantProfiles("ch-1", ["user-a"])).toEqual([]);
+  });
+});
+
+describe("fetchGroupCallParticipantProfiles (issue #612)", () => {
+  it("posts to the dm call-participants route", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { profiles: [] } });
+
+    await fetchGroupCallParticipantProfiles("conv-1", ["user-a"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv-1/call-participants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["user-a"] }),
+      signal: undefined,
+    });
   });
 });
 

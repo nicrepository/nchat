@@ -1,0 +1,374 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import DedicatedCallStage from "./DedicatedCallStage";
+
+const baseControls = {
+  microphoneEnabled: true,
+  cameraEnabled: true,
+  screenShareEnabled: false,
+  pendingControl: null,
+  onMicrophone: vi.fn(),
+  onCamera: vi.fn(),
+  onScreenShare: vi.fn(),
+  onEnd: vi.fn(),
+};
+
+const baseProps = {
+  title: "Equipe Infra",
+  status: "connected" as const,
+  participantCount: 3,
+  participants: [
+    { identity: "user-a", displayName: "Ana Souza", hasVideo: false, avatarUrl: "https://x/a.png" },
+    { identity: "user-b", displayName: "Bruno Lima", hasVideo: false },
+  ],
+  controls: baseControls,
+  onMinimize: vi.fn(),
+  hasLocalVideo: false,
+  localSeed: "user-1",
+  localParticipantId: "user-1",
+  localDisplayName: "Caio Almeida (você)",
+  localInitials: "CA",
+  activeSpeakerId: null,
+};
+
+describe("DedicatedCallStage", () => {
+  it("renders the local participant's real name with (você)", () => {
+    render(<DedicatedCallStage {...baseProps} />);
+    expect(screen.getByText("Caio Almeida (você)")).toBeInTheDocument();
+  });
+
+  it("renders each participant's own resolved name, not a shared resource name", () => {
+    render(<DedicatedCallStage {...baseProps} />);
+    expect(screen.getByText("Ana Souza")).toBeInTheDocument();
+    expect(screen.getByText("Bruno Lima")).toBeInTheDocument();
+  });
+
+  it("renders a participant's own avatar image when avatarUrl is set", () => {
+    const { container } = render(<DedicatedCallStage {...baseProps} />);
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+  });
+
+  it("falls back to that participant's own deterministic initials when they have no avatar", () => {
+    const { container } = render(<DedicatedCallStage {...baseProps} />);
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    expect(tiles[2]!.querySelector("img")).not.toBeInTheDocument();
+    expect(tiles[2]).toHaveTextContent("BL");
+  });
+
+  it("uses the passed-in localInitials verbatim, never derived from the (você)-suffixed localDisplayName (issue #612 blocker)", () => {
+    const { container } = render(
+      <DedicatedCallStage {...baseProps} localDisplayName="Ana (você)" localInitials="A" />,
+    );
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    const localAvatar = tiles[0]!.querySelector(".dedicated-call__avatar")!;
+    expect(localAvatar.textContent).toBe("A");
+  });
+
+  it("renders the local avatar image when localAvatarUrl is set", () => {
+    const { container } = render(
+      <DedicatedCallStage {...baseProps} localAvatarUrl="https://x/local.png" />,
+    );
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    expect(tiles[0]!.querySelector("img")).toHaveAttribute("src", "https://x/local.png");
+  });
+
+  it("falls back to deterministic initials, no broken image, when a participant avatar fails to load", () => {
+    const { container } = render(<DedicatedCallStage {...baseProps} />);
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    fireEvent.error(tiles[1]!.querySelector("img")!);
+    expect(tiles[1]!.querySelector("img")).not.toBeInTheDocument();
+    expect(tiles[1]).toHaveTextContent("AS");
+  });
+
+  it("camera-on: renders no avatar fallback for that tile", () => {
+    const { container } = render(
+      <DedicatedCallStage
+        {...baseProps}
+        hasLocalVideo
+        participants={[
+          {
+            identity: "user-a",
+            displayName: "Ana Souza",
+            hasVideo: true,
+            avatarUrl: "https://x/a.png",
+          },
+        ]}
+      />,
+    );
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    expect(tiles[0]!.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+    expect(tiles[1]!.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+  });
+
+  describe("dedicated direct header identity (issue #612 blocker fix)", () => {
+    it("shows the direct peer's real name and avatar in the header", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          title="Ana Souza"
+          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/peer.png" }}
+        />,
+      );
+      expect(container.querySelector(".dedicated-call__header strong")).toHaveTextContent(
+        "Ana Souza",
+      );
+      const headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
+      expect(headerAvatar.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+    });
+
+    it("falls back to deterministic initials in the header when the peer avatar is missing or broken", () => {
+      const { container, rerender } = render(
+        <DedicatedCallStage {...baseProps} title="Ana Souza" headerAvatar={{ seed: "peer-1" }} />,
+      );
+      let headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
+      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
+      expect(headerAvatar).toHaveTextContent("AS");
+
+      rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          title="Ana Souza"
+          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/broken.png" }}
+        />,
+      );
+      headerAvatar = container.querySelector(".dedicated-call__header-avatar")!;
+      fireEvent.error(headerAvatar.querySelector("img")!);
+      expect(headerAvatar.querySelector("img")).not.toBeInTheDocument();
+      expect(headerAvatar).toHaveTextContent("AS");
+    });
+
+    it("is decorative (aria-hidden) since the visible title already names the peer", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          title="Ana Souza"
+          headerAvatar={{ seed: "peer-1", avatarUrl: "https://x/peer.png" }}
+        />,
+      );
+      expect(container.querySelector(".dedicated-call__header-avatar")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+    });
+
+    it("never shows a header avatar for a channel/group resource call", () => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} title="Equipe Infra" headerAvatar={undefined} />,
+      );
+      expect(container.querySelector(".dedicated-call__header-avatar")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("dedicated direct remote tile (issue #612 follow-up)", () => {
+    it("shows the direct peer's real name and avatar in the remote tile when camera is off", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      const tiles = container.querySelectorAll(".dedicated-call__tile");
+      // Local tile is first, remote-direct tile is second.
+      expect(tiles[1]).toHaveTextContent("Ana Souza");
+      expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+    });
+
+    it("falls back to deterministic initials in the remote tile when the peer avatar is missing or broken", () => {
+      const { container, rerender } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            hasVideo: false,
+          }}
+        />,
+      );
+      let tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector("img")).not.toBeInTheDocument();
+      expect(tile).toHaveTextContent("AS");
+
+      rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/broken.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      fireEvent.error(tile.querySelector("img")!);
+      expect(tile.querySelector("img")).not.toBeInTheDocument();
+      expect(tile).toHaveTextContent("AS");
+    });
+
+    it("is decorative (aria-hidden) since the visible name is adjacent in the same tile", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      const tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector(".dedicated-call__avatar")).toHaveAttribute("aria-hidden", "true");
+    });
+
+    it("camera-on: renders no avatar fallback in the remote tile, only the video container", () => {
+      const bindVideo = vi.fn();
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: true,
+            bindVideo,
+          }}
+        />,
+      );
+      const tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      expect(tile.querySelector(".dedicated-call__media")).toBeInTheDocument();
+    });
+
+    it("never renders a remote-direct tile for a channel/group resource call", () => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} title="Equipe Infra" remoteDirect={undefined} />,
+      );
+      // Only the local tile plus the two baseProps.participants tiles — no
+      // extra remote-direct tile ever appears when it wasn't wired in.
+      expect(container.querySelectorAll(".dedicated-call__tile")).toHaveLength(3);
+    });
+  });
+
+  describe("active speaker presentation", () => {
+    it("highlights a resource video tile by canonical participant identity", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          participants={[{ identity: "user-a", displayName: "Ana Souza", hasVideo: true }]}
+        />,
+      );
+
+      const tile = screen.getByText("Ana Souza").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("keeps camera-off initials and profile-avatar fallbacks highlighted", () => {
+      const view = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-b" />);
+      let tile = screen.getByText("Bruno Lima").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile).toHaveTextContent("BL");
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId="user-a" />);
+      tile = screen.getByText("Ana Souza").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+    });
+
+    it("highlights the local participant by current-user identity", () => {
+      const { container } = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-1" />);
+
+      expect(screen.getByText("Caio Almeida (você)").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("highlights the direct remote participant by explicit identity", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="peer-1"
+          participants={[]}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Davi Rocha",
+            hasVideo: false,
+          }}
+        />,
+      );
+
+      expect(screen.getByText("Davi Rocha").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("moves and clears the highlight without leaving duplicate or stale tiles", () => {
+      const view = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-a" />);
+      expect(screen.getByText("Ana Souza").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId="user-b" />);
+      expect(screen.getByText("Ana Souza").closest("article")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(screen.getByText("Bruno Lima").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId={null} />);
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+
+      view.rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          participants={baseProps.participants.filter(({ identity }) => identity !== "user-a")}
+        />,
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+    });
+
+    it("never marks a screen-share tile and exposes a microphone cue with the speaker's full name", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          bindScreenShare={vi.fn()}
+          screenShareName="Ana Souza"
+        />,
+      );
+
+      expect(container.querySelector(".dedicated-call__tile--screen")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      const cue = screen.getByLabelText("Ana Souza está falando");
+      expect(cue).toHaveClass("call-speaker-indicator");
+      expect(cue).toHaveAttribute("role", "img");
+      expect(cue).toHaveTextContent("mic");
+      expect(cue.querySelector(".material-symbols-outlined")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+    });
+  });
+});

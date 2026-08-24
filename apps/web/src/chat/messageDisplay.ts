@@ -54,6 +54,18 @@ export function initialsFrom(name: string): string {
   return initials || "?";
 }
 
+/**
+ * The local participant's call-presentation name (issue #612): the real
+ * profile name with a "(você)" suffix, or a bare "Você" when there is no
+ * usable name yet (profile loading/error/empty). The real name is always
+ * primary — "Você" never *replaces* it, only stands in for it when there is
+ * nothing else to show.
+ */
+export function localParticipantDisplayName(displayName: string): string {
+  const trimmed = displayName.trim();
+  return trimmed ? `${trimmed} (você)` : "Você";
+}
+
 const avatarColors: AvatarColor[] = ["purple", "green", "blue", "rose", "amber", "teal"];
 
 /**

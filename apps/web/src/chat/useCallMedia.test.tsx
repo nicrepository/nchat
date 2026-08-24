@@ -270,6 +270,27 @@ describe("useCallMedia", () => {
     vi.useRealTimers();
   });
 
+  it("clears a stabilized active speaker when that participant disconnects", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Ana Souza");
+      session.callbacks.onActiveSpeakersChanged(["identity-a"]);
+      vi.advanceTimersByTime(400);
+    });
+    expect(view.result.current.activeSpeakerId).toBe("identity-a");
+
+    act(() => session.callbacks.onParticipantDisconnected("identity-a"));
+    expect(view.result.current.activeSpeakerId).toBeNull();
+
+    view.unmount();
+    vi.useRealTimers();
+  });
+
   it("binds remote screen share separately from participant camera media", async () => {
     const view = setup();
     await act(() => view.result.current.connect(videoCall, "participant-token"));

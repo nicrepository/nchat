@@ -225,6 +225,14 @@ type fakeMemberStore struct {
 	candidateCalls         []candidateSearchCall
 	addCMsErr              error
 	addChannelMembersCalls []addChannelMembersCall
+
+	// callParticipantProfiles models the channel's active membership by user
+	// ID (issue #612); ListChannelMemberProfilesByIDs returns only the
+	// requested IDs that are present here, exactly like the real store's join
+	// silently omitting a non-member.
+	callParticipantProfiles    map[string]domain.CallParticipantProfile
+	callParticipantProfilesErr error
+	lastCallParticipantIDs     []string
 }
 
 // addChannelMembersCall records what the service handed the store, so a test can
@@ -306,6 +314,22 @@ func (f *fakeMemberStore) ListOnlineChannelMemberProfiles(
 	}
 	page.Online = matched
 	return page, nil
+}
+
+func (f *fakeMemberStore) ListChannelMemberProfilesByIDs(
+	_ context.Context, _, _ string, userIDs []string,
+) ([]domain.CallParticipantProfile, error) {
+	f.lastCallParticipantIDs = append([]string(nil), userIDs...)
+	if f.callParticipantProfilesErr != nil {
+		return nil, f.callParticipantProfilesErr
+	}
+	var out []domain.CallParticipantProfile
+	for _, id := range userIDs {
+		if profile, ok := f.callParticipantProfiles[id]; ok {
+			out = append(out, profile)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeMemberStore) SearchDMCandidates(_ context.Context, _, _, query string, limit int) ([]domain.DMCandidate, error) {

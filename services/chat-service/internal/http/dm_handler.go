@@ -28,6 +28,10 @@ type dmProvider interface {
 	SearchGroupParticipantCandidates(ctx context.Context, input service.SearchGroupParticipantCandidatesInput) ([]domain.DMCandidate, error)
 	// GetDirectProfile is the 1:1 profile projection (issue #443).
 	GetDirectProfile(ctx context.Context, input service.DirectProfileInput) (service.DirectProfile, error)
+	// GetGroupCallParticipantProfiles resolves presentation identities for a
+	// set of call-participant user IDs, scoped to this group conversation
+	// (issue #612).
+	GetGroupCallParticipantProfiles(ctx context.Context, input service.GroupCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
 }
 
 type dmRateLimiter interface {
@@ -237,6 +241,63 @@ func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDe
 // writeGroupDetailsError folds every denial into the same 404. A caller must
 // not be able to tell "this conversation exists but is not yours" from "no such
 // conversation", nor a group from a 1:1 they cannot see.
+// GroupCallParticipants handles POST /api/chat/dm/{conversationID}/call-participants
+// (issue #612). Same shape as ChannelHandler.CallParticipants, sharing its
+// request/response JSON types since both return the identical
+// {user_id, display_name, avatar_url} shape.
+func (h *DMHandler) GroupCallParticipants(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.dms == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "dms not available")
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	allowed, err := h.limiter.AllowActionWithLimit(r.Context(), callerID, callParticipantsAction, callParticipantsRateLimit, dmRateLimitWindowSeconds)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "dms not available")
+		return
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(dmRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return
+	}
+	if !requireJSONContentType(w, r) {
+		return
+	}
+	var request callParticipantProfilesRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+		} else {
+			httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+		}
+		return
+	}
+	profiles, err := h.dms.GetGroupCallParticipantProfiles(r.Context(), service.GroupCallParticipantProfilesInput{
+		WorkspaceID:    workspace.ID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		UserIDs:        request.UserIDs,
+	})
+	if err != nil {
+		writeCallParticipantProfilesError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, callParticipantProfilesBody(profiles))
+}
+
 func writeGroupDetailsError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrForbidden):
