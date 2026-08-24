@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 
 import {
@@ -8,7 +8,7 @@ import {
   type CallParticipantProfile,
 } from "../chat/chatApi";
 import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
-import type { Call } from "../chat/callState";
+import { isTerminalCall, type Call } from "../chat/callState";
 import { resolveCall } from "../chat/resourceCallSignaling";
 import { useSelfProfile } from "../profile/selfProfile";
 import DedicatedCallStage from "./DedicatedCallStage";
@@ -37,14 +37,24 @@ export default function DedicatedCallPage() {
     media,
     ownerState,
     registerDirectory,
+    releaseDirectTerminal,
   } = session;
   const [resolved, setResolved] = useState<Call | null>(null);
   const [directory, setDirectory] = useState<Awaited<ReturnType<typeof fetchSidebarData>> | null>(
     null,
   );
   const [error, setError] = useState("");
+  const currentPageCall = useRef(callId);
+  useLayoutEffect(() => {
+    currentPageCall.current = callId;
+  }, [callId]);
   const activationCall = useRef("");
   const acknowledged = useRef(false);
+  const terminalClose = useRef<{
+    callId: string;
+    phase: "converging" | "completed" | "failed";
+  } | null>(null);
+  const [terminalCleanupFailed, setTerminalCleanupFailed] = useState(false);
   const invalidCallID = !callIDPattern.test(callId);
 
   // Local call-presentation identity (issue #612), reused from the shared
@@ -197,10 +207,97 @@ export default function DedicatedCallPage() {
     }
   }, [acknowledgeDedicated, media.status, resolved]);
 
-  if (invalidCallID || error) {
+  // Terminal convergence is correlated against the route's own callId and
+  // calls.call — never `resolved` (issue #614 follow-up blocker).
+  // calls.call is populated independently by useCallSignaling's own
+  // reconnect call.sync, so it can (and does, in the exact race this closes)
+  // go terminal before the initial resolveCall(callId)/fetchSidebarData
+  // request above ever settles — and that request can then reject with
+  // call_not_found, since CurrentCallForUser only returns a call that is
+  // still ringing/active. Depending on `resolved` for this correlation left
+  // the dedicated tab stuck open, media/ownership never released, whenever
+  // that race won. callId is validated as a real UUID by invalidCallID, so
+  // matching calls.call.call_id against it directly is exactly as safe as
+  // matching it against resolved.call_id was.
+  useEffect(() => {
+    const call = calls.call;
+    if (
+      invalidCallID ||
+      !call ||
+      call.call_id !== callId ||
+      call.target_type !== "user" ||
+      !isTerminalCall(call.status) ||
+      terminalClose.current?.callId === callId
+    ) {
+      return;
+    }
+    // Captured once, from the route param — never read back off `resolved`
+    // inside this promise chain, since resolution can still be pending (or
+    // can later reject) for the entire lifetime of this attempt.
+    const closingCallId = callId;
+    terminalClose.current = { callId: closingCallId, phase: "converging" };
+    setTerminalCleanupFailed(false);
+    void releaseDirectTerminal(closingCallId).then(
+      () => {
+        const attempt = terminalClose.current;
+        if (
+          currentPageCall.current !== closingCallId ||
+          attempt?.callId !== closingCallId ||
+          attempt.phase !== "converging"
+        ) {
+          return;
+        }
+        terminalClose.current = { callId: closingCallId, phase: "completed" };
+        window.close();
+        if (!window.closed) navigate("/chat");
+      },
+      () => {
+        const attempt = terminalClose.current;
+        if (
+          currentPageCall.current !== closingCallId ||
+          attempt?.callId !== closingCallId ||
+          attempt.phase !== "converging"
+        ) {
+          return;
+        }
+        terminalClose.current = { callId: closingCallId, phase: "failed" };
+        setTerminalCleanupFailed(true);
+      },
+    );
+  }, [callId, calls.call, invalidCallID, navigate, releaseDirectTerminal, terminalCleanupFailed]);
+
+  if (invalidCallID) {
     return (
       <main className="dedicated-call dedicated-call--message">
-        <p role="alert">{invalidCallID ? "Chamada inválida." : error}</p>
+        <p role="alert">Chamada inválida.</p>
+      </main>
+    );
+  }
+  // Checked before the initial-resolution `error` below (issue #614
+  // follow-up blocker, point 3): once terminal convergence has actually
+  // started, calls.call already carries the authoritative outcome — a later
+  // call_not_found from the (now stale) initial resolveCall(callId) must
+  // never mask the cleanup-failed retry state the user needs to act on.
+  if (terminalCleanupFailed) {
+    return (
+      <main className="dedicated-call dedicated-call--message">
+        <p role="alert">Não foi possível liberar a mídia da chamada.</p>
+        <button
+          type="button"
+          onClick={() => {
+            terminalClose.current = null;
+            setTerminalCleanupFailed(false);
+          }}
+        >
+          Tentar fechar novamente
+        </button>
+      </main>
+    );
+  }
+  if (error) {
+    return (
+      <main className="dedicated-call dedicated-call--message">
+        <p role="alert">{error}</p>
       </main>
     );
   }
@@ -251,11 +348,11 @@ export default function DedicatedCallPage() {
     onCamera: media.toggleCamera,
     onScreenShare: media.toggleScreenShare,
     onEnd: () => {
-      emitCallTechnicalEvent("end");
       if (resolved.target_type === "user") {
         calls.end();
         return;
       }
+      emitCallTechnicalEvent("end");
       // Issue #570: leaving a resource/group call from the dedicated tab
       // must fully converge — participant leave (#569), release dedicated
       // ownership, then close this tab (falling back to /chat when the

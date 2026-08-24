@@ -580,79 +580,165 @@ describe("resource call signaling", () => {
     });
   });
 
-  describe("resolveCall (unchanged: authenticated call.sync by call_id, direct or resource)", () => {
-    it("resolves a call by id through authenticated call.sync", async () => {
+  describe("resolveCall (authenticated call.sync by call_id, correlated by sync_id — issue #614 blocker follow-up)", () => {
+    const syncId = "00000000-0000-4000-8000-000000000603";
+
+    it("sends call.sync with call_id and its own sync_id", () => {
+      const socket = setup();
+      void resolveCall(call.call_id, {
+        acquire: socket.acquire,
+        syncId: () => syncId,
+        setTimeout: vi.fn(() => 1),
+        clearTimeout: vi.fn(),
+      });
+      socket.listener.onOpen?.(1);
+      expect(socket.handle.send).toHaveBeenCalledWith({
+        type: "call.sync",
+        call_id: call.call_id,
+        sync_id: syncId,
+      });
+    });
+
+    it("resolves solely on call.synced correlated by sync_id", async () => {
       const socket = setup();
       const resolving = resolveCall(call.call_id, {
         acquire: socket.acquire,
+        syncId: () => syncId,
         setTimeout: vi.fn(() => 1),
         clearTimeout: vi.fn(),
       });
 
       socket.listener.onOpen?.(1);
-      expect(socket.handle.send).toHaveBeenCalledWith({ type: "call.sync", call_id: call.call_id });
-      socket.listener.onMessage?.(
-        {
-          type: "call.accepted",
-          event_id: "event",
-          target_type: "channel",
-          target_id: call.target_id,
-          call,
-        },
-        1,
-      );
-      socket.listener.onStatus?.("connected");
-      socket.listener.onMessage?.(
-        {
-          type: "call.accepted",
-          event_id: "duplicate",
-          target_type: "channel",
-          target_id: call.target_id,
-          call,
-        },
-        1,
-      );
+      socket.listener.onMessage?.({ type: "call.synced", sync_id: syncId, call }, 1);
 
       await expect(resolving).resolves.toEqual(call);
       expect(socket.handle.release).toHaveBeenCalledOnce();
     });
 
-    it("ignores unrelated events and fails closed for every sync failure path", async () => {
+    it("ignores a call.synced response with the wrong sync_id or a foreign call_id, and every lifecycle broadcast", async () => {
       const socket = setup();
       let expire: () => void = () => undefined;
       const resolving = resolveCall(call.call_id, {
         acquire: socket.acquire,
+        syncId: () => syncId,
         setTimeout: (callback) => {
           expire = callback;
           return 1;
         },
         clearTimeout: vi.fn(),
       });
+      // A stale/foreign call.synced (wrong sync_id — e.g. an abandoned
+      // earlier attempt's own reply) must never resolve this one.
+      socket.listener.onMessage?.({ type: "call.synced", sync_id: "wrong-sync-id", call }, 1);
+      // A malformed/foreign call.synced with the RIGHT sync_id but the wrong
+      // call payload must not resolve either.
+      socket.listener.onMessage?.(
+        { type: "call.synced", sync_id: syncId, call: { ...call, call_id: "some-other-call" } },
+        1,
+      );
+      // A real lifecycle broadcast for the exact same call_id — the shape a
+      // legacy (sync_id-less) call.sync reply used to be indistinguishable
+      // from — must never be mistaken for this correlated reply either.
       socket.listener.onMessage?.(
         {
           type: "call.accepted",
-          event_id: "other",
+          event_id: "broadcast",
           target_type: "channel",
           target_id: call.target_id,
-          call: { ...call, call_id: "other" },
+          call,
         },
         1,
       );
       expire();
       await expect(resolving).rejects.toThrow("call sync timed out");
+    });
 
-      const denied = setup();
-      const deniedSync = resolveCall(call.call_id, {
-        acquire: denied.acquire,
+    // The #614 blocker's exact race: useCallSignaling's own reconnect
+    // call.sync (A, no sync_id — see useCallSignaling.ts's onOpen) races a
+    // later, independent recovery resolveCall (B) for the SAME call_id
+    // sharing the one underlying socket. The old resolveCall correlated
+    // solely by call_id, so A's stale "active" reply — a real answer to A,
+    // just observed before the call actually ended — could be mistaken for
+    // B's own answer. With sync_id correlation, B's own attempt can only
+    // ever be satisfied by ITS OWN sync_id, so A's reply (whatever shape it
+    // takes) can never settle B; B settles only once ITS OWN terminal
+    // call.synced reply arrives.
+    it("two concurrent direct call.syncs sharing one socket never cross-resolve — a stale reply for A must never settle B", async () => {
+      const listeners: ChatSocketListener[] = [];
+      const handle: ChatSocketHandle = {
+        send: vi.fn(() => true),
+        isOpen: vi.fn(() => true),
+        generation: vi.fn(() => 1),
+        release: vi.fn(),
+      };
+      const acquire = vi.fn((value: ChatSocketListener) => {
+        listeners.push(value);
+        return handle;
+      });
+      const broadcast = (data: Record<string, unknown>) => {
+        for (const listener of listeners) listener.onMessage?.(data, 1);
+      };
+
+      const resolvingB = resolveCall(call.call_id, { acquire, syncId: () => "sync-b" });
+      let settledB: "pending" | "settled" = "pending";
+      void resolvingB.then(
+        () => (settledB = "settled"),
+        () => (settledB = "settled"),
+      );
+
+      // A's own reply (unrelated sync_id) arrives on the shared socket while
+      // B is still in flight — every consumer attached to it, including B's,
+      // receives this onMessage call.
+      broadcast({ type: "call.synced", sync_id: "sync-a", call });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(settledB).toBe("pending");
+
+      // B's own terminal reply — the call ended between A's read and B's —
+      // is the only thing that may settle B, and it must reflect B's own
+      // observation, never get short-circuited by A's already-delivered one.
+      const endedCall = { ...call, status: "ended" as const, version: call.version + 1 };
+      broadcast({ type: "call.synced", sync_id: "sync-b", call: endedCall });
+      await expect(resolvingB).resolves.toEqual(endedCall);
+    });
+
+    it("rejects with the correlated call.error, ignoring one for an unrelated sync_id", async () => {
+      const socket = setup();
+      const resolving = resolveCall(call.call_id, {
+        acquire: socket.acquire,
+        syncId: () => syncId,
         setTimeout: vi.fn(() => 1),
         clearTimeout: vi.fn(),
       });
-      denied.listener.onMessage?.({ type: "call.error", operation: "call.sync" }, 1);
+      socket.listener.onMessage?.(
+        { type: "call.error", operation: "call.sync", response_to: "other-sync" },
+        1,
+      );
+      socket.listener.onMessage?.(
+        { type: "call.error", operation: "call.sync", response_to: syncId },
+        1,
+      );
+      await expect(resolving).rejects.toThrow("call sync failed");
+    });
+
+    it("fails deterministically when send fails, the socket fails, or its deadline fires", async () => {
+      const denied = setup();
+      const deniedSync = resolveCall(call.call_id, {
+        acquire: denied.acquire,
+        syncId: () => syncId,
+        setTimeout: vi.fn(() => 1),
+        clearTimeout: vi.fn(),
+      });
+      denied.listener.onMessage?.(
+        { type: "call.error", operation: "call.sync", response_to: syncId },
+        1,
+      );
       await expect(deniedSync).rejects.toThrow("call sync failed");
 
       const failed = setup();
       const failedSync = resolveCall(call.call_id, {
         acquire: failed.acquire,
+        syncId: () => syncId,
         setTimeout: vi.fn(() => 1),
         clearTimeout: vi.fn(),
       });
@@ -663,11 +749,26 @@ describe("resource call signaling", () => {
       cannotSend.handle.send = vi.fn(() => false);
       const sendFailure = resolveCall(call.call_id, {
         acquire: cannotSend.acquire,
+        syncId: () => syncId,
         setTimeout: vi.fn(() => 1),
         clearTimeout: vi.fn(),
       });
       cannotSend.listener.onOpen?.(1);
       await expect(sendFailure).rejects.toThrow("call sync failed");
+
+      const timed = setup();
+      let expire: () => void = () => undefined;
+      const timeout = resolveCall(call.call_id, {
+        acquire: timed.acquire,
+        syncId: () => syncId,
+        setTimeout: (callback) => {
+          expire = callback;
+          return 1;
+        },
+        clearTimeout: vi.fn(),
+      });
+      expire();
+      await expect(timeout).rejects.toThrow("call sync timed out");
     });
   });
 

@@ -1,5 +1,5 @@
 import { acquireChatSocket, type ChatSocketHandle, type ChatSocketListener } from "./chatSocket";
-import { parseCall, parseCallEvent, type Call } from "./callState";
+import { parseCall, type Call } from "./callState";
 import type { ResourceCallKind } from "./callApi";
 import { randomId } from "../lib/randomId";
 
@@ -335,20 +335,43 @@ export function leaveResourceCall(
   );
 }
 
+/**
+ * Resolves the authoritative current state of one specific call by id —
+ * direct or resource — via authenticated call.sync (issue #614 blocker
+ * follow-up).
+ *
+ * Correlated by sync_id, exactly like syncResourceCall's call.resource.sync:
+ * the server's call.synced reply echoes it back and is never broadcast (see
+ * services/chat-service/internal/ws/call_protocol.go's sendCallSynced).
+ * This is NOT redundant with the call_id check below — it is what call_id
+ * alone could never provide. Before this, resolveCall correlated solely by
+ * call_id against sendCallToClient's plain lifecycle-event shape, which is
+ * wire-identical to a real broadcast for the same call and to another
+ * concurrent call.sync's own reply. Two overlapping resolveCall/call.sync
+ * attempts for the same call_id share one underlying socket (every
+ * acquireChatSocket consumer fans out from the same dispatch — see
+ * startResourceCall's own concurrent-request test above), so a stale or
+ * unrelated reply for one attempt could settle a different, later one purely
+ * because both named the same call_id — exactly the race
+ * CallSessionProvider's restoreOwnership fence depends on never happening.
+ */
 export function resolveCall(
   callID: string,
-  options: Omit<ResourceCallSignalingOptions, "requestId"> = {},
+  options: Omit<ResourceCallSignalingOptions, "requestId"> & { syncId?: () => string } = {},
 ): Promise<Call> {
+  const syncID = (options.syncId ?? (() => randomId()))();
   return runSocketRequest<Call>(
     options,
-    (handle) => handle.send({ type: "call.sync", call_id: callID }),
+    (handle) => handle.send({ type: "call.sync", call_id: callID, sync_id: syncID }),
     (data, finish) => {
       if (data["type"] === "call.error" && data["operation"] === "call.sync") {
+        if (data["response_to"] !== syncID) return;
         finish(new Error("call sync failed"));
         return;
       }
-      const event = parseCallEvent(data);
-      if (event?.call.call_id === callID) finish(event.call);
+      if (data["type"] !== "call.synced" || data["sync_id"] !== syncID) return;
+      const call = parseCall(data["call"]);
+      if (call?.call_id === callID) finish(call);
     },
     "call sync failed",
     "call sync timed out",

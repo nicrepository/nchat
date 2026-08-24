@@ -16,6 +16,11 @@ const (
 	crsTestRequest  = "00000000-0000-4000-8000-000000000203"
 	crsTestCallID   = "00000000-0000-4000-8000-000000000204"
 	crsObservedTime = "2026-08-10T12:00:00Z"
+	// Distinct call.sync sync_ids for two overlapping direct syncs of the
+	// SAME call_id (issue #614 blocker follow-up) — see
+	// TestTwoConcurrentCallSyncsCorrelateBySyncIDNeverCrossResolve below.
+	callSyncTestSyncIDA = "00000000-0000-4000-8000-000000000205"
+	callSyncTestSyncIDB = "00000000-0000-4000-8000-000000000206"
 )
 
 func mustParseTime(t *testing.T, value string) time.Time {
@@ -399,5 +404,165 @@ func TestCallStartErrorCorrelationDependsOnResourceVsDirect(t *testing.T) {
 	}
 	if got := callResponseTo(directMsg); got != "" {
 		t.Fatalf("direct call.start response_to = %q, want empty", got)
+	}
+}
+
+// ── call.sync (direct, correlated) — issue #614 blocker follow-up ──────────
+//
+// resolveCall's old correlation-by-call_id-alone let a stale reply to an
+// abandoned/superseded call.sync, or a live broadcast for the same call_id,
+// be mistaken for the answer to a DIFFERENT, later call.sync of the same
+// call — because sendCallToClient's plain lifecycle-event shape is wire-
+// identical to a real broadcast and carries no per-request identifier. These
+// tests cover the new sync_id-correlated call.synced reply that closes that
+// gap, and prove the pre-existing (sync_id-less) path is untouched.
+
+func TestCallSyncWithSyncIDRepliesCorrelatedNeverBroadcast(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 4)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-synced", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	requester := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	outsider := newClient("other-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	for _, c := range []*Client{requester, outsider} {
+		if !hub.Register(c) {
+			t.Fatal("register client")
+		}
+	}
+
+	err := hub.handleClientMessage(context.Background(), requester, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: callSyncTestSyncIDA,
+	})
+	if err != nil {
+		t.Fatalf("call.sync: %v", err)
+	}
+
+	select {
+	case payload := <-requester.outbox:
+		var response callSyncedResponse
+		if err := json.Unmarshal(payload, &response); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if response.Type != "call.synced" || response.SyncID != callSyncTestSyncIDA || response.Call.ID != callTestID {
+			t.Fatalf("unexpected call.synced response: %+v", response)
+		}
+	default:
+		t.Fatal("expected a direct call.synced response")
+	}
+	if len(outsider.outbox) != 0 {
+		t.Fatal("call.sync must never broadcast, correlated or not")
+	}
+}
+
+// TestTwoConcurrentCallSyncsCorrelateBySyncIDNeverCrossResolve is the
+// protocol-level evidence for the #614 blocker: two overlapping call.sync
+// requests for the SAME call_id, issued with distinct sync_ids (as
+// resourceCallSignaling.ts's resolveCall now does for every attempt),
+// produce two replies each tagged with their own request's sync_id — so a
+// consumer holding two such requests in flight can always tell them apart
+// and never treats B's own request as answered by A's reply, or vice versa,
+// even though both answers describe the exact same call_id. This is the
+// server-side half of the fix; resourceCallSignaling.test.ts covers the
+// client-side consumer that relies on it.
+func TestTwoConcurrentCallSyncsCorrelateBySyncIDNeverCrossResolve(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 4)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-concurrent", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register client")
+	}
+
+	// Sync A observes the call while still active.
+	if err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: callSyncTestSyncIDA,
+	}); err != nil {
+		t.Fatalf("sync A: %v", err)
+	}
+	// The call ends between A's read and B's — a later, independent sync
+	// (the recovery attempt in restoreOwnership's fence) must observe that.
+	handler.call = callProtocolCall(domain.CallStatusEnded, 5)
+	if err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: callSyncTestSyncIDB,
+	}); err != nil {
+		t.Fatalf("sync B: %v", err)
+	}
+
+	var replyA, replyB callSyncedResponse
+	if err := json.Unmarshal(<-client.outbox, &replyA); err != nil {
+		t.Fatalf("decode A: %v", err)
+	}
+	if err := json.Unmarshal(<-client.outbox, &replyB); err != nil {
+		t.Fatalf("decode B: %v", err)
+	}
+	if replyA.SyncID != callSyncTestSyncIDA || replyA.Call.Status != domain.CallStatusActive {
+		t.Fatalf("A's own reply must carry A's sync_id and A's observed state: %+v", replyA)
+	}
+	if replyB.SyncID != callSyncTestSyncIDB || replyB.Call.Status != domain.CallStatusEnded {
+		t.Fatalf("B's own reply must carry B's sync_id and B's observed state: %+v", replyB)
+	}
+	// The defect this closes: a consumer correlating by call_id alone (the
+	// old resolveCall) could not tell these two replies apart at all — both
+	// describe callTestID. A caller keying strictly off SyncID, as the fixed
+	// resolveCall now does, can never let A's stale "active" resolve B's
+	// fence, which is exactly the cross-resolution #614's review flagged.
+	if replyA.SyncID == replyB.SyncID {
+		t.Fatal("A and B must never share a sync_id in this scenario")
+	}
+}
+
+func TestCallSyncRejectsMalformedSyncID(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-bad-syncid", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register client")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: "not-a-uuid",
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want invalid input", err)
+	}
+}
+
+// A call.sync's own call_not_found error correlates by sync_id exactly like
+// its success reply does when the requester supplied one — and, symmetrically,
+// carries none at all (never a synthesized one) when the requester did not,
+// keeping every pre-#614 legacy caller's error shape byte-identical.
+func TestCallSyncErrorResponseToMirrorsWhetherSyncIDWasSupplied(t *testing.T) {
+	withSyncID := ClientMessage{Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: callSyncTestSyncIDA}
+	if got := callResponseTo(withSyncID); got != callSyncTestSyncIDA {
+		t.Fatalf("response_to = %q, want the supplied sync_id %q", got, callSyncTestSyncIDA)
+	}
+	withoutSyncID := ClientMessage{Type: ClientMessageTypeCallSync, CallID: callTestID}
+	if got := callResponseTo(withoutSyncID); got != "" {
+		t.Fatalf("response_to = %q, want empty for a legacy call.sync", got)
+	}
+
+	handler := &fakeCallHandler{err: domain.ErrNotFound}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-error-correlation", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register client")
+	}
+
+	msg := ClientMessage{Type: ClientMessageTypeCallSync, CallID: callTestID, SyncID: callSyncTestSyncIDA}
+	err := hub.handleClientMessage(context.Background(), client, msg)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error = %v, want not found", err)
+	}
+	if !handleCallClientError(client, msg.Type, msg.CallID, callResponseTo(msg), err) {
+		t.Fatal("expected call.sync error to be handled")
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response.Type != "call.error" || response.Operation != "call.sync" ||
+		response.Code != "call_not_found" || response.ResponseTo != callSyncTestSyncIDA {
+		t.Fatalf("unexpected call error: %+v", response)
 	}
 }

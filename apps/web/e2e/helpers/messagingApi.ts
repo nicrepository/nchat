@@ -1132,18 +1132,33 @@ async function installWebSocketMock(
           sentMessages.push(parsed);
           if (parsed["type"] === "call.sync") {
             const known = knownCalls.get(parsed["call_id"] as string);
-            queueMicrotask(() =>
-              this.onmessage?.(
-                new MessageEvent("message", {
-                  data: JSON.stringify(
-                    known ?? {
+            // Models both call.sync contracts the real backend serves side
+            // by side (issue #614 blocker follow-up): legacy (no sync_id)
+            // replies with the bare lifecycle fixture / an uncorrelated
+            // call.error, exactly as before; correlated (sync_id present)
+            // replies with a requester-only call.synced echoing sync_id, or a
+            // call.error carrying that same value as response_to. resolveCall()
+            // only ever sends the correlated form and deliberately ignores a
+            // lifecycle-shaped reply for it — answering with the legacy shape
+            // here would silently strand every dedicated-tab E2E.
+            const syncId = parsed["sync_id"];
+            const body =
+              typeof syncId === "string"
+                ? known
+                  ? { type: "call.synced", sync_id: syncId, call: known["call"] }
+                  : {
                       type: "call.error",
                       operation: "call.sync",
                       code: "call_not_found",
-                    },
-                  ),
-                }),
-              ),
+                      response_to: syncId,
+                    }
+                : (known ?? {
+                    type: "call.error",
+                    operation: "call.sync",
+                    code: "call_not_found",
+                  });
+            queueMicrotask(() =>
+              this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) })),
             );
             return;
           }

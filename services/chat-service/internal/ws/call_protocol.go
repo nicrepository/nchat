@@ -280,11 +280,33 @@ func (h *Hub) handleCallMessage(ctx context.Context, c *Client, msg ClientMessag
 				return domain.ErrInvalidInput
 			}
 		}
+		// SyncID is optional (issue #614 blocker follow-up), unlike
+		// call.resource.sync's mandatory one: a legacy client that omits it
+		// keeps getting the pre-existing sendCallToClient reply below,
+		// unchanged. A client that supplies one gets a distinct,
+		// requester-only call.synced reply correlated by it — the plain
+		// lifecycle-event shape sendCallToClient sends is wire-identical to
+		// a real broadcast for the same call_id (and to another concurrent
+		// call.sync's own reply), so it can never be safely correlated to
+		// one specific request. See resolveCall in
+		// apps/web/src/chat/resourceCallSignaling.ts.
+		syncID := ""
+		if msg.SyncID != "" {
+			var err error
+			syncID, err = canonicalCallUUID(msg.SyncID)
+			if err != nil {
+				return domain.ErrInvalidInput
+			}
+		}
 		call, err := h.callHandler.CurrentCall(ctx, c.workspaceID, c.userID, callID)
 		if err != nil {
 			return err
 		}
-		h.sendCallToClient(c, call)
+		if syncID != "" {
+			h.sendCallSynced(c, syncID, call)
+		} else {
+			h.sendCallToClient(c, call)
+		}
 		return nil
 	default:
 		return domain.ErrInvalidInput
@@ -456,6 +478,27 @@ func (h *Hub) sendResourceSynced(c *Client, syncID string, targetType TargetType
 	}
 }
 
+// callSyncedResponse is the requester-only, sync_id-correlated answer to a
+// call.sync that supplied one (issue #614 blocker follow-up) — a direct
+// counterpart to callResourceSyncedResponse above, for the direct/authenticated
+// call.sync path. Never broadcast. Deliberately carries nothing beyond `call`
+// (no participants, token, or media): identical payload shape to every other
+// call.sync reply, just correlated instead of shaped like a lifecycle event.
+type callSyncedResponse struct {
+	Type   string           `json:"type"`
+	SyncID string           `json:"sync_id"`
+	Call   CallEventPayload `json:"call"`
+}
+
+func (h *Hub) sendCallSynced(c *Client, syncID string, call domain.Call) {
+	data, err := json.Marshal(callSyncedResponse{
+		Type: "call.synced", SyncID: syncID, Call: callEventPayload(call),
+	})
+	if err == nil {
+		_ = c.enqueue(data)
+	}
+}
+
 func callEventType(status domain.CallStatus) (EventType, bool) {
 	switch status {
 	case domain.CallStatusRinging:
@@ -540,6 +583,11 @@ func callResponseTo(msg ClientMessage) string {
 	case ClientMessageTypeCallJoin, ClientMessageTypeCallLeave:
 		return msg.RequestID
 	case ClientMessageTypeCallResourceSync:
+		return msg.SyncID
+	case ClientMessageTypeCallSync:
+		// Empty for a legacy client that omitted sync_id (unchanged from
+		// before #614's blocker follow-up) — response.ResponseTo has
+		// omitempty, so its call.error stays wire-identical to before.
 		return msg.SyncID
 	default:
 		return ""
