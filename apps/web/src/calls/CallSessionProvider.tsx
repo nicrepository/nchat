@@ -29,7 +29,7 @@ import {
 } from "../chat/resourceCallDiscovery";
 import { syncResourceCall } from "../chat/resourceCallSignaling";
 import type { Channel, DMConversation } from "../chat/chatTypes";
-import { localParticipantDisplayName } from "../chat/messageDisplay";
+import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
 import { useSelfProfile } from "../profile/selfProfile";
 import { useCallMedia, type CallMediaSessionController } from "../chat/useCallMedia";
 import {
@@ -192,6 +192,10 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const selfDisplayName = selfProfile.status === "ready" ? selfProfile.profile.displayName : "";
   const selfAvatarUrl = selfProfile.status === "ready" ? selfProfile.profile.avatarUrl : undefined;
   const localName = localParticipantDisplayName(selfDisplayName);
+  // Initials from the raw name, never the "(você)"-suffixed label (issue
+  // #612 blocker) — see DedicatedCallPage's identical derivation. Empty/
+  // loading falls back to "Você", never "?".
+  const localInitials = initialsFrom(selfDisplayName || "Você");
   const [mediaEnabled, setMediaEnabled] = useState(false);
   const [ownerState, setOwnerState] = useState<OwnerState>("none");
   const ownerStateRef = useRef<OwnerState>("none");
@@ -1591,6 +1595,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           hasLocalVideo={media.hasLocalVideo}
           localSeed={localSeed}
           localName={localName}
+          localInitials={localInitials}
           localAvatarUrl={selfAvatarUrl}
           controls={controls}
           onExpand={expand}

@@ -468,11 +468,12 @@ describe("FloatingCallWindow", () => {
         hasLocalVideo={false}
         localSeed="current-user"
         localName="Você"
+        localInitials="V"
       />,
     );
     const avatar = document.querySelector(".floating-call__local-avatar");
     expect(avatar).not.toBeNull();
-    expect(avatar).toHaveTextContent(initialsFrom("Você"));
+    expect(avatar).toHaveTextContent("V");
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
     // Unlike a remote/resource fallback (name shown adjacent), the floating
     // local preview has no other visible name anywhere — the avatar itself
@@ -492,9 +493,29 @@ describe("FloatingCallWindow", () => {
         hasLocalVideo
         localSeed="current-user"
         localName="Você"
+        localInitials="V"
       />,
     );
     expect(document.querySelector(".floating-call__local-avatar")).toBeNull();
+  });
+
+  it("uses the passed-in localInitials verbatim, never derived from the (você)-suffixed localName (issue #612 blocker)", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={controls}
+        onExpand={noop}
+        {...videoPresent}
+        hasLocalVideo={false}
+        localSeed="current-user"
+        localName="Ana (você)"
+        localInitials="A"
+      />,
+    );
+    const avatar = document.querySelector(".floating-call__local-avatar")!;
+    expect(avatar.textContent).toBe("A");
   });
 
   it("keeps the participant count in its own stable slot across active-speaker mount/unmount", () => {
@@ -634,6 +655,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.getByRole("main", { name: "Chamada Produto" })).toBeInTheDocument();
@@ -658,6 +680,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.getByText("Sua tela")).toBeInTheDocument();
@@ -680,6 +703,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     // Never two simultaneous screen tiles — only the local one.
@@ -704,6 +728,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.getByText("Sua tela")).toBeInTheDocument();
@@ -722,6 +747,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.queryByText("Sua tela")).not.toBeInTheDocument();
@@ -741,6 +767,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(document.querySelector(".dedicated-call__tile--screen")).toBeNull();
@@ -760,6 +787,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Reconectando");
@@ -779,6 +807,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(screen.getByText("Tela de Participante")).toBeInTheDocument();
@@ -796,6 +825,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     const avatar = document.querySelector(".dedicated-call__avatar");
@@ -819,6 +849,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(document.querySelector(".dedicated-call__avatar")).toHaveTextContent("Z");
@@ -836,6 +867,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo={false}
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     const avatars = document.querySelectorAll(".dedicated-call__avatar");
@@ -856,6 +888,7 @@ describe("global and dedicated presentation", () => {
         hasLocalVideo
         localSeed="current-user"
         localDisplayName="Você"
+        localInitials="V"
       />,
     );
     expect(document.querySelector(".dedicated-call__avatar")).toBeNull();

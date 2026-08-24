@@ -1242,6 +1242,9 @@ describe("CallSessionProvider", () => {
     await screen.findByTestId("floating-call-window");
 
     const avatar = document.querySelector(".floating-call__local-avatar")!;
+    // Empty/loading profile name falls back to "Você" for initials too
+    // (issue #612 blocker) — same visual fallback as the display label,
+    // never "?" and never derived from a "(você)"-suffixed string.
     expect(avatar).toHaveTextContent(initialsFrom("Você"));
     // currentUserId (userB) — the registered directory's own id, never a
     // fetched profile just for this fallback.
@@ -1263,6 +1266,24 @@ describe("CallSessionProvider", () => {
         "aria-label",
         "Ana Souza (você)",
       );
+    });
+  });
+
+  it("derives the local floating fallback's initials from the raw one-word name, never 'A(' from the (você) suffix (issue #612 blocker)", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "Ana" });
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.hasLocalVideo = false;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    await screen.findByTestId("floating-call-window");
+
+    await waitFor(() => {
+      const avatar = document.querySelector(".floating-call__local-avatar")!;
+      expect(avatar).toHaveTextContent(initialsFrom("Ana"));
+      expect(avatar.textContent).not.toContain("(");
     });
   });
 

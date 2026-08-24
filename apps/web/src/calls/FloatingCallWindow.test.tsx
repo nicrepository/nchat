@@ -25,6 +25,7 @@ const baseProps = {
   hasLocalVideo: false,
   localSeed: "user-1",
   localName: "Ana Souza (você)",
+  localInitials: "AS",
 };
 
 describe("FloatingCallWindow", () => {
@@ -37,12 +38,22 @@ describe("FloatingCallWindow", () => {
   });
 
   it("falls back to a bare Você when there is no local name yet", () => {
-    const { container } = render(<FloatingCallWindow {...baseProps} localName="Você" />);
+    const { container } = render(
+      <FloatingCallWindow {...baseProps} localName="Você" localInitials="V" />,
+    );
     expect(container.querySelector(".floating-call__local-avatar")).toHaveAttribute(
       "aria-label",
       "Você",
     );
     expect(container.querySelector(".floating-call__local-avatar")).toHaveTextContent("V");
+  });
+
+  it("derives initials from the raw one-word name, never 'A(' from the (você) suffix (issue #612 blocker)", () => {
+    const { container } = render(
+      <FloatingCallWindow {...baseProps} localName="Ana (você)" localInitials="A" />,
+    );
+    const avatar = container.querySelector(".floating-call__local-avatar")!;
+    expect(avatar.textContent).toBe("A");
   });
 
   it("renders the local avatar image when localAvatarUrl is set", () => {

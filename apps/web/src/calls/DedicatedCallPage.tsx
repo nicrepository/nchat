@@ -7,7 +7,7 @@ import {
   fetchSidebarData,
   type CallParticipantProfile,
 } from "../chat/chatApi";
-import { localParticipantDisplayName } from "../chat/messageDisplay";
+import { initialsFrom, localParticipantDisplayName } from "../chat/messageDisplay";
 import type { Call } from "../chat/callState";
 import { resolveCall } from "../chat/resourceCallSignaling";
 import { useSelfProfile } from "../profile/selfProfile";
@@ -53,6 +53,12 @@ export default function DedicatedCallPage() {
   const selfDisplayName = selfProfile.status === "ready" ? selfProfile.profile.displayName : "";
   const selfAvatarUrl = selfProfile.status === "ready" ? selfProfile.profile.avatarUrl : undefined;
   const localDisplayName = localParticipantDisplayName(selfDisplayName);
+  // Initials must come from the raw name, never from the "(você)"-suffixed
+  // display label (issue #612 blocker) — initialsFrom would otherwise take
+  // "(" as a second "word" for a one-word name like "Ana". Empty/loading
+  // falls back to "Você" (the same visual fallback as localDisplayName),
+  // never to "?".
+  const localInitials = initialsFrom(selfDisplayName || "Você");
   const [participantProfiles, setParticipantProfiles] = useState<
     Map<string, CallParticipantProfile>
   >(new Map());
@@ -217,7 +223,25 @@ export default function DedicatedCallPage() {
   }
 
   const title = target.name;
-  const participantCount = Math.max(1, media.participants.length + 1);
+  // A direct call is always exactly 2 people (issue #612 blocker): it never
+  // routes through media.participants (resource-room-only), so the local +
+  // remoteDirect tiles are the whole roster. Resource/group calls keep the
+  // existing media.participants + local count.
+  const participantCount = resolved.target_type === "user" ? 2 : media.participants.length + 1;
+  // Canonical per-participant presentation (issue #612 blocker): the batch
+  // profile's real name/avatar wins when present, falling back to LiveKit's
+  // displayName only when the profile is absent or empty. Derived once here
+  // and reused for both the tile list and screenShareName below, so the two
+  // surfaces never disagree about who's who.
+  const presentedParticipants = media.participants.map((participant) => {
+    const profile = participantProfiles.get(participant.identity);
+    const profileName = profile?.displayName.trim();
+    return {
+      ...participant,
+      displayName: profileName ? profileName : participant.displayName,
+      avatarUrl: profile?.avatarUrl,
+    };
+  });
   const controls = {
     microphoneEnabled: media.microphoneEnabled,
     cameraEnabled: media.cameraEnabled,
@@ -271,10 +295,7 @@ export default function DedicatedCallPage() {
                 : "connecting"
         }
         participantCount={participantCount}
-        participants={media.participants.map((participant) => ({
-          ...participant,
-          avatarUrl: participantProfiles.get(participant.identity)?.avatarUrl,
-        }))}
+        participants={presentedParticipants}
         controls={controls}
         bindLocalMedia={media.bindLocalMedia}
         bindRemoteAudio={media.bindRemoteAudio}
@@ -282,7 +303,7 @@ export default function DedicatedCallPage() {
         bindLocalScreenShare={media.bindLocalScreenShare}
         screenShareName={
           media.remoteScreenShare
-            ? (media.participants.find(
+            ? (presentedParticipants.find(
                 (participant) => participant.identity === media.remoteScreenShare?.identity,
               )?.displayName ?? "Participante")
             : undefined
@@ -291,10 +312,22 @@ export default function DedicatedCallPage() {
         hasLocalVideo={media.hasLocalVideo}
         localSeed={directory.currentUserId}
         localDisplayName={localDisplayName}
+        localInitials={localInitials}
         localAvatarUrl={selfAvatarUrl}
         headerAvatar={
           resolved.target_type === "user"
             ? { seed: target.id, avatarUrl: target.avatarUrl }
+            : undefined
+        }
+        remoteDirect={
+          resolved.target_type === "user"
+            ? {
+                seed: target.id,
+                displayName: target.name,
+                avatarUrl: target.avatarUrl,
+                hasVideo: media.hasRemoteVideo,
+                bindVideo: media.bindRemoteMedia,
+              }
             : undefined
         }
         onMinimize={() => {

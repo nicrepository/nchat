@@ -27,6 +27,7 @@ const baseProps = {
   hasLocalVideo: false,
   localSeed: "user-1",
   localDisplayName: "Caio Almeida (você)",
+  localInitials: "CA",
 };
 
 describe("DedicatedCallStage", () => {
@@ -52,6 +53,15 @@ describe("DedicatedCallStage", () => {
     const tiles = container.querySelectorAll(".dedicated-call__tile");
     expect(tiles[2]!.querySelector("img")).not.toBeInTheDocument();
     expect(tiles[2]).toHaveTextContent("BL");
+  });
+
+  it("uses the passed-in localInitials verbatim, never derived from the (você)-suffixed localDisplayName (issue #612 blocker)", () => {
+    const { container } = render(
+      <DedicatedCallStage {...baseProps} localDisplayName="Ana (você)" localInitials="A" />,
+    );
+    const tiles = container.querySelectorAll(".dedicated-call__tile");
+    const localAvatar = tiles[0]!.querySelector(".dedicated-call__avatar")!;
+    expect(localAvatar.textContent).toBe("A");
   });
 
   it("renders the local avatar image when localAvatarUrl is set", () => {
@@ -146,6 +156,98 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage {...baseProps} title="Equipe Infra" headerAvatar={undefined} />,
       );
       expect(container.querySelector(".dedicated-call__header-avatar")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("dedicated direct remote tile (issue #612 follow-up)", () => {
+    it("shows the direct peer's real name and avatar in the remote tile when camera is off", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      const tiles = container.querySelectorAll(".dedicated-call__tile");
+      // Local tile is first, remote-direct tile is second.
+      expect(tiles[1]).toHaveTextContent("Ana Souza");
+      expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+    });
+
+    it("falls back to deterministic initials in the remote tile when the peer avatar is missing or broken", () => {
+      const { container, rerender } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{ seed: "peer-1", displayName: "Ana Souza", hasVideo: false }}
+        />,
+      );
+      let tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector("img")).not.toBeInTheDocument();
+      expect(tile).toHaveTextContent("AS");
+
+      rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/broken.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      fireEvent.error(tile.querySelector("img")!);
+      expect(tile.querySelector("img")).not.toBeInTheDocument();
+      expect(tile).toHaveTextContent("AS");
+    });
+
+    it("is decorative (aria-hidden) since the visible name is adjacent in the same tile", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: false,
+          }}
+        />,
+      );
+      const tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector(".dedicated-call__avatar")).toHaveAttribute("aria-hidden", "true");
+    });
+
+    it("camera-on: renders no avatar fallback in the remote tile, only the video container", () => {
+      const bindVideo = vi.fn();
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          remoteDirect={{
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            avatarUrl: "https://x/peer.png",
+            hasVideo: true,
+            bindVideo,
+          }}
+        />,
+      );
+      const tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
+      expect(tile.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      expect(tile.querySelector(".dedicated-call__media")).toBeInTheDocument();
+    });
+
+    it("never renders a remote-direct tile for a channel/group resource call", () => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} title="Equipe Infra" remoteDirect={undefined} />,
+      );
+      // Only the local tile plus the two baseProps.participants tiles — no
+      // extra remote-direct tile ever appears when it wasn't wired in.
+      expect(container.querySelectorAll(".dedicated-call__tile")).toHaveLength(3);
     });
   });
 });

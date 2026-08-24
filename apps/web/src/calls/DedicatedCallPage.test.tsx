@@ -74,6 +74,7 @@ const session = {
     participants: [] as unknown[],
     remoteScreenShare: null as unknown,
     hasLocalVideo: true,
+    hasRemoteVideo: false,
     microphoneEnabled: true,
     cameraEnabled: false,
     screenShareEnabled: false,
@@ -83,6 +84,7 @@ const session = {
     toggleScreenShare: vi.fn(),
     bindLocalMedia: vi.fn(),
     bindLocalScreenShare: vi.fn(),
+    bindRemoteMedia: vi.fn(),
     bindRemoteAudio: vi.fn(),
   },
 };
@@ -132,6 +134,7 @@ describe("DedicatedCallPage", () => {
     session.media.remoteScreenShare = null;
     session.media.screenShareEnabled = false;
     session.media.hasLocalVideo = true;
+    session.media.hasRemoteVideo = false;
     vi.mocked(useCallSession).mockReturnValue(session as never);
     vi.mocked(resolveCall).mockResolvedValue(resolvedCall);
     vi.mocked(fetchSidebarData).mockResolvedValue({
@@ -573,6 +576,48 @@ describe("DedicatedCallPage", () => {
     );
   });
 
+  describe("resource participant presentation (issue #612 blocker fix)", () => {
+    it("the batch profile's real name replaces a placeholder LiveKit name once resolved", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Participante", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      ]);
+      renderPage();
+      expect(await screen.findByText("Ana Souza")).toBeInTheDocument();
+      expect(screen.queryByText("Participante")).not.toBeInTheDocument();
+    });
+
+    it("falls back to the LiveKit displayName when the profile is absent or has an empty/whitespace name", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
+        { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        // user-a has a profile, but the name is blank — must still fall
+        // back to LiveKit's name, never render an empty label.
+        { userId: "user-a", displayName: "   ", avatarUrl: "https://x/a.png" },
+        // user-b has no profile entry at all (not a member, fetch miss).
+      ]);
+      renderPage();
+      expect(await screen.findByText("Ana Souza")).toBeInTheDocument();
+      expect(await screen.findByText("Bruno Lima")).toBeInTheDocument();
+    });
+
+    it("the resource screen-share label uses the same resolved profile identity as the tile", async () => {
+      session.media.participants = [
+        { identity: "user-a", displayName: "Participante", hasVideo: false, bindVideo: vi.fn() },
+      ];
+      session.media.remoteScreenShare = { identity: "user-a", bindMedia: vi.fn() };
+      vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
+        { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
+      ]);
+      renderPage();
+      expect(await screen.findByText("Tela de Ana Souza")).toBeInTheDocument();
+    });
+  });
+
   describe("batch-fetch lifecycle (issue #612 blocker review)", () => {
     it("does not re-fetch when the participant array is recreated but the identity set is unchanged", async () => {
       session.media.participants = [
@@ -651,7 +696,11 @@ describe("DedicatedCallPage", () => {
       ]);
       const view = renderPage();
       await waitFor(() => expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1));
+      await waitFor(() => screen.getByText("Ana Souza"));
 
+      // A stale/renamed LiveKit displayName arriving for the SAME identity
+      // must never re-fetch nor override the already-resolved profile name
+      // (issue #612 blocker): the profile's real name always wins once known.
       session.media.participants = [
         {
           identity: "user-a",
@@ -661,7 +710,8 @@ describe("DedicatedCallPage", () => {
         },
       ];
       view.rerender(pageTree());
-      await waitFor(() => screen.getByText("Ana Souza (LiveKit)"));
+      await waitFor(() => screen.getByText("Ana Souza"));
+      expect(screen.queryByText("Ana Souza (LiveKit)")).not.toBeInTheDocument();
       expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(1);
     });
 
@@ -818,7 +868,9 @@ describe("DedicatedCallPage", () => {
 
       session.media.participants = [...participants].reverse();
       view.rerender(pageTree());
-      await waitFor(() => screen.getByText("Participante 0"));
+      // The batch profile's name ("user-000", per profilesFor) wins over the
+      // LiveKit placeholder ("Participante 0") once resolved (issue #612).
+      await waitFor(() => screen.getByText("user-000"));
       expect(fetchChannelCallParticipantProfiles).toHaveBeenCalledTimes(2);
     });
 
@@ -995,5 +1047,112 @@ describe("DedicatedCallPage", () => {
       expect(main.querySelector(".dedicated-call__header strong")).toHaveTextContent("Produto");
       expect(registerDirectory).toHaveBeenCalledOnce();
     });
+  });
+
+  describe("dedicated direct remote tile (issue #612 follow-up)", () => {
+    function setUpDirectCall(counterpart: {
+      userId: string;
+      displayName: string;
+      avatarUrl?: string;
+    }) {
+      session.calls.call = { call_id: callId, status: "active" };
+      vi.mocked(resolveCall).mockResolvedValue({
+        ...resolvedCall,
+        target_type: "user" as const,
+        target_id: undefined,
+        caller_id: "current-user",
+        callee_id: counterpart.userId,
+      });
+      vi.mocked(fetchSidebarData).mockResolvedValue({
+        currentUserId: "current-user",
+        workspaceId: "workspace-1",
+        channels: [],
+        dms: [
+          { id: "dm-1", name: counterpart.displayName, type: "1:1", participants: [], counterpart },
+        ],
+        categories: [],
+      });
+      session.media.participants = [];
+    }
+
+    it("shows the direct peer's real name and avatar in the remote tile when camera is off, not just the header", async () => {
+      setUpDirectCall({
+        userId: "peer-1",
+        displayName: "Ana Souza",
+        avatarUrl: "https://x/peer.png",
+      });
+      session.media.hasRemoteVideo = false;
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+
+      await waitFor(() => {
+        const tiles = container.querySelectorAll(".dedicated-call__tile");
+        expect(tiles).toHaveLength(2); // local + remote-direct
+        expect(tiles[1]).toHaveTextContent("Ana Souza");
+        expect(tiles[1]!.querySelector("img")).toHaveAttribute("src", "https://x/peer.png");
+      });
+    });
+
+    it("falls back to deterministic initials in the remote tile when the peer has no avatar", async () => {
+      setUpDirectCall({ userId: "peer-1", displayName: "Ana Souza" });
+      session.media.hasRemoteVideo = false;
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+
+      const tile = (await waitFor(() => {
+        const tiles = container.querySelectorAll(".dedicated-call__tile");
+        expect(tiles).toHaveLength(2);
+        return tiles[1]!;
+      })) as Element;
+      expect(tile.querySelector("img")).not.toBeInTheDocument();
+      expect(tile).toHaveTextContent("AS");
+    });
+
+    it("camera-on: shows the remote peer's real video, no avatar fallback tile content", async () => {
+      setUpDirectCall({
+        userId: "peer-1",
+        displayName: "Ana Souza",
+        avatarUrl: "https://x/peer.png",
+      });
+      session.media.hasRemoteVideo = true;
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+
+      await waitFor(() => {
+        const tiles = container.querySelectorAll(".dedicated-call__tile");
+        expect(tiles).toHaveLength(2);
+        expect(tiles[1]!.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      });
+    });
+
+    it("never adds a remote-direct tile for a channel resource call", async () => {
+      const { container } = renderPage();
+      await screen.findByRole("main", { name: "Chamada Produto" });
+      // Only the local tile — no participants joined, no phantom remote-direct tile.
+      expect(container.querySelectorAll(".dedicated-call__tile")).toHaveLength(1);
+    });
+
+    it("shows a coherent 2-participant count for a dedicated direct call (issue #612 blocker)", async () => {
+      setUpDirectCall({ userId: "peer-1", displayName: "Ana Souza" });
+      renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+      expect(await screen.findByText("2 participantes")).toBeInTheDocument();
+    });
+
+    it("wires bindRemoteMedia to the direct remote tile's media container", async () => {
+      setUpDirectCall({ userId: "peer-1", displayName: "Ana Souza" });
+      renderPage();
+      await screen.findByRole("main", { name: "Chamada Ana Souza" });
+      await waitFor(() => expect(session.media.bindRemoteMedia).toHaveBeenCalled());
+    });
+  });
+
+  it("local user with a one-word profile name and no avatar shows a single initial, never 'A(' (issue #612 blocker)", async () => {
+    mockFetchMyProfile.mockResolvedValue({ id: "current-user", displayName: "Ana" });
+    session.media.hasLocalVideo = false;
+    renderPage();
+    const label = await screen.findByText("Ana (você)");
+    const avatar = label.closest("article")!.querySelector(".dedicated-call__avatar")!;
+    expect(avatar.textContent).toBe("A");
   });
 });

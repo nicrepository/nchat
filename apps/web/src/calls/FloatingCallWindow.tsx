@@ -61,6 +61,13 @@ interface FloatingCallWindowProps {
    * the caller knows the self-profile state.
    */
   localName: string;
+  /**
+   * Initials for the local fallback avatar, derived from the raw profile
+   * name — never from localName's "(você)" suffix (issue #612 blocker),
+   * which would otherwise feed "(" in as a second initial for a one-word
+   * name.
+   */
+  localInitials: string;
   /** The local participant's configured avatar, when available. */
   localAvatarUrl?: string;
   testId?: string;
@@ -105,6 +112,7 @@ export default function FloatingCallWindow({
   hasLocalVideo,
   localSeed,
   localName,
+  localInitials,
   localAvatarUrl,
   testId = "floating-call-window",
   activationRequired = false,
@@ -265,7 +273,7 @@ export default function FloatingCallWindow({
             >
               <PersonAvatarImage
                 src={localAvatarUrl}
-                initials={initialsFrom(localName)}
+                initials={localInitials}
                 imgClassName="call-avatar__img"
               />
             </div>
