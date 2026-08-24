@@ -123,16 +123,27 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 	// same environment every other service receives from the shared ConfigMap
 	// and Secret.
 	configuration := service.NewConfigService(storage.NewPGXConfigStore(pool), audit)
+	// The observability surface (issue #581) reads the same environment for the
+	// same reason, and adds one thing the rest of this service does not do:
+	// outbound connections. Every destination comes from a compile-time
+	// registry resolved against this pod's own environment — no request
+	// supplies one — and the health check for PostgreSQL reuses the pool built
+	// above rather than opening a second connection to it.
+	healthMetrics := service.NewHealthMetrics()
+	health := service.NewHealthService(store, healthMetrics)
+	dashboard := service.NewDashboardService(health, storage.NewPGXMetricsStore(pool), healthMetrics)
 	return httpapi.RouterDependencies{
-		TokenValidator:  validator,
-		Sessions:        sessions,
-		Authenticator:   sessions,
-		CSRF:            sessions,
-		Audit:           httpapi.NewAuditPorts(audit, audit),
-		RateLimiter:     httpapi.NewIPRateLimiter(cfg.SessionRateLimitPerMinute, cfg.SessionRateLimitBurst, httputil.ParseCIDRs(cfg.TrustedProxyCIDRs)),
-		ReadinessPinger: store,
-		Management:      httpapi.NewManagementPorts(users, channels, policies),
-		Configuration:   configuration,
+		TokenValidator:   validator,
+		Sessions:         sessions,
+		Authenticator:    sessions,
+		CSRF:             sessions,
+		Audit:            httpapi.NewAuditPorts(audit, audit),
+		RateLimiter:      httpapi.NewIPRateLimiter(cfg.SessionRateLimitPerMinute, cfg.SessionRateLimitBurst, httputil.ParseCIDRs(cfg.TrustedProxyCIDRs)),
+		ReadinessPinger:  store,
+		Management:       httpapi.NewManagementPorts(users, channels, policies),
+		Configuration:    configuration,
+		Observability:    httpapi.NewObservabilityPorts(dashboard, health),
+		HealthCollectors: healthMetrics.Collectors(),
 	}, pool, nil
 }
 

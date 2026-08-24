@@ -174,6 +174,9 @@ type harnessSettings struct {
 	// reason: the foundation's specs describe a deployment that serves those
 	// paths as unavailable.
 	configuration ConfigAdmin
+	// observability is the issue #581 surface, nil by default for the same
+	// reason as the two above.
+	observability *ObservabilityPorts
 	logger        *slog.Logger
 }
 
@@ -183,6 +186,10 @@ func withManagement(ports *ManagementPorts) harnessOption {
 
 func withConfiguration(configuration ConfigAdmin) harnessOption {
 	return func(s *harnessSettings) { s.configuration = configuration }
+}
+
+func withObservability(ports *ObservabilityPorts) harnessOption {
+	return func(s *harnessSettings) { s.observability = ports }
 }
 
 func withConfig(apply func(*config.Config)) harnessOption {
@@ -219,6 +226,7 @@ func newHarness(t *testing.T, store *stubStore, options ...harnessOption) *testH
 		ReadinessPinger: store,
 		Management:      settings.management,
 		Configuration:   settings.configuration,
+		Observability:   settings.observability,
 	})
 	return &testHarness{router: router, store: store, cfg: cfg, auth: sessions}
 }

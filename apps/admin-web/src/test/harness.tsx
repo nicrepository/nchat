@@ -93,3 +93,22 @@ export function routedFetch(
 export function requestedURLs(fetchMock: ReturnType<typeof vi.fn>): string[] {
   return fetchMock.mock.calls.map((call) => String(call[0]));
 }
+
+/**
+ * A promise the test settles by hand.
+ *
+ * Ordering specs must not be expressed with timers: `setTimeout` makes the
+ * outcome depend on how fast the machine happens to be, which is exactly the
+ * property a race test cannot have. Holding each response open and settling it
+ * at the precise moment the scenario calls for makes the interleaving explicit
+ * and the result deterministic.
+ */
+export function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}

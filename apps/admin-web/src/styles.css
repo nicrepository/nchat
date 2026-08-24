@@ -798,3 +798,260 @@ a {
   margin: 0.35rem 0;
   color: var(--admin-muted);
 }
+
+/*
+ * Observabilidade — Dashboard e Health Center (issue #581).
+ *
+ * Regra que governa esta seção: estado nunca é só cor. Cada badge carrega
+ * palavra, forma e cor, e as três dizem a mesma coisa; a cor some numa
+ * impressão em preto e branco, a forma sobrevive, e o texto sobrevive a
+ * qualquer uma das duas.
+ */
+
+.admin-panel {
+  margin: 1.5rem 0;
+  padding: 1rem 1.15rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+}
+
+.admin-panel > h2:first-child,
+.admin-panel > h2 {
+  margin-top: 0;
+}
+
+.admin-health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid currentcolor;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.admin-health-badge__mark {
+  font-size: 0.8em;
+  line-height: 1;
+}
+
+.admin-health-badge--ok {
+  color: var(--admin-ok);
+}
+
+.admin-health-badge--warn {
+  color: var(--admin-warn);
+}
+
+.admin-health-badge--danger {
+  color: var(--admin-danger);
+}
+
+.admin-health-badge--muted {
+  color: var(--admin-muted);
+}
+
+.admin-health-badge--neutral {
+  color: var(--admin-accent);
+}
+
+.admin-platform-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+.admin-platform-state__meaning {
+  color: var(--admin-muted);
+}
+
+.admin-state-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+}
+
+.admin-state-counts__item {
+  display: flex;
+  flex-direction: column;
+}
+
+.admin-state-counts__value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.admin-state-counts__label {
+  color: var(--admin-muted);
+  font-size: 0.85rem;
+}
+
+.admin-alert-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.admin-alert-item {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--admin-border);
+  border-left-width: 4px;
+  border-radius: var(--admin-radius);
+}
+
+.admin-alert-item--critical {
+  border-left-color: var(--admin-danger);
+}
+
+.admin-alert-item--warning {
+  border-left-color: var(--admin-warn);
+}
+
+.admin-alert-item__title {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+/* A severidade é palavra antes de ser cor de borda. */
+.admin-alert-item__severity {
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+
+.admin-alert-item__impact,
+.admin-alert-item__action {
+  margin: 0 0 0.35rem;
+}
+
+.admin-alert-item__action {
+  color: var(--admin-muted);
+}
+
+/*
+ * Cards que reorganizam sozinhos: auto-fit com minmax evita media queries e
+ * mantém o comportamento correto também com zoom de 200%, quando o viewport
+ * efetivo encolhe pela metade.
+ */
+.admin-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.admin-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+}
+
+.admin-metric__label {
+  font-weight: 600;
+}
+
+.admin-metric__value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+/* Indisponível não é um número: não usa o mesmo peso visual de um. */
+.admin-metric__value--absent {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--admin-muted);
+}
+
+.admin-metric__window {
+  color: var(--admin-accent);
+  font-size: 0.8rem;
+}
+
+.admin-metric__definition {
+  color: var(--admin-muted);
+  font-size: 0.8rem;
+}
+
+.admin-refresh-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0 0.5rem;
+}
+
+.admin-refresh-bar > p {
+  margin: 0;
+}
+
+.admin-health-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 0 0 1rem;
+}
+
+.admin-health-controls select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--admin-border);
+  border-radius: var(--admin-radius);
+  background: var(--admin-surface);
+  color: var(--admin-text);
+  font: inherit;
+}
+
+.admin-button--quiet {
+  background: transparent;
+  color: var(--admin-text);
+  font-weight: 500;
+}
+
+.admin-health-detail > td {
+  background: var(--admin-surface);
+}
+
+.admin-health-detail__impact {
+  margin: 0 0 0.35rem;
+  font-weight: 600;
+}
+
+.admin-health-detail__diagnosis {
+  margin: 0 0 0.5rem;
+}
+
+/* Informação técnica avançada: presente, secundária, nunca em primeiro plano. */
+.admin-health-detail__technical {
+  color: var(--admin-muted);
+  font-size: 0.85rem;
+}
+
+.admin-legend-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
+.admin-legend-entry dd {
+  margin: 0;
+  color: var(--admin-muted);
+}

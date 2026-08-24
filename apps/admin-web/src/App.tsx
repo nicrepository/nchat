@@ -7,6 +7,7 @@ import AuditPage from "./pages/AuditPage";
 import ChannelsPage from "./pages/ChannelsPage";
 import ConfigurationPage from "./pages/ConfigurationPage";
 import FilesPage from "./pages/FilesPage";
+import HealthCenterPage from "./pages/HealthCenterPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import OverviewPage from "./pages/OverviewPage";
 import SecurityPage from "./pages/SecurityPage";
@@ -76,6 +77,7 @@ export default function App() {
             <Route path="security" element={<SecurityPage />} />
             <Route path="files" element={<FilesPage />} />
             <Route path="configuration" element={<ConfigurationPage />} />
+            <Route path="health" element={<HealthCenterPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>

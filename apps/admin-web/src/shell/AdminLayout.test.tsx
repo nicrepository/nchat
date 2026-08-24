@@ -98,7 +98,7 @@ describe("AdminLayout", () => {
     render(<App />);
 
     const nav = await screen.findByRole("navigation", { name: "Seções administrativas" });
-    const placeholder = within(nav).getByText("Health Center").closest("span");
+    const placeholder = within(nav).getByText("Sistema").closest("span");
     expect(placeholder).toHaveAttribute("aria-disabled", "true");
     expect(placeholder?.tagName).toBe("SPAN");
     expect(
@@ -112,6 +112,7 @@ describe("AdminLayout", () => {
       "Segurança e políticas",
       "Arquivos e armazenamento",
       "Configurações",
+      "Health Center",
       "Auditoria",
     ]);
   });

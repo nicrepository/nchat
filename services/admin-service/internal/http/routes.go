@@ -69,4 +69,23 @@ const (
 	// values: the change set and the preconditions are derived from the
 	// recorded version, server-side, and a client names only which version.
 	RouteAdminConfigRollbackPreview = "/config/versions/{versionID}/rollback/preview"
+
+	// Observability routes (issue #581).
+	//
+	// Three routes, none of which takes a destination. The dashboard is one
+	// aggregate read so the console makes one request instead of one per card;
+	// the health listing is the same collection in full; the refresh is a POST
+	// with no body, which is what puts it behind the CSRF and origin guards
+	// like every other non-safe method.
+	//
+	// There is deliberately no /health/{service} and no endpoint that accepts a
+	// URL, host, port or DSN. A caller may narrow the listing with ?service=,
+	// and that value is resolved against the compile-time registry in
+	// domain/health.go before anything reads it: the set of addresses this pod
+	// is willing to contact comes from its own environment and from nowhere
+	// else, which is what stops a health check from becoming an SSRF
+	// primitive.
+	RouteAdminOverview      = "/overview"
+	RouteAdminHealth        = "/health/services"
+	RouteAdminHealthRefresh = "/health/refresh"
 )

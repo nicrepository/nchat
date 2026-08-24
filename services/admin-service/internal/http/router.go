@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/nicrepository/nchat/libs/go/platform/httputil"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/admin-service/internal/config"
@@ -35,6 +37,14 @@ type RouterDependencies struct {
 	// has one and not the other answers 503 on the missing paths rather than
 	// serving any of them without their guards.
 	Configuration ConfigAdmin
+	// Observability is the issue #581 surface: the dashboard summary and the
+	// Health Center. Separate for the same all-or-nothing reason as the others.
+	Observability *ObservabilityPorts
+	// HealthCollectors are the Prometheus collectors the health surface
+	// exports. They are handed in already built so the router only decides
+	// whether to register them, which is the same decision it makes about
+	// every other collector: only when metrics are enabled.
+	HealthCollectors []prometheus.Collector
 }
 
 // ManagementPorts groups the three management surfaces. They are wired
@@ -82,6 +92,10 @@ func NewRouter(cfg config.Config, logger *slog.Logger, dependencies ...RouterDep
 	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg, deps.ReadinessPinger)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
+	// Register is a no-op when PROMETHEUS_METRICS_ENABLED is unset, so the
+	// health surface stays instrumented exactly as much as the rest of the
+	// platform and never more.
+	metrics.Register(deps.HealthCollectors...)
 
 	registerAdminAPI(mux, cfg, logger, deps)
 
@@ -143,6 +157,59 @@ func registerAdminAPI(mux *http.ServeMux, cfg config.Config, logger *slog.Logger
 
 	registerManagementAPI(mux, cfg, deps, ready)
 	registerConfigAPI(mux, cfg, deps, ready)
+	registerObservabilityAPI(mux, cfg, deps, ready)
+}
+
+// observabilityRoute is one observability endpoint as the table below declares
+// it.
+type observabilityRoute struct {
+	path       string
+	method     string
+	capability domain.Capability
+	handler    func(*ObservabilityPorts) http.Handler
+}
+
+// registerObservabilityAPI wires the issue #581 surface.
+//
+// Same guard chain and same order as every other surface: administrative
+// session, then — for the refresh, which is a POST — the origin and CSRF
+// checks, then the one capability the route declares.
+//
+// All three require admin.infrastructure.read, and no new capability was
+// introduced for them. The console's navigation map already declared that
+// capability for the Health Center and the system section, the platform
+// already defines it, the database CHECK in migration 000008 already allows
+// it, and the RBAC matrix already documents it. Minting a capability to hold
+// what an existing one is already for would have widened the model for
+// nothing; widening admin.superuser instead would have been worse.
+//
+// Why a read is guarded as strictly as a write: the dashboard reports how many
+// people are signed in and how much traffic the platform carries, and the
+// Health Center names every dependency the deployment has. Both are
+// reconnaissance for anyone who should not be holding this session.
+func registerObservabilityAPI(mux *http.ServeMux, cfg config.Config, deps RouterDependencies, ready bool) {
+	routes := []observabilityRoute{
+		{RouteAdminOverview, http.MethodGet, domain.CapabilityInfrastructureRead, GetOverview},
+		{RouteAdminHealth, http.MethodGet, domain.CapabilityInfrastructureRead, ListHealthChecks},
+		{RouteAdminHealthRefresh, http.MethodPost, domain.CapabilityInfrastructureRead, RefreshHealth},
+	}
+	enabled := ready && deps.Observability != nil &&
+		deps.Observability.Dashboard != nil && deps.Observability.Health != nil
+	for _, route := range routes {
+		handler := adminUnavailable()
+		if enabled {
+			handler = guardObservability(cfg, deps, route)
+		}
+		mux.Handle(route.path, httputil.MethodNotAllowed(route.method, handler))
+	}
+}
+
+func guardObservability(cfg config.Config, deps RouterDependencies, route observabilityRoute) http.Handler {
+	handler := RequireCapability(route.capability, deps.Audit.Recorder)(route.handler(deps.Observability))
+	if !isSafeMethod(route.method) {
+		handler = RequireCSRF(deps.CSRF, cfg.AllowedOrigins)(handler)
+	}
+	return RequireAdminSession(deps.Authenticator, sessionCookieName)(handler)
 }
 
 // registerConfigAPI wires the issue #580 surface.
