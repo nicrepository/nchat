@@ -20,14 +20,15 @@ const controls = {
   onEnd: noop,
 };
 
-// Every FloatingCallWindow test below that isn't specifically exercising the
-// identity fallback wants "video is present, no fallback" — these are the
-// two real media flags plus their (irrelevant-to-those-tests) color seeds.
+// Default media and local-presentation props for FloatingCallWindow tests
+// that are not specifically exercising the local identity fallback.
 const videoPresent = {
   hasRemoteVideo: true,
   remoteSeed: "peer-seed",
   hasLocalVideo: true,
   localSeed: "local-user",
+  localName: "Você",
+  localInitials: "V",
 };
 
 describe("IncomingCallPopup", () => {
