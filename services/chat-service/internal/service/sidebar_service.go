@@ -42,6 +42,15 @@ type SidebarChannel struct {
 	LastMessageAt *time.Time
 	PinnedAt      *time.Time
 	UnreadCount   int
+	// CanRename is the server's own answer to "may this caller rename this
+	// channel" (issue #527), derived from the membership GetSidebar already
+	// loaded. It exists so the row's action menu can omit an item the server
+	// would refuse, and it is never the control: PATCH /api/chat/channels/{id}
+	// re-derives the same decision from the session on every call.
+	//
+	// False for #geral, matching the write path: the general channel is
+	// immutable, so no role makes it renameable.
+	CanRename bool
 }
 
 type sidebarChannelStore interface {
@@ -193,8 +202,12 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 			pinnedPtr = &pinnedCopy
 		}
 		sidebarChannels = append(sidebarChannels, SidebarChannel{
-			Channel:       access.Channel,
-			CanWrite:      domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			Channel:  access.Channel,
+			CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
+			// The same predicate ChannelService.UpdateChannel enforces, on the
+			// membership already loaded above — not a second, parallel rule. The
+			// grouped category listing calls the identical function.
+			CanRename:     domain.CanRenameChannel(&member, access.Channel),
 			LastMessageAt: access.LastMessageAt,
 			PinnedAt:      pinnedPtr,
 			UnreadCount:   unreadCounts[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID],

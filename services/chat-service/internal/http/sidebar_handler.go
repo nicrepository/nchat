@@ -64,6 +64,13 @@ type sidebarChannelJSON struct {
 	Type        string `json:"type"`
 	IsGeneral   bool   `json:"is_general"`
 	CanWrite    bool   `json:"can_write"`
+	// CanRename is the server's answer to "may this caller rename this channel"
+	// (issue #527). It is presentation only — the row's action menu omits an
+	// item the server would refuse — and PATCH /api/chat/channels/{channelID}
+	// re-derives the same decision on every call. Never omitempty: a client
+	// that predates the field reads a missing value as "no", which hides an
+	// action rather than offering one that 403s.
+	CanRename bool `json:"can_rename"`
 	// RFC 3339 UTC, with the sub-second fraction kept — see formatSidebarTime
 	// for why these two keep a precision the detail endpoints do not need.
 	CreatedAt     string  `json:"created_at"`
@@ -195,6 +202,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			Type:          string(ch.Type),
 			IsGeneral:     ch.IsGeneral,
 			CanWrite:      sidebarChannel.CanWrite,
+			CanRename:     sidebarChannel.CanRename,
 			CreatedAt:     formatSidebarTime(ch.CreatedAt),
 			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
 			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),

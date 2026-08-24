@@ -13,6 +13,11 @@ const (
 	RouteDMConversations      = "/api/chat/dms"
 	RouteDMGroupConversations = "/api/chat/dms/group"
 	RouteChannels             = "/api/chat/channels"
+	// RouteChannel is the single channel a manager may edit (issue #527). Served
+	// only for PATCH, and only for the display name — the same prefix as the
+	// literal /details and /members below, with no workspace segment for the same
+	// reason none of them has one.
+	RouteChannel = "/api/chat/channels/{channelID}"
 	// RF-17 channel categories. No workspace segment: the workspace is resolved
 	// server-side from the authenticated session, exactly like every other chat
 	// route, so there is no path for a client to aim at another workspace.

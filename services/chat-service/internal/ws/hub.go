@@ -775,6 +775,45 @@ func (h *Hub) PublishMembersAdded(
 	}
 }
 
+// PublishChannelUpdated broadcasts that one channel's metadata changed
+// (issue #527).
+//
+// Callers must invoke it only after the write has committed: the event tells
+// subscribers their view is stale, and one sent for a rename that then failed
+// would make every client refetch its way back to the state it already had.
+//
+// Delivery follows the same route as pin.updated — the local broadcast queue
+// re-checks each subscriber's authorization at fan-out, and the bus publish is
+// best-effort for other instances. The event carries no payload at all, so a
+// subscriber who may read the channel learns only that it changed; what it
+// changed to comes from the sidebar endpoint, which authorizes for itself.
+func (h *Hub) PublishChannelUpdated(ctx context.Context, workspaceID, channelID string) {
+	if workspaceID == "" || channelID == "" {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeChannelUpdated,
+		WorkspaceID: workspaceID, TargetType: TargetTypeChannel, TargetID: channelID,
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal channel.updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: channel update bus publish failed", "error", err)
+	}
+}
+
 // PublishConversationAvailable delivers a sidebar-invalidation signal to the
 // sessions of the given users, wherever those sessions are connected (#398).
 //
@@ -2504,7 +2543,8 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	switch evt.Type {
 	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
-		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeAttachmentStatus,
+		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeChannelUpdated,
+		EventTypeAttachmentStatus,
 		EventTypePresenceUpdated, EventTypeTypingUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
@@ -2535,7 +2575,49 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	return evt, true
 }
 
+// canonicalizeEventIDs validates and canonicalizes the identifiers of a remote
+// event, dispatching on how that event is addressed.
+//
+// Three shapes exist in this protocol and they are checked by three different
+// rules, so this is a dispatcher over them rather than one flat sequence:
+//
+//   - recipient-scoped: conversation.available, the one event delivered to a
+//     user rather than to a target's subscribers;
+//   - target-scoped without a message: events about the target itself;
+//   - message-scoped: everything else, plus the call family, which
+//     canonicalizeCallEvent has already validated in full.
+//
+// Every unmatched shape still lands on the message-scoped rule, which requires a
+// UUID message_id — there is no permissive default here.
 func canonicalizeEventIDs(evt Event) (Event, bool) {
+	evt, ok := canonicalizeCoreIDs(evt)
+	if !ok {
+		return Event{}, false
+	}
+	if evt.Type == EventTypeConversationAvailable {
+		return canonicalizeRecipientScopedIDs(evt)
+	}
+	// No other event type may carry a recipient — that field is what makes
+	// delivery bypass subscriptions, so it must not appear where it is not
+	// expected.
+	if evt.RecipientUserID != "" {
+		return Event{}, false
+	}
+	if isTargetScopedEventWithoutMessage(evt.Type) {
+		return canonicalizeTargetScopedIDs(evt)
+	}
+	// Call events (RF-23) route to a user through TargetTypeUser/TargetID rather
+	// than through RecipientUserID, and name no message. canonicalizeCallEvent
+	// has already asserted both, plus the whole call payload.
+	if isCallEventType(evt.Type) {
+		return evt, true
+	}
+	return canonicalizeMessageScopedIDs(evt)
+}
+
+// canonicalizeCoreIDs validates the three identifiers every event carries, in
+// canonical lowercase form. All three are required for every shape.
+func canonicalizeCoreIDs(evt Event) (Event, bool) {
 	// event_id: required, must be a valid UUID; canonicalize to lowercase.
 	eid, err := uuid.Parse(evt.EventID)
 	if err != nil {
@@ -2556,59 +2638,76 @@ func canonicalizeEventIDs(evt Event) (Event, bool) {
 		return Event{}, false
 	}
 	evt.TargetID = tid.String()
+	return evt, true
+}
 
-	// conversation.available is the one event that names a user rather than a
-	// message: it is routed to a recipient, not to a message's subscribers.
-	// Its recipient is required and must be a UUID; a message ID is not.
-	if evt.Type == EventTypeConversationAvailable {
-		rid, err := uuid.Parse(evt.RecipientUserID)
-		if err != nil {
-			return Event{}, false
-		}
-		evt.RecipientUserID = rid.String()
-		// Nothing else may ride along: strip every payload a sender might have
-		// attached, so a remote event can carry no identities or content.
-		evt.MessageID = ""
-		evt.Pin = nil
-		evt.Reaction = nil
-		evt.Members = nil
-		evt.Presence = nil
-		return evt, true
-	}
-
-	// No other event type may carry a recipient — that field is what makes
-	// delivery bypass subscriptions, so it must not appear where it is not
-	// expected.
-	if evt.RecipientUserID != "" {
+// canonicalizeRecipientScopedIDs validates conversation.available, the one event
+// that names a user rather than a message: it is routed to a recipient, not to a
+// message's subscribers. Its recipient is required and must be a UUID; a message
+// ID is not.
+func canonicalizeRecipientScopedIDs(evt Event) (Event, bool) {
+	rid, err := uuid.Parse(evt.RecipientUserID)
+	if err != nil {
 		return Event{}, false
 	}
+	evt.RecipientUserID = rid.String()
+	// Nothing else may ride along: strip every payload a sender might have
+	// attached, so a remote event can carry no identities or content.
+	evt.MessageID = ""
+	evt.Pin = nil
+	evt.Reaction = nil
+	evt.Members = nil
+	evt.Presence = nil
+	return evt, true
+}
 
-	// members.added is target-scoped like the message events, but it is about the
-	// target itself rather than about anything in it, so it has no message to
-	// name. A message_id on one is a shape this protocol does not produce.
-	//
-	// attachment.status is the same shape for the same reason: it is about a file
-	// in the target, not about a message, and an attachment can outlive the
-	// message that carried it.
-	//
-	// presence.updated and typing.updated are both about a person in the target
-	// rather than about anything in it, so neither names a message either.
-	if evt.Type == EventTypeMembersAdded || evt.Type == EventTypeAttachmentStatus ||
-		evt.Type == EventTypePresenceUpdated || evt.Type == EventTypeTypingUpdated {
-		if evt.MessageID != "" {
-			return Event{}, false
-		}
-		return evt, true
+// isTargetScopedEventWithoutMessage reports whether an event is about the target
+// itself rather than about anything in it, and so names no message.
+//
+// members.added is target-scoped like the message events, but it is about the
+// target rather than about anything in it, so it has no message to name. A
+// message_id on one is a shape this protocol does not produce.
+//
+// attachment.status is the same shape for the same reason: it is about a file in
+// the target, not about a message, and an attachment can outlive the message
+// that carried it.
+//
+// presence.updated and typing.updated are both about a person in the target
+// rather than about anything in it, so neither names a message either.
+//
+// channel.updated joins them for the strictest version of the same reason: it is
+// about the channel row itself and carries no payload whatsoever, so there is
+// nothing on it that could name a message.
+func isTargetScopedEventWithoutMessage(eventType EventType) bool {
+	switch eventType {
+	case EventTypeMembersAdded, EventTypeAttachmentStatus,
+		EventTypePresenceUpdated, EventTypeTypingUpdated, EventTypeChannelUpdated:
+		return true
+	default:
+		return false
 	}
+}
 
-	// Call events (RF-23) route to a user through TargetTypeUser/TargetID rather
-	// than through RecipientUserID, and name no message. canonicalizeCallEvent
-	// has already asserted both, plus the whole call payload.
-	if isCallEventType(evt.Type) {
-		return evt, true
+// canonicalizeTargetScopedIDs refuses a message_id on an event that has no
+// message to name, and strips channel.updated's foreign payloads.
+func canonicalizeTargetScopedIDs(evt Event) (Event, bool) {
+	if evt.MessageID != "" {
+		return Event{}, false
 	}
+	if evt.Type == EventTypeChannelUpdated {
+		// The one event with no payload of its own. Anything attached to it
+		// belongs to a different event type and is relaying state nobody asked
+		// this one about, so it is dropped rather than forwarded.
+		evt.Pin = nil
+		evt.Members = nil
+		evt.Reaction = nil
+	}
+	return evt, true
+}
 
-	// Everything that remains is message-scoped.
+// canonicalizeMessageScopedIDs validates the message_id every remaining event
+// type is required to name.
+func canonicalizeMessageScopedIDs(evt Event) (Event, bool) {
 	mid, err := uuid.Parse(evt.MessageID)
 	if err != nil {
 		return Event{}, false

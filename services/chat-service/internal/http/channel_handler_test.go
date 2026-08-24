@@ -30,6 +30,19 @@ type fakeChannelProvider struct {
 	callParticipantProfilesErr error
 	lastCallParticipantsInput  service.ChannelCallParticipantProfilesInput
 	callParticipantsCalls      int
+
+	updated         domain.Channel
+	updateErr       error
+	lastUpdateInput service.UpdateChannelInput
+	updateCalls     int
+}
+
+func (f *fakeChannelProvider) UpdateChannel(
+	_ context.Context, input service.UpdateChannelInput,
+) (domain.Channel, error) {
+	f.updateCalls++
+	f.lastUpdateInput = input
+	return f.updated, f.updateErr
 }
 
 func (f *fakeChannelProvider) CreateChannel(_ context.Context, input service.CreateChannelInput) (domain.Channel, error) {

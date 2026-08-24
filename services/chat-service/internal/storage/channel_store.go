@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -41,6 +42,13 @@ type CreateChannelInput struct {
 // UpdateChannelInput holds the complete mutable channel state to persist.
 // CategoryID and EnsureMemberUserID are optional (empty string = NULL / disabled).
 type UpdateChannelInput struct {
+	// CallerID is the authenticated actor, and it is required: UpdateChannel
+	// re-derives that actor's workspace management role from the database inside
+	// the write transaction. It is deliberately an identity and never a decision
+	// — no role, no capability, no boolean — because a decision computed before
+	// the transaction opened is exactly what the re-derivation exists to
+	// distrust. It comes from the session, never from a request body.
+	CallerID           string
 	WorkspaceID        string
 	ChannelID          string
 	CategoryID         string
@@ -87,6 +95,13 @@ type ChannelStore interface {
 	// public and general channels are always included; private channels require channel membership.
 	// Returns an empty slice when the workspace is disabled or userID is not an active member.
 	ListVisibleChannelsByUser(ctx context.Context, workspaceID, userID string) ([]domain.Channel, error)
+	// UpdateChannel persists the channel's mutable state, re-deriving
+	// input.CallerID's workspace management role inside the same transaction as
+	// the write and holding the membership row while it happens.
+	//
+	// Returns domain.ErrForbidden — without saying which condition failed — when
+	// the workspace is not active, or CallerID does not hold an active
+	// owner/admin membership in it at the moment of the UPDATE.
 	UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error)
 	ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error)
 }
@@ -565,11 +580,86 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 	return accesses, rows.Err()
 }
 
-func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
-	if input.EnsureMemberUserID == "" {
-		return updateChannel(ctx, s.pool, input)
-	}
+// channelManagerRoles is the SQL statement of domain.CanManageWorkspace: the
+// roles that may change what a channel *is*.
+//
+// Owner and admin, and deliberately not the RF-74 workspace moderator — that
+// role moderates channel structure and membership, which is a different
+// predicate (domain.CanManageChannelMembers, spelled out separately in
+// member_store.go). A constant so the allowlist has one definition here, and
+// never `role != 'guest'`: an unrecognised role — a row written before a CHECK
+// was widened, a value from a future migration — must fail closed.
+//
+// This is chat.workspace_members.role. The per-channel moderator on
+// chat.channel_members is a different scope and is never consulted here.
+const channelManagerRoles = `('owner', 'admin')`
 
+// lockActorChannelManagementSQL re-derives the actor's workspace management
+// authority and holds the membership row for the rest of the transaction.
+//
+// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
+// channel_category_store.go and PGXMemberStore.AddChannelMembers: demoting a
+// role, suspending a membership and deleting it are all UPDATE/DELETE of that
+// row, which take FOR NO KEY UPDATE or FOR UPDATE and conflict with FOR SHARE —
+// so a revocation in flight is serialised against the update, in both
+// directions. Two managers editing different channels of the same workspace
+// both take FOR SHARE and do not block each other, which FOR UPDATE would have
+// made them do for no safety gained.
+const lockActorChannelManagementSQL = `
+	SELECT true
+	FROM chat.workspace_members wm
+	JOIN chat.workspaces w
+	  ON w.id = wm.workspace_id AND w.status = 'active'
+	WHERE wm.workspace_id = $1::uuid
+	  AND wm.user_id = $2::uuid
+	  AND wm.status = 'active'
+	  AND wm.role IN ` + channelManagerRoles + `
+	FOR SHARE OF wm`
+
+// requireChannelManager is the authorization decision that counts, taken inside
+// the caller's transaction so it cannot be overtaken by a concurrent revocation.
+//
+// The service checks the same predicate first for a legible error; the decision
+// is deliberately not passed down as a boolean, because a boolean computed a
+// moment ago is exactly the thing this query exists to distrust.
+//
+// One answer — ErrForbidden — for a revoked role, a suspended or removed
+// membership and a disabled workspace, so the error cannot be used to tell them
+// apart.
+func requireChannelManager(ctx context.Context, q channelQuerier, workspaceID, callerID string) error {
+	var authorized bool
+	err := q.QueryRow(ctx, lockActorChannelManagementSQL, workspaceID, callerID).Scan(&authorized)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrForbidden
+		}
+		return fmt.Errorf("lock actor workspace membership: %w", err)
+	}
+	return nil
+}
+
+// UpdateChannel persists the channel's mutable state with the authorization
+// serialized against the write.
+//
+// The service's own check happens before the transaction opens; in between, the
+// actor can be demoted from admin to member, suspended, or removed from the
+// workspace outright, and without this they would still get to write. Locking
+// the membership row also serialises this against a concurrent role change
+// rather than merely observing one that already committed.
+//
+// Lock order is the canonical one channelmembership.LockChannelSQL documents and
+// every membership mutation obeys: the channel row first, then the actor's
+// membership, then the mutation. Taking the membership first would invert the
+// order PGXMemberStore.AddChannelMembers uses on the same two rows and make a
+// cycle reachable.
+//
+// Always a transaction, including when no membership has to be seeded: the
+// authorization and the UPDATE are two statements and must not be two
+// transactions.
+func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
+	if input.CallerID == "" {
+		return domain.Channel{}, domain.ErrForbidden
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Channel{}, fmt.Errorf("begin update channel: %w", err)
@@ -581,18 +671,54 @@ func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannel
 		}
 	}()
 
-	ch, err := updateChannel(ctx, tx, input)
+	ch, err := updateChannelAuthorized(ctx, tx, input)
 	if err != nil {
 		return domain.Channel{}, err
 	}
-	if err := addChannelMember(ctx, tx, ch.ID, input.EnsureMemberUserID, domain.ChannelRoleMember); err != nil {
-		return domain.Channel{}, err
+	if input.EnsureMemberUserID != "" {
+		if err := addChannelMember(ctx, tx, ch.ID, input.EnsureMemberUserID, domain.ChannelRoleMember); err != nil {
+			return domain.Channel{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Channel{}, fmt.Errorf("commit update channel: %w", err)
 	}
 	committed = true
 	return ch, nil
+}
+
+// updateChannelAuthorized runs the three steps in canonical lock order: pin the
+// channel, re-derive and hold the actor's authority, then write.
+//
+// A channel that does not exist stops at the first step, so an unauthorized
+// caller and a missing channel keep the errors they already had.
+func updateChannelAuthorized(ctx context.Context, tx pgx.Tx, input UpdateChannelInput) (domain.Channel, error) {
+	if err := lockChannelForUpdate(ctx, tx, input.ChannelID); err != nil {
+		return domain.Channel{}, err
+	}
+	if err := requireChannelManager(ctx, tx, input.WorkspaceID, input.CallerID); err != nil {
+		return domain.Channel{}, err
+	}
+	return updateChannel(ctx, tx, input)
+}
+
+// lockChannelForUpdate pins the channel row for the rest of the transaction.
+//
+// It is channelmembership.LockChannelSQL, the serialization protocol shared with
+// admin-service, and it is first for the reason that file documents. Scoping is
+// still the UPDATE's job: a channel in another workspace is locked here and then
+// matches nothing below, which keeps "wrong workspace" and "does not exist"
+// indistinguishable.
+func lockChannelForUpdate(ctx context.Context, tx pgx.Tx, channelID string) error {
+	var lockedID string
+	err := tx.QueryRow(ctx, channelmembership.LockChannelSQL, channelID).Scan(&lockedID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrNotFound
+		}
+		return fmt.Errorf("lock channel for update: %w", err)
+	}
+	return nil
 }
 
 func updateChannel(ctx context.Context, q channelQuerier, input UpdateChannelInput) (domain.Channel, error) {

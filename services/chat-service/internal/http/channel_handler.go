@@ -20,6 +20,17 @@ type channelProvider interface {
 	// GetCallParticipantProfiles resolves presentation identities for a set
 	// of call-participant user IDs, scoped to this channel (issue #612).
 	GetCallParticipantProfiles(ctx context.Context, input service.ChannelCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
+	// UpdateChannel edits one channel's mutable fields (issue #527). The Rename
+	// route forwards only DisplayName; every other field is left "unchanged".
+	UpdateChannel(ctx context.Context, input service.UpdateChannelInput) (domain.Channel, error)
+}
+
+// channelUpdateBroadcaster publishes the post-commit "this channel's metadata
+// changed" signal (issue #527). Its own interface rather than a method on
+// membersBroadcaster: that one is shared with DMHandler, and a group has no
+// channel to update. app.go adapts the hub to both.
+type channelUpdateBroadcaster interface {
+	PublishChannelUpdated(ctx context.Context, workspaceID, channelID string)
 }
 
 // presenceLookup answers "who in this workspace is online right now" for the
@@ -80,6 +91,9 @@ type ChannelHandler struct {
 	presence   presenceLookup
 	members    channelMemberManager
 	broadcast  membersBroadcaster
+	// channelUpdates is optional: without it a rename still persists and still
+	// answers 200, it simply does not tell other sessions to refetch.
+	channelUpdates channelUpdateBroadcaster
 }
 
 func NewChannelHandler(workspaces workspaceResolver, channels channelProvider, limiter channelRateLimiter) *ChannelHandler {
@@ -108,6 +122,20 @@ func (h *ChannelHandler) WithMembers(members channelMemberManager, broadcast mem
 	next := *h
 	next.members = members
 	next.broadcast = broadcast
+	return &next
+}
+
+// WithChannelUpdates returns a handler that emits the post-commit
+// channel.updated signal (issue #527). Wired after the hub exists, like
+// WithMembers. Unlike the members routes, the rename route is registered
+// regardless: the write is authoritative on its own and a missing broadcaster
+// costs a stale name until the next sidebar refetch, never the rename.
+func (h *ChannelHandler) WithChannelUpdates(broadcast channelUpdateBroadcaster) *ChannelHandler {
+	if h == nil {
+		return nil
+	}
+	next := *h
+	next.channelUpdates = broadcast
 	return &next
 }
 
@@ -735,6 +763,189 @@ func writeCreateChannelError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusConflict, "conflict", "channel already exists")
 	case errors.Is(err, domain.ErrNotFound):
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// ── Rename (issue #527) ──────────────────────────────────────────────────────
+
+// renameChannelRequest is the whole accepted body.
+//
+// One field, and the omissions are the contract: no workspace_id, no type, no
+// slug, no role and no actor. The workspace is resolved from the session, the
+// caller comes from the authenticated context, and the strict decoder answers
+// 400 to a client that sends anything else — so a payload cannot claim a
+// privilege, move a channel between workspaces, or turn a rename into a
+// visibility change.
+type renameChannelRequest struct {
+	DisplayName string `json:"display_name"`
+}
+
+// renameChannelResponse reports the persisted result.
+//
+// The ID is echoed because the whole point of a rename is that it does not
+// change: a client that sees the same id knows it is looking at the same
+// channel and not at a new one.
+type renameChannelResponse struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+const (
+	// channelRenameRateLimit bounds renames per user per minute. Tight for the
+	// same reason channel creation is: every accepted call changes a
+	// workspace-wide object the whole sidebar renders from.
+	channelRenameRateLimit = 20
+	channelRenameAction    = "channel_update"
+)
+
+// Rename handles PATCH /api/chat/channels/{channelID} (issue #527).
+//
+// Transport concerns only. Who may rename (domain.CanManageWorkspace, via
+// ChannelService.requireManagePermission), what a valid name is
+// (domain.NormalizeChannelDisplayName) and the #geral immutability all live in
+// ChannelService.UpdateChannel; this function makes no authorization decision
+// of its own and never inspects the name beyond decoding it.
+//
+// Only DisplayName is forwarded. Slug, Type, CategoryID and Position are left
+// nil/empty, which UpdateChannel reads as "unchanged", so this route cannot
+// change a channel's visibility, its category or its address — a rename is a
+// rename.
+//
+// The realtime signal is published only after the service returns successfully,
+// so a refused or rolled-back write broadcasts nothing.
+func (h *ChannelHandler) Rename(w http.ResponseWriter, r *http.Request) {
+	callerID, workspaceID, channelID, ok := h.beginRename(w, r)
+	if !ok {
+		return
+	}
+	var request renameChannelRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	// The same domain rule the create path uses, applied here for one reason
+	// UpdateChannel cannot cover: an empty display_name is "leave it unchanged"
+	// to a general-purpose update, and a silent no-op is the worst answer a
+	// rename can give — the dialog would close on a name that was never
+	// persisted. Normalising here makes an empty or blank name a refusal, and it
+	// is emphatically not a second validator: it is the same function, and
+	// UpdateChannel applies it again to the value forwarded below.
+	displayName, err := domain.NormalizeChannelDisplayName(request.DisplayName)
+	if err != nil {
+		writeRenameChannelError(w, err)
+		return
+	}
+	updated, err := h.channels.UpdateChannel(r.Context(), service.UpdateChannelInput{
+		WorkspaceID: workspaceID,
+		CallerID:    callerID,
+		ChannelID:   channelID,
+		DisplayName: displayName,
+	})
+	if err != nil {
+		writeRenameChannelError(w, err)
+		return
+	}
+	if h.channelUpdates != nil {
+		h.channelUpdates.PublishChannelUpdated(r.Context(), workspaceID, updated.ID)
+	}
+	httputil.WriteJSON(w, http.StatusOK, renameChannelResponse{
+		ID:          updated.ID,
+		DisplayName: updated.DisplayName,
+	})
+}
+
+// beginRename performs everything that must hold before a rename is attempted,
+// in the order that matters: a well-formed target, then the actor and the
+// budget, then the workspace. The workspace is resolved last and never from the
+// request, so nothing a client sends can aim the write elsewhere.
+func (h *ChannelHandler) beginRename(w http.ResponseWriter, r *http.Request) (string, string, string, bool) {
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return "", "", "", false
+	}
+	callerID, ok := h.admitChannelWriter(w, r, channelRenameAction, channelRenameRateLimit)
+	if !ok {
+		return "", "", "", false
+	}
+	workspaceID, ok := h.resolveDefaultWorkspaceID(w, r)
+	if !ok {
+		return "", "", "", false
+	}
+	return callerID, workspaceID, channelID, true
+}
+
+// admitChannelWriter checks the wiring, authenticates the actor, spends the
+// named per-user budget and requires a JSON content type — returning the caller
+// ID only when all four hold.
+//
+// Rate limiting runs before the body is read, so an oversized or malformed
+// payload cannot be used to make the server parse anything for free.
+func (h *ChannelHandler) admitChannelWriter(
+	w http.ResponseWriter, r *http.Request, action string, limit int,
+) (string, bool) {
+	if h.workspaces == nil || h.channels == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return "", false
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return "", false
+	}
+	allowed, err := h.limiter.AllowActionWithLimit(
+		r.Context(), callerID, action, limit, channelRateLimitWindowSeconds,
+	)
+	if err != nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return "", false
+	}
+	if !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(channelRateLimitWindowSeconds))
+		httputil.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+		return "", false
+	}
+	if !requireJSONContentType(w, r) {
+		return "", false
+	}
+	return callerID, true
+}
+
+// resolveDefaultWorkspaceID answers with the session's workspace, or writes the
+// failure. The workspace never comes from a path segment, a query parameter or
+// a body field — there is no request shape that names one.
+func (h *ChannelHandler) resolveDefaultWorkspaceID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	workspace, err := h.workspaces.GetDefaultWorkspace(r.Context())
+	if err == nil {
+		return workspace.ID, true
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "workspace not found")
+	} else {
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+	return "", false
+}
+
+// writeRenameChannelError keeps denials legible without describing state.
+//
+// A caller who may not manage the workspace gets 403 before the channel is ever
+// read, so the status code cannot be used to learn whether a channel ID exists.
+// A channel in another workspace, an archived one and one that never existed all
+// answer 404. No branch carries a SQL message, a constraint name or the rejected
+// value — a refused name can be tens of kilobytes of caller-controlled text.
+func writeRenameChannelError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrChannelDisplayNameRequired),
+		errors.Is(err, domain.ErrChannelDisplayNameTooLong),
+		errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid channel name")
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "channel not found")
+	case errors.Is(err, domain.ErrConflict):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}

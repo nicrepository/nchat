@@ -212,6 +212,13 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	// 503 on a route that does not exist.
 	if channels != nil {
 		mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
+		// Rename (issue #527). PATCH only, and only under the {channelID} segment:
+		// the literal /details, /members and /call-participants below sit under the
+		// same prefix and Go's mux prefers them. Authorization is enforced inside
+		// ChannelService.UpdateChannel — registration grants nothing on its own —
+		// and the write budget is applied in the handler, like the other channel
+		// mutations, so it holds per user rather than per replica.
+		mux.Handle("PATCH "+RouteChannel, authMiddleware(http.HandlerFunc(channels.Rename)))
 		// Channel details (issue #435) is a read, so it shares the listing budget
 		// rather than the write one: the panel refetches on every channel switch.
 		mux.Handle("GET "+RouteChannelDetails, authMiddleware(

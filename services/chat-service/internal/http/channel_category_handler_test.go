@@ -177,8 +177,9 @@ func TestChannelCategoryHandler_List_DistinguishesTheVirtualGroup(t *testing.T) 
 		{
 			Category: &domain.ChannelCategory{ID: testCategoryID, Name: "Projetos", Position: 0},
 			Channels: []service.SidebarChannel{{
-				Channel:  domain.Channel{ID: "ch-a", Slug: "alfa", DisplayName: "Alfa", Type: domain.ChannelTypePrivate},
-				CanWrite: false,
+				Channel:   domain.Channel{ID: "ch-a", Slug: "alfa", DisplayName: "Alfa", Type: domain.ChannelTypePrivate},
+				CanWrite:  false,
+				CanRename: true,
 			}},
 		},
 	}}
@@ -222,16 +223,21 @@ func TestChannelCategoryHandler_List_DistinguishesTheVirtualGroup(t *testing.T) 
 		t.Fatalf("persisted name = %v", persisted["name"])
 	}
 
-	// The channel shape is the sidebar's, including the server-derived can_write.
+	// The channel shape is the sidebar's, including the server-derived can_write
+	// and can_rename. The unread count is the only field this projection drops
+	// (it is not authoritative here), so a capability must never join it.
 	channels := persisted["channels"].([]any)
 	channel := channels[0].(map[string]any)
-	for _, field := range []string{"id", "slug", "display_name", "type", "is_general", "can_write"} {
+	for _, field := range []string{"id", "slug", "display_name", "type", "is_general", "can_write", "can_rename"} {
 		if _, present := channel[field]; !present {
 			t.Fatalf("channel is missing %q: %v", field, channel)
 		}
 	}
 	if channel["can_write"] != false {
 		t.Fatalf("can_write = %v, want false", channel["can_write"])
+	}
+	if channel["can_rename"] != true {
+		t.Fatalf("can_rename = %v, want the service's own answer to survive the projection", channel["can_rename"])
 	}
 	if _, present := channel["unread_count"]; present {
 		t.Fatalf("category projection must not publish a non-authoritative unread count: %v", channel)

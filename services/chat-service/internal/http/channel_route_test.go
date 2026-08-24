@@ -119,6 +119,12 @@ type routeChannelStore struct {
 	// readable by the caller, so a details request for anything else takes the
 	// same ErrNotFound path a private or foreign channel does.
 	visible map[string]domain.Channel
+
+	// stored models the persisted rows the rename path reads and writes (issue
+	// #527), and updates records what actually reached the store — empty is how
+	// a refused rename proves it never got that far.
+	stored  map[string]domain.Channel
+	updates []storage.UpdateChannelInput
 }
 
 func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {

@@ -779,3 +779,72 @@ func TestSidebarService_UnpinConversationUsesAuthenticatedUser(t *testing.T) {
 		}
 	}
 }
+
+// The sidebar's can_rename is presentation only, but it must agree exactly with
+// the predicate the write path enforces (issue #527): an item the menu offers
+// and the server then refuses is a worse outcome than an item that is absent.
+//
+// domain.CanManageWorkspace admits owner and admin and nobody else — the
+// moderator row is the one that matters, since RF-74 deliberately left it out of
+// workspace administration.
+func TestSidebarService_CanRenameMatchesTheUpdatePredicate(t *testing.T) {
+	for _, tc := range []struct {
+		role domain.WorkspaceRole
+		want bool
+	}{
+		{domain.WorkspaceRoleOwner, true},
+		{domain.WorkspaceRoleAdmin, true},
+		{domain.WorkspaceRoleModerator, false},
+		{domain.WorkspaceRoleMember, false},
+		{domain.WorkspaceRoleGuest, false},
+	} {
+		t.Run(string(tc.role), func(t *testing.T) {
+			member := activeMember()
+			member.Role = tc.role
+			svc := newSidebarService(
+				&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+				&sidebarFakeMemberStore{member: member},
+				&sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{
+					{Channel: domain.Channel{ID: "ch-1", WorkspaceID: sidebarWsID, Slug: "infra", Type: domain.ChannelTypePublic}},
+				}},
+				&sidebarFakeDMStore{dms: nil},
+			)
+			data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(data.Channels) != 1 {
+				t.Fatalf("channels = %d, want 1", len(data.Channels))
+			}
+			if data.Channels[0].CanRename != tc.want {
+				t.Fatalf("CanRename = %v for active %s, want %v", data.Channels[0].CanRename, tc.role, tc.want)
+			}
+		})
+	}
+}
+
+// #geral is immutable in the write path (UpdateChannel refuses it and the SQL
+// carries is_general = false), so no role makes it renameable.
+func TestSidebarService_CanRenameIsFalseForTheGeneralChannel(t *testing.T) {
+	member := activeMember()
+	member.Role = domain.WorkspaceRoleOwner
+	svc := newSidebarService(
+		&sidebarFakeWorkspaceStore{workspace: activeWorkspace()},
+		&sidebarFakeMemberStore{member: member},
+		&sidebarFakeChannelStore{accesses: []storage.VisibleChannelAccess{
+			{Channel: domain.Channel{
+				ID: "ch-geral", WorkspaceID: sidebarWsID, Slug: "geral",
+				Type: domain.ChannelTypePublic, IsGeneral: true,
+			}},
+		}},
+		&sidebarFakeDMStore{dms: nil},
+	)
+
+	data, err := svc.GetSidebar(context.Background(), sidebarUserID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data.Channels[0].CanRename {
+		t.Fatal("CanRename = true for #geral, which the write path refuses for every role")
+	}
+}

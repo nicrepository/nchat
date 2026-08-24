@@ -506,6 +506,24 @@ func CanModerateWorkspace(wm *WorkspaceMember) bool {
 // channel that every real member sees.
 func CanCreateChannel(wm *WorkspaceMember) bool { return CanReachPublicChannels(wm) }
 
+// CanRenameChannel reports whether wm may rename ch (issue #527).
+//
+// The single statement of the rule, so the sidebar listing and the grouped
+// category listing cannot answer it differently: a channel that appears under a
+// category and the same channel uncategorized must offer the same action.
+//
+// It is exactly what ChannelService.UpdateChannel enforces, in the same two
+// parts — CanManageWorkspace for the role, and #geral's immutability — and it is
+// presentation only. The PATCH re-derives both from the session on every call,
+// so a client that ignores this predicate gets a 403, never a rename.
+//
+// Deliberately not widened to the workspace moderator: CanManageWorkspace
+// documents why changing what a channel *is* stays administration, and offering
+// the action to a moderator would only produce a button that 403s.
+func CanRenameChannel(wm *WorkspaceMember, ch Channel) bool {
+	return !ch.IsGeneral && CanManageWorkspace(wm)
+}
+
 // MaxAddMembersPerRequest bounds one add-members call (issue #398).
 //
 // A batch ceiling, not a conversation ceiling: it caps how many membership rows
