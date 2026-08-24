@@ -15,11 +15,24 @@ interface DedicatedParticipant {
 }
 
 interface RemoteDirectTileProps {
+  identity: string;
   seed: string;
   displayName: string;
   avatarUrl?: string;
   hasVideo: boolean;
   bindVideo?: RefCallback<HTMLDivElement>;
+  activeSpeakerId?: string | null;
+}
+
+function SpeakerIndicator({ active, name }: { active: boolean; name: string }) {
+  if (!active) return null;
+  return (
+    <span className="call-speaker-indicator" role="img" aria-label={`${name} está falando`}>
+      <span className="material-symbols-outlined" aria-hidden="true">
+        mic
+      </span>
+    </span>
+  );
 }
 
 // A dedicated function component — not inlined into the parent's JSX — so its
@@ -30,14 +43,19 @@ interface RemoteDirectTileProps {
 // reads as "accessing a ref during render" to that rule even though bindVideo
 // here is just one more field of a plain object, never an actual ref value.
 function RemoteDirectTile({
+  identity,
   seed,
   displayName,
   avatarUrl,
   hasVideo,
   bindVideo,
+  activeSpeakerId,
 }: RemoteDirectTileProps) {
+  const active = identity === activeSpeakerId;
   return (
-    <article className="dedicated-call__tile">
+    <article
+      className={`dedicated-call__tile call-speaker-surface${active ? " call-speaker-surface--active" : ""}`}
+    >
       <div ref={bindVideo} className="dedicated-call__media" />
       {!hasVideo && (
         <div
@@ -51,7 +69,8 @@ function RemoteDirectTile({
           />
         </div>
       )}
-      <span>{displayName}</span>
+      <span className="dedicated-call__name">{displayName}</span>
+      <SpeakerIndicator active={active} name={displayName} />
     </article>
   );
 }
@@ -71,11 +90,13 @@ export default function DedicatedCallStage({
   bindScreenShare,
   hasLocalVideo,
   localSeed,
+  localParticipantId,
   localDisplayName,
   localInitials,
   localAvatarUrl,
   headerAvatar,
   remoteDirect,
+  activeSpeakerId,
 }: {
   title: string;
   status: "connecting" | "connected" | "reconnecting" | "failed";
@@ -103,6 +124,8 @@ export default function DedicatedCallStage({
   hasLocalVideo: boolean;
   /** Stable seed (the current user's id) for the local fallback avatar's color. */
   localSeed: string;
+  /** Canonical current-user identity used only for active-speaker comparison. */
+  localParticipantId?: string;
   /**
    * The local participant's call-presentation name (issue #612) — the real
    * profile name plus "(você)", or a bare "Você" fallback. Computed by
@@ -138,14 +161,11 @@ export default function DedicatedCallStage({
    * Undefined for a channel/group resource call: those participants arrive
    * through `participants` instead, one tile per real person, never this.
    */
-  remoteDirect?: {
-    seed: string;
-    displayName: string;
-    avatarUrl?: string;
-    hasVideo: boolean;
-    bindVideo?: RefCallback<HTMLDivElement>;
-  };
+  remoteDirect?: Omit<RemoteDirectTileProps, "activeSpeakerId">;
+  /** Stabilized canonical identity from useCallMedia; null means no highlighted person. */
+  activeSpeakerId?: string | null;
 }) {
+  const localActive = activeSpeakerId != null && localParticipantId === activeSpeakerId;
   return (
     <main className="dedicated-call" aria-label={`Chamada ${title}`}>
       <header className="dedicated-call__header">
@@ -183,7 +203,7 @@ export default function DedicatedCallStage({
         {localScreenShareActive && (
           <article className="dedicated-call__tile dedicated-call__tile--screen">
             <div ref={bindLocalScreenShare} className="dedicated-call__media" />
-            <span>Sua tela</span>
+            <span className="dedicated-call__name">Sua tela</span>
           </article>
         )}
         {
@@ -196,11 +216,15 @@ export default function DedicatedCallStage({
           !localScreenShareActive && bindScreenShare && (
             <article className="dedicated-call__tile dedicated-call__tile--screen">
               <div ref={bindScreenShare} className="dedicated-call__media" />
-              <span>Tela de {screenShareName ?? "Participante"}</span>
+              <span className="dedicated-call__name">
+                Tela de {screenShareName ?? "Participante"}
+              </span>
             </article>
           )
         }
-        <article className="dedicated-call__tile">
+        <article
+          className={`dedicated-call__tile call-speaker-surface${localActive ? " call-speaker-surface--active" : ""}`}
+        >
           <div ref={bindLocalMedia} className="dedicated-call__media" />
           {!hasLocalVideo && (
             <div
@@ -214,27 +238,35 @@ export default function DedicatedCallStage({
               />
             </div>
           )}
-          <span>{localDisplayName}</span>
+          <span className="dedicated-call__name">{localDisplayName}</span>
+          <SpeakerIndicator active={localActive} name={localDisplayName} />
         </article>
-        {remoteDirect && <RemoteDirectTile {...remoteDirect} />}
-        {participants.map((participant) => (
-          <article key={participant.identity} className="dedicated-call__tile">
-            <div ref={participant.bindVideo} className="dedicated-call__media" />
-            {!participant.hasVideo && (
-              <div
-                className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(participant.identity)}`}
-                aria-hidden="true"
-              >
-                <PersonAvatarImage
-                  src={participant.avatarUrl}
-                  initials={initialsFrom(participant.displayName)}
-                  imgClassName="call-avatar__img"
-                />
-              </div>
-            )}
-            <span>{participant.displayName}</span>
-          </article>
-        ))}
+        {remoteDirect && <RemoteDirectTile {...remoteDirect} activeSpeakerId={activeSpeakerId} />}
+        {participants.map((participant) => {
+          const active = participant.identity === activeSpeakerId;
+          return (
+            <article
+              key={participant.identity}
+              className={`dedicated-call__tile call-speaker-surface${active ? " call-speaker-surface--active" : ""}`}
+            >
+              <div ref={participant.bindVideo} className="dedicated-call__media" />
+              {!participant.hasVideo && (
+                <div
+                  className={`dedicated-call__avatar call-avatar call-avatar--${avatarColorFor(participant.identity)}`}
+                  aria-hidden="true"
+                >
+                  <PersonAvatarImage
+                    src={participant.avatarUrl}
+                    initials={initialsFrom(participant.displayName)}
+                    imgClassName="call-avatar__img"
+                  />
+                </div>
+              )}
+              <span className="dedicated-call__name">{participant.displayName}</span>
+              <SpeakerIndicator active={active} name={participant.displayName} />
+            </article>
+          );
+        })}
       </section>
       <div ref={bindRemoteAudio} hidden />
       <footer>

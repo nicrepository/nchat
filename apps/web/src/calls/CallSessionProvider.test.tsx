@@ -474,6 +474,7 @@ describe("CallSessionProvider", () => {
     resource.error = null;
     media.status = "connected";
     media.error = null;
+    media.activeSpeakerId = null;
     media.participants = [];
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);
@@ -1154,6 +1155,7 @@ describe("CallSessionProvider", () => {
   it("covers action guards, floating controls, reconnect lifecycle, and terminal cleanup", async () => {
     const opened = vi.spyOn(window, "open").mockReturnValue(null);
     const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Expandir probe" }));
     fireEvent.click(screen.getByRole("button", { name: "Takeover probe" }));
     expect(ownership.claim).not.toHaveBeenCalled();
@@ -1170,6 +1172,10 @@ describe("CallSessionProvider", () => {
     const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
     await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
     await screen.findByTestId("floating-call-window");
+    expect(document.querySelector(".floating-call__local")).toHaveClass(
+      "call-speaker-surface--active",
+    );
+    expect(screen.getByLabelText("Você está falando")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Expandir probe" }));
     opened.mockReturnValue({} as Window);
@@ -1229,6 +1235,32 @@ describe("CallSessionProvider", () => {
     const avatar = document.querySelector(".floating-call__avatar")!;
     expect(avatar).toHaveTextContent(initialsFrom("Ana"));
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(userA)}`);
+  });
+
+  it("models a direct remote active speaker from the canonical peer id", async () => {
+    const view = renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    calls.call = activeDirect();
+    media.activeSpeakerId = userA;
+    view.rerender(providerTree());
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+    await screen.findByTestId("floating-call-window");
+
+    expect(document.querySelector(".floating-call__remote-participant")).toHaveClass(
+      "call-speaker-surface--active",
+    );
+    expect(screen.getByLabelText("Ana está falando")).toBeInTheDocument();
+  });
+
+  it("does not infer a direct remote speaker before the current-user identity is known", async () => {
+    calls.call = activeDirect();
+    media.activeSpeakerId = userA;
+    renderProvider();
+    await screen.findByTestId("floating-call-window");
+
+    expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+    expect(document.querySelector(".floating-call__speaker")).not.toBeInTheDocument();
   });
 
   it("floats the local fallback avatar with the current user's real id", async () => {
@@ -1332,6 +1364,22 @@ describe("CallSessionProvider", () => {
     const avatar = document.querySelector(".floating-call__avatar")!;
     expect(avatar).toHaveTextContent(initialsFrom("Produto"));
     expect(avatar).toHaveClass(`call-avatar--${avatarColorFor(channelId)}`);
+  });
+
+  it("models a resource speaker as a compact participant cue without highlighting the room", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    media.activeSpeakerId = userA;
+    media.participants = [
+      { identity: userA, displayName: "Ana", hasVideo: false, bindVideo: vi.fn() },
+    ];
+    renderProvider();
+    await screen.findByTestId("resource-call-panel");
+
+    expect(document.querySelector(".floating-call__remote-participant")).not.toHaveClass(
+      "call-speaker-surface--active",
+    );
+    expect(screen.getByLabelText("Ana está falando")).toBeInTheDocument();
   });
 
   it("never masks a resource participant's real video with the group fallback", async () => {
@@ -2008,6 +2056,7 @@ describe("screen-share ownership fence and non-resumption (issue #611)", () => {
     resource.error = null;
     media.status = "connected";
     media.error = null;
+    media.activeSpeakerId = null;
     media.participants = [];
     media.screenShareEnabled = false;
     ownership.getLease.mockReturnValue(null);
@@ -2805,6 +2854,7 @@ describe("participation generation is cross-tab and reload safe (issue #570 foll
     resource.error = null;
     media.status = "connected";
     media.error = null;
+    media.activeSpeakerId = null;
     media.participants = [];
     ownership.getLease.mockReturnValue(null);
     ownership.getOwner.mockReturnValue(null);

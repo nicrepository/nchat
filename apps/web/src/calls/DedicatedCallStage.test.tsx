@@ -26,8 +26,10 @@ const baseProps = {
   onMinimize: vi.fn(),
   hasLocalVideo: false,
   localSeed: "user-1",
+  localParticipantId: "user-1",
   localDisplayName: "Caio Almeida (você)",
   localInitials: "CA",
+  activeSpeakerId: null,
 };
 
 describe("DedicatedCallStage", () => {
@@ -165,6 +167,7 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           remoteDirect={{
+            identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
             avatarUrl: "https://x/peer.png",
@@ -182,7 +185,12 @@ describe("DedicatedCallStage", () => {
       const { container, rerender } = render(
         <DedicatedCallStage
           {...baseProps}
-          remoteDirect={{ seed: "peer-1", displayName: "Ana Souza", hasVideo: false }}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Ana Souza",
+            hasVideo: false,
+          }}
         />,
       );
       let tile = container.querySelectorAll(".dedicated-call__tile")[1]!;
@@ -193,6 +201,7 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           remoteDirect={{
+            identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
             avatarUrl: "https://x/broken.png",
@@ -211,6 +220,7 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           remoteDirect={{
+            identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
             avatarUrl: "https://x/peer.png",
@@ -228,6 +238,7 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           remoteDirect={{
+            identity: "peer-1",
             seed: "peer-1",
             displayName: "Ana Souza",
             avatarUrl: "https://x/peer.png",
@@ -248,6 +259,116 @@ describe("DedicatedCallStage", () => {
       // Only the local tile plus the two baseProps.participants tiles — no
       // extra remote-direct tile ever appears when it wasn't wired in.
       expect(container.querySelectorAll(".dedicated-call__tile")).toHaveLength(3);
+    });
+  });
+
+  describe("active speaker presentation", () => {
+    it("highlights a resource video tile by canonical participant identity", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          participants={[{ identity: "user-a", displayName: "Ana Souza", hasVideo: true }]}
+        />,
+      );
+
+      const tile = screen.getByText("Ana Souza").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("keeps camera-off initials and profile-avatar fallbacks highlighted", () => {
+      const view = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-b" />);
+      let tile = screen.getByText("Bruno Lima").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile).toHaveTextContent("BL");
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId="user-a" />);
+      tile = screen.getByText("Ana Souza").closest("article")!;
+      expect(tile).toHaveClass("call-speaker-surface--active");
+      expect(tile.querySelector("img")).toHaveAttribute("src", "https://x/a.png");
+    });
+
+    it("highlights the local participant by current-user identity", () => {
+      const { container } = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-1" />);
+
+      expect(screen.getByText("Caio Almeida (você)").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("highlights the direct remote participant by explicit identity", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="peer-1"
+          participants={[]}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Davi Rocha",
+            hasVideo: false,
+          }}
+        />,
+      );
+
+      expect(screen.getByText("Davi Rocha").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(container.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("moves and clears the highlight without leaving duplicate or stale tiles", () => {
+      const view = render(<DedicatedCallStage {...baseProps} activeSpeakerId="user-a" />);
+      expect(screen.getByText("Ana Souza").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId="user-b" />);
+      expect(screen.getByText("Ana Souza").closest("article")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(screen.getByText("Bruno Lima").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+
+      view.rerender(<DedicatedCallStage {...baseProps} activeSpeakerId={null} />);
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+
+      view.rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          participants={baseProps.participants.filter(({ identity }) => identity !== "user-a")}
+        />,
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+    });
+
+    it("never marks a screen-share tile and exposes a microphone cue with the speaker's full name", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          activeSpeakerId="user-a"
+          bindScreenShare={vi.fn()}
+          screenShareName="Ana Souza"
+        />,
+      );
+
+      expect(container.querySelector(".dedicated-call__tile--screen")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      const cue = screen.getByLabelText("Ana Souza está falando");
+      expect(cue).toHaveClass("call-speaker-indicator");
+      expect(cue).toHaveAttribute("role", "img");
+      expect(cue).toHaveTextContent("mic");
+      expect(cue.querySelector(".material-symbols-outlined")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
     });
   });
 });

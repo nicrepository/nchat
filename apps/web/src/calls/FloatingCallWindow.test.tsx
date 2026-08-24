@@ -1,4 +1,4 @@
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import FloatingCallWindow from "./FloatingCallWindow";
@@ -96,5 +96,126 @@ describe("FloatingCallWindow", () => {
     );
     expect(container.querySelector(".floating-call__avatar")).not.toBeInTheDocument();
     expect(container.querySelector(".floating-call__local-avatar")).not.toBeInTheDocument();
+  });
+
+  describe("active speaker presentation", () => {
+    it("highlights the local preview with video or avatar fallback", () => {
+      const view = render(
+        <FloatingCallWindow
+          {...baseProps}
+          hasLocalVideo
+          activeSpeaker={{ kind: "local", name: "Ana Souza (você)" }}
+        />,
+      );
+      expect(document.querySelector(".floating-call__local")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+
+      view.rerender(
+        <FloatingCallWindow
+          {...baseProps}
+          hasLocalVideo={false}
+          localAvatarUrl="https://x/local.png"
+          activeSpeaker={{ kind: "local", name: "Ana Souza (você)" }}
+        />,
+      );
+      expect(document.querySelector(".floating-call__local")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelector(".floating-call__local-avatar img")).toHaveAttribute(
+        "src",
+        "https://x/local.png",
+      );
+    });
+
+    it("highlights the direct remote presentation with video or avatar fallback", () => {
+      const view = render(
+        <FloatingCallWindow
+          {...baseProps}
+          hasRemoteVideo
+          activeSpeaker={{ kind: "direct-remote", name: "Caio Almeida" }}
+        />,
+      );
+      expect(document.querySelector(".floating-call__remote-participant")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+
+      view.rerender(
+        <FloatingCallWindow
+          {...baseProps}
+          hasRemoteVideo={false}
+          avatarUrl="https://x/remote.png"
+          activeSpeaker={{ kind: "direct-remote", name: "Caio Almeida" }}
+        />,
+      );
+      expect(document.querySelector(".floating-call__remote-participant")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelector(".floating-call__avatar img")).toHaveAttribute(
+        "src",
+        "https://x/remote.png",
+      );
+    });
+
+    it("uses only the compact cue for a resource participant not individually presented", () => {
+      render(
+        <FloatingCallWindow
+          {...baseProps}
+          title="Equipe Infra"
+          activeSpeaker={{ kind: "resource-remote", name: "Bruno Lima" }}
+        />,
+      );
+
+      expect(document.querySelector(".floating-call__remote-participant")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(screen.getByLabelText("Bruno Lima está falando")).toHaveTextContent("Bruno Lima");
+    });
+
+    it("moves and clears one highlight without duplicating active speakers", () => {
+      const view = render(
+        <FloatingCallWindow
+          {...baseProps}
+          activeSpeaker={{ kind: "local", name: "Ana Souza (você)" }}
+        />,
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+
+      view.rerender(
+        <FloatingCallWindow
+          {...baseProps}
+          activeSpeaker={{ kind: "direct-remote", name: "Caio Almeida" }}
+        />,
+      );
+      expect(document.querySelector(".floating-call__local")).not.toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelector(".floating-call__remote-participant")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+
+      view.rerender(<FloatingCallWindow {...baseProps} activeSpeaker={undefined} />);
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+      expect(document.querySelector(".floating-call__speaker")).not.toBeInTheDocument();
+    });
+
+    it("communicates speaking with a visible microphone icon and an accessible full-name label", () => {
+      render(
+        <FloatingCallWindow
+          {...baseProps}
+          activeSpeaker={{ kind: "direct-remote", name: "Caio Almeida" }}
+        />,
+      );
+
+      const cue = screen.getByLabelText("Caio Almeida está falando");
+      expect(cue).toHaveClass("floating-call__speaker");
+      expect(cue).toHaveTextContent("Caio Almeida está falando");
+      expect(cue.querySelector(".material-symbols-outlined")).toHaveTextContent("mic");
+      expect(cue.querySelector(".material-symbols-outlined")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+    });
   });
 });

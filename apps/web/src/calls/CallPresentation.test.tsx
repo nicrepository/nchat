@@ -1,4 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
@@ -6,6 +8,8 @@ import DedicatedCallStage from "./DedicatedCallStage";
 import FloatingCallWindow from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 import IncomingCallPopup from "./IncomingCallPopup";
+
+const presentationCSS = readFileSync(resolve("src/calls/CallPresentation.css"), "utf8");
 
 const noop = vi.fn();
 
@@ -120,7 +124,7 @@ describe("FloatingCallWindow", () => {
         title="Ana"
         status="reconnecting"
         participantCount={2}
-        activeSpeakerName="Ana"
+        activeSpeaker={{ kind: "direct-remote", name: "Ana" }}
         screenShareLabel="Você está compartilhando a tela"
         controls={controls}
         onExpand={noop}
@@ -538,7 +542,7 @@ describe("FloatingCallWindow", () => {
         title="Ana"
         status="connected"
         participantCount={3}
-        activeSpeakerName="Ana"
+        activeSpeaker={{ kind: "direct-remote", name: "Ana" }}
         controls={controls}
         onExpand={noop}
         {...videoPresent}
@@ -611,7 +615,7 @@ describe("FloatingCallWindow", () => {
         title="Ana"
         status="connected"
         participantCount={3}
-        activeSpeakerName="Ana"
+        activeSpeaker={{ kind: "direct-remote", name: "Ana" }}
         screenShareLabel="Você está compartilhando a tela"
         controls={controls}
         onExpand={noop}
@@ -893,5 +897,14 @@ describe("global and dedicated presentation", () => {
       />,
     );
     expect(document.querySelector(".dedicated-call__avatar")).toBeNull();
+  });
+});
+
+describe("active speaker CSS", () => {
+  it("keeps the visual state but disables its transition for reduced motion", () => {
+    expect(presentationCSS).toMatch(/\.call-speaker-surface--active::after/);
+    expect(presentationCSS).toMatch(
+      /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.call-speaker-surface::after[\s\S]*transition: none/,
+    );
   });
 });
