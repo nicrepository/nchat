@@ -36,6 +36,12 @@ interface SidebarChannelFixture extends SidebarActivityFixture {
   type: "public" | "private";
   can_write: boolean;
   unread_count: number;
+  /**
+   * The server's rename capability (issue #527). Absent by default, exactly as a
+   * member's real payload would be, so a spec has to opt a channel in before the
+   * menu offers "Renomear canal".
+   */
+  can_rename?: boolean;
 }
 
 interface SidebarDMFixture extends SidebarActivityFixture {
@@ -148,6 +154,8 @@ export interface MessagingScenario {
     favorites: Array<{ messageId: string; action: "add" | "remove" }>;
     pins: Array<{ messageId: string; targetId: string; action: "add" | "remove" }>;
     sidebarPins: Array<{ targetId: string; action: "add" | "remove" }>;
+    /** Issue #527: what PATCH /api/chat/channels/{id} actually received. */
+    channelRenames: Array<{ channelId: string; displayName: string }>;
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
@@ -413,6 +421,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       favorites: [],
       pins: [],
       sidebarPins: [],
+      channelRenames: [],
       reactions: [],
       dmCreates: [],
       groupCreates: [],
@@ -1408,6 +1417,57 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   };
   await page.route("**/api/chat/channels/*/read", markConversationRead);
   await page.route("**/api/chat/dm/*/read", markConversationRead);
+
+  // Rename (issue #527). Models the real endpoint closely enough for the flows
+  // that matter: PATCH only, the capability is re-checked server-side (a channel
+  // without can_rename answers 403 however the request was produced), the name
+  // is validated, and the channel keeps its id.
+  await page.route("**/api/chat/channels/*", async (route) => {
+    const request = route.request();
+    if (request.method() !== "PATCH") {
+      await route.fallback();
+      return;
+    }
+    const id = new URL(request.url()).pathname.split("/").pop() ?? "";
+    const channel = scenario.sidebarChannels.find((candidate) => candidate.id === id);
+    if (!channel) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    if (!channel.can_rename) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: errorBody("forbidden"),
+      });
+      return;
+    }
+    const raw = (request.postDataJSON() ?? {}) as { display_name?: unknown };
+    const displayName = typeof raw.display_name === "string" ? raw.display_name.trim() : "";
+    if (!displayName) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: errorBody("bad_request"),
+      });
+      return;
+    }
+    scenario.requests.channelRenames.push({ channelId: id, displayName });
+    channel.display_name = displayName;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { id, display_name: displayName } }),
+    });
+  });
+}
+
+function errorBody(code: string): string {
+  return JSON.stringify({ error: { code, message: code } });
 }
 
 async function installInteractionMocks(

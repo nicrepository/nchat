@@ -55,6 +55,7 @@ import {
   searchChannelMemberCandidates,
   searchDMCandidates,
   searchGroupParticipantCandidates,
+  renameChannel,
   setSidebarConversationPinned,
   unfavoriteMessage,
   unpinMessage,
@@ -340,6 +341,9 @@ describe("fetchChannels", () => {
       name: "geral",
       type: "public",
       canWrite: true,
+      // Absent from the payload, so "no" — a server that predates the field
+      // must never be read as granting the rename (issue #527).
+      canRename: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -350,6 +354,7 @@ describe("fetchChannels", () => {
       name: "eng",
       type: "private",
       canWrite: false,
+      canRename: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -737,6 +742,7 @@ describe("fetchSidebarData", () => {
       name: "geral",
       type: "public",
       canWrite: true,
+      canRename: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -842,6 +848,47 @@ describe("fetchSidebarData", () => {
     expect(channels[0]).toMatchObject({ id: "ch-1", categoryId: "cat-1", unreadCount: 3 });
   });
 
+  // ISSUE #527 — a categorized channel is mapped from the categories endpoint,
+  // so its rename capability has to survive that path too. A channel offering
+  // "Renomear canal" when uncategorized and hiding it once someone files it in a
+  // category is the same channel answering two different questions.
+  it("maps can_rename for categorized channels, not only for uncategorized ones", async () => {
+    const categorized = {
+      id: "ch-cat",
+      slug: "infra",
+      display_name: "Infra",
+      type: "public",
+      can_write: true,
+      can_rename: true,
+    };
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            categorized,
+            {
+              id: "ch-flat",
+              slug: "avulso",
+              display_name: "Avulso",
+              type: "public",
+              can_write: true,
+              can_rename: true,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [{ kind: "category", id: "cat-1", name: "Equipe", channels: [categorized] }],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+    const byId = new Map(channels.map((channel) => [channel.id, channel]));
+    expect(byId.get("ch-cat")).toMatchObject({ categoryId: "cat-1", canRename: true });
+    expect(byId.get("ch-flat")).toMatchObject({ categoryId: undefined, canRename: true });
+  });
+
   it("uses target-specific idempotent pin endpoints without user or workspace payload", async () => {
     mockAuthFetch.mockResolvedValue({});
     await setSidebarConversationPinned("channel", "ch 1", true);
@@ -853,6 +900,149 @@ describe("fetchSidebarData", () => {
     expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/sidebar-pin", {
       method: "DELETE",
     });
+  });
+
+  // ISSUE #527 — the rename request carries the channel and the name, and
+  // nothing that could claim a privilege or aim the write somewhere else.
+  it("renames a channel with only the display name in the body", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { id: "ch 1", display_name: "Plataforma" } });
+
+    const result = await renameChannel("ch 1", "  Plataforma  ");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: "Plataforma" }),
+      signal: undefined,
+    });
+    // The id comes back unchanged: a rename is not a new channel.
+    expect(result).toEqual({ id: "ch 1", name: "Plataforma" });
+  });
+
+  it("surfaces a refused rename instead of swallowing it", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(renameChannel("ch-1", "Plataforma")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  // can_rename is a capability, so anything that is not an explicit `true` — a
+  // server that predates the field, a rewritten payload — must be read as "no".
+  it("reads can_rename strictly, and only from the server", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "a",
+            display_name: "a",
+            type: "public",
+            is_general: false,
+            can_write: true,
+            can_rename: true,
+          },
+          {
+            id: "ch-2",
+            slug: "b",
+            display_name: "b",
+            type: "public",
+            is_general: false,
+            can_write: true,
+            can_rename: "yes",
+          },
+          {
+            id: "ch-3",
+            slug: "c",
+            display_name: "c",
+            type: "public",
+            is_general: false,
+            can_write: true,
+          },
+        ],
+        dms: [],
+      }),
+    );
+
+    const { channels } = await fetchSidebarData();
+    expect(channels.map((channel) => channel.canRename)).toEqual([true, false, false]);
+  });
+
+  // ISSUE #527 — the grouped listing is a narrower projection of the same
+  // channel (it drops the unread count). Building a categorized row from it is
+  // what once lost can_rename, so the canonical sidebar entry is the base and a
+  // capability the grouped copy omits must still survive.
+  it("does not let the grouped projection drop a capability the sidebar published", async () => {
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            {
+              id: "ch-cat",
+              slug: "infra",
+              display_name: "Infra",
+              type: "public",
+              can_write: true,
+              can_rename: true,
+              unread_count: 4,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [
+            {
+              kind: "category",
+              id: "cat-1",
+              name: "Equipe",
+              // An older server, or one that narrows this projection further:
+              // the capability is simply absent from the grouped copy.
+              channels: [{ id: "ch-cat", slug: "infra", display_name: "Infra", type: "public" }],
+            },
+          ],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toMatchObject({
+      id: "ch-cat",
+      categoryId: "cat-1",
+      categoryName: "Equipe",
+      // Every server-derived field comes from the canonical payload.
+      canRename: true,
+      canWrite: true,
+      unreadCount: 4,
+    });
+  });
+
+  // A channel the grouped response carries and the sidebar response does not is
+  // still placed, never dropped: the two requests can race across a deploy.
+  it("still places a grouped channel the sidebar response does not carry", async () => {
+    mockAuthFetch.mockResolvedValueOnce(sidebarResponse({ channels: [] })).mockResolvedValueOnce({
+      data: {
+        groups: [
+          {
+            kind: "category",
+            id: "cat-1",
+            name: "Equipe",
+            channels: [
+              {
+                id: "ch-orfao",
+                slug: "orfao",
+                display_name: "Orfao",
+                type: "public",
+                can_write: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const { channels } = await fetchSidebarData();
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toMatchObject({ id: "ch-orfao", categoryId: "cat-1", canWrite: true });
   });
 
   it("marks target-specific conversations read with an optional message id", async () => {

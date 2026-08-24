@@ -285,6 +285,21 @@ export interface WSConversationAvailableEvent {
 }
 
 /**
+ * A channel's own metadata changed — today, it was renamed (issue #527).
+ *
+ * Carries no payload at all, not even the new name: like members.added it means
+ * "your view of this target is stale", and the handler converges by refetching
+ * the sidebar, which the server re-authorises. That is also what makes it
+ * idempotent — a repeat costs one extra refetch and can never produce a second
+ * row for the same channel.
+ */
+export interface WSChannelUpdatedEvent {
+  type: "channel.updated";
+  target_type: "channel";
+  target_id: string;
+}
+
+/**
  * An attachment's antimalware verdict changed (RF-22).
  *
  * Produced by file-service and relayed over the same bus and the same
@@ -342,6 +357,7 @@ interface UseChatWebSocketOptions {
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
+  onChannelUpdated?: (event: WSChannelUpdatedEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
   onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -388,6 +404,7 @@ export function useChatWebSocket({
   onMembersAdded,
   onAttachmentStatus,
   onConversationAvailable,
+  onChannelUpdated,
   onReactionError,
   onSubscriptionError,
   onSubscribed,
@@ -419,6 +436,7 @@ export function useChatWebSocket({
   const onMembersRef = useRef(onMembersAdded);
   const onAttachmentStatusRef = useRef(onAttachmentStatus);
   const onConversationAvailableRef = useRef(onConversationAvailable);
+  const onChannelUpdatedRef = useRef(onChannelUpdated);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
@@ -443,6 +461,7 @@ export function useChatWebSocket({
     onMembersRef.current = onMembersAdded;
     onAttachmentStatusRef.current = onAttachmentStatus;
     onConversationAvailableRef.current = onConversationAvailable;
+    onChannelUpdatedRef.current = onChannelUpdated;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
@@ -682,6 +701,16 @@ export function useChatWebSocket({
         // reconcile is whichever one the attachment belongs to.
         if (d["type"] === "attachment.status") {
           onAttachmentStatusRef.current?.(normalizedData as unknown as WSAttachmentStatusEvent);
+          return;
+        }
+        // Routed for any subscribed target rather than only the primary one, and
+        // for the same reason attachment.status is: a rename performed by someone
+        // else lands while this reader is looking at a different conversation,
+        // and the sidebar row still has to converge. Only a channel can be
+        // renamed, so an event claiming another target type is not one this
+        // protocol produces and is dropped.
+        if (d["type"] === "channel.updated" && incomingTargetType === "channel") {
+          onChannelUpdatedRef.current?.(normalizedData as unknown as WSChannelUpdatedEvent);
           return;
         }
         // Mutating actions remain scoped to the primary target.

@@ -53,6 +53,12 @@ interface SidebarChannelResponse {
   is_general: boolean;
   /** Optional only while pre-RF-08 sidebar responses remain in rolling deploys. */
   can_write?: unknown;
+  /**
+   * Whether the server would accept a rename from this caller (issue #527).
+   * Absent on a server that predates the field, which is read as "no": hiding
+   * an action is the safe failure, offering one that 403s is not.
+   */
+  can_rename?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -127,6 +133,15 @@ interface CreateChannelEnvelope {
   };
 }
 
+/**
+ * The rename response (issue #527): the unchanged id and the persisted name.
+ * Deliberately narrower than the creation envelope — a rename says nothing about
+ * the slug, the type or the category, because it changes none of them.
+ */
+interface RenameChannelEnvelope {
+  data: { id: string; display_name: string };
+}
+
 interface AllowedReactionEmojisEnvelope {
   data: { emojis: unknown };
 }
@@ -180,6 +195,10 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     name: ch.display_name || ch.slug,
     type: ch.type,
     canWrite: ch.can_write === true,
+    // Strict equality, like can_write: anything that is not an explicit `true`
+    // — absent, null, a truthy string from a proxy that rewrote the payload —
+    // is "no". The PATCH re-derives the decision regardless.
+    canRename: ch.can_rename === true,
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
@@ -340,6 +359,43 @@ export async function fetchDMs(): Promise<DMConversation[]> {
 }
 
 /**
+ * Files one channel of the grouped listing under its category, on top of the
+ * canonical sidebar entry for the same channel.
+ *
+ * The base is deliberately the flat /api/chat/sidebar entry and never the
+ * grouped copy. Both endpoints project the same channel from the same
+ * visibility query, but the grouped one is a strictly narrower view — it drops
+ * the unread count, which is not authoritative there — so building the result
+ * from it silently loses whatever it does not carry. That is exactly how
+ * can_rename went missing for categorized channels (issue #527): a
+ * server-derived capability existed on the sidebar payload and never reached
+ * the rows that came through a category.
+ *
+ * Taking the canonical entry as the base makes that class of loss structural
+ * rather than a thing to remember: a field added to the sidebar payload reaches
+ * categorized channels without anyone editing this function.
+ *
+ * The group is authoritative for exactly one thing, and it is the only thing
+ * read from it: where the channel is filed. Nothing else is merged, so this is
+ * not a blind spread of two arbitrary objects.
+ *
+ * The grouped mapping is still the fallback for a channel the sidebar response
+ * does not carry — a rolling deploy or a race between the two requests — so an
+ * unmatched channel is placed rather than dropped.
+ */
+function placeInCategory(
+  grouped: Channel,
+  canonical: Map<string, Channel>,
+  group: { id?: string; name: string },
+): Channel {
+  return {
+    ...(canonical.get(grouped.id) ?? grouped),
+    categoryId: group.id,
+    categoryName: group.name,
+  };
+}
+
+/**
  * Fetches the full sidebar in a single request and returns channels (with category context), DMs, and categories list.
  */
 export async function fetchSidebarData(): Promise<{
@@ -361,16 +417,9 @@ export async function fetchSidebarData(): Promise<{
   const canonicalChannels = new Map(flatChannels.map((channel) => [channel.id, channel]));
   const channels: Channel[] = [];
   for (const group of categoriesRes.groups ?? []) {
-    const groupChannels = (group.channels ?? []).map((ch) => {
-      const channel = mapSidebarChannel(ch);
-      const authoritative = canonicalChannels.get(channel.id)?.unreadCount;
-      return {
-        ...channel,
-        ...(authoritative !== undefined ? { unreadCount: authoritative } : {}),
-        categoryId: group.id,
-        categoryName: group.name,
-      };
-    });
+    const groupChannels = (group.channels ?? []).map((ch) =>
+      placeInCategory(mapSidebarChannel(ch), canonicalChannels, group),
+    );
     channels.push(...groupChannels);
   }
 
@@ -603,6 +652,39 @@ export async function createChannel(
     canWrite: true,
     categoryId: created.category_id,
   };
+}
+
+/**
+ * Renames a channel (issue #527).
+ *
+ * The channel ID and the new name are the whole request. No workspace, no
+ * actor, no role, no type and no slug — the endpoint's strict decoder rejects a
+ * body that carries any of them, so there is nothing here through which a
+ * browser could claim a privilege or aim the write elsewhere.
+ *
+ * The name is trimmed because the server trims it too; that is shaping, never a
+ * check. Authorization is not consulted on this side at all: a caller the
+ * server refuses gets a 403, which the dialog surfaces as a refusal rather than
+ * as a generic failure.
+ *
+ * The response's id is returned so the caller can assert what the contract
+ * guarantees — a rename keeps the same channel.
+ */
+export async function renameChannel(
+  channelId: string,
+  displayName: string,
+  signal?: AbortSignal,
+): Promise<{ id: string; name: string }> {
+  const response = await authenticatedFetch<RenameChannelEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: displayName.trim() }),
+      signal,
+    },
+  );
+  return { id: response.data.id, name: response.data.display_name };
 }
 
 export async function createChannelCategory(

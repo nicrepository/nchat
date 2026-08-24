@@ -7,6 +7,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
@@ -4659,6 +4660,143 @@ function renderChannelSwitcher(currentUserId = "me-123") {
 function detailsToggle() {
   return screen.getByRole("button", { name: "Detalhes do canal" });
 }
+
+/**
+ * Renders the message area with a *mutable* channel list in the outlet context.
+ *
+ * The two gestures are real buttons, like renderChannelSwitcher's, so a test can
+ * navigate or apply `afterRename` — exactly what the sidebar refetch and the
+ * channel.updated event produce — without remounting ChatMessageArea or the
+ * panel it owns.
+ */
+function renderChannelsWithMutableNames(
+  initial: ChatOutletContext["channels"],
+  afterRename: ChatOutletContext["channels"] = initial,
+) {
+  function Host() {
+    const [channels, setChannels] = useState(initial);
+    const navigate = useNavigate();
+    return (
+      <>
+        <button type="button" onClick={() => navigate("/chat/channel/outro")}>
+          ir para outro canal
+        </button>
+        <button type="button" onClick={() => setChannels(afterRename)}>
+          aplicar renomeacao
+        </button>
+        <ParentWithContext ctx={{ currentUserId: "me-123", channels, dms: [] }} />
+      </>
+    );
+  }
+  render(
+    <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+      <Routes>
+        <Route path="/chat" element={<Host />}>
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+function detailsRequestsFor(channelId: string): number {
+  return mockFetchChannelDetails.mock.calls.filter((call) => call[0] === channelId).length;
+}
+
+const namedChannel = (id: string, name: string): ChatOutletContext["channels"][number] => ({
+  id,
+  name,
+  type: "public",
+  canWrite: true,
+});
+
+// ── Detalhes e renomeação (issue #527) ───────────────────────────────────────
+//
+// The panel holds its own copy of display_name from GET /details, so a rename of
+// the conversation it is showing has to make it refetch. What must NOT happen is
+// that same refetch firing on navigation: useConversationDetails already loads
+// the new target from its own kind/id effect, and a second request would abort
+// and repeat it.
+
+describe("ChatMessageArea — detalhes e renomeação do canal (#527)", () => {
+  it("requests the new channel's details exactly once when switching channels", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelsWithMutableNames([
+      namedChannel("geral", "Geral"),
+      namedChannel("outro", "Outro"),
+    ]);
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    expect(detailsRequestsFor("geral")).toBe(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "ir para outro canal" }));
+    await waitFor(() => expect(detailsRequestsFor("outro")).toBeGreaterThan(0));
+
+    expect(detailsRequestsFor("outro")).toBe(1);
+    expect(detailsRequestsFor("geral")).toBe(1);
+  });
+
+  it("refetches the open panel exactly once when its own channel is renamed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    // What the sidebar refetch produces after a rename, locally or from
+    // channel.updated: the same id under a new name.
+    renderChannelsWithMutableNames(
+      [namedChannel("geral", "Geral")],
+      [namedChannel("geral", "Plataforma")],
+    );
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    expect(detailsRequestsFor("geral")).toBe(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "aplicar renomeacao" }));
+    await waitFor(() => expect(detailsRequestsFor("geral")).toBe(2));
+
+    // The header converges from the outlet context, and the route did not move.
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Plataforma");
+    expect(detailsRequestsFor("geral")).toBe(2);
+  });
+
+  // A closed panel has no target and nothing to refresh: a rename must not be a
+  // reason to fetch details nobody is looking at.
+  it("does not request details at all when the panel is closed during a rename", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelsWithMutableNames(
+      [namedChannel("geral", "Geral")],
+      [namedChannel("geral", "Plataforma")],
+    );
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "aplicar renomeacao" }));
+
+    // The header still converges — it reads the outlet context, not /details.
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Plataforma");
+    expect(detailsRequestsFor("geral")).toBe(0);
+    expect(mockFetchChannelDetails).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch the open panel when a different channel is renamed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelsWithMutableNames(
+      [namedChannel("geral", "Geral"), namedChannel("outro", "Outro")],
+      [namedChannel("geral", "Geral"), namedChannel("outro", "Plataforma")],
+    );
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    expect(detailsRequestsFor("geral")).toBe(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "aplicar renomeacao" }));
+
+    expect(detailsRequestsFor("geral")).toBe(1);
+    expect(detailsRequestsFor("outro")).toBe(0);
+  });
+});
 
 describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
   it("opens and closes from the header control, reflecting the state in aria-expanded", async () => {

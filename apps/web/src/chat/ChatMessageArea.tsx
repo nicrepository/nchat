@@ -1087,6 +1087,36 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // of two. A closed panel has no target and so refetches nothing.
   const reloadOpenDetails = detailsState.reload;
 
+  // A rename lands in the sidebar payload first — through this actor's own
+  // refetch or through channel.updated for everybody else — and the header above
+  // reads its name straight from there. The open details panel does not: it
+  // holds its own display_name from GET /details, so without this it would keep
+  // showing the old one until the panel was closed and reopened (issue #527).
+  //
+  // Watching the rendered name rather than subscribing to a second WebSocket
+  // callback is deliberate: every source of a name change — the local rename,
+  // the realtime event, a reconciling refetch — arrives through this one value,
+  // so one effect covers all three and the panel refetches from the authority
+  // instead of patching a field.
+  //
+  // The name is watched *together with the target's identity*, and that pairing
+  // is the whole point. Switching conversations also changes `resolvedName`, but
+  // there useConversationDetails is already loading the new target from its own
+  // kind/id effect — reloading here as well would abort that request and issue a
+  // second one for the same panel. So a changed identity is left alone, and only
+  // a name that moved *under the same conversation* triggers a refetch. A closed
+  // panel has no target and refetches nothing either way.
+  const openDetailsKey = `${kind}:${targetId}`;
+  const lastDetailsRef = useRef({ key: openDetailsKey, name: resolvedName });
+  useEffect(() => {
+    const previous = lastDetailsRef.current;
+    lastDetailsRef.current = { key: openDetailsKey, name: resolvedName };
+    // Navigation: useConversationDetails owns the load for the new target.
+    if (previous.key !== openDetailsKey) return;
+    if (previous.name === resolvedName) return;
+    if (detailsOpen) reloadOpenDetails();
+  }, [openDetailsKey, resolvedName, detailsOpen, reloadOpenDetails]);
+
   const closeDetails = useCallback(() => {
     setDetailsOpen(false);
     // Focus returns to the control that opened the panel, but only if it is
