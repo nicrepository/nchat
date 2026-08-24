@@ -56,6 +56,7 @@ import { emitCallTechnicalEvent } from "./callTelemetry";
 import FloatingCallWindow, { type FloatingActiveSpeaker } from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 import IncomingCallPopup from "./IncomingCallPopup";
+import OutgoingCallPopup from "./OutgoingCallPopup";
 
 type OwnerState = "none" | "local" | "remote";
 
@@ -1573,11 +1574,32 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     (!directory || calls.call.callee_id === directory.currentUserId)
       ? calls.call
       : null;
+  // The CALLER's own surface for the exact same call.ringing (issue #615) —
+  // authoritative only: gated on calls.call itself, never on calls.pending
+  // (a start() preflight that never reaches the server, or one that fails
+  // before ringing, must never show this). No target_type check needed:
+  // calls.call (useCallSignaling) already only ever holds a direct/"user"
+  // call by construction — its onMessage drops any envelope whose
+  // target_type isn't "user" before a Call ever reaches this state, and the
+  // Call payload's own target_type is undefined for legacy direct rows
+  // (directActive/directIncoming above rely on the exact same invariant).
+  // Deliberately requires `directory` to already be loaded (unlike
+  // directIncoming's permissive `!directory ||` fallback above) — the two
+  // conditions must never both hold for the same ringing call, or this and
+  // IncomingCallPopup would render simultaneously for it.
+  const directOutgoing =
+    calls.call?.status === "ringing" &&
+    directory &&
+    calls.call.caller_id === directory.currentUserId
+      ? calls.call
+      : null;
   const peerId = directActive
     ? directActive.caller_id === directory?.currentUserId
       ? directActive.callee_id
       : directActive.caller_id
-    : (directIncoming?.caller_id ?? "");
+    : directOutgoing
+      ? directOutgoing.callee_id
+      : (directIncoming?.caller_id ?? "");
   const peer = directory?.dms.find((dm) => dm.counterpart?.userId === peerId)?.counterpart;
   const resourceTarget = directActive ? null : resource.active;
   const title = peer?.displayName ?? resourceTarget?.name ?? "Participante";
@@ -1664,6 +1686,26 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           }}
           identityStatus={identity.status}
           onRetryIdentity={() => identity.retry?.()}
+        />
+      )}
+      {!dedicated && directOutgoing && (
+        <OutgoingCallPopup
+          name={peer?.displayName ?? "Participante"}
+          avatarUrl={peer?.avatarUrl}
+          callType={directOutgoing.call_type}
+          // calls.cancelling (never calls.pending — issue #615 blocker
+          // follow-up): `pending` alone also covers reconnect/call.sync
+          // reconciliation, which would otherwise show "Cancelando…" and
+          // disable the button for a call the user never asked to cancel.
+          cancelling={calls.cancelling}
+          onCancel={() => {
+            const cancelled = calls.cancel();
+            // Only a command that actually got sent is a real cancel
+            // attempt — never emitted for a no-op (offline, already
+            // pending, mid-reconnect).
+            if (cancelled) emitCallTechnicalEvent("cancelled");
+            return cancelled;
+          }}
         />
       )}
       {!dedicated &&

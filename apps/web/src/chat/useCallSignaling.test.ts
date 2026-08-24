@@ -131,6 +131,11 @@ const baseCall = {
 };
 const liveKitServerUrl = "wss://livekit-dev.nic-labs.com";
 
+// The CALLEE's own copy of a direct lifecycle event — target_id ===
+// call.callee_id, matching how the real backend's publishCallToUser sends
+// this connection's own copy when it is the one being called (see
+// services/chat-service/internal/ws/call_protocol.go's PublishCall, which
+// always sends the caller and callee two independently-scoped copies).
 function ringingEvent(version: number) {
   return {
     type: "call.ringing",
@@ -138,6 +143,28 @@ function ringingEvent(version: number) {
     target_type: "user",
     target_id: baseCall.callee_id,
     call: { ...baseCall, status: "ringing", version },
+  };
+}
+
+// The CALLER's own copy of a direct lifecycle event — target_id ===
+// call.caller_id, the shape this connection receives for a call IT started
+// (issue #615 blocker follow-up). Distinct from ringingEvent's callee copy
+// above: useCallSignaling's own pending-start fence keys off exactly this
+// caller/callee distinction, so a test standing in for "my own outgoing
+// call's lifecycle" must use this, never ringingEvent.
+function outgoingRingingEvent(overrides: { callId: string; requestId: string }, version = 0) {
+  return {
+    type: "call.ringing",
+    event_id: `00000000-0000-4000-8000-00000000091${version}`,
+    target_type: "user",
+    target_id: baseCall.caller_id,
+    call: {
+      ...baseCall,
+      call_id: overrides.callId,
+      request_id: overrides.requestId,
+      status: "ringing",
+      version,
+    },
   };
 }
 
@@ -438,7 +465,7 @@ describe("useCallSignaling", () => {
     expect(media.startAudio).toHaveBeenCalledTimes(2);
   });
 
-  it("accepts a new start after a server error releases the pending command", async () => {
+  it("accepts a new start after a correlated server error releases the pending command", async () => {
     const media = mediaBridge();
     const { result } = renderHook(() => useCallSignaling(media));
     const socket = FakeWebSocket.instances[0];
@@ -448,11 +475,13 @@ describe("useCallSignaling", () => {
       expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
     });
     await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    const requestId = callCommands(socket)[0]!["request_id"] as string;
     act(() =>
       socket.simulateMessage({
         type: "call.error",
         operation: "call.start",
         code: "call_invalid_state",
+        response_to: requestId,
       }),
     );
     act(() => {
@@ -465,7 +494,7 @@ describe("useCallSignaling", () => {
     expect(media.stop).not.toHaveBeenCalled();
   });
 
-  it("shows a busy-specific message for a call.start rejected as call_participant_busy", async () => {
+  it("shows a busy-specific message for a correlated call.start rejected as call_participant_busy", async () => {
     const media = mediaBridge();
     const { result } = renderHook(() => useCallSignaling(media));
     const socket = FakeWebSocket.instances[0];
@@ -475,11 +504,13 @@ describe("useCallSignaling", () => {
       expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
     });
     await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    const requestId = callCommands(socket)[0]!["request_id"] as string;
     act(() =>
       socket.simulateMessage({
         type: "call.error",
         operation: "call.start",
         code: "call_participant_busy",
+        response_to: requestId,
       }),
     );
 
@@ -489,7 +520,7 @@ describe("useCallSignaling", () => {
     expect(media.stop).not.toHaveBeenCalled();
   });
 
-  it("keeps the call_invalid_state message unchanged for call.start", async () => {
+  it("keeps the call_invalid_state message unchanged for a correlated call.start error", async () => {
     const { result } = renderHook(() => useCallSignaling());
     const socket = FakeWebSocket.instances[0];
     act(() => socket.simulateOpen());
@@ -498,16 +529,293 @@ describe("useCallSignaling", () => {
       expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
     });
     await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    const requestId = callCommands(socket)[0]!["request_id"] as string;
     act(() =>
       socket.simulateMessage({
         type: "call.error",
         operation: "call.start",
         code: "call_invalid_state",
+        response_to: requestId,
       }),
     );
 
     expect(result.current.pending).toBe(false);
     expect(result.current.error).toBe("A chamada já mudou de estado.");
+  });
+
+  // Issue #615: the backend now echoes request_id via response_to for a
+  // DIRECT call.start's own call.error too (previously only resource
+  // call.start had this — see call_protocol.go's callResponseTo). A
+  // call.start error that does not carry a matching response_to must never
+  // be treated as an answer to whatever call.start this hook currently has
+  // pending — see the concrete A/B race test below for why this matters.
+  it("a call.start error with no response_to never releases or errors the pending direct-call start", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_participant_busy",
+      }),
+    );
+
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
+  // The concrete race issue #615 requires closed: attempt A's own stale
+  // call.error (correlated by A's OWN request_id) must never be mistaken for
+  // an answer to a later, still-pending attempt B of the same operation —
+  // even though both are "call.start" and this hook only ever tracks one
+  // pending command at a time, so operation-only correlation could not tell
+  // them apart before this fix.
+  it("attempt A's stale call.start error never cross-resolves a later pending attempt B (race)", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    // Attempt A starts, then is released by its OWN correlated error —
+    // "erro ... libera A conforme fluxo permitido".
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    const requestIdA = callCommands(socket)[0]!["request_id"] as string;
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_invalid_state",
+        response_to: requestIdA,
+      }),
+    );
+    expect(result.current.pending).toBe(false);
+
+    // Attempt B starts — a brand new, distinct request_id.
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(2));
+    const requestIdB = callCommands(socket)[1]!["request_id"] as string;
+    expect(requestIdB).not.toBe(requestIdA);
+
+    // A's stale reply (a late-arriving duplicate/retry of A's own error)
+    // finally arrives while B is pending — must not touch B at all.
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_participant_busy",
+        response_to: requestIdA,
+      }),
+    );
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    // Only B's own correlated error may release/error B.
+    act(() =>
+      socket.simulateMessage({
+        type: "call.error",
+        operation: "call.start",
+        code: "call_participant_busy",
+        response_to: requestIdB,
+      }),
+    );
+    expect(result.current.pending).toBe(false);
+    expect(result.current.error).toBe("Você ou este usuário já está em outra chamada.");
+  });
+
+  // Issue #615 blocker follow-up: a stale/unrelated OUTGOING lifecycle (a
+  // DIFFERENT call_id AND request_id, delivered as THIS connection's own
+  // CALLER copy — see outgoingRingingEvent above) must never overwrite a
+  // pending start attempt's state. The earlier version of this test allowed
+  // the stale event to adopt calls.call, which would make applyCallEvent
+  // treat that unrelated call as "current" and non-terminal — silently
+  // wedging the real attempt, since a later, genuinely correlated ringing
+  // for a DIFFERENT call_id would then be rejected as belonging to another
+  // call entirely.
+  it("a stale outgoing call.ringing for a different call_id/request_id, delivered as this connection's own caller copy, never overwrites a pending start attempt", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+    const requestIdB = callCommands(socket)[0]!["request_id"] as string;
+    const staleCallIdA = "00000000-0000-4000-8000-000000000911";
+    const staleRequestIdA = "00000000-0000-4000-8000-000000000912";
+
+    // Attempt A's own stale ringing — a completely different call — arrives
+    // while B is still pending.
+    act(() =>
+      socket.simulateMessage(
+        outgoingRingingEvent({ callId: staleCallIdA, requestId: staleRequestIdA }),
+      ),
+    );
+
+    expect(result.current.call).toBeNull();
+    expect(result.current.pending).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    // B's own correlated ringing now arrives and is accepted normally —
+    // proving the fence above rejected A without wedging B.
+    act(() =>
+      socket.simulateMessage(
+        outgoingRingingEvent({ callId: baseCall.call_id, requestId: requestIdB }),
+      ),
+    );
+
+    expect(result.current.pending).toBe(false);
+    expect(result.current.call?.call_id).toBe(baseCall.call_id);
+    expect(result.current.call?.status).toBe("ringing");
+  });
+
+  // The fence above must key off caller-vs-callee, never off "any
+  // unrelated request_id" — a genuinely incoming call, delivered as THIS
+  // connection's own CALLEE copy, is a completely different, legitimate
+  // event and must not be discarded just because an outgoing start happens
+  // to be pending at the same time.
+  it("a legitimate incoming call.ringing, delivered as this connection's own callee copy, is never discarded by the outgoing pending-start fence", async () => {
+    const { result } = renderHook(() => useCallSignaling());
+    const socket = FakeWebSocket.instances[0];
+    act(() => socket.simulateOpen());
+
+    act(() => {
+      expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+    });
+    await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+
+    // A genuinely incoming call — the callee's own copy (ringingEvent) —
+    // carries an unrelated call_id/request_id purely because it IS a
+    // different call, never because it is stale.
+    act(() => socket.simulateMessage(ringingEvent(0)));
+
+    expect(result.current.call?.call_id).toBe(baseCall.call_id);
+    expect(result.current.call?.status).toBe("ringing");
+  });
+
+  // Issue #615 blocker follow-up: OutgoingCallPopup's "Cancelando…"/disabled
+  // state must key off a semantic `cancelling` field, never off `pending`
+  // directly — `pending` also covers reconnect/call.sync reconciliation
+  // (every reconnect sets it regardless of any real command in flight, see
+  // the two tests below), which must never look like a cancel in progress.
+  describe("cancelling (issue #615 blocker follow-up)", () => {
+    async function startOutgoingRinging(
+      socket: FakeWebSocket,
+      result: { current: ReturnType<typeof useCallSignaling> },
+    ) {
+      act(() => {
+        expect(result.current.start(baseCall.callee_id, "audio")).toBe(true);
+      });
+      await waitFor(() => expect(callCommands(socket)).toHaveLength(1));
+      const requestId = callCommands(socket)[0]!["request_id"] as string;
+      act(() =>
+        socket.simulateMessage({
+          ...ringingEvent(0),
+          call: { ...ringingEvent(0).call, request_id: requestId },
+        }),
+      );
+      expect(result.current.call?.status).toBe("ringing");
+      expect(result.current.pending).toBe(false);
+      expect(result.current.cancelling).toBe(false);
+      return requestId;
+    }
+
+    it("A: is true only while this call's own cancel() is pending, and clears on its correlated terminal", async () => {
+      const { result } = renderHook(() => useCallSignaling());
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await startOutgoingRinging(socket, result);
+
+      act(() => {
+        expect(result.current.cancel()).toBe(true);
+      });
+      await waitFor(() => expect(callCommands(socket)).toHaveLength(2));
+      expect(result.current.pending).toBe(true);
+      expect(result.current.cancelling).toBe(true);
+
+      act(() =>
+        socket.simulateMessage({
+          type: "call.cancelled",
+          event_id: "00000000-0000-4000-8000-000000000901",
+          target_type: "user",
+          target_id: baseCall.callee_id,
+          call: { ...baseCall, status: "cancelled", version: 1 },
+        }),
+      );
+
+      expect(result.current.pending).toBe(false);
+      expect(result.current.cancelling).toBe(false);
+      expect(result.current.call?.status).toBe("cancelled");
+    });
+
+    it("A (error path): clears on a correlated call.error for the cancel, same as the terminal path", async () => {
+      const { result } = renderHook(() => useCallSignaling());
+      const socket = FakeWebSocket.instances[0];
+      act(() => socket.simulateOpen());
+      await startOutgoingRinging(socket, result);
+
+      act(() => {
+        expect(result.current.cancel()).toBe(true);
+      });
+      await waitFor(() => expect(callCommands(socket)).toHaveLength(2));
+      expect(result.current.cancelling).toBe(true);
+
+      act(() =>
+        socket.simulateMessage({
+          type: "call.error",
+          operation: "call.cancel",
+          call_id: baseCall.call_id,
+          code: "call_not_found",
+        }),
+      );
+
+      expect(result.current.pending).toBe(false);
+      expect(result.current.cancelling).toBe(false);
+    });
+
+    it("B: reconnect/call.sync reconciliation sets pending=true but never cancelling=true", async () => {
+      const { result } = renderHook(() => useCallSignaling());
+      const firstSocket = FakeWebSocket.instances[0];
+      act(() => firstSocket.simulateOpen());
+      const requestId = await startOutgoingRinging(firstSocket, result);
+
+      vi.useFakeTimers();
+      act(() => firstSocket.close());
+      expect(result.current.pending).toBe(false);
+      expect(result.current.cancelling).toBe(false);
+      act(() => vi.advanceTimersByTime(FIRST_RETRY_MS));
+
+      const secondSocket = FakeWebSocket.instances[1];
+      act(() => secondSocket.simulateOpen());
+
+      // The reconnect's own call.sync reconciliation legitimately sets
+      // pending=true here — this is the exact premise the review flagged.
+      expect(result.current.pending).toBe(true);
+      // It must never look like a cancel the user asked for.
+      expect(result.current.cancelling).toBe(false);
+
+      act(() =>
+        secondSocket.simulateMessage({
+          ...ringingEvent(0),
+          call: { ...ringingEvent(0).call, request_id: requestId },
+        }),
+      );
+
+      expect(result.current.pending).toBe(false);
+      expect(result.current.cancelling).toBe(false);
+      expect(result.current.call?.status).toBe("ringing");
+    });
   });
 
   it("ignores an event carrying an older version than the current call state", () => {

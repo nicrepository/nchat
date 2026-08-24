@@ -1,4 +1,5 @@
 .incoming-call,
+.outgoing-call,
 .global-call-indicator {
   position: fixed;
   z-index: 80;
@@ -25,7 +26,8 @@
   backdrop-filter: blur(18px);
 }
 
-.incoming-call {
+.incoming-call,
+.outgoing-call {
   right: 1rem;
   bottom: 1rem;
   width: min(24rem, calc(100vw - 2rem));
@@ -34,23 +36,28 @@
 }
 .incoming-call__identity,
 .incoming-call__actions,
+.outgoing-call__identity,
+.outgoing-call__actions,
 .global-call-indicator {
   display: flex;
   align-items: center;
   gap: 0.75rem;
 }
 .incoming-call__identity > div:last-child,
+.outgoing-call__identity > div:last-child,
 .global-call-indicator > div {
   display: grid;
   gap: 0.15rem;
   min-width: 0;
 }
 .incoming-call__identity span,
+.outgoing-call__identity span,
 .global-call-indicator span {
   color: var(--color-text-muted, #94a3b8);
   font-size: 0.82rem;
 }
-.incoming-call__avatar {
+.incoming-call__avatar,
+.outgoing-call__avatar {
   display: grid;
   place-items: center;
   width: 3rem;
@@ -61,16 +68,19 @@
   background: #334155;
   font-weight: 700;
 }
-.incoming-call__avatar img {
+.incoming-call__avatar img,
+.outgoing-call__avatar img {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
-.incoming-call__actions {
+.incoming-call__actions,
+.outgoing-call__actions {
   justify-content: flex-end;
   margin-top: 1rem;
 }
 .incoming-call button,
+.outgoing-call button,
 .global-call-indicator button {
   min-height: 2.5rem;
   padding: 0 0.85rem;
@@ -83,9 +93,14 @@
   color: #052e16;
   background: #86efac;
 }
-.incoming-call__reject {
+.incoming-call__reject,
+.outgoing-call__cancel {
   color: #fff;
   background: #be123c;
+}
+.outgoing-call__cancel:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 .floating-call {
@@ -507,6 +522,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .incoming-call,
+  .outgoing-call,
   .floating-call,
   .global-call-indicator,
   .call-presentation__control,
