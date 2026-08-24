@@ -1,13 +1,16 @@
 # Admin Service — Admin API
 
 > **Scope:** the Admin Console foundation (issue #578), the management surface
-> (issue #579), configuration management (issue #580) and platform observability
-> (issue #581). This document covers the endpoints that exist today: the
-> administrative session handshake, the console bootstrap, the audit trail, the
-> platform user directory, the channel and conversation directories, the two
-> operational policies that are configurable at runtime, the platform
-> configuration catalogue, and the operational dashboard and Health Center.
-> Integrations administration is **not** implemented and is not described here.
+> (issue #579), configuration management (issue #580), platform observability
+> (issue #581) and integration diagnostics (issue #582). This document covers
+> the endpoints that exist today: the administrative session handshake, the
+> console bootstrap, the audit trail, the platform user directory, the channel
+> and conversation directories, the two operational policies that are
+> configurable at runtime, the platform configuration catalogue, the operational
+> dashboard and Health Center, and the integration inventory with its active
+> diagnostics. Integration **configuration** remains read-only here: every
+> integration setting is class C or D, so changing one is a commit and a rollout
+> or the Sealed Secrets runbook, never a write through this API.
 
 Public base: `/api/admin`. The gateways rewrite `/api/admin/<rest>` to
 `/<rest>` before the request reaches the pod, so the paths admin-service
@@ -39,6 +42,7 @@ Every response uses the platform envelope: `{"data": …}` on success,
 | 5   | —      | Management (issue #579)    | Admin session cookie + capability |
 | 6   | —      | Configuration (issue #580) | Admin session cookie + capability |
 | 7   | —      | Observability (issue #581) | Admin session cookie + capability |
+| 8   | —      | Integrations (issue #582)  | Admin session cookie + capability |
 
 Every management route below is guarded in the same order: the administrative
 session, then — for a mutation — the origin and CSRF checks, then the one
@@ -1460,3 +1464,239 @@ id, one of the five states — so the series count is bounded by the size of two
 literals. No user id, e-mail, URL, request id, channel id or file id appears in
 a label. They are registered into the shared registry, so they are exported only
 when `PROMETHEUS_METRICS_ENABLED` is set, exactly like the rest of the platform's.
+
+---
+
+## 8. Integrations — configuration and diagnostics (issue #582)
+
+Three endpoints. They answer the two questions an operator has about an
+integration that is not working: what does the platform currently know about it,
+and what happens when we actually try.
+
+The first question is answered from the passive collection of
+[issue #581](#7-observability--dashboard-and-health-center-issue-581) — opening
+the screen contacts nothing. The second is the only place in admin-service where
+an operator's click causes an outbound connection, and everything below is about
+bounding that.
+
+### What these endpoints do not accept
+
+No URL. No hostname. No IP address. No port. No credential. No namespace. No
+Kubernetes resource. No file path. No SMTP recipient.
+
+`GET /api/admin/integrations` takes no parameter at all. The diagnostic takes one
+path segment, resolved against the compile-time registry in
+`services/admin-service/internal/domain/integration.go` before anything reads it.
+The test message takes an empty body.
+
+That is what keeps "Testar configuração" from being a proxy: the set of things
+this pod is willing to contact comes from its own environment, and a caller can
+only choose **which** of them to contact, never **what** they are.
+
+### Where the configuration lives
+
+This surface writes nothing. Every setting it shows belongs to the registry of
+issue #580 and is class C or D — a value in the Git-managed ConfigMap or a
+credential in a Sealed Secret — so changing one is a commit and a rollout, or the
+rotation runbook. There is no "substituir secret" field, because there is no
+endpoint that would accept one; see
+[`config-inventory.md`](../security/config-inventory.md) for why class B does
+not exist.
+
+`ValidateIntegrationRegistry` asserts that every key an integration claims is a
+key the configuration registry already declares, so this screen cannot grow a
+second configuration model with keys of its own.
+
+### The integrations, and what can be checked
+
+| Integration | Diagnostic | Stages                                                |
+| ----------- | ---------- | ----------------------------------------------------- |
+| `oidc`      | yes        | DNS, TCP, TLS, discovery, issuer, JWKS, credential¹   |
+| `smtp`      | yes        | DNS, TCP, TLS, credential, ready — plus delivery²     |
+| `livekit`   | yes        | DNS, TCP, TLS, credential, ready                      |
+| `clamav`    | yes        | DNS, TCP, ready (`PING`/`VERSION`)                    |
+| `storage`   | yes        | DNS, TCP, TLS, ready                                  |
+| `turn`      | **no**     | no platform variable names a TURN server³             |
+| `link_scan` | **no**     | the provider credential is scoped to other workloads³ |
+
+¹ The client stage is reported as **skipped**, with the reason: verifying a
+client without performing a real authentication is not something the protocol
+offers, and a diagnostic that signed somebody in would put a login event in the
+identity provider's trail on every click.
+
+² Only when the test message endpoint was called. An ordinary diagnostic never
+delivers anything.
+
+³ Reported with the reason shown verbatim in the console, not as a missing
+button. Inventing a target is the one thing this surface exists to prevent.
+
+### `GET /api/admin/integrations`
+
+Requires `admin.integrations.read`. Guarded like a mutation, one capability
+weaker, for the same reason the configuration catalogue is: the list names every
+integration the deployment has and whether each is reachable.
+
+The `settings` array is the configuration projection of issue #580, with an
+`advanced` flag. It is present only for an actor who **also** holds
+`admin.config.read`; otherwise `settings_visible` is `false` and the array is
+empty. "You may not see them" and "there are none" are different sentences on the
+screen, so they are different fields on the wire.
+
+A credential arrives exactly as it does on `/config`: `configured: true|false`,
+no `value`, no `default`.
+
+### `POST /api/admin/integrations/{integrationID}/diagnose`
+
+Requires `admin.integrations.manage` — the manage capability and not the read
+one, even though nothing is written. A diagnostic makes this pod open outbound
+connections and sign a LiveKit credential; that is an action with a cost, and the
+capability that authorizes it should be one an operator grants deliberately.
+
+No body, and that is enforced rather than merely documented: a request carrying
+any content at all is refused with `400` before the integration is resolved and
+before anything is dialled. The rule is the absence of a body and not the absence
+of meaningful JSON, so `{}` is refused alongside `{"unexpected":"payload"}` —
+neither endpoint has a field a caller could send, and accepting one silently
+would leave a future field free to arrive from a client nobody reviewed.
+
+Being a POST, it passes the origin and CSRF guards like every other non-safe
+method.
+
+**A failed check answers `200` with the report.** "O relay recusou a credencial"
+is the result the operator asked for, not a server fault, and a `502` would lose
+every stage that did pass.
+
+```json
+{
+  "data": {
+    "report": {
+      "integration": "oidc",
+      "started_at": "2026-08-23T11:05:00Z",
+      "status": "failed",
+      "summary": "Ao menos uma etapa falhou. As etapas seguintes não foram executadas.",
+      "steps": [
+        { "stage": "resolve", "status": "passed", "latency_ms": 3 },
+        { "stage": "connect", "status": "passed", "latency_ms": 8 },
+        {
+          "stage": "tls",
+          "status": "failed",
+          "category": "tls_error",
+          "detail": "Não foi possível estabelecer TLS com a dependência.",
+          "latency_ms": 41
+        },
+        {
+          "stage": "jwks",
+          "status": "skipped",
+          "detail": "Não executada porque uma etapa anterior falhou."
+        }
+      ]
+    }
+  }
+}
+```
+
+`status` is one of `passed`, `warning`, `failed`, `skipped`. A stage that did not
+run is `skipped` and carries no `latency_ms` — it was not measured, and zero
+would read as instantaneous. `category` is the same closed set the Health Center
+uses (`error_category` above).
+
+Nothing a dependency said is in that payload. Bodies are drained or read under a
+byte cap and reduced to known fields; errors are classified by type and the
+original text is dropped; a version string passes a character allowlist and a
+length cap. A caller learns `tls_error`, never a certificate chain, an internal
+hostname or a stack trace.
+
+### `POST /api/admin/integrations/smtp/test-email`
+
+Requires `admin.integrations.manage`, passes CSRF, and accepts **no body** —
+enforced exactly as on the diagnostic above, and refused with `400` before the
+relay is contacted.
+
+The destination is the authenticated administrator's own address, read from the
+session principal. There is no recipient field to send, so there is nothing for a
+stolen session to aim: the worst it can do is mail the victim. That single
+decision is the whole anti-relay control, and it is why no allowlist of
+destinations had to be invented.
+
+The message is fixed, marked `Auto-Submitted: auto-generated`, and carries no
+platform data. It answers with the same staged report, ending in a `delivery`
+stage.
+
+### Network policy
+
+Every diagnostic connection goes through a dialer whose `Control` hook inspects
+**the address the kernel is about to connect to**, after resolution and
+immediately before `connect(2)`. Checking there rather than resolving the name
+separately is what closes the window DNS rebinding depends on.
+
+Refused for every integration, with no opt-out:
+
+- link-local (`169.254.0.0/16`, `fe80::/10`) — the cloud metadata range, which is
+  `169.254.169.254` on AWS and Azure and what `metadata.google.internal` resolves
+  to on GCP;
+- the unspecified address, multicast and broadcast.
+
+**Not** refused: RFC 1918, unique-local and loopback. Every NChat dependency is a
+cluster service, so a blanket "no private addresses" rule would break the real
+deployment while doing nothing about the range that matters. The policy is
+declared per integration in the registry, and what differs between them is the
+protocol and the accepted schemes.
+
+Also enforced, on every integration:
+
+- `http` and `https` only for a URL-shaped target; a bare `host:port` for the
+  others. A ConfigMap holding `file://` or `gopher://` produces a configuration
+  error, not a request;
+- a URL carrying credentials is refused rather than stripped;
+- **no redirect is ever followed**. A dependency that answers `302` is reported as
+  reachable and nothing more;
+- for OIDC, the `jwks_uri` the provider returns must share the issuer's scheme,
+  host **and port**. Two services on one host are two origins, and a provider
+  that could nominate either would be choosing an address this deployment never
+  configured;
+- TLS verification is never relaxed. There is no `InsecureSkipVerify` in the
+  package and no setting that could introduce one.
+
+### Rate limits and concurrency
+
+| What                   | Budget                                                     |
+| ---------------------- | ---------------------------------------------------------- |
+| Diagnostic             | 6 per minute, burst 3, per **administrator × integration** |
+| SMTP test message      | 1 per minute, no burst, per administrator                  |
+| Concurrent diagnostics | 2 per pod, refused rather than queued                      |
+| Whole run              | 20 s ceiling; each stage has its own short timeout         |
+
+Per administrator and integration rather than per IP: two operators debugging one
+outage must not throttle each other, and one operator holding a button must not
+turn the console into a scanner. Exceeding a budget is `429` with `Retry-After`.
+
+A diagnostic is cancelled with the request that asked for it — the opposite of the
+health collection, which is shared and therefore detached. Navigating away stops
+the outbound work.
+
+### Errors
+
+| Status | Meaning                                                                   |
+| ------ | ------------------------------------------------------------------------- |
+| `200`  | Ran. The report may describe a failure; that is the answer, not an error. |
+| `400`  | The request carried a body. Both POSTs take none; see below.              |
+| `401`  | No live administrative session.                                           |
+| `403`  | Missing the capability, or a rejected origin/CSRF token.                  |
+| `404`  | The path names an integration the registry does not declare.              |
+| `409`  | The integration is declared and has no diagnostic on this deployment.     |
+| `429`  | Over the rate limit, or the pod is already running two diagnostics.       |
+| `503`  | The integration surface is not wired on this pod.                         |
+
+### Audit
+
+Every diagnostic and every test message writes one row, whether it succeeded,
+was refused or failed.
+
+- action: `admin.integration.diagnose` or `admin.integration.smtp.test_email`;
+- resource: `admin.integration:<id>`;
+- metadata, by allowlist: `integration`, `outcome`, and `failed_stage` when one
+  failed.
+
+No target, no response, no credential and no recipient reaches the trail — the
+recipient in particular is redundant, since the actor column already identifies
+whose mailbox it was.

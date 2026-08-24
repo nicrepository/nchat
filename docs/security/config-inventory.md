@@ -225,6 +225,32 @@ Ownership e cadencia de rotacao continuam em
 
 ---
 
+## A tela de Integracoes (issue #582)
+
+O Admin Console agrupa parte destas chaves por integracao em `/integrations`,
+com o modelo uniforme estado / configuracao / teste / historico. A tela **nao
+acrescenta configuracao**: o registry em
+`services/admin-service/internal/domain/integration.go` apenas nomeia chaves que
+ja existem aqui, e `ValidateIntegrationRegistry` recusa uma que nao exista no
+catalogo. Toda chave de integracao e classe C ou D, entao a tela e somente
+leitura por construcao — nao existe campo "substituir secret", pelo mesmo motivo
+que nao existe classe B.
+
+O que a #582 acrescenta e o **diagnostico ativo**: uma verificacao explicita, por
+etapa, disparada por um operador. Ela e uma superficie de rede e por isso vive
+fora da #580 — `ValidateConfigCatalog` continua exigindo `source = database` em
+toda definicao editavel, o que mantem a validacao de configuracao sem acesso a
+rede. O contrato do diagnostico, a politica de rede por integracao e os limites
+estao em [`admin-endpoints.md`](../api/admin-endpoints.md).
+
+Duas integracoes aparecem na tela e **nao podem ser diagnosticadas**, com o
+motivo exibido no console em vez de um botao ausente:
+
+| Integracao | Motivo                                                                                                      |
+| ---------- | ----------------------------------------------------------------------------------------------------------- |
+| TURN       | Nenhuma variavel da plataforma nomeia o servidor; o coturn e configurado dentro do LiveKit e no compose dev |
+| Link Scan  | A credencial e um Secret montado apenas por chat-service e file-service; o admin-service nao a recebe       |
+
 ## Como manter este documento
 
 O registry em
