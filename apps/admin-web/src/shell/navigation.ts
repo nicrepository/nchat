@@ -50,7 +50,12 @@ export const ADMIN_NAV: AdminNavItem[] = [
   { id: "email", label: "E-mail", capability: "admin.integrations.read" },
   { id: "calls", label: "Chamadas", capability: "admin.integrations.read" },
   { id: "links", label: "Links e conteúdo", capability: "admin.security.read" },
-  { id: "integrations", label: "Integrações", capability: "admin.integrations.read" },
+  {
+    id: "integrations",
+    label: "Integrações",
+    capability: "admin.integrations.read",
+    path: "/integrations",
+  },
   { id: "system", label: "Sistema", capability: "admin.infrastructure.read" },
   {
     id: "health",

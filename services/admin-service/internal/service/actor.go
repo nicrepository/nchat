@@ -38,6 +38,15 @@ type Actor struct {
 	// is still decided by the capability the route declares. The zero value
 	// grants nothing, so a service that forgets to populate it denies.
 	Capabilities domain.CapabilitySet
+	// Email is the administrator's own address, as the session guard loaded it
+	// from the database.
+	//
+	// Carried for exactly one purpose: the SMTP test message of issue #582 is
+	// delivered here and nowhere else. Making the destination an attribute of
+	// the authenticated principal rather than a request field is what keeps the
+	// console from being usable as a mail relay, so it must arrive with the
+	// actor and never from a body.
+	Email string
 	// CorrelationID is the server-minted request id. admin-service generates it
 	// rather than accepting one from the caller, so it cannot be forged into
 	// matching somebody else's trail.

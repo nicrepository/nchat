@@ -88,4 +88,22 @@ const (
 	RouteAdminOverview      = "/overview"
 	RouteAdminHealth        = "/health/services"
 	RouteAdminHealthRefresh = "/health/refresh"
+
+	// Integration routes (issue #582).
+	//
+	// Three routes, and none of them names a destination. The listing takes no
+	// parameter at all; the diagnostic takes one path segment resolved against
+	// the compile-time registry in domain/integration.go; the test message takes
+	// an empty body and delivers to the authenticated administrator's own
+	// address.
+	//
+	// The test message has a literal path rather than travelling through a
+	// generic /integrations/{id}/actions/{action}. An endpoint parameterised by
+	// the action is an endpoint whose effect nobody can review at the route, and
+	// this one sends mail — so it is registered by name, with its own capability
+	// and its own rate limit, like every other privileged operation in this
+	// service.
+	RouteAdminIntegrations         = "/integrations"
+	RouteAdminIntegrationDiagnose  = "/integrations/{integrationID}/diagnose"
+	RouteAdminIntegrationTestEmail = "/integrations/smtp/test-email"
 )

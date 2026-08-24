@@ -85,6 +85,23 @@ func (l *IPRateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// Allow spends one token for an arbitrary key.
+//
+// Exported so a caller that is not an HTTP middleware can share this limiter
+// rather than growing a second one. The active diagnostics of issue #582 are
+// the caller: they are limited per administrator and integration, not per IP,
+// because the thing worth bounding there is how often one operator can make
+// this pod open outbound connections.
+//
+// The bucket semantics, the TTL and the LRU ceiling are the same for every key
+// space, which is the point — one limiter, one set of properties to review.
+func (l *IPRateLimiter) Allow(key string) bool {
+	if l == nil {
+		return true
+	}
+	return l.allow(key)
+}
+
 // allow spends one token for key, and reports whether there was one to spend.
 //
 // Every branch is constant time: a map lookup, a list splice, and at most one

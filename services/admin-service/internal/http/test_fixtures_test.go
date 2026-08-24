@@ -177,7 +177,10 @@ type harnessSettings struct {
 	// observability is the issue #581 surface, nil by default for the same
 	// reason as the two above.
 	observability *ObservabilityPorts
-	logger        *slog.Logger
+	// integrations is the issue #582 surface, nil by default for the same
+	// reason as the three above.
+	integrations IntegrationAdmin
+	logger       *slog.Logger
 }
 
 func withManagement(ports *ManagementPorts) harnessOption {
@@ -190,6 +193,10 @@ func withConfiguration(configuration ConfigAdmin) harnessOption {
 
 func withObservability(ports *ObservabilityPorts) harnessOption {
 	return func(s *harnessSettings) { s.observability = ports }
+}
+
+func withIntegrations(integrations IntegrationAdmin) harnessOption {
+	return func(s *harnessSettings) { s.integrations = integrations }
 }
 
 func withConfig(apply func(*config.Config)) harnessOption {
@@ -227,6 +234,7 @@ func newHarness(t *testing.T, store *stubStore, options ...harnessOption) *testH
 		Management:      settings.management,
 		Configuration:   settings.configuration,
 		Observability:   settings.observability,
+		Integrations:    settings.integrations,
 	})
 	return &testHarness{router: router, store: store, cfg: cfg, auth: sessions}
 }

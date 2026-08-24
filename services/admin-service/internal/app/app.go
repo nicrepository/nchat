@@ -27,6 +27,21 @@ type App struct {
 	shutdownErr     error
 }
 
+// The budget one administrator has for the active diagnostics of issue #582.
+//
+// Per administrator and per integration, not per IP: two operators debugging
+// the same outage must not throttle each other, and one operator holding down a
+// button must not turn the console into a scanner. The test message is one per
+// minute with no burst at all — it leaves the platform, lands in a mailbox and
+// costs the relay's reputation, so being able to press it twice in a row buys
+// nothing an operator needs.
+const (
+	diagnosticsPerMinute = 6
+	diagnosticsBurst     = 3
+	testEmailsPerMinute  = 1
+	testEmailsBurst      = 1
+)
+
 type appDependencies struct {
 	openDB          func(context.Context, string, int) (storage.Pool, error)
 	tracingShutdown observability.ShutdownFunc
@@ -132,6 +147,21 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 	healthMetrics := service.NewHealthMetrics()
 	health := service.NewHealthService(store, healthMetrics)
 	dashboard := service.NewDashboardService(health, storage.NewPGXMetricsStore(pool), healthMetrics)
+	// The integration surface (issue #582) composes the two above and adds the
+	// only outbound connection an operator can cause deliberately: the active
+	// diagnostic. It gets its own limiters rather than sharing the session one,
+	// because the thing worth bounding is not how often an address signs in but
+	// how often one administrator can make this pod dial a dependency — and the
+	// test message, which spends a relay's reputation, is bounded harder still.
+	// The store is handed in as the authorizer: an operation whose effect
+	// leaves the platform re-proves the administrator's authority against the
+	// database at the last safe point, rather than trusting the snapshot the
+	// middleware produced when the request arrived.
+	integrations := service.NewIntegrationService(
+		health, configuration, store, audit,
+		httpapi.NewIPRateLimiter(diagnosticsPerMinute, diagnosticsBurst, nil),
+		httpapi.NewIPRateLimiter(testEmailsPerMinute, testEmailsBurst, nil),
+	)
 	return httpapi.RouterDependencies{
 		TokenValidator:   validator,
 		Sessions:         sessions,
@@ -143,6 +173,7 @@ func buildAdminAPI(cfg config.Config, logger *slog.Logger, deps appDependencies)
 		Management:       httpapi.NewManagementPorts(users, channels, policies),
 		Configuration:    configuration,
 		Observability:    httpapi.NewObservabilityPorts(dashboard, health),
+		Integrations:     integrations,
 		HealthCollectors: healthMetrics.Collectors(),
 	}, pool, nil
 }

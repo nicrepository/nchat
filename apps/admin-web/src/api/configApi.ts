@@ -203,8 +203,14 @@ function optionalText(raw: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function parseSetting(raw: Record<string, unknown>, index: number): ConfigSetting {
-  const field = `settings[${index}]`;
+/**
+ * Reads one setting, enforcing the credential invariant at the boundary.
+ *
+ * Exported because the integrations surface of issue #582 embeds the very same
+ * projection: one parser means one place where "a credential arrives as a
+ * status and never as a value" is checked, rather than two that can drift.
+ */
+export function parseConfigSetting(raw: Record<string, unknown>, field: string): ConfigSetting {
   const sensitive = bool(raw, "sensitive", field);
   const setting: ConfigSetting = {
     key: str(raw, "key", field),
@@ -341,7 +347,7 @@ export async function loadConfiguration(signal?: AbortSignal): Promise<ConfigCat
       };
     }),
     settings: requireArray(raw.settings, "settings").map((entry, index) =>
-      parseSetting(requireRecord(entry, `settings[${index}]`), index),
+      parseConfigSetting(requireRecord(entry, `settings[${index}]`), `settings[${index}]`),
     ),
   };
 }

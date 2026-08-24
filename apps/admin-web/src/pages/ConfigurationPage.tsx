@@ -1,4 +1,5 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
+import { useSearchParams } from "react-router";
 
 import {
   listConfigVersions,
@@ -10,6 +11,7 @@ import {
 import ConfigDiffDialog from "../components/ConfigDiffDialog";
 import ConfigField from "../components/ConfigField";
 import ConfigPolicyForm from "../components/ConfigPolicyForm";
+import ConfigSearch from "../components/ConfigSearch";
 import QueryStates from "../components/QueryStates";
 import {
   AUTH_POLICY_DOCUMENT,
@@ -18,7 +20,9 @@ import {
   formatConfigValue,
   groupByCategory,
 } from "../lib/configFields";
+import { searchSettings } from "../lib/configSearch";
 import { useAdminQuery } from "../lib/useAdminQuery";
+import { useDebouncedValue } from "../lib/useDebouncedValue";
 import { useConfigDrafts } from "../lib/useConfigDrafts";
 import { useConfigReview, type ConfigReviewKind } from "../lib/useConfigReview";
 import { useAdminSession } from "../session/useAdminSession";
@@ -46,6 +50,7 @@ const VERSION_PAGE_SIZE = 25;
  */
 export default function ConfigurationPage() {
   const { can } = useAdminSession();
+  const [searchParams] = useSearchParams();
   const canManage = can("admin.config.manage");
 
   const loadCatalog = useCallback((signal: AbortSignal) => loadConfiguration(signal), []);
@@ -58,6 +63,13 @@ export default function ConfigurationPage() {
   const versions = useAdminQuery(loadVersions);
 
   const { settings, revision } = useMemo(() => readCatalog(catalog.data), [catalog.data]);
+
+  // The term seeds from the URL so a card on the integrations page can link
+  // straight to the settings it owns, and it is debounced so typing a name is
+  // one filter pass rather than one per keystroke.
+  const [term, setTerm] = useState(searchParams.get("q") ?? "");
+  const settled = useDebouncedValue(term);
+  const visible = useMemo(() => searchSettings(settings, settled), [settings, settled]);
 
   const drafts = useConfigDrafts(catalog.data, settings);
   const flow = useConfigReview({
@@ -107,16 +119,31 @@ export default function ConfigurationPage() {
 
       {catalog.status === "ready" && settings.length > 0 && (
         <>
+          <ConfigSearch
+            term={term}
+            onTerm={setTerm}
+            matches={visible.length}
+            total={settings.length}
+          />
+
           <ConfigPolicyForm
-            settings={settings.filter((setting) => setting.editable)}
+            settings={visible.filter((setting) => setting.editable)}
             drafts={drafts}
             revision={revision}
             canManage={canManage}
             applying={flow.busy}
+            // The change set is computed over *every* setting, not the filtered
+            // view. A field edited before the search was typed is still an edit,
+            // and dropping it because a filter hid it would discard work
+            // silently. The diff dialog is what shows the operator everything
+            // they are about to apply.
             onReview={() => flow.open(changedValues(settings, drafts.drafts))}
           />
 
-          <ReadOnlySections settings={settings.filter((setting) => !setting.editable)} />
+          <ReadOnlySections
+            settings={visible.filter((setting) => !setting.editable)}
+            searching={settled.trim() !== ""}
+          />
 
           <VersionHistory
             versions={versions}
@@ -181,7 +208,14 @@ function reviewConfirmLabel(kind: ConfigReviewKind): string {
  * they fill in — and because leaving forty read-only rows expanded above the
  * history would bury both.
  */
-function ReadOnlySections({ settings }: { settings: ConfigSetting[] }) {
+function ReadOnlySections({
+  settings,
+  searching,
+}: {
+  settings: ConfigSetting[];
+  /** Open every group while a term is active, so a match is never hidden. */
+  searching: boolean;
+}) {
   const groups = groupByCategory(settings);
   return (
     <>
@@ -190,8 +224,11 @@ function ReadOnlySections({ settings }: { settings: ConfigSetting[] }) {
         Valores efetivos observados por este serviço. A fonte de verdade é o Git ou a
         infraestrutura, e alterá-los exige commit e rollout.
       </p>
+      {groups.length === 0 && searching && (
+        <p className="admin-empty">Nenhuma configuração corresponde à busca.</p>
+      )}
       {groups.map(([category, entries]) => (
-        <details key={category} className="admin-subsection">
+        <details key={category} className="admin-subsection" open={searching}>
           <summary>
             {categoryLabel(category)} ({entries.length})
           </summary>

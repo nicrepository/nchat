@@ -52,8 +52,9 @@ import (
 // there is no cycle. Adding a privileged write means calling this first and
 // keeping that order; adding a revocation means locking the principal row.
 
-// authorizeMutationLockQuery re-proves the acting administrator, and locks the
-// two rows a revocation would have to change to take that authority away.
+// authorizeMutationPredicate is the one definition of "is this administrator
+// still allowed to act", shared by the transactional check below and by the
+// lock-free re-authorization at the bottom of this file.
 //
 // Every clause is a revocation somebody can perform right now:
 //
@@ -62,12 +63,7 @@ import (
 //	p.status = 'active'               the principal is not suspended
 //	u.status / u.deleted_at           the account is not suspended or deleted
 //	us.revoked_at / us.absolute…      the login behind it is still valid
-//
-// FOR UPDATE OF s, p locks only those two rows — one session and one principal,
-// never a table and never another administrator's rows. auth.users and
-// auth.user_sessions are read but not locked: suspension takes the principal
-// lock too, so it cannot commit while this transaction holds it.
-const authorizeMutationLockQuery = `
+const authorizeMutationPredicate = `
 	SELECT p.user_id::text
 	FROM auth.admin_sessions AS s
 	JOIN auth.admin_principals AS p ON p.user_id = s.user_id
@@ -82,7 +78,15 @@ const authorizeMutationLockQuery = `
 	  AND u.status = 'active'
 	  AND u.deleted_at IS NULL
 	  AND us.revoked_at IS NULL
-	  AND (us.absolute_expires_at IS NULL OR us.absolute_expires_at > now())
+	  AND (us.absolute_expires_at IS NULL OR us.absolute_expires_at > now())`
+
+// authorizeMutationLockQuery adds the locks a transactional write needs.
+//
+// FOR UPDATE OF s, p locks only those two rows — one session and one principal,
+// never a table and never another administrator's rows. auth.users and
+// auth.user_sessions are read but not locked: suspension takes the principal
+// lock too, so it cannot commit while this transaction holds it.
+const authorizeMutationLockQuery = authorizeMutationPredicate + `
 	FOR UPDATE OF s, p`
 
 // authorizeMutationCapabilityQuery re-reads the capabilities the principal
@@ -155,6 +159,63 @@ func lockAdminPrincipalTx(ctx context.Context, tx pgx.Tx, userID string) error {
 		`SELECT 1 FROM auth.admin_principals WHERE user_id = $1::uuid FOR UPDATE`, userID)
 	if err != nil {
 		return fmt.Errorf("lock admin principal: %w", err)
+	}
+	return nil
+}
+
+// Re-authorization for an external side effect (issue #582).
+//
+// The transactional path above cannot serve an operation whose effect leaves
+// PostgreSQL. Holding a transaction and two row locks across DNS, TCP, TLS, an
+// SMTP AUTH and a relay's response time would make the lock duration a function
+// of somebody else's network, and would let a slow relay block the very
+// revocation this check exists to observe.
+//
+// So this reads the same predicate without locking anything and without a
+// transaction. What it gives up is the serialization: a revocation committing
+// in the microseconds between this read and the SMTP envelope is not ordered
+// against it, because PostgreSQL and an SMTP relay are two systems and there is
+// no atomicity across them. What it gives is the property that is actually
+// implementable — the authority is re-derived from the database at the last
+// safe point before the side effect, so a revocation that is already visible
+// there stops the operation.
+
+// reauthorizeActionQuery is the transactional predicate with the locks removed.
+// Sharing the constant is deliberate: one predicate means a clause added to the
+// revocation model applies to both paths, and neither can drift into checking
+// less than the other.
+const reauthorizeActionQuery = authorizeMutationPredicate + `
+	LIMIT 1`
+
+// ReauthorizeAction re-proves an administrator's current authority without
+// locking anything.
+//
+// Same two answers as the transactional check, so a revocation observed here
+// looks to a client exactly like one the middleware caught: ErrUnauthorized
+// when the session, the login or the account is no longer usable,
+// ErrForbidden when the identity holds and the capability does not.
+func (s *PGXAdminStore) ReauthorizeAction(ctx context.Context, authorization domain.MutationAuthorization) error {
+	if s == nil || s.pool == nil {
+		return domain.ErrUnavailable
+	}
+	if !authorization.Valid() {
+		return domain.ErrForbidden
+	}
+	var principalID string
+	err := s.pool.QueryRow(ctx, reauthorizeActionQuery, authorization.SessionID, authorization.UserID).Scan(&principalID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrUnauthorized
+		}
+		return fmt.Errorf("reauthorize action: %w", err)
+	}
+
+	var granted []string
+	if err := s.pool.QueryRow(ctx, authorizeMutationCapabilityQuery, principalID).Scan(&granted); err != nil {
+		return fmt.Errorf("reauthorize action capabilities: %w", err)
+	}
+	if !domain.NewCapabilitySet(toCapabilities(granted)).Has(authorization.Capability) {
+		return domain.ErrForbidden
 	}
 	return nil
 }
