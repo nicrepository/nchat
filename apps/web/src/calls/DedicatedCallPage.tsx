@@ -295,7 +295,7 @@ export default function DedicatedCallPage() {
                 : "connecting"
         }
         participantCount={participantCount}
-        participants={presentedParticipants}
+        participants={resolved.target_type === "user" ? [] : presentedParticipants}
         controls={controls}
         bindLocalMedia={media.bindLocalMedia}
         bindRemoteAudio={media.bindRemoteAudio}
@@ -303,14 +303,17 @@ export default function DedicatedCallPage() {
         bindLocalScreenShare={media.bindLocalScreenShare}
         screenShareName={
           media.remoteScreenShare
-            ? (presentedParticipants.find(
-                (participant) => participant.identity === media.remoteScreenShare?.identity,
-              )?.displayName ?? "Participante")
+            ? resolved.target_type === "user"
+              ? target.name
+              : (presentedParticipants.find(
+                  (participant) => participant.identity === media.remoteScreenShare?.identity,
+                )?.displayName ?? "Participante")
             : undefined
         }
         bindScreenShare={media.remoteScreenShare?.bindMedia}
         hasLocalVideo={media.hasLocalVideo}
         localSeed={directory.currentUserId}
+        localParticipantId={directory.currentUserId}
         localDisplayName={localDisplayName}
         localInitials={localInitials}
         localAvatarUrl={selfAvatarUrl}
@@ -322,6 +325,7 @@ export default function DedicatedCallPage() {
         remoteDirect={
           resolved.target_type === "user"
             ? {
+                identity: target.id,
                 seed: target.id,
                 displayName: target.name,
                 avatarUrl: target.avatarUrl,
@@ -330,6 +334,7 @@ export default function DedicatedCallPage() {
               }
             : undefined
         }
+        activeSpeakerId={media.activeSpeakerId}
         onMinimize={() => {
           void session.releaseDedicated(resolved.call_id).then(() => {
             window.close();

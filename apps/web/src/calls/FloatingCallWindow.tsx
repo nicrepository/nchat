@@ -21,11 +21,16 @@ const corners: FloatingCorner[] = ["top-left", "top-right", "bottom-left", "bott
 // to reject it there rather than relying on the button to stop propagation.
 const INTERACTIVE_SELECTOR = "button, a, input, select, textarea, [contenteditable='true']";
 
+export interface FloatingActiveSpeaker {
+  kind: "local" | "direct-remote" | "resource-remote";
+  name: string;
+}
+
 interface FloatingCallWindowProps {
   title: string;
   status: "connecting" | "connected" | "reconnecting" | "failed";
   participantCount: number;
-  activeSpeakerName?: string;
+  activeSpeaker?: FloatingActiveSpeaker;
   /**
    * Compact screen-share status text (issue #611) — "Você está
    * compartilhando a tela" or "<displayName> está compartilhando a tela".
@@ -100,7 +105,7 @@ export default function FloatingCallWindow({
   title,
   status,
   participantCount,
-  activeSpeakerName,
+  activeSpeaker,
   screenShareLabel,
   controls,
   onExpand,
@@ -248,22 +253,28 @@ export default function FloatingCallWindow({
         </button>
       </header>
       <div className="floating-call__stage">
-        <div ref={bindRemoteMedia} className="floating-call__remote" />
-        {!hasRemoteVideo && (
-          <div className="floating-call__avatar-wrap">
-            <div
-              className={`floating-call__avatar call-avatar call-avatar--${avatarColorFor(remoteSeed)}`}
-              aria-hidden="true"
-            >
-              <PersonAvatarImage
-                src={avatarUrl}
-                initials={initialsFrom(title)}
-                imgClassName="call-avatar__img"
-              />
+        <div
+          className={`floating-call__remote-participant call-speaker-surface${activeSpeaker?.kind === "direct-remote" ? " call-speaker-surface--active" : ""}`}
+        >
+          <div ref={bindRemoteMedia} className="floating-call__remote" />
+          {!hasRemoteVideo && (
+            <div className="floating-call__avatar-wrap">
+              <div
+                className={`floating-call__avatar call-avatar call-avatar--${avatarColorFor(remoteSeed)}`}
+                aria-hidden="true"
+              >
+                <PersonAvatarImage
+                  src={avatarUrl}
+                  initials={initialsFrom(title)}
+                  imgClassName="call-avatar__img"
+                />
+              </div>
             </div>
-          </div>
-        )}
-        <div className="floating-call__local">
+          )}
+        </div>
+        <div
+          className={`floating-call__local call-speaker-surface${activeSpeaker?.kind === "local" ? " call-speaker-surface--active" : ""}`}
+        >
           <div ref={bindLocalMedia} className="floating-call__local-media" />
           {!hasLocalVideo && (
             <div
@@ -282,8 +293,16 @@ export default function FloatingCallWindow({
         <span className="floating-call__count">
           {participantCount} participante{participantCount === 1 ? "" : "s"}
         </span>
-        {activeSpeakerName && (
-          <span className="floating-call__speaker">{activeSpeakerName} está falando</span>
+        {activeSpeaker && (
+          <span
+            className="floating-call__speaker"
+            aria-label={`${activeSpeaker.name} está falando`}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              mic
+            </span>
+            <span>{activeSpeaker.name} está falando</span>
+          </span>
         )}
         {screenShareLabel && <span className="floating-call__share">{screenShareLabel}</span>}
       </div>

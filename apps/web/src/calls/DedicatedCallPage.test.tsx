@@ -71,6 +71,7 @@ const session = {
   resource: { join, leave: vi.fn(async () => undefined) },
   media: {
     status: "connected" as string,
+    activeSpeakerId: null as string | null,
     participants: [] as unknown[],
     remoteScreenShare: null as unknown,
     hasLocalVideo: true,
@@ -130,6 +131,7 @@ describe("DedicatedCallPage", () => {
     session.dedicatedRecoveryFailed = false;
     session.calls.call = null;
     session.media.status = "connected";
+    session.media.activeSpeakerId = null;
     session.media.participants = [];
     session.media.remoteScreenShare = null;
     session.media.screenShareEnabled = false;
@@ -298,10 +300,12 @@ describe("DedicatedCallPage", () => {
     session.media.participants = [
       { identity: "caller", displayName: "Ana", hasVideo: true, bindVideo: vi.fn() },
     ];
+    session.media.activeSpeakerId = "caller";
     session.media.remoteScreenShare = { identity: "caller", bindMedia: vi.fn() };
     renderPage();
 
     expect(await screen.findByText("Tela de Ana")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ana está falando")).toBeInTheDocument();
     // activateMedia() runs in a passive effect that commits after the DOM
     // update above, not synchronously with it — same reasoning as the
     // join() wait a few tests up for the channel/dm activation branch.
@@ -384,12 +388,14 @@ describe("DedicatedCallPage", () => {
     });
     session.calls.call = direct;
     session.media.hasLocalVideo = false;
+    session.media.activeSpeakerId = "current-user";
     renderPage();
 
     const avatar = await screen.findByText("Você", { selector: "span" });
     const tile = avatar.closest("article")!;
     const localAvatar = tile.querySelector(".dedicated-call__avatar")!;
     expect(localAvatar).toHaveClass(`call-avatar--${avatarColorFor("current-user")}`);
+    expect(tile).toHaveClass("call-speaker-surface--active");
   });
 
   it("releases (stopping media first) before attempting window.close, then falls back to /chat when it is blocked", async () => {
@@ -528,6 +534,7 @@ describe("DedicatedCallPage", () => {
       { identity: "user-a", displayName: "Ana Souza", hasVideo: false, bindVideo: vi.fn() },
       { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, bindVideo: vi.fn() },
     ];
+    session.media.activeSpeakerId = "user-a";
     vi.mocked(fetchChannelCallParticipantProfiles).mockResolvedValue([
       { userId: "user-a", displayName: "Ana Souza", avatarUrl: "https://x/a.png" },
     ]);
@@ -537,6 +544,7 @@ describe("DedicatedCallPage", () => {
       "channel-1",
       expect.arrayContaining(["user-a", "user-b"]),
     );
+    expect(screen.getByLabelText("Ana Souza está falando")).toBeInTheDocument();
   });
 
   it("two distinct participants never share one resolved identity", async () => {

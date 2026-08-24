@@ -53,7 +53,7 @@ import {
 } from "./callOwnership";
 import { initialPresentation, transition, type PresentationState } from "./callPresentation";
 import { emitCallTechnicalEvent } from "./callTelemetry";
-import FloatingCallWindow from "./FloatingCallWindow";
+import FloatingCallWindow, { type FloatingActiveSpeaker } from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 import IncomingCallPopup from "./IncomingCallPopup";
 
@@ -1511,15 +1511,21 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const localSeed = directory?.currentUserId ?? "local";
   const participants = media.participants ?? [];
   const participantCount = Math.max(1, participants.length + 1);
-  const activeSpeakerName =
+  const activeSpeakerParticipant = participants.find(
+    (participant) => participant.identity === media.activeSpeakerId,
+  );
+  const activeSpeaker: FloatingActiveSpeaker | undefined =
     media.activeSpeakerId === directory?.currentUserId
-      ? "Você"
-      : participants.find((participant) => participant.identity === media.activeSpeakerId)
-          ?.displayName;
+      ? { kind: "local", name: "Você" }
+      : directActive && directory && media.activeSpeakerId === peerId
+        ? { kind: "direct-remote", name: title }
+        : resourceTarget && activeSpeakerParticipant
+          ? { kind: "resource-remote", name: activeSpeakerParticipant.displayName }
+          : undefined;
   // Compact floating status text (issue #611) — local always takes
   // precedence over remote (matching the dedicated primary-tile tie-break),
-  // reusing the same participant displayName lookup already used above for
-  // activeSpeakerName. No preview, no second grid — text only.
+  // reusing the same participant displayName lookup already used above.
+  // No preview, no second grid — text only.
   const screenShareLabel = media.screenShareEnabled
     ? "Você está compartilhando a tela"
     : media.remoteScreenShare
@@ -1587,7 +1593,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           title={title}
           status={floatingStatus}
           participantCount={participantCount}
-          activeSpeakerName={activeSpeakerName}
+          activeSpeaker={activeSpeaker}
           screenShareLabel={screenShareLabel}
           hasRemoteVideo={media.hasRemoteVideo}
           remoteSeed={remoteSeed}
