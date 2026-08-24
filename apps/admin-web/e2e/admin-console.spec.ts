@@ -157,13 +157,26 @@ test("o ambiente exibido vem do backend, não do hostname", async ({ page }) => 
 test("seções não implementadas aparecem como indisponíveis e não são clicáveis", async ({
   page,
 }) => {
+  // A superuser sees every entry, which is what makes this the one scenario
+  // where both halves of the navigation contract are observable at once.
   await stubBootstrap(page, { data: { ...BOOTSTRAP, capabilities: ["admin.superuser"] } });
 
   await page.goto("/");
   const nav = page.getByRole("navigation", { name: "Seções administrativas" });
 
-  await expect(nav.getByText("Health Center")).toHaveCount(1);
-  await expect(nav.getByRole("link", { name: "Health Center" })).toHaveCount(0);
+  // "Sistema" carries no `path` in ADMIN_NAV, so the shell must draw it as a
+  // disabled span: visible, announced as unavailable, and not a link. A
+  // placeholder rendered as a working control is how an operator ends up
+  // believing a section did something.
+  await expect(nav.getByText("Sistema")).toHaveCount(1);
+  await expect(nav.getByRole("link", { name: "Sistema" })).toHaveCount(0);
+  await expect(nav.getByText("Sistema")).toHaveAttribute("aria-disabled", "true");
+
+  // The other half of the same contract: a section that *is* implemented is a
+  // real link. Health Center gained its route in issue #581, and the sidebar
+  // entry is the one way into it that admin-observability.spec.ts does not
+  // exercise — that suite reaches /health by URL and from a dashboard alert.
+  await expect(nav.getByRole("link", { name: "Health Center" })).toHaveAttribute("href", "/health");
 });
 
 test("logout encerra a sessão e volta para a tela de acesso", async ({ page }) => {
