@@ -341,6 +341,12 @@ export function useCallMedia(
   }, []);
 
   const removeParticipant = useCallback((identity: string) => {
+    for (const element of remoteElementsRef.current) {
+      if (element.dataset.participantIdentity !== identity) continue;
+      remoteElementsRef.current.delete(element);
+      remoteAudioElementsRef.current.delete(element);
+      element.remove();
+    }
     participantsMapRef.current.delete(identity);
     participantBindRef.current.delete(identity);
     participantOrderRef.current = participantOrderRef.current.filter((id) => id !== identity);
@@ -456,6 +462,7 @@ export function useCallMedia(
         onParticipantDisconnected(identity) {
           if (!current()) return;
           removeParticipant(identity);
+          syncRemoteState();
           if (
             speakerStateRef.current?.candidate === identity ||
             speakerStateRef.current?.visible === identity
@@ -482,6 +489,14 @@ export function useCallMedia(
             entry.hasVideo = false;
             entry.container?.replaceChildren();
           }
+          syncParticipants();
+        },
+        onRemoteAudioAvailabilityChanged(identity, available) {
+          if (!current()) return;
+          ensureParticipant(identity);
+          const entry = participantsMapRef.current.get(identity);
+          if (!entry) return;
+          entry.hasAudio = available;
           syncParticipants();
         },
         onDisconnected() {

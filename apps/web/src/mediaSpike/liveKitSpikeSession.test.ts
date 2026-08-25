@@ -146,6 +146,7 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onParticipantConnected: vi.fn(),
     onParticipantDisconnected: vi.fn(),
     onRemoteVideoAvailabilityChanged: vi.fn(),
+    onRemoteAudioAvailabilityChanged: vi.fn(),
     onActiveSpeakersChanged: vi.fn(),
     onScreenShareChanged: vi.fn(),
     onLocalScreenShareChanged: vi.fn(),
@@ -989,20 +990,30 @@ describe("createLiveKitSpikeSession", () => {
       expect(handlers.onMicrophoneStateChanged).toHaveBeenCalledExactlyOnceWith(true);
     });
 
-    it("ignores RoomEvent.TrackMuted for a remote participant's microphone", () => {
+    it("reports RoomEvent.TrackMuted for a remote participant's microphone", () => {
       const { handlers, room } = setup();
+      const participant = { sid: "participant-b", identity: "identity-b" };
 
-      room.emit(liveKitMock.events.TrackMuted, micPublication(true), { sid: "participant-b" });
+      room.emit(liveKitMock.events.TrackMuted, micPublication(true), participant);
 
       expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+      expect(handlers.onRemoteAudioAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-b",
+        false,
+      );
     });
 
-    it("ignores RoomEvent.TrackUnmuted for a remote participant's microphone", () => {
+    it("reports RoomEvent.TrackUnmuted for a remote participant's microphone", () => {
       const { handlers, room } = setup();
+      const participant = { sid: "participant-b", identity: "identity-b" };
 
-      room.emit(liveKitMock.events.TrackUnmuted, micPublication(false), { sid: "participant-b" });
+      room.emit(liveKitMock.events.TrackUnmuted, micPublication(false), participant);
 
       expect(handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
+      expect(handlers.onRemoteAudioAvailabilityChanged).toHaveBeenCalledExactlyOnceWith(
+        "identity-b",
+        true,
+      );
     });
 
     it("ignores a local mute/unmute event for the camera source", () => {
@@ -1161,7 +1172,7 @@ describe("createLiveKitSpikeSession", () => {
       expect(handlers.onRemoteVideoAvailabilityChanged).toHaveBeenCalledWith("identity-a", true);
     });
 
-    it("E: reconnect resync never reports for a microphone publication", () => {
+    it("E: reconnect resyncs the remote microphone without treating it as video", () => {
       const { handlers, room } = setup();
       room.remoteParticipants.set("participant-a", {
         identity: "identity-a",
@@ -1174,6 +1185,7 @@ describe("createLiveKitSpikeSession", () => {
       room.emit(liveKitMock.events.Reconnected);
 
       expect(handlers.onRemoteVideoAvailabilityChanged).not.toHaveBeenCalled();
+      expect(handlers.onRemoteAudioAvailabilityChanged).toHaveBeenCalledWith("identity-a", false);
     });
 
     it("resync after connect() only reports subscribed camera publications, never an unsubscribed one", async () => {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import DedicatedCallStage from "./DedicatedCallStage";
@@ -19,8 +19,14 @@ const baseProps = {
   status: "connected" as const,
   participantCount: 3,
   participants: [
-    { identity: "user-a", displayName: "Ana Souza", hasVideo: false, avatarUrl: "https://x/a.png" },
-    { identity: "user-b", displayName: "Bruno Lima", hasVideo: false },
+    {
+      identity: "user-a",
+      displayName: "Ana Souza",
+      hasVideo: false,
+      hasAudio: true,
+      avatarUrl: "https://x/a.png",
+    },
+    { identity: "user-b", displayName: "Bruno Lima", hasVideo: false, hasAudio: false },
   ],
   controls: baseControls,
   onMinimize: vi.fn(),
@@ -92,6 +98,7 @@ describe("DedicatedCallStage", () => {
             identity: "user-a",
             displayName: "Ana Souza",
             hasVideo: true,
+            hasAudio: true,
             avatarUrl: "https://x/a.png",
           },
         ]}
@@ -268,7 +275,9 @@ describe("DedicatedCallStage", () => {
         <DedicatedCallStage
           {...baseProps}
           activeSpeakerId="user-a"
-          participants={[{ identity: "user-a", displayName: "Ana Souza", hasVideo: true }]}
+          participants={[
+            { identity: "user-a", displayName: "Ana Souza", hasVideo: true, hasAudio: true },
+          ]}
         />,
       );
 
@@ -369,6 +378,165 @@ describe("DedicatedCallStage", () => {
         "aria-hidden",
         "true",
       );
+    });
+  });
+
+  describe("resource screen-share participant sidebar (issue #643)", () => {
+    it("keeps the normal resource layout when no screen share is active", () => {
+      const { container } = render(<DedicatedCallStage {...baseProps} resourceCall />);
+
+      expect(container.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+      expect(
+        container.querySelector(".dedicated-call__screen-share-layout"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it.each([
+      { localScreenShareActive: true, label: "Sua tela" },
+      { bindScreenShare: vi.fn(), screenShareName: "Ana Souza", label: "Tela de Ana Souza" },
+    ])("uses the side-by-side resource layout for $label", (shareProps) => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} resourceCall {...shareProps} />,
+      );
+
+      expect(container.querySelector(".dedicated-call")).toHaveClass(
+        "dedicated-call--screen-share",
+      );
+      expect(container.querySelector(".dedicated-call__screen-share-layout")).toBeInTheDocument();
+      expect(screen.getByText(shareProps.label)).toBeInTheDocument();
+      expect(screen.getByRole("complementary", { name: "Participantes" })).toHaveAttribute(
+        "tabindex",
+        "0",
+      );
+      expect(screen.getByLabelText("Controles da chamada")).toBeInTheDocument();
+    });
+
+    it("keeps local share precedence over a simultaneous remote share", () => {
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          localScreenShareActive
+          bindLocalScreenShare={vi.fn()}
+          bindScreenShare={vi.fn()}
+          screenShareName="Ana Souza"
+        />,
+      );
+
+      expect(screen.getByText("Sua tela")).toBeInTheDocument();
+      expect(screen.queryByText("Tela de Ana Souza")).not.toBeInTheDocument();
+      expect(document.querySelectorAll(".dedicated-call__tile--screen")).toHaveLength(1);
+    });
+
+    it("shows the local and remote roster with accessible media states", () => {
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          bindScreenShare={vi.fn()}
+          remoteScreenShareParticipantId="user-a"
+          activeSpeakerId="user-a"
+        />,
+      );
+
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(sidebar).toHaveTextContent(baseProps.localDisplayName);
+      expect(sidebar).toHaveTextContent("Ana Souza");
+      expect(sidebar).toHaveTextContent("Bruno Lima");
+      expect(sidebar.querySelectorAll(".dedicated-call__participant")).toHaveLength(3);
+      expect(sidebar.querySelector(".call-speaker-surface--active")).toHaveTextContent("Ana Souza");
+      expect(within(sidebar).getByLabelText("Ana Souza est\u00e1 falando")).toBeInTheDocument();
+      expect(within(sidebar).getByLabelText("Ana Souza: microfone ligado")).toBeInTheDocument();
+      expect(
+        within(sidebar).getByLabelText("Ana Souza: c\u00e2mera desligada"),
+      ).toBeInTheDocument();
+      expect(
+        within(sidebar).getByLabelText("Ana Souza est\u00e1 compartilhando a tela"),
+      ).toBeInTheDocument();
+      expect(within(sidebar).getByLabelText("Bruno Lima: microfone desligado")).toBeInTheDocument();
+    });
+
+    it("updates and clears the derived sidebar without stale participants or speakers", () => {
+      const view = render(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          bindScreenShare={vi.fn()}
+          activeSpeakerId="user-a"
+        />,
+      );
+      expect(screen.getByRole("complementary", { name: "Participantes" })).toHaveTextContent(
+        "Ana Souza",
+      );
+
+      view.rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          bindScreenShare={vi.fn()}
+          participants={[
+            { identity: "user-c", displayName: "Carla Dias", hasVideo: true, hasAudio: true },
+          ]}
+          activeSpeakerId="user-c"
+        />,
+      );
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(sidebar).not.toHaveTextContent("Ana Souza");
+      expect(sidebar).toHaveTextContent("Carla Dias");
+      expect(sidebar.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+
+      view.rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          bindScreenShare={vi.fn()}
+          participants={[
+            { identity: "user-c", displayName: "Carla Dias", hasVideo: true, hasAudio: true },
+          ]}
+          activeSpeakerId={null}
+        />,
+      );
+      expect(sidebar.querySelectorAll(".call-speaker-surface--active")).toHaveLength(0);
+    });
+
+    it("removes the special layout immediately when sharing ends", () => {
+      const view = render(
+        <DedicatedCallStage {...baseProps} resourceCall bindScreenShare={vi.fn()} />,
+      );
+
+      view.rerender(<DedicatedCallStage {...baseProps} resourceCall />);
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
+      expect(
+        document.querySelector(".dedicated-call__screen-share-layout"),
+      ).not.toBeInTheDocument();
+      expect(document.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+    });
+
+    it("does not apply the resource sidebar to a direct call with screen share", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          bindScreenShare={vi.fn()}
+          remoteDirect={{
+            identity: "peer-1",
+            seed: "peer-1",
+            displayName: "Davi Rocha",
+            hasVideo: false,
+          }}
+        />,
+      );
+
+      expect(screen.getByText("Tela de Participante")).toBeInTheDocument();
+      expect(container.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
     });
   });
 });

@@ -885,6 +885,27 @@ describe("global and dedicated presentation", () => {
     );
     expect(document.querySelector(".dedicated-call__avatar")).toBeNull();
   });
+
+  it("confines the resource screen-share layout to the viewport with internal sidebar scrolling", () => {
+    expect(presentationCSS).toMatch(
+      /\.dedicated-call--screen-share\s*\{[^}]*height:\s*100dvh;[^}]*overflow:\s*hidden;/s,
+    );
+    expect(presentationCSS).toMatch(
+      /\.dedicated-call__participant-sidebar\s*\{[^}]*overflow:\s*auto;/s,
+    );
+  });
+
+  it("preserves shared-screen content with contain instead of cropping it", () => {
+    expect(presentationCSS).toMatch(
+      /\.dedicated-call__tile--screen \.dedicated-call__media video\s*\{[^}]*object-fit:\s*contain;/s,
+    );
+  });
+
+  it("keeps a narrow-viewport participant strip inside the call stage", () => {
+    expect(presentationCSS).toMatch(
+      /@media \(max-width: 720px\)[\s\S]*\.dedicated-call__screen-share-layout\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto;/,
+    );
+  });
 });
 
 describe("outgoing call presentation CSS (#648)", () => {
