@@ -1196,6 +1196,36 @@ async function installWebSocketMock(
             );
             return;
           }
+          if (parsed["type"] === "call.resource.sync") {
+            const targetType = parsed["target_type"];
+            const targetId = parsed["target_id"];
+            let call: Record<string, unknown> | null = null;
+            if (allowed.has(`${targetType}:${targetId}`)) {
+              for (const event of knownCalls.values()) {
+                const candidate = event["call"] as Record<string, unknown> | undefined;
+                if (
+                  candidate?.["target_type"] === targetType &&
+                  candidate["target_id"] === targetId &&
+                  candidate["status"] === "active"
+                ) {
+                  call = candidate;
+                  break;
+                }
+              }
+            }
+            const body = {
+              type: "call.resource.synced",
+              sync_id: parsed["sync_id"],
+              target_type: targetType,
+              target_id: targetId,
+              observed_at: new Date().toISOString(),
+              call,
+            };
+            queueMicrotask(() =>
+              this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(body) })),
+            );
+            return;
+          }
           if (parsed["type"] === "subscribe" || parsed["type"] === "unsubscribe") {
             const kind = parsed["target_type"];
             const id = parsed["target_id"];

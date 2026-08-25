@@ -212,6 +212,9 @@
   outline-offset: 2px;
   border-radius: 0.35rem;
 }
+.voicebanner__open--info {
+  cursor: default;
+}
 .voicebanner__icon {
   display: grid;
   place-items: center;
