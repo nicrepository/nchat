@@ -1,14 +1,30 @@
 package httpapi
 
 const (
-	RouteHealthz              = "/healthz"
-	RouteReadyz               = "/readyz"
-	RouteVersion              = "/version"
-	RouteSidebar              = "/api/chat/sidebar"
-	RouteChannelSidebarPin    = "/api/chat/channels/{channelID}/sidebar-pin"
-	RouteDMSidebarPin         = "/api/chat/dm/{conversationID}/sidebar-pin"
-	RouteChannelRead          = "/api/chat/channels/{channelID}/read"
-	RouteDMRead               = "/api/chat/dm/{conversationID}/read"
+	RouteHealthz           = "/healthz"
+	RouteReadyz            = "/readyz"
+	RouteVersion           = "/version"
+	RouteSidebar           = "/api/chat/sidebar"
+	RouteChannelSidebarPin = "/api/chat/channels/{channelID}/sidebar-pin"
+	RouteDMSidebarPin      = "/api/chat/dm/{conversationID}/sidebar-pin"
+	RouteChannelRead       = "/api/chat/channels/{channelID}/read"
+	RouteDMRead            = "/api/chat/dm/{conversationID}/read"
+	// Issue #527 mute. A per-user preference like the sidebar pin above, so it
+	// has the same shape: POST to silence, DELETE to restore, no body at all, and
+	// the workspace resolved from the session. The general channel is refused in
+	// SQL, not by omitting the route.
+	RouteChannelMute = "/api/chat/channels/{channelID}/mute"
+	RouteDMMute      = "/api/chat/dm/{conversationID}/mute"
+	// Issue #527 self-leave. DELETE on the actor's own membership, and the path
+	// names no user precisely because it cannot affect anyone else's: the actor
+	// is the session. The administrative removal of *another* member keeps its
+	// own surface under /members.
+	RouteChannelMembership = "/api/chat/channels/{channelID}/membership"
+	RouteDMMembership      = "/api/chat/dm/{conversationID}/membership"
+	// Issue #527 group rename. Under the DM prefix because a group is a
+	// chat.dm_conversations row; served only for PATCH, and only for a group —
+	// a 1:1 conversation matches nothing in the statement behind it.
+	RouteDMConversation       = "/api/chat/dm/{conversationID}"
 	RouteDMCandidates         = "/api/chat/dm-candidates"
 	RouteDMConversations      = "/api/chat/dms"
 	RouteDMGroupConversations = "/api/chat/dms/group"

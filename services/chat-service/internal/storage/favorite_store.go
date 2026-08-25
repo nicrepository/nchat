@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -139,6 +141,13 @@ func (s *PGXFavoriteStore) AddFavorite(ctx context.Context, input AddFavoriteInp
 			SELECT m.id
 			FROM chat.messages m`+messageAccessJoins("$2")+`
 			WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
+			  -- A system message is a record of something that happened, not a
+			  -- message somebody wrote, and every other interaction already
+			  -- refuses it (issue #527). Favouriting is the last one, and it is
+			  -- refused here rather than in the handler for the same reason the
+			  -- others are: the UI hiding an action is not what makes it
+			  -- impossible.
+			  AND m.kind = 'user'
 			  AND `+messageAccessPredicate("$2")+`
 		),
 		ins AS (
@@ -185,6 +194,12 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 		LEFT JOIN auth.users u
 		  ON u.id = m.sender_id
 		WHERE f.user_id = $2
+		  -- The same rule AddFavorite applies, restated on the read side on
+		  -- purpose. AddFavorite is what stops one being created; this is what
+		  -- keeps a row created before that guard existed — or by any other
+		  -- route into the table — from coming back as a favourite. Nothing is
+		  -- deleted: historical rows stay, they simply stop being served.
+		  AND m.kind = 'user'
 		  AND ` + messageAccessPredicate("$2") + `
 		  AND ` + messageNotPendingPredicate("m")
 
@@ -207,31 +222,11 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 
 	var favorites []domain.FavoriteMessage
 	for rows.Next() {
-		var fav domain.FavoriteMessage
-		var editedAt, deletedAt *time.Time
-		msg := &fav.Message
-		if err := rows.Scan(
-			&msg.ID, &msg.WorkspaceID,
-			&msg.ChannelID, &msg.DMConversationID,
-			&msg.SenderID,
-			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
-			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-			&editedAt, &msg.EditCount, &deletedAt,
-			&msg.CreatedAt, &msg.UpdatedAt,
-			(*string)(&msg.LinkSafety),
-			&msg.SenderDisplayName, &msg.SenderEmail,
-			&msg.IsFavorited,
-			&fav.FavoritedAt,
-		); err != nil {
-			return ListFavoritesResult{}, fmt.Errorf("scan favorite row: %w", err)
+		favorite, err := scanFavoriteRow(rows)
+		if err != nil {
+			return ListFavoritesResult{}, err
 		}
-		if editedAt != nil {
-			msg.EditedAt = *editedAt
-		}
-		if deletedAt != nil {
-			msg.DeletedAt = *deletedAt
-		}
-		favorites = append(favorites, fav)
+		favorites = append(favorites, favorite)
 	}
 	if err := rows.Err(); err != nil {
 		return ListFavoritesResult{}, fmt.Errorf("iterate favorite rows: %w", err)
@@ -244,4 +239,43 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 		nextCursor = &MessageCursor{CreatedAt: oldest.FavoritedAt, ID: oldest.Message.ID}
 	}
 	return ListFavoritesResult{Favorites: favorites, NextCursor: nextCursor}, nil
+}
+
+// scanFavoriteRow reads one row of the favourites listing.
+//
+// Its own function because the row carries the full message column contract —
+// the same one every other message query produces, event columns included — and
+// reading fifteen destinations inline is what pushed ListFavorites over the
+// complexity gate the quality review holds this branch to.
+func scanFavoriteRow(rows pgx.Rows) (domain.FavoriteMessage, error) {
+	var fav domain.FavoriteMessage
+	var editedAt, deletedAt *time.Time
+	var eventPayload []byte
+	msg := &fav.Message
+	if err := rows.Scan(
+		&msg.ID, &msg.WorkspaceID,
+		&msg.ChannelID, &msg.DMConversationID,
+		&msg.SenderID,
+		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
+		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
+		&editedAt, &msg.EditCount, &deletedAt,
+		&msg.CreatedAt, &msg.UpdatedAt,
+		(*string)(&msg.LinkSafety),
+		&msg.EventType, &eventPayload,
+		&msg.SenderDisplayName, &msg.SenderEmail,
+		&msg.IsFavorited,
+		&fav.FavoritedAt,
+	); err != nil {
+		return domain.FavoriteMessage{}, fmt.Errorf("scan favorite row: %w", err)
+	}
+	if err := decodeConversationEvent(msg, eventPayload); err != nil {
+		return domain.FavoriteMessage{}, err
+	}
+	if editedAt != nil {
+		msg.EditedAt = *editedAt
+	}
+	if deletedAt != nil {
+		msg.DeletedAt = *deletedAt
+	}
+	return fav, nil
 }

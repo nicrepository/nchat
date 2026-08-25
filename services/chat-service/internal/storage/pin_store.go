@@ -62,6 +62,11 @@ func (s *PGXPinStore) AddPin(ctx context.Context, workspaceID, targetType, targe
 			SELECT m.id
 			FROM chat.messages m`+messageAccessJoins("$4")+`
 			WHERE m.workspace_id = $3 AND m.id = $5 AND m.status = 'active'
+			  -- Pinning highlights something a person said. A system message is
+			  -- an event in the timeline, not content, so it is not pinnable
+			  -- (issue #527). This is the *message* pin; the sidebar's
+			  -- conversation pin is a different thing and is untouched.
+			  AND m.kind = 'user'
 			  AND `+pinMessageTargetPredicate+`
 			  AND `+messageAccessPredicate("$4")+`
 		),
@@ -203,6 +208,7 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 		var pin domain.PinnedMessage
 		var allowed, hasPin bool
 		var editedAt, deletedAt *time.Time
+		var eventPayload []byte
 		var rowTotal int
 		msg := &pin.Message
 		if err := rows.Scan(
@@ -215,12 +221,16 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
 			(*string)(&msg.LinkSafety),
+			&msg.EventType, &eventPayload,
 			&msg.SenderDisplayName, &msg.SenderEmail,
 			&msg.IsFavorited,
 			&pin.PinnedAt, &pin.PinnedByUserID,
 			&rowTotal,
 		); err != nil {
 			return ListPinsResult{}, fmt.Errorf("scan pin row: %w", err)
+		}
+		if err := decodeConversationEvent(msg, eventPayload); err != nil {
+			return ListPinsResult{}, err
 		}
 		if !allowed {
 			return ListPinsResult{}, domain.ErrNotFound

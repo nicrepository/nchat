@@ -9,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/nicrepository/nchat/libs/go/platform/channelmembership"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
 
@@ -59,6 +58,18 @@ type UpdateChannelInput struct {
 	EnsureMemberUserID string
 }
 
+// UpdateChannelResult is what a committed channel update produced.
+//
+// Event is the system message the same transaction wrote, and it is present only
+// when the display name actually changed — an update that touches the slug, the
+// category or the position renames nothing, and a PATCH that sets the name it
+// already had is not a rename either. Its zero value means "no event", which is
+// what lets the caller publish one only when there is one (issue #527).
+type UpdateChannelResult struct {
+	Channel domain.Channel
+	Event   domain.Message
+}
+
 // VisibleChannelAccess carries the membership used to evaluate channel policy.
 //
 // LastMessageAt is the created_at of the channel's newest message, or nil when
@@ -102,8 +113,15 @@ type ChannelStore interface {
 	// Returns domain.ErrForbidden — without saying which condition failed — when
 	// the workspace is not active, or CallerID does not hold an active
 	// owner/admin membership in it at the moment of the UPDATE.
-	UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error)
+	//
+	// A change of display name also writes a conversation_renamed system message
+	// in the same transaction, returned alongside the channel (issue #527).
+	UpdateChannel(ctx context.Context, input UpdateChannelInput) (UpdateChannelResult, error)
 	ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error)
+	// LeaveChannelSelf removes the actor's own membership and records the
+	// departure in the same transaction. Self-leave only, and refused for the
+	// general channel in SQL (issue #527).
+	LeaveChannelSelf(ctx context.Context, workspaceID, channelID, callerID string) (LeaveConversationResult, error)
 }
 
 // PGXChannelStore implements ChannelStore using a pgx connection pool.
@@ -656,13 +674,13 @@ func requireChannelManager(ctx context.Context, q channelQuerier, workspaceID, c
 // Always a transaction, including when no membership has to be seeded: the
 // authorization and the UPDATE are two statements and must not be two
 // transactions.
-func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
+func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannelInput) (UpdateChannelResult, error) {
 	if input.CallerID == "" {
-		return domain.Channel{}, domain.ErrForbidden
+		return UpdateChannelResult{}, domain.ErrForbidden
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Channel{}, fmt.Errorf("begin update channel: %w", err)
+		return UpdateChannelResult{}, fmt.Errorf("begin update channel: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -671,54 +689,92 @@ func (s *PGXChannelStore) UpdateChannel(ctx context.Context, input UpdateChannel
 		}
 	}()
 
-	ch, err := updateChannelAuthorized(ctx, tx, input)
+	result, err := updateChannelAuthorized(ctx, tx, input)
 	if err != nil {
-		return domain.Channel{}, err
+		return UpdateChannelResult{}, err
 	}
 	if input.EnsureMemberUserID != "" {
-		if err := addChannelMember(ctx, tx, ch.ID, input.EnsureMemberUserID, domain.ChannelRoleMember); err != nil {
-			return domain.Channel{}, err
+		if err := addChannelMember(ctx, tx, result.Channel.ID, input.EnsureMemberUserID, domain.ChannelRoleMember); err != nil {
+			return UpdateChannelResult{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Channel{}, fmt.Errorf("commit update channel: %w", err)
+		return UpdateChannelResult{}, fmt.Errorf("commit update channel: %w", err)
 	}
 	committed = true
-	return ch, nil
+	return result, nil
 }
 
-// updateChannelAuthorized runs the three steps in canonical lock order: pin the
-// channel, re-derive and hold the actor's authority, then write.
+// updateChannelAuthorized runs the steps in canonical lock order: pin the
+// channel, re-derive and hold the actor's authority, write, and record the
+// rename when there was one.
 //
 // A channel that does not exist stops at the first step, so an unauthorized
 // caller and a missing channel keep the errors they already had.
-func updateChannelAuthorized(ctx context.Context, tx pgx.Tx, input UpdateChannelInput) (domain.Channel, error) {
-	if err := lockChannelForUpdate(ctx, tx, input.ChannelID); err != nil {
-		return domain.Channel{}, err
+//
+// The system message is written here rather than by the caller, and that is the
+// whole point: it shares this transaction, so a rename that rolls back leaves no
+// event claiming it happened, and an event never exists without the change it
+// describes (issue #527). A failure to insert it fails the rename.
+func updateChannelAuthorized(ctx context.Context, tx pgx.Tx, input UpdateChannelInput) (UpdateChannelResult, error) {
+	previousName, err := lockChannelForUpdate(ctx, tx, input.ChannelID)
+	if err != nil {
+		return UpdateChannelResult{}, err
 	}
 	if err := requireChannelManager(ctx, tx, input.WorkspaceID, input.CallerID); err != nil {
-		return domain.Channel{}, err
+		return UpdateChannelResult{}, err
 	}
-	return updateChannel(ctx, tx, input)
+	channel, err := updateChannel(ctx, tx, input)
+	if err != nil {
+		return UpdateChannelResult{}, err
+	}
+	// Only a real change of name is a rename. An update that moved the channel
+	// between categories, or a PATCH that set the name it already had, has
+	// nothing to announce and must not put a line in the timeline.
+	if channel.DisplayName == previousName {
+		return UpdateChannelResult{Channel: channel}, nil
+	}
+	event, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		WorkspaceID: input.WorkspaceID,
+		ChannelID:   channel.ID,
+		ActorID:     input.CallerID,
+		Event:       domain.ConversationEventRenamed,
+		Payload:     domain.ConversationEventPayload{OldName: previousName, NewName: channel.DisplayName},
+	})
+	if err != nil {
+		return UpdateChannelResult{}, err
+	}
+	return UpdateChannelResult{Channel: channel, Event: event}, nil
 }
 
-// lockChannelForUpdate pins the channel row for the rest of the transaction.
+// lockChannelForUpdate pins the channel row and returns the name it had.
+//
+// The previous name has to be read here, under the lock, and not before the
+// transaction: a value read outside it could already be stale by the time the
+// UPDATE runs, and the event would then describe a rename that never happened.
 //
 // It is channelmembership.LockChannelSQL, the serialization protocol shared with
 // admin-service, and it is first for the reason that file documents. Scoping is
 // still the UPDATE's job: a channel in another workspace is locked here and then
 // matches nothing below, which keeps "wrong workspace" and "does not exist"
 // indistinguishable.
-func lockChannelForUpdate(ctx context.Context, tx pgx.Tx, channelID string) error {
-	var lockedID string
-	err := tx.QueryRow(ctx, channelmembership.LockChannelSQL, channelID).Scan(&lockedID)
+// lockChannelForUpdateSQL is channelmembership.LockChannelSQL widened by one
+// column — the same thing admin-service's channel store does when it needs a
+// fact alongside the lock. The lock, the row and the predicate are identical;
+// only the projection differs, so the shared serialization protocol still holds.
+const lockChannelForUpdateSQL = `
+	SELECT id, display_name FROM chat.channels WHERE id = $1::uuid FOR UPDATE`
+
+func lockChannelForUpdate(ctx context.Context, tx pgx.Tx, channelID string) (string, error) {
+	var lockedID, previousName string
+	err := tx.QueryRow(ctx, lockChannelForUpdateSQL, channelID).Scan(&lockedID, &previousName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ErrNotFound
+			return "", domain.ErrNotFound
 		}
-		return fmt.Errorf("lock channel for update: %w", err)
+		return "", fmt.Errorf("lock channel for update: %w", err)
 	}
-	return nil
+	return previousName, nil
 }
 
 func updateChannel(ctx context.Context, q channelQuerier, input UpdateChannelInput) (domain.Channel, error) {

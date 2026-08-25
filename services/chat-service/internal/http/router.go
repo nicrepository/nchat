@@ -144,6 +144,20 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("DELETE "+RouteDMSidebarPin, authMiddleware(
 		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnpinDM)),
 	))
+	// Mute is a private preference and a write; it reuses the same pin-action
+	// budget so silencing cannot become an unbounded write API either.
+	mux.Handle("POST "+RouteChannelMute, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MuteChannel)),
+	))
+	mux.Handle("DELETE "+RouteChannelMute, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnmuteChannel)),
+	))
+	mux.Handle("POST "+RouteDMMute, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MuteDM)),
+	))
+	mux.Handle("DELETE "+RouteDMMute, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnmuteDM)),
+	))
 	mux.Handle("POST "+RouteChannelRead, authMiddleware(
 		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MarkChannelRead)),
 	))
@@ -219,6 +233,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		// and the write budget is applied in the handler, like the other channel
 		// mutations, so it holds per user rather than per replica.
 		mux.Handle("PATCH "+RouteChannel, authMiddleware(http.HandlerFunc(channels.Rename)))
+		// Self-leave (issue #527). DELETE on the caller's own membership; the
+		// budget is applied inside the handler like the other channel mutations.
+		mux.Handle("DELETE "+RouteChannelMembership, authMiddleware(http.HandlerFunc(channels.Leave)))
 		// Channel details (issue #435) is a read, so it shares the listing budget
 		// rather than the write one: the panel refetches on every channel switch.
 		mux.Handle("GET "+RouteChannelDetails, authMiddleware(
@@ -257,6 +274,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 		// Adding participants to an existing group (issue #398). Same shared
 		// add-members budget as the channel route, applied inside the handler.
 		mux.Handle("POST "+RouteDMMembers, authMiddleware(http.HandlerFunc(directMessages.AddParticipants)))
+		// Group rename and self-leave (issue #527). Both are group-only: the
+		// statements behind them require type = 'group', so a 1:1 conversation
+		// ID reaches nothing. Registration grants neither on its own —
+		// participation is re-derived inside each write transaction.
+		mux.Handle("PATCH "+RouteDMConversation, authMiddleware(http.HandlerFunc(directMessages.RenameGroup)))
+		mux.Handle("DELETE "+RouteDMMembership, authMiddleware(http.HandlerFunc(directMessages.LeaveGroup)))
 		mux.Handle("GET "+RouteDMMemberCandidates, authMiddleware(http.HandlerFunc(directMessages.ParticipantCandidates)))
 		// Group details (issue #441) is a read, so it shares the listing budget
 		// rather than the write one: the panel refetches on every conversation

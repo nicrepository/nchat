@@ -509,7 +509,7 @@ func TestChannelService_UpdateChannel_ManagerCanUpdateMutableFields(t *testing.T
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if got.Slug != "team-updates" || got.CategoryID != "cat-1" || got.Position != 20 {
+	if got.Channel.Slug != "team-updates" || got.Channel.CategoryID != "cat-1" || got.Channel.Position != 20 {
 		t.Fatalf("unexpected update: %+v", got)
 	}
 }
@@ -666,7 +666,7 @@ func TestChannelService_UpdateChannel_PublicToPrivateKeepsCallerAsMember(t *test
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if got.Type != domain.ChannelTypePrivate {
+	if got.Channel.Type != domain.ChannelTypePrivate {
 		t.Fatalf("expected private type, got %+v", got)
 	}
 	if channels.lastUpdateInput.EnsureMemberUserID != "owner-1" {
@@ -694,7 +694,7 @@ func TestChannelService_UpdateChannel_PrivateToPublicAllowedForManager(t *testin
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if got.Type != domain.ChannelTypePublic {
+	if got.Channel.Type != domain.ChannelTypePublic {
 		t.Fatalf("expected public type, got %+v", got)
 	}
 	if channels.lastUpdateInput.EnsureMemberUserID != "" {
