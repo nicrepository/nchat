@@ -171,6 +171,7 @@ export default function LiveKitSpikePage({
       onParticipantConnected: () => undefined,
       onParticipantDisconnected: () => undefined,
       onRemoteVideoAvailabilityChanged: () => undefined,
+      onRemoteAudioAvailabilityChanged: () => undefined,
       onActiveSpeakersChanged: () => undefined,
       onScreenShareChanged: () => undefined,
       onLocalScreenShareChanged: () => undefined,

@@ -24,6 +24,7 @@ interface SessionCallbacks {
   onParticipantConnected(identity: string, displayName: string): void;
   onParticipantDisconnected(identity: string): void;
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  onRemoteAudioAvailabilityChanged(identity: string, available: boolean): void;
   onActiveSpeakersChanged(identities: string[]): void;
   onScreenShareChanged(enabled: boolean): void;
   onLocalScreenShareChanged(element: HTMLMediaElement | null): void;
@@ -1588,6 +1589,49 @@ describe("useCallMedia participants (RF-24)", () => {
 
     act(() => session.callbacks.onElementRemoved(audio));
     expect(view.result.current.participants[0]).toMatchObject({ hasVideo: false, hasAudio: false });
+  });
+
+  it("updates the existing participant when the remote microphone is muted or unmuted", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const audio = remoteAudioFor("identity-a");
+
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(audio);
+      session.callbacks.onRemoteAudioAvailabilityChanged("identity-a", false);
+    });
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      hasAudio: false,
+    });
+
+    act(() => session.callbacks.onRemoteAudioAvailabilityChanged("identity-a", true));
+    expect(view.result.current.participants[0]).toMatchObject({
+      identity: "identity-a",
+      hasAudio: true,
+    });
+  });
+
+  it("removes a disconnected participant's media even when track removal arrives later", async () => {
+    const view = setup();
+    await act(() => view.result.current.connect(videoCall, "participant-token"));
+    const session = view.getSession();
+    const audio = remoteAudioFor("identity-a");
+
+    act(() => {
+      session.callbacks.onParticipantConnected("identity-a", "Pedro Almeida");
+      session.callbacks.onRemoteElement(audio);
+    });
+    render(<div ref={view.result.current.bindRemoteAudio} data-testid="audio-sink" />);
+    expect(screen.getByTestId("audio-sink")).toContainElement(audio);
+
+    act(() => session.callbacks.onParticipantDisconnected("identity-a"));
+
+    expect(screen.getByTestId("audio-sink")).not.toContainElement(audio);
+    expect(view.result.current.participants).toEqual([]);
+    expect(view.result.current.hasRemoteMedia).toBe(false);
   });
 
   it("upserts the participant from a track arriving before ParticipantConnected, then fills in the real name once it arrives (HIGH: late displayName)", async () => {

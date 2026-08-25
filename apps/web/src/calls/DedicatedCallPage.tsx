@@ -382,6 +382,7 @@ export default function DedicatedCallPage() {
       )}
       <DedicatedCallStage
         title={title}
+        resourceCall={resolved.target_type !== "user"}
         status={
           media.status === "connected"
             ? "connected"
@@ -408,6 +409,7 @@ export default function DedicatedCallPage() {
             : undefined
         }
         bindScreenShare={media.remoteScreenShare?.bindMedia}
+        remoteScreenShareParticipantId={media.remoteScreenShare?.identity}
         hasLocalVideo={media.hasLocalVideo}
         localSeed={directory.currentUserId}
         localParticipantId={directory.currentUserId}
