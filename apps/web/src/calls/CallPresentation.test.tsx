@@ -639,7 +639,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         screenShareName="Ana"
@@ -685,7 +685,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         localScreenShareActive
@@ -710,7 +710,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         localScreenShareActive
@@ -730,7 +730,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         localScreenShareActive={false}
@@ -753,7 +753,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         hasLocalVideo
@@ -773,7 +773,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="reconnecting"
         participantCount={1}
-        participants={[{ identity: "remote", displayName: "Ana", hasVideo: true }]}
+        participants={[{ identity: "remote", displayName: "Ana", hasVideo: true, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         hasLocalVideo
@@ -811,7 +811,9 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "user-1", displayName: "Ana Beatriz", hasVideo: false }]}
+        participants={[
+          { identity: "user-1", displayName: "Ana Beatriz", hasVideo: false, hasAudio: true },
+        ]}
         controls={controls}
         onMinimize={noop}
         hasLocalVideo
@@ -835,7 +837,7 @@ describe("global and dedicated presentation", () => {
         title="Produto"
         status="connected"
         participantCount={2}
-        participants={[{ identity: "user-2", displayName: "Zoe", hasVideo: false }]}
+        participants={[{ identity: "user-2", displayName: "Zoe", hasVideo: false, hasAudio: true }]}
         controls={controls}
         onMinimize={noop}
         hasLocalVideo
