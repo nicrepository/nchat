@@ -317,8 +317,9 @@ func TestPGXChannelStoreUpdateChannelPreservesIdentityAndPinPostgreSQL(t *testin
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if updated.ID != renameChannelID || updated.Slug != "infra" || updated.Type != domain.ChannelTypePublic {
-		t.Fatalf("rename changed more than the name: %+v", updated)
+	if updated.Channel.ID != renameChannelID || updated.Channel.Slug != "infra" ||
+		updated.Channel.Type != domain.ChannelTypePublic {
+		t.Fatalf("rename changed more than the name: %+v", updated.Channel)
 	}
 	// The pin is a per-user preference on the same channel_id. A rename must
 	// leave both the row and its instant alone, so the sidebar keeps its order.

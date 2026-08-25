@@ -48,6 +48,38 @@ func TestPGXFavoriteStore_AddFavorite_UnauthorizedReturnsErrNotFound(t *testing.
 	checkExpectations(t, mock)
 }
 
+// The system-message guard, asserted on the statement itself so it cannot be
+// dropped without a test noticing. The behaviour it produces is proven against a
+// real database in TestSystemMessageIsNotInteractivePostgreSQL.
+func TestPGXFavoriteStore_SQLRefusesSystemMessages(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectQuery(`(?s)WITH authorized AS.*m\.kind = 'user'.*INSERT INTO chat\.message_favorites`).
+		WithArgs("ws-1", "user-1", "msg-1").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	if err := storage.NewPGXFavoriteStore(mock).AddFavorite(context.Background(), favoriteInput()); err != nil {
+		t.Fatalf("AddFavorite: %v", err)
+	}
+	checkExpectations(t, mock)
+
+	// The listing restates it, so a favourite created before the guard existed
+	// is not served either.
+	listMock := newMock(t)
+	listMock.ExpectQuery(`FROM chat\.message_favorites f`).
+		WithArgs("ws-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(favoriteCols()))
+	var capturedSQL string
+	pool := &sqlCapturingPool{Pool: listMock, captured: &capturedSQL}
+	if _, err := storage.NewPGXFavoriteStore(pool).ListFavorites(context.Background(), storage.ListFavoritesInput{
+		WorkspaceID: "ws-1", UserID: "user-1",
+	}); err != nil {
+		t.Fatalf("ListFavorites: %v", err)
+	}
+	if !regexp.MustCompile(`m\.kind = 'user'`).MatchString(capturedSQL) {
+		t.Fatalf("favorites listing must exclude system messages:\n%s", capturedSQL)
+	}
+	checkExpectations(t, listMock)
+}
+
 func TestPGXFavoriteStore_AddFavorite_QueryErrorWrapped(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(addFavoriteSQL).WillReturnError(errors.New("db down"))
@@ -219,6 +251,8 @@ func TestPGXFavoriteStore_ListFavorites_WithEditedAt_ScansTimestamps(t *testing.
 		&editedAt, 1, &deletedAt,
 		now, now,
 		"",
+		// No conversation event: this is a user message (issue #527).
+		"", []byte(nil),
 		"Test User", "test@example.com", true,
 		now.Add(-time.Hour),
 	}

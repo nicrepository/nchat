@@ -22,7 +22,11 @@ type channelProvider interface {
 	GetCallParticipantProfiles(ctx context.Context, input service.ChannelCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
 	// UpdateChannel edits one channel's mutable fields (issue #527). The Rename
 	// route forwards only DisplayName; every other field is left "unchanged".
-	UpdateChannel(ctx context.Context, input service.UpdateChannelInput) (domain.Channel, error)
+	// The result carries the system message the same transaction wrote.
+	UpdateChannel(ctx context.Context, input service.UpdateChannelInput) (storage.UpdateChannelResult, error)
+	// LeaveChannel removes the caller's own membership (issue #527). Self-leave
+	// only: there is no target user, here or anywhere below it.
+	LeaveChannel(ctx context.Context, workspaceID, channelID, callerID string) (storage.LeaveConversationResult, error)
 }
 
 // channelUpdateBroadcaster publishes the post-commit "this channel's metadata
@@ -30,7 +34,12 @@ type channelProvider interface {
 // membersBroadcaster: that one is shared with DMHandler, and a group has no
 // channel to update. app.go adapts the hub to both.
 type channelUpdateBroadcaster interface {
-	PublishChannelUpdated(ctx context.Context, workspaceID, channelID string)
+	// PublishConversationUpdated invalidates a renamed conversation for its
+	// subscribers; PublishConversationEvent announces one persisted system
+	// message. Both are route-only — the client reads the change back through
+	// the authorized endpoints (issue #527).
+	PublishConversationUpdated(ctx context.Context, workspaceID, targetType, targetID string)
+	PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string)
 }
 
 // presenceLookup answers "who in this workspace is online right now" for the
@@ -78,6 +87,11 @@ type channelMemberManager interface {
 // app.go adapts the hub to it, exactly as it does for pins.
 type membersBroadcaster interface {
 	PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int)
+	// PublishConversationUpdated invalidates a renamed conversation for its
+	// subscribers, and PublishConversationEvent announces the system message the
+	// same transaction wrote (issue #527).
+	PublishConversationUpdated(ctx context.Context, workspaceID, targetType, targetID string)
+	PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string)
 	// PublishConversationAvailable signals the newly added users directly, since
 	// they are not yet subscribed to the target and so cannot receive the
 	// room-scoped event above.
@@ -836,7 +850,7 @@ func (h *ChannelHandler) Rename(w http.ResponseWriter, r *http.Request) {
 		writeRenameChannelError(w, err)
 		return
 	}
-	updated, err := h.channels.UpdateChannel(r.Context(), service.UpdateChannelInput{
+	result, err := h.channels.UpdateChannel(r.Context(), service.UpdateChannelInput{
 		WorkspaceID: workspaceID,
 		CallerID:    callerID,
 		ChannelID:   channelID,
@@ -846,13 +860,31 @@ func (h *ChannelHandler) Rename(w http.ResponseWriter, r *http.Request) {
 		writeRenameChannelError(w, err)
 		return
 	}
-	if h.channelUpdates != nil {
-		h.channelUpdates.PublishChannelUpdated(r.Context(), workspaceID, updated.ID)
-	}
+	// Both signals fire only here, after the service returned — which means only
+	// after the transaction that wrote the name *and* the system message
+	// committed. A refused or rolled-back rename announces nothing.
+	h.publishRename(r.Context(), workspaceID, result)
 	httputil.WriteJSON(w, http.StatusOK, renameChannelResponse{
-		ID:          updated.ID,
-		DisplayName: updated.DisplayName,
+		ID:          result.Channel.ID,
+		DisplayName: result.Channel.DisplayName,
 	})
+}
+
+// publishRename announces a committed rename to the channel's subscribers.
+//
+// Two signals for two different jobs: the sidebar copy of the name is stale for
+// everyone, and the timeline gained an entry. The event is published only when
+// the transaction actually wrote one — an update that changed no name has none,
+// and inventing an announcement for it would put a line in every reader's
+// timeline for nothing.
+func (h *ChannelHandler) publishRename(ctx context.Context, workspaceID string, result storage.UpdateChannelResult) {
+	if h.channelUpdates == nil {
+		return
+	}
+	h.channelUpdates.PublishConversationUpdated(ctx, workspaceID, "channel", result.Channel.ID)
+	if result.Event.ID != "" {
+		h.channelUpdates.PublishConversationEvent(ctx, workspaceID, "channel", result.Channel.ID, result.Event.ID)
+	}
 }
 
 // beginRename performs everything that must hold before a rename is attempted,
@@ -946,6 +978,72 @@ func writeRenameChannelError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "channel not found")
 	case errors.Is(err, domain.ErrConflict):
 		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// ── Self-leave (issue #527) ──────────────────────────────────────────────────
+
+// leaveChannelRateLimit shares the rename budget's window. Leaving is rarer than
+// renaming and just as permanent from the actor's point of view, so it gets the
+// same tight per-user allowance rather than the general write budget.
+const (
+	leaveChannelRateLimit = 20
+	leaveChannelAction    = "channel_leave"
+)
+
+// Leave handles DELETE /api/chat/channels/{channelID}/membership (issue #527).
+//
+// The body is not read at all — there is none — so there is no field through
+// which a caller could name a user, a workspace or a role. The membership this
+// removes is the session's own, decided in SQL.
+//
+// The realtime signal is published only after the service returns successfully,
+// which means only after the transaction that removed the membership and wrote
+// the departure event committed.
+func (h *ChannelHandler) Leave(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	callerID, ok := h.admitChannelWriter(w, r, leaveChannelAction, leaveChannelRateLimit)
+	if !ok {
+		return
+	}
+	workspaceID, ok := h.resolveDefaultWorkspaceID(w, r)
+	if !ok {
+		return
+	}
+	result, err := h.channels.LeaveChannel(r.Context(), workspaceID, channelID, callerID)
+	if err != nil {
+		writeLeaveConversationError(w, err)
+		return
+	}
+	if h.channelUpdates != nil {
+		h.channelUpdates.PublishConversationEvent(r.Context(), workspaceID, "channel", channelID, result.Event.ID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeLeaveConversationError keeps the structural refusals legible without
+// describing state.
+//
+// The general channel answers 403 and says so, because the caller can plainly
+// see the channel and a "not found" would be a lie they cannot act on. Every
+// other refusal keeps the non-enumerating shape the rest of the channel surface
+// has: an invisible channel, one in another workspace and one that never existed
+// are all 404.
+func writeLeaveConversationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrGeneralChannelImmutable):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "the general channel cannot be left")
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}

@@ -29,18 +29,34 @@ func (s *routeChannelStore) GetChannelByIDInWorkspace(_ context.Context, workspa
 	return channel, nil
 }
 
-func (s *routeChannelStore) UpdateChannel(_ context.Context, input storage.UpdateChannelInput) (domain.Channel, error) {
+// UpdateChannel models the real store closely enough for a route test: the same
+// workspace and #geral predicates, and the same "a rename also writes a system
+// message in this transaction" contract (issue #527). The transaction itself is
+// proved against PostgreSQL in the storage package.
+func (s *routeChannelStore) UpdateChannel(_ context.Context, input storage.UpdateChannelInput) (storage.UpdateChannelResult, error) {
 	channel, ok := s.stored[input.ChannelID]
 	if !ok || channel.WorkspaceID != input.WorkspaceID || channel.IsGeneral {
-		return domain.Channel{}, domain.ErrNotFound
+		return storage.UpdateChannelResult{}, domain.ErrNotFound
 	}
 	s.updates = append(s.updates, input)
+	previousName := channel.DisplayName
 	channel.DisplayName = input.DisplayName
 	channel.Slug = input.Slug
 	channel.Type = input.Type
 	channel.UpdatedAt = time.Now().UTC()
 	s.stored[input.ChannelID] = channel
-	return channel, nil
+	result := storage.UpdateChannelResult{Channel: channel}
+	if previousName != channel.DisplayName {
+		s.events = append(s.events, [3]string{input.CallerID, previousName, channel.DisplayName})
+		result.Event = domain.Message{
+			ID: "event-" + input.ChannelID, Kind: domain.MessageKindSystem, SenderID: input.CallerID,
+			EventType: string(domain.ConversationEventRenamed),
+			EventPayload: domain.ConversationEventPayload{
+				OldName: previousName, NewName: channel.DisplayName,
+			},
+		}
+	}
+	return result, nil
 }
 
 const renameRouteChannelID = "33333333-3333-4333-8333-333333333333"

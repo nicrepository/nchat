@@ -21,6 +21,15 @@ const (
 )
 
 type fakeDMProvider struct {
+	// Group rename and self-leave (issue #527).
+	renameGroupResult storage.RenameGroupResult
+	renameGroupErr    error
+	lastRenameGroup   service.RenameGroupInput
+	renameGroupCalls  int
+	leaveGroupErr     error
+	lastLeaveGroup    service.LeaveGroupInput
+	leaveGroupCalls   int
+
 	candidates       []domain.DMCandidate
 	searchErr        error
 	createOutput     service.CreateDirectConversationOutput
@@ -75,6 +84,24 @@ func (f *fakeDMRateLimiter) AllowActionWithLimit(_ context.Context, userID, acti
 	key := action + ":" + userID
 	f.counts[key]++
 	return f.counts[key] <= maxActions, nil
+}
+
+// RenameGroup and LeaveGroup record what the handler forwarded (issue #527).
+func (f *fakeDMProvider) RenameGroup(_ context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error) {
+	f.renameGroupCalls++
+	f.lastRenameGroup = input
+	return f.renameGroupResult, f.renameGroupErr
+}
+
+func (f *fakeDMProvider) LeaveGroup(_ context.Context, input service.LeaveGroupInput) (storage.LeaveConversationResult, error) {
+	f.leaveGroupCalls++
+	f.lastLeaveGroup = input
+	if f.leaveGroupErr != nil {
+		return storage.LeaveConversationResult{}, f.leaveGroupErr
+	}
+	return storage.LeaveConversationResult{
+		Event: domain.Message{ID: "event-" + input.ConversationID, Kind: domain.MessageKindSystem},
+	}, nil
 }
 
 func (f *fakeDMProvider) SearchDMCandidates(_ context.Context, input service.SearchDMCandidatesInput) ([]domain.DMCandidate, error) {

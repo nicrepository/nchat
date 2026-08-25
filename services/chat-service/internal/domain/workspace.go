@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -389,6 +390,10 @@ type DMConversationWithParticipantIDs struct {
 	LastMessageAt          *time.Time
 	PinnedAt               *time.Time
 	UnreadCount            int
+	// Muted is the viewer's own notification preference for this conversation
+	// (issue #527), viewer-scoped like the counterpart fields above and never a
+	// property of the conversation itself.
+	Muted bool
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.
@@ -523,6 +528,35 @@ func CanCreateChannel(wm *WorkspaceMember) bool { return CanReachPublicChannels(
 func CanRenameChannel(wm *WorkspaceMember, ch Channel) bool {
 	return !ch.IsGeneral && CanManageWorkspace(wm)
 }
+
+// CanMuteConversation reports whether ch may be silenced by a member (#527).
+//
+// Muting is an individual preference and takes no role — anyone who can read a
+// channel may silence it for themselves. The one exception is structural: the
+// workspace's general channel is where everyone is reachable by construction,
+// so it is not silenceable, by anybody, for the same reason it cannot be
+// renamed or left.
+//
+// The identity test is chat.channels.is_general, never the display name: a
+// channel called "Geral" that is not the general channel is an ordinary channel,
+// and the general channel renamed to anything else is still structural.
+func CanMuteChannel(ch Channel) bool { return !ch.IsGeneral }
+
+// CanLeaveChannel reports whether ch may be left by one of its members (#527).
+//
+// Same structural rule as muting, and the same single reason: membership of the
+// general channel is owned by the workspace sync, not by the person. Every other
+// active channel may be left by anyone who is in it — leaving takes no
+// management role, because it removes only the actor's own membership.
+func CanLeaveChannel(ch Channel) bool { return !ch.IsGeneral }
+
+// ErrGeneralChannelImmutable is the single refusal for every structural
+// operation the general channel does not admit: rename, mute and leave.
+//
+// One error so the three paths cannot drift into three different stories, and
+// deliberately not "not found" — the caller can see the channel, and pretending
+// otherwise would be a lie a client cannot act on.
+var ErrGeneralChannelImmutable = errors.New("general channel is immutable")
 
 // MaxAddMembersPerRequest bounds one add-members call (issue #398).
 //

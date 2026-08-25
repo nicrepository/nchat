@@ -32,6 +32,10 @@ type dmProvider interface {
 	// set of call-participant user IDs, scoped to this group conversation
 	// (issue #612).
 	GetGroupCallParticipantProfiles(ctx context.Context, input service.GroupCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
+	// RenameGroup sets a group's title (issue #527). Group conversations only.
+	RenameGroup(ctx context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error)
+	// LeaveGroup removes the caller's own participation (issue #527).
+	LeaveGroup(ctx context.Context, input service.LeaveGroupInput) (storage.LeaveConversationResult, error)
 }
 
 type dmRateLimiter interface {
@@ -771,6 +775,156 @@ func writeDMConversationError(w http.ResponseWriter, err error) {
 		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
 	case errors.Is(err, domain.ErrForbidden), errors.Is(err, domain.ErrNotFound):
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "user not available")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+// ── Group rename and self-leave (issue #527) ─────────────────────────────────
+
+const (
+	// One budget for both group mutations, following the category precedent: a
+	// caller must not get a separate allowance for renaming and another for
+	// leaving, and both change what the whole group sees.
+	groupAdminRateLimit = 20
+	groupAdminAction    = "group_admin"
+)
+
+// renameGroupRequest is the whole accepted body. One field, and the omissions
+// are the contract: no workspace, no actor, no participant list, no type. The
+// strict decoder answers 400 to a client that sends any of them.
+type renameGroupRequest struct {
+	Title string `json:"title"`
+}
+
+// renameGroupResponse echoes the unchanged conversation id alongside the
+// persisted name, so a client can assert what the contract guarantees — a
+// rename keeps the same group.
+type renameGroupResponse struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+// RenameGroup handles PATCH /api/chat/dm/{conversationID} (issue #527).
+//
+// Group conversations only. A 1:1 conversation reaches nothing: the statement
+// behind this requires type = 'group', so a direct conversation's ID is a
+// not-found — renaming a DM is not a refused operation but an absent one, since
+// a direct conversation has no title to change.
+//
+// Authorization is participation, re-derived inside the write transaction. The
+// realtime signals fire only after that transaction commits.
+func (h *DMHandler) RenameGroup(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, true)
+	if !ok {
+		return
+	}
+	var request renameGroupRequest
+	if !decodeStrictJSON(w, r, &request) {
+		return
+	}
+	result, err := h.dms.RenameGroup(r.Context(), service.RenameGroupInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		Title:          request.Title,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupChange(r.Context(), workspaceID, conversationID, result.Event.ID, true)
+	httputil.WriteJSON(w, http.StatusOK, renameGroupResponse{
+		ID:    result.Conversation.ID,
+		Title: result.Conversation.Title,
+	})
+}
+
+// LeaveGroup handles DELETE /api/chat/dm/{conversationID}/membership (#527).
+//
+// The caller's own participation and nothing else: there is no target user in
+// the path, in a body (there is none) or in the statement below, which updates
+// the row matching the session's actor.
+func (h *DMHandler) LeaveGroup(w http.ResponseWriter, r *http.Request) {
+	conversationID, callerID, workspaceID, ok := h.beginGroupAdmin(w, r, false)
+	if !ok {
+		return
+	}
+	result, err := h.dms.LeaveGroup(r.Context(), service.LeaveGroupInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	h.publishGroupChange(r.Context(), workspaceID, conversationID, result.Event.ID, false)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// beginGroupAdmin performs what both group mutations share, in the order that
+// matters: wiring, a well-formed target, an authenticated actor, the shared
+// budget, the content type when there is a body, and the workspace last —
+// resolved from the session and never from the request.
+func (h *DMHandler) beginGroupAdmin(w http.ResponseWriter, r *http.Request, hasBody bool) (string, string, string, bool) {
+	if !h.checkDeps(w) {
+		return "", "", "", false
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return "", "", "", false
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return "", "", "", false
+	}
+	if !h.allowAction(w, r, callerID, groupAdminAction, groupAdminRateLimit) {
+		return "", "", "", false
+	}
+	if hasBody && !requireJSONContentType(w, r) {
+		return "", "", "", false
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return "", "", "", false
+	}
+	return conversationID, callerID, workspaceID, true
+}
+
+// publishGroupChange announces a committed group mutation.
+//
+// A rename also invalidates every subscriber's sidebar copy of the name, so it
+// publishes the conversation-updated signal as well as the system message; a
+// departure only produces the message, because the person who left is no longer
+// a subscriber and everyone else's list is unchanged.
+func (h *DMHandler) publishGroupChange(ctx context.Context, workspaceID, conversationID, messageID string, renamed bool) {
+	if h.broadcast == nil {
+		return
+	}
+	if renamed {
+		h.broadcast.PublishConversationUpdated(ctx, workspaceID, "dm", conversationID)
+	}
+	h.broadcast.PublishConversationEvent(ctx, workspaceID, "dm", conversationID, messageID)
+}
+
+// writeGroupAdminError keeps the refusals legible without describing state.
+//
+// A conversation that is not an active group of this workspace — including every
+// 1:1 conversation — is 404, so the route cannot be used to learn which IDs
+// exist or which are groups. A caller who does not participate is 403, which
+// discloses nothing they could not already infer from having the ID.
+func writeGroupAdminError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidInput):
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid request")
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
+	case errors.Is(err, domain.ErrConflict):
+		httputil.WriteError(w, http.StatusConflict, httputil.ErrCodeConflict, "conflict")
 	default:
 		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
 	}
