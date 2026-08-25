@@ -1,15 +1,32 @@
-import { useCallback, useEffect } from "react";
-import { Outlet } from "react-router";
+import { useCallback, useEffect, useState } from "react";
+import { Outlet, useLocation } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
 import type { ParticipantMedia } from "./useCallMedia";
 import "./ChatShell.css";
 import ChatSidebar from "./ChatSidebar";
+import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
 import type { ResourceCallKind } from "./callApi";
 import type { Call, CallType } from "./callState";
 import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
-import { useChatSidebar } from "./useChatSidebar";
+import { useChatSidebar, type SidebarState } from "./useChatSidebar";
+
+/**
+ * The sidebar's data, or empty stand-ins while it is still loading.
+ *
+ * Stated once because five call sites below need the same "ready or nothing"
+ * answer, and repeating the discriminant at each of them is how one of them
+ * eventually forgets and reads a field off a loading state.
+ */
+function readySidebar(state: SidebarState): {
+  currentUserId: string;
+  channels: Channel[];
+  dms: DMConversation[];
+} {
+  if (state.status !== "ready") return { currentUserId: "", channels: [], dms: [] };
+  return { currentUserId: state.currentUserId, channels: state.channels, dms: state.dms };
+}
 
 /**
  * Everything ActiveResourceCallBar (issue #642) needs to represent the
@@ -70,8 +87,76 @@ export interface ChatOutletContext {
   resourceCallSession?: ActiveResourceCallSession;
 }
 
+/**
+ * Resolves a row menu's target to the details panel's own vocabulary.
+ *
+ * The sidebar speaks the API's two kinds (channel / dm); the panel speaks three,
+ * because a group and a 1:1 render differently. The discriminant is `dm.type`,
+ * the server's own value, and never the name or the participant count.
+ *
+ * Returns null for a conversation the sidebar does not hold — a refetch may have
+ * removed it between the click and this call — so nothing opens over nothing.
+ */
+function resolveDetailsTarget(
+  kind: "channel" | "dm",
+  targetId: string,
+  dms: DMConversation[],
+): SidebarDetailsTarget | null {
+  if (kind === "channel") return { kind: "channel", id: targetId };
+  const dm = dms.find((item) => item.id === targetId);
+  if (!dm) return null;
+  return { kind: dm.type === "group" ? "group" : "direct", id: targetId };
+}
+
+/**
+ * Whether the conversation a details panel is open for is still one this user
+ * has (issue #527, code review).
+ *
+ * Derived from the canonical sidebar collection rather than from the route: a
+ * self-leave removes the row without changing the pathname, and a panel is only
+ * valid while its subject is.
+ */
+function detailsTargetExists(
+  target: SidebarDetailsTarget,
+  ready: { channels: Channel[]; dms: DMConversation[] },
+): boolean {
+  const collection = target.kind === "channel" ? ready.channels : ready.dms;
+  return collection.some((item) => item.id === target.id);
+}
+
 export default function ChatShell() {
-  const { state, retry, setPinned, markRead, renameChannel } = useChatSidebar();
+  const {
+    state,
+    retry,
+    setPinned,
+    markRead,
+    renameChannel,
+    renameGroup,
+    setMuted,
+    leaveConversation,
+  } = useChatSidebar();
+  // Details opened from a row menu, for that row's target (issue #527). Held
+  // here rather than in ChatMessageArea because the target may be a
+  // conversation other than the open one, and opening it must not navigate.
+  const { pathname } = useLocation();
+  // The route is part of the panel's identity, not something an effect syncs to
+  // it: navigating away closes the panel because the value stored alongside it
+  // stops matching, with no extra render pass. The panel is a peek at one
+  // conversation, not a second persistent surface to keep in step with a route.
+  const [sidebarDetails, setSidebarDetails] = useState<
+    (SidebarDetailsTarget & { pathname: string }) | null
+  >(null);
+  const ready = readySidebar(state);
+  // Two conditions, and both are about the target still being real. The route is
+  // part of the panel's identity, so navigating away closes it with no extra
+  // render pass; and the conversation must still be in the canonical list, so
+  // leaving the conversation the panel is showing closes it too — the row is
+  // gone, and a panel over a conversation this user can no longer see would keep
+  // polling for details it may not have.
+  const openDetailsTarget =
+    sidebarDetails?.pathname === pathname && detailsTargetExists(sidebarDetails, ready)
+      ? sidebarDetails
+      : null;
   const {
     calls,
     resource: resourceCall,
@@ -108,7 +193,18 @@ export default function ChatShell() {
       activeResourceTarget?.kind === kind && activeResourceTarget.id === id,
     [activeResourceTarget],
   );
-  const currentUserId = state.status === "ready" ? state.currentUserId : "";
+  const openSidebarDetails = useCallback(
+    (kind: "channel" | "dm", targetId: string) => {
+      const resolved = resolveDetailsTarget(
+        kind,
+        targetId,
+        state.status === "ready" ? state.dms : [],
+      );
+      if (resolved) setSidebarDetails({ ...resolved, pathname });
+    },
+    [state, pathname],
+  );
+
   // #642 (review fix): gated on resourcePresentationCall alone — the single
   // authority CallSessionProvider also uses to suppress its own
   // FloatingCallWindow — never a looser, independently-recomputed check.
@@ -123,7 +219,7 @@ export default function ChatShell() {
         callId: resourcePresentationCall.call_id,
         startedAt: resourcePresentationCall.created_at,
         participants: media.participants,
-        localId: currentUserId,
+        localId: ready.currentUserId,
         localName: localIdentity.name,
         localInitials: localIdentity.initials,
         localAvatarUrl: localIdentity.avatarUrl,
@@ -144,10 +240,11 @@ export default function ChatShell() {
         },
       }
     : undefined;
+
   const outletContext: ChatOutletContext = {
-    currentUserId,
-    channels: state.status === "ready" ? state.channels : [],
-    dms: state.status === "ready" ? state.dms : [],
+    currentUserId: ready.currentUserId,
+    channels: ready.channels,
+    dms: ready.dms,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,
@@ -173,10 +270,19 @@ export default function ChatShell() {
         setPinned={setPinned}
         markRead={markRead}
         renameChannel={renameChannel}
+        renameGroup={renameGroup}
+        setMuted={setMuted}
+        leaveConversation={leaveConversation}
+        onOpenDetails={openSidebarDetails}
       />
       <main className="chat-app__main" aria-label="Área de mensagens">
         <Outlet context={outletContext} />
       </main>
+      <SidebarDetailsPanel
+        target={openDetailsTarget}
+        currentUserId={ready.currentUserId}
+        onClose={() => setSidebarDetails(null)}
+      />
     </div>
   );
 }

@@ -157,7 +157,8 @@ func TestMessageService_ForwardChannelMessage_PublishesOnlyAfterPersistence(t *t
 func TestMessageService_EditMessage_BroadcastsUpdatedAfterPersist(t *testing.T) {
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
-			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1, Status: domain.MessageStatusActive,
+			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
 		}},
 		editedMessage: domain.Message{
 			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
@@ -456,7 +457,7 @@ func TestMessageService_GetChannelMessage_ReturnsMessage(t *testing.T) {
 	msgs := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{
 			"ws-1:msg-1": {ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1",
-				SenderID: user1, Status: domain.MessageStatusActive},
+				SenderID: user1, Kind: domain.MessageKindUser, Status: domain.MessageStatusActive},
 		},
 	}
 

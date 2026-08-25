@@ -171,6 +171,16 @@ func (f *sidebarFakePinStore) ListVisible(_ context.Context, _, _ string) ([]sto
 	return f.pins, f.listErr
 }
 
+// Group rename and self-leave are not exercised here; these exist so the fake
+// still satisfies storage.DMStore (issue #527).
+func (f *sidebarFakeDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
+	return storage.RenameGroupResult{}, nil
+}
+
+func (f *sidebarFakeDMStore) LeaveGroupConversation(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
+	return storage.LeaveConversationResult{}, nil
+}
+
 func (f *sidebarFakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
 	return storage.CreateDirectConversationResult{}, nil
 }

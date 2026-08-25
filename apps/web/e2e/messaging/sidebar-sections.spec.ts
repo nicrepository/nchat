@@ -351,14 +351,124 @@ test.describe("sidebar — conversas fixadas", () => {
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
   });
 
-  test("não oferece Sair em uma conversa direta nem em um grupo", async ({ page }, testInfo) => {
+  // A 1:1 conversation has no membership to leave and no title of its own, so
+  // neither action exists for it. A group has both (issue #527).
+  test("nunca oferece Sair nem Renomear em uma conversa direta", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    await rowMenu(page, `conversa com ${OTHER_USER_NAME}`).click();
+    await expect(page.getByRole("menu")).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: /sair/i })).toHaveCount(0);
+    await expect(page.getByRole("menuitem", { name: /renomear/i })).toHaveCount(0);
+    // What a DM does get.
+    await expect(page.getByRole("menuitem", { name: "Silenciar notificações" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Detalhes da conversa" })).toBeVisible();
+  });
+
+  test("oferece sair e renomear em um grupo", async ({ page }, testInfo) => {
+    await openChatWithAllThreeCategories(page, testInfo);
+
+    await rowMenu(page, `grupo ${GROUP_DM_NAME}`).click();
+    await expect(page.getByRole("menuitem", { name: "Renomear grupo" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Sair do grupo" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Detalhes do grupo" })).toBeVisible();
+  });
+
+  /**
+   * The sidebar's nav is a scrollport (`overflow-y: auto`), so a popup rendered
+   * inside it was clipped at its bottom edge: on the last row the menu was cut
+   * in half or invisible. The assertion is geometric but not pixel-perfect —
+   * every item must have a real box inside the viewport, and the last one must
+   * actually be clickable, which is what a clipped menu fails.
+   */
+  test("mostra o menu inteiro na última linha de uma sidebar rolável", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    for (let index = 0; index < 24; index += 1) {
+      scenario.sidebarChannels.push({
+        id: `e2e-channel-scroll-${index}`,
+        slug: `rolagem-${index}`,
+        display_name: `Canal Rolagem ${index}`,
+        type: "public",
+        can_write: true,
+        unread_count: 0,
+        last_message_at: "2026-08-13T10:00:00Z",
+      });
+    }
+    // Short enough that the list cannot fit, which is the whole premise.
+    await page.setViewportSize({ width: 1280, height: 600 });
+    await page.reload();
+
+    const nav = page.locator(".chat-sidebar__nav");
+    await expect(nav).toBeVisible();
+    const scrollToBottom = () =>
+      nav.evaluate((element) => {
+        element.scrollTop = element.scrollHeight;
+        return element.scrollTop;
+      });
+    // Without a real scroll there is nothing to clip and the test proves nothing.
+    expect(await scrollToBottom()).toBeGreaterThan(0);
+
+    // The last rows, not just the last one: the row flush with the scrollport's
+    // bottom edge and the rows just above it fail differently, and it was one of
+    // the latter — far enough from the window's bottom to open downwards, too
+    // close to the scrollport's to fit inside it — that used to be cut off.
+    const triggers = nav.locator(".chat-sidebar__actions-trigger");
+    const total = await triggers.count();
+    expect(total).toBeGreaterThan(4);
+
+    const viewport = page.viewportSize()!;
+    for (let index = total - 4; index < total; index += 1) {
+      await scrollToBottom();
+      await triggers.nth(index).click();
+      const menu = page.getByRole("menu");
+      await expect(menu).toBeVisible();
+
+      // Geometry plus a hit test on every item. The hit test is the part that
+      // catches clipping: an ancestor's `overflow` does not change an element's
+      // layout box, so a clipped item still reports a bounding box — but the
+      // point at its centre belongs to whatever is painted there instead.
+      const items = await menu.evaluate((node) =>
+        Array.from(node.querySelectorAll('[role="menuitem"]')).map((item) => {
+          const box = item.getBoundingClientRect();
+          const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+          return {
+            width: box.width,
+            height: box.height,
+            top: box.top,
+            bottom: box.bottom,
+            left: box.left,
+            right: box.right,
+            reachable: node.contains(hit),
+          };
+        }),
+      );
+      expect(items.length).toBeGreaterThan(0);
+      for (const item of items) {
+        expect(item.width).toBeGreaterThan(0);
+        expect(item.height).toBeGreaterThan(0);
+        expect(item.top).toBeGreaterThanOrEqual(0);
+        expect(item.bottom).toBeLessThanOrEqual(viewport.height);
+        expect(item.left).toBeGreaterThanOrEqual(0);
+        expect(item.right).toBeLessThanOrEqual(viewport.width);
+        expect(item.reachable).toBe(true);
+      }
+
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("menu")).toHaveCount(0);
+    }
+  });
+
+  // Archiving and hiding are deliberately out of scope for this branch, so they
+  // must not appear anywhere — not even disabled.
+  test("nunca oferece arquivar ou ocultar", async ({ page }, testInfo) => {
     await openChatWithAllThreeCategories(page, testInfo);
 
     for (const name of [`conversa com ${OTHER_USER_NAME}`, `grupo ${GROUP_DM_NAME}`]) {
       await rowMenu(page, name).click();
       await expect(page.getByRole("menu")).toBeVisible();
-      await expect(page.getByRole("menuitem", { name: /sair/i })).toHaveCount(0);
-      await expect(page.getByRole("menuitem", { name: /arquivar|silenciar/i })).toHaveCount(0);
+      await expect(page.getByRole("menuitem", { name: /arquivar|ocultar/i })).toHaveCount(0);
       await page.keyboard.press("Escape");
     }
   });
@@ -500,5 +610,192 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     expect(sidebar).not.toBeNull();
     expect(box).not.toBeNull();
     expect(box!.x + box!.width).toBeLessThanOrEqual(sidebar!.x + sidebar!.width + 1);
+  });
+});
+
+/**
+ * ISSUE #527 — the actions the row menu gained: silencing, renaming a group and
+ * leaving. Each drives the real endpoints through the mocked contract, so the
+ * state a scenario builds survives a reload the way it would in production.
+ */
+test.describe("sidebar — silenciar notificações", () => {
+  test("silencia e reativa um canal, mantendo o estado", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Silenciar notificações" }).click();
+
+    await expect
+      .poll(() => scenario.requests.mutes)
+      .toEqual([{ targetType: "channel", targetId: channel.id, muted: true }]);
+    // The menu closed, and reopening reflects the persisted preference.
+    await expect(page.getByRole("menu")).toHaveCount(0);
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await expect(page.getByRole("menuitem", { name: "Ativar notificações" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Silenciar notificações" })).toHaveCount(0);
+
+    await page.getByRole("menuitem", { name: "Ativar notificações" }).click();
+    await expect.poll(() => scenario.requests.mutes).toHaveLength(2);
+
+    // It survives a reload, because the preference is the server's and not the
+    // client's.
+    await page.reload();
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await expect(page.getByRole("menuitem", { name: "Silenciar notificações" })).toBeVisible();
+  });
+
+  test("silencia uma conversa direta", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+
+    await rowMenu(page, `conversa com ${OTHER_USER_NAME}`).click();
+    await page.getByRole("menuitem", { name: "Silenciar notificações" }).click();
+
+    await expect.poll(() => scenario.requests.mutes.map((m) => m.targetType)).toEqual(["dm"]);
+  });
+
+  test("não oferece silenciar no canal Geral", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+    channel.is_general = true;
+    await page.reload();
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await expect(page.getByRole("menu")).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: /notificações/i })).toHaveCount(0);
+    await expect(page.getByRole("menuitem", { name: /renomear/i })).toHaveCount(0);
+    await expect(page.getByRole("menuitem", { name: /sair/i })).toHaveCount(0);
+    // What the general channel does keep.
+    await expect(page.getByRole("menuitem", { name: "Fixar no topo" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Detalhes do canal" })).toBeVisible();
+  });
+});
+
+test.describe("sidebar — renomear grupo", () => {
+  test("renomeia pelo menu e o novo nome persiste", async ({ page }, testInfo) => {
+    const { scenario, targetId } = await openChatWithAllThreeCategories(page, testInfo);
+    const group = scenario.sidebarDMs.find((dm) => dm.type === "group");
+    if (!group) throw new Error("fixture must carry a group");
+
+    await rowMenu(page, `grupo ${group.name}`).click();
+    await page.getByRole("menuitem", { name: "Renomear grupo" }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByLabel("Nome do grupo")).toHaveValue(group.name);
+    await dialog.getByLabel("Nome do grupo").fill("Piloto MVP");
+    await dialog.getByRole("button", { name: "Salvar" }).click();
+
+    await expect
+      .poll(() => scenario.requests.groupRenames)
+      .toEqual([{ conversationId: group.id, title: "Piloto MVP" }]);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(section(page, "Grupos").getByRole("option")).toHaveText([/Piloto MVP/]);
+    // The rename did not open the renamed group.
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+
+    await page.reload();
+    await expect(section(page, "Grupos").getByRole("option")).toHaveText([/Piloto MVP/]);
+  });
+
+  test("mostra o evento de renomeação na timeline do grupo", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const group = scenario.sidebarDMs.find((dm) => dm.type === "group");
+    if (!group) throw new Error("fixture must carry a group");
+    const previousName = group.name;
+
+    await rowMenu(page, `grupo ${previousName}`).click();
+    await page.getByRole("menuitem", { name: "Renomear grupo" }).click();
+    await page.getByRole("dialog").getByLabel("Nome do grupo").fill("Piloto MVP");
+    await page.getByRole("dialog").getByRole("button", { name: "Salvar" }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+
+    // Open the group and read the event the server persisted. It is a discrete
+    // timeline line, never a message bubble.
+    await section(page, "Grupos").getByRole("option").first().click();
+    const event = page.getByTestId("chat-system-message");
+    await expect(event).toContainText(
+      `${CURRENT_USER_NAME} renomeou o grupo de ${previousName} para Piloto MVP`,
+    );
+    await expect(event.locator("button")).toHaveCount(0);
+  });
+});
+
+test.describe("sidebar — sair da conversa", () => {
+  test("sai de um grupo após confirmação e a linha desaparece", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const group = scenario.sidebarDMs.find((dm) => dm.type === "group");
+    if (!group) throw new Error("fixture must carry a group");
+
+    await rowMenu(page, `grupo ${group.name}`).click();
+    await page.getByRole("menuitem", { name: "Sair do grupo" }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText(`Sair de ${group.name}?`);
+    // The safe action holds focus, so a stray Enter cannot make someone leave.
+    await expect(dialog.getByRole("button", { name: "Cancelar" })).toBeFocused();
+
+    await dialog.getByRole("button", { name: "Sair do grupo" }).click();
+
+    await expect
+      .poll(() => scenario.requests.leaves)
+      .toEqual([{ targetType: "dm", targetId: group.id }]);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(section(page, "Grupos").getByRole("option")).toHaveCount(0);
+  });
+
+  test("cancela a saída sem chamar o servidor", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const group = scenario.sidebarDMs.find((dm) => dm.type === "group");
+    if (!group) throw new Error("fixture must carry a group");
+
+    await rowMenu(page, `grupo ${group.name}`).click();
+    await page.getByRole("menuitem", { name: "Sair do grupo" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Cancelar" }).click();
+
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    expect(scenario.requests.leaves).toEqual([]);
+    await expect(section(page, "Grupos").getByRole("option")).toHaveCount(1);
+  });
+
+  /**
+   * Leaving the conversation on screen (issue #527, code review). The row going
+   * away is not enough: the route still names a channel this user is no longer
+   * in, and the message area would keep asking for it. The reader is put back on
+   * the neutral route instead.
+   */
+  test("volta para a rota neutra ao sair do canal aberto", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+
+    await optionsIn(page, "Canais").filter({ hasText: channel.display_name }).click();
+    await expect(page).toHaveURL(new RegExp(`/chat/channel/${channel.id}$`));
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Sair do canal" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Sair do canal" }).click();
+
+    await expect
+      .poll(() => scenario.requests.leaves)
+      .toEqual([{ targetType: "channel", targetId: channel.id }]);
+    await expect(page).toHaveURL(/\/chat$/);
+    await expect(
+      section(page, "Canais").getByRole("option").filter({ hasText: channel.display_name }),
+    ).toHaveCount(0);
+  });
+
+  test("sai de um canal normal e a linha desaparece", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+
+    await rowMenu(page, `canal ${channel.display_name}`).click();
+    await page.getByRole("menuitem", { name: "Sair do canal" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Sair do canal" }).click();
+
+    await expect
+      .poll(() => scenario.requests.leaves)
+      .toEqual([{ targetType: "channel", targetId: channel.id }]);
+    await expect(
+      section(page, "Canais").getByRole("option").filter({ hasText: channel.display_name }),
+    ).toHaveCount(0);
   });
 });

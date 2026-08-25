@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// channel.updated (issue #527).
+// conversation.updated (issue #527).
 //
 // A rename is target-scoped: it goes to the people already subscribed to the
 // channel, telling them their view of it is stale. Its remote path is therefore
@@ -19,9 +19,9 @@ import (
 // travels over the bus, so nothing has to be stripped to keep it out of an
 // unauthorized reader's socket.
 
-func channelUpdatedEvent() Event {
+func conversationUpdatedEvent() Event {
 	return Event{
-		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeChannelUpdated,
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeConversationUpdated,
 		WorkspaceID: maWorkspace, TargetType: TargetTypeChannel, TargetID: maChannel,
 		EventID:          "1d8c4b52-7e3a-4f96-b105-8c2d7e4a3b91",
 		SourceInstanceID: "instance-B",
@@ -29,24 +29,24 @@ func channelUpdatedEvent() Event {
 	}
 }
 
-func TestCanonicalizeRemoteChannelUpdatedIsAccepted(t *testing.T) {
-	evt := channelUpdatedEvent()
+func TestCanonicalizeRemoteConversationUpdatedIsAccepted(t *testing.T) {
+	evt := conversationUpdatedEvent()
 	evt.WorkspaceID = strings.ToUpper(maWorkspace)
 	evt.TargetID = strings.ToUpper(maChannel)
 
 	canonical, ok := canonicalizeRemoteEvent(evt)
 	if !ok {
-		t.Fatal("a valid channel.updated must canonicalize; without this a rename never crosses instances")
+		t.Fatal("a valid conversation.updated must canonicalize; without this a rename never crosses instances")
 	}
 	if canonical.WorkspaceID != maWorkspace || canonical.TargetID != maChannel {
 		t.Fatalf("scope = %s/%s, want the canonicalized envelope", canonical.WorkspaceID, canonical.TargetID)
 	}
 	if canonical.RecipientUserID != "" {
-		t.Fatalf("RecipientUserID = %q; channel.updated must stay target-scoped", canonical.RecipientUserID)
+		t.Fatalf("RecipientUserID = %q; conversation.updated must stay target-scoped", canonical.RecipientUserID)
 	}
 }
 
-func TestCanonicalizeRemoteChannelUpdatedRejectsMalformedEnvelopes(t *testing.T) {
+func TestCanonicalizeRemoteConversationUpdatedRejectsMalformedEnvelopes(t *testing.T) {
 	for name, mutate := range map[string]func(*Event){
 		"workspace not a uuid": func(e *Event) { e.WorkspaceID = "nope" },
 		"no workspace":         func(e *Event) { e.WorkspaceID = "" },
@@ -58,10 +58,10 @@ func TestCanonicalizeRemoteChannelUpdatedRejectsMalformedEnvelopes(t *testing.T)
 		"unknown schema":       func(e *Event) { e.SchemaVersion = 99 },
 	} {
 		t.Run(name, func(t *testing.T) {
-			evt := channelUpdatedEvent()
+			evt := conversationUpdatedEvent()
 			mutate(&evt)
 			if canonical, ok := canonicalizeRemoteEvent(evt); ok {
-				t.Fatalf("a malformed channel.updated was accepted: %+v", canonical)
+				t.Fatalf("a malformed conversation.updated was accepted: %+v", canonical)
 			}
 		})
 	}
@@ -70,8 +70,8 @@ func TestCanonicalizeRemoteChannelUpdatedRejectsMalformedEnvelopes(t *testing.T)
 // A remote producer cannot smuggle a name, a body or an actor along with the
 // invalidation signal: the new name reaches a client only through the sidebar
 // endpoint, which authorizes for itself.
-func TestRemoteChannelUpdatedCarriesNothingButTheRoute(t *testing.T) {
-	evt := channelUpdatedEvent()
+func TestRemoteConversationUpdatedCarriesNothingButTheRoute(t *testing.T) {
+	evt := conversationUpdatedEvent()
 	evt.Payload = &MessagePayload{ID: maChannel, BodyText: "sensitive message body", SenderID: maOutsider}
 	evt.MessageUpdate = &MessageUpdatedPayload{MessageID: maChannel, Body: "sensitive edit"}
 	evt.Presence = &PresencePayload{UserID: maOutsider, State: "online"}
@@ -84,7 +84,7 @@ func TestRemoteChannelUpdatedCarriesNothingButTheRoute(t *testing.T) {
 		t.Fatal("expected the event to canonicalize")
 	}
 	if canonical.Members != nil || canonical.Pin != nil || canonical.Payload != nil {
-		t.Fatalf("a foreign payload rode along on channel.updated: %+v", canonical)
+		t.Fatalf("a foreign payload rode along on conversation.updated: %+v", canonical)
 	}
 	data, err := json.Marshal(canonical)
 	if err != nil {
@@ -92,21 +92,21 @@ func TestRemoteChannelUpdatedCarriesNothingButTheRoute(t *testing.T) {
 	}
 	for _, leak := range []string{"sensitive", maOutsider, "body_text", "display_name", "email", "presence"} {
 		if strings.Contains(string(data), leak) {
-			t.Fatalf("channel.updated carried %q: %s", leak, data)
+			t.Fatalf("conversation.updated carried %q: %s", leak, data)
 		}
 	}
 }
 
 // The headline case: pod A persists the rename, the reader's socket is on pod B,
 // and B delivers so that reader's sidebar refetches without a reload.
-func TestChannelUpdatedCrossesInstances(t *testing.T) {
+func TestConversationUpdatedCrossesInstances(t *testing.T) {
 	auth := &recordingAuthorizer{allowed: true}
 	_, hubB, bus := twoHubsWithAuthorizer(t, auth)
 	startHubLoop(t, hubB)
 	subscriber := registerForTest(hubB, "c-remote", maMember, maWorkspace)
 	subscribeForTest(hubB, subscriber, TargetTypeChannel, maChannel)
 
-	bus.inject(channelUpdatedEvent())
+	bus.inject(conversationUpdatedEvent())
 	if queued := deliverRemoteBroadcast(t, hubB); queued != 1 {
 		t.Fatalf("%d remote broadcast(s) queued, want 1", queued)
 	}
@@ -119,22 +119,22 @@ func TestChannelUpdatedCrossesInstances(t *testing.T) {
 	if err := json.Unmarshal(messages[0], &evt); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if evt.Type != EventTypeChannelUpdated || evt.TargetID != maChannel {
+	if evt.Type != EventTypeConversationUpdated || evt.TargetID != maChannel {
 		t.Fatalf("wrong event delivered: %+v", evt)
 	}
 }
 
 // The same event twice is indistinguishable from once for anything downstream:
 // it carries no state, so a duplicate can only cost one extra refetch.
-func TestChannelUpdatedIsIdempotentOnRepeat(t *testing.T) {
+func TestConversationUpdatedIsIdempotentOnRepeat(t *testing.T) {
 	auth := &recordingAuthorizer{allowed: true}
 	_, hubB, bus := twoHubsWithAuthorizer(t, auth)
 	startHubLoop(t, hubB)
 	subscriber := registerForTest(hubB, "c-remote", maMember, maWorkspace)
 	subscribeForTest(hubB, subscriber, TargetTypeChannel, maChannel)
 
-	first := channelUpdatedEvent()
-	second := channelUpdatedEvent()
+	first := conversationUpdatedEvent()
+	second := conversationUpdatedEvent()
 	second.EventID = "2e9d5c63-8f4b-4a07-c216-9d3e8f5b4c02"
 	bus.inject(first)
 	bus.inject(second)
@@ -157,14 +157,14 @@ func TestChannelUpdatedIsIdempotentOnRepeat(t *testing.T) {
 
 // A subscription is not a standing permission: a reader who lost access to the
 // channel is not told it was renamed.
-func TestRemoteChannelUpdatedIsNotDeliveredToAnUnauthorizedSubscriber(t *testing.T) {
+func TestRemoteConversationUpdatedIsNotDeliveredToAnUnauthorizedSubscriber(t *testing.T) {
 	auth := &recordingAuthorizer{allowed: false}
 	_, hubB, bus := twoHubsWithAuthorizer(t, auth)
 	startHubLoop(t, hubB)
 	subscriber := registerForTest(hubB, "c-remote", maMember, maWorkspace)
 	subscribeForTest(hubB, subscriber, TargetTypeChannel, maChannel)
 
-	bus.inject(channelUpdatedEvent())
+	bus.inject(conversationUpdatedEvent())
 	deliverRemoteBroadcast(t, hubB)
 
 	if got := len(drain(subscriber)); got != 0 {

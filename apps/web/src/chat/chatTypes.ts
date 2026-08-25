@@ -42,6 +42,18 @@ export interface Channel extends ConversationActivity {
    * as "no".
    */
   canRename?: boolean;
+  /**
+   * Whether this channel is the workspace's structural general channel
+   * (issue #527). It is the server's `is_general`, never a comparison against
+   * the visible name: a channel called "Geral" that is not the general one is
+   * ordinary, and the general one renamed to anything else is still structural.
+   *
+   * The row menu reads it to omit rename, mute and leave. The backend refuses
+   * all three for it regardless, in SQL.
+   */
+  isGeneral?: boolean;
+  /** This viewer's own notification preference (issue #527). */
+  muted?: boolean;
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;
@@ -113,6 +125,8 @@ export interface DMConversation extends ConversationActivity {
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;
+  /** This viewer's own notification preference (issue #527). */
+  muted?: boolean;
 }
 
 /**
@@ -279,12 +293,36 @@ export interface MentionCandidate {
   label: string;
 }
 
+/**
+ * The server-generated conversation events a system message can describe
+ * (issue #527). A closed set: an event this build does not know is rendered as
+ * nothing rather than guessed at.
+ */
+export type ConversationEventType = "conversation_renamed" | "conversation_member_left";
+
+/**
+ * The structured facts a system message carries. Deliberately no actor name —
+ * the actor is the message's own sender, resolved through the same authorized
+ * projection every other message's sender goes through, so nothing a client
+ * sends can put a name here.
+ */
+export interface ConversationEventPayload {
+  oldName?: string;
+  newName?: string;
+}
+
 export interface Message {
   id: string;
   senderId: string;
   senderDisplayName: string;
   senderEmail: string;
   kind: MessageKind;
+  /**
+   * Set only on `kind: "system"` (issue #527). The database enforces that
+   * pairing, so a user message can never carry one.
+   */
+  eventType?: ConversationEventType;
+  eventPayload?: ConversationEventPayload;
   /** Only present when status is "active". Empty for removed messages. */
   bodyText: string;
   bodyFormat: MessageBodyFormat;

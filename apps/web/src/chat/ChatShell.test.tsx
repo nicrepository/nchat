@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
-import { fetchSidebarData } from "./chatApi";
+import { fetchSidebarData, leaveConversation } from "./chatApi";
 import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
@@ -14,8 +14,14 @@ import { useCallMedia } from "./useCallMedia";
 
 vi.mock("./chatApi", async () => {
   const actual = await vi.importActual<typeof import("./chatApi")>("./chatApi");
-  return { ...actual, fetchSidebarData: vi.fn() };
+  return { ...actual, fetchSidebarData: vi.fn(), leaveConversation: vi.fn() };
 });
+// A stub, because what is under test here is which target the shell hands the
+// panel — not what the panel then renders for it. The real one fetches.
+vi.mock("./SidebarDetailsPanel", () => ({
+  default: ({ target }: { target: { kind: string; id: string } | null }) =>
+    target ? <div data-testid="sidebar-details">{`${target.kind}:${target.id}`}</div> : null,
+}));
 vi.mock("./callApi", () => ({ issueCallToken: vi.fn(), issueResourceCallToken: vi.fn() }));
 vi.mock("./useChatWebSocket", () => ({ useChatWebSocket: vi.fn() }));
 vi.mock("./useCallMedia", () => ({ useCallMedia: vi.fn() }));
@@ -1169,5 +1175,113 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
     // #642's onLeave never owned any local state to falsely clean up in the
     // first place — the error stays entirely CallSessionProvider's own
     // resource.status/resource.error retry authority.
+  });
+});
+
+/**
+ * ISSUE #527 (code review) — leaving the conversation that is on screen.
+ *
+ * The row disappearing is not the whole of it: the route still names the
+ * conversation, and the details panel opened from its menu still has it as a
+ * subject. Both are derived from the canonical list, so both must stop pointing
+ * at a conversation this user is no longer in.
+ */
+describe("ChatShell — leaving the conversation on screen", () => {
+  const readingId = "00000000-0000-4000-8000-0000000005a1";
+  const otherId = "00000000-0000-4000-8000-0000000005a2";
+
+  function renderShellAt(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route index element={<div>vazio</div>} />
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function sidebarWith(channels: { id: string; name: string }[]) {
+    return {
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: channels.map((channel) => ({
+        ...channel,
+        type: "public" as const,
+        canWrite: true,
+      })),
+      dms: [],
+      categories: [],
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(leaveConversation).mockResolvedValue(undefined);
+  });
+
+  // The panel's subject is the row whose menu was used, which may be a
+  // conversation other than the one being read. Leaving *that* one changes no
+  // route at all, so the pathname guard cannot help: what closes the panel is
+  // the conversation no longer being in the canonical list.
+  it("closes a details panel for another conversation when that one is left", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchSidebarData).mockResolvedValue(
+      sidebarWith([
+        { id: readingId, name: "Plataforma" },
+        { id: otherId, name: "Infra" },
+      ]),
+    );
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(screen.getByRole("button", { name: "Mais opções para canal Infra" }));
+    await user.click(screen.getByRole("menuitem", { name: "Detalhes do canal" }));
+    expect(screen.getByTestId("sidebar-details")).toHaveTextContent(`channel:${otherId}`);
+
+    // The refetch that follows the departure no longer carries the channel,
+    // which is what makes the panel's subject stop existing.
+    vi.mocked(fetchSidebarData).mockResolvedValue(
+      sidebarWith([{ id: readingId, name: "Plataforma" }]),
+    );
+    await user.click(screen.getByRole("button", { name: "Mais opções para canal Infra" }));
+    await user.click(screen.getByRole("menuitem", { name: "Sair do canal" }));
+    // The confirm button and the menu item share a label, so it is taken from
+    // inside the dialog.
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Sair do canal" }),
+    );
+
+    await waitFor(() => expect(screen.queryByTestId("sidebar-details")).not.toBeInTheDocument());
+    expect(leaveConversation).toHaveBeenCalledWith("channel", otherId);
+    // Nothing navigated: the conversation being read was not the one left.
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+  });
+
+  it("returns to the neutral route when the conversation being read is left", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchSidebarData).mockResolvedValue(
+      sidebarWith([{ id: readingId, name: "Plataforma" }]),
+    );
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    vi.mocked(fetchSidebarData).mockResolvedValue(sidebarWith([]));
+    await user.click(screen.getByRole("button", { name: "Mais opções para canal Plataforma" }));
+    await user.click(screen.getByRole("menuitem", { name: "Sair do canal" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Sair do canal" }),
+    );
+
+    await waitFor(() => expect(screen.getByText("vazio")).toBeInTheDocument());
+    expect(leaveConversation).toHaveBeenCalledWith("channel", readingId);
   });
 });

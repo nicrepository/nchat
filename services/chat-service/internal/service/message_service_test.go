@@ -372,10 +372,11 @@ func TestMessageService_EditMessage_RewritesAddedMention(t *testing.T) {
 	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
-			// Explicitly active: editing is only permitted in that state, so a
-			// fixture with a zero-value status is not an editable message.
+			// Explicitly a user message and explicitly active: editing is
+			// permitted only in that state and only for that kind, so a fixture
+			// with either zero-valued is not an editable message (issue #527).
 			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
-			Status: domain.MessageStatusActive,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
 		}},
 		authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Alice"},
 	}
@@ -398,6 +399,7 @@ func TestMessageService_EditMessage_RemovesExistingMention(t *testing.T) {
 	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
 	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
 		ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		Kind:     domain.MessageKindUser,
 		Status:   domain.MessageStatusActive,
 		BodyText: `@[Alice](mention:user:` + mentionedUserID + `)`, BodyFormat: domain.MessageBodyFormatV3,
 	}}}
@@ -419,10 +421,11 @@ func TestMessageService_EditMessage_RejectsUnauthorizedMention(t *testing.T) {
 	const mentionedUserID = "99999999-9999-9999-9999-999999999999"
 	store := &fakeMessageStore{
 		messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
-			// Explicitly active: editing is only permitted in that state, so a
-			// fixture with a zero-value status is not an editable message.
+			// Explicitly a user message and explicitly active: editing is
+			// permitted only in that state and only for that kind, so a fixture
+			// with either zero-valued is not an editable message (issue #527).
 			ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
-			Status: domain.MessageStatusActive,
+			Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
 		}},
 		authorizedMentionLabels: map[string]string{},
 	}
@@ -1084,7 +1087,7 @@ func TestMessageService_CreateChannelMessage_ValidParentMessageSucceeds(t *testi
 	channels := &fakeChannelStore{visibleChannel: ch}
 	msgs := &fakeMessageStore{
 		createdMessage: domain.Message{ID: "msg-child", WorkspaceID: "ws-1", ChannelID: "ch-1",
-			SenderID: user1, Status: domain.MessageStatusActive},
+			SenderID: user1, Kind: domain.MessageKindUser, Status: domain.MessageStatusActive},
 		// validateRefTargetErr left nil = valid reference
 	}
 

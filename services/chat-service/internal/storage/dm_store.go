@@ -59,6 +59,14 @@ type DMStore interface {
 	// user is ineligible. There is no capacity conflict: groups have no fixed
 	// participant ceiling.
 	AddGroupParticipants(ctx context.Context, input AddGroupParticipantsInput) (AddMembersResult, error)
+	// RenameGroupConversation sets a group's title and records the event in the
+	// same transaction. Authorized by participation; a 1:1 conversation is
+	// unreachable because the statement requires type = 'group' (issue #527).
+	RenameGroupConversation(ctx context.Context, input RenameGroupInput) (RenameGroupResult, error)
+	// LeaveGroupConversation marks the actor's own participation left and
+	// records the departure. Self-leave only — there is no target user
+	// parameter (issue #527).
+	LeaveGroupConversation(ctx context.Context, workspaceID, conversationID, callerID string) (LeaveConversationResult, error)
 	// ListParticipantProfiles returns up to limit active participants of
 	// conversationID in workspaceID plus the total number of active
 	// participants, in one round trip. The caller's access to the conversation

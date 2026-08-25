@@ -25,6 +25,13 @@ import "./RenameChannelDialog.css";
 import { ApiRequestError } from "../lib/api";
 
 interface RenameChannelDialogProps {
+  /**
+   * Which vocabulary the dialog uses (issue #527). A channel and a group are
+   * renamed through different endpoints but through the same dialog: the only
+   * thing that varies is the wording, so this is a label choice and never a
+   * behavioural switch.
+   */
+  kind?: "channel" | "group";
   channelId: string;
   currentName: string;
   onClose: () => void;
@@ -37,14 +44,15 @@ const inputId = "chat-rename-channel-name";
 const errorId = "chat-rename-channel-error";
 
 /**
- * The server's own limit, restated here only as an input bound.
+ * The server's own limits, restated here only as input bounds.
  *
- * It is not a second validation rule: the backend counts the same 100 Unicode
- * code points (domain.MaxChannelDisplayNameCodePoints) and refuses anything
- * longer whatever this attribute says. Its whole job is to stop a user typing
- * two hundred characters before being told.
+ * They are not a second validation rule: the backend counts the same Unicode
+ * code points — 100 for a channel (domain.MaxChannelDisplayNameCodePoints), 120
+ * for a group (maxDMTitleRunes) — and refuses anything longer whatever this
+ * attribute says. Their whole job is to stop a user typing past the limit before
+ * being told.
  */
-const maxNameLength = 100;
+const maxNameLength = { channel: 100, group: 120 } as const;
 
 /**
  * Maps a failure to copy, by status code only. The server's message is never
@@ -53,7 +61,7 @@ const maxNameLength = 100;
  */
 function renameErrorMessage(error: unknown): string {
   if (error instanceof ApiRequestError) {
-    if (error.status === 400) return "Escolha um nome entre 1 e 100 caracteres.";
+    if (error.status === 400) return "Escolha um nome válido para esta conversa.";
     if (error.status === 403) return "Você não tem permissão para renomear este canal.";
     if (error.status === 404) return "Este canal não está mais disponível.";
     if (error.status === 409)
@@ -66,12 +74,19 @@ function renameErrorMessage(error: unknown): string {
   return "Não foi possível renomear o canal. Tente novamente.";
 }
 
+const dialogCopy = {
+  channel: { title: "Renomear canal", field: "Nome do canal" },
+  group: { title: "Renomear grupo", field: "Nome do grupo" },
+} as const;
+
 export default function RenameChannelDialog({
+  kind = "channel",
   channelId,
   currentName,
   onClose,
   onRename,
 }: RenameChannelDialogProps) {
+  const copy = dialogCopy[kind];
   // Seeded with the current name and owned from here on: the field is what the
   // user is editing, so a refetch landing mid-edit must not overwrite it.
   const [name, setName] = useState(currentName);
@@ -129,7 +144,7 @@ export default function RenameChannelDialog({
     // backend enforces the same rule and remains the authority — this only saves
     // a round trip, and every other verdict comes from the server.
     if (!trimmed) {
-      setError("Escolha um nome entre 1 e 100 caracteres.");
+      setError("Escolha um nome para esta conversa.");
       inputRef.current?.focus();
       return;
     }
@@ -166,11 +181,11 @@ export default function RenameChannelDialog({
         onMouseDown={(event) => event.stopPropagation()}
       >
         <h2 id={titleId} className="rename-channel__title">
-          Renomear canal
+          {copy.title}
         </h2>
         <form onSubmit={submit}>
           <label className="rename-channel__label" htmlFor={inputId}>
-            Nome do canal
+            {copy.field}
           </label>
           <input
             ref={inputRef}
@@ -178,7 +193,7 @@ export default function RenameChannelDialog({
             className="rename-channel__input"
             type="text"
             autoComplete="off"
-            maxLength={maxNameLength}
+            maxLength={maxNameLength[kind]}
             value={name}
             disabled={pending}
             aria-invalid={error ? true : undefined}

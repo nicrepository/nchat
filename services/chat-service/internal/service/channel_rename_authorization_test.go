@@ -72,8 +72,13 @@ func TestChannelService_UpdateChannel_RenameFollowsCanManageWorkspace(t *testing
 			if stored := channels.lastUpdateInput; stored.CallerID != "actor-1" {
 				t.Fatalf("store received CallerID %q, want actor-1", stored.CallerID)
 			}
-			if updated.ID != "ch-1" {
-				t.Fatalf("channel id = %q, want the unchanged ch-1", updated.ID)
+			if updated.Channel.ID != "ch-1" {
+				t.Fatalf("channel id = %q, want the unchanged ch-1", updated.Channel.ID)
+			}
+			// The rename and its system message are one transaction, so a
+			// successful rename always comes back with the event (issue #527).
+			if updated.Event.ID == "" || updated.Event.Kind != domain.MessageKindSystem {
+				t.Fatalf("event = %+v, want the system message the rename wrote", updated.Event)
 			}
 			// A rename touches the name and nothing else: the slug, the type and
 			// the category are carried through from the current row, so the
