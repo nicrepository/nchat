@@ -797,6 +797,12 @@ type fakeDMStore struct {
 	addParticipantsCalls  int
 	lastAddParticipants   storage.AddGroupParticipantsInput
 
+	// Group rename and self-leave (issue #527).
+	lastRenameGroup storage.RenameGroupInput
+	renameGroupErr  error
+	lastLeaveGroup  [3]string
+	leaveGroupErr   error
+
 	// callParticipantProfiles models the conversation's active participants by
 	// user ID (issue #612); ListParticipantProfilesByIDs returns only the
 	// requested IDs present here, mirroring the real store's join silently
@@ -813,6 +819,33 @@ type groupCandidateCall struct {
 	CallerID       string
 	Query          string
 	Limit          int
+}
+
+// Group rename and self-leave (issue #527). The fake records what the service
+// forwarded; the transaction, the participation lock and the system message are
+// proved against PostgreSQL in the storage package.
+func (f *fakeDMStore) RenameGroupConversation(_ context.Context, input storage.RenameGroupInput) (storage.RenameGroupResult, error) {
+	f.lastRenameGroup = input
+	if f.renameGroupErr != nil {
+		return storage.RenameGroupResult{}, f.renameGroupErr
+	}
+	return storage.RenameGroupResult{
+		Conversation: domain.DMConversation{
+			ID: input.ConversationID, WorkspaceID: input.WorkspaceID,
+			Type: domain.DMConversationTypeGroup, Title: input.Title,
+		},
+		Event: domain.Message{ID: "event-" + input.ConversationID, Kind: domain.MessageKindSystem},
+	}, nil
+}
+
+func (f *fakeDMStore) LeaveGroupConversation(_ context.Context, workspaceID, conversationID, callerID string) (storage.LeaveConversationResult, error) {
+	f.lastLeaveGroup = [3]string{workspaceID, conversationID, callerID}
+	if f.leaveGroupErr != nil {
+		return storage.LeaveConversationResult{}, f.leaveGroupErr
+	}
+	return storage.LeaveConversationResult{
+		Event: domain.Message{ID: "event-" + conversationID, Kind: domain.MessageKindSystem},
+	}, nil
 }
 
 func (f *fakeDMStore) CreateDirectConversation(_ context.Context, input storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {

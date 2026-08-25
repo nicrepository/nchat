@@ -22,6 +22,13 @@ type sidebarPinProvider interface {
 	UnpinConversation(ctx context.Context, userID, targetType, targetID string) error
 }
 
+// sidebarMuteProvider is the SidebarService surface the mute routes use,
+// declared narrowly and satisfied by the same service the pin routes use.
+type sidebarMuteProvider interface {
+	MuteConversation(ctx context.Context, userID, targetType, targetID string) error
+	UnmuteConversation(ctx context.Context, userID, targetType, targetID string) error
+}
+
 type sidebarReadProvider interface {
 	MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error
 }
@@ -38,7 +45,9 @@ type sidebarWorkspaceJSON struct {
 	// nothing, and file-service re-reads it from the destination's own row on
 	// every upload, so a client that ignores or edits this value changes only
 	// which error it receives.
-	MaxUploadBytes int64 `json:"max_upload_bytes"`
+	MaxUploadBytes            int64 `json:"max_upload_bytes"`
+	MaxMessageAttachments     int   `json:"max_message_attachments"`
+	MaxMessageAttachmentBytes int64 `json:"max_message_attachment_bytes"`
 }
 
 // sidebarChannelJSON is the JSON shape for a channel in the sidebar response.
@@ -71,6 +80,10 @@ type sidebarChannelJSON struct {
 	// that predates the field reads a missing value as "no", which hides an
 	// action rather than offering one that 403s.
 	CanRename bool `json:"can_rename"`
+	// Muted is this viewer's own notification preference (issue #527), never a
+	// property of the channel. Always false for the general channel, which is
+	// not silenceable. Never omitempty: absent must read as "not muted".
+	Muted bool `json:"muted"`
 	// RFC 3339 UTC, with the sub-second fraction kept — see formatSidebarTime
 	// for why these two keep a precision the detail endpoints do not need.
 	CreatedAt     string  `json:"created_at"`
@@ -109,6 +122,8 @@ type sidebarDMJSON struct {
 	LastMessageAt *string                   `json:"last_message_at"`
 	PinnedAt      *string                   `json:"pinned_at"`
 	UnreadCount   int                       `json:"unread_count"`
+	// Muted is this viewer's own notification preference (issue #527).
+	Muted bool `json:"muted"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -127,13 +142,29 @@ type sidebarResponseBody struct {
 
 // SidebarHandler handles GET /api/chat/sidebar.
 type SidebarHandler struct {
-	svc sidebarProvider
+	svc                       sidebarProvider
+	maxMessageAttachments     int
+	maxMessageAttachmentBytes int64
 }
 
 // NewSidebarHandler returns a SidebarHandler backed by svc. When svc is nil,
 // all requests return 503 (service not yet wired).
 func NewSidebarHandler(svc sidebarProvider) *SidebarHandler {
-	return &SidebarHandler{svc: svc}
+	return &SidebarHandler{
+		svc:                       svc,
+		maxMessageAttachments:     domain.MaxMessageAttachments,
+		maxMessageAttachmentBytes: domain.DefaultMaxMessageAttachmentBytes,
+	}
+}
+
+func (h *SidebarHandler) WithMessageAttachmentLimits(count int, bytes int64) *SidebarHandler {
+	if count > 0 && count <= domain.MaxMessageAttachments {
+		h.maxMessageAttachments = count
+	}
+	if bytes > 0 {
+		h.maxMessageAttachmentBytes = bytes
+	}
+	return h
 }
 
 // Ready reports whether the handler is wired to a real sidebar service.
@@ -170,10 +201,12 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body := sidebarResponseBody{
 		CurrentUserID: userID,
 		Workspace: sidebarWorkspaceJSON{
-			ID:             data.Workspace.ID,
-			Name:           data.Workspace.Name,
-			Slug:           data.Workspace.Slug,
-			MaxUploadBytes: domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
+			ID:                        data.Workspace.ID,
+			Name:                      data.Workspace.Name,
+			Slug:                      data.Workspace.Slug,
+			MaxUploadBytes:            domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
+			MaxMessageAttachments:     h.maxMessageAttachments,
+			MaxMessageAttachmentBytes: h.maxMessageAttachmentBytes,
 		},
 		Channels:         mapChannels(data.Channels),
 		DMConvs:          mapDMs(data.DMs),
@@ -207,6 +240,7 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
 			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),
 			UnreadCount:   &unreadCount,
+			Muted:         sidebarChannel.Muted,
 		})
 	}
 	return out
@@ -226,6 +260,7 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
 			PinnedAt:      formatSidebarTimePtr(dm.PinnedAt),
 			UnreadCount:   dm.UnreadCount,
+			Muted:         dm.Muted,
 		})
 	}
 	return out
@@ -245,6 +280,54 @@ func (h *SidebarHandler) PinDM(w http.ResponseWriter, r *http.Request) {
 
 func (h *SidebarHandler) UnpinDM(w http.ResponseWriter, r *http.Request) {
 	h.pinConversation(w, r, service.PinTargetDM, r.PathValue("conversationID"), "conversation_id", false)
+}
+
+func (h *SidebarHandler) MuteChannel(w http.ResponseWriter, r *http.Request) {
+	h.muteConversation(w, r, service.ReadTargetChannel, r.PathValue("channelID"), "channel_id", true)
+}
+
+func (h *SidebarHandler) UnmuteChannel(w http.ResponseWriter, r *http.Request) {
+	h.muteConversation(w, r, service.ReadTargetChannel, r.PathValue("channelID"), "channel_id", false)
+}
+
+func (h *SidebarHandler) MuteDM(w http.ResponseWriter, r *http.Request) {
+	h.muteConversation(w, r, service.ReadTargetDM, r.PathValue("conversationID"), "conversation_id", true)
+}
+
+func (h *SidebarHandler) UnmuteDM(w http.ResponseWriter, r *http.Request) {
+	h.muteConversation(w, r, service.ReadTargetDM, r.PathValue("conversationID"), "conversation_id", false)
+}
+
+// muteConversation is the same shape pinConversation has, and for the same
+// reasons: the target is a path segment validated as a UUID, the actor is the
+// authenticated principal, the workspace is resolved server-side, and there is
+// no body at all — so nothing a client sends can name a user, a workspace or a
+// role. The general-channel refusal lives below, in SQL.
+func (h *SidebarHandler) muteConversation(w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string, muted bool) {
+	mutes, ok := h.svc.(sidebarMuteProvider)
+	if h.svc == nil || !ok {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar not available")
+		return
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var err error
+	if muted {
+		err = mutes.MuteConversation(r.Context(), userID, targetType, targetID)
+	} else {
+		err = mutes.UnmuteConversation(r.Context(), userID, targetType, targetID)
+	}
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type markConversationReadRequest struct {

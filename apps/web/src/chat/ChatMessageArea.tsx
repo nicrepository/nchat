@@ -31,6 +31,7 @@ import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
 
 import "./ChatMessageArea.css";
+import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
@@ -42,6 +43,8 @@ import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetails } from "./useConversationDetails";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import ConversationSystemMessage from "./ConversationSystemMessage.tsx";
+import { systemScopeFor, type SystemMessageScope } from "./conversationSystemMessage";
 import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
@@ -524,6 +527,12 @@ interface MessageListProps {
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   editDisabledIds: Set<string>;
   channelId?: string;
+  /**
+   * Whether a system message in this timeline says "canal", "grupo" or
+   * "conversa" (issue #527). The kind comes from the conversation record, never
+   * from the route or the name.
+   */
+  systemScope: SystemMessageScope;
   /** The conversation on screen, so a sender's presence is resolved in it. */
   presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -554,6 +563,7 @@ function MessageList({
   onDeleteMessage,
   editDisabledIds,
   channelId,
+  systemScope,
   presenceTarget,
   onTogglePin,
   pinnedIds,
@@ -768,6 +778,16 @@ function MessageList({
           <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
             {item.label}
           </div>
+        ) : item.message.kind === "system" ? (
+          // A conversation event is not something a person said, so it never
+          // becomes a MessageBubble: no bubble, no avatar, and none of the
+          // message actions — editing "Fulano saiu do grupo" is not a thing
+          // (issue #527).
+          <ConversationSystemMessage
+            key={item.message.id}
+            message={item.message}
+            scope={systemScope}
+          />
         ) : (
           <MessageBubble
             key={item.message.id}
@@ -1441,6 +1461,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
                 }),
             };
 
+  // #642: channel keeps the "#" prefix already used everywhere else in this
+  // header; a group DM has no channel-style handle, so it uses the bare
+  // name (issue explicitly forbids inventing a "#" for it). Resource calls
+  // are always call_type "audio" by construction (RF-24: one multiparty
+  // room, never RF-23's separate audio/video split — see
+  // useResourceCallSession.join()'s own hardcoded "audio"), so "Chamada de
+  // voz" is a real invariant here, not a hardcoded guess.
+  const activeResourceCallBarTitle =
+    resourceCallKind === "channel"
+      ? `Chamada de voz — #${resolvedName}`
+      : `Chamada de voz — ${resolvedName}`;
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1488,6 +1520,34 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           />
         )}
 
+        {/*
+          #642 (review fix): ctx.resourceCallSession is present only once
+          CallSessionProvider's own resourcePresentationCall authority has
+          proven a call_id match against discovery — never re-derived here
+          from a second, independent discoveredResourceCall lookup, which
+          could momentarily disagree during the exact window blocker 2
+          exists to close. participatingHere still proves this is the SAME
+          target the route is showing, never a different one this tab also
+          happens to participate in.
+        */}
+        {participatingHere && ctx.resourceCallSession && (
+          <ActiveResourceCallBar
+            title={activeResourceCallBarTitle}
+            startedAt={ctx.resourceCallSession.startedAt}
+            participants={ctx.resourceCallSession.participants}
+            localId={ctx.resourceCallSession.localId}
+            localName={ctx.resourceCallSession.localName}
+            localInitials={ctx.resourceCallSession.localInitials}
+            localAvatarUrl={ctx.resourceCallSession.localAvatarUrl}
+            activeSpeakerId={ctx.resourceCallSession.activeSpeakerId}
+            microphoneEnabled={ctx.resourceCallSession.microphoneEnabled}
+            microphonePending={ctx.resourceCallSession.microphonePending}
+            onToggleMicrophone={ctx.resourceCallSession.onToggleMicrophone}
+            onLeave={ctx.resourceCallSession.onLeave}
+            onOpenFullCall={ctx.resourceCallSession.onOpenFullCall}
+          />
+        )}
+
         <PinnedBar pin={latestPin} onUnpin={togglePin} />
 
         {state.status === "loading" && <LoadingSkeleton />}
@@ -1502,6 +1562,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           <MessageList
             messages={state.messages}
             currentUserId={ctx.currentUserId}
+            // "canal" / "grupo" / "conversa" for this timeline's system
+            // messages (issue #527).
+            systemScope={systemScopeFor(detailsKind, kind)}
             hasMore={state.nextCursor !== ""}
             loadingMore={state.loadingMore}
             lastMutation={state.lastMutation}
@@ -1601,6 +1664,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           // the very pair the composer is keyed by — so an attachment can never
           // be posted to the destination the user just navigated away from.
           uploadTarget={targetId ? { kind, id: targetId } : null}
+          attachmentLimits={ctx.attachmentLimits}
           // An upload adds a file to the destination without creating a message
           // — the message comes later, when the user presses Enviar (RF-32) —
           // so the details panel's file list still has to reconcile here.

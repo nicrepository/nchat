@@ -51,8 +51,8 @@ func (g *generatedSource) Read(p []byte) (int, error) {
 	for i := range p {
 		// A cheap non-constant pattern: constant bytes would let a broken
 		// chunk boundary go unnoticed in the round-trip comparison.
-		g.next = g.next*31 + 17
-		p[i] = g.next
+		g.next = (g.next + 17) % 90
+		p[i] = 32 + g.next
 	}
 	g.digest.Write(p)
 	g.remaining -= int64(len(p))
@@ -156,8 +156,8 @@ func TestUploadStreamsWithoutBufferingTheWholeFile(t *testing.T) {
 		t.Fatalf("authorize: %v", err)
 	}
 	view, err := svc.Upload(ctx, service.UploadInput{
-		Target: target, Filename: "large.bin",
-		DeclaredMIME: "application/octet-stream", Content: source,
+		Target: target, Filename: "large.txt",
+		DeclaredMIME: "text/plain", Content: source,
 	})
 	if err != nil {
 		t.Fatalf("upload: %v", err)

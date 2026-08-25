@@ -111,6 +111,7 @@ describe("useMessages — attachments", () => {
       parentMessageId: undefined,
       referencedMessageId: undefined,
       attachmentIds: ["att-1"],
+      idempotencyKey: expect.any(String),
     });
     expect(result.current.state.messages[0]?.attachments).toEqual([attachment]);
   });
@@ -125,6 +126,28 @@ describe("useMessages — attachments", () => {
       expect(sent).toEqual({ status: "stale" });
     });
     expect(mockPostChannelMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the idempotency key for an unchanged retry and renews it after content changes", async () => {
+    mockPostChannelMessage
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValue(message({ attachments: [attachment] }));
+    const { result } = renderMessages();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      await expect(result.current.sendMessage("legenda", undefined, ["att-1"])).rejects.toThrow();
+    });
+    const firstKey = mockPostChannelMessage.mock.calls[0][2].idempotencyKey;
+    await act(async () => {
+      await result.current.sendMessage("legenda", undefined, ["att-1"]);
+    });
+    expect(mockPostChannelMessage.mock.calls[1][2].idempotencyKey).toBe(firstKey);
+
+    await act(async () => {
+      await result.current.sendMessage("legenda alterada", undefined, ["att-1"]);
+    });
+    expect(mockPostChannelMessage.mock.calls[2][2].idempotencyKey).not.toBe(firstKey);
   });
 
   it("renders an attachment carried by a realtime message without refetching", async () => {

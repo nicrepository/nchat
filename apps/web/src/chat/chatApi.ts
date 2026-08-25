@@ -39,6 +39,8 @@ import {
   type MessagePage,
   type MessageSecuritySnapshot,
   type PinnedItem,
+  type ConversationEventPayload,
+  type ConversationEventType,
 } from "./chatTypes";
 
 const CHAT_BASE = import.meta.env.VITE_CHAT_API_BASE_URL ?? "/api/chat";
@@ -59,6 +61,8 @@ interface SidebarChannelResponse {
    * an action is the safe failure, offering one that 403s is not.
    */
   can_rename?: unknown;
+  /** This viewer's own notification preference (issue #527). */
+  muted?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -84,11 +88,20 @@ interface SidebarDMResponse {
   last_message_at?: unknown;
   pinned_at?: unknown;
   unread_count?: unknown;
+  /** This viewer's own notification preference (issue #527). */
+  muted?: unknown;
 }
 
 interface SidebarResponse {
   current_user_id: string;
-  workspace: { id: string; name: string; slug: string; max_upload_bytes?: number };
+  workspace: {
+    id: string;
+    name: string;
+    slug: string;
+    max_upload_bytes?: number;
+    max_message_attachments?: number;
+    max_message_attachment_bytes?: number;
+  };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
 }
@@ -140,6 +153,11 @@ interface CreateChannelEnvelope {
  */
 interface RenameChannelEnvelope {
   data: { id: string; display_name: string };
+}
+
+/** The group rename response: the unchanged id and the persisted title. */
+interface RenameGroupEnvelope {
+  data: { id: string; title: string };
 }
 
 interface AllowedReactionEmojisEnvelope {
@@ -199,6 +217,10 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     // — absent, null, a truthy string from a proxy that rewrote the payload —
     // is "no". The PATCH re-derives the decision regardless.
     canRename: ch.can_rename === true,
+    // Structural identity, from the server's own column. Strict equality like
+    // the capabilities above: anything that is not an explicit `true` is "no".
+    isGeneral: ch.is_general === true,
+    muted: ch.muted === true,
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
@@ -314,6 +336,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     counterpart: type === "group" ? undefined : mapSidebarCounterpart(dm.counterpart),
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
+    muted: dm.muted === true,
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
@@ -401,6 +424,9 @@ function placeInCategory(
 export async function fetchSidebarData(): Promise<{
   currentUserId: string;
   workspaceId: string;
+  maxUploadBytes?: number | null;
+  maxFiles?: number;
+  maxBytes?: number;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -435,9 +461,29 @@ export async function fetchSidebarData(): Promise<{
   }
 
   const dms = mapSidebarDMs(sidebar.dm_conversations);
+  const rawMaxUploadBytes = sidebar.workspace?.max_upload_bytes;
+  const rawMaxFiles = sidebar.workspace?.max_message_attachments;
+  const rawMaxBytes = sidebar.workspace?.max_message_attachment_bytes;
   return {
     currentUserId: sidebar.current_user_id ?? "",
     workspaceId: sidebar.workspace?.id ?? "",
+    maxUploadBytes:
+      typeof rawMaxUploadBytes === "number" &&
+      Number.isSafeInteger(rawMaxUploadBytes) &&
+      rawMaxUploadBytes > 0
+        ? rawMaxUploadBytes
+        : null,
+    maxFiles:
+      typeof rawMaxFiles === "number" &&
+      Number.isSafeInteger(rawMaxFiles) &&
+      rawMaxFiles >= 1 &&
+      rawMaxFiles <= 10
+        ? rawMaxFiles
+        : 1,
+    maxBytes:
+      typeof rawMaxBytes === "number" && Number.isSafeInteger(rawMaxBytes) && rawMaxBytes > 0
+        ? rawMaxBytes
+        : Number.MAX_SAFE_INTEGER,
     channels,
     dms,
     categories,
@@ -494,13 +540,10 @@ export async function markConversationRead(
  * its pre-flight check, and file-service — which re-reads the policy on every
  * upload — remains the only thing that decides.
  */
-export async function fetchWorkspaceUploadLimit(): Promise<number | null> {
-  const sidebar = await fetchSidebar();
-  const raw = sidebar.workspace?.max_upload_bytes;
-  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw <= 0) {
-    return null;
-  }
-  return raw;
+export interface WorkspaceAttachmentLimits {
+  maxUploadBytes: number | null;
+  maxFiles: number;
+  maxBytes: number;
 }
 
 export async function searchDMCandidates(
@@ -687,6 +730,69 @@ export async function renameChannel(
   return { id: response.data.id, name: response.data.display_name };
 }
 
+/**
+ * Silences or restores notifications for one conversation (issue #527).
+ *
+ * A per-user preference, so the request carries no user: the actor is the
+ * session. POST to silence and DELETE to restore, with no body at all — the
+ * same shape the sidebar pin uses, and for the same reason. The general channel
+ * is refused by the server in SQL; this client never decides that.
+ */
+export async function setConversationMuted(
+  targetType: "channel" | "dm",
+  targetId: string,
+  muted: boolean,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/mute`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/mute`;
+  await authenticatedFetch(target, { method: muted ? "POST" : "DELETE" });
+}
+
+/**
+ * Renames a group conversation (issue #527).
+ *
+ * Groups only. A 1:1 conversation reaches nothing on the server — the statement
+ * behind this requires type = 'group' — so this is never a path by which a DM
+ * could be renamed. Authorization is participation, re-derived server-side.
+ */
+export async function renameGroup(
+  conversationId: string,
+  title: string,
+  signal?: AbortSignal,
+): Promise<{ id: string; name: string }> {
+  const response = await authenticatedFetch<RenameGroupEnvelope>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+      signal,
+    },
+  );
+  return { id: response.data.id, name: response.data.title };
+}
+
+/**
+ * Removes the caller's own membership from a channel or a group (issue #527).
+ *
+ * Self-leave: there is no user in the path and no body, so nothing here can
+ * affect anyone else's membership. A 1:1 conversation has no membership to
+ * leave and the server refuses it structurally, which is why this client never
+ * offers the action for one.
+ */
+export async function leaveConversation(
+  targetType: "channel" | "dm",
+  targetId: string,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/membership`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/membership`;
+  await authenticatedFetch(target, { method: "DELETE" });
+}
+
 export async function createChannelCategory(
   name: string,
   signal?: AbortSignal,
@@ -734,6 +840,9 @@ interface MessageResponse {
   sender_display_name?: string;
   sender_email?: string;
   kind: string;
+  /** Structured conversation event, on system messages only (issue #527). */
+  event_type?: unknown;
+  event_payload?: unknown;
   body_text?: string;
   body_format?: string;
   is_removed?: boolean;
@@ -904,6 +1013,32 @@ function isMentionEnvelope(value: unknown): value is MentionEnvelope {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Reads a system message's structured event, if it has one (issue #527).
+ *
+ * An event type this build does not know produces nothing at all rather than an
+ * unknown one: the renderer then draws nothing for that row, which is the safe
+ * failure for a value written by a newer server. Names are copied as plain
+ * strings and rendered as React text — never as markup.
+ */
+function mapConversationEvent(r: MessageResponse): {
+  eventType?: ConversationEventType;
+  eventPayload?: ConversationEventPayload;
+} {
+  const known: ConversationEventType[] = ["conversation_renamed", "conversation_member_left"];
+  const eventType = known.find((candidate) => candidate === r.event_type);
+  if (r.kind !== "system" || !eventType) return {};
+  const payload =
+    typeof r.event_payload === "object" && r.event_payload
+      ? (r.event_payload as Record<string, unknown>)
+      : {};
+  const read = (value: unknown) => (typeof value === "string" ? value : undefined);
+  return {
+    eventType,
+    eventPayload: { oldName: read(payload["old_name"]), newName: read(payload["new_name"]) },
+  };
+}
+
 function mapMessage(r: MessageResponse): Message {
   const isRemoved = r.is_removed === true || r.status === "deleted" || Boolean(r.deleted_at);
   return {
@@ -912,6 +1047,7 @@ function mapMessage(r: MessageResponse): Message {
     senderDisplayName: r.sender_display_name ?? "",
     senderEmail: r.sender_email ?? "",
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
+    ...mapConversationEvent(r),
     bodyText: isRemoved ? "" : (r.body_text ?? ""),
     bodyFormat: normalizeBodyFormat(r.body_format),
     isRemoved,
@@ -1050,6 +1186,7 @@ export interface PostMessageOptions {
    * re-validates each id against the destination before it links anything.
    */
   attachmentIds?: string[];
+  idempotencyKey?: string;
   signal?: AbortSignal;
 }
 
@@ -1072,7 +1209,10 @@ export async function postChannelMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v3", options),
     signal: options.signal,
   });
@@ -1248,7 +1388,10 @@ export async function postDMMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v2", options),
     signal: options.signal,
   });

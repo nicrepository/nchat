@@ -43,7 +43,6 @@ import {
   markConversationRead,
   MessageEditError,
   fetchSidebarData,
-  fetchWorkspaceUploadLimit,
   messagesPath,
   pinMessage,
   postChannelMessage,
@@ -342,8 +341,14 @@ describe("fetchChannels", () => {
       type: "public",
       canWrite: true,
       // Absent from the payload, so "no" — a server that predates the field
-      // must never be read as granting the rename (issue #527).
+      // must never be read as granting the rename (issue #527). isGeneral and
+      // muted read the same way: absent is the safe answer.
       canRename: false,
+      // The fixture's ch-1 is the workspace's general channel, so the mapper
+      // must carry that through — it is what the row menu reads to omit rename,
+      // mute and leave (issue #527).
+      isGeneral: true,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -355,6 +360,8 @@ describe("fetchChannels", () => {
       type: "private",
       canWrite: false,
       canRename: false,
+      isGeneral: false,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -466,6 +473,7 @@ describe("fetchDMs", () => {
       type: "1:1",
       name: "Juliane Lino",
       participants: [],
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
     });
@@ -743,6 +751,8 @@ describe("fetchSidebarData", () => {
       type: "public",
       canWrite: true,
       canRename: false,
+      isGeneral: true,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -754,6 +764,7 @@ describe("fetchSidebarData", () => {
       type: "1:1",
       name: "Juliane",
       participants: [],
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
     });
@@ -1224,6 +1235,9 @@ describe("partial sidebar compatibility", () => {
     await expect(fetchSidebarData()).resolves.toEqual({
       currentUserId: "user-1",
       workspaceId: "ws-1",
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
       channels: [],
       dms: [],
       categories: [],
@@ -2562,6 +2576,9 @@ describe("fetchSidebarData", () => {
       expect(data).toEqual({
         currentUserId: "user-1",
         workspaceId: "ws-1",
+        maxUploadBytes: null,
+        maxFiles: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
         channels: [],
         dms: [],
         categories: [],
@@ -2574,6 +2591,9 @@ describe("fetchSidebarData", () => {
     await expect(fetchSidebarData()).resolves.toEqual({
       currentUserId: "user-1",
       workspaceId: "ws-1",
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
       channels: [],
       dms: [],
       categories: [],
@@ -3406,52 +3426,51 @@ describe("searchGroupParticipantCandidates", () => {
   });
 });
 
-// ── fetchWorkspaceUploadLimit (RF-32, issue #458) ─────────────────────────────
-
-describe("fetchWorkspaceUploadLimit", () => {
-  it("returns the workspace's published limit", async () => {
+describe("fetchSidebarData attachment limits", () => {
+  it("returns all published workspace limits from the canonical sidebar request", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
-        workspace: { id: "ws-1", name: "NIC Labs", slug: "default", max_upload_bytes: 104857600 },
-        channels: [],
-        dm_conversations: [],
-      },
-    });
-
-    await expect(fetchWorkspaceUploadLimit()).resolves.toBe(104857600);
-  });
-
-  it("returns null rather than inventing a default the workspace may not have", async () => {
-    // Every one of these is "the server did not publish a usable limit". The
-    // client must not substitute 250 MiB: a workspace whose administrator set a
-    // different policy would then be shown the wrong figure. Null means the
-    // pre-flight check is skipped and file-service decides.
-    for (const raw of [undefined, null, 0, -1, 1.5, "250", Number.NaN]) {
-      mockAuthFetch.mockResolvedValue({
-        data: {
-          workspace: { id: "ws-1", name: "NIC Labs", slug: "default", max_upload_bytes: raw },
-          channels: [],
-          dm_conversations: [],
+        workspace: {
+          id: "ws-1",
+          name: "NIC Labs",
+          slug: "default",
+          max_upload_bytes: 104857600,
+          max_message_attachments: 10,
+          max_message_attachment_bytes: 536870912,
         },
-      });
-
-      await expect(fetchWorkspaceUploadLimit()).resolves.toBeNull();
-    }
-  });
-
-  it("reads the limit of the session's own workspace, from the sidebar", async () => {
-    mockAuthFetch.mockResolvedValue({
-      data: {
-        workspace: { id: "ws-2", name: "Outro", slug: "outro", max_upload_bytes: 8388608 },
         channels: [],
         dm_conversations: [],
       },
     });
 
-    await expect(fetchWorkspaceUploadLimit()).resolves.toBe(8388608);
-    expect(mockAuthFetch).toHaveBeenCalledWith(
-      expect.stringContaining("/sidebar"),
-      expect.objectContaining({ method: "GET" }),
-    );
+    const result = await fetchSidebarData();
+    expect(result).toMatchObject({
+      maxUploadBytes: 104857600,
+      maxFiles: 10,
+      maxBytes: 536870912,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses conservative rollout defaults for missing or invalid limits", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: {
+          id: "ws-1",
+          name: "NIC Labs",
+          slug: "default",
+          max_upload_bytes: 0,
+          max_message_attachments: 11,
+          max_message_attachment_bytes: -1,
+        },
+        channels: [],
+        dm_conversations: [],
+      },
+    });
+    await expect(fetchSidebarData()).resolves.toMatchObject({
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    });
   });
 });

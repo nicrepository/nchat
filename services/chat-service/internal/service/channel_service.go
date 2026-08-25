@@ -276,17 +276,17 @@ func (s *ChannelService) GetChannel(ctx context.Context, input GetChannelInput) 
 // whether a channel or a category exists in it. The one that *decides* is
 // PGXChannelStore.UpdateChannel's, taken inside the write transaction with the
 // membership row locked — a role revoked after this line still stops the write.
-func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelInput) (domain.Channel, error) {
+func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelInput) (storage.UpdateChannelResult, error) {
 	if _, err := s.requireManagePermission(ctx, input.WorkspaceID, input.CallerID); err != nil {
-		return domain.Channel{}, err
+		return storage.UpdateChannelResult{}, err
 	}
 
 	current, err := s.channels.GetChannelByIDInWorkspace(ctx, input.WorkspaceID, input.ChannelID)
 	if err != nil {
-		return domain.Channel{}, err
+		return storage.UpdateChannelResult{}, err
 	}
 	if current.IsGeneral {
-		return domain.Channel{}, fmt.Errorf("%w: geral is immutable", domain.ErrInvalidInput)
+		return storage.UpdateChannelResult{}, fmt.Errorf("%w: geral is immutable", domain.ErrInvalidInput)
 	}
 
 	next := storage.UpdateChannelInput{
@@ -304,40 +304,8 @@ func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelI
 		Type:        current.Type,
 		Position:    current.Position,
 	}
-	if input.Slug != "" {
-		slug := strings.ToLower(strings.TrimSpace(input.Slug))
-		if !slugRE.MatchString(slug) {
-			return domain.Channel{}, fmt.Errorf("%w: slug must be lowercase alphanumeric with optional internal hyphens, no leading/trailing hyphens, max 63 chars", domain.ErrInvalidInput)
-		}
-		if slug == generalChannelSlug {
-			return domain.Channel{}, fmt.Errorf("%w: geral is reserved", domain.ErrInvalidInput)
-		}
-		next.Slug = slug
-	}
-	if input.DisplayName != "" {
-		// The same rule as creation, from the same helper: a rename must not be
-		// the way past a cap the create path enforces.
-		displayName, err := domain.NormalizeChannelDisplayName(input.DisplayName)
-		if err != nil {
-			return domain.Channel{}, err
-		}
-		next.DisplayName = displayName
-	}
-	if input.CategoryID != nil {
-		categoryID := strings.TrimSpace(*input.CategoryID)
-		if err := s.requireCategoryInWorkspace(ctx, input.WorkspaceID, categoryID); err != nil {
-			return domain.Channel{}, err
-		}
-		next.CategoryID = categoryID
-	}
-	if input.Position != nil {
-		next.Position = *input.Position
-	}
-	if input.Type != nil {
-		if err := validateChannelType(*input.Type); err != nil {
-			return domain.Channel{}, err
-		}
-		next.Type = *input.Type
+	if err := s.applyChannelUpdatePatch(ctx, input, &next); err != nil {
+		return storage.UpdateChannelResult{}, err
 	}
 	if current.Type == domain.ChannelTypePublic && next.Type == domain.ChannelTypePrivate {
 		next.EnsureMemberUserID = input.CallerID
@@ -345,9 +313,91 @@ func (s *ChannelService) UpdateChannel(ctx context.Context, input UpdateChannelI
 
 	updated, err := s.channels.UpdateChannel(ctx, next)
 	if err != nil {
-		return domain.Channel{}, err
+		return storage.UpdateChannelResult{}, err
 	}
 	return updated, nil
+}
+
+// applyChannelUpdatePatch overlays the fields the request actually set onto the
+// channel's current values.
+//
+// Every field is optional and each one is validated by its own rule, which is
+// why they are separate helpers rather than one long sequence of ifs: a rename
+// and a re-categorisation fail for unrelated reasons, and reading them apart is
+// how the reasons stay distinguishable.
+func (s *ChannelService) applyChannelUpdatePatch(ctx context.Context, input UpdateChannelInput, next *storage.UpdateChannelInput) error {
+	if err := applyChannelSlugPatch(input, next); err != nil {
+		return err
+	}
+	if err := applyChannelDisplayNamePatch(input, next); err != nil {
+		return err
+	}
+	if err := s.applyChannelCategoryPatch(ctx, input, next); err != nil {
+		return err
+	}
+	// Position carries no rule of its own: any int is an ordering hint.
+	if input.Position != nil {
+		next.Position = *input.Position
+	}
+	return applyChannelTypePatch(input, next)
+}
+
+// applyChannelSlugPatch refuses a malformed slug and the reserved one. "geral"
+// is reserved because the general channel is identified structurally, and a
+// second channel wearing its slug is a name collision waiting to be mistaken for
+// it.
+func applyChannelSlugPatch(input UpdateChannelInput, next *storage.UpdateChannelInput) error {
+	if input.Slug == "" {
+		return nil
+	}
+	slug := strings.ToLower(strings.TrimSpace(input.Slug))
+	if !slugRE.MatchString(slug) {
+		return fmt.Errorf("%w: slug must be lowercase alphanumeric with optional internal hyphens, no leading/trailing hyphens, max 63 chars", domain.ErrInvalidInput)
+	}
+	if slug == generalChannelSlug {
+		return fmt.Errorf("%w: geral is reserved", domain.ErrInvalidInput)
+	}
+	next.Slug = slug
+	return nil
+}
+
+// applyChannelDisplayNamePatch normalises through the same helper creation uses:
+// a rename must not be the way past a cap the create path enforces.
+func applyChannelDisplayNamePatch(input UpdateChannelInput, next *storage.UpdateChannelInput) error {
+	if input.DisplayName == "" {
+		return nil
+	}
+	displayName, err := domain.NormalizeChannelDisplayName(input.DisplayName)
+	if err != nil {
+		return err
+	}
+	next.DisplayName = displayName
+	return nil
+}
+
+// applyChannelCategoryPatch requires the category to belong to this workspace,
+// so a channel cannot be filed under a category from another one.
+func (s *ChannelService) applyChannelCategoryPatch(ctx context.Context, input UpdateChannelInput, next *storage.UpdateChannelInput) error {
+	if input.CategoryID == nil {
+		return nil
+	}
+	categoryID := strings.TrimSpace(*input.CategoryID)
+	if err := s.requireCategoryInWorkspace(ctx, input.WorkspaceID, categoryID); err != nil {
+		return err
+	}
+	next.CategoryID = categoryID
+	return nil
+}
+
+func applyChannelTypePatch(input UpdateChannelInput, next *storage.UpdateChannelInput) error {
+	if input.Type == nil {
+		return nil
+	}
+	if err := validateChannelType(*input.Type); err != nil {
+		return err
+	}
+	next.Type = *input.Type
+	return nil
 }
 
 // ArchiveChannel marks a non-general channel archived. It never hard-deletes.
@@ -454,4 +504,35 @@ func validateChannelType(t domain.ChannelType) error {
 		return fmt.Errorf("%w: type must be public or private", domain.ErrInvalidInput)
 	}
 	return nil
+}
+
+// ── Self-leave (issue #527) ──────────────────────────────────────────────────
+
+// LeaveChannel removes the caller's own membership from a channel.
+//
+// Deliberately not MemberService.RemoveMemberFromChannel with the caller as its
+// own target. That method is the administrative removal: it takes a workspace
+// moderation role and names a target user, and reaching it with "myself" would
+// mean a plain member could not leave at all — while an endpoint that accepted a
+// user ID from someone with no authority over anyone would be a privilege
+// escalation wearing the shape of a membership change. Leaving takes no role,
+// because the only row it can affect is the actor's own.
+//
+// Two structural refusals, and both are re-derived below in SQL rather than
+// trusted from here: the general channel cannot be left, and a channel outside
+// this workspace does not exist as far as this caller is concerned. The check
+// here is the fail-fast that produces a legible error; LeaveChannelSelf's is the
+// one that decides, serialized with the write.
+func (s *ChannelService) LeaveChannel(ctx context.Context, workspaceID, channelID, callerID string) (storage.LeaveConversationResult, error) {
+	if _, err := s.requireActiveWorkspaceMember(ctx, workspaceID, callerID); err != nil {
+		return storage.LeaveConversationResult{}, err
+	}
+	current, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, callerID)
+	if err != nil {
+		return storage.LeaveConversationResult{}, err
+	}
+	if !domain.CanLeaveChannel(current) {
+		return storage.LeaveConversationResult{}, domain.ErrGeneralChannelImmutable
+	}
+	return s.channels.LeaveChannelSelf(ctx, workspaceID, channelID, callerID)
 }

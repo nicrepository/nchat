@@ -42,7 +42,7 @@ func TestUploadAcceptsExactlyTheWorkspacePolicy(t *testing.T) {
 	f := newFixture(t)
 	withWorkspacePolicy(f, policyBytes)
 
-	view, err := f.upload(context.Background(), bytes.NewReader(make([]byte, policyBytes)), "exact.bin")
+	view, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), int(policyBytes))), "exact.txt")
 	if err != nil {
 		t.Fatalf("a file exactly at the limit must be accepted, got %v", err)
 	}
@@ -55,7 +55,7 @@ func TestUploadRejectsOneByteOverTheWorkspacePolicy(t *testing.T) {
 	f := newFixture(t)
 	withWorkspacePolicy(f, policyBytes)
 
-	_, err := f.upload(context.Background(), bytes.NewReader(make([]byte, policyBytes+1)), "over.bin")
+	_, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), int(policyBytes+1))), "over.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("expected ErrTooLarge, got %v", err)
 	}
@@ -78,7 +78,7 @@ func TestUploadOverTheLimitLeavesNoStoredObjectAndIsNeverScannable(t *testing.T)
 	f := newFixture(t)
 	withWorkspacePolicy(f, policyBytes)
 
-	_, err := f.upload(context.Background(), bytes.NewReader(make([]byte, policyBytes+1)), "over.bin")
+	_, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), int(policyBytes+1))), "over.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("expected ErrTooLarge, got %v", err)
 	}
@@ -99,7 +99,7 @@ func TestUploadOverTheLimitLeavesNoStoredObjectAndIsNeverScannable(t *testing.T)
 func TestUploadOverATightCeilingNeverCallsStorageAtAll(t *testing.T) {
 	f := newFixture(t, fixtureOptions{maxUploadBytes: 128, scanRequired: true})
 
-	_, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 129)), "over.bin")
+	_, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 129)), "over.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("expected ErrTooLarge, got %v", err)
 	}
@@ -114,7 +114,7 @@ func TestUploadFallsBackToTheDefaultWhenTheWorkspaceHasNoPolicy(t *testing.T) {
 
 	// Small enough to pass under the default and large enough to prove the
 	// budget is not zero.
-	view, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 4096)), "ok.bin")
+	view, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 4096)), "ok.txt")
 	if err != nil {
 		t.Fatalf("an absent policy must fall back to the default, got %v", err)
 	}
@@ -130,7 +130,7 @@ func TestUploadIgnoresAnOutOfRangeWorkspacePolicy(t *testing.T) {
 		f := newFixture(t)
 		withWorkspacePolicy(f, policy)
 
-		view, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 4096)), "ok.bin")
+		view, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 4096)), "ok.txt")
 		if err != nil {
 			t.Fatalf("policy %d must resolve to the default, got %v", policy, err)
 		}
@@ -146,13 +146,13 @@ func TestDeploymentCeilingNarrowsAWiderWorkspacePolicy(t *testing.T) {
 	f := newFixture(t, fixtureOptions{maxUploadBytes: 1024, scanRequired: true})
 	withWorkspacePolicy(f, uploadpolicy.MaxMaxUploadBytes)
 
-	if _, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 1024)), "at.bin"); err != nil {
+	if _, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 1024)), "at.txt"); err != nil {
 		t.Fatalf("a file at the ceiling must be accepted, got %v", err)
 	}
 
 	over := newFixture(t, fixtureOptions{maxUploadBytes: 1024, scanRequired: true})
 	withWorkspacePolicy(over, uploadpolicy.MaxMaxUploadBytes)
-	_, err := over.upload(context.Background(), bytes.NewReader(make([]byte, 1025)), "over.bin")
+	_, err := over.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 1025)), "over.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("the ceiling must still refuse, got %v", err)
 	}
@@ -164,7 +164,7 @@ func TestWorkspacePolicyNarrowerThanTheCeilingWins(t *testing.T) {
 	f := newFixture(t, fixtureOptions{maxUploadBytes: uploadpolicy.MaxMaxUploadBytes})
 	withWorkspacePolicy(f, policyBytes)
 
-	_, err := f.upload(context.Background(), bytes.NewReader(make([]byte, policyBytes+1)), "over.bin")
+	_, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), int(policyBytes+1))), "over.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("the workspace policy must be enforced, got %v", err)
 	}
@@ -175,7 +175,7 @@ func TestWorkspacePolicyNarrowerThanTheCeilingWins(t *testing.T) {
 func TestAReadFailureIsNotReportedAsTooLarge(t *testing.T) {
 	f := newFixture(t)
 	withWorkspacePolicy(f, 4096)
-	source := &failingReader{data: make([]byte, 1024), err: errors.New("connection reset")}
+	source := &failingReader{data: bytes.Repeat([]byte("x"), 1024), err: errors.New("connection reset")}
 
 	_, err := f.upload(context.Background(), source, "broken.bin")
 	if errors.Is(err, domain.ErrTooLarge) {

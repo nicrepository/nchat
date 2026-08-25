@@ -646,3 +646,90 @@ func canonicalizeUserID(s string) (string, error) {
 	}
 	return id.String(), nil
 }
+
+// ── Group rename and self-leave (issue #527) ─────────────────────────────────
+
+// RenameGroupInput and LeaveGroupInput carry an actor and a target, and nothing
+// else. There is no role, no capability and no participant list: a group's
+// authority is participation, re-derived inside the store's transaction, so
+// there is nothing here a client could assert about itself.
+type RenameGroupInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	Title          string
+}
+
+type LeaveGroupInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+}
+
+// RenameGroup sets a group conversation's title.
+//
+// Groups only, and that is enforced twice: this method is reached from a route
+// that exists for group conversations, and the store's statement requires
+// type = 'group', so a 1:1 conversation ID matches nothing and comes back as
+// ErrNotFound. A direct conversation has no title to change — its name is the
+// counterpart's, resolved per viewer — so renaming one is not a restricted
+// operation but an impossible one.
+//
+// Authorization is participation and is settled in the store, serialized with
+// the write. Nothing is checked here that the store does not check again.
+func (s *DMService) RenameGroup(ctx context.Context, input RenameGroupInput) (storage.RenameGroupResult, error) {
+	if strings.TrimSpace(input.WorkspaceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return storage.RenameGroupResult{}, fmt.Errorf("%w: workspace_id and conversation_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(input.CallerID)
+	if err != nil {
+		return storage.RenameGroupResult{}, err
+	}
+	title, err := normalizeGroupRenameTitle(input.Title)
+	if err != nil {
+		return storage.RenameGroupResult{}, err
+	}
+	return s.dms.RenameGroupConversation(ctx, storage.RenameGroupInput{
+		WorkspaceID:    input.WorkspaceID,
+		ConversationID: input.ConversationID,
+		CallerID:       callerID,
+		Title:          title,
+	})
+}
+
+// LeaveGroup removes the caller's own participation in a group.
+//
+// The actor is the only person this can affect: there is no target user in the
+// input and none in the store's statement, which updates the row matching the
+// caller. A 1:1 conversation is again unreachable — the store requires
+// type = 'group' — so "leaving a DM" is not a refused operation but an absent
+// one.
+func (s *DMService) LeaveGroup(ctx context.Context, input LeaveGroupInput) (storage.LeaveConversationResult, error) {
+	if strings.TrimSpace(input.WorkspaceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return storage.LeaveConversationResult{}, fmt.Errorf("%w: workspace_id and conversation_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(input.CallerID)
+	if err != nil {
+		return storage.LeaveConversationResult{}, err
+	}
+	return s.dms.LeaveGroupConversation(ctx, input.WorkspaceID, input.ConversationID, callerID)
+}
+
+// normalizeGroupRenameTitle trims and bounds a new group title.
+//
+// It shares maxDMTitleRunes with creation, deliberately, so a rename cannot be
+// the way past a cap creation enforces. It differs from normalizeDMTitle in one
+// respect and only one: creation accepts an empty title — a group with none is
+// named after its participants — whereas a *rename* to nothing is not a name,
+// it is a request with no content, and silently keeping the old title would
+// leave the dialog showing a change that never happened.
+func normalizeGroupRenameTitle(title string) (string, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", fmt.Errorf("%w: title is required", domain.ErrInvalidInput)
+	}
+	if utf8.RuneCountInString(title) > maxDMTitleRunes {
+		return "", fmt.Errorf("%w: title must be 120 characters or fewer", domain.ErrInvalidInput)
+	}
+	return title, nil
+}

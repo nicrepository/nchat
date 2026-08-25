@@ -775,8 +775,8 @@ func (h *Hub) PublishMembersAdded(
 	}
 }
 
-// PublishChannelUpdated broadcasts that one channel's metadata changed
-// (issue #527).
+// PublishConversationUpdated broadcasts that one conversation's metadata
+// changed (issue #527).
 //
 // Callers must invoke it only after the write has committed: the event tells
 // subscribers their view is stale, and one sent for a rename that then failed
@@ -787,19 +787,19 @@ func (h *Hub) PublishMembersAdded(
 // best-effort for other instances. The event carries no payload at all, so a
 // subscriber who may read the channel learns only that it changed; what it
 // changed to comes from the sidebar endpoint, which authorizes for itself.
-func (h *Hub) PublishChannelUpdated(ctx context.Context, workspaceID, channelID string) {
-	if workspaceID == "" || channelID == "" {
+func (h *Hub) PublishConversationUpdated(ctx context.Context, workspaceID string, targetType TargetType, targetID string) {
+	if workspaceID == "" || targetID == "" {
 		return
 	}
 	evt := Event{
-		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeChannelUpdated,
-		WorkspaceID: workspaceID, TargetType: TargetTypeChannel, TargetID: channelID,
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeConversationUpdated,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
 		EventID:          uuid.New().String(),
 		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {
-		h.logger.ErrorContext(ctx, "ws: marshal channel.updated event", "error", err)
+		h.logger.ErrorContext(ctx, "ws: marshal conversation.updated event", "error", err)
 		return
 	}
 	select {
@@ -810,7 +810,45 @@ func (h *Hub) PublishChannelUpdated(ctx context.Context, workspaceID, channelID 
 		return
 	}
 	if err := h.bus.Publish(ctx, evt); err != nil {
-		h.logger.WarnContext(ctx, "ws: channel update bus publish failed", "error", err)
+		h.logger.WarnContext(ctx, "ws: conversation update bus publish failed", "error", err)
+	}
+}
+
+// PublishConversationEvent broadcasts that a system message was persisted in a
+// channel or group (issue #527).
+//
+// Callers must invoke it only after the transaction that wrote both the change
+// and its event has committed, so a rolled-back rename or departure announces
+// nothing.
+//
+// Delivery follows pin.updated's route: the local broadcast queue re-checks each
+// subscriber's authorization at fan-out, and the bus publish is best-effort for
+// other instances. The message id travels, the message does not.
+func (h *Hub) PublishConversationEvent(ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID string) {
+	if workspaceID == "" || targetID == "" || messageID == "" {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeConversationEvent,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal conversation.event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: conversation event bus publish failed", "error", err)
 	}
 }
 
@@ -2543,8 +2581,8 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	switch evt.Type {
 	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
-		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeChannelUpdated,
-		EventTypeAttachmentStatus,
+		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeConversationUpdated,
+		EventTypeConversationEvent, EventTypeAttachmentStatus,
 		EventTypePresenceUpdated, EventTypeTypingUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
@@ -2681,7 +2719,7 @@ func canonicalizeRecipientScopedIDs(evt Event) (Event, bool) {
 func isTargetScopedEventWithoutMessage(eventType EventType) bool {
 	switch eventType {
 	case EventTypeMembersAdded, EventTypeAttachmentStatus,
-		EventTypePresenceUpdated, EventTypeTypingUpdated, EventTypeChannelUpdated:
+		EventTypePresenceUpdated, EventTypeTypingUpdated, EventTypeConversationUpdated:
 		return true
 	default:
 		return false
@@ -2694,7 +2732,7 @@ func canonicalizeTargetScopedIDs(evt Event) (Event, bool) {
 	if evt.MessageID != "" {
 		return Event{}, false
 	}
-	if evt.Type == EventTypeChannelUpdated {
+	if evt.Type == EventTypeConversationUpdated {
 		// The one event with no payload of its own. Anything attached to it
 		// belongs to a different event type and is relaying state nobody asked
 		// this one about, so it is dropped rather than forwarded.

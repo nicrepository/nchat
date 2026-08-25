@@ -10,6 +10,7 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 // recordingChannelUpdates captures the post-commit realtime signal so the tests
@@ -17,11 +18,17 @@ import (
 type recordingChannelUpdates struct {
 	workspaceIDs []string
 	channelIDs   []string
+	// Persisted system messages announced after commit (issue #527).
+	eventMessageIDs []string
 }
 
-func (r *recordingChannelUpdates) PublishChannelUpdated(_ context.Context, workspaceID, channelID string) {
+func (r *recordingChannelUpdates) PublishConversationUpdated(_ context.Context, workspaceID, _, targetID string) {
 	r.workspaceIDs = append(r.workspaceIDs, workspaceID)
-	r.channelIDs = append(r.channelIDs, channelID)
+	r.channelIDs = append(r.channelIDs, targetID)
+}
+
+func (r *recordingChannelUpdates) PublishConversationEvent(_ context.Context, _, _, _, messageID string) {
+	r.eventMessageIDs = append(r.eventMessageIDs, messageID)
 }
 
 func renameHandler(provider *fakeChannelProvider, updates *recordingChannelUpdates) *httpapi.ChannelHandler {
@@ -41,8 +48,23 @@ func renameRequest(channelID, body string) *http.Request {
 	return r
 }
 
-func renamed(name string) domain.Channel {
-	return domain.Channel{ID: createdChannelID, Slug: "infra", DisplayName: name, Type: domain.ChannelTypePublic}
+// renamed models what a committed rename returns: the channel plus the system
+// message the same transaction wrote (issue #527).
+func renamed(name string) storage.UpdateChannelResult {
+	return storage.UpdateChannelResult{
+		Channel: domain.Channel{
+			ID: createdChannelID, Slug: "infra", DisplayName: name, Type: domain.ChannelTypePublic,
+		},
+		Event: domain.Message{ID: "event-" + createdChannelID, Kind: domain.MessageKindSystem},
+	}
+}
+
+// renamedWithoutEvent models an update that changed no name, so the transaction
+// wrote no event and nothing must be announced for it.
+func renamedWithoutEvent(name string) storage.UpdateChannelResult {
+	result := renamed(name)
+	result.Event = domain.Message{}
+	return result
 }
 
 // The caller and the workspace come from the session. A body that tries to name
@@ -76,7 +98,29 @@ func TestChannelHandler_Rename_DerivesCallerAndWorkspaceServerSide(t *testing.T)
 		t.Fatalf("response display_name = %v, want Plataforma", data["display_name"])
 	}
 	if len(updates.channelIDs) != 1 || updates.channelIDs[0] != createdChannelID {
-		t.Fatalf("channel.updated published for %v, want exactly [%s]", updates.channelIDs, createdChannelID)
+		t.Fatalf("conversation.updated published for %v, want exactly [%s]", updates.channelIDs, createdChannelID)
+	}
+	// The system message the transaction wrote is announced too, and only after
+	// the service returned — that is, only after the commit (issue #527).
+	if len(updates.eventMessageIDs) != 1 || updates.eventMessageIDs[0] != "event-"+createdChannelID {
+		t.Fatalf("conversation.event published for %v, want the persisted message id", updates.eventMessageIDs)
+	}
+}
+
+// An update that renamed nothing has no event to announce, and must not invent
+// one: a timeline entry for "nothing changed" would be visible to everyone.
+func TestChannelHandler_Rename_PublishesNoEventWhenNothingWasRenamed(t *testing.T) {
+	provider := &fakeChannelProvider{updated: renamedWithoutEvent("Infra")}
+	updates := &recordingChannelUpdates{}
+
+	recorder := httptest.NewRecorder()
+	renameHandler(provider, updates).Rename(recorder, renameRequest(createdChannelID, `{"display_name":"Infra"}`))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(updates.eventMessageIDs) != 0 {
+		t.Fatalf("published %v for an update that renamed nothing", updates.eventMessageIDs)
 	}
 }
 
@@ -186,8 +230,9 @@ func TestChannelHandler_Rename_MapsDomainErrors(t *testing.T) {
 			if body := recorder.Body.String(); strings.Contains(body, "X") {
 				t.Fatalf("response echoed the submitted name: %s", body)
 			}
-			if len(updates.channelIDs) != 0 {
-				t.Fatalf("a refused rename published %d realtime events", len(updates.channelIDs))
+			if len(updates.channelIDs) != 0 || len(updates.eventMessageIDs) != 0 {
+				t.Fatalf("a refused rename published %d updates and %d events",
+					len(updates.channelIDs), len(updates.eventMessageIDs))
 			}
 		})
 	}

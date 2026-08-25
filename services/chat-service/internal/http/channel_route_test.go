@@ -125,6 +125,10 @@ type routeChannelStore struct {
 	// a refused rename proves it never got that far.
 	stored  map[string]domain.Channel
 	updates []storage.UpdateChannelInput
+	// events records the rename system messages the store wrote, as
+	// (actor, old, new) — so a route test can assert the event exists exactly
+	// when the rename did (issue #527).
+	events [][3]string
 }
 
 func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {

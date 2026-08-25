@@ -1,19 +1,87 @@
-import { useCallback, useEffect } from "react";
-import { Outlet } from "react-router";
+import { useCallback, useEffect, useState } from "react";
+import { Outlet, useLocation } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
+import type { ParticipantMedia } from "./useCallMedia";
 import "./ChatShell.css";
 import ChatSidebar from "./ChatSidebar";
+import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
 import type { ResourceCallKind } from "./callApi";
 import type { Call, CallType } from "./callState";
 import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
-import { useChatSidebar } from "./useChatSidebar";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
+import { useChatSidebar, type SidebarState } from "./useChatSidebar";
+
+/**
+ * The sidebar's data, or empty stand-ins while it is still loading.
+ *
+ * Stated once because five call sites below need the same "ready or nothing"
+ * answer, and repeating the discriminant at each of them is how one of them
+ * eventually forgets and reads a field off a loading state.
+ */
+function readySidebar(state: SidebarState): {
+  currentUserId: string;
+  channels: Channel[];
+  dms: DMConversation[];
+  attachmentLimits: WorkspaceAttachmentLimits;
+} {
+  if (state.status !== "ready")
+    return {
+      currentUserId: "",
+      channels: [],
+      dms: [],
+      attachmentLimits: {
+        maxUploadBytes: null,
+        maxFiles: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      },
+    };
+  return {
+    currentUserId: state.currentUserId,
+    channels: state.channels,
+    dms: state.dms,
+    attachmentLimits: state.attachmentLimits ?? {
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    },
+  };
+}
+
+/**
+ * Everything ActiveResourceCallBar (issue #642) needs to represent the
+ * user's OWN resource-call participation inside the channel/group-DM view
+ * that owns it — populated ONLY when CallSessionProvider's own
+ * resourcePresentationCall authority is non-null (issue #642 review): a
+ * proven call_id match against discovery, resource+media both settled
+ * (never connecting/reconnecting/error — the floating window keeps
+ * presenting those), and local ownership. `callId`/`startedAt` come
+ * straight from that same validated Call, never a second guess. Every
+ * other field is a pass-through of state/callbacks CallSessionProvider
+ * already computes — never a second source of media/lifecycle truth.
+ */
+export interface ActiveResourceCallSession {
+  callId: string;
+  startedAt: string;
+  participants: ParticipantMedia[];
+  localId: string;
+  localName: string;
+  localInitials: string;
+  localAvatarUrl?: string;
+  activeSpeakerId: string | null;
+  microphoneEnabled: boolean;
+  microphonePending: boolean;
+  onToggleMicrophone: () => void;
+  onLeave: () => void;
+  onOpenFullCall: () => void;
+}
 
 export interface ChatOutletContext {
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
+  attachmentLimits?: WorkspaceAttachmentLimits;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
    * Discovery only (issue #622 round 2): whether a channel/group-DM has an
@@ -37,10 +105,80 @@ export interface ChatOutletContext {
    * abort this brand-new attempt before it registers.
    */
   joinResourceCall?: (target: ResourceCallTarget) => void;
+  /** Present only while participating in a resource call with local ownership (issue #642). */
+  resourceCallSession?: ActiveResourceCallSession;
+}
+
+/**
+ * Resolves a row menu's target to the details panel's own vocabulary.
+ *
+ * The sidebar speaks the API's two kinds (channel / dm); the panel speaks three,
+ * because a group and a 1:1 render differently. The discriminant is `dm.type`,
+ * the server's own value, and never the name or the participant count.
+ *
+ * Returns null for a conversation the sidebar does not hold — a refetch may have
+ * removed it between the click and this call — so nothing opens over nothing.
+ */
+function resolveDetailsTarget(
+  kind: "channel" | "dm",
+  targetId: string,
+  dms: DMConversation[],
+): SidebarDetailsTarget | null {
+  if (kind === "channel") return { kind: "channel", id: targetId };
+  const dm = dms.find((item) => item.id === targetId);
+  if (!dm) return null;
+  return { kind: dm.type === "group" ? "group" : "direct", id: targetId };
+}
+
+/**
+ * Whether the conversation a details panel is open for is still one this user
+ * has (issue #527, code review).
+ *
+ * Derived from the canonical sidebar collection rather than from the route: a
+ * self-leave removes the row without changing the pathname, and a panel is only
+ * valid while its subject is.
+ */
+function detailsTargetExists(
+  target: SidebarDetailsTarget,
+  ready: { channels: Channel[]; dms: DMConversation[] },
+): boolean {
+  const collection = target.kind === "channel" ? ready.channels : ready.dms;
+  return collection.some((item) => item.id === target.id);
 }
 
 export default function ChatShell() {
-  const { state, retry, setPinned, markRead, renameChannel } = useChatSidebar();
+  const {
+    state,
+    retry,
+    setPinned,
+    markRead,
+    renameChannel,
+    renameGroup,
+    setMuted,
+    leaveConversation,
+  } = useChatSidebar();
+  // Details opened from a row menu, for that row's target (issue #527). Held
+  // here rather than in ChatMessageArea because the target may be a
+  // conversation other than the open one, and opening it must not navigate.
+  const { pathname } = useLocation();
+  // The route is part of the panel's identity, not something an effect syncs to
+  // it: navigating away closes the panel because the value stored alongside it
+  // stops matching, with no extra render pass. The panel is a peek at one
+  // conversation, not a second persistent surface to keep in step with a route.
+  const [sidebarDetails, setSidebarDetails] = useState<
+    (SidebarDetailsTarget & { pathname: string }) | null
+  >(null);
+  const ready = readySidebar(state);
+  // Two conditions, and both are about the target still being real. The route is
+  // part of the panel's identity, so navigating away closes it with no extra
+  // render pass; and the conversation must still be in the canonical list, so
+  // leaving the conversation the panel is showing closes it too — the row is
+  // gone, and a panel over a conversation this user can no longer see would keep
+  // polling for details it may not have.
+  const openDetailsTarget =
+    sidebarDetails?.pathname === pathname && detailsTargetExists(sidebarDetails, ready)
+      ? sidebarDetails
+      : null;
   const {
     calls,
     resource: resourceCall,
@@ -48,6 +186,11 @@ export default function ChatShell() {
     registerDirectory,
     registerIdentity,
     getResourceCall,
+    media,
+    expand,
+    leaveResourceParticipation,
+    localIdentity,
+    resourcePresentationCall,
   } = useCallSession();
   useEffect(() => registerIdentity(state.status, retry), [registerIdentity, retry, state.status]);
   useEffect(() => {
@@ -72,13 +215,63 @@ export default function ChatShell() {
       activeResourceTarget?.kind === kind && activeResourceTarget.id === id,
     [activeResourceTarget],
   );
+  const openSidebarDetails = useCallback(
+    (kind: "channel" | "dm", targetId: string) => {
+      const resolved = resolveDetailsTarget(
+        kind,
+        targetId,
+        state.status === "ready" ? state.dms : [],
+      );
+      if (resolved) setSidebarDetails({ ...resolved, pathname });
+    },
+    [state, pathname],
+  );
+
+  // #642 (review fix): gated on resourcePresentationCall alone — the single
+  // authority CallSessionProvider also uses to suppress its own
+  // FloatingCallWindow — never a looser, independently-recomputed check.
+  // Never undefined -> present the instant discovery/resource/media catch
+  // up out of a connecting/reconnecting/error/leaving state, and never
+  // present a frame earlier: that authority already accounts for a stale
+  // discovery call_id (call.admitted/call.accepted have no ordering
+  // guarantee) and for the "leaving" participation phase clearing
+  // synchronously, before the leave's own server round trip resolves.
+  const resourceCallSession: ActiveResourceCallSession | undefined = resourcePresentationCall
+    ? {
+        callId: resourcePresentationCall.call_id,
+        startedAt: resourcePresentationCall.created_at,
+        participants: media.participants,
+        localId: ready.currentUserId,
+        localName: localIdentity.name,
+        localInitials: localIdentity.initials,
+        localAvatarUrl: localIdentity.avatarUrl,
+        activeSpeakerId: media.activeSpeakerId,
+        microphoneEnabled: media.microphoneEnabled,
+        microphonePending: media.pendingControl === "microphone",
+        onToggleMicrophone: () => void media.toggleMicrophone(),
+        // Mirrors FloatingCallWindow's own resource onEnd exactly (issue
+        // #642 review, blocker 5): endResourceParticipation deliberately
+        // rethrows on failure — the error is already reflected through
+        // resource.status/resource.error, the existing retry authority —
+        // so the rejection must be swallowed here, never left unhandled.
+        onLeave: () => {
+          void leaveResourceParticipation().catch(() => undefined);
+        },
+        onOpenFullCall: () => {
+          expand();
+        },
+      }
+    : undefined;
+
   const outletContext: ChatOutletContext = {
-    currentUserId: state.status === "ready" ? state.currentUserId : "",
-    channels: state.status === "ready" ? state.channels : [],
-    dms: state.status === "ready" ? state.dms : [],
+    currentUserId: ready.currentUserId,
+    channels: ready.channels,
+    dms: ready.dms,
+    attachmentLimits: ready.attachmentLimits,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,
+    resourceCallSession,
     // Fresh join/rejoin gesture (issue #594 adversarial follow-up, round
     // 3): must go through joinResourceParticipation, never resourceCall.join
     // directly, so an old "left" for whatever this callId's participation
@@ -100,10 +293,19 @@ export default function ChatShell() {
         setPinned={setPinned}
         markRead={markRead}
         renameChannel={renameChannel}
+        renameGroup={renameGroup}
+        setMuted={setMuted}
+        leaveConversation={leaveConversation}
+        onOpenDetails={openSidebarDetails}
       />
       <main className="chat-app__main" aria-label="Área de mensagens">
         <Outlet context={outletContext} />
       </main>
+      <SidebarDetailsPanel
+        target={openDetailsTarget}
+        currentUserId={ready.currentUserId}
+        onClose={() => setSidebarDetails(null)}
+      />
     </div>
   );
 }

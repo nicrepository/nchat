@@ -21,8 +21,10 @@ import (
 // (boundaries, part headers) cannot make a legitimately sized file fail.
 const multipartOverhead = 8 << 10
 
-// uploadFormField is the single accepted multipart field name.
-const uploadFormField = "file"
+const (
+	uploadFormField    = "file"
+	uploadPurposeField = "purpose"
+)
 
 const (
 	errCodePayloadTooLarge    = "payload_too_large"
@@ -65,7 +67,27 @@ type AttachmentUseCases interface {
 	Download(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
 	Preview(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
 	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
+	CancelDraft(ctx context.Context, input service.CancelDraftInput) error
 	Ready() bool
+}
+
+// CancelDraft handles DELETE /attachments/{attachmentID}. Authorization uses
+// the authenticated uploader and all disallowed outcomes stay non-enumerating.
+func (h *AttachmentHandler) CancelDraft(w http.ResponseWriter, r *http.Request) {
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	err := h.useCases.CancelDraft(r.Context(), service.CancelDraftInput{
+		AttachmentID: r.PathValue("attachmentID"),
+		UploaderID:   principal.UserID,
+	})
+	if err != nil {
+		writeAttachmentError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // listAttachmentsResponse is the listing payload. The array is named rather
@@ -205,6 +227,23 @@ func (h *AttachmentHandler) upload(
 		h.failUpload(w, r, startedAt, kind, fmt.Errorf("%w: missing file part", domain.ErrInvalidInput))
 		return
 	}
+	purpose := ""
+	if part.FormName() == uploadPurposeField && part.FileName() == "" {
+		purposeBytes, readErr := io.ReadAll(io.LimitReader(part, 65))
+		_ = part.Close()
+		if readErr != nil || len(purposeBytes) > 64 || string(purposeBytes) != service.UploadPurposeMessageDraft {
+			h.failUpload(w, r, startedAt, kind,
+				fmt.Errorf("%w: invalid upload purpose", domain.ErrInvalidInput))
+			return
+		}
+		purpose = string(purposeBytes)
+		part, err = reader.NextPart()
+		if err != nil {
+			h.failUpload(w, r, startedAt, kind,
+				fmt.Errorf("%w: missing file part", domain.ErrInvalidInput))
+			return
+		}
+	}
 	defer func() { _ = part.Close() }()
 	if part.FormName() != uploadFormField || part.FileName() == "" {
 		h.failUpload(w, r, startedAt, kind,
@@ -216,6 +255,7 @@ func (h *AttachmentHandler) upload(
 		Target:       target,
 		Filename:     part.FileName(),
 		DeclaredMIME: part.Header.Get("Content-Type"),
+		Purpose:      purpose,
 		Content:      &singleFileReader{part: part, reader: reader},
 	})
 	if err != nil {
@@ -729,6 +769,8 @@ func attachmentErrorStatus(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrTooLarge):
 		return http.StatusRequestEntityTooLarge, errCodePayloadTooLarge
+	case errors.Is(err, domain.ErrUnsupportedMedia):
+		return http.StatusUnsupportedMediaType, errCodeUnsupportedMedia
 	case errors.Is(err, domain.ErrInvalidInput):
 		return http.StatusBadRequest, httputil.ErrCodeBadRequest
 	case errors.Is(err, domain.ErrUnauthorized):
@@ -777,6 +819,8 @@ func attachmentErrorMessage(status int, code string) string {
 		return "file exceeds the configured size limit"
 	case http.StatusBadRequest:
 		return "invalid upload request"
+	case http.StatusUnsupportedMediaType:
+		return "file type is not supported"
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusForbidden:

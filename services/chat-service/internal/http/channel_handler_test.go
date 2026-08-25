@@ -11,6 +11,7 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 const createdChannelID = "77777777-7777-7777-7777-777777777777"
@@ -31,15 +32,31 @@ type fakeChannelProvider struct {
 	lastCallParticipantsInput  service.ChannelCallParticipantProfilesInput
 	callParticipantsCalls      int
 
-	updated         domain.Channel
+	updated         storage.UpdateChannelResult
 	updateErr       error
 	lastUpdateInput service.UpdateChannelInput
 	updateCalls     int
+
+	leaveErr   error
+	lastLeave  [3]string
+	leaveCalls int
+}
+
+// LeaveChannel records the caller's own departure (issue #527).
+func (f *fakeChannelProvider) LeaveChannel(_ context.Context, workspaceID, channelID, callerID string) (storage.LeaveConversationResult, error) {
+	f.leaveCalls++
+	f.lastLeave = [3]string{workspaceID, channelID, callerID}
+	if f.leaveErr != nil {
+		return storage.LeaveConversationResult{}, f.leaveErr
+	}
+	return storage.LeaveConversationResult{
+		Event: domain.Message{ID: "event-" + channelID, Kind: domain.MessageKindSystem},
+	}, nil
 }
 
 func (f *fakeChannelProvider) UpdateChannel(
 	_ context.Context, input service.UpdateChannelInput,
-) (domain.Channel, error) {
+) (storage.UpdateChannelResult, error) {
 	f.updateCalls++
 	f.lastUpdateInput = input
 	return f.updated, f.updateErr

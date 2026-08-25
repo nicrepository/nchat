@@ -20,10 +20,27 @@ import (
 // mutation obeys — and then the actor's workspace-management membership, held
 // FOR SHARE so a concurrent revocation is serialised against the update rather
 // than racing it.
+// expectRenameEvent sets up the conversation_renamed system message the same
+// transaction writes whenever the display name actually changed (issue #527).
+func expectRenameEvent(mock pgxmock.PgxPoolIface, channelID string) {
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{
+				"id", "workspace_id", "channel_id", "dm_conversation_id",
+				"sender_id", "kind", "event_type", "created_at",
+			}).AddRow("event-1", "ws-1", channelID, "", "owner-1", "system",
+				"conversation_renamed", time.Now()),
+		)
+}
+
 func expectUpdateChannelPreamble(mock pgxmock.PgxPoolIface, channelID, workspaceID, callerID string) {
-	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, display_name FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
 		WithArgs(channelID).
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(channelID))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).AddRow(channelID, "Antigo"))
 	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin'\).*FOR SHARE OF wm`).
 		WithArgs(workspaceID, callerID).
 		WillReturnRows(pgxmock.NewRows([]string{"authorized"}).AddRow(true))
@@ -644,6 +661,7 @@ func TestPGXChannelStore_UpdateChannel_WorkspaceBound(t *testing.T) {
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team-updates", "Team Updates", "public", 20).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "cat-1", "team-updates", "Team Updates", "public", "active", false, 20, "owner-1", now, now))
+	expectRenameEvent(mock, "ch-1")
 	mock.ExpectCommit()
 
 	store := storage.NewPGXChannelStore(mock)
@@ -655,7 +673,7 @@ func TestPGXChannelStore_UpdateChannel_WorkspaceBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if ch.Slug != "team-updates" || ch.WorkspaceID != "ws-1" {
+	if ch.Channel.Slug != "team-updates" || ch.Channel.WorkspaceID != "ws-1" {
 		t.Fatalf("unexpected channel: %+v", ch)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -677,6 +695,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateEnsuresMembershipInTransac
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "team", "Team", "private", "active", false, 0, "owner-1", now, now))
+	expectRenameEvent(mock, "ch-1")
 	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
 		WithArgs("ch-1", "owner-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
@@ -691,7 +710,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateEnsuresMembershipInTransac
 	if err != nil {
 		t.Fatalf("UpdateChannel: %v", err)
 	}
-	if ch.Type != domain.ChannelTypePrivate {
+	if ch.Channel.Type != domain.ChannelTypePrivate {
 		t.Fatalf("unexpected channel: %+v", ch)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -713,6 +732,7 @@ func TestPGXChannelStore_UpdateChannel_PublicToPrivateRollsBackWhenMembershipFai
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "private", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "team", "Team", "private", "active", false, 0, "owner-1", now, now))
+	expectRenameEvent(mock, "ch-1")
 	mock.ExpectExec(`INSERT INTO chat\.channel_members`).
 		WithArgs("ch-1", "owner-1", "member").
 		WillReturnError(errors.New("membership insert failed"))
@@ -859,9 +879,9 @@ func TestPGXChannelStore_UpdateChannel_RefusesWhenAuthorityWasRevoked(t *testing
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, display_name FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
 		WithArgs("ch-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-1"))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).AddRow("ch-1", "Antigo"))
 	// No row: the role was demoted, the membership suspended or removed, or the
 	// workspace disabled. The query does not say which.
 	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*FOR SHARE OF wm`).
@@ -895,9 +915,9 @@ func TestPGXChannelStore_UpdateChannel_NotFoundBeforeAuthorizing(t *testing.T) {
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, display_name FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
 		WithArgs("missing").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}))
 	mock.ExpectRollback()
 
 	store := storage.NewPGXChannelStore(mock)
@@ -923,9 +943,9 @@ func TestPGXChannelStore_UpdateChannel_AuthorizationSQLIsAnOwnerAdminAllowlist(t
 	defer mock.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT id FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
+	mock.ExpectQuery(`SELECT id, display_name FROM chat\.channels WHERE id = \$1::uuid FOR UPDATE`).
 		WithArgs("ch-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-1"))
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).AddRow("ch-1", "Antigo"))
 	// The pattern is the assertion: an active membership, an active workspace,
 	// the two roles, and the row held FOR SHARE.
 	mock.ExpectQuery(`(?s)wm\.status = 'active'.*wm\.role IN \('owner', 'admin'\).*FOR SHARE OF wm`).
@@ -935,6 +955,7 @@ func TestPGXChannelStore_UpdateChannel_AuthorizationSQLIsAnOwnerAdminAllowlist(t
 		WithArgs("ws-1", "ch-1", pgxmock.AnyArg(), "team", "Team", "public", 0).
 		WillReturnRows(pgxmock.NewRows(channelCols()).
 			AddRow("ch-1", "ws-1", "", "team", "Team", "public", "active", false, 0, "owner-1", time.Now(), time.Now()))
+	expectRenameEvent(mock, "ch-1")
 	mock.ExpectCommit()
 
 	store := storage.NewPGXChannelStore(mock)

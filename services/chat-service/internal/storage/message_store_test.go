@@ -69,6 +69,9 @@ func messageCols() []string {
 		"edited_at", "edit_count", "deleted_at",
 		"created_at", "updated_at",
 		"link_safety_state",
+		// The structured conversation event (issue #527). Non-null only on
+		// kind='system' rows, which the database enforces.
+		"event_type", "event_payload",
 	}
 }
 
@@ -84,6 +87,8 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		// link_safety_state: the empty state, which is what the overwhelming
 		// majority of messages carry — they contain no links at all (issue #135).
 		"",
+		// A user message carries no conversation event.
+		"", []byte(nil),
 	}
 }
 
@@ -160,6 +165,7 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // link safety fingerprint
 			pgxmock.AnyArg(), // create request fingerprint
 			pgxmock.AnyArg(), // initial link safety state
+			pgxmock.AnyArg(), // aggregate attachment byte limit
 		).
 		WillReturnRows(rows)
 }
@@ -213,6 +219,7 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
 				).
 				WillReturnError(dbErr)
@@ -560,7 +567,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -583,7 +590,7 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -612,7 +619,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"99999999-9999-9999-9999-999999999999"},
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
@@ -798,6 +805,8 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		&editedAt, 1, &deletedAt,
 		now, now,
 		"",
+		// No conversation event: this is a user message (issue #527).
+		"", []byte(nil),
 		"Test User", "test@example.com", false,
 	}
 	row = append(row, emptyQuoteRow()...)
@@ -932,8 +941,8 @@ func TestPGXMessageStore_EditMessage_SnapshotsAndUpdatesInOneTransaction(t *test
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
 		WithArgs("ws-1", "msg-1", "user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
-			AddRow("user-1", "active", nil, now.Add(-time.Minute), &window, now))
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "user", "active", nil, now.Add(-time.Minute), &window, now))
 	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("history-1"))
@@ -982,8 +991,8 @@ func TestPGXMessageStore_EditMessage_ExpiredRollsBackBeforeSnapshot(t *testing.T
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
 		WithArgs("ws-1", "msg-1", "user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
-			AddRow("user-1", "active", nil, now.Add(-901*time.Second), &window, now))
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "user", "active", nil, now.Add(-901*time.Second), &window, now))
 	mock.ExpectRollback()
 
 	_, err := storage.NewPGXMessageStore(mock).EditMessage(context.Background(), storage.EditMessageInput{
@@ -1003,8 +1012,8 @@ func TestPGXMessageStore_EditMessage_AtWindowLimitSucceeds(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
 		WithArgs("ws-1", "msg-1", "user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
-			AddRow("user-1", "active", nil, now.Add(-900*time.Second), &window, now))
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "user", "active", nil, now.Add(-900*time.Second), &window, now))
 	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("history-1"))
@@ -1038,8 +1047,8 @@ func TestPGXMessageStore_EditMessage_MissingSnapshotRowRollsBack(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT m\.sender_id::text.*FOR UPDATE OF m`).
 		WithArgs("ws-1", "msg-1", "user-1").
-		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
-			AddRow("user-1", "active", nil, now.Add(-time.Minute), &window, now))
+		WillReturnRows(pgxmock.NewRows([]string{"sender_id", "kind", "status", "deleted_at", "created_at", "edit_window_seconds", "now"}).
+			AddRow("user-1", "user", "active", nil, now.Add(-time.Minute), &window, now))
 	mock.ExpectQuery(`INSERT INTO chat\.message_edit_history`).
 		WithArgs("msg-1", "user-1", now).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}))
@@ -1323,6 +1332,8 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		&editedAt, 1, &deletedAt,
 		now, now,
 		"",
+		// No conversation event: this is a user message (issue #527).
+		"", []byte(nil),
 		"Test User", "test@example.com", false,
 	}
 	row = append(row, emptyQuoteRow()...)

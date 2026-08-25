@@ -42,6 +42,14 @@ interface SidebarChannelFixture extends SidebarActivityFixture {
    * menu offers "Renomear canal".
    */
   can_rename?: boolean;
+  /** Issue #527: this viewer's own notification preference. */
+  muted?: boolean;
+  /**
+   * Issue #527: the workspace's structural general channel. The menu omits
+   * rename, mute and leave for it, and the mocks refuse all three — exactly as
+   * the server does in SQL.
+   */
+  is_general?: boolean;
 }
 
 interface SidebarDMFixture extends SidebarActivityFixture {
@@ -55,6 +63,8 @@ interface SidebarDMFixture extends SidebarActivityFixture {
    * — both are shapes the UI must cope with, so neither is defaulted here.
    */
   counterpart?: { user_id: string; display_name: string; avatar_url?: string };
+  /** Issue #527: this viewer's own notification preference. */
+  muted?: boolean;
 }
 
 export interface DMCandidateFixture {
@@ -81,6 +91,9 @@ interface RawMessage {
   reactions: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
   is_favorited: boolean;
   is_forwarded: boolean;
+  /** Issue #527: structured conversation event, on system messages only. */
+  event_type?: string;
+  event_payload?: Record<string, string>;
   quoted?: RawQuote;
   reference?: RawReference;
 }
@@ -156,6 +169,10 @@ export interface MessagingScenario {
     sidebarPins: Array<{ targetId: string; action: "add" | "remove" }>;
     /** Issue #527: what PATCH /api/chat/channels/{id} actually received. */
     channelRenames: Array<{ channelId: string; displayName: string }>;
+    /** Issue #527: group renames, mutes and departures the UI performed. */
+    groupRenames: Array<{ conversationId: string; title: string }>;
+    mutes: Array<{ targetType: "channel" | "dm"; targetId: string; muted: boolean }>;
+    leaves: Array<{ targetType: "channel" | "dm"; targetId: string }>;
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
@@ -318,6 +335,11 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     is_forwarded: overrides.is_forwarded ?? false,
     quoted: overrides.quoted,
     reference: overrides.reference,
+    // Issue #527: the structured conversation event, on system messages only.
+    // The database pairs these with kind='system', so a user message never
+    // carries them and neither does a fixture built without them.
+    event_type: overrides.event_type,
+    event_payload: overrides.event_payload,
   };
 }
 
@@ -422,6 +444,9 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       pins: [],
       sidebarPins: [],
       channelRenames: [],
+      groupRenames: [],
+      mutes: [],
+      leaves: [],
       reactions: [],
       dmCreates: [],
       groupCreates: [],
@@ -1433,6 +1458,124 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
   await page.route("**/api/chat/channels/*/read", markConversationRead);
   await page.route("**/api/chat/dm/*/read", markConversationRead);
 
+  // Mute / unmute (issue #527). A per-user preference, so the mock stores it on
+  // the fixture the sidebar payload is built from — that is what makes the state
+  // survive a reload inside a scenario. The general channel is refused here for
+  // the same reason the server refuses it in SQL.
+  const mutateNotificationPref = async (route: Route) => {
+    const request = route.request();
+    const { targetType, id } = sidebarTargetFromURL(request.url());
+    const item =
+      targetType === "channel"
+        ? scenario.sidebarChannels.find((channel) => channel.id === id)
+        : scenario.sidebarDMs.find((dm) => dm.id === id);
+    if (!item) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    if (targetType === "channel" && isGeneralChannel(scenario, id)) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    const muted = request.method() === "POST";
+    scenario.requests.mutes.push({ targetType, targetId: id, muted });
+    item.muted = muted;
+    await route.fulfill({ status: 204 });
+  };
+  await page.route("**/api/chat/channels/*/mute", mutateNotificationPref);
+  await page.route("**/api/chat/dm/*/mute", mutateNotificationPref);
+
+  // Self-leave (issue #527). The conversation leaves this viewer's sidebar
+  // because the canonical listing stops returning it — the same thing the real
+  // server does — never because the client hid a row.
+  const leaveConversation = async (route: Route) => {
+    const request = route.request();
+    if (request.method() !== "DELETE") {
+      await route.fallback();
+      return;
+    }
+    const { targetType, id } = sidebarTargetFromURL(request.url());
+    if (targetType === "channel" && isGeneralChannel(scenario, id)) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: errorBody("forbidden"),
+      });
+      return;
+    }
+    const list = targetType === "channel" ? scenario.sidebarChannels : scenario.sidebarDMs;
+    const index = list.findIndex((item) => item.id === id);
+    if (index < 0) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    scenario.requests.leaves.push({ targetType, targetId: id });
+    list.splice(index, 1);
+    await route.fulfill({ status: 204 });
+  };
+  await page.route("**/api/chat/channels/*/membership", leaveConversation);
+  await page.route("**/api/chat/dm/*/membership", leaveConversation);
+
+  // Group rename (issue #527). Groups only: a 1:1 conversation is refused, the
+  // way the real statement refuses it by requiring type = 'group'.
+  await page.route("**/api/chat/dm/*", async (route) => {
+    const request = route.request();
+    if (request.method() !== "PATCH") {
+      await route.fallback();
+      return;
+    }
+    const { id } = sidebarTargetFromURL(request.url());
+    const group = scenario.sidebarDMs.find((dm) => dm.id === id && dm.type === "group");
+    if (!group) {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/json",
+        body: errorBody("not_found"),
+      });
+      return;
+    }
+    const raw = (request.postDataJSON() ?? {}) as { title?: unknown };
+    const title = typeof raw.title === "string" ? raw.title.trim() : "";
+    if (!title) {
+      await route.fulfill({
+        status: 400,
+        contentType: "application/json",
+        body: errorBody("bad_request"),
+      });
+      return;
+    }
+    scenario.requests.groupRenames.push({ conversationId: id, title });
+    const previous = group.name;
+    group.name = title;
+    // The real rename writes a system message in the same transaction; the mock
+    // appends the same structured event so the timeline can render it.
+    appendConversationEvent(
+      scenario,
+      { kind: "dm", targetId: id },
+      {
+        event_type: "conversation_renamed",
+        event_payload: { old_name: previous, new_name: title },
+      },
+    );
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: { id, title } }),
+    });
+  });
+
   // Rename (issue #527). Models the real endpoint closely enough for the flows
   // that matter: PATCH only, the capability is re-checked server-side (a channel
   // without can_rename answers 403 however the request was produced), the name
@@ -1472,7 +1615,16 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
       return;
     }
     scenario.requests.channelRenames.push({ channelId: id, displayName });
+    const previousName = channel.display_name;
     channel.display_name = displayName;
+    appendConversationEvent(
+      scenario,
+      { kind: "channel", targetId: id },
+      {
+        event_type: "conversation_renamed",
+        event_payload: { old_name: previousName, new_name: displayName },
+      },
+    );
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -1483,6 +1635,48 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
 
 function errorBody(code: string): string {
   return JSON.stringify({ error: { code, message: code } });
+}
+
+/** Splits `/api/chat/{channels|dm}/{id}/...` into the pair the mocks key on. */
+function sidebarTargetFromURL(url: string): { targetType: "channel" | "dm"; id: string } {
+  const parts = new URL(url).pathname.split("/");
+  const marker = parts.indexOf("channels") >= 0 ? "channels" : "dm";
+  return {
+    targetType: marker === "channels" ? "channel" : "dm",
+    id: parts[parts.indexOf(marker) + 1] ?? "",
+  };
+}
+
+/** The general channel is structural; the mocks refuse it exactly as SQL does. */
+function isGeneralChannel(scenario: MessagingScenario, channelId: string): boolean {
+  return scenario.sidebarChannels.some((channel) => channel.id === channelId && channel.is_general);
+}
+
+/**
+ * Appends the system message a mutation persists (issue #527).
+ *
+ * Structured, like the real row: an event type and a payload of facts, with the
+ * actor being the message's sender. The sentence is the client's to build.
+ */
+function appendConversationEvent(
+  scenario: MessagingScenario,
+  target: { kind: TargetKind; targetId: string },
+  event: { event_type: string; event_payload: Record<string, string> },
+) {
+  // messagesFor owns the map's key shape (kind + id) and creates the list when a
+  // conversation has none yet, so appending through it keeps the event on the
+  // same timeline the listing route serves.
+  const existing = messagesFor(scenario, target.kind, target.targetId);
+  existing.push(
+    makeMessage({
+      id: `${target.targetId}-event-${existing.length}`,
+      kind: "system",
+      sender_id: CURRENT_USER_ID,
+      sender_display_name: CURRENT_USER_NAME,
+      body_text: "",
+      ...event,
+    }),
+  );
 }
 
 async function installInteractionMocks(

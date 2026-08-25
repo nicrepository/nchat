@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,7 +366,9 @@ type MessageService struct {
 	// provider work. Zero values disable the corresponding ceiling.
 	linkScanCapacity storage.LinkScanCapacity
 	// admissionMetrics reports capacity decisions. Nil is the no-op reporter.
-	admissionMetrics *urlsafety.PipelineMetrics
+	admissionMetrics          *urlsafety.PipelineMetrics
+	maxMessageAttachments     int
+	maxMessageAttachmentBytes int64
 }
 
 // SetMentionLabelCache enables the optional read-through cache. Configure it
@@ -389,12 +390,24 @@ func (s *MessageService) SetMentionLabelCacheTTL(ttl time.Duration) {
 // NewMessageService creates a MessageService backed by the provided stores.
 func NewMessageService(channels storage.ChannelStore, dms storage.DMStore, messages storage.MessageStore) *MessageService {
 	return &MessageService{
-		channels:         channels,
-		dms:              dms,
-		messages:         messages,
-		mentionLabelsTTL: defaultMentionLabelCacheTTL,
-		publishSlots:     make(chan struct{}, DefaultPublishQueueCapacity),
+		channels:                  channels,
+		dms:                       dms,
+		messages:                  messages,
+		mentionLabelsTTL:          defaultMentionLabelCacheTTL,
+		publishSlots:              make(chan struct{}, DefaultPublishQueueCapacity),
+		maxMessageAttachments:     domain.MaxMessageAttachments,
+		maxMessageAttachmentBytes: domain.DefaultMaxMessageAttachmentBytes,
 	}
+}
+
+func (s *MessageService) WithMessageAttachmentLimits(count int, bytes int64) *MessageService {
+	if count > 0 && count <= domain.MaxMessageAttachments {
+		s.maxMessageAttachments = count
+	}
+	if bytes > 0 {
+		s.maxMessageAttachmentBytes = bytes
+	}
+	return s
 }
 
 // SetPublisher attaches an event publisher. Call after creating both the service
@@ -429,7 +442,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		WorkspaceID: workspaceID, TargetID: input.ChannelID, TargetField: "channel_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
-	})
+	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -490,6 +503,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		MentionedUserIDs:       mentionedUserIDs,
 		MentionedChannelIDs:    mentionedChannelIDs,
 		AttachmentIDs:          attachmentIDs,
+		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
 	}, links, body, replayInput, "create channel message")
 	if err != nil {
 		return domain.Message{}, err
@@ -537,7 +551,7 @@ type createRequest struct {
 // attachment count and shape, body length, body format — which is why it runs
 // first: input that could never name a valid message costs no query and no
 // provider quota.
-func normalizeCreateRequest(input createRequestInput) (createRequest, error) {
+func normalizeCreateRequest(input createRequestInput, maxAttachments int) (createRequest, error) {
 	request := createRequest{
 		TargetID: strings.TrimSpace(input.TargetID),
 		SenderID: strings.TrimSpace(input.SenderID),
@@ -547,7 +561,7 @@ func normalizeCreateRequest(input createRequestInput) (createRequest, error) {
 		return createRequest{}, fmt.Errorf("%w: workspace_id, %s, and sender_id are required",
 			domain.ErrInvalidInput, input.TargetField)
 	}
-	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs)
+	attachmentIDs, err := normalizeAttachmentIDs(input.AttachmentIDs, maxAttachments)
 	if err != nil {
 		return createRequest{}, err
 	}
@@ -714,22 +728,25 @@ type createIdentity struct {
 // invalidates old values rather than letting a request that differs in the new
 // field compare equal to one recorded before it existed.
 const createIdentityVersion = "create.v1"
+const orderedAttachmentIdentityVersion = "create.v2"
 
 // fingerprint serialises the identity deterministically.
 //
 // Length-prefixed rather than delimited, so no combination of fields can be
 // confused with a different one by concatenation — ("ab","c") and ("a","bc")
-// must not hash alike. Attachments are sorted because the client's ordering of a
-// set it re-sends is not part of what the message means; that is future-proofing
-// while domain.MaxMessageAttachments is 1, and it costs one sort of a
-// single-element slice. Everything else is taken in a fixed order.
+// must not hash alike. Zero and one attachment retain create.v1 compatibility;
+// a multi-attachment message uses create.v2 and preserves order because that
+// order is rendered to every recipient. Everything else is taken in a fixed order.
 func (i createIdentity) fingerprint() string {
-	attachments := append([]string(nil), i.AttachmentIDs...)
-	sort.Strings(attachments)
+	attachments := i.AttachmentIDs
+	version := createIdentityVersion
+	if len(attachments) > 1 {
+		version = orderedAttachmentIdentityVersion
+	}
 
 	digest := sha256.New()
 	for _, field := range []string{
-		createIdentityVersion,
+		version,
 		i.DestinationType, i.DestinationID,
 		i.BodyText, i.BodyFormat,
 		i.ParentMessageID, i.ForwardedFromID, i.ReferencedMessageID,
@@ -1004,7 +1021,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		WorkspaceID: workspaceID, TargetID: input.ConversationID, TargetField: "conversation_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
-	})
+	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -1052,6 +1069,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
 		AttachmentIDs:          attachmentIDs,
+		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
 	}, links, body, replayInput, "create dm message")
 	if err != nil {
 		return domain.Message{}, err
@@ -1530,13 +1548,16 @@ func validateMessageContent(body string, attachmentCount int) error {
 // too many ids, an empty or malformed one, or the same id twice. A duplicate is
 // an error rather than something to silently collapse, because a client sending
 // one is not describing the message it thinks it is.
-func normalizeAttachmentIDs(rawIDs []string) ([]string, error) {
+func normalizeAttachmentIDs(rawIDs []string, maxAttachments int) ([]string, error) {
 	if len(rawIDs) == 0 {
 		return nil, nil
 	}
-	if len(rawIDs) > domain.MaxMessageAttachments {
+	if maxAttachments < 1 || maxAttachments > domain.MaxMessageAttachments {
+		maxAttachments = domain.MaxMessageAttachments
+	}
+	if len(rawIDs) > maxAttachments {
 		return nil, fmt.Errorf("%w: at most %d attachment_ids are allowed",
-			domain.ErrInvalidInput, domain.MaxMessageAttachments)
+			domain.ErrInvalidInput, maxAttachments)
 	}
 	ids := make([]string, 0, len(rawIDs))
 	seen := make(map[string]struct{}, len(rawIDs))

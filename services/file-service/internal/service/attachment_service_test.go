@@ -97,27 +97,54 @@ func TestUploadToConversationRecordsTheDMDestination(t *testing.T) {
 	}
 }
 
+func TestMessageDraftUploadGetsAServerControlledExpiry(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		UserID:      testUserID, SessionID: testSessionID,
+	})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	before := time.Now().UTC().Add(23 * time.Hour)
+	_, err = f.service.Upload(context.Background(), service.UploadInput{
+		Target: target, Filename: "draft.txt", DeclaredMIME: "text/plain",
+		Purpose: service.UploadPurposeMessageDraft, Content: strings.NewReader("draft body"),
+	})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	created, _, _ := f.store.snapshot()
+	if created[0].DraftExpiresAt == nil || created[0].DraftExpiresAt.Before(before) ||
+		created[0].DraftExpiresAt.After(time.Now().UTC().Add(25*time.Hour)) {
+		t.Fatalf("unexpected server draft expiry: %v", created[0].DraftExpiresAt)
+	}
+}
+
 // The client's declared type is recorded but never trusted: the served type
 // comes from the real bytes.
-func TestUploadDetectsTheContentTypeFromTheBytes(t *testing.T) {
+func TestUploadRejectsActiveContentDisguisedAsAnImage(t *testing.T) {
 	f := newFixture(t)
-	view, err := f.uploadTo(context.Background(),
+	_, err := f.uploadTo(context.Background(),
 		domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
 		strings.NewReader("<html><script>alert(1)</script></html>"),
 		"totally-an-image.png", "image/png")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, domain.ErrUnsupportedMedia) {
+		t.Fatalf("active content must be rejected, got %v", err)
 	}
-	if strings.HasPrefix(view.ContentType, "image/") {
-		t.Fatalf("the declared type must not win, got %q", view.ContentType)
+	assertNothingPersisted(t, f)
+}
+
+func TestUploadRejectsActiveMarkupBeyondTheDetectionWindowAndCleansThePartialObject(t *testing.T) {
+	f := newFixture(t)
+	payload := strings.Repeat("safe text ", 80) + "<script>alert(1)</script>"
+	_, err := f.uploadTo(context.Background(),
+		domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		strings.NewReader(payload), "notes.txt", "text/plain")
+	if !errors.Is(err, domain.ErrUnsupportedMedia) {
+		t.Fatalf("active markup must be rejected across the full stream, got %v", err)
 	}
-	created, uploaded, _ := f.store.snapshot()
-	if created[0].DeclaredMIME != "image/png" {
-		t.Fatalf("the declared type must be kept for auditing, got %q", created[0].DeclaredMIME)
-	}
-	if uploaded[0].DetectedMIME == created[0].DeclaredMIME {
-		t.Fatal("the detected type must be recorded separately from the declared one")
-	}
+	assertCompensated(t, f)
 }
 
 func TestUploadNormalisesTheFilenameBeforePersisting(t *testing.T) {
@@ -165,7 +192,7 @@ func TestUploadEnforcesTheConfiguredCapOnBytesActuallyRead(t *testing.T) {
 
 	// One byte over the cap, streamed: Content-Length is irrelevant here, the
 	// limit is applied to what is read.
-	_, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 1025)), "big.bin")
+	_, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 1025)), "big.txt")
 	if !errors.Is(err, domain.ErrTooLarge) {
 		t.Fatalf("expected ErrTooLarge, got %v", err)
 	}
@@ -174,7 +201,7 @@ func TestUploadEnforcesTheConfiguredCapOnBytesActuallyRead(t *testing.T) {
 
 func TestUploadAcceptsExactlyTheCap(t *testing.T) {
 	f := newFixture(t, fixtureOptions{maxUploadBytes: 1024})
-	view, err := f.upload(context.Background(), bytes.NewReader(make([]byte, 1024)), "exact.bin")
+	view, err := f.upload(context.Background(), bytes.NewReader(bytes.Repeat([]byte("x"), 1024)), "exact.txt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -198,7 +225,7 @@ func TestUploadRejectsMoreThanOneFile(t *testing.T) {
 func TestUploadTreatsATruncatedRequestAsAClientError(t *testing.T) {
 	f := newFixture(t)
 	// A body larger than the sniff window so the failure lands during storage.
-	source := &failingReader{data: make([]byte, 4096), err: io.ErrUnexpectedEOF}
+	source := &failingReader{data: bytes.Repeat([]byte("x"), 4096), err: io.ErrUnexpectedEOF}
 
 	_, err := f.upload(context.Background(), source, "truncated.bin")
 	if !errors.Is(err, domain.ErrInvalidInput) {
@@ -1107,3 +1134,124 @@ type lyingReader struct{ io.Reader }
 
 func (r *lyingReader) Len() int    { return 1 << 30 }
 func (r *lyingReader) Size() int64 { return 1 << 30 }
+
+type draftStoreStub struct {
+	*fakeStore
+	cancelAttachmentID string
+	cancelUploaderID   string
+	cancelErr          error
+	expireLimit        int
+	expireCount        int
+	expireErr          error
+}
+
+func newDraftStoreStub() *draftStoreStub {
+	return &draftStoreStub{fakeStore: newFakeStore()}
+}
+
+func (s *draftStoreStub) CancelDraft(_ context.Context, attachmentID, uploaderID string) error {
+	s.cancelAttachmentID = attachmentID
+	s.cancelUploaderID = uploaderID
+	return s.cancelErr
+}
+
+func (s *draftStoreStub) ExpireDrafts(_ context.Context, limit int) (int, error) {
+	s.expireLimit = limit
+	return s.expireCount, s.expireErr
+}
+
+func attachmentServiceWithStore(store service.AttachmentStore) *service.AttachmentService {
+	return service.NewAttachmentService(nil, store, nil, nil, 0, false, nil, nil)
+}
+
+func TestCancelDraftValidatesIdentifiersBeforeCallingTheStore(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input service.CancelDraftInput
+	}{
+		{"missing attachment", service.CancelDraftInput{UploaderID: testUserID}},
+		{"missing uploader", service.CancelDraftInput{AttachmentID: testChannelID}},
+		{"invalid attachment", service.CancelDraftInput{AttachmentID: "not-a-uuid", UploaderID: testUserID}},
+		{"invalid uploader", service.CancelDraftInput{AttachmentID: testChannelID, UploaderID: "not-a-uuid"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newDraftStoreStub()
+			err := attachmentServiceWithStore(store).CancelDraft(context.Background(), tc.input)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("expected ErrInvalidInput, got %v", err)
+			}
+			if store.cancelAttachmentID != "" || store.cancelUploaderID != "" {
+				t.Fatalf("store called with %q, %q", store.cancelAttachmentID, store.cancelUploaderID)
+			}
+		})
+	}
+}
+
+func TestCancelDraftRequiresDraftCapableStore(t *testing.T) {
+	err := attachmentServiceWithStore(newFakeStore()).CancelDraft(context.Background(), service.CancelDraftInput{
+		AttachmentID: testChannelID,
+		UploaderID:   testUserID,
+	})
+	if !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("expected ErrDependenciesUnavailable, got %v", err)
+	}
+}
+
+func TestCancelDraftDelegatesExactIdentifiersAndPropagatesErrors(t *testing.T) {
+	store := newDraftStoreStub()
+	svc := attachmentServiceWithStore(store)
+	input := service.CancelDraftInput{AttachmentID: testChannelID, UploaderID: testUserID}
+	if err := svc.CancelDraft(context.Background(), input); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.cancelAttachmentID != input.AttachmentID || store.cancelUploaderID != input.UploaderID {
+		t.Fatalf("delegated identifiers = %q, %q", store.cancelAttachmentID, store.cancelUploaderID)
+	}
+
+	store.cancelErr = domain.ErrNotFound
+	if err := svc.CancelDraft(context.Background(), input); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected delegated ErrNotFound, got %v", err)
+	}
+}
+
+func TestDraftExpiryUsesConfiguredLimitAndReturnsStoreResult(t *testing.T) {
+	store := newDraftStoreStub()
+	store.expireCount = 3
+	svc := service.NewDraftExpiryService(store, 25)
+	got, err := svc.ProcessDue(context.Background())
+	if err != nil || got != 3 {
+		t.Fatalf("ProcessDue() = %d, %v; want 3, nil", got, err)
+	}
+	if store.expireLimit != 25 {
+		t.Fatalf("expiry limit = %d, want 25", store.expireLimit)
+	}
+}
+
+func TestDraftExpiryFallsBackToBoundedDefaultAndPropagatesErrors(t *testing.T) {
+	for _, limit := range []int{0, -1, 101} {
+		store := newDraftStoreStub()
+		store.expireErr = errors.New("database unavailable")
+		got, err := service.NewDraftExpiryService(store, limit).ProcessDue(context.Background())
+		if got != 0 || !errors.Is(err, store.expireErr) {
+			t.Fatalf("limit %d: ProcessDue() = %d, %v", limit, got, err)
+		}
+		if store.expireLimit != 50 {
+			t.Fatalf("limit %d: delegated limit = %d, want 50", limit, store.expireLimit)
+		}
+	}
+}
+
+func TestDraftExpiryFailsClosedWithoutDependency(t *testing.T) {
+	var nilService *service.DraftExpiryService
+	for name, svc := range map[string]*service.DraftExpiryService{
+		"nil service": nilService,
+		"nil store":   service.NewDraftExpiryService(nil, 25),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := svc.ProcessDue(context.Background())
+			if got != 0 || !errors.Is(err, domain.ErrDependenciesUnavailable) {
+				t.Fatalf("ProcessDue() = %d, %v", got, err)
+			}
+		})
+	}
+}

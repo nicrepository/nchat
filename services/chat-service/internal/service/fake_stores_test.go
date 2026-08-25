@@ -74,6 +74,9 @@ type fakeChannelStore struct {
 	getVisibleBySlugCalls  int
 	creatorMembershipSeeds int
 	archiveCalls           int
+
+	leftChannels [][3]string
+	leaveErr     error
 }
 
 func (f *fakeChannelStore) CreateCategory(_ context.Context, _ storage.CreateCategoryInput) (domain.ChannelCategory, error) {
@@ -162,25 +165,46 @@ func (f *fakeChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ str
 	f.listVisibleCalls++
 	return f.visibleChannels, f.listVisibleErr
 }
-func (f *fakeChannelStore) UpdateChannel(_ context.Context, input storage.UpdateChannelInput) (domain.Channel, error) {
-	f.lastUpdateInput = input
-	if f.updateErr != nil {
-		return domain.Channel{}, f.updateErr
+
+// LeaveChannelSelf records the actor's own departure (issue #527). The fake
+// keeps only what the service asserts on; the transaction and the system message
+// are proved against PostgreSQL in the storage package.
+func (f *fakeChannelStore) LeaveChannelSelf(_ context.Context, workspaceID, channelID, callerID string) (storage.LeaveConversationResult, error) {
+	f.leftChannels = append(f.leftChannels, [3]string{workspaceID, channelID, callerID})
+	if f.leaveErr != nil {
+		return storage.LeaveConversationResult{}, f.leaveErr
 	}
-	if f.updatedChannel.ID != "" {
-		return f.updatedChannel, nil
-	}
-	return domain.Channel{
-		ID:          input.ChannelID,
-		WorkspaceID: input.WorkspaceID,
-		CategoryID:  input.CategoryID,
-		Slug:        input.Slug,
-		DisplayName: input.DisplayName,
-		Type:        input.Type,
-		Status:      domain.ChannelStatusActive,
-		Position:    input.Position,
+	return storage.LeaveConversationResult{
+		Event: domain.Message{ID: "event-" + channelID, Kind: domain.MessageKindSystem},
 	}, nil
 }
+
+func (f *fakeChannelStore) UpdateChannel(_ context.Context, input storage.UpdateChannelInput) (storage.UpdateChannelResult, error) {
+	f.lastUpdateInput = input
+	if f.updateErr != nil {
+		return storage.UpdateChannelResult{}, f.updateErr
+	}
+	channel := f.updatedChannel
+	if channel.ID == "" {
+		channel = domain.Channel{
+			ID:          input.ChannelID,
+			WorkspaceID: input.WorkspaceID,
+			CategoryID:  input.CategoryID,
+			Slug:        input.Slug,
+			DisplayName: input.DisplayName,
+			Type:        input.Type,
+			Status:      domain.ChannelStatusActive,
+			Position:    input.Position,
+		}
+	}
+	// The real store writes the rename event in the same transaction; the fake
+	// reports one so the handler's publish path is exercised (issue #527).
+	return storage.UpdateChannelResult{
+		Channel: channel,
+		Event:   domain.Message{ID: "event-" + input.ChannelID, Kind: domain.MessageKindSystem},
+	}, nil
+}
+
 func (f *fakeChannelStore) ArchiveChannel(_ context.Context, workspaceID, channelID string) (domain.Channel, error) {
 	f.archiveCalls++
 	if f.archiveErr != nil {

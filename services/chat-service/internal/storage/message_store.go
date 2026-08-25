@@ -89,6 +89,9 @@ type CreateMessageInput struct {
 	// database in the same statement that inserts the message, and a message is
 	// not created at all when any of them fails.
 	AttachmentIDs []string
+	// MaxAttachmentBytes is the server-owned aggregate size ceiling applied in
+	// the same statement that locks and associates all candidate attachments.
+	MaxAttachmentBytes int64
 
 	// Status is the lifecycle state the message is created in. Empty means
 	// active, which is what every path that carries no link uses.
@@ -550,7 +553,9 @@ func messageColumns(alias string) string {
 	COALESCE(` + p + `referenced_message_id::text, ''),
 	` + p + `edited_at, ` + p + `edit_count, ` + p + `deleted_at,
 	` + p + `created_at, ` + p + `updated_at,
-	` + p + `link_safety_state`
+	` + p + `link_safety_state,
+	COALESCE(` + p + `event_type, ''),
+	COALESCE(` + p + `event_payload, '{}'::jsonb)`
 }
 
 // listMessageColumns returns messageColumns plus sender display info from
@@ -607,6 +612,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 	var editedAt, deletedAt *time.Time
 	var quote domain.QuotedMessage
 	var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
+	var eventPayload []byte
 	destinations := []any{
 		&msg.ID, &msg.WorkspaceID,
 		&msg.ChannelID, &msg.DMConversationID,
@@ -616,6 +622,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&editedAt, &msg.EditCount, &deletedAt,
 		&msg.CreatedAt, &msg.UpdatedAt,
 		(*string)(&msg.LinkSafety),
+		&msg.EventType, &eventPayload,
 		&msg.SenderDisplayName, &msg.SenderEmail,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
@@ -624,6 +631,9 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 	destinations = append(destinations, extra...)
 	err := row.Scan(destinations...)
 	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := decodeConversationEvent(&msg, eventPayload); err != nil {
 		return domain.Message{}, err
 	}
 	if editedAt != nil {
@@ -664,6 +674,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	if bodyFormat == "" {
 		bodyFormat = domain.MessageBodyFormatV1
 	}
+	maxAttachmentBytes := input.MaxAttachmentBytes
+	if maxAttachmentBytes <= 0 {
+		maxAttachmentBytes = domain.DefaultMaxMessageAttachmentBytes
+	}
 	// Authorization and reference integrity are enforced atomically in one INSERT.
 	//
 	// The auth subquery (UNION ALL of channel branch + DM branch) yields exactly one
@@ -702,6 +716,22 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				SELECT id::uuid AS attachment_id, ord
 				FROM unnest($13::text[]) WITH ORDINALITY AS ids(id, ord)
 			),
+			authorized_attachments AS MATERIALIZED (
+				SELECT a.id AS attachment_id, a.size_bytes, candidate.ord
+				FROM attachment_candidates candidate
+				JOIN files.attachments a ON a.id = candidate.attachment_id
+				WHERE a.workspace_id = $1::uuid
+				  AND a.channel_id IS NOT DISTINCT FROM $2::uuid
+				  AND a.conversation_id IS NOT DISTINCT FROM $3::uuid
+				  AND a.uploader_id = $4::uuid
+				  AND a.status IN ('pending_scan', 'clean')
+				  AND a.deleted_at IS NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM chat.message_attachments existing
+					WHERE existing.attachment_id = a.id
+				  )
+				FOR UPDATE OF a
+			),
 			-- RF-32 attachment authorization. A client sends only ids, so every
 			-- property that decides whether a link may exist is re-read here from
 			-- files.attachments — never taken from the request:
@@ -727,22 +757,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			-- invalid reference produces.
 			invalid_attachments AS (
 				SELECT 1
-				FROM attachment_candidates candidate
-				WHERE NOT EXISTS (
-					SELECT 1
-					FROM files.attachments a
-					WHERE a.id = candidate.attachment_id
-					  AND a.workspace_id = $1::uuid
-					  AND a.channel_id IS NOT DISTINCT FROM $2::uuid
-					  AND a.conversation_id IS NOT DISTINCT FROM $3::uuid
-					  AND a.uploader_id = $4::uuid
-					  AND a.status IN ('pending_scan', 'clean')
-					  AND a.deleted_at IS NULL
-					  AND NOT EXISTS (
-						SELECT 1 FROM chat.message_attachments existing
-						WHERE existing.attachment_id = a.id
-					  )
-				)
+				WHERE (SELECT COUNT(*) FROM authorized_attachments) <>
+				      (SELECT COUNT(*) FROM attachment_candidates)
+				   OR (SELECT COALESCE(SUM(size_bytes), 0) FROM authorized_attachments) > $20::bigint
 			),
 			invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
@@ -856,7 +873,12 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, edit_count, deleted_at, created_at, updated_at,
-			          link_safety_state
+			          link_safety_state,
+			          -- Always NULL here: CreateMessage writes user messages, and a
+			          -- system message is written by its own event path. The columns
+			          -- are still projected because the outer SELECT reads this CTE
+			          -- through messageColumns, which names them (issue #527).
+			          event_type, event_payload
 		),
 		-- A published message notifies its mentions immediately, exactly as it
 		-- always has. A withheld one must not: a notification is a side effect
@@ -892,8 +914,15 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			INSERT INTO chat.message_attachments (message_id, attachment_id, position)
 			SELECT inserted.id, candidate.attachment_id, candidate.ord - 1
 			FROM inserted
-			CROSS JOIN attachment_candidates candidate
+			CROSS JOIN authorized_attachments candidate
 			RETURNING attachment_id
+		),
+		published_attachments AS (
+			UPDATE files.attachments AS a
+			SET draft_expires_at = NULL, updated_at = now()
+			FROM attachment_links AS linked
+			WHERE a.id = linked.attachment_id
+			RETURNING a.id
 		),
 		-- RF-21. Same statement again, for the same reason: a withheld message
 		-- and the URLs it is waiting on are one atomic fact. A commit in which
@@ -933,6 +962,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.LinkSafetyFingerprint,
 		input.RequestFingerprint,
 		string(input.LinkSafetyState),
+		maxAttachmentBytes,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
@@ -1117,6 +1147,10 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
 			          edited_at, edit_count, deleted_at, created_at, updated_at,
 			          link_safety_state,
+			          -- Always NULL here: a forward is a user message. The columns
+			          -- are still projected because the outer SELECT reads this CTE
+			          -- through messageColumns, which names them (issue #527).
+			          event_type, event_payload,
 			          (xmax <> 0) AS replayed
 		),
 		-- RF-21, same atomicity argument as CreateMessage's: the withheld
@@ -1167,14 +1201,14 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 	var editWindowSeconds *int
 	var databaseNow time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT m.sender_id::text, m.status, m.deleted_at, m.created_at,
+		SELECT m.sender_id::text, m.kind, m.status, m.deleted_at, m.created_at,
 		       w.edit_window_seconds, clock_timestamp()
 		FROM chat.messages m`+messageAccessJoins("$3")+`
 		WHERE m.workspace_id = $1 AND m.id = $2
 		  AND `+messageAccessPredicate("$3")+`
 		FOR UPDATE OF m`,
 		input.WorkspaceID, input.MessageID, input.EditorID,
-	).Scan(&current.SenderID, (*string)(&current.Status), &deletedAt, &current.CreatedAt, &editWindowSeconds, &databaseNow)
+	).Scan(&current.SenderID, (*string)(&current.Kind), (*string)(&current.Status), &deletedAt, &current.CreatedAt, &editWindowSeconds, &databaseNow)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Message{}, domain.ErrNotFound
@@ -1589,6 +1623,11 @@ func (s *PGXMessageStore) ValidateRefMessageInTarget(ctx context.Context, worksp
 		WHERE m.id = $1
 		  AND m.workspace_id = $2
 		  AND m.status = 'active'
+		  -- Reply parents and forward provenance both presuppose something a
+		  -- person said. A system message is an event, has no body to quote and
+		  -- cannot be a thread root, so it is not a valid reference here
+		  -- (issue #527). The cross-channel forward path already required this.
+		  AND m.kind = 'user'
 		  AND m.channel_id IS NOT DISTINCT FROM $3
 		  AND m.dm_conversation_id IS NOT DISTINCT FROM $4
 		  AND `+messageAccessPredicate("$5"),
@@ -1624,6 +1663,10 @@ func (s *PGXMessageStore) ResolveMessageReferences(ctx context.Context, workspac
 		WHERE m.workspace_id = $1::uuid
 		  AND m.status = 'active'
 		  AND m.deleted_at IS NULL
+		  -- A quote shows what somebody wrote. A system message has no body to
+		  -- show, so quoting one would render an empty preview; it is simply not
+		  -- a referenceable message (issue #527).
+		  AND m.kind = 'user'
 		  AND `+messageAccessPredicate("$2"),
 		workspaceID, userID, messageIDs,
 	)
@@ -2070,6 +2113,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 		var editedAt, deletedAt *time.Time
 		var quote domain.QuotedMessage
 		var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
+		var eventPayload []byte
 		dest := []any{
 			&msg.ID, &msg.WorkspaceID,
 			&msg.ChannelID, &msg.DMConversationID,
@@ -2079,6 +2123,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&editedAt, &msg.EditCount, &deletedAt,
 			&msg.CreatedAt, &msg.UpdatedAt,
 			(*string)(&msg.LinkSafety),
+			&msg.EventType, &eventPayload,
 		}
 		if withSender {
 			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
@@ -2090,6 +2135,9 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 		err := rows.Scan(dest...)
 		if err != nil {
 			return nil, fmt.Errorf("scan message row: %w", err)
+		}
+		if err := decodeConversationEvent(&msg, eventPayload); err != nil {
+			return nil, err
 		}
 		if editedAt != nil {
 			msg.EditedAt = *editedAt

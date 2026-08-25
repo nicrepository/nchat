@@ -40,6 +40,7 @@ func NewFencedAttachmentStore(pool Pool, fence TransactionFence) *PGXAttachmentS
 var (
 	_ service.ScanResultStore        = (*PGXAttachmentStore)(nil)
 	_ service.AttachmentRemovalStore = (*PGXAttachmentStore)(nil)
+	_ service.DraftAttachmentStore   = (*PGXAttachmentStore)(nil)
 )
 
 func NewPGXAttachmentStore(pool Pool) *PGXAttachmentStore {
@@ -81,15 +82,16 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 			channel_id, conversation_id,
 			original_filename, declared_mime,
 			storage_provider, storage_object_key,
-			envelope_version, dek_wrap_version, status
+			envelope_version, dek_wrap_version, status, draft_expires_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 		attachment.ID, attachment.WorkspaceID, attachment.UploaderID,
 		string(attachment.Destination.Kind), channelID, conversationID,
 		attachment.Filename, attachment.DeclaredMIME,
 		attachment.StorageProvider, attachment.StorageObjectKey,
 		attachment.EnvelopeVersion, attachment.KeyWrapVersion,
 		string(domain.StatusPendingUpload),
+		attachment.DraftExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("create pending attachment: %w", err)
@@ -189,6 +191,100 @@ func (s *PGXAttachmentStore) MarkFailed(ctx context.Context, attachmentID, failu
 		return fmt.Errorf("mark attachment failed: %w", err)
 	}
 	return nil
+}
+
+// CancelDraft atomically hides a caller-owned, unpublished message draft and
+// queues its stored object for deletion. The candidate intentionally includes
+// an already deleted row, making a repeated cancellation return success.
+func (s *PGXAttachmentStore) CancelDraft(ctx context.Context, attachmentID, uploaderID string) error {
+	if s == nil || s.pool == nil {
+		return domain.ErrDependenciesUnavailable
+	}
+	if attachmentID == "" || uploaderID == "" {
+		return fmt.Errorf("%w: attachment and uploader are required", domain.ErrInvalidInput)
+	}
+	var found bool
+	err := s.pool.QueryRow(ctx, `
+		WITH candidate AS MATERIALIZED (
+			SELECT a.id, a.storage_object_key
+			FROM files.attachments AS a
+			WHERE a.id = $1
+			  AND a.uploader_id = $2
+			  AND a.draft_expires_at IS NOT NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM chat.message_attachments AS ma
+				WHERE ma.attachment_id = a.id
+			  )
+			FOR UPDATE OF a
+		), removed AS (
+			UPDATE files.attachments AS a
+			SET deleted_at = COALESCE(a.deleted_at, now()),
+				preview_status = CASE WHEN a.preview_status = 'pending' THEN 'unsupported' ELSE a.preview_status END,
+				preview_next_attempt_at = CASE WHEN a.preview_status = 'pending' THEN NULL ELSE a.preview_next_attempt_at END,
+				scan_next_attempt_at = NULL,
+				updated_at = now()
+			FROM candidate AS c
+			WHERE a.id = c.id
+			RETURNING c.storage_object_key
+		), queued AS (
+			INSERT INTO files.object_cleanup_jobs (object_key)
+			SELECT storage_object_key FROM removed
+			ON CONFLICT (object_key) DO NOTHING
+		)
+		SELECT EXISTS (SELECT 1 FROM candidate)`, attachmentID, uploaderID).Scan(&found)
+	if err != nil {
+		return fmt.Errorf("cancel attachment draft: %w", err)
+	}
+	if !found {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// ExpireDrafts claims a bounded batch with SKIP LOCKED, rechecks that no
+// message association exists while holding each row lock, then soft-deletes
+// and queues the original objects in the same statement.
+func (s *PGXAttachmentStore) ExpireDrafts(ctx context.Context, limit int) (int, error) {
+	if s == nil || s.pool == nil {
+		return 0, domain.ErrDependenciesUnavailable
+	}
+	if limit <= 0 || limit > 100 {
+		return 0, fmt.Errorf("%w: invalid expiry batch size", domain.ErrInvalidInput)
+	}
+	var expired int
+	err := s.pool.QueryRow(ctx, `
+		WITH candidates AS MATERIALIZED (
+			SELECT a.id, a.storage_object_key
+			FROM files.attachments AS a
+			WHERE a.draft_expires_at <= now()
+			  AND a.deleted_at IS NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM chat.message_attachments AS ma
+				WHERE ma.attachment_id = a.id
+			  )
+			ORDER BY a.draft_expires_at, a.id
+			LIMIT $1
+			FOR UPDATE OF a SKIP LOCKED
+		), removed AS (
+			UPDATE files.attachments AS a
+			SET deleted_at = now(),
+				preview_status = CASE WHEN a.preview_status = 'pending' THEN 'unsupported' ELSE a.preview_status END,
+				preview_next_attempt_at = CASE WHEN a.preview_status = 'pending' THEN NULL ELSE a.preview_next_attempt_at END,
+				scan_next_attempt_at = NULL,
+				updated_at = now()
+			FROM candidates AS c
+			WHERE a.id = c.id
+			RETURNING c.storage_object_key
+		), queued AS (
+			INSERT INTO files.object_cleanup_jobs (object_key)
+			SELECT storage_object_key FROM removed
+			ON CONFLICT (object_key) DO NOTHING
+		)
+		SELECT count(*) FROM removed`, limit).Scan(&expired)
+	if err != nil {
+		return 0, fmt.Errorf("expire attachment drafts: %w", err)
+	}
+	return expired, nil
 }
 
 // markScanRejectedQuery applies an antimalware verdict of "rejected" and
@@ -710,6 +806,12 @@ const (
 		  AND a.workspace_id = $1
 		  AND a.channel_id = $2
 		  AND a.status = ANY($3)
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM chat.message_attachments AS ma
+		      JOIN chat.messages AS m ON m.id = ma.message_id
+		      WHERE ma.attachment_id = a.id AND m.status <> 'active'
+		  )
 		ORDER BY a.created_at DESC, a.id DESC
 		LIMIT $4`
 
@@ -722,6 +824,12 @@ const (
 		  AND a.workspace_id = $1
 		  AND a.conversation_id = $2
 		  AND a.status = ANY($3)
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM chat.message_attachments AS ma
+		      JOIN chat.messages AS m ON m.id = ma.message_id
+		      WHERE ma.attachment_id = a.id AND m.status <> 'active'
+		  )
 		ORDER BY a.created_at DESC, a.id DESC
 		LIMIT $4`
 )
@@ -852,6 +960,12 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		CROSS JOIN active_session AS active
 		WHERE a.id = $3
 		  AND a.deleted_at IS NULL
+		  AND NOT EXISTS (
+		      SELECT 1
+		      FROM chat.message_attachments AS ma
+		      JOIN chat.messages AS m ON m.id = ma.message_id
+		      WHERE ma.attachment_id = a.id AND m.status <> 'active'
+		  )
 		  AND (
 		    (a.destination_kind = 'channel' AND EXISTS (
 		        SELECT 1

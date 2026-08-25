@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
@@ -27,6 +28,9 @@ const (
 	defaultCallStartRateLimitWindowSecs = 60
 	defaultTypingRateLimitMaxActions    = 20
 	defaultTypingRateLimitWindowSecs    = 30
+	defaultMaxMessageAttachments        = 10
+	defaultMaxMessageAttachmentBytes    = int64(512 << 20)
+	maxMessageAttachmentBytesCeiling    = int64(5 << 30)
 
 	// wsInstanceIDMaxLen matches sourceInstanceIDMaxLen in the ws package.
 	// Kept in sync manually; both must allow the same set of valid identifiers.
@@ -39,12 +43,14 @@ const (
 var wsInstanceIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 type Config struct {
-	ServiceName              string
-	Env                      string
-	Port                     int
-	ReadHeaderTimeoutSeconds int
-	DatabaseURL              string
-	DBConnectTimeoutSeconds  int
+	ServiceName               string
+	Env                       string
+	Port                      int
+	ReadHeaderTimeoutSeconds  int
+	DatabaseURL               string
+	DBConnectTimeoutSeconds   int
+	MaxMessageAttachments     int
+	MaxMessageAttachmentBytes int64
 
 	// AuthJWTHMACSecret is the shared HMAC secret used to validate access tokens
 	// issued by auth-service. Must match AUTH_JWT_HMAC_SECRET in auth-service.
@@ -171,6 +177,8 @@ func Load() Config {
 		ReadHeaderTimeoutSeconds:    platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
 		DatabaseURL:                 platformconfig.GetString("DATABASE_URL", ""),
 		DBConnectTimeoutSeconds:     platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		MaxMessageAttachments:       platformconfig.GetInt("CHAT_MAX_MESSAGE_ATTACHMENTS", defaultMaxMessageAttachments),
+		MaxMessageAttachmentBytes:   int64(platformconfig.GetInt("CHAT_MAX_MESSAGE_ATTACHMENT_BYTES", int(defaultMaxMessageAttachmentBytes))),
 		AuthJWTHMACSecret:           platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
 		AuthJWTIssuer:               platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer),
 		AuthJWTAudience:             platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience),
@@ -232,6 +240,18 @@ func Load() Config {
 // Both are start-up errors, the same way file-service treats them. There is no
 // third state: either the check is off on purpose, or it is on and it works.
 func (c Config) Validate() error {
+	// Config values built programmatically predate these fields and use the Go
+	// zero value to mean "unset". Both downstream builders retain their safe
+	// defaults when both are zero. A partial zero remains invalid: it represents
+	// an incomplete explicit policy, not a legacy config.
+	if c.MaxMessageAttachments != 0 || c.MaxMessageAttachmentBytes != 0 {
+		if c.MaxMessageAttachments < 1 || c.MaxMessageAttachments > defaultMaxMessageAttachments {
+			return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENTS must be between 1 and %d", defaultMaxMessageAttachments)
+		}
+		if c.MaxMessageAttachmentBytes < 1 || c.MaxMessageAttachmentBytes > maxMessageAttachmentBytesCeiling {
+			return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENT_BYTES must be between 1 and %d", maxMessageAttachmentBytesCeiling)
+		}
+	}
 	return c.validateLinkSafety()
 }
 
