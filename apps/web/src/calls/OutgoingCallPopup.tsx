@@ -36,7 +36,7 @@ export default function OutgoingCallPopup({
           />
         </div>
         <div>
-          <strong>{name}</strong>
+          <strong className="outgoing-call__name">{name}</strong>
           <span>{callType === "video" ? "Chamada de vídeo" : "Chamada de voz"}</span>
           {/* role="status" carries its own implicit polite live region — the
               single element that actually needs to be announced, never the
