@@ -1,5 +1,5 @@
 /*
- * ChatSidebar — dark sidebar for NIC Chat.
+ * ChatSidebar — dark sidebar for Nchat.
  * Scoped under .chat-sidebar to avoid leaking into auth/admin pages.
  * Overrides design tokens for the prototype purple/dark palette,
  * following the same pattern as AdminShell.css.
@@ -42,23 +42,15 @@
   color: inherit;
 }
 
-.chat-sidebar__brand-mark {
-  width: 32px;
-  height: 32px;
-  border-radius: 6px;
-  background: rgba(168, 101, 247, 0.1);
-  border: 1px solid rgba(168, 101, 247, 0.22);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.chat-sidebar__brand-img {
+  width: 30px;
+  height: 34px;
+  object-fit: contain;
   flex-shrink: 0;
-  overflow: hidden;
 }
 
-.chat-sidebar__brand-img {
-  width: 22px;
-  height: 22px;
-  object-fit: contain;
+.chat-sidebar__brand-copy {
+  min-width: 0;
 }
 
 .chat-sidebar__brand-title {
@@ -68,6 +60,9 @@
   margin: 0;
   color: #fff;
   line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-sidebar__brand-sub {
@@ -75,6 +70,9 @@
   font-weight: 500;
   color: var(--cs-sidebar-muted);
   margin: 1px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── CTA ─────────────────────────────────────────────────────────────────────── */
