@@ -728,7 +728,7 @@ func (s *AttachmentService) preparePendingAttachment(
 	if err != nil {
 		return pendingAttachment{}, nil, fmt.Errorf("prepare attachment key: %w", err)
 	}
-	plaintext := io.Reader(io.MultiReader(bytes.NewReader(content.head), source))
+	var plaintext io.Reader = io.MultiReader(bytes.NewReader(content.head), source)
 	var markupScan *activeMarkupReader
 	if content.scanMarkup {
 		markupScan = &activeMarkupReader{source: plaintext}
