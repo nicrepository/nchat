@@ -3,15 +3,16 @@ import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
 import { useSelfProfile } from "../profile/selfProfile";
-import { partitionDMs, type Channel, type DMConversation } from "./chatTypes";
+import { partitionDMs, type Channel, type ChannelCategory, type DMConversation } from "./chatTypes";
 import ConversationActionsMenu from "./ConversationActionsMenu";
 import {
   actionsTriggerLabel,
   conversationActions,
-  pinTargetKind,
+  conversationTargetKind,
   type ConversationActionId,
   type ConversationTarget,
 } from "./conversationActions";
+import LeaveConversationDialog from "./LeaveConversationDialog";
 import RenameChannelDialog from "./RenameChannelDialog";
 import { avatarColorFor, initialsFrom } from "./messageDisplay";
 import NewConversationDialog from "./NewConversationDialog";
@@ -347,7 +348,7 @@ function RowActions({
 }: RowActionsProps & { target: ConversationTarget }) {
   const key = targetKey(target);
   return (
-    <>
+    <span className="chat-sidebar__trailing">
       {target.pinned && <PinnedIndicator />}
       <ConversationActionsMenu
         triggerLabel={actionsTriggerLabel(target)}
@@ -356,7 +357,7 @@ function RowActions({
         onOpenChange={(open) => onOpenChange(key, open)}
         onAction={(action) => onAction(target, action)}
       />
-    </>
+    </span>
   );
 }
 
@@ -404,6 +405,8 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
           name: ch.name,
           pinned: Boolean(ch.pinnedAt),
           canRename: ch.canRename,
+          isGeneral: ch.isGeneral,
+          muted: Boolean(ch.muted),
           hasUnread: hasUnread(ch.unreadCount),
         };
         return (
@@ -502,6 +505,7 @@ function DMRow({
     id: dm.id,
     name: dm.name,
     pinned: Boolean(dm.pinnedAt),
+    muted: Boolean(dm.muted),
     hasUnread: hasUnread(dm.unreadCount),
   };
 
@@ -591,28 +595,90 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: D
  * three-way conditional, which is the shape that turns a container into a God
  * component one action at a time.
  */
+/**
+ * Resolves the conversation a rename dialog is open for, and renders nothing
+ * when there is none (issue #527).
+ *
+ * One host for both kinds. A channel and a group are renamed through different
+ * endpoints, but the dialog is the same — a name, a field and a Save — so the
+ * only thing that varies is which persist function it is handed, chosen here
+ * from the canonical lists rather than by the dialog.
+ *
+ * The name is read from those lists rather than captured when the menu item was
+ * chosen, so the field is seeded from the same value the row shows, and a
+ * conversation the refetch removed closes its dialog instead of leaving a stale
+ * one open.
+ */
 function SidebarRenameDialog({
   channels,
-  channelId,
+  dms,
+  targetId,
   onClose,
-  onRename,
+  onRenameChannel,
+  onRenameGroup,
 }: {
   channels: Channel[] | undefined;
-  channelId: string | null;
+  dms: DMConversation[] | undefined;
+  targetId: string | null;
   onClose: () => void;
-  onRename?: (channelId: string, displayName: string) => Promise<void>;
+  onRenameChannel?: (channelId: string, displayName: string) => Promise<void>;
+  onRenameGroup?: (conversationId: string, title: string) => Promise<void>;
 }) {
-  const channel = channels?.find((candidate) => candidate.id === channelId);
-  if (!channel || !onRename) return null;
+  const channel = channels?.find((candidate) => candidate.id === targetId);
+  // Groups only: a 1:1 has no title of its own, so it is never a rename target.
+  const group = dms?.find((candidate) => candidate.id === targetId && candidate.type === "group");
+  const rename = channel ? onRenameChannel : onRenameGroup;
+  const conversation = channel ?? group;
+  if (!conversation || !rename) return null;
   return (
     <RenameChannelDialog
-      // Keyed by channel so switching targets remounts with the right name
+      // Keyed by conversation so switching targets remounts with the right name
       // rather than keeping the previous edit in the field.
-      key={channel.id}
-      channelId={channel.id}
-      currentName={channel.name}
+      key={conversation.id}
+      kind={channel ? "channel" : "group"}
+      channelId={conversation.id}
+      currentName={conversation.name}
       onClose={onClose}
-      onRename={onRename}
+      onRename={rename}
+    />
+  );
+}
+
+/**
+ * Resolves the conversation a leave confirmation is open for.
+ *
+ * Same shape and same reasoning as the rename host above, plus one fact the
+ * dialog needs and cannot derive: whether a channel is private, which decides
+ * what the person is told they will lose.
+ *
+ * A 1:1 conversation can never appear here — it is not in either lookup — which
+ * is the structural half of "a DM has no Sair".
+ */
+function SidebarLeaveDialog({
+  channels,
+  dms,
+  targetId,
+  onClose,
+  onLeave,
+}: {
+  channels: Channel[] | undefined;
+  dms: DMConversation[] | undefined;
+  targetId: string | null;
+  onClose: () => void;
+  onLeave?: (target: { kind: "channel" | "dm"; targetId: string }) => Promise<void>;
+}) {
+  const channel = channels?.find((candidate) => candidate.id === targetId);
+  const group = dms?.find((candidate) => candidate.id === targetId && candidate.type === "group");
+  const conversation = channel ?? group;
+  if (!conversation || !onLeave) return null;
+  return (
+    <LeaveConversationDialog
+      key={conversation.id}
+      kind={channel ? "channel" : "group"}
+      name={conversation.name}
+      isPrivate={channel?.type === "private"}
+      onClose={onClose}
+      onConfirm={() => onLeave({ kind: channel ? "channel" : "dm", targetId: conversation.id })}
     />
   );
 }
@@ -626,6 +692,120 @@ function safeDecodeURIComponent(segment: string): string {
     // Malformed percent-encoding (e.g. a bare `%` or `%ZZ`) — return raw segment.
     return segment;
   }
+}
+
+/**
+ * The conversation the route names, split into the two ids the lists compare
+ * against. `/chat/channel/:id` and `/chat/dm/:id` are the only two shapes; a
+ * malformed or unrelated path selects nothing rather than guessing.
+ */
+function selectionFromPath(pathname: string): {
+  activeChannelId: string | undefined;
+  activeDMId: string | undefined;
+} {
+  // pathParts: ["chat", "channel"|"dm", encodedId]. The id is decoded because
+  // navigate() encodes it.
+  const pathParts = pathname.split("/").filter(Boolean);
+  const activeType = pathParts[1];
+  const activeId = pathParts[2] ? safeDecodeURIComponent(pathParts[2]) : undefined;
+  return {
+    activeChannelId: activeType === "channel" ? activeId : undefined,
+    activeDMId: activeType === "dm" ? activeId : undefined,
+  };
+}
+
+/**
+ * The canonical lists, or nothing at all while loading or on error.
+ *
+ * Undefined rather than empty on purpose: an empty list is a real answer ("you
+ * are in no channels") and the sections render it as such, so a state that has
+ * no answer yet must be distinguishable from one that does.
+ */
+function sidebarLists(state: SidebarState): {
+  channels: Channel[] | undefined;
+  dms: DMConversation[] | undefined;
+  categories: ChannelCategory[] | undefined;
+} {
+  if (state.status !== "ready")
+    return { channels: undefined, dms: undefined, categories: undefined };
+  return { channels: state.channels, dms: state.dms, categories: state.categories };
+}
+
+interface ChannelsByCategoryProps {
+  grouped: { category: ChannelCategory; channels: Channel[] }[];
+  activeChannelId: string | undefined;
+  onSelect: (id: string) => void;
+  actions: RowActionsProps;
+  collapsed: Record<string, boolean>;
+  onToggleCategory: (key: string) => void;
+}
+
+/**
+ * The channels section, with or without category headers.
+ *
+ * A workspace that has never created a category has exactly one implicit group,
+ * and drawing a "Geral" header above the only list would be a heading that
+ * distinguishes nothing — so that case renders the plain list. Everything else
+ * gets one collapsible group per category, each list labelled by its own header
+ * so the listbox is never anonymous.
+ */
+function ChannelsByCategory({
+  grouped,
+  activeChannelId,
+  onSelect,
+  actions,
+  collapsed,
+  onToggleCategory,
+}: ChannelsByCategoryProps) {
+  if (grouped.length <= 1 && grouped[0]?.category.kind === "uncategorized") {
+    return (
+      <ChannelList
+        channels={grouped[0]?.channels ?? []}
+        activeChannelId={activeChannelId}
+        onSelect={onSelect}
+        labelId={CHANNELS_LABEL_ID}
+        actions={actions}
+      />
+    );
+  }
+  return (
+    <div className="chat-sidebar__categories-list">
+      {grouped.map(({ category, channels: categoryChannels }) => {
+        const categoryKey = category.id ?? "uncategorized";
+        const headerId = `chat-sidebar-category-${categoryKey}`;
+        const isCollapsed = Boolean(collapsed[categoryKey]);
+        return (
+          <div key={categoryKey} className="chat-sidebar__category-group">
+            <button
+              type="button"
+              id={headerId}
+              className="chat-sidebar__category-header"
+              aria-expanded={!isCollapsed}
+              onClick={() => onToggleCategory(categoryKey)}
+            >
+              <span
+                className={`chat-sidebar__category-chevron${isCollapsed ? " chat-sidebar__category-chevron--collapsed" : ""}`}
+              >
+                <IconChevronDown />
+              </span>
+              <span className="chat-sidebar__category-title">{category.name}</span>
+            </button>
+            {!isCollapsed && (
+              <div className="chat-sidebar__category-channels">
+                <ChannelList
+                  channels={categoryChannels}
+                  activeChannelId={activeChannelId}
+                  onSelect={onSelect}
+                  labelId={headerId}
+                  actions={actions}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // ── Footer user block ─────────────────────────────────────────────────────────
@@ -717,6 +897,22 @@ interface ChatSidebarProps {
   markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
   /** Persists a channel's new name; rejects with the API error (issue #527). */
   renameChannel?: (channelId: string, displayName: string) => Promise<void>;
+  /** Persists a group's new title; rejects with the API error (issue #527). */
+  renameGroup?: (conversationId: string, title: string) => Promise<void>;
+  /** Silences or restores one conversation for this viewer (issue #527). */
+  setMuted?: (
+    target: { kind: "channel" | "dm"; targetId: string },
+    muted: boolean,
+  ) => Promise<void>;
+  /** Removes this viewer from a channel or group (issue #527). */
+  leaveConversation?: (target: { kind: "channel" | "dm"; targetId: string }) => Promise<void>;
+  /**
+   * Opens the details panel for the conversation whose menu was used —
+   * deliberately the menu's target and never the selected one (issue #527).
+   * Absent when the shell has no panel to open, which simply omits the action's
+   * effect rather than the item.
+   */
+  onOpenDetails?: (kind: "channel" | "dm", targetId: string) => void;
 }
 
 // Static because the sidebar is mounted once per app; each heading owns the id
@@ -731,6 +927,10 @@ export default function ChatSidebar({
   setPinned,
   markRead,
   renameChannel,
+  renameGroup,
+  setMuted,
+  leaveConversation,
+  onOpenDetails,
 }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -748,7 +948,10 @@ export default function ChatSidebar({
 
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
-  const [pinError, setPinError] = useState("");
+  // One line for every row action that can fail without a dialog of its own:
+  // pinning and muting. Two separate states would let a stale pin error sit
+  // under a fresh mute failure, and the row only ever has one thing to say.
+  const [actionError, setActionError] = useState("");
   // One open menu for the whole sidebar, identified by `type:id` (issue #527).
   // Holding it here rather than per row is what keeps forty rows from mounting
   // forty popovers and forty document listeners, and it makes "the anchor stopped
@@ -758,7 +961,12 @@ export default function ChatSidebar({
   // The channel a rename dialog is open for, by id. The name is read from the
   // canonical list at render time rather than captured here, so the field is
   // seeded from the same value the row shows.
-  const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  // The conversation a leave confirmation is open for. Like the rename dialog,
+  // it holds only an id: the name and the kind are read from the canonical list
+  // at render time, so a refetch that removed the conversation closes the
+  // dialog instead of leaving one open over nothing.
+  const [leavingId, setLeavingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!newConversationOpen && state.status === "ready" && restoreFocusRef.current) {
@@ -767,15 +975,7 @@ export default function ChatSidebar({
     }
   }, [newConversationOpen, state.status]);
 
-  // Derive active item from pathname: /chat/channel/:id or /chat/dm/:id
-  // decodeURIComponent handles IDs that were encoded with encodeURIComponent on navigate.
-  const pathParts = location.pathname.split("/").filter(Boolean);
-  // pathParts: ["chat", "channel"|"dm", encodedId]
-  const activeType = pathParts[1] as "channel" | "dm" | undefined;
-  const activeId = pathParts[2] ? safeDecodeURIComponent(pathParts[2]) : undefined;
-
-  const activeChannelId = activeType === "channel" ? activeId : undefined;
-  const activeDMId = activeType === "dm" ? activeId : undefined;
+  const { activeChannelId, activeDMId } = selectionFromPath(location.pathname);
 
   // Derived on every render from the canonical list, so a refetch that reorders
   // or replaces items cannot leave a stale copy behind in either section, and
@@ -791,9 +991,7 @@ export default function ChatSidebar({
   // conversation id (never by index), so React moves the existing DOM nodes
   // instead of rewriting them: the selected row stays selected, focus stays on
   // the element that had it, and the scroll position survives a reorder.
-  const channels = state.status === "ready" ? state.channels : undefined;
-  const dms = state.status === "ready" ? state.dms : undefined;
-  const categories = state.status === "ready" ? state.categories : undefined;
+  const { channels, dms, categories } = sidebarLists(state);
 
   const effectiveCategories = useMemo(
     () =>
@@ -839,9 +1037,9 @@ export default function ChatSidebar({
 
   function handlePin(kind: "channel" | "dm", id: string, pinned: boolean) {
     if (!setPinned) return;
-    setPinError("");
+    setActionError("");
     void setPinned({ kind, targetId: id }, !pinned).catch(() =>
-      setPinError("Nao foi possivel atualizar a fixacao."),
+      setActionError("Não foi possível atualizar a fixação."),
     );
   }
 
@@ -850,22 +1048,41 @@ export default function ChatSidebar({
     setOpenMenuKey(open ? key : (current) => (current === key ? null : current));
   }
 
+  function handleMute(target: ConversationTarget, muted: boolean) {
+    if (!setMuted) return;
+    setActionError("");
+    void setMuted({ kind: conversationTargetKind(target.kind), targetId: target.id }, muted).catch(
+      () => setActionError("Não foi possível atualizar as notificações."),
+    );
+  }
+
   /**
    * Runs one menu action against one target.
    *
    * A table rather than a cascade of ifs, and deliberately the only place that
-   * maps an action id to an effect. None of these navigates, changes the
-   * selection or touches the composer: pinning is the #474 hook's own optimistic
-   * write and rollback, marking read is the same pair the navigation effect
-   * performs, and renaming only opens a dialog.
+   * maps an action id to an effect.
+   *
+   * Every one of these acts on `target` — the conversation whose menu was
+   * opened — and never on whatever happens to be selected. That distinction is
+   * the whole point of threading the target through: muting a channel from the
+   * sidebar while reading a different one must silence the one that was clicked.
+   *
+   * None of them navigates, changes the selection or touches the composer.
+   * Pinning is the #474 hook's optimistic write and rollback, marking read is
+   * the same pair the navigation effect performs, muting is the equivalent for
+   * notifications, and rename, details and leave only open something.
    */
   function handleAction(target: ConversationTarget, action: ConversationActionId) {
-    const pinTarget = { kind: pinTargetKind(target.kind), targetId: target.id };
+    const apiTarget = { kind: conversationTargetKind(target.kind), targetId: target.id };
     const effects: Record<ConversationActionId, () => void> = {
-      pin: () => handlePin(pinTarget.kind, target.id, false),
-      unpin: () => handlePin(pinTarget.kind, target.id, true),
-      "mark-read": () => markRead?.(pinTarget),
-      rename: () => setRenamingChannelId(target.id),
+      pin: () => handlePin(apiTarget.kind, target.id, false),
+      unpin: () => handlePin(apiTarget.kind, target.id, true),
+      "mark-read": () => markRead?.(apiTarget),
+      mute: () => handleMute(target, true),
+      unmute: () => handleMute(target, false),
+      rename: () => setRenamingId(target.id),
+      details: () => onOpenDetails?.(apiTarget.kind, target.id),
+      leave: () => setLeavingId(target.id),
     };
     effects[action]();
   }
@@ -948,53 +1165,14 @@ export default function ChatSidebar({
         {state.status === "ready" && (
           <>
             <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              {groupedChannelsByCategory.length <= 1 &&
-              groupedChannelsByCategory[0]?.category.kind === "uncategorized" ? (
-                <ChannelList
-                  channels={groupedChannelsByCategory[0]?.channels ?? []}
-                  activeChannelId={activeChannelId}
-                  onSelect={handleChannelSelect}
-                  labelId={CHANNELS_LABEL_ID}
-                  actions={rowActions}
-                />
-              ) : (
-                <div className="chat-sidebar__categories-list">
-                  {groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => {
-                    const categoryKey = category.id ?? "uncategorized";
-                    const headerId = `chat-sidebar-category-${categoryKey}`;
-                    const collapsed = Boolean(collapsedCategories[categoryKey]);
-                    return (
-                      <div key={categoryKey} className="chat-sidebar__category-group">
-                        <button
-                          type="button"
-                          id={headerId}
-                          className="chat-sidebar__category-header"
-                          aria-expanded={!collapsed}
-                          onClick={() => toggleCategory(categoryKey)}
-                        >
-                          <span
-                            className={`chat-sidebar__category-chevron${collapsed ? " chat-sidebar__category-chevron--collapsed" : ""}`}
-                          >
-                            <IconChevronDown />
-                          </span>
-                          <span className="chat-sidebar__category-title">{category.name}</span>
-                        </button>
-                        {!collapsed && (
-                          <div className="chat-sidebar__category-channels">
-                            <ChannelList
-                              channels={categoryChannels}
-                              activeChannelId={activeChannelId}
-                              onSelect={handleChannelSelect}
-                              labelId={headerId}
-                              actions={rowActions}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
+              <ChannelsByCategory
+                grouped={groupedChannelsByCategory}
+                activeChannelId={activeChannelId}
+                onSelect={handleChannelSelect}
+                actions={rowActions}
+                collapsed={collapsedCategories}
+                onToggleCategory={toggleCategory}
+              />
             </Section>
 
             <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
@@ -1020,9 +1198,9 @@ export default function ChatSidebar({
             </Section>
           </>
         )}
-        {pinError && (
+        {actionError && (
           <p className="chat-sidebar__pin-error" role="alert">
-            {pinError}
+            {actionError}
           </p>
         )}
       </div>
@@ -1045,9 +1223,18 @@ export default function ChatSidebar({
       </div>
       <SidebarRenameDialog
         channels={channels}
-        channelId={renamingChannelId}
-        onClose={() => setRenamingChannelId(null)}
-        onRename={renameChannel}
+        dms={dms}
+        targetId={renamingId}
+        onClose={() => setRenamingId(null)}
+        onRenameChannel={renameChannel}
+        onRenameGroup={renameGroup}
+      />
+      <SidebarLeaveDialog
+        channels={channels}
+        dms={dms}
+        targetId={leavingId}
+        onClose={() => setLeavingId(null)}
+        onLeave={leaveConversation}
       />
       {newConversationOpen && state.status === "ready" && (
         <NewConversationDialog

@@ -12,14 +12,23 @@
  * the row is a flex container whose click would otherwise be a plausible future
  * hazard, and a menu that navigates is the defect this issue exists to prevent.
  *
+ * The popup is rendered through a portal into document.body, with fixed
+ * coordinates measured from the trigger. It has to be: the sidebar's nav is an
+ * `overflow-y: auto` scrollport, and an absolutely positioned descendant of it
+ * is clipped at its edge — so a menu on the last visible row was cut off no
+ * matter how the flip was computed. A portal escapes the clipping ancestor
+ * entirely, which is why the position is fixed rather than absolute.
+ *
  * Keyboard: Tab reaches the trigger, Enter/Space open it, ArrowUp/ArrowDown move
  * between items, Home/End jump, Escape closes, and focus returns to the trigger
  * on every close. The popup is a real `role="menu"` with `role="menuitem"`
  * children and roving focus — not a half-implemented one.
  */
 
-import { useCallback, useEffect, useId, useRef } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef } from "react";
+import { createPortal } from "react-dom";
 
+import { ConversationActionGlyph } from "./ConversationActionIcons";
 import type { ConversationAction, ConversationActionId } from "./conversationActions";
 
 interface ConversationActionsMenuProps {
@@ -47,6 +56,49 @@ function IconMore() {
   );
 }
 
+/** Viewport coordinates for the portalled popup. */
+interface MenuPosition {
+  top: number;
+  left: number;
+}
+
+/**
+ * The menu's width and the gap it keeps from the trigger and the viewport edges.
+ * They live here rather than in CSS because the position is computed in JS, and
+ * two sources for one number is how they drift apart.
+ */
+const menuWidth = 224;
+const menuGap = 4;
+const viewportMargin = 8;
+/** A menu is a handful of rows; this is item height plus the popup's padding. */
+const estimatedItemHeight = 36;
+const menuPadding = 16;
+
+/**
+ * Places the popup against the trigger, in viewport coordinates.
+ *
+ * Vertically it opens below unless that would run past the bottom edge and there
+ * is more room above — the same flip as before, but now measured against the
+ * viewport, which is what the fixed-position portal is actually laid out in.
+ *
+ * Horizontally it is right-aligned with the trigger, then clamped so it cannot
+ * leave the screen on either side. A narrow window is the case that matters: the
+ * sidebar is near the left edge, so an unclamped right-aligned menu would hang
+ * off it.
+ */
+function menuPosition(trigger: DOMRect, itemCount: number): MenuPosition {
+  const height = itemCount * estimatedItemHeight + menuPadding;
+  const opensBelow =
+    trigger.bottom + menuGap + height <= window.innerHeight || trigger.top < height;
+  const top = opensBelow ? trigger.bottom + menuGap : trigger.top - menuGap - height;
+  const maxLeft = window.innerWidth - menuWidth - viewportMargin;
+  const left = Math.min(
+    Math.max(viewportMargin, trigger.right - menuWidth),
+    Math.max(viewportMargin, maxLeft),
+  );
+  return { top: Math.max(viewportMargin, top), left };
+}
+
 /** Wraps around both ends, so ArrowDown on the last item lands on the first. */
 function nextIndex(current: number, delta: number, length: number): number {
   return (current + delta + length) % length;
@@ -62,10 +114,6 @@ export default function ConversationActionsMenu({
   const menuId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  // Set while a close is the consequence of a user gesture on this menu, so
-  // focus goes back to the trigger — and left alone when the menu closes because
-  // the sidebar reordered, unmounted or opened another row's menu, where forcing
-  // focus would steal it from wherever the user has since moved.
   const restoreFocusRef = useRef(false);
 
   const close = useCallback(
@@ -75,6 +123,46 @@ export default function ConversationActionsMenu({
     },
     [onOpenChange],
   );
+
+  // Placed before the first paint that shows the menu, so it never appears in the
+  // wrong spot and jumps. Written straight to the node rather than held in state:
+  // the position is not something the component renders differently for, it is
+  // where the popup physically is, and a state round-trip would only add a frame.
+  //
+  // The height estimate is deliberately crude — a menu is at most a handful of
+  // rows — because the real height is not known until it renders, and a second
+  // measuring pass would cost exactly the jump this avoids.
+  const applyPosition = useCallback(() => {
+    const node = menuRef.current;
+    const trigger = triggerRef.current?.getBoundingClientRect();
+    if (!node || !trigger) return;
+    const { top, left } = menuPosition(trigger, actions.length);
+    node.style.top = `${top}px`;
+    node.style.left = `${left}px`;
+  }, [actions.length]);
+
+  // A callback ref, so the popup is positioned in the same commit that mounts it.
+  const attachMenu = useCallback(
+    (node: HTMLDivElement | null) => {
+      menuRef.current = node;
+      if (node) applyPosition();
+    },
+    [applyPosition],
+  );
+
+  // Only an open menu listens, and only while it is open. The listeners are on
+  // capture so a scroll inside the sidebar's own scrollport is seen too — that
+  // container scrolls, not the window — and the menu follows its trigger instead
+  // of being left behind.
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener("scroll", applyPosition, true);
+    window.addEventListener("resize", applyPosition);
+    return () => {
+      window.removeEventListener("scroll", applyPosition, true);
+      window.removeEventListener("resize", applyPosition);
+    };
+  }, [open, applyPosition]);
 
   // Focus lands on the first item when the menu opens, and returns to the
   // trigger when a gesture closed it.
@@ -131,12 +219,18 @@ export default function ConversationActionsMenu({
       Home: () => focusEdge(false),
       End: () => focusEdge(true),
     };
+    // Tab must leave the menu — it is not a focus trap. Since the popup is
+    // portalled to <body> it sits last in the document, so letting the browser
+    // move focus from *there* would drop the user at the end of the page rather
+    // than back near the row they were on. Tab closes the menu and puts focus on
+    // the trigger instead: the menu is gone, and the next Tab continues from the
+    // sidebar exactly as it would have if the menu had never been opened.
+    if (event.key === "Tab") {
+      event.preventDefault();
+      close(true);
+      return;
+    }
     const handler = handlers[event.key];
-    // Tab is deliberately absent: the items are tabIndex={-1}, so Tab moves
-    // focus to the next control after the menu, and the focusin listener above
-    // closes it. Handling Tab here would unmount the menu before the browser
-    // performed the move, and focus would fall to <body> instead — the tab order
-    // must never be trapped, and it must never be dropped either.
     if (!handler) return;
     event.preventDefault();
     event.stopPropagation();
@@ -171,33 +265,53 @@ export default function ConversationActionsMenu({
       >
         <IconMore />
       </button>
-      {open && (
-        <div
-          ref={menuRef}
-          id={menuId}
-          role="menu"
-          aria-label={triggerLabel}
-          className="chat-sidebar__actions-menu"
-          onKeyDown={handleMenuKeyDown}
-        >
-          {actions.map((action) => (
-            <button
-              key={action.id}
-              type="button"
-              role="menuitem"
-              tabIndex={-1}
-              className="chat-sidebar__actions-item"
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                runAction(action.id);
-              }}
-            >
-              {action.label}
-            </button>
-          ))}
-        </div>
-      )}
+      {open &&
+        createPortal(
+          <div
+            ref={attachMenu}
+            id={menuId}
+            role="menu"
+            aria-label={triggerLabel}
+            className="chat-sidebar__actions-menu"
+            onKeyDown={handleMenuKeyDown}
+            // The portal puts the popup outside the row in the DOM, so a click
+            // inside it no longer bubbles through the row at all. This stays for
+            // the same reason the trigger's does: nothing in this menu may reach
+            // a handler that could select a conversation.
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            {actions.map((action, index) => (
+              <Fragment key={action.id}>
+                {/* A separator wherever the group changes, so the destructive
+                  action is visibly apart from the ordinary ones. `role="none"`
+                  keeps it out of the menu's own item sequence. */}
+                {index > 0 && actions[index - 1]?.group !== action.group && (
+                  <span className="chat-sidebar__actions-separator" role="none" />
+                )}
+                <button
+                  type="button"
+                  role="menuitem"
+                  tabIndex={-1}
+                  className={`chat-sidebar__actions-item${
+                    action.destructive ? " chat-sidebar__actions-item--destructive" : ""
+                  }`}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    runAction(action.id);
+                  }}
+                >
+                  <ConversationActionGlyph
+                    icon={action.icon}
+                    className="chat-sidebar__actions-icon"
+                  />
+                  <span className="chat-sidebar__actions-label">{action.label}</span>
+                </button>
+              </Fragment>
+            ))}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
