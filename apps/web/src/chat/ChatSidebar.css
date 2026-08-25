@@ -162,22 +162,46 @@
   flex: 1;
   min-width: 0;
 }
-/* ── Row state and actions (issue #527) ───────────────────────────────────────
-   The trailing area of every row, pinned or not, is exactly one fixed width. It
-   is what makes the "…" appear on hover without moving the name, the avatar or
-   the unread badge by a pixel: the button is always laid out, only its opacity
-   changes. Nothing here is display:none — a hidden button is not focusable, and
-   the trigger has to be reachable by Tab. */
+/* ── Row trailing area (issue #527) ───────────────────────────────────────────
+   One stable slot at the end of every row, wide enough for what can appear
+   there at once: the unread badge, the pinned indicator and the "…" trigger.
+   Its width does not depend on which of them are present, which is what keeps
+   hover from moving the avatar, the name or the badge by a pixel.
+
+   Nothing is display:none. A hidden button is not focusable, and the trigger has
+   to be reachable by Tab; the trigger is always laid out and only its opacity
+   changes. */
+.chat-sidebar__trailing {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  flex: 0 0 auto;
+  /* Reserved for indicator + trigger. A pinned row shows both, an unpinned one
+     shows only the trigger, and both occupy the same width. */
+  min-width: 3.25rem;
+  justify-content: flex-end;
+}
+
 .chat-sidebar__pinned {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 1.25rem;
+  height: 1.25rem;
   flex: 0 0 auto;
   /* State, not decoration-by-colour: the pin is only ever drawn on a pinned row
-     (it is absent otherwise, not greyed out), and the row's accessible name says
-     "fixado" for anyone who is not looking at it. */
+     (absent otherwise, never greyed out), and the row's accessible name says
+     "fixado" for anyone not looking at it. White against the sidebar's dark
+     surface, so it reads at a glance without competing with the unread badge —
+     which is a filled pill, a different shape at a different weight. */
   color: #fff;
+  opacity: 0.92;
+}
+
+.chat-sidebar__pinned .chat-sidebar__icon {
+  /* Smaller than a row icon: it annotates the row, it does not label it. */
+  width: 0.875rem;
+  height: 0.875rem;
 }
 
 .chat-sidebar__actions {
@@ -192,8 +216,8 @@
   align-items: center;
   justify-content: center;
   /* A comfortable target on touch, where there is no hover to reveal it. */
-  min-width: 2rem;
-  min-height: 2rem;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
   border: 0;
   background: transparent;
   color: inherit;
@@ -205,7 +229,8 @@
 
 /* Visible whenever the row is hovered, whenever anything inside the row has
    focus, and for as long as the menu is open — so it never disappears out from
-   under the pointer that is on it. */
+   under the pointer that is on it. The pinned indicator stays visible through
+   all of it: hover reveals the menu, it never replaces the state. */
 .chat-sidebar__item-row:hover .chat-sidebar__actions-trigger,
 .chat-sidebar__item-row:focus-within .chat-sidebar__actions-trigger,
 .chat-sidebar__actions-trigger[aria-expanded="true"] {
@@ -243,31 +268,71 @@
   height: 1.125rem;
 }
 
+/* ── The popover ──────────────────────────────────────────────────────────────
+   Width follows the content between a floor and a ceiling, so a two-item menu is
+   not a wide empty box and a long channel name cannot push it past the sidebar.
+   It is anchored to the row's trailing edge and flips above when there is no
+   room below. */
+/* Portalled into <body>, so it is positioned in viewport coordinates by
+   ConversationActionsMenu and cannot be clipped by the nav's `overflow-y: auto`.
+   Two consequences: `top`/`left` are written by that component (the values here
+   only keep the first frame off the corner), and the palette it used to inherit
+   from .chat-sidebar has to be restated — outside the sidebar there is nothing
+   to inherit it from. The width is fixed because the same number is used to
+   right-align the popup with its trigger in JS. */
 .chat-sidebar__actions-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  z-index: 30;
-  min-width: 11rem;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 40;
+  width: 14rem;
+  max-width: calc(100vw - 1rem);
+  color: #e5e1f0;
+  --cs-sidebar-hover: rgba(255, 255, 255, 0.06);
   padding: 0.25rem;
   display: flex;
   flex-direction: column;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 0.5rem;
   background: #241f31;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.3);
 }
 
 .chat-sidebar__actions-item {
-  padding: 0.5rem 0.625rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.5rem;
+  /* A comfortable pointer and touch target without making the menu tall. */
   min-height: 2rem;
   text-align: left;
   font: inherit;
+  font-size: 0.8125rem;
   color: inherit;
   border: 0;
   border-radius: 0.25rem;
   background: transparent;
   cursor: pointer;
+}
+
+.chat-sidebar__actions-icon {
+  width: 1rem;
+  height: 1rem;
+  /* Fixed, so every label starts at the same x whatever glyph precedes it. */
+  flex: 0 0 auto;
+  opacity: 0.85;
+}
+
+.chat-sidebar__actions-label {
+  flex: 1;
+  min-width: 0;
+  /* A long channel name is truncated rather than allowed to widen the popover
+     past its ceiling. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-sidebar__actions-item:hover,
@@ -278,6 +343,26 @@
 .chat-sidebar__actions-item:focus-visible {
   outline: 2px solid currentColor;
   outline-offset: -2px;
+}
+
+/* One rule between groups. Semantically it is nothing — role="none" — because a
+   separator that a screen reader announces in a menu is noise. */
+.chat-sidebar__actions-separator {
+  display: block;
+  height: 1px;
+  margin: 0.25rem 0.25rem;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* The only destructive colour in this surface, and the only action that earns
+   it: leaving is the one item here that removes the viewer from something. */
+.chat-sidebar__actions-item--destructive {
+  color: #ff9a8f;
+}
+
+.chat-sidebar__actions-item--destructive:hover,
+.chat-sidebar__actions-item--destructive:focus-visible {
+  background: rgba(255, 154, 143, 0.14);
 }
 
 .chat-sidebar__pin-error {

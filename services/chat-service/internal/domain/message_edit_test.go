@@ -9,7 +9,7 @@ import (
 func TestValidateMessageEdit(t *testing.T) {
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	window := 900
-	base := Message{SenderID: "author", Status: MessageStatusActive, CreatedAt: now.Add(-900 * time.Second)}
+	base := Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusActive, CreatedAt: now.Add(-900 * time.Second)}
 
 	for _, tt := range []struct {
 		name      string
@@ -19,10 +19,10 @@ func TestValidateMessageEdit(t *testing.T) {
 		want      error
 	}{
 		{name: "exact boundary included", message: base, requester: "author", window: &window},
-		{name: "no limit", message: Message{SenderID: "author", Status: MessageStatusActive, CreatedAt: now.Add(-24 * time.Hour)}, requester: "author"},
-		{name: "outside window", message: Message{SenderID: "author", Status: MessageStatusActive, CreatedAt: now.Add(-901 * time.Second)}, requester: "author", window: &window, want: ErrEditWindowExpired},
+		{name: "no limit", message: Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusActive, CreatedAt: now.Add(-24 * time.Hour)}, requester: "author"},
+		{name: "outside window", message: Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusActive, CreatedAt: now.Add(-901 * time.Second)}, requester: "author", window: &window, want: ErrEditWindowExpired},
 		{name: "not author", message: base, requester: "other", window: &window, want: ErrEditForbidden},
-		{name: "deleted", message: Message{SenderID: "author", Status: MessageStatusDeleted, CreatedAt: base.CreatedAt}, requester: "author", window: &window, want: ErrEditForbidden},
+		{name: "deleted", message: Message{SenderID: "author", Kind: MessageKindUser, Status: MessageStatusDeleted, CreatedAt: base.CreatedAt}, requester: "author", window: &window, want: ErrEditForbidden},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateMessageEdit(tt.message, tt.requester, tt.window, now)

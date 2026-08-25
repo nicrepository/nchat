@@ -924,116 +924,119 @@ describe("useChatWebSocket", () => {
     expect(onMembersAdded).not.toHaveBeenCalled();
   });
 
-  // ── channel.updated (issue #527) ─────────────────────────────────────────
+  // ── conversation.updated (issue #527) ─────────────────────────────────────────
   //
   // A rename is an invalidation signal for the channel's subscribers. It carries
   // no payload at all, so these assert routing and the boundary and nothing else.
 
-  it("routes channel.updated for a subscribed channel exactly once", () => {
-    const onChannelUpdated = vi.fn();
+  it("routes conversation.updated for a subscribed channel exactly once", () => {
+    const onConversationUpdated = vi.fn();
     renderHook(() =>
       useChatWebSocket({
         kind: "channel",
         targetId: "ch-1",
         onMessageCreated: vi.fn(),
-        onChannelUpdated,
+        onConversationUpdated,
       }),
     );
     act(() =>
       FakeWebSocket.instances[0].simulateMessage({
-        type: "channel.updated",
+        type: "conversation.updated",
         target_type: "channel",
         target_id: "ch-1",
       }),
     );
 
-    expect(onChannelUpdated).toHaveBeenCalledOnce();
-    expect(onChannelUpdated).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "channel.updated", target_id: "ch-1" }),
+    expect(onConversationUpdated).toHaveBeenCalledOnce();
+    expect(onConversationUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "conversation.updated", target_id: "ch-1" }),
     );
   });
 
   // Renaming a channel this client does not watch is none of its business: the
   // subscription set is the boundary, exactly as for members.added.
-  it("ignores channel.updated for a target it does not watch", () => {
-    const onChannelUpdated = vi.fn();
+  it("ignores conversation.updated for a target it does not watch", () => {
+    const onConversationUpdated = vi.fn();
     renderHook(() =>
       useChatWebSocket({
         kind: "channel",
         targetId: "ch-1",
         onMessageCreated: vi.fn(),
-        onChannelUpdated,
+        onConversationUpdated,
       }),
     );
     act(() =>
       FakeWebSocket.instances[0].simulateMessage({
-        type: "channel.updated",
+        type: "conversation.updated",
         target_type: "channel",
         target_id: "ch-other",
       }),
     );
 
-    expect(onChannelUpdated).not.toHaveBeenCalled();
+    expect(onConversationUpdated).not.toHaveBeenCalled();
   });
 
   // It reaches every subscribed target, not only the primary one: a rename
   // performed by someone else lands while this reader is looking elsewhere, and
   // that row still has to converge.
-  it("routes channel.updated for an additional subscribed channel", () => {
-    const onChannelUpdated = vi.fn();
+  it("routes conversation.updated for an additional subscribed channel", () => {
+    const onConversationUpdated = vi.fn();
     renderHook(() =>
       useChatWebSocket({
         kind: "channel",
         targetId: "ch-1",
         additionalTargets: [{ kind: "channel", targetId: "ch-2" }],
         onMessageCreated: vi.fn(),
-        onChannelUpdated,
+        onConversationUpdated,
       }),
     );
     act(() =>
       FakeWebSocket.instances[0].simulateMessage({
-        type: "channel.updated",
+        type: "conversation.updated",
         target_type: "channel",
         target_id: "ch-2",
       }),
     );
 
-    expect(onChannelUpdated).toHaveBeenCalledOnce();
+    expect(onConversationUpdated).toHaveBeenCalledOnce();
   });
 
-  // Only a channel can be renamed. An event claiming another target type is not
-  // one this protocol produces, so it is dropped rather than forwarded.
-  it("ignores a channel.updated that claims a DM target", () => {
-    const onChannelUpdated = vi.fn();
+  // Groups are renameable too (issue #527), so a DM target is a shape this
+  // protocol really does produce and must be routed.
+  it("routes conversation.updated for a subscribed DM target", () => {
+    const onConversationUpdated = vi.fn();
     renderHook(() =>
       useChatWebSocket({
         kind: "dm",
         targetId: "dm-1",
         onMessageCreated: vi.fn(),
-        onChannelUpdated,
+        onConversationUpdated,
       }),
     );
     act(() =>
       FakeWebSocket.instances[0].simulateMessage({
-        type: "channel.updated",
+        type: "conversation.updated",
         target_type: "dm",
         target_id: "dm-1",
       }),
     );
 
-    expect(onChannelUpdated).not.toHaveBeenCalled();
+    expect(onConversationUpdated).toHaveBeenCalledOnce();
+    expect(onConversationUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ target_type: "dm", target_id: "dm-1" }),
+    );
   });
 
   // The callback belongs to one event type: nothing else may reach it.
-  it("does not hand another event type to onChannelUpdated", () => {
-    const onChannelUpdated = vi.fn();
+  it("does not hand another event type to onConversationUpdated", () => {
+    const onConversationUpdated = vi.fn();
     const onMembersAdded = vi.fn();
     renderHook(() =>
       useChatWebSocket({
         kind: "channel",
         targetId: "ch-1",
         onMessageCreated: vi.fn(),
-        onChannelUpdated,
+        onConversationUpdated,
         onMembersAdded,
       }),
     );
@@ -1047,7 +1050,83 @@ describe("useChatWebSocket", () => {
     );
 
     expect(onMembersAdded).toHaveBeenCalledOnce();
-    expect(onChannelUpdated).not.toHaveBeenCalled();
+    expect(onConversationUpdated).not.toHaveBeenCalled();
+  });
+
+  // ── conversation.event (issue #527) ──────────────────────────────────────
+  //
+  // A system message landed — a rename, a departure. Route plus message id, so
+  // the handler refetches rather than rendering anything from the broadcast.
+
+  it("routes conversation.event for a subscribed target exactly once", () => {
+    const onConversationEvent = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationEvent,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "conversation.event",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-sys-1",
+      }),
+    );
+
+    expect(onConversationEvent).toHaveBeenCalledOnce();
+    expect(onConversationEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ target_id: "ch-1", message_id: "msg-sys-1" }),
+    );
+  });
+
+  // The subscription set is the boundary: a departure in a conversation this
+  // client does not watch is none of its business.
+  it("ignores conversation.event for a target it does not watch", () => {
+    const onConversationEvent = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationEvent,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "conversation.event",
+        target_type: "channel",
+        target_id: "ch-other",
+        message_id: "msg-sys-1",
+      }),
+    );
+
+    expect(onConversationEvent).not.toHaveBeenCalled();
+  });
+
+  // An event with no message to fetch is not one this protocol produces.
+  it("ignores conversation.event with no message id", () => {
+    const onConversationEvent = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onConversationEvent,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "conversation.event",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+
+    expect(onConversationEvent).not.toHaveBeenCalled();
   });
 
   // ── attachment.status (RF-22) ────────────────────────────────────────────

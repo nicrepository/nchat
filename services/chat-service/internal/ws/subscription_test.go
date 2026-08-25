@@ -66,6 +66,16 @@ type fakeDMStore struct {
 	userID         string
 }
 
+// Group rename and self-leave are not part of subscription authorization; these
+// exist so the fake still satisfies storage.DMStore (issue #527).
+func (f *fakeDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
+	return storage.RenameGroupResult{}, nil
+}
+
+func (f *fakeDMStore) LeaveGroupConversation(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
+	return storage.LeaveConversationResult{}, nil
+}
+
 func (f *fakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {
 	return storage.CreateDirectConversationResult{}, nil
 }

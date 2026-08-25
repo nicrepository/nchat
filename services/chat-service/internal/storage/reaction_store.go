@@ -64,6 +64,12 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 			JOIN chat.workspace_members wm
 			  ON wm.workspace_id = m.workspace_id AND wm.user_id = $2 AND wm.status = 'active'
 			WHERE m.workspace_id = $1 AND m.id = $3 AND m.status = 'active'
+			  -- Reactions are for what people said. A system message is
+			  -- something that happened *to* the conversation — a rename, a
+			  -- departure — and reacting to one is not an operation this domain
+			  -- has (issue #527). The UI never offers it; this is what makes it
+			  -- true for a direct call as well.
+			  AND m.kind = 'user'
 			FOR SHARE OF m, wm
 		),
 		public_channel AS MATERIALIZED (

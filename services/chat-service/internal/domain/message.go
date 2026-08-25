@@ -204,6 +204,13 @@ type Message struct {
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 
+	// EventType and EventPayload describe a server-generated conversation event
+	// and are set only on Kind == MessageKindSystem (issue #527). The database
+	// enforces that pairing, so a user message can never carry one — which is
+	// what keeps a system event unforgeable through the ordinary send endpoint.
+	EventType    string
+	EventPayload ConversationEventPayload
+
 	// Populated by list queries that JOIN auth.users; empty for create results.
 	SenderDisplayName string
 	SenderEmail       string
@@ -285,6 +292,14 @@ type MessageEditHistory struct {
 // question this asks is "is this state editable?" and not "is this state one of
 // the ones I remembered to exclude?".
 func ValidateMessageEdit(message Message, requesterID string, editWindowSeconds *int, now time.Time) error {
+	// A system message is an immutable record of something that happened — a
+	// rename, a departure (issue #527). Its sender_id is the actor, so without
+	// this the person who renamed a channel could edit the line that says they
+	// did. The same rule ValidateMessageDelete already applies, for the same
+	// reason: these operations presuppose a user message.
+	if message.Kind != MessageKindUser {
+		return ErrEditForbidden
+	}
 	if message.SenderID != requesterID || !message.DeletedAt.IsZero() || !message.Status.isEditable() {
 		return ErrEditForbidden
 	}

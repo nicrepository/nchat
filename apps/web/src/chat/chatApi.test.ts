@@ -342,8 +342,14 @@ describe("fetchChannels", () => {
       type: "public",
       canWrite: true,
       // Absent from the payload, so "no" — a server that predates the field
-      // must never be read as granting the rename (issue #527).
+      // must never be read as granting the rename (issue #527). isGeneral and
+      // muted read the same way: absent is the safe answer.
       canRename: false,
+      // The fixture's ch-1 is the workspace's general channel, so the mapper
+      // must carry that through — it is what the row menu reads to omit rename,
+      // mute and leave (issue #527).
+      isGeneral: true,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -355,6 +361,8 @@ describe("fetchChannels", () => {
       type: "private",
       canWrite: false,
       canRename: false,
+      isGeneral: false,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -466,6 +474,7 @@ describe("fetchDMs", () => {
       type: "1:1",
       name: "Juliane Lino",
       participants: [],
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
     });
@@ -743,6 +752,8 @@ describe("fetchSidebarData", () => {
       type: "public",
       canWrite: true,
       canRename: false,
+      isGeneral: true,
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -754,6 +765,7 @@ describe("fetchSidebarData", () => {
       type: "1:1",
       name: "Juliane",
       participants: [],
+      muted: false,
       createdAt: null,
       lastMessageAt: null,
     });

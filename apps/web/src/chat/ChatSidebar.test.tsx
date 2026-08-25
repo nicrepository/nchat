@@ -2586,6 +2586,13 @@ describe("ChatSidebar — row action menu", () => {
     ) => Promise<void>;
     markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
     renameChannel?: (channelId: string, displayName: string) => Promise<void>;
+    renameGroup?: (conversationId: string, title: string) => Promise<void>;
+    setMuted?: (
+      target: { kind: "channel" | "dm"; targetId: string },
+      muted: boolean,
+    ) => Promise<void>;
+    leaveConversation?: (target: { kind: "channel" | "dm"; targetId: string }) => Promise<void>;
+    onOpenDetails?: (kind: "channel" | "dm", targetId: string) => void;
   }
 
   const renderSidebar = ({
@@ -2595,6 +2602,10 @@ describe("ChatSidebar — row action menu", () => {
     setPinned = vi.fn().mockResolvedValue(undefined),
     markRead = vi.fn(),
     renameChannel = vi.fn().mockResolvedValue(undefined),
+    renameGroup = vi.fn().mockResolvedValue(undefined),
+    setMuted = vi.fn().mockResolvedValue(undefined),
+    leaveConversation = vi.fn().mockResolvedValue(undefined),
+    onOpenDetails = vi.fn(),
   }: RenderOptions = {}) =>
     render(
       <MemoryRouter initialEntries={[path]}>
@@ -2604,6 +2615,10 @@ describe("ChatSidebar — row action menu", () => {
           setPinned={setPinned}
           markRead={markRead}
           renameChannel={renameChannel}
+          renameGroup={renameGroup}
+          setMuted={setMuted}
+          leaveConversation={leaveConversation}
+          onOpenDetails={onOpenDetails}
         />
       </MemoryRouter>,
     );
@@ -2713,7 +2728,8 @@ describe("ChatSidebar — row action menu", () => {
     expect(screen.queryByRole("menuitem", { name: /sair/i })).not.toBeInTheDocument();
   });
 
-  // Nothing the backend cannot do may appear, on any kind of row.
+  // Archiving and hiding have no backend at all, so they must never appear on
+  // any row (issue #527 keeps them out of scope deliberately).
   it("offers no action the backend does not implement", async () => {
     const user = userEvent.setup();
     renderSidebar({
@@ -2723,11 +2739,148 @@ describe("ChatSidebar — row action menu", () => {
 
     for (const name of ["canal geral", "grupo Equipe", "conversa com Juliane"]) {
       await user.click(trigger(name));
-      for (const absent of [/sair/i, /arquivar/i, /silenciar/i, /detalhes/i]) {
+      for (const absent of [/arquivar/i, /ocultar/i, /excluir/i]) {
         expect(screen.queryByRole("menuitem", { name: absent })).not.toBeInTheDocument();
       }
       await user.keyboard("{Escape}");
     }
+  });
+
+  // The structural rules, asserted through the rendered menu rather than only
+  // through the action builder.
+  it("never offers Sair or Renomear on a 1:1 conversation", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ dms: [dm("Juliane", "1:1", { unreadCount: 2 })] });
+
+    await user.click(trigger("conversa com Juliane"));
+
+    expect(screen.queryByRole("menuitem", { name: /sair/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /renomear/i })).not.toBeInTheDocument();
+    // What it does get.
+    expect(screen.getByRole("menuitem", { name: "Silenciar notificações" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Detalhes da conversa" })).toBeInTheDocument();
+  });
+
+  // The general channel is structural: no rename, no mute, no leave, for anyone.
+  it("omits rename, mute and leave on the general channel", async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      channels: [channel("geral", { isGeneral: true, canRename: true, unreadCount: 3 })],
+    });
+
+    await user.click(trigger("canal geral"));
+
+    for (const absent of [/renomear/i, /silenciar/i, /notificações/i, /sair/i]) {
+      expect(screen.queryByRole("menuitem", { name: absent })).not.toBeInTheDocument();
+    }
+    expect(screen.getByRole("menuitem", { name: "Fixar no topo" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Marcar como lido" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Detalhes do canal" })).toBeInTheDocument();
+  });
+
+  it("offers the full menu on an ordinary channel", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ channels: [channel("infra", { canRename: true, unreadCount: 1 })] });
+
+    await user.click(trigger("canal infra"));
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Fixar no topo",
+      "Marcar como lido",
+      "Silenciar notificações",
+      "Renomear canal",
+      "Detalhes do canal",
+      "Sair do canal",
+    ]);
+  });
+
+  it("offers the full menu on a group, including rename", async () => {
+    const user = userEvent.setup();
+    renderSidebar({ dms: [dm("Equipe", "group", { unreadCount: 1 })] });
+
+    await user.click(trigger("grupo Equipe"));
+
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Fixar no topo",
+      "Marcar como lido",
+      "Silenciar notificações",
+      "Renomear grupo",
+      "Detalhes do grupo",
+      "Sair do grupo",
+    ]);
+  });
+
+  it("toggles the notification item against the persisted preference", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({ channels: [channel("infra", { muted: true })], setMuted });
+
+    await user.click(trigger("canal infra"));
+    expect(
+      screen.queryByRole("menuitem", { name: "Silenciar notificações" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("menuitem", { name: "Ativar notificações" }));
+
+    expect(setMuted).toHaveBeenCalledWith({ kind: "channel", targetId: "infra" }, false);
+  });
+
+  // A group mutes through the DM endpoint, because it is a dm_conversations row.
+  it("mutes a group through the DM endpoint", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn().mockResolvedValue(undefined);
+    renderSidebar({ dms: [dm("Equipe", "group")], setMuted });
+
+    await user.click(trigger("grupo Equipe"));
+    await user.click(screen.getByRole("menuitem", { name: "Silenciar notificações" }));
+
+    expect(setMuted).toHaveBeenCalledWith({ kind: "dm", targetId: "Equipe" }, true);
+  });
+
+  // The action acts on the row whose menu was opened, never on the selected
+  // conversation. This is the mistake the whole target-threading exists to stop.
+  it("acts on the menu's target and not on the selected conversation", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn().mockResolvedValue(undefined);
+    const markRead = vi.fn();
+    renderSidebar({
+      channels: [channel("geral", { unreadCount: 4 }), channel("infra", { unreadCount: 2 })],
+      path: "/chat/channel/geral",
+      setMuted,
+      markRead,
+    });
+
+    await user.click(trigger("canal infra"));
+    await user.click(screen.getByRole("menuitem", { name: "Marcar como lido" }));
+    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "infra" });
+
+    await user.click(trigger("canal infra"));
+    await user.click(screen.getByRole("menuitem", { name: "Silenciar notificações" }));
+    expect(setMuted).toHaveBeenCalledWith({ kind: "channel", targetId: "infra" }, true);
+
+    // The selected conversation is untouched throughout.
+    expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("opens details for the menu's target, without navigating", async () => {
+    const user = userEvent.setup();
+    const onOpenDetails = vi.fn();
+    renderSidebar({
+      channels: [channel("geral"), channel("infra")],
+      path: "/chat/channel/geral",
+      onOpenDetails,
+    });
+
+    await user.click(trigger("canal infra"));
+    await user.click(screen.getByRole("menuitem", { name: "Detalhes do canal" }));
+
+    expect(onOpenDetails).toHaveBeenCalledWith("channel", "infra");
+    expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("shows Renomear canal only when the server said this caller may rename", async () => {
@@ -2909,6 +3062,23 @@ describe("ChatSidebar — row action menu", () => {
     expect(markRead).not.toHaveBeenCalled();
   });
 
+  // The sidebar's nav is an `overflow-y: auto` scrollport, which clips anything
+  // absolutely positioned inside it — the menu on the last visible row was cut
+  // off. It is portalled to <body> instead, so the popup has no clipping
+  // ancestor at all and is positioned in viewport coordinates.
+  it("renders the menu outside the sidebar's scrollport", async () => {
+    const user = userEvent.setup();
+    const { container } = renderSidebar({ channels: [channel("geral")] });
+
+    await user.click(trigger("canal geral"));
+
+    const menu = screen.getByRole("menu");
+    expect(container.querySelector(".chat-sidebar__nav")?.contains(menu)).toBe(false);
+    expect(menu.parentElement).toBe(document.body);
+    expect(menu.style.top).not.toBe("");
+    expect(menu.style.left).not.toBe("");
+  });
+
   it("returns focus to the trigger after an action runs", async () => {
     const user = userEvent.setup();
     renderSidebar({ channels: [channel("geral")] });
@@ -2922,17 +3092,26 @@ describe("ChatSidebar — row action menu", () => {
     expect(button).toHaveFocus();
   });
 
-  // The menu is not a focus trap: Tab out of it closes it and focus moves on.
+  // The menu is not a focus trap: Tab out of it closes it and leaves focus on the
+  // trigger, from which the next Tab continues through the sidebar normally. The
+  // popup is portalled to <body>, so handing the move to the browser from inside
+  // it would strand focus at the end of the document instead.
   it("does not trap Tab inside the menu", async () => {
     const user = userEvent.setup();
     renderSidebar({ channels: [channel("geral"), channel("infra")] });
 
-    trigger("canal geral").focus();
+    const button = trigger("canal geral");
+    button.focus();
     await user.keyboard("{Enter}");
     await user.tab();
 
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     expect(document.activeElement).not.toBe(document.body);
+    expect(button).toHaveFocus();
+
+    // And the sidebar's tab order continues from there.
+    await user.tab();
+    expect(button).not.toHaveFocus();
   });
 
   // ── Reordering (#474 is preserved) ─────────────────────────────────────────
@@ -3001,7 +3180,7 @@ describe("ChatSidebar — row action menu", () => {
     await user.click(trigger("canal geral"));
     await user.click(screen.getByRole("menuitem", { name: "Fixar no topo" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(/fixac/i);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/fixação/i);
     expect(screen.queryAllByTestId("chat-sidebar-pinned")).toHaveLength(0);
   });
 });

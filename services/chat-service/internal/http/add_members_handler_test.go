@@ -53,6 +53,11 @@ type recordingBroadcaster struct {
 	// room broadcast goes to existing subscribers, this goes only to the people
 	// the transaction actually inserted.
 	available []availableRecord
+	// The issue #527 signals: a renamed conversation and a persisted system
+	// message. Recorded separately so a test can assert each fires only after
+	// its own transaction committed.
+	conversationUpdates [][3]string
+	conversationEvents  [][4]string
 }
 
 type availableRecord struct {
@@ -78,6 +83,16 @@ type broadcastRecord struct {
 	ActorUserID string
 	AddedCount  int
 	MemberCount int
+}
+
+// The two issue #527 signals. Recorded so a test can assert a rename or a
+// departure announced exactly once, and never before its transaction committed.
+func (b *recordingBroadcaster) PublishConversationUpdated(_ context.Context, workspaceID, targetType, targetID string) {
+	b.conversationUpdates = append(b.conversationUpdates, [3]string{workspaceID, targetType, targetID})
+}
+
+func (b *recordingBroadcaster) PublishConversationEvent(_ context.Context, workspaceID, targetType, targetID, messageID string) {
+	b.conversationEvents = append(b.conversationEvents, [4]string{workspaceID, targetType, targetID, messageID})
 }
 
 func (b *recordingBroadcaster) PublishMembersAdded(

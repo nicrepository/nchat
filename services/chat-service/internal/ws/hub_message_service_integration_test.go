@@ -49,8 +49,25 @@ func (s *integChannelStore) ListChannelsByWorkspace(_ context.Context, _ string)
 func (s *integChannelStore) ListVisibleChannelsByUser(_ context.Context, _, _ string) ([]domain.Channel, error) {
 	return nil, nil
 }
-func (s *integChannelStore) UpdateChannel(_ context.Context, _ storage.UpdateChannelInput) (domain.Channel, error) {
-	return domain.Channel{}, nil
+
+// LeaveChannelSelf is unused by the message flows this file exercises; it
+// exists so integChannelStore still satisfies storage.ChannelStore (issue #527).
+// The two group mutations are unused here for the same reason, and stubbed for
+// the same reason: interface satisfaction, not behaviour (issue #527).
+func (s *integDMStore) RenameGroupConversation(context.Context, storage.RenameGroupInput) (storage.RenameGroupResult, error) {
+	return storage.RenameGroupResult{}, nil
+}
+
+func (s *integDMStore) LeaveGroupConversation(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
+	return storage.LeaveConversationResult{}, nil
+}
+
+func (s *integChannelStore) LeaveChannelSelf(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
+	return storage.LeaveConversationResult{}, nil
+}
+
+func (s *integChannelStore) UpdateChannel(_ context.Context, _ storage.UpdateChannelInput) (storage.UpdateChannelResult, error) {
+	return storage.UpdateChannelResult{}, nil
 }
 func (s *integChannelStore) ArchiveChannel(_ context.Context, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil

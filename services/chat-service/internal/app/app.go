@@ -209,7 +209,8 @@ func New(cfg config.Config) (*App, error) {
 			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).
 				WithPins(sidebarPinStore).
-				WithReadState(conversationReadStateStore)
+				WithReadState(conversationReadStateStore).
+				WithNotificationPrefs(storage.NewPGXNotificationPrefStore(pool))
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
 			// RF-21. Wired here, where the message service exists, and fatal:
 			// starting with the flag on and no gate would accept links nobody
@@ -801,11 +802,16 @@ func (b *hubBroadcaster) PublishMessageLinkSafetyChanged(
 		ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, state, updatedAt)
 }
 
-// PublishChannelUpdated adapts the hub for the issue #527 rename signal. The
-// target type is always a channel, so unlike the members adapter there is no
-// string to convert.
-func (b *hubBroadcaster) PublishChannelUpdated(ctx context.Context, workspaceID, channelID string) {
-	b.hub.PublishChannelUpdated(ctx, workspaceID, channelID)
+// PublishConversationUpdated adapts the hub for the issue #527 rename signal,
+// converting the string targetType so the HTTP layer keeps no ws import.
+func (b *hubBroadcaster) PublishConversationUpdated(ctx context.Context, workspaceID, targetType, targetID string) {
+	b.hub.PublishConversationUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID)
+}
+
+// PublishConversationEvent adapts the hub for the issue #527 system-message
+// signal, converting the string targetType so the HTTP layer keeps no ws import.
+func (b *hubBroadcaster) PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string) {
+	b.hub.PublishConversationEvent(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID)
 }
 
 // PublishConversationAvailable adapts the hub's user-scoped signal (issue #398).

@@ -4,8 +4,11 @@ import { useLocation, useNavigate } from "react-router";
 import { showBrowserMessageNotification } from "./browserNotification";
 import {
   fetchSidebarData,
+  leaveConversation as leaveConversationRequest,
   markConversationRead,
   renameChannel as renameChannelRequest,
+  renameGroup as renameGroupRequest,
+  setConversationMuted,
   setSidebarConversationPinned,
 } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
@@ -70,7 +73,8 @@ type Action =
       isMentioned: boolean;
     }
   | { type: "target_opened"; target: WSSubscriptionTarget }
-  | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null };
+  | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null }
+  | { type: "mute_changed"; target: WSSubscriptionTarget; muted: boolean };
 
 /**
  * Replaces the list with the server's, keeping each surviving item's activity
@@ -156,103 +160,149 @@ function bumpActivity<T extends ConversationActivity & { id: string }>(
   });
 }
 
+/**
+ * Applies one per-conversation preference to whichever list owns the target.
+ *
+ * Pin and mute are the same operation on two different fields — find the row by
+ * id, replace one value, leave every other row untouched — so they share this
+ * rather than each carrying a copy of the branch. Both are private to the
+ * viewer, which is why neither ever needs to touch anything but the named row.
+ *
+ * Membership is never invented here: an id the list does not hold changes
+ * nothing, because what this user may see is the server's decision and not an
+ * event's.
+ */
+function applyPreference(
+  state: SidebarState,
+  target: WSSubscriptionTarget,
+  change: { muted?: boolean; pinnedAt?: string | null },
+): SidebarState {
+  if (state.status !== "ready") return state;
+  const update = <T extends { id: string }>(items: T[]): T[] =>
+    items.map((item) => (item.id === target.targetId ? { ...item, ...change } : item));
+  return {
+    ...state,
+    channels: target.kind === "channel" ? update(state.channels) : state.channels,
+    dms: target.kind === "dm" ? update(state.dms) : state.dms,
+  };
+}
+
+/**
+ * Rebuilds the ready state from a server response, carrying forward the two
+ * things the response does not carry: how recently each surviving conversation
+ * was written in, and the viewer's unread/mention state.
+ */
+function applyLoaded(
+  state: SidebarState,
+  action: Extract<Action, { type: "loaded" }>,
+): SidebarState {
+  const previous = state.status === "ready" ? state : undefined;
+  const channels = mergeActivity(action.channels, previous?.channels);
+  const dms = mergeActivity(action.dms, previous?.dms);
+  return {
+    status: "ready",
+    currentUserId: action.currentUserId,
+    workspaceId: action.workspaceId,
+    channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
+    dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
+    categories: action.categories || [],
+  };
+}
+
+/**
+ * Whether this message adds to an unread count.
+ *
+ * Narrower than the rule for activity: the user's own message is not unread to
+ * them, and neither is one arriving in the conversation they are currently
+ * reading. Activity keeps its own, broader rule — writing in a conversation is
+ * what makes it the most recently active one, whoever wrote and wherever they
+ * are looking — because the two questions have different answers.
+ */
+function countsAsUnread(
+  state: Extract<SidebarState, { status: "ready" }>,
+  action: Extract<Action, { type: "message_created" }>,
+): boolean {
+  if (action.senderId === state.currentUserId) return false;
+  return !(
+    action.activeTarget?.kind === action.target.kind &&
+    action.activeTarget.targetId === action.target.targetId
+  );
+}
+
+function incrementUnread<
+  T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean },
+>(items: T[], targetId: string, isMentioned: boolean): T[] {
+  return items.map((item) =>
+    item.id === targetId
+      ? {
+          ...item,
+          unreadCount: (item.unreadCount ?? 0) + 1,
+          hasMentionUnread: item.hasMentionUnread || isMentioned,
+        }
+      : item,
+  );
+}
+
+/** Opening a conversation is what marks it read; a row with nothing unread is left alone. */
+function clearUnread<T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean }>(
+  items: T[],
+  targetId: string,
+): T[] {
+  return items.map((item) =>
+    item.id === targetId && item.unreadCount
+      ? { ...item, unreadCount: 0, hasMentionUnread: false }
+      : item,
+  );
+}
+
+function applyMessageCreated(
+  state: SidebarState,
+  action: Extract<Action, { type: "message_created" }>,
+): SidebarState {
+  if (state.status !== "ready") return state;
+  const counts = countsAsUnread(state, action);
+  const { targetId } = action.target;
+  if (action.target.kind === "channel") {
+    const channels = counts
+      ? incrementUnread(state.channels, targetId, action.isMentioned)
+      : state.channels;
+    return { ...state, channels: bumpActivity(channels, targetId, action.messageCreatedAt) };
+  }
+  const dms = counts ? incrementUnread(state.dms, targetId, action.isMentioned) : state.dms;
+  return { ...state, dms: bumpActivity(dms, targetId, action.messageCreatedAt) };
+}
+
+function applyTargetOpened(
+  state: SidebarState,
+  action: Extract<Action, { type: "target_opened" }>,
+): SidebarState {
+  if (state.status !== "ready") return state;
+  const { targetId } = action.target;
+  if (action.target.kind === "channel") {
+    return { ...state, channels: clearUnread(state.channels, targetId) };
+  }
+  return { ...state, dms: clearUnread(state.dms, targetId) };
+}
+
+// Routing only: each case names the transition and hands the state to the pure
+// function that performs it. Every one of those functions is exhaustive about
+// its own case, so what the switch shows is the set of transitions that exist.
 function reducer(state: SidebarState, action: Action): SidebarState {
   switch (action.type) {
-    case "loaded": {
-      const previous = state.status === "ready" ? state : undefined;
-      const channels = mergeActivity(action.channels, previous?.channels);
-      const dms = mergeActivity(action.dms, previous?.dms);
-      return {
-        status: "ready",
-        currentUserId: action.currentUserId,
-        workspaceId: action.workspaceId,
-        channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
-        dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
-        categories: action.categories || [],
-      };
-    }
+    case "loaded":
+      return applyLoaded(state, action);
     case "error":
       return { status: "error", error: action.error };
     case "reload":
       return { status: "loading" };
-    case "message_created": {
-      if (state.status !== "ready") return state;
-      // Activity is recorded for every persisted message, including the user's
-      // own and including one in the conversation they are currently reading:
-      // writing in a conversation is what makes it the most recently active one,
-      // whoever wrote and wherever they are looking. Unread counting keeps its
-      // own, narrower rule below — the two questions have different answers.
-      const counts =
-        action.senderId !== state.currentUserId &&
-        !(
-          action.activeTarget?.kind === action.target.kind &&
-          action.activeTarget.targetId === action.target.targetId
-        );
-      const withUnread = <
-        T extends { id: string; unreadCount?: number; hasMentionUnread?: boolean },
-      >(
-        items: T[],
-      ): T[] =>
-        counts
-          ? items.map((item) =>
-              item.id === action.target.targetId
-                ? {
-                    ...item,
-                    unreadCount: (item.unreadCount ?? 0) + 1,
-                    hasMentionUnread: item.hasMentionUnread || action.isMentioned,
-                  }
-                : item,
-            )
-          : items;
-
-      if (action.target.kind === "channel") {
-        return {
-          ...state,
-          channels: bumpActivity(
-            withUnread(state.channels),
-            action.target.targetId,
-            action.messageCreatedAt,
-          ),
-        };
-      }
-      return {
-        ...state,
-        dms: bumpActivity(withUnread(state.dms), action.target.targetId, action.messageCreatedAt),
-      };
-    }
-    case "target_opened": {
-      if (state.status !== "ready") return state;
-      if (action.target.kind === "channel") {
-        return {
-          ...state,
-          channels: state.channels.map((channel) =>
-            channel.id === action.target.targetId && channel.unreadCount
-              ? { ...channel, unreadCount: 0, hasMentionUnread: false }
-              : channel,
-          ),
-        };
-      }
-      return {
-        ...state,
-        dms: state.dms.map((dm) =>
-          dm.id === action.target.targetId && dm.unreadCount
-            ? { ...dm, unreadCount: 0, hasMentionUnread: false }
-            : dm,
-        ),
-      };
-    }
-    case "pin_changed": {
-      if (state.status !== "ready") return state;
-      const update = <T extends { id: string; pinnedAt?: string | null }>(items: T[]): T[] =>
-        items.map((item) =>
-          item.id === action.target.targetId ? { ...item, pinnedAt: action.pinnedAt } : item,
-        );
-      return {
-        ...state,
-        channels: action.target.kind === "channel" ? update(state.channels) : state.channels,
-        dms: action.target.kind === "dm" ? update(state.dms) : state.dms,
-      };
-    }
+    case "message_created":
+      return applyMessageCreated(state, action);
+    case "target_opened":
+      return applyTargetOpened(state, action);
+    case "mute_changed":
+      return applyPreference(state, action.target, { muted: action.muted });
+    case "pin_changed":
+      return applyPreference(state, action.target, { pinnedAt: action.pinnedAt });
   }
 }
 
@@ -264,6 +314,82 @@ function targetFromPath(pathname: string): WSSubscriptionTarget | undefined {
     return targetId ? { kind: match[1] as "channel" | "dm", targetId } : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Announces one freshly received message to the reader and reports whether it
+ * mentions them.
+ *
+ * Two things at once because they answer the same question from the same
+ * classification: "is this relevant to the reader" decides the chime, and its
+ * mention half decides the unread badge's dot. It is computed here rather than
+ * threaded out of the reducer because a reducer performs state transitions, not
+ * side effects like audio playback — and running the classification twice for
+ * one event is how the two answers eventually disagree.
+ */
+function announceMessage(
+  event: WSMessageCreatedEvent,
+  currentUserId: string,
+  activeTarget: WSSubscriptionTarget | undefined,
+  onNavigate: (path: string) => void,
+): boolean {
+  const payload = event.payload;
+  if (!payload) return false;
+  const classified = classifySoundEvent(payload, event.target_type, currentUserId);
+  const isWindowFocused = document.visibilityState === "visible";
+  const play = shouldPlayMessageSound({
+    mode: getSoundNotificationMode(),
+    // Already past the seenRealtimeMessageIds check at the call site — this
+    // event is guaranteed fresh by the time it reaches this decision.
+    isDuplicate: false,
+    isOwnMessage: (payload.sender_id ?? "") === currentUserId,
+    category: classified.category,
+    isMentioned: classified.isMentioned,
+    isActiveConversation:
+      activeTarget?.kind === event.target_type && activeTarget.targetId === event.target_id,
+    isWindowFocused,
+  });
+  if (play) notifyOrChime(event, payload, isWindowFocused, onNavigate);
+  return classified.isMentioned;
+}
+
+/**
+ * The native notification and the chime are alternate channels for the same
+ * eligible event, never both: a native one shown successfully replaces the
+ * chime; anything else (denied/default/unsupported permission, a background API
+ * failure, or the tab being in the foreground — native notifications never fire
+ * there) falls through to the sound path.
+ */
+function notifyOrChime(
+  event: WSMessageCreatedEvent,
+  payload: NonNullable<WSMessageCreatedEvent["payload"]>,
+  isWindowFocused: boolean,
+  onNavigate: (path: string) => void,
+): void {
+  let shown = false;
+  if (!isWindowFocused) {
+    try {
+      shown = showBrowserMessageNotification({
+        targetKind: event.target_type,
+        targetId: event.target_id,
+        senderDisplayName: payload.sender_display_name,
+        bodyText: payload.body_text,
+        onNavigate,
+      }).shown;
+    } catch {
+      // The module already guards itself; this is defense in depth — the WS
+      // callback must never break because of it.
+    }
+  }
+  if (shown) return;
+  // playMessageSound() already never throws, but the unread badge must update
+  // even if that guarantee is ever violated — a failed chime is never allowed to
+  // break message receipt.
+  try {
+    playMessageSound();
+  } catch {
+    // Swallowed on purpose: see above.
   }
 }
 
@@ -424,12 +550,16 @@ export function useChatSidebar() {
     // A conversation the user was just added to. They are not subscribed to it,
     // so this is the only way they hear about it before a reload.
     onConversationAvailable: refreshSidebar,
-    // A channel was renamed somewhere else (issue #527). The event names the
-    // channel and nothing else, so the only correct response is the same
+    // A conversation was renamed somewhere else (issue #527). The event names
+    // the target and nothing else, so the only correct response is the same
     // coalescing refetch membership changes use: the server re-derives what this
-    // user may see, and the row keeps its identity, its pin and its unread badge
-    // because the reducer replaces items by id.
-    onChannelUpdated: refreshSidebar,
+    // user may see, and the row keeps its identity, its pin, its mute state and
+    // its unread badge because the reducer replaces items by id.
+    onConversationUpdated: refreshSidebar,
+    // A system message landed (a rename, someone leaving). The sidebar shows no
+    // message content, but a departure changes what this user may see, so the
+    // same refetch settles it — and it is coalesced, so a burst costs one.
+    onConversationEvent: refreshSidebar,
     onMessageCreated: (event: WSMessageCreatedEvent) => {
       if (seenRealtimeMessageIds.current.has(event.message_id)) return;
       seenRealtimeMessageIds.current.add(event.message_id);
@@ -445,70 +575,12 @@ export function useChatSidebar() {
         refreshSidebar();
         return;
       }
-      // Same "is this relevant to the reader" question the reducer's `counts`
-      // (message_created case above) answers for unread badges, recomputed
-      // here rather than threaded out of the reducer: a reducer performs
-      // state transitions, not side effects like audio playback, and this
-      // callback already has senderId, currentUserId and the active target
-      // in scope for the very same event. The classification is also reused
-      // for the reducer's `isMentioned` flag below, so it only runs once.
-      let isMentioned = false;
-      if (state.status === "ready" && event.payload) {
-        const payload = event.payload;
-        const isOwnMessage = (payload.sender_id ?? "") === state.currentUserId;
-        const isActiveConversation =
-          openedTarget?.kind === event.target_type && openedTarget.targetId === event.target_id;
-        const classified = classifySoundEvent(payload, event.target_type, state.currentUserId);
-        isMentioned = classified.isMentioned;
-        const isWindowFocused = document.visibilityState === "visible";
-        const play = shouldPlayMessageSound({
-          mode: getSoundNotificationMode(),
-          // Already past the seenRealtimeMessageIds check above — this event
-          // is guaranteed fresh by the time it reaches this decision.
-          isDuplicate: false,
-          isOwnMessage,
-          category: classified.category,
-          isMentioned: classified.isMentioned,
-          isActiveConversation,
-          isWindowFocused,
+      const isMentioned =
+        state.status === "ready" &&
+        announceMessage(event, state.currentUserId, openedTarget, (path) => {
+          navigate(path);
+          refreshSidebar();
         });
-        if (play) {
-          // The native notification and the chime are alternate channels for
-          // the same eligible event, never both: a native one shown
-          // successfully replaces the chime; anything else (denied/default/
-          // unsupported permission, background API failure, or the tab being
-          // in the foreground — native notifications never fire there) falls
-          // through to the existing sound path unchanged.
-          let shown = false;
-          if (!isWindowFocused) {
-            try {
-              shown = showBrowserMessageNotification({
-                targetKind: event.target_type,
-                targetId: event.target_id,
-                senderDisplayName: payload.sender_display_name,
-                bodyText: payload.body_text,
-                onNavigate: (path) => {
-                  navigate(path);
-                  refreshSidebar();
-                },
-              }).shown;
-            } catch {
-              // The module already guards itself; this is defense in depth —
-              // the WS callback must never break because of it.
-            }
-          }
-          if (!shown) {
-            // playMessageSound() already never throws, but the unread badge
-            // must update even if that guarantee is ever violated — a failed
-            // chime is never allowed to break message receipt.
-            try {
-              playMessageSound();
-            } catch {
-              // Swallowed on purpose: see above.
-            }
-          }
-        }
-      }
       dispatch({
         type: "message_created",
         target: { kind: event.target_type, targetId: event.target_id },
@@ -589,5 +661,82 @@ export function useChatSidebar() {
     [refreshSidebar],
   );
 
-  return { state, retry: load, setPinned, markRead, renameChannel };
+  /**
+   * Silences or restores one conversation for this user only (issue #527).
+   *
+   * Optimistic like the pin, and for the same reason: it is a private
+   * preference the server either accepts or refuses outright, so showing the
+   * new state immediately and rolling back on failure is honest. The refetch
+   * after a confirmed write reconciles with what was actually persisted.
+   */
+  const setMuted = useCallback(
+    async (target: WSSubscriptionTarget, muted: boolean) => {
+      if (state.status !== "ready") return;
+      const items = target.kind === "channel" ? state.channels : state.dms;
+      const previous = Boolean(items.find((item) => item.id === target.targetId)?.muted);
+      dispatch({ type: "mute_changed", target, muted });
+      try {
+        await setConversationMuted(target.kind, target.targetId, muted);
+      } catch (error) {
+        dispatch({ type: "mute_changed", target, muted: previous });
+        throw error;
+      }
+    },
+    [state],
+  );
+
+  /**
+   * Renames a group. Same no-optimism rule the channel rename follows: a name
+   * the server never accepted must not appear, so the refetch after a confirmed
+   * 200 is what updates every surface.
+   */
+  const renameGroup = useCallback(
+    async (conversationId: string, title: string) => {
+      await renameGroupRequest(conversationId, title);
+      refreshSidebar();
+    },
+    [refreshSidebar],
+  );
+
+  /**
+   * Removes this user from a channel or group and drops it from the sidebar.
+   *
+   * The refetch is the removal: membership is the server's to decide, so the row
+   * disappears because the canonical list stopped returning it, never because
+   * the client deleted it locally. That also unsubscribes it from realtime —
+   * the socket's target list is derived from the same state — without touching
+   * the connection itself.
+   *
+   * Leaving the conversation you are *reading* additionally has to move you off
+   * it. Staying would leave the route pointing at something this user can no
+   * longer see: the message area would keep asking for its history, the details
+   * panel would keep polling, and the composer would still be aimed at it. The
+   * navigation happens only after the request resolved — never optimistically —
+   * so a refusal leaves the reader exactly where they were.
+   *
+   * The fallback is the chat's own base route, which is the neutral state this
+   * product already renders when nothing is selected. There is no "next
+   * conversation" convention in this sidebar to follow, and inventing one here
+   * would be a product decision disguised as error handling.
+   */
+  const leaveConversation = useCallback(
+    async (target: WSSubscriptionTarget) => {
+      const wasReading = openedTargetKind === target.kind && openedTargetId === target.targetId;
+      await leaveConversationRequest(target.kind, target.targetId);
+      refreshSidebar();
+      if (wasReading) navigate("/chat");
+    },
+    [refreshSidebar, navigate, openedTargetKind, openedTargetId],
+  );
+
+  return {
+    state,
+    retry: load,
+    setPinned,
+    markRead,
+    renameChannel,
+    renameGroup,
+    setMuted,
+    leaveConversation,
+  };
 }

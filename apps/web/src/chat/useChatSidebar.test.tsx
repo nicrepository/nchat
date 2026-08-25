@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
-import { MemoryRouter, useNavigate } from "react-router";
+import { MemoryRouter, useLocation, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -10,13 +10,15 @@ import type {
 import { parseInstant } from "./sidebarOrder";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
 import type { WSMessageCreatedEvent } from "./useChatWebSocket";
-import { useChatSidebar } from "./useChatSidebar";
+import { useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 const {
   mockFetchSidebarData,
   mockMarkConversationRead,
   mockSetSidebarConversationPinned,
   mockRenameChannel,
+  mockSetConversationMuted,
+  mockLeaveConversation,
   mockPlayMessageSound,
   mockGetSoundNotificationMode,
   mockShowBrowserMessageNotification,
@@ -26,6 +28,8 @@ const {
   mockMarkConversationRead: vi.fn(),
   mockSetSidebarConversationPinned: vi.fn(),
   mockRenameChannel: vi.fn(),
+  mockSetConversationMuted: vi.fn(),
+  mockLeaveConversation: vi.fn(),
   mockPlayMessageSound: vi.fn(),
   mockGetSoundNotificationMode: vi.fn(
     () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
@@ -39,7 +43,8 @@ const {
   websocket: {
     onMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     onConversationAvailable: null as (() => void) | null,
-    onChannelUpdated: null as (() => void) | null,
+    onConversationUpdated: null as (() => void) | null,
+    onConversationEvent: null as (() => void) | null,
   },
 }));
 
@@ -48,6 +53,8 @@ vi.mock("./chatApi", () => ({
   markConversationRead: mockMarkConversationRead,
   setSidebarConversationPinned: mockSetSidebarConversationPinned,
   renameChannel: mockRenameChannel,
+  setConversationMuted: mockSetConversationMuted,
+  leaveConversation: mockLeaveConversation,
 }));
 vi.mock("./messageSound", () => ({
   playMessageSound: mockPlayMessageSound,
@@ -63,15 +70,18 @@ vi.mock("./useChatWebSocket", () => ({
     ({
       onMessageCreated,
       onConversationAvailable,
-      onChannelUpdated,
+      onConversationUpdated,
+      onConversationEvent,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onConversationAvailable?: () => void;
-      onChannelUpdated?: () => void;
+      onConversationUpdated?: () => void;
+      onConversationEvent?: () => void;
     }) => {
       websocket.onMessageCreated = onMessageCreated;
       websocket.onConversationAvailable = onConversationAvailable ?? null;
-      websocket.onChannelUpdated = onChannelUpdated ?? null;
+      websocket.onConversationUpdated = onConversationUpdated ?? null;
+      websocket.onConversationEvent = onConversationEvent ?? null;
       return { toggleReaction: vi.fn() };
     },
   ),
@@ -121,6 +131,27 @@ function navigableWrapper(path: string) {
     );
   }
   return { Wrapper, navigateRef };
+}
+
+/**
+ * Like `wrapper`, but reports the route the hook is on, so a test can assert
+ * where a navigation landed instead of only that one was requested.
+ */
+function routedWrapper(path: string) {
+  const pathnameRef = { current: path };
+  function LocationCapture() {
+    pathnameRef.current = useLocation().pathname;
+    return null;
+  }
+  function Wrapper({ children }: PropsWithChildren) {
+    return (
+      <MemoryRouter initialEntries={[path]}>
+        <LocationCapture />
+        {children}
+      </MemoryRouter>
+    );
+  }
+  return { Wrapper, pathnameRef };
 }
 
 function messageCreated(
@@ -2174,7 +2205,7 @@ describe("useChatSidebar — ações do menu de conversa", () => {
     mockFetchSidebarData.mockReset();
     mockMarkConversationRead.mockReset();
     mockRenameChannel.mockReset();
-    websocket.onChannelUpdated = null;
+    websocket.onConversationUpdated = null;
     mockMarkConversationRead.mockResolvedValue(undefined);
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
@@ -2259,10 +2290,10 @@ describe("useChatSidebar — ações do menu de conversa", () => {
 
   // Someone else renamed the channel. The event names it and nothing else, so
   // the only correct response is the canonical refetch.
-  it("refetches when a channel.updated event arrives, without duplicating the row", async () => {
+  it("refetches when a conversation.updated event arrives, without duplicating the row", async () => {
     const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
-    expect(websocket.onChannelUpdated).toBeTypeOf("function");
+    expect(websocket.onConversationUpdated).toBeTypeOf("function");
 
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
@@ -2273,8 +2304,8 @@ describe("useChatSidebar — ações do menu de conversa", () => {
 
     // Twice: a repeated event must be indistinguishable from one.
     await act(async () => {
-      websocket.onChannelUpdated?.();
-      websocket.onChannelUpdated?.();
+      websocket.onConversationUpdated?.();
+      websocket.onConversationUpdated?.();
       await Promise.resolve();
     });
 
@@ -2284,5 +2315,281 @@ describe("useChatSidebar — ações do menu de conversa", () => {
       expect(result.current.state.channels[0]).toMatchObject({ id: channelA, name: "Plataforma" });
       expect(unreadCounts(result.current.state).channelA).toBe(5);
     });
+  });
+});
+
+// ── System messages must not become mentions or chimes (issue #527) ──────────
+//
+// A rename or a departure arrives as `conversation.event`, never as
+// `message.created`, so it structurally cannot reach the mention classifier or
+// the sound/notification path — both of which live in the message.created
+// handler. These pin that down.
+
+describe("useChatSidebar — system messages", () => {
+  beforeEach(() => {
+    mockFetchSidebarData.mockReset();
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
+    websocket.onConversationEvent = null;
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        {
+          id: channelA,
+          name: "infra",
+          type: "public",
+          canWrite: true,
+          unreadCount: 2,
+          hasMentionUnread: false,
+        },
+      ],
+      dms: [],
+    });
+  });
+
+  it("never raises a mention, a chime or a notification for a conversation event", async () => {
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(websocket.onConversationEvent).toBeTypeOf("function");
+
+    await act(async () => {
+      websocket.onConversationEvent?.();
+      await Promise.resolve();
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    const channel = result.current.state.channels[0];
+    // The mention flag is untouched: only message.created can set it, and a
+    // system event is not one.
+    expect(channel?.hasMentionUnread).toBe(false);
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+  // ── Leaving the conversation on screen (issue #527, code review) ───────────
+  //
+  // Leaving is the one action that can remove the conversation the reader is
+  // looking at. The row disappearing is not enough: the route still names a
+  // conversation this user is no longer a member of, and everything downstream
+  // of it — the message list, the details panel — would keep asking for it.
+  describe("leaving the open conversation", () => {
+    beforeEach(() => {
+      mockLeaveConversation.mockResolvedValue(undefined);
+      mockFetchSidebarData.mockResolvedValue({
+        currentUserId,
+        channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+        dms: [{ id: groupD, name: "Squad", type: "group", isGroup: true }],
+      });
+    });
+
+    it("returns to the neutral route after leaving the channel being read", async () => {
+      const { Wrapper, pathnameRef } = routedWrapper(`/chat/channel/${channelA}`);
+      const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      await act(async () => {
+        await result.current.leaveConversation({ kind: "channel", targetId: channelA });
+      });
+
+      expect(mockLeaveConversation).toHaveBeenCalledWith("channel", channelA);
+      expect(pathnameRef.current).toBe("/chat");
+    });
+
+    it("returns to the neutral route after leaving the group being read", async () => {
+      const { Wrapper, pathnameRef } = routedWrapper(`/chat/dm/${groupD}`);
+      const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      await act(async () => {
+        await result.current.leaveConversation({ kind: "dm", targetId: groupD });
+      });
+
+      expect(pathnameRef.current).toBe("/chat");
+    });
+
+    // Leaving from the sidebar while reading something else must not move the
+    // reader: the action is about the row whose menu was opened, never about
+    // the selection.
+    it("stays where it is when the conversation left is not the one on screen", async () => {
+      const { Wrapper, pathnameRef } = routedWrapper(`/chat/channel/${channelA}`);
+      const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      await act(async () => {
+        await result.current.leaveConversation({ kind: "dm", targetId: groupD });
+      });
+
+      expect(pathnameRef.current).toBe(`/chat/channel/${channelA}`);
+    });
+
+    // The navigation is a consequence of the departure, so it must not precede
+    // it: a request that fails leaves the reader exactly where they were, still
+    // in a conversation they are still a member of.
+    it("does not leave the route when the request fails", async () => {
+      mockLeaveConversation.mockRejectedValueOnce(new Error("offline"));
+      const { Wrapper, pathnameRef } = routedWrapper(`/chat/channel/${channelA}`);
+      const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
+      await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+      await act(async () => {
+        await expect(
+          result.current.leaveConversation({ kind: "channel", targetId: channelA }),
+        ).rejects.toThrow("offline");
+      });
+
+      expect(pathnameRef.current).toBe(`/chat/channel/${channelA}`);
+    });
+  });
+});
+
+// ── Per-conversation preferences on every kind of row (issue #527) ──────────
+//
+// Pin and mute are the same shape — optimistic write, rollback on refusal — and
+// both have to work on a direct conversation and a group, not only on a channel.
+// The list a preference lands in is chosen from the target's kind, so a DM
+// target reaching the channel list would silently update nothing.
+describe("useChatSidebar conversation preferences", () => {
+  beforeEach(() => {
+    mockFetchSidebarData.mockReset();
+    mockSetSidebarConversationPinned.mockReset();
+    mockSetConversationMuted.mockReset();
+    mockSetSidebarConversationPinned.mockResolvedValue(undefined);
+    mockSetConversationMuted.mockResolvedValue(undefined);
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [
+        { id: dmC, name: "Juliane", type: "1:1" },
+        { id: groupD, name: "Squad", type: "group", isGroup: true },
+      ],
+    });
+  });
+
+  const readyHook = async () => {
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    return result;
+  };
+
+  const dmRow = (result: { current: { state: SidebarState } }, id: string) => {
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    return result.current.state.dms.find((dm) => dm.id === id);
+  };
+
+  it("mutes a direct conversation optimistically and keeps the other rows alone", async () => {
+    const result = await readyHook();
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "dm", targetId: dmC }, true);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", dmC, true);
+    expect(dmRow(result, dmC)?.muted).toBe(true);
+    // A preference is per conversation: nothing else moved.
+    expect(dmRow(result, groupD)?.muted).toBeFalsy();
+    if (result.current.state.status === "ready") {
+      expect(result.current.state.channels[0]?.muted).toBeFalsy();
+    }
+  });
+
+  it("rolls a mute back to what it was when the server refuses", async () => {
+    mockSetConversationMuted.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(
+        result.current.setMuted({ kind: "channel", targetId: channelA }, true),
+      ).rejects.toThrow("offline");
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    // Un-muted is what it was, so un-muted is what it must be again: a refusal
+    // must never leave a conversation looking silenced.
+    expect(result.current.state.channels[0]?.muted).toBeFalsy();
+  });
+
+  it("unmutes a group back to false", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [],
+      dms: [{ id: groupD, name: "Squad", type: "group", isGroup: true, muted: true }],
+    });
+    const result = await readyHook();
+    expect(dmRow(result, groupD)?.muted).toBe(true);
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "dm", targetId: groupD }, false);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", groupD, false);
+    expect(dmRow(result, groupD)?.muted).toBe(false);
+  });
+
+  it("pins a direct conversation optimistically, then reconciles with the server", async () => {
+    const persisted = deferredValue<void>();
+    mockSetSidebarConversationPinned.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setPinned({ kind: "dm", targetId: dmC }, true);
+    });
+
+    expect(mockSetSidebarConversationPinned).toHaveBeenCalledWith("dm", dmC, true);
+    // The row shows the pin while the write is in flight, and the row next to it
+    // does not.
+    expect(dmRow(result, dmC)?.pinnedAt).toBeTruthy();
+    expect(dmRow(result, groupD)?.pinnedAt).toBeFalsy();
+
+    persisted.resolve();
+    await act(async () => operation);
+
+    // Only after it is persisted does the canonical list get refetched — what is
+    // finally on screen is the server's answer, not the optimistic guess.
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBefore),
+    );
+  });
+
+  it("restores a direct conversation's previous pin when the write fails", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [],
+      dms: [{ id: dmC, name: "Juliane", type: "1:1", pinnedAt: "2026-08-01T10:00:00Z" }],
+    });
+    mockSetSidebarConversationPinned.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(result.current.setPinned({ kind: "dm", targetId: dmC }, false)).rejects.toThrow(
+        "offline",
+      );
+    });
+
+    expect(dmRow(result, dmC)?.pinnedAt).toBe("2026-08-01T10:00:00Z");
+  });
+
+  // A preference for a conversation the sidebar does not have changes nothing —
+  // membership comes from the server's list and never from an action's target.
+  it("changes nothing when the target is not in the sidebar", async () => {
+    const result = await readyHook();
+    const before = result.current.state;
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "dm", targetId: "missing-id" }, true);
+      await result.current.setPinned({ kind: "channel", targetId: "missing-id" }, true);
+    });
+
+    if (result.current.state.status !== "ready" || before.status !== "ready") {
+      throw new Error("not ready");
+    }
+    // The rows the sidebar does have are untouched, and no row was invented for
+    // the id that is not in it.
+    expect(result.current.state.channels.map((channel) => channel.id)).toEqual([channelA]);
+    expect(result.current.state.dms.map((dm) => dm.id)).toEqual([dmC, groupD]);
+    expect(result.current.state.channels.every((channel) => !channel.muted)).toBe(true);
+    expect(result.current.state.dms.every((dm) => !dm.muted && !dm.pinnedAt)).toBe(true);
   });
 });

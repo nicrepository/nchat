@@ -207,6 +207,43 @@ export interface WSMessageUpdatedEvent {
   };
 }
 
+/**
+ * The target an inbound frame names, normalised once per frame.
+ *
+ * `key` is what every routing decision below compares against, and `data` is the
+ * frame with its target id normalised — handlers receive that rather than the
+ * raw frame, so no consumer has to re-normalise an id.
+ */
+interface IncomingTarget {
+  id: string;
+  type: "channel" | "dm" | "";
+  key: string;
+  data: Record<string, unknown>;
+}
+
+function incomingTarget(d: Record<string, unknown>): IncomingTarget {
+  const id = typeof d["target_id"] === "string" ? normalizeChatTargetId(d["target_id"]) : "";
+  const type = d["target_type"] === "channel" || d["target_type"] === "dm" ? d["target_type"] : "";
+  return { id, type, key: `${type}:${id}`, data: id ? { ...d, target_id: id } : d };
+}
+
+/**
+ * A link-safety frame is only applied when its payload is complete and names the
+ * same message the frame does. A verdict for another message, or one missing its
+ * state, is dropped rather than half-applied.
+ */
+function isLinkSafetyPayload(d: Record<string, unknown>): boolean {
+  const linkSafety = d["link_safety"];
+  if (!linkSafety || typeof linkSafety !== "object") return false;
+  const payload = linkSafety as Record<string, unknown>;
+  return (
+    typeof payload["message_id"] === "string" &&
+    payload["message_id"] === d["message_id"] &&
+    typeof payload["state"] === "string" &&
+    typeof payload["updated_at"] === "string"
+  );
+}
+
 function isMessageUpdatedEvent(
   value: Record<string, unknown>,
 ): value is Record<string, unknown> & WSMessageUpdatedEvent {
@@ -285,18 +322,37 @@ export interface WSConversationAvailableEvent {
 }
 
 /**
- * A channel's own metadata changed — today, it was renamed (issue #527).
+ * A conversation's own metadata changed — today, it was renamed (issue #527).
  *
  * Carries no payload at all, not even the new name: like members.added it means
  * "your view of this target is stale", and the handler converges by refetching
  * the sidebar, which the server re-authorises. That is also what makes it
  * idempotent — a repeat costs one extra refetch and can never produce a second
- * row for the same channel.
+ * row for the same conversation.
+ *
+ * One event for channels and groups, because it is one fact and `target_type`
+ * already says which kind it is.
  */
-export interface WSChannelUpdatedEvent {
-  type: "channel.updated";
-  target_type: "channel";
+export interface WSConversationUpdatedEvent {
+  type: "conversation.updated";
+  target_type: "channel" | "dm";
   target_id: string;
+}
+
+/**
+ * A system message was persisted in a conversation — a rename, a departure
+ * (issue #527).
+ *
+ * Route plus message id, and nothing else: not the event type, not the names,
+ * not the actor. The message is read back through the same authorized listing
+ * every other message goes through, so the broadcast grants nothing and the
+ * rendered text can never come from a payload a remote node supplied.
+ */
+export interface WSConversationEventMessage {
+  type: "conversation.event";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
 }
 
 /**
@@ -357,7 +413,8 @@ interface UseChatWebSocketOptions {
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
-  onChannelUpdated?: (event: WSChannelUpdatedEvent) => void;
+  onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
+  onConversationEvent?: (event: WSConversationEventMessage) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
   onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -404,7 +461,8 @@ export function useChatWebSocket({
   onMembersAdded,
   onAttachmentStatus,
   onConversationAvailable,
-  onChannelUpdated,
+  onConversationUpdated,
+  onConversationEvent,
   onReactionError,
   onSubscriptionError,
   onSubscribed,
@@ -436,7 +494,8 @@ export function useChatWebSocket({
   const onMembersRef = useRef(onMembersAdded);
   const onAttachmentStatusRef = useRef(onAttachmentStatus);
   const onConversationAvailableRef = useRef(onConversationAvailable);
-  const onChannelUpdatedRef = useRef(onChannelUpdated);
+  const onConversationUpdatedRef = useRef(onConversationUpdated);
+  const onConversationEventRef = useRef(onConversationEvent);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
@@ -461,7 +520,8 @@ export function useChatWebSocket({
     onMembersRef.current = onMembersAdded;
     onAttachmentStatusRef.current = onAttachmentStatus;
     onConversationAvailableRef.current = onConversationAvailable;
-    onChannelUpdatedRef.current = onChannelUpdated;
+    onConversationUpdatedRef.current = onConversationUpdated;
+    onConversationEventRef.current = onConversationEvent;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
@@ -581,6 +641,144 @@ export function useChatWebSocket({
       }, delay);
     };
 
+    // ── Routing ──────────────────────────────────────────────────────────────
+    // Declared here rather than at module scope because each one closes over the
+    // consumer's callback refs and this effect's socket handle. Every one of them
+    // returns true when it consumed the frame.
+
+    function routeSubscriptionAck(
+      control: SubscriptionControl,
+      d: Record<string, unknown>,
+      incoming: IncomingTarget,
+    ): boolean {
+      if (d["type"] !== "subscribed" || d["operation"] !== "subscribe") return false;
+      if (!control.expected.has(incoming.key)) return false;
+      const acknowledgement = incoming.data as unknown as WSSubscribedEvent;
+      const wasPending = control.pending.delete(incoming.key);
+      control.confirmed.add(incoming.key);
+      if (incoming.key === primaryTargetKey) {
+        control.primaryAcknowledgement = acknowledgement;
+      }
+      if (wasPending && completeSubscriptionRecovery(control)) {
+        onSubscribedRef.current?.(control.primaryAcknowledgement ?? acknowledgement);
+      }
+      return true;
+    }
+
+    function routeClientError(d: Record<string, unknown>, generation: number): boolean {
+      if (d["type"] !== "error" || typeof d["code"] !== "string") return false;
+      const clientError = d as unknown as WSClientErrorEvent;
+      if (d["operation"] !== "subscribe") {
+        onReactionErrorRef.current?.(clientError);
+        return true;
+      }
+      onSubscriptionErrorRef.current?.(clientError);
+      if (d["code"] === "room_subscription_unavailable" && handle?.isOpen()) {
+        scheduleSubscriptionRecovery(generation);
+      }
+      return true;
+    }
+
+    // Routed before the subscription guard on purpose. conversation.available
+    // exists precisely for a target the client is not subscribed to yet, so
+    // requiring a subscription would drop the one message that tells a
+    // newly-added user their sidebar is stale; message.blocked is addressed to a
+    // user rather than to a conversation and carries no target to match against,
+    // and without it the author of a blocked message would sit on "checking
+    // links…" forever.
+    function routeUnscopedEvent(d: Record<string, unknown>, incoming: IncomingTarget): boolean {
+      if (d["type"] === "conversation.available" && incoming.id && incoming.type) {
+        onConversationAvailableRef.current?.(
+          incoming.data as unknown as WSConversationAvailableEvent,
+        );
+        return true;
+      }
+      if (d["type"] === "message.blocked" && typeof d["message_id"] === "string") {
+        onMessageBlockedRef.current?.(incoming.data as unknown as WSMessageBlockedEvent);
+        return true;
+      }
+      return false;
+    }
+
+    // Delivered for any subscribed target rather than only the primary one
+    // (RF-22): none of these is a mutating action the user just took. A scan
+    // verdict, a link-safety reconciliation, a rename or a departure lands
+    // seconds or minutes later, quite possibly while the reader is looking at a
+    // different conversation — and the correction still has to be applied, or a
+    // message that stopped being safe stays drawn as safe because its tab is in
+    // the background.
+    function routeSubscribedTargetEvent(
+      d: Record<string, unknown>,
+      incoming: IncomingTarget,
+    ): boolean {
+      if (d["type"] === "message.link_safety_changed" && typeof d["message_id"] === "string") {
+        if (isLinkSafetyPayload(d)) {
+          onLinkSafetyRef.current?.(incoming.data as unknown as WSMessageLinkSafetyChangedEvent);
+        }
+        return true;
+      }
+      if (d["type"] === "message.created") {
+        onMessageRef.current(incoming.data as unknown as WSMessageCreatedEvent);
+        return true;
+      }
+      if (d["type"] === "attachment.status") {
+        onAttachmentStatusRef.current?.(incoming.data as unknown as WSAttachmentStatusEvent);
+        return true;
+      }
+      return routeConversationEvent(d, incoming);
+    }
+
+    // An event with no recognised target type is not one this protocol produces
+    // and is dropped.
+    function routeConversationEvent(d: Record<string, unknown>, incoming: IncomingTarget): boolean {
+      if (d["type"] === "conversation.updated" && incoming.type) {
+        onConversationUpdatedRef.current?.(incoming.data as unknown as WSConversationUpdatedEvent);
+        return true;
+      }
+      if (
+        d["type"] === "conversation.event" &&
+        incoming.type &&
+        typeof d["message_id"] === "string"
+      ) {
+        onConversationEventRef.current?.(incoming.data as unknown as WSConversationEventMessage);
+        return true;
+      }
+      return false;
+    }
+
+    // Split in two along what the frame is about: an edit, a reaction or a pin
+    // changes a message that is on screen; typing and a new member change the
+    // room around it. Both are scoped to the primary target because they are the
+    // consequence of an action someone took in the conversation being read.
+    function routePrimaryTargetEvent(d: Record<string, unknown>, incoming: IncomingTarget): void {
+      if (routeMessageMutation(d, incoming)) return;
+      routeRoomActivity(d, incoming);
+    }
+
+    function routeMessageMutation(d: Record<string, unknown>, incoming: IncomingTarget): boolean {
+      if (d["type"] === "message.updated" && isMessageUpdatedEvent(incoming.data)) {
+        onMessageUpdatedRef.current?.(incoming.data);
+        return true;
+      }
+      if (d["type"] === "reaction.updated") {
+        onReactionRef.current?.(incoming.data as unknown as WSReactionUpdatedEvent);
+        return true;
+      }
+      if (d["type"] === "pin.updated") {
+        onPinRef.current?.(incoming.data as unknown as WSPinUpdatedEvent);
+        return true;
+      }
+      return false;
+    }
+
+    function routeRoomActivity(d: Record<string, unknown>, incoming: IncomingTarget): void {
+      if (d["type"] === "typing.updated") {
+        onTypingRef.current?.(incoming.data as unknown as WSTypingUpdatedEvent);
+      } else if (d["type"] === "members.added") {
+        onMembersRef.current?.(incoming.data as unknown as WSMembersAddedEvent);
+      }
+    }
+
     handle = acquireChatSocket({
       onStatus: (next) => {
         if (!closed) setConnectionStatus(next);
@@ -612,120 +810,25 @@ export function useChatWebSocket({
         }
       },
 
+      // Routing only. Each route function answers one question — is this frame
+      // mine? — and reports whether it consumed the frame, so the order of the
+      // guards below *is* the protocol: control frames first, then the events
+      // addressed to a user rather than to a conversation, then the subscription
+      // check, then events any subscribed target may deliver, and last the ones
+      // scoped to the conversation on screen. Nothing here decides what an event
+      // means; that is still the consumer's callback.
       onMessage: (d, generation) => {
         const control = currentSubscriptionControl(generation);
         if (!control) return;
-        const incomingTargetId =
-          typeof d["target_id"] === "string" ? normalizeChatTargetId(d["target_id"]) : "";
-        const incomingTargetType =
-          d["target_type"] === "channel" || d["target_type"] === "dm" ? d["target_type"] : "";
-        const incomingTargetKey = `${incomingTargetType}:${incomingTargetId}`;
-        const normalizedData = incomingTargetId ? { ...d, target_id: incomingTargetId } : d;
-        if (
-          d["type"] === "subscribed" &&
-          d["operation"] === "subscribe" &&
-          control.expected.has(incomingTargetKey)
-        ) {
-          const acknowledgement = normalizedData as unknown as WSSubscribedEvent;
-          const wasPending = control.pending.delete(incomingTargetKey);
-          control.confirmed.add(incomingTargetKey);
-          if (incomingTargetKey === primaryTargetKey) {
-            control.primaryAcknowledgement = acknowledgement;
-          }
-          if (wasPending && completeSubscriptionRecovery(control)) {
-            onSubscribedRef.current?.(control.primaryAcknowledgement ?? acknowledgement);
-          }
-          return;
-        }
-        if (d["type"] === "error" && typeof d["code"] === "string") {
-          const clientError = d as unknown as WSClientErrorEvent;
-          if (d["operation"] === "subscribe") {
-            onSubscriptionErrorRef.current?.(clientError);
-            if (d["code"] === "room_subscription_unavailable" && handle?.isOpen()) {
-              scheduleSubscriptionRecovery(generation);
-            }
-            return;
-          }
-          onReactionErrorRef.current?.(clientError);
-          return;
-        }
-        // Routed before the subscription guard on purpose: this event exists
-        // precisely for a target the client is not subscribed to yet, so
-        // requiring a subscription would drop the one message that tells a
-        // newly-added user their sidebar is stale.
-        if (d["type"] === "conversation.available" && incomingTargetId && incomingTargetType) {
-          onConversationAvailableRef.current?.(
-            normalizedData as unknown as WSConversationAvailableEvent,
-          );
-          return;
-        }
-        // Routed before the subscription guard for the same reason
-        // conversation.available is: it is addressed to a user rather than to a
-        // conversation, so it carries no target to match against. Without this
-        // the author of a blocked message would never be told, and their
-        // composer would sit on "checking links…" forever.
-        if (d["type"] === "message.blocked" && typeof d["message_id"] === "string") {
-          onMessageBlockedRef.current?.(normalizedData as unknown as WSMessageBlockedEvent);
-          return;
-        }
-        if (!control.expected.has(incomingTargetKey)) return;
-        // Routed for any subscribed target rather than only the primary one, for
-        // the same reason attachment.status is: a reconciliation lands minutes
-        // after the message and quite possibly while the reader is looking at a
-        // different conversation. The correction still has to be applied — a
-        // message that stopped being safe must not stay drawn as safe just
-        // because its tab is in the background.
-        if (d["type"] === "message.link_safety_changed" && typeof d["message_id"] === "string") {
-          const linkSafety = d["link_safety"];
-          if (
-            !linkSafety ||
-            typeof linkSafety !== "object" ||
-            typeof (linkSafety as Record<string, unknown>)["message_id"] !== "string" ||
-            (linkSafety as Record<string, unknown>)["message_id"] !== d["message_id"] ||
-            typeof (linkSafety as Record<string, unknown>)["state"] !== "string" ||
-            typeof (linkSafety as Record<string, unknown>)["updated_at"] !== "string"
-          ) {
-            return;
-          }
-          onLinkSafetyRef.current?.(normalizedData as unknown as WSMessageLinkSafetyChangedEvent);
-          return;
-        }
-        if (d["type"] === "message.created") {
-          onMessageRef.current(normalizedData as unknown as WSMessageCreatedEvent);
-          return;
-        }
-        // Routed for any subscribed target rather than only the primary one
-        // (RF-22). A scan verdict is not a mutating action the user just took:
-        // it lands seconds or minutes after an upload, possibly while the user
-        // is looking at a different conversation, and the panel that has to
-        // reconcile is whichever one the attachment belongs to.
-        if (d["type"] === "attachment.status") {
-          onAttachmentStatusRef.current?.(normalizedData as unknown as WSAttachmentStatusEvent);
-          return;
-        }
-        // Routed for any subscribed target rather than only the primary one, and
-        // for the same reason attachment.status is: a rename performed by someone
-        // else lands while this reader is looking at a different conversation,
-        // and the sidebar row still has to converge. Only a channel can be
-        // renamed, so an event claiming another target type is not one this
-        // protocol produces and is dropped.
-        if (d["type"] === "channel.updated" && incomingTargetType === "channel") {
-          onChannelUpdatedRef.current?.(normalizedData as unknown as WSChannelUpdatedEvent);
-          return;
-        }
+        const incoming = incomingTarget(d);
+        if (routeSubscriptionAck(control, d, incoming)) return;
+        if (routeClientError(d, generation)) return;
+        if (routeUnscopedEvent(d, incoming)) return;
+        if (!control.expected.has(incoming.key)) return;
+        if (routeSubscribedTargetEvent(d, incoming)) return;
         // Mutating actions remain scoped to the primary target.
-        if (incomingTargetKey !== primaryTargetKey) return;
-        if (d["type"] === "message.updated" && isMessageUpdatedEvent(normalizedData)) {
-          onMessageUpdatedRef.current?.(normalizedData);
-        } else if (d["type"] === "reaction.updated") {
-          onReactionRef.current?.(normalizedData as unknown as WSReactionUpdatedEvent);
-        } else if (d["type"] === "typing.updated") {
-          onTypingRef.current?.(normalizedData as unknown as WSTypingUpdatedEvent);
-        } else if (d["type"] === "pin.updated") {
-          onPinRef.current?.(normalizedData as unknown as WSPinUpdatedEvent);
-        } else if (d["type"] === "members.added") {
-          onMembersRef.current?.(normalizedData as unknown as WSMembersAddedEvent);
-        }
+        if (incoming.key !== primaryTargetKey) return;
+        routePrimaryTargetEvent(d, incoming);
       },
 
       onClose: (generation) => {
