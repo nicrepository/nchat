@@ -887,6 +887,23 @@ describe("global and dedicated presentation", () => {
   });
 });
 
+describe("outgoing call presentation CSS (#648)", () => {
+  it("colors the outgoing card and its secondary text with the real ink/muted tokens, not the shared fallback that never resolves in this app", () => {
+    expect(presentationCSS).toMatch(/\.outgoing-call\s*\{[^}]*color:\s*var\(--color-ink/);
+    expect(presentationCSS).toMatch(
+      /\.outgoing-call__identity span\s*\{[^}]*color:\s*var\(--color-muted/,
+    );
+  });
+
+  it("tightens the outgoing actions gap to match the #616 incoming fix, closing the dead space above Cancelar", () => {
+    expect(presentationCSS).toMatch(/\.outgoing-call__actions\s*\{[^}]*margin-top:\s*0\.6rem/);
+  });
+
+  it("gives the outgoing cancel button a visible focus ring on the light card", () => {
+    expect(presentationCSS).toMatch(/\.outgoing-call__cancel:focus-visible\s*\{[^}]*outline:/);
+  });
+});
+
 describe("active speaker CSS", () => {
   it("keeps the visual state but disables its transition for reduced motion", () => {
     expect(presentationCSS).toMatch(/\.call-speaker-surface--active::after/);

@@ -143,6 +143,38 @@
   }
 }
 
+/*
+ * #648 (follow-up to #616): same root cause as the incoming comment above —
+ * the shared `.outgoing-call { color: var(--color-text, #f8fafc) }` and
+ * `.outgoing-call__identity span { color: var(--color-text-muted, #94a3b8) }`
+ * fall back to near-white because --color-text/--color-text-muted are never
+ * defined here (real tokens: --color-ink/--color-muted). #616 deliberately
+ * left outgoing untouched; this scopes the same fix to it. Also closes the
+ * dead space above Cancelar: outgoing was still on the shared 1rem
+ * margin-top instead of the 0.6rem incoming got in #616.
+ */
+.outgoing-call {
+  color: var(--color-ink, #102a33);
+}
+.outgoing-call__identity span {
+  color: var(--color-muted, #5c7380);
+}
+.outgoing-call__name {
+  display: block;
+  overflow: hidden;
+  font-size: 1.05rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.outgoing-call__actions {
+  min-height: 2.5rem;
+  margin-top: 0.6rem;
+}
+.outgoing-call__cancel:focus-visible {
+  outline: 3px solid var(--color-ink, #102a33);
+  outline-offset: 2px;
+}
+
 .floating-call {
   top: 0;
   left: 0;
