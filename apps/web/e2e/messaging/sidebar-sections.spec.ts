@@ -598,8 +598,12 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
   });
 
   test("mantém o rodapé utilizável em largura reduzida", async ({ page }, testInfo) => {
-    await page.setViewportSize({ width: 360, height: 720 });
     await openChatWithAllThreeCategories(page, testInfo);
+    // Issue #467: below the drawer breakpoint the navigation is no longer a
+    // permanent column, so it is opened before the footer inside it can be
+    // asserted on. Narrowing after the load also exercises the resize itself.
+    await page.setViewportSize({ width: 360, height: 720 });
+    await page.getByTestId("chat-nav-toggle").click();
 
     const settings = page.getByRole("link", { name: "Configurações" });
     await expect(settings).toBeVisible();

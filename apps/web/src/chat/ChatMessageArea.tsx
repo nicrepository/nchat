@@ -1136,13 +1136,24 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     if (detailsOpen) reloadOpenDetails();
   }, [openDetailsKey, resolvedName, detailsOpen, reloadOpenDetails]);
 
+  // Focus returns to the control that opened the panel — but after the render
+  // that closes it, never during the click that asked for it. Below the
+  // wide-desktop threshold (issue #467) the panel covers the conversation and
+  // the header is hidden underneath it, and an element inside a hidden subtree
+  // cannot take focus; by the time this effect runs the header is on screen
+  // again. Guarded by the flag so only a real close restores focus, and by the
+  // ref so a control that is no longer mounted — after a channel switch to a DM
+  // it is not — never drops focus to <body>.
+  const restoreDetailsFocusRef = useRef(false);
   const closeDetails = useCallback(() => {
+    restoreDetailsFocusRef.current = true;
     setDetailsOpen(false);
-    // Focus returns to the control that opened the panel, but only if it is
-    // still mounted — after a channel switch to a DM it is not, and forcing
-    // focus onto a detached node would drop it to <body> instead.
-    detailsToggleRef.current?.focus();
   }, []);
+  useEffect(() => {
+    if (detailsOpen || !restoreDetailsFocusRef.current) return;
+    restoreDetailsFocusRef.current = false;
+    detailsToggleRef.current?.focus();
+  }, [detailsOpen]);
   const toggleDetails = useCallback(() => setDetailsOpen((open) => !open), []);
 
   // Typing indicator: useTypingIndicator needs sendTyping, which useMessages

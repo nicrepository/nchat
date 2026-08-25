@@ -2876,7 +2876,10 @@ describe("ChatSidebar — row action menu", () => {
     await user.click(trigger("canal infra"));
     await user.click(screen.getByRole("menuitem", { name: "Detalhes do canal" }));
 
-    expect(onOpenDetails).toHaveBeenCalledWith("channel", "infra");
+    // The row's own trigger travels with the request (issue #467, code quality
+    // review): the panel opens elsewhere, and closing it has to know where to
+    // hand focus back to.
+    expect(onOpenDetails).toHaveBeenCalledWith("channel", "infra", trigger("canal infra"));
     expect(screen.getByRole("option", { name: /Canal geral/ })).toHaveAttribute(
       "aria-selected",
       "true",

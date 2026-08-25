@@ -39,46 +39,59 @@
   overflow: hidden;
 }
 
-/* Narrow desktop: the panel gives width back to the messages rather than
-   squeezing them below a readable measure. */
-@media (max-width: 1180px) {
-  .chat-msg-area--with-details {
-    grid-template-columns: minmax(0, 1fr) 272px;
-  }
-}
-
 /*
- * Tablet and below: two columns would leave the conversation unusable, so the
- * panel covers it instead of narrowing it. The conversation keeps its full width
- * underneath — nothing is unmounted, the scroll position and the composer are
- * intact — and closing the panel reveals it again. Nothing overflows the
- * viewport, so the page never scrolls horizontally.
+ * Below the wide-desktop threshold documented in ChatShell.css, two columns
+ * would leave the conversation unusable, so the panel covers it instead of
+ * narrowing it. The conversation keeps its full width underneath — nothing is
+ * unmounted, the scroll position and the composer are intact — and closing the
+ * panel reveals it again. Nothing overflows the viewport, so the page never
+ * scrolls horizontally.
+ *
+ * The two share the grid cell rather than the panel being taken out of flow, and
+ * `visibility` is what keeps the covered conversation out of the tab order and
+ * the accessibility tree for exactly as long as it is covered — the same
+ * mechanism the shell uses, so overlay mode never needs a focus trap that would
+ * have to be kept in step with the width.
  */
-@media (max-width: 900px) {
+@media (max-width: 1279.98px) {
   .chat-msg-area--with-details {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas: "conversation";
   }
 
+  .chat-msg-area--with-details .chat-msg-area__conversation {
+    visibility: hidden;
+  }
+
   .chat-msg-area--with-details .chat-details {
-    position: absolute;
-    inset: 0;
+    grid-area: conversation;
+    visibility: visible;
     z-index: 5;
+    border-left: 0;
     box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
   }
 }
 
 /* ── Header ──────────────────────────────────────────────────────────────────── */
 
+/*
+ * The header never scrolls and never clips (issue #467): a long conversation
+ * name truncates, and the actions wrap to a second line rather than being
+ * pushed out of reach — which is what a 200% zoom does to a one-line header.
+ * min-height rather than height, so the wrapped state has somewhere to go.
+ */
 .chat-msg-area__header {
   flex-shrink: 0;
-  height: 60px;
+  min-height: 60px;
   background: var(--color-surface, #fff);
   border-bottom: 1px solid var(--color-border, #e8e3f0);
   display: flex;
   align-items: center;
-  padding: 0 24px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 8px clamp(12px, 2vw, 24px);
   gap: 12px;
+  row-gap: 6px;
 }
 
 .chat-msg-area__header-icon {
@@ -88,7 +101,14 @@
   flex-shrink: 0;
 }
 
+/* The one element that gives way: it shrinks and ellipsises so the icon, the
+   presence pill and every action keep their room. */
 .chat-msg-area__header-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 18px;
   font-weight: 700;
   color: var(--color-ink, #16121f);
@@ -125,6 +145,7 @@
   display: flex;
   align-items: center;
   gap: 4px;
+  flex: none;
 }
 
 /* RF-24/#622 round 2: the channel/group-DM resource call indicator + join
@@ -133,6 +154,12 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: none;
+}
+
+.chat-msg-area__call-actions button {
+  /* Touch-sized wherever there is no pointer to be precise with. */
+  min-height: 34px;
 }
 
 .chat-msg-area__call-status {
@@ -229,7 +256,7 @@
 .chat-msg-area__list {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 24px;
+  padding: 20px clamp(12px, 2vw, 24px);
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -260,13 +287,15 @@
   display: flex;
   gap: 10px;
   padding: 2px 0;
-  max-width: 560px;
+  /* A readable measure on a wide column, the column itself on a narrow one — a
+     bubble is never the reason the page scrolls sideways. */
+  max-width: min(560px, 100%);
 }
 
 .chat-msg-area__msg--mine {
   flex-direction: row-reverse;
   align-self: flex-end;
-  max-width: 560px;
+  max-width: min(560px, 100%);
 }
 
 .chat-msg-area__msg-avatar {
@@ -1375,7 +1404,9 @@
 
 .chat-msg-area__composer {
   flex-shrink: 0;
-  padding: 12px 24px 20px;
+  /* The bottom inset keeps the send row clear of a phone's home indicator; it
+     resolves to 0 everywhere else, so the desktop spacing is unchanged. */
+  padding: 12px clamp(12px, 2vw, 24px) calc(20px + env(safe-area-inset-bottom));
   background: var(--color-bg, #f7f5fb);
 }
 
@@ -1505,10 +1536,15 @@
   max-width: calc(100% - 32px);
 }
 
+/* Toolbar, attachment control and send share one row and wrap onto a second
+   before they would ever overlap — the composer loses no action to a narrow
+   viewport or to a high zoom level, it only stacks. */
 .chat-msg-area__composer-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
+  row-gap: 6px;
   padding: 6px 10px;
   border-top: 1px solid var(--color-border, #e8e3f0);
 }
@@ -1645,8 +1681,8 @@
 .composer-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 2px;
-  flex-shrink: 0;
 }
 
 .composer-toolbar__wrap {
@@ -2096,5 +2132,33 @@
 @media (max-width: 480px) {
   .chat-msg-area__attachment-preview {
     height: 200px;
+  }
+}
+
+/* ── Phone density (issue #467) ──────────────────────────────────────────────
+   Only spacing and one redundant label; every control stays where it was and
+   stays reachable. The thresholds are the ones documented in ChatShell.css. */
+@media (max-width: 767.98px) {
+  .chat-msg-area__header {
+    gap: 8px;
+    padding-block: 6px;
+  }
+
+  .chat-msg-area__header-title {
+    font-size: 16px;
+  }
+
+  /* The button beside it already says "Entrar na chamada". The action is what
+     has to survive a narrow header; the word next to it does not. */
+  .chat-msg-area__call-status {
+    display: none;
+  }
+
+  .chat-msg-area__list {
+    padding-block: 12px;
+  }
+
+  .chat-msg-area__composer {
+    padding-top: 8px;
   }
 }

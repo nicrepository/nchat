@@ -22,7 +22,9 @@
 
 .chat-details__head {
   flex-shrink: 0;
-  height: 60px;
+  /* min-height, not height: at a high zoom the title needs room to grow rather
+     than to be clipped against the close button (issue #467). */
+  min-height: 60px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -33,6 +35,8 @@
 
 .chat-details__title {
   margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 15px;
   font-weight: 700;
   color: var(--color-ink, #16121f);
@@ -65,7 +69,7 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px 20px 24px;
+  padding: 16px clamp(12px, 3vw, 20px) calc(24px + env(safe-area-inset-bottom));
 }
 
 .chat-details__section + .chat-details__section {

@@ -179,6 +179,39 @@ describe("ConversationDetailsPanel — canal: estrutura e acessibilidade", () =>
 
     expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
   });
+
+  // Issue #467: the panel closes on Escape, which is what gets a keyboard user
+  // out of it where it covers the conversation instead of sitting beside it.
+  it("closes on Escape", async () => {
+    const { onClose } = renderPanel();
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  // React bubbles a portal's events to its React parent rather than its DOM one,
+  // so Escape inside a dialog this panel opened reaches the panel's own handler.
+  // Dismissing that dialog must leave the panel exactly where it was: the dialog
+  // hands focus back to the control inside the panel that opened it, and there
+  // would be nothing left to hand it back to.
+  it("stays open when Escape dismisses a dialog it opened", async () => {
+    const { onClose } = renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ canManageMembers: true }) },
+      }),
+    });
+
+    const addMembers = screen.getByRole("button", { name: "Adicionar membros" });
+    await userEvent.click(addMembers);
+    expect(await screen.findByRole("dialog", { name: "Adicionar membros" })).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "Adicionar membros" })).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(addMembers).toHaveFocus();
+  });
 });
 
 describe("ConversationDetailsPanel — canal: seção Sobre", () => {

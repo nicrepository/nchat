@@ -325,7 +325,11 @@ function unreadBadgeLabel(count: number, hasMentionUnread?: boolean): string {
 interface RowActionsProps {
   openTargetKey: string | null;
   onOpenChange: (key: string, open: boolean) => void;
-  onAction: (target: ConversationTarget, action: ConversationActionId) => void;
+  onAction: (
+    target: ConversationTarget,
+    action: ConversationActionId,
+    trigger: HTMLButtonElement | null,
+  ) => void;
 }
 
 function targetKey(target: ConversationTarget): string {
@@ -355,7 +359,7 @@ function RowActions({
         actions={conversationActions(target)}
         open={openTargetKey === key}
         onOpenChange={(open) => onOpenChange(key, open)}
-        onAction={(action) => onAction(target, action)}
+        onAction={(action, trigger) => onAction(target, action, trigger)}
       />
     </span>
   );
@@ -912,8 +916,21 @@ interface ChatSidebarProps {
    * Absent when the shell has no panel to open, which simply omits the action's
    * effect rather than the item.
    */
-  onOpenDetails?: (kind: "channel" | "dm", targetId: string) => void;
+  onOpenDetails?: (
+    kind: "channel" | "dm",
+    targetId: string,
+    trigger: HTMLButtonElement | null,
+  ) => void;
 }
+
+/**
+ * The navigation landmark's id (issue #467).
+ *
+ * Exported because the shell's drawer toggle has to point `aria-controls` at
+ * the very element it shows and hides, and a generated id would leave the two
+ * unable to agree on what that element is.
+ */
+export const chatNavigationId = "chat-navigation";
 
 // Static because the sidebar is mounted once per app; each heading owns the id
 // its section's listbox is labelled by.
@@ -1072,7 +1089,11 @@ export default function ChatSidebar({
    * the same pair the navigation effect performs, muting is the equivalent for
    * notifications, and rename, details and leave only open something.
    */
-  function handleAction(target: ConversationTarget, action: ConversationActionId) {
+  function handleAction(
+    target: ConversationTarget,
+    action: ConversationActionId,
+    trigger: HTMLButtonElement | null,
+  ) {
     const apiTarget = { kind: conversationTargetKind(target.kind), targetId: target.id };
     const effects: Record<ConversationActionId, () => void> = {
       pin: () => handlePin(apiTarget.kind, target.id, false),
@@ -1081,7 +1102,10 @@ export default function ChatSidebar({
       mute: () => handleMute(target, true),
       unmute: () => handleMute(target, false),
       rename: () => setRenamingId(target.id),
-      details: () => onOpenDetails?.(apiTarget.kind, target.id),
+      // The trigger travels with the request: the panel opens somewhere else
+      // entirely, and closing it has to know which row to hand focus back to
+      // (issue #467, code quality review).
+      details: () => onOpenDetails?.(apiTarget.kind, target.id, trigger),
       leave: () => setLeavingId(target.id),
     };
     effects[action]();
@@ -1116,6 +1140,7 @@ export default function ChatSidebar({
 
   return (
     <aside
+      id={chatNavigationId}
       className="chat-sidebar"
       aria-label="Navegação do workspace NIC Chat"
       data-testid="chat-sidebar"
