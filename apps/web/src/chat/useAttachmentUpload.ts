@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { UploadProgress } from "../lib/api";
-import { fetchWorkspaceMessageAttachmentLimits, fetchWorkspaceUploadLimit } from "./chatApi";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
 import {
   AttachmentUploadError,
   deleteAttachmentDraft,
@@ -63,6 +63,7 @@ const failureMessage = (cause: unknown) =>
 
 export function useAttachmentUpload(
   target: AttachmentUploadTarget | null,
+  limits: WorkspaceAttachmentLimits,
   onUploaded?: () => void,
 ): AttachmentUploadState {
   const [items, setItems] = useState<AttachmentUploadItem[]>([]);
@@ -78,24 +79,8 @@ export function useAttachmentUpload(
   const pumpRef = useRef<() => void>(() => undefined);
   const targetKey = target ? `${target.kind}:${target.id}` : "";
   const ownerRef = useRef(targetKey);
-  const limitsRef = useRef<{ maxFiles: number; maxBytes: number } | null>(null);
-  const limitsRequestRef = useRef<{
-    owner: string;
-    promise: Promise<{ maxFiles: number; maxBytes: number }>;
-  } | null>(null);
-
-  const loadLimits = useCallback((owner: string) => {
-    if (limitsRequestRef.current?.owner === owner) return limitsRequestRef.current.promise;
-    const promise = fetchWorkspaceMessageAttachmentLimits().catch(() => ({
-      maxFiles: 1,
-      maxBytes: Number.MAX_SAFE_INTEGER,
-    }));
-    limitsRequestRef.current = { owner, promise };
-    void promise.then((limits) => {
-      if (ownerRef.current === owner) limitsRef.current = limits;
-    });
-    return promise;
-  }, []);
+  const limitsRef = useRef(limits);
+  limitsRef.current = limits;
 
   const replaceItems = useCallback(
     (update: (current: AttachmentUploadItem[]) => AttachmentUploadItem[]) => {
@@ -122,12 +107,7 @@ export function useAttachmentUpload(
         ),
       );
       try {
-        let limit: number | null = null;
-        try {
-          limit = await fetchWorkspaceUploadLimit();
-        } catch {
-          // The service remains authoritative when the courtesy lookup fails.
-        }
+        const limit = limitsRef.current.maxUploadBytes;
         if (limit !== null && item.file.size > limit) {
           throw new AttachmentUploadError("too_large", tooLargeMessage(limit));
         }
@@ -247,27 +227,9 @@ export function useAttachmentUpload(
       if (!targetRef.current) return;
       const files = Array.from(selected);
       if (files.length === 0) return;
-      const knownLimits = limitsRef.current;
-      const becomesBatch = itemsRef.current.length + files.length > 1;
-      if (knownLimits) {
-        applySelection(files, knownLimits);
-        return;
-      }
-      if (!becomesBatch) {
-        // One attachment is compatible with both old and new backends and must
-        // never wait for the rollout-capability lookup.
-        applySelection(files, { maxFiles: 1, maxBytes: Number.MAX_SAFE_INTEGER });
-        return;
-      }
-
-      const owner = ownerRef.current;
-      setNotice("Validando limites dos anexos…");
-      void loadLimits(owner).then((limits) => {
-        if (!mountedRef.current || ownerRef.current !== owner) return;
-        applySelection(files, limits);
-      });
+      applySelection(files, limitsRef.current);
     },
-    [applySelection, loadLimits],
+    [applySelection],
   );
 
   const remove = useCallback(
@@ -321,9 +283,7 @@ export function useAttachmentUpload(
       ownerRef.current = targetKey;
       dismiss();
     }
-    limitsRef.current = null;
-    if (targetKey) void loadLimits(targetKey);
-  }, [dismiss, loadLimits, targetKey]);
+  }, [dismiss, targetKey]);
 
   useEffect(() => {
     itemsRef.current = items;

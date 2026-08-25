@@ -218,8 +218,8 @@ function mapUploadError(error: unknown, maxUploadBytes: number | null): Attachme
 /**
  * Uploads one file to a channel or a conversation.
  *
- * `maxUploadBytes` is the workspace's effective limit, obtained from
- * `fetchWorkspaceUploadLimit`, or null when the server published none. Checking
+ * `maxUploadBytes` is the workspace's effective limit from the canonical
+ * sidebar snapshot, or null when the server published none. Checking
  * `file.size` against it here saves the user from spending their upload
  * bandwidth on a request that cannot succeed — it is not a control.
  * file-service re-reads the policy from the destination's own row and counts

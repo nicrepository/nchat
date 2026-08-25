@@ -148,6 +148,62 @@ func TestExpireDraftsUsesBoundedSkipLockedClaim(t *testing.T) {
 	}
 }
 
+func TestCancelDraftRejectsMissingDependenciesAndInput(t *testing.T) {
+	var nilStore *storage.PGXAttachmentStore
+	if err := nilStore.CancelDraft(context.Background(), testAttachmentID, testUserID); !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("nil store: expected ErrDependenciesUnavailable, got %v", err)
+	}
+	if err := storage.NewPGXAttachmentStore(nil).CancelDraft(context.Background(), testAttachmentID, testUserID); !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("nil pool: expected ErrDependenciesUnavailable, got %v", err)
+	}
+	for _, ids := range [][2]string{{"", testUserID}, {testAttachmentID, ""}} {
+		err := storage.NewPGXAttachmentStore(&fakePool{}).CancelDraft(context.Background(), ids[0], ids[1])
+		if !errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("ids %q: expected ErrInvalidInput, got %v", ids, err)
+		}
+	}
+}
+
+func TestCancelDraftWrapsDatabaseFailure(t *testing.T) {
+	dbErr := errors.New("query failed")
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row { return errRow{err: dbErr} }}
+	err := storage.NewPGXAttachmentStore(pool).CancelDraft(context.Background(), testAttachmentID, testUserID)
+	if !errors.Is(err, dbErr) || !strings.Contains(err.Error(), "cancel attachment draft") {
+		t.Fatalf("expected contextual database error, got %v", err)
+	}
+}
+
+func TestExpireDraftsRejectsMissingDependenciesAndInvalidLimits(t *testing.T) {
+	var nilStore *storage.PGXAttachmentStore
+	if _, err := nilStore.ExpireDrafts(context.Background(), 25); !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("nil store: expected ErrDependenciesUnavailable, got %v", err)
+	}
+	if _, err := storage.NewPGXAttachmentStore(nil).ExpireDrafts(context.Background(), 25); !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("nil pool: expected ErrDependenciesUnavailable, got %v", err)
+	}
+	for _, limit := range []int{0, -1, 101} {
+		got, err := storage.NewPGXAttachmentStore(&fakePool{}).ExpireDrafts(context.Background(), limit)
+		if got != 0 || !errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("limit %d: ExpireDrafts() = %d, %v", limit, got, err)
+		}
+	}
+}
+
+func TestExpireDraftsReturnsZeroAndWrapsDatabaseFailure(t *testing.T) {
+	zeroPool := &fakePool{queryRow: func(string, ...any) pgx.Row { return valueRow{values: []any{0}} }}
+	got, err := storage.NewPGXAttachmentStore(zeroPool).ExpireDrafts(context.Background(), 10)
+	if err != nil || got != 0 {
+		t.Fatalf("empty claim = %d, %v; want 0, nil", got, err)
+	}
+
+	dbErr := errors.New("claim failed")
+	errorPool := &fakePool{queryRow: func(string, ...any) pgx.Row { return errRow{err: dbErr} }}
+	got, err = storage.NewPGXAttachmentStore(errorPool).ExpireDrafts(context.Background(), 10)
+	if got != 0 || !errors.Is(err, dbErr) || !strings.Contains(err.Error(), "expire attachment drafts") {
+		t.Fatalf("failed claim = %d, %v", got, err)
+	}
+}
+
 func TestCreatePendingRejectsUnknownDestinationKind(t *testing.T) {
 	err := storage.NewPGXAttachmentStore(&fakePool{}).CreatePending(context.Background(),
 		newAttachment("workspace", testChannelID))

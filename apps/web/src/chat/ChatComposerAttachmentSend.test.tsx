@@ -12,24 +12,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * upload to the send, and about the bytes never travelling twice.
  */
 
-const {
-  mockFetchMentionCandidates,
-  mockUploadLimit,
-  mockAttachmentLimits,
-  mockUploadAttachment,
-  mockDeleteAttachment,
-} = vi.hoisted(() => ({
-  mockFetchMentionCandidates: vi.fn(),
-  mockUploadLimit: vi.fn(),
-  mockAttachmentLimits: vi.fn(),
-  mockUploadAttachment: vi.fn(),
-  mockDeleteAttachment: vi.fn(),
-}));
+const { mockFetchMentionCandidates, mockUploadAttachment, mockDeleteAttachment } = vi.hoisted(
+  () => ({
+    mockFetchMentionCandidates: vi.fn(),
+    mockUploadAttachment: vi.fn(),
+    mockDeleteAttachment: vi.fn(),
+  }),
+);
 
 vi.mock("./chatApi", () => ({
   fetchMentionCandidates: (...args: unknown[]) => mockFetchMentionCandidates(...args),
-  fetchWorkspaceUploadLimit: () => mockUploadLimit(),
-  fetchWorkspaceMessageAttachmentLimits: () => mockAttachmentLimits(),
 }));
 
 vi.mock("./filesApi", async () => {
@@ -71,6 +63,11 @@ function renderComposer(
       placeholder="Mensagem..."
       onSend={onSend}
       uploadTarget={target}
+      attachmentLimits={{
+        maxUploadBytes: 8 * 1024 * 1024,
+        maxFiles: 10,
+        maxBytes: 512 * 1024 * 1024,
+      }}
     />,
   );
 }
@@ -106,11 +103,6 @@ async function fillEditor(text: string) {
 
 beforeEach(() => {
   mockFetchMentionCandidates.mockReset().mockResolvedValue([]);
-  mockUploadLimit.mockReset().mockResolvedValue(8 * 1024 * 1024);
-  mockAttachmentLimits.mockReset().mockResolvedValue({
-    maxFiles: 10,
-    maxBytes: 512 * 1024 * 1024,
-  });
   mockUploadAttachment.mockReset().mockResolvedValue(attachment);
   mockDeleteAttachment.mockReset().mockResolvedValue(undefined);
 });

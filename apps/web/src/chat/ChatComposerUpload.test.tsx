@@ -11,24 +11,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * component makes, not the internals of the hook behind it.
  */
 
-const {
-  mockFetchMentionCandidates,
-  mockUploadLimit,
-  mockAttachmentLimits,
-  mockUploadAttachment,
-  mockDeleteAttachment,
-} = vi.hoisted(() => ({
-  mockFetchMentionCandidates: vi.fn(),
-  mockUploadLimit: vi.fn(),
-  mockAttachmentLimits: vi.fn(),
-  mockUploadAttachment: vi.fn(),
-  mockDeleteAttachment: vi.fn(),
-}));
+const { mockFetchMentionCandidates, mockUploadAttachment, mockDeleteAttachment } = vi.hoisted(
+  () => ({
+    mockFetchMentionCandidates: vi.fn(),
+    mockUploadAttachment: vi.fn(),
+    mockDeleteAttachment: vi.fn(),
+  }),
+);
 
 vi.mock("./chatApi", () => ({
   fetchMentionCandidates: (...args: unknown[]) => mockFetchMentionCandidates(...args),
-  fetchWorkspaceUploadLimit: () => mockUploadLimit(),
-  fetchWorkspaceMessageAttachmentLimits: () => mockAttachmentLimits(),
 }));
 
 vi.mock("./filesApi", async () => {
@@ -44,6 +36,7 @@ vi.mock("./filesApi", async () => {
 
 import { ApiRequestError } from "../lib/api";
 import ChatComposer from "./ChatComposer";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { AttachmentUploadError } from "./filesApi";
 import type { SendResult } from "./useMessages";
 
@@ -71,6 +64,11 @@ function uploadedAttachment(filename = "relatorio.pdf") {
 function renderComposer(
   target: { kind: "channel" | "dm"; id: string } | null = { kind: "channel", id: "ch-1" },
   onAttachmentUploaded?: () => void,
+  attachmentLimits: WorkspaceAttachmentLimits = {
+    maxUploadBytes: LIMIT,
+    maxFiles: 10,
+    maxBytes: 512 * MIB,
+  },
 ) {
   const onSend = vi.fn<(body: string) => Promise<SendResult>>();
   onSend.mockResolvedValue({ status: "sent" });
@@ -80,6 +78,7 @@ function renderComposer(
       placeholder="Mensagem..."
       onSend={onSend}
       uploadTarget={target}
+      attachmentLimits={attachmentLimits}
       onAttachmentUploaded={onAttachmentUploaded}
     />,
   );
@@ -106,8 +105,6 @@ function dropData(files: File[]): DataTransfer {
 
 beforeEach(() => {
   mockFetchMentionCandidates.mockReset().mockResolvedValue([]);
-  mockUploadLimit.mockReset().mockResolvedValue(LIMIT);
-  mockAttachmentLimits.mockReset().mockResolvedValue({ maxFiles: 10, maxBytes: 512 * MIB });
   mockUploadAttachment.mockReset().mockResolvedValue(uploadedAttachment());
   mockDeleteAttachment.mockReset().mockResolvedValue(undefined);
 });
@@ -321,8 +318,7 @@ describe("composer upload destinations", () => {
 // ── States ───────────────────────────────────────────────────────────────────
 
 describe("composer upload state", () => {
-  it("keeps the existing single-file flow when limits are still loading and MIME is empty", async () => {
-    mockAttachmentLimits.mockReturnValue(new Promise(() => {}));
+  it("keeps the existing single-file flow when MIME is empty", async () => {
     renderComposer();
 
     const realWorldFile = new File(["plain bytes"], "arquivo-sem-mime.pdf");
@@ -332,23 +328,15 @@ describe("composer upload state", () => {
     expect(screen.queryByText(/arquivos foram ignorados/i)).not.toBeInTheDocument();
   });
 
-  it("waits for server limits when a user selects a batch immediately", async () => {
-    let resolveLimits: (limits: { maxFiles: number; maxBytes: number }) => void = () => {};
-    mockAttachmentLimits.mockReturnValue(
-      new Promise((resolve) => {
-        resolveLimits = resolve;
-      }),
-    );
+  it("uses the canonical sidebar snapshot when a user selects a batch immediately", async () => {
     mockUploadAttachment.mockReturnValue(new Promise(() => {}));
     renderComposer();
 
     fireEvent.drop(composerBox(), {
       dataTransfer: dropData([fileOfSize(100, "a.pdf"), fileOfSize(100, "b.pdf")]),
     });
-    expect(screen.queryByText(/arquivos foram ignorados/i)).not.toBeInTheDocument();
-
-    act(() => resolveLimits({ maxFiles: 10, maxBytes: 512 * MIB }));
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText(/arquivos foram ignorados/i)).not.toBeInTheDocument();
   });
 
   it("shows progress while the request is pending and clears it on success", async () => {
@@ -629,8 +617,8 @@ describe("composer upload errors", () => {
 
 // ── Limit resolution ─────────────────────────────────────────────────────────
 
-describe("composer upload limit resolution", () => {
-  it("re-reads the policy on every attempt, never caching it", async () => {
+describe("composer upload limit snapshot", () => {
+  it("does not request sidebar policy from the composer", async () => {
     renderComposer();
 
     await userEvent.upload(fileInput(), fileOfSize(1024));
@@ -638,35 +626,44 @@ describe("composer upload limit resolution", () => {
     await userEvent.upload(fileInput(), fileOfSize(2048));
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
 
-    expect(mockUploadLimit).toHaveBeenCalledTimes(2);
+    expect(mockUploadAttachment.mock.calls[0][2]).toBe(LIMIT);
+    expect(mockUploadAttachment.mock.calls[1][2]).toBe(LIMIT);
   });
 
-  // An administrator can tighten the policy while a composer is open. The
-  // second attempt must be judged by the new limit, not by the one the first
-  // attempt happened to read.
-  it("uses a limit reduced between attempts", async () => {
-    mockUploadLimit.mockResolvedValueOnce(8 * MIB).mockResolvedValueOnce(2 * MIB);
-    renderComposer();
+  it("uses a limit reduced by a new canonical sidebar snapshot", async () => {
+    const view = renderComposer(undefined, undefined, {
+      maxUploadBytes: 8 * MIB,
+      maxFiles: 10,
+      maxBytes: 512 * MIB,
+    });
 
     await userEvent.upload(fileInput(), fileOfSize(4 * MIB));
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
     expect(mockUploadAttachment.mock.calls[0][2]).toBe(8 * MIB);
 
-    // The very same file is now too large.
+    view.rerender(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={vi.fn().mockResolvedValue({ status: "sent" })}
+        uploadTarget={{ kind: "channel", id: "ch-1" }}
+        attachmentLimits={{ maxUploadBytes: 2 * MIB, maxFiles: 10, maxBytes: 512 * MIB }}
+      />,
+    );
     await userEvent.upload(fileInput(), fileOfSize(4 * MIB));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "O arquivo excede o limite permitido de 2 MiB.",
     );
     expect(mockUploadAttachment).toHaveBeenCalledOnce();
-    expect(mockUploadLimit).toHaveBeenCalledTimes(2);
   });
 
-  // And the other direction: a file refused under the old policy must go
-  // through once the policy is widened, with no reload and no remount.
-  it("uses a limit raised between attempts", async () => {
-    mockUploadLimit.mockResolvedValueOnce(2 * MIB).mockResolvedValueOnce(8 * MIB);
-    renderComposer();
+  it("uses a limit raised by a new canonical sidebar snapshot", async () => {
+    const view = renderComposer(undefined, undefined, {
+      maxUploadBytes: 2 * MIB,
+      maxFiles: 10,
+      maxBytes: 512 * MIB,
+    });
 
     await userEvent.upload(fileInput(), fileOfSize(4 * MIB));
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -674,13 +671,22 @@ describe("composer upload limit resolution", () => {
     );
     expect(mockUploadAttachment).not.toHaveBeenCalled();
 
-    await userEvent.upload(fileInput(), fileOfSize(4 * MIB));
+    view.rerender(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={vi.fn().mockResolvedValue({ status: "sent" })}
+        uploadTarget={{ kind: "channel", id: "ch-1" }}
+        attachmentLimits={{ maxUploadBytes: 8 * MIB, maxFiles: 10, maxBytes: 512 * MIB }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
     expect(mockUploadAttachment.mock.calls[0][2]).toBe(8 * MIB);
   });
 
-  it("re-reads the policy for a newly mounted composer", async () => {
+  it("uses the current snapshot for a newly mounted composer", async () => {
     const first = renderComposer({ kind: "channel", id: "ch-1" });
     await userEvent.upload(fileInput(), fileOfSize(1024));
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
@@ -688,17 +694,23 @@ describe("composer upload limit resolution", () => {
 
     // ChatMessageArea keys the composer by target, so a switch remounts it and
     // no limit read for the previous destination survives.
-    mockUploadLimit.mockResolvedValue(2 * MIB);
-    renderComposer({ kind: "dm", id: "dm-1" });
+    renderComposer({ kind: "dm", id: "dm-1" }, undefined, {
+      maxUploadBytes: 2 * MIB,
+      maxFiles: 10,
+      maxBytes: 512 * MIB,
+    });
     await userEvent.upload(fileInput(), fileOfSize(1024));
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
     expect(mockUploadAttachment.mock.calls[1][2]).toBe(2 * MIB);
   });
 
-  it("still uploads when the policy cannot be read, leaving enforcement to the backend", async () => {
-    mockUploadLimit.mockRejectedValue(new Error("network"));
-    renderComposer();
+  it("still uploads when the policy is absent, leaving enforcement to the backend", async () => {
+    renderComposer(undefined, undefined, {
+      maxUploadBytes: null,
+      maxFiles: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    });
 
     // Far larger than any real policy: with the limit unknown the client must
     // not refuse locally, because refusing would mean inventing a limit.
@@ -709,11 +721,14 @@ describe("composer upload limit resolution", () => {
   });
 
   it("shows the backend's rejection when the policy was unknown", async () => {
-    mockUploadLimit.mockResolvedValue(null);
     mockUploadAttachment.mockRejectedValueOnce(
       new AttachmentUploadError("too_large", "O arquivo excede o limite permitido."),
     );
-    renderComposer();
+    renderComposer(undefined, undefined, {
+      maxUploadBytes: null,
+      maxFiles: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    });
 
     await userEvent.upload(fileInput(), fileOfSize(400 * MIB));
 

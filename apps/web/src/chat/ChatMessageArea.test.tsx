@@ -164,10 +164,6 @@ vi.mock("./chatApi", () => ({
   fetchSidebarData: vi.fn(),
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
-  fetchWorkspaceMessageAttachmentLimits: vi.fn().mockResolvedValue({
-    maxFiles: 10,
-    maxBytes: 512 * 1024 * 1024,
-  }),
   fetchChannelMessages: (channelId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(channelId, beforeCursor, signal),
   fetchChannelMessage: mockFetchChannelMessage,

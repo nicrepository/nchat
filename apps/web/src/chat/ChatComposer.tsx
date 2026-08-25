@@ -20,6 +20,7 @@ import {
 } from "react";
 import type { UploadProgress } from "../lib/api";
 import { useAttachmentUpload, type AttachmentUploadTarget } from "./useAttachmentUpload";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
@@ -88,6 +89,7 @@ export interface ChatComposerProps {
    * unchanged.
    */
   uploadTarget?: AttachmentUploadTarget | null;
+  attachmentLimits?: WorkspaceAttachmentLimits;
   /** Called after a successful upload so the caller can refresh its file list. */
   onAttachmentUploaded?: () => void;
   /**
@@ -176,13 +178,18 @@ export default function ChatComposer({
   onCancelReference,
   onSend,
   uploadTarget = null,
+  attachmentLimits = {
+    maxUploadBytes: null,
+    maxFiles: 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
   onAttachmentUploaded,
   onActivity,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
-  const upload = useAttachmentUpload(uploadTarget, onAttachmentUploaded);
+  const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
   const attachEnabled = uploadTarget !== null && !disabled;
   const uploading = upload.busy;
   const pendingAttachments = upload.items

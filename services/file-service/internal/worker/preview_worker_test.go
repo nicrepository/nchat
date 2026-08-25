@@ -243,6 +243,35 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 	}
 }
 
+func TestDraftExpiryUsesSafeDefaultLoggerAndRuns(t *testing.T) {
+	processor := newCountingProcessor()
+	job := worker.NewDraftExpiry(processor, nil)
+	job.SetIntervalForTest(10 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		job.Start(ctx)
+	}()
+	select {
+	case <-processor.signal:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("draft expiry worker never processed a pass")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("draft expiry worker did not stop after cancellation")
+	}
+	if got := processor.callCount(); got < 1 {
+		t.Fatalf("draft expiry passes = %d, want at least one", got)
+	}
+}
+
 // The cleanup worker is the same loop on a slower cadence, so it has to stop
 // the same way: cancelled, and returned from.
 func TestObjectCleanupWorkerStopsWhenCancelled(t *testing.T) {
