@@ -160,10 +160,7 @@ describe("LeaveConversationDialog", () => {
       new ApiRequestError(429, "rate_limited", "no"),
       "Muitas solicitações em sequência. Aguarde um momento e tente novamente.",
     ],
-    [
-      new ApiRequestError(0, "network", "no"),
-      "Sem conexão. Verifique sua rede e tente novamente.",
-    ],
+    [new ApiRequestError(0, "network", "no"), "Sem conexão. Verifique sua rede e tente novamente."],
     [new ApiRequestError(500, "internal", "no"), "Não foi possível sair. Tente novamente."],
     [new Error("boom"), "Não foi possível sair. Tente novamente."],
   ])("explains the refusal and stays open: %s", async (failure, expected) => {

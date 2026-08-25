@@ -59,7 +59,8 @@ function renderWithTriggerRect(rect: Partial<DOMRect>, actionList: ConversationA
     />,
   );
   const trigger = screen.getByRole("button", { name: "Mais opções para canal Plataforma" });
-  trigger.getBoundingClientRect = () => ({ top: 0, bottom: 0, left: 0, right: 0, ...rect }) as DOMRect;
+  trigger.getBoundingClientRect = () =>
+    ({ top: 0, bottom: 0, left: 0, right: 0, ...rect }) as DOMRect;
   view.rerender(
     <ConversationActionsMenu
       triggerLabel="Mais opções para canal Plataforma"
