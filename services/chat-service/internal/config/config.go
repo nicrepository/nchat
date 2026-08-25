@@ -240,11 +240,17 @@ func Load() Config {
 // Both are start-up errors, the same way file-service treats them. There is no
 // third state: either the check is off on purpose, or it is on and it works.
 func (c Config) Validate() error {
-	if c.MaxMessageAttachments < 1 || c.MaxMessageAttachments > defaultMaxMessageAttachments {
-		return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENTS must be between 1 and %d", defaultMaxMessageAttachments)
-	}
-	if c.MaxMessageAttachmentBytes < 1 || c.MaxMessageAttachmentBytes > maxMessageAttachmentBytesCeiling {
-		return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENT_BYTES must be between 1 and %d", maxMessageAttachmentBytesCeiling)
+	// Config values built programmatically predate these fields and use the Go
+	// zero value to mean "unset". Both downstream builders retain their safe
+	// defaults when both are zero. A partial zero remains invalid: it represents
+	// an incomplete explicit policy, not a legacy config.
+	if c.MaxMessageAttachments != 0 || c.MaxMessageAttachmentBytes != 0 {
+		if c.MaxMessageAttachments < 1 || c.MaxMessageAttachments > defaultMaxMessageAttachments {
+			return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENTS must be between 1 and %d", defaultMaxMessageAttachments)
+		}
+		if c.MaxMessageAttachmentBytes < 1 || c.MaxMessageAttachmentBytes > maxMessageAttachmentBytesCeiling {
+			return fmt.Errorf("CHAT_MAX_MESSAGE_ATTACHMENT_BYTES must be between 1 and %d", maxMessageAttachmentBytesCeiling)
+		}
 	}
 	return c.validateLinkSafety()
 }

@@ -380,6 +380,12 @@ func TestMessageAttachmentLimitsDefaultAndValidate(t *testing.T) {
 	}
 }
 
+func TestMessageAttachmentLimitsAllowLegacyProgrammaticConfigWhenBothAreUnset(t *testing.T) {
+	if err := (Config{}).Validate(); err != nil {
+		t.Fatalf("legacy zero-value config must retain downstream defaults: %v", err)
+	}
+}
+
 func TestMessageAttachmentLimitsRejectUnsafeValues(t *testing.T) {
 	for _, test := range []struct {
 		name         string
