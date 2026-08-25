@@ -31,6 +31,7 @@ import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
 
 import "./ChatMessageArea.css";
+import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
@@ -42,7 +43,7 @@ import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetails } from "./useConversationDetails";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
-import ConversationSystemMessage from "./ConversationSystemMessage";
+import ConversationSystemMessage from "./ConversationSystemMessage.tsx";
 import { systemScopeFor, type SystemMessageScope } from "./conversationSystemMessage";
 import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
@@ -1460,6 +1461,18 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
                 }),
             };
 
+  // #642: channel keeps the "#" prefix already used everywhere else in this
+  // header; a group DM has no channel-style handle, so it uses the bare
+  // name (issue explicitly forbids inventing a "#" for it). Resource calls
+  // are always call_type "audio" by construction (RF-24: one multiparty
+  // room, never RF-23's separate audio/video split — see
+  // useResourceCallSession.join()'s own hardcoded "audio"), so "Chamada de
+  // voz" is a real invariant here, not a hardcoded guess.
+  const activeResourceCallBarTitle =
+    resourceCallKind === "channel"
+      ? `Chamada de voz — #${resolvedName}`
+      : `Chamada de voz — ${resolvedName}`;
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1504,6 +1517,34 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
                 />
               ) : undefined
             }
+          />
+        )}
+
+        {/*
+          #642 (review fix): ctx.resourceCallSession is present only once
+          CallSessionProvider's own resourcePresentationCall authority has
+          proven a call_id match against discovery — never re-derived here
+          from a second, independent discoveredResourceCall lookup, which
+          could momentarily disagree during the exact window blocker 2
+          exists to close. participatingHere still proves this is the SAME
+          target the route is showing, never a different one this tab also
+          happens to participate in.
+        */}
+        {participatingHere && ctx.resourceCallSession && (
+          <ActiveResourceCallBar
+            title={activeResourceCallBarTitle}
+            startedAt={ctx.resourceCallSession.startedAt}
+            participants={ctx.resourceCallSession.participants}
+            localId={ctx.resourceCallSession.localId}
+            localName={ctx.resourceCallSession.localName}
+            localInitials={ctx.resourceCallSession.localInitials}
+            localAvatarUrl={ctx.resourceCallSession.localAvatarUrl}
+            activeSpeakerId={ctx.resourceCallSession.activeSpeakerId}
+            microphoneEnabled={ctx.resourceCallSession.microphoneEnabled}
+            microphonePending={ctx.resourceCallSession.microphonePending}
+            onToggleMicrophone={ctx.resourceCallSession.onToggleMicrophone}
+            onLeave={ctx.resourceCallSession.onLeave}
+            onOpenFullCall={ctx.resourceCallSession.onOpenFullCall}
           />
         )}
 

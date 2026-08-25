@@ -1042,6 +1042,142 @@ describe("ChatShell RF-24 fresh join — issue #594 adversarial follow-up (round
   });
 });
 
+// ── issue #642 review, blocker 5: onLeave must swallow a rejection from
+// leaveResourceParticipation (== CallSessionProvider's endResourceParticipation,
+// which deliberately rethrows on failure — the error is already reflected
+// through resource.status/resource.error, the existing retry authority).
+// useCallSession is mocked ONLY for this one test (vi.doMock, not the
+// hoisted vi.mock every other test in this file relies on the real
+// CallSessionProvider for) so the rest of the suite is untouched. ──
+
+// Deterministically proves whether a CALLER attached a rejection handler to
+// the promise, without depending on a test runner/environment's own
+// unhandled-rejection reporting (unreliable here — Vitest under this pool
+// never surfaces it). Shadows .catch as an OWN property on each produced
+// instance only — Promise.prototype and every other promise are untouched.
+// The rejection is built lazily, INSIDE make() — never eagerly up front —
+// so it comes into existence in the exact same tick the real async
+// endResourceParticipation's returned promise would: the moment the mock is
+// actually called, matching production's `fn().catch(...)` chaining
+// exactly and avoiding Node's unrelated "handled asynchronously" warning a
+// pre-built, only-later-caught promise would otherwise trigger.
+function trackedRejectionFactory(error: Error) {
+  let caught = false;
+  const make = () => {
+    const promise = Promise.reject(error);
+    const originalCatch = promise.catch.bind(promise);
+    Object.defineProperty(promise, "catch", {
+      value: (...args: Parameters<typeof originalCatch>) => {
+        caught = true;
+        return originalCatch(...args);
+      },
+    });
+    return promise;
+  };
+  return { make, wasCaught: () => caught };
+}
+
+describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
+  afterEach(() => {
+    vi.doUnmock("../calls/CallSessionProvider");
+    vi.doUnmock("./useChatSidebar");
+    vi.doUnmock("./ChatSidebar");
+    vi.resetModules();
+  });
+
+  it("calls .catch() on leaveResourceParticipation's rejection, and performs no false local cleanup", async () => {
+    // ChatShell (and transitively CallSessionProvider) is already cached in
+    // this file's module graph from the static import at the top — the
+    // cache must be cleared BEFORE doMock + the dynamic import below, or
+    // the fresh import still resolves to the already-evaluated real module.
+    vi.resetModules();
+    const { make: makeRejectedLeave, wasCaught } = trackedRejectionFactory(
+      new Error("leave failed"),
+    );
+    const leaveResourceParticipation = vi.fn(() => makeRejectedLeave());
+    const resourcePresentationCall = {
+      call_id: "call-1",
+      request_id: "req-1",
+      caller_id: currentUserId,
+      callee_id: "",
+      target_type: "channel" as const,
+      target_id: "chan-1",
+      call_type: "audio" as const,
+      status: "active" as const,
+      version: 1,
+      created_at: "2024-01-01T12:00:00.000Z",
+      occurred_at: "2024-01-01T12:00:00.000Z",
+      expires_at: "2024-01-01T13:00:00.000Z",
+    };
+    vi.doMock("../calls/CallSessionProvider", () => ({
+      useCallSession: () => ({
+        calls: { call: null, start: vi.fn() },
+        resource: {
+          active: { kind: "channel", id: "chan-1", name: "Geral" },
+          callId: "call-1",
+          status: "active",
+          error: null,
+        },
+        joinResourceParticipation: vi.fn(),
+        registerDirectory: vi.fn(),
+        registerIdentity: vi.fn(),
+        getResourceCall: vi.fn(() => null),
+        media: {
+          participants: [],
+          activeSpeakerId: null,
+          microphoneEnabled: true,
+          pendingControl: null,
+          toggleMicrophone: vi.fn(),
+        },
+        expand: vi.fn(),
+        leaveResourceParticipation,
+        localIdentity: { name: "Você", initials: "V" },
+        resourcePresentationCall,
+      }),
+    }));
+    vi.doMock("./useChatSidebar", () => ({
+      useChatSidebar: () => ({
+        state: { status: "ready", currentUserId, channels: [], dms: [] },
+        retry: vi.fn(),
+        setPinned: vi.fn(),
+        markRead: vi.fn(),
+        renameChannel: vi.fn(),
+      }),
+    }));
+    vi.doMock("./ChatSidebar", () => ({ default: () => null }));
+
+    const { default: ChatShellFresh } = await import("./ChatShell");
+
+    function LeaveProbe() {
+      const ctx = useOutletContext<ChatOutletContext>();
+      return (
+        <button type="button" onClick={() => ctx.resourceCallSession?.onLeave()}>
+          Sair da chamada
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Routes>
+          <Route path="/chat" element={<ChatShellFresh />}>
+            <Route index element={<LeaveProbe />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Sair da chamada" }));
+
+    await waitFor(() => expect(leaveResourceParticipation).toHaveBeenCalledOnce());
+    await waitFor(() => expect(wasCaught()).toBe(true));
+    // #642's onLeave never owned any local state to falsely clean up in the
+    // first place — the error stays entirely CallSessionProvider's own
+    // resource.status/resource.error retry authority.
+  });
+});
+
 /**
  * ISSUE #527 (code review) — leaving the conversation that is on screen.
  *
