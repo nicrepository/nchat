@@ -1674,7 +1674,6 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
         <IncomingCallPopup
           name={peer?.displayName ?? "Participante"}
           avatarUrl={peer?.avatarUrl}
-          targetKind="user"
           callType={directIncoming.call_type}
           onAccept={() => {
             emitCallTechnicalEvent("accepted");

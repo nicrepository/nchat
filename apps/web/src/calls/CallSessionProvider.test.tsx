@@ -909,9 +909,11 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Identidade" }));
     expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana" }),
+    );
     expect(calls.accept).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("button", { name: "Recusar" }));
+    fireEvent.click(screen.getByRole("button", { name: "Recusar chamada de Ana" }));
     expect(calls.decline).toHaveBeenCalledOnce();
 
     calls.call = activeDirect();

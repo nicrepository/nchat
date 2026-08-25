@@ -36,14 +36,12 @@ const videoPresent = {
 };
 
 describe("IncomingCallPopup", () => {
-  it("shows a non-modal channel video call without stealing focus", () => {
+  it("shows a non-modal video call without stealing focus", () => {
     render(
       <IncomingCallPopup
         name="Equipe Produto"
         avatarUrl="/avatar.png"
-        targetKind="channel"
         callType="video"
-        participantCount={3}
         onAccept={noop}
         onReject={noop}
       />,
@@ -51,9 +49,8 @@ describe("IncomingCallPopup", () => {
 
     const popup = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(popup).toHaveAttribute("aria-modal", "false");
-    expect(screen.getByText("Canal · chamada de vídeo")).toBeInTheDocument();
-    expect(screen.getByText("3 participantes")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
+    expect(screen.getByText("Chamada de vídeo")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Atender/ })).not.toHaveFocus();
   });
 
   it("covers loading and recoverable identity failure without duplicate retries", async () => {
@@ -61,7 +58,6 @@ describe("IncomingCallPopup", () => {
     const view = render(
       <IncomingCallPopup
         name="Ana"
-        targetKind="user"
         callType="audio"
         onAccept={noop}
         onReject={noop}
@@ -72,9 +68,7 @@ describe("IncomingCallPopup", () => {
     view.rerender(
       <IncomingCallPopup
         name="Ana"
-        targetKind="dm"
         callType="audio"
-        participantCount={1}
         onAccept={noop}
         onReject={noop}
         identityStatus="error"
@@ -85,26 +79,19 @@ describe("IncomingCallPopup", () => {
     fireEvent.click(screen.getByRole("button", { name: "Tentar novamente" }));
     expect(retry).toHaveBeenCalledOnce();
     await act(async () => undefined);
-    expect(screen.getByText("1 participante")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Tentar novamente" })).not.toBeDisabled();
   });
 
   it("accepts an audio call and safely ignores an unavailable identity retry", () => {
     const view = render(
-      <IncomingCallPopup
-        name="Ana"
-        targetKind="user"
-        callType="audio"
-        onAccept={noop}
-        onReject={noop}
-      />,
+      <IncomingCallPopup name="Ana" callType="audio" onAccept={noop} onReject={noop} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Atender" }));
+    fireEvent.click(screen.getByRole("button", { name: /Atender/ }));
     expect(noop).toHaveBeenCalled();
 
     view.rerender(
       <IncomingCallPopup
         name="Ana"
-        targetKind="user"
         callType="audio"
         onAccept={noop}
         onReject={noop}

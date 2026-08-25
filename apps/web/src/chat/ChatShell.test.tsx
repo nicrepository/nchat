@@ -211,8 +211,12 @@ describe("ChatShell call identity bootstrap", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Chamada recebida" });
     expect(within(dialog).getByRole("status")).toHaveTextContent("Preparando chamada…");
-    expect(screen.queryByRole("button", { name: "Atender com câmera" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Recusar" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Recusar chamada de Ana Lima" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(prepareMedia).not.toHaveBeenCalled();
     expect(syncCommands(socket)).toHaveLength(1);
@@ -235,8 +239,12 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
-    expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", {
+        name: "Atender com câmera a chamada de vídeo de Ana Lima",
+      }),
+    ).not.toHaveFocus();
+    expect(screen.getByRole("button", { name: "Recusar chamada de Ana Lima" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(syncCommands(socket)).toHaveLength(1);
@@ -312,8 +320,12 @@ describe("ChatShell call identity bootstrap", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Atender com câmera" })).not.toHaveFocus();
-    expect(screen.getByRole("button", { name: "Recusar" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", {
+        name: "Atender com câmera a chamada de vídeo de Ana Lima",
+      }),
+    ).not.toHaveFocus();
+    expect(screen.getByRole("button", { name: "Recusar chamada de Ana Lima" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancelar chamada" })).not.toBeInTheDocument();
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(syncCommands(socket)).toHaveLength(1);
@@ -539,7 +551,7 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
     expect(await screen.findByRole("dialog", { name: "Chamada recebida" })).toBeInTheDocument();
     expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Recusar" }));
+    await user.click(screen.getByRole("button", { name: "Recusar chamada de Ana Lima" }));
 
     await waitFor(() =>
       expect(declineCommands(socket)).toContainEqual({
@@ -569,7 +581,9 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
 
     // The permission prompt never resolves: call.accept is never sent, so
     // RF-23 never reaches "active" and never asks for the Room.
@@ -579,7 +593,9 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         resolvePermission = resolve;
       }),
     );
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
 
     expect(syncCommands(socket)).toHaveLength(1); // only the initial call.sync
     expect(stopMedia).not.toHaveBeenCalled();
@@ -607,14 +623,18 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
     vi.mocked(requestMediaPermission).mockResolvedValueOnce({
       ok: false,
       kind: "permission_denied",
       message: "Permissão negada.",
     });
 
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
 
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
     expect(syncCommands(socket)).toHaveLength(1);
@@ -640,9 +660,13 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
 
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
 
     // The command was accepted locally (preflight granted, call.accept sent)
     // but the server has not confirmed "active" yet: RF-24 must still be
@@ -684,8 +708,12 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     let resolveStop!: () => void;
@@ -736,7 +764,9 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
 
     let resolvePermission!: (value: MediaPermissionResult) => void;
     vi.mocked(requestMediaPermission).mockReturnValueOnce(
@@ -744,10 +774,12 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         resolvePermission = resolve;
       }),
     );
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalled());
 
-    const recusar = screen.getByRole("button", { name: "Recusar" });
+    const recusar = screen.getByRole("button", { name: "Recusar chamada de Ana Lima" });
     expect(recusar).toBeEnabled();
     await user.click(recusar);
 
@@ -779,8 +811,12 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     const token = deferredValue<Awaited<ReturnType<typeof issueCallToken>>>();
@@ -831,8 +867,12 @@ describe("ChatShell RF-23 x RF-24 arbitration", () => {
         call,
       }),
     );
-    await screen.findByRole("button", { name: "Atender com câmera" });
-    await user.click(screen.getByRole("button", { name: "Atender com câmera" }));
+    await screen.findByRole("button", {
+      name: "Atender com câmera a chamada de vídeo de Ana Lima",
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Atender com câmera a chamada de vídeo de Ana Lima" }),
+    );
     await waitFor(() => expect(requestMediaPermission).toHaveBeenCalledWith("video"));
 
     stopMedia.mockRejectedValueOnce(new Error("cleanup failed"));
