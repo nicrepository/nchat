@@ -254,6 +254,7 @@ export async function uploadAttachment(
 
   const collection = target.kind === "channel" ? "channels" : "dm";
   const form = new FormData();
+  form.append("purpose", "message_draft");
   form.append("file", file);
 
   let body: { data: unknown };
@@ -276,4 +277,13 @@ export async function uploadAttachment(
     throw new AttachmentUploadError("unknown", "Não foi possível enviar o arquivo.");
   }
   return attachment;
+}
+
+/** Best-effort cancellation for an unpublished message draft. */
+export async function deleteAttachmentDraft(attachmentId: string): Promise<void> {
+  await authenticatedFetch(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}`,
+    { method: "DELETE" },
+    async () => undefined,
+  );
 }

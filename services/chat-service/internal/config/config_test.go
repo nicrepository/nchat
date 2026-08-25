@@ -367,3 +367,35 @@ func TestUncertainStalenessThresholdMustBePositive(t *testing.T) {
 		t.Fatal("a zero staleness threshold was accepted")
 	}
 }
+
+func TestMessageAttachmentLimitsDefaultAndValidate(t *testing.T) {
+	t.Setenv("CHAT_MAX_MESSAGE_ATTACHMENTS", "")
+	t.Setenv("CHAT_MAX_MESSAGE_ATTACHMENT_BYTES", "")
+	cfg := Load()
+	if cfg.MaxMessageAttachments != 10 || cfg.MaxMessageAttachmentBytes != 512<<20 {
+		t.Fatalf("unexpected defaults: count=%d bytes=%d", cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
+	}
+}
+
+func TestMessageAttachmentLimitsRejectUnsafeValues(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		count, bytes int
+	}{
+		{"zero count", 0, 512 << 20},
+		{"above schema capacity", 11, 512 << 20},
+		{"zero aggregate", 10, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Load()
+			cfg.MaxMessageAttachments = test.count
+			cfg.MaxMessageAttachmentBytes = int64(test.bytes)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid attachment limits were accepted")
+			}
+		})
+	}
+}

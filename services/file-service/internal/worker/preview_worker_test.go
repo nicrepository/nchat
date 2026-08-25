@@ -193,7 +193,7 @@ func (h *attrCapturingHandler) value(key string) string {
 	return found
 }
 
-// Three jobs share this loop, so a failure has to say which one failed.
+// Several jobs share this loop, so a failure has to say which one failed.
 //
 // The assertion is on the `worker` attribute alone and not on the message: the
 // wording is free to change, but an operator triaging a stuck scan queue must
@@ -207,6 +207,7 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 		{"preview", worker.NewPreview, "preview"},
 		{"cleanup", worker.NewObjectCleanup, "object_cleanup"},
 		{"scan", worker.NewMalwareScan, "malware_scan"},
+		{"draft expiry", worker.NewDraftExpiry, "draft_expiry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			handler := newAttrCapturingHandler()

@@ -11,15 +11,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * component makes, not the internals of the hook behind it.
  */
 
-const { mockFetchMentionCandidates, mockUploadLimit, mockUploadAttachment } = vi.hoisted(() => ({
+const {
+  mockFetchMentionCandidates,
+  mockUploadLimit,
+  mockAttachmentLimits,
+  mockUploadAttachment,
+  mockDeleteAttachment,
+} = vi.hoisted(() => ({
   mockFetchMentionCandidates: vi.fn(),
   mockUploadLimit: vi.fn(),
+  mockAttachmentLimits: vi.fn(),
   mockUploadAttachment: vi.fn(),
+  mockDeleteAttachment: vi.fn(),
 }));
 
 vi.mock("./chatApi", () => ({
   fetchMentionCandidates: (...args: unknown[]) => mockFetchMentionCandidates(...args),
   fetchWorkspaceUploadLimit: () => mockUploadLimit(),
+  fetchWorkspaceMessageAttachmentLimits: () => mockAttachmentLimits(),
 }));
 
 vi.mock("./filesApi", async () => {
@@ -29,6 +38,7 @@ vi.mock("./filesApi", async () => {
   return {
     ...actual,
     uploadAttachment: (...args: unknown[]) => mockUploadAttachment(...args),
+    deleteAttachmentDraft: (...args: unknown[]) => mockDeleteAttachment(...args),
   };
 });
 
@@ -64,7 +74,7 @@ function renderComposer(
 ) {
   const onSend = vi.fn<(body: string) => Promise<SendResult>>();
   onSend.mockResolvedValue({ status: "sent" });
-  return render(
+  const view = render(
     <ChatComposer
       bodyFormat="v2"
       placeholder="Mensagem..."
@@ -73,6 +83,7 @@ function renderComposer(
       onAttachmentUploaded={onAttachmentUploaded}
     />,
   );
+  return { ...view, onSend };
 }
 
 const fileInput = () => screen.getByTestId("chat-composer-file-input") as HTMLInputElement;
@@ -96,7 +107,9 @@ function dropData(files: File[]): DataTransfer {
 beforeEach(() => {
   mockFetchMentionCandidates.mockReset().mockResolvedValue([]);
   mockUploadLimit.mockReset().mockResolvedValue(LIMIT);
+  mockAttachmentLimits.mockReset().mockResolvedValue({ maxFiles: 10, maxBytes: 512 * MIB });
   mockUploadAttachment.mockReset().mockResolvedValue(uploadedAttachment());
+  mockDeleteAttachment.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -216,11 +229,11 @@ describe("composer drag and drop", () => {
     const box = composerBox();
 
     fireEvent.dragOver(box, { dataTransfer: dropData([fileOfSize(1024)]) });
-    expect(screen.getByText("Solte o arquivo para enviar.")).toBeInTheDocument();
+    expect(screen.getByText("Solte os arquivos aqui.")).toBeInTheDocument();
 
     dragLeaveTo(box, box.querySelector("button"));
 
-    expect(screen.getByText("Solte o arquivo para enviar.")).toBeInTheDocument();
+    expect(screen.getByText("Solte os arquivos aqui.")).toBeInTheDocument();
   });
 
   it("drops the hint once the pointer really leaves the composer", () => {
@@ -308,6 +321,36 @@ describe("composer upload destinations", () => {
 // ── States ───────────────────────────────────────────────────────────────────
 
 describe("composer upload state", () => {
+  it("keeps the existing single-file flow when limits are still loading and MIME is empty", async () => {
+    mockAttachmentLimits.mockReturnValue(new Promise(() => {}));
+    renderComposer();
+
+    const realWorldFile = new File(["plain bytes"], "arquivo-sem-mime.pdf");
+    await userEvent.upload(fileInput(), realWorldFile);
+
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/arquivos foram ignorados/i)).not.toBeInTheDocument();
+  });
+
+  it("waits for server limits when a user selects a batch immediately", async () => {
+    let resolveLimits: (limits: { maxFiles: number; maxBytes: number }) => void = () => {};
+    mockAttachmentLimits.mockReturnValue(
+      new Promise((resolve) => {
+        resolveLimits = resolve;
+      }),
+    );
+    mockUploadAttachment.mockReturnValue(new Promise(() => {}));
+    renderComposer();
+
+    fireEvent.drop(composerBox(), {
+      dataTransfer: dropData([fileOfSize(100, "a.pdf"), fileOfSize(100, "b.pdf")]),
+    });
+    expect(screen.queryByText(/arquivos foram ignorados/i)).not.toBeInTheDocument();
+
+    act(() => resolveLimits({ maxFiles: 10, maxBytes: 512 * MIB }));
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
+  });
+
   it("shows progress while the request is pending and clears it on success", async () => {
     let resolveUpload: (value: unknown) => void = () => {};
     mockUploadAttachment.mockReturnValue(
@@ -320,23 +363,68 @@ describe("composer upload state", () => {
     await userEvent.upload(fileInput(), fileOfSize(1024));
 
     expect(await screen.findByText("Enviando arquivo…")).toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-attach-btn")).toBeDisabled();
+    expect(screen.getByTestId("chat-composer-attach-btn")).toBeEnabled();
 
     resolveUpload(uploadedAttachment("relatorio.pdf"));
 
-    expect(await screen.findByText(/Anexo pronto para envio: relatorio\.pdf/)).toBeInTheDocument();
+    expect(await screen.findByText("Pronto para enviar")).toBeInTheDocument();
+    expect(screen.getByText("relatorio.pdf")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("chat-composer-attach-btn")).toBeEnabled());
   });
 
-  it("does not start a second upload while one is in flight", async () => {
+  it("uploads two files concurrently and queues the third", async () => {
     mockUploadAttachment.mockReturnValue(new Promise(() => {}));
     renderComposer();
 
-    fireEvent.drop(composerBox(), { dataTransfer: dropData([fileOfSize(1024)]) });
-    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
-    fireEvent.drop(composerBox(), { dataTransfer: dropData([fileOfSize(2048)]) });
+    fireEvent.drop(composerBox(), {
+      dataTransfer: dropData([
+        fileOfSize(1024, "a.pdf"),
+        fileOfSize(2048, "b.pdf"),
+        fileOfSize(4096, "c.pdf"),
+      ]),
+    });
 
-    expect(mockUploadAttachment).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
+    expect(mockUploadAttachment.mock.calls.map((call) => (call[1] as File).name)).toEqual([
+      "a.pdf",
+      "b.pdf",
+    ]);
+  });
+
+  it("ignores exact duplicates and active content with an accessible notice", async () => {
+    renderComposer();
+    const safe = fileOfSize(100, "safe.pdf");
+    const html = new File(["<script>alert(1)</script>"], "page.html", { type: "text/html" });
+    fireEvent.drop(composerBox(), { dataTransfer: dropData([safe, safe, html]) });
+
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(1));
+    expect(
+      screen.getByText(
+        "Arquivos duplicados foram ignorados. HTML, SVG e executáveis não podem ser anexados.",
+      ),
+    ).toHaveAttribute("role", "status");
+  });
+
+  it("sends uploaded ids in selection order even when uploads finish out of order", async () => {
+    const resolvers = new Map<string, (value: unknown) => void>();
+    mockUploadAttachment.mockImplementation((...args: unknown[]) => {
+      const file = args[1] as File;
+      return new Promise((resolve) => resolvers.set(file.name, resolve));
+    });
+    const view = renderComposer();
+
+    fireEvent.change(fileInput(), {
+      target: { files: [fileOfSize(100, "a.pdf"), fileOfSize(100, "b.pdf")] },
+    });
+    await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
+    act(() => resolvers.get("b.pdf")?.({ ...uploadedAttachment("b.pdf"), id: "b-id" }));
+    act(() => resolvers.get("a.pdf")?.({ ...uploadedAttachment("a.pdf"), id: "a-id" }));
+
+    await waitFor(() => expect(screen.getAllByText("Pronto para enviar")).toHaveLength(2));
+    expect(screen.getByText("2 arquivos anexados")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+    expect(view.onSend).toHaveBeenCalledWith("", ["a-id", "b-id"]);
+    expect(view.container.querySelector('input[type="file"]')).toHaveAttribute("multiple");
   });
 
   it("restores the composer after a failure so a retry is possible", async () => {
@@ -355,7 +443,7 @@ describe("composer upload state", () => {
     await userEvent.upload(fileInput(), fileOfSize(1024));
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText(/Anexo pronto para envio/)).toBeInTheDocument();
+    expect(await screen.findByText("Pronto para enviar")).toBeInTheDocument();
   });
 });
 
@@ -440,8 +528,43 @@ describe("composer upload progress", () => {
 
     upload.finish(uploadedAttachment());
 
-    expect(await screen.findByText(/Anexo pronto para envio/)).toBeInTheDocument();
+    expect(await screen.findByText("Pronto para enviar")).toBeInTheDocument();
     expect(screen.queryByTestId("chat-composer-upload-progress")).not.toBeInTheDocument();
+  });
+
+  it("requests cleanup when a completed draft is removed", async () => {
+    renderComposer();
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await screen.findByText("Pronto para enviar");
+    await userEvent.click(screen.getByTestId("chat-composer-remove-attachment"));
+    expect(mockDeleteAttachment).toHaveBeenCalledWith("a-1");
+  });
+
+  it("requests cleanup for completed drafts when the composer unmounts", async () => {
+    const view = renderComposer();
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await screen.findByText("Pronto para enviar");
+
+    view.unmount();
+
+    expect(mockDeleteAttachment).toHaveBeenCalledWith("a-1");
+  });
+
+  it("requests cleanup for completed drafts when the conversation changes", async () => {
+    const view = renderComposer({ kind: "channel", id: "ch-1" });
+    await userEvent.upload(fileInput(), fileOfSize(2048));
+    await screen.findByText("Pronto para enviar");
+
+    view.rerender(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={view.onSend}
+        uploadTarget={{ kind: "dm", id: "dm-2" }}
+      />,
+    );
+
+    await waitFor(() => expect(mockDeleteAttachment).toHaveBeenCalledWith("a-1"));
   });
 
   // A report can land after the composer is gone: the request outlives the
@@ -579,7 +702,7 @@ describe("composer upload limit resolution", () => {
 
     // Far larger than any real policy: with the limit unknown the client must
     // not refuse locally, because refusing would mean inventing a limit.
-    await userEvent.upload(fileInput(), fileOfSize(900 * MIB));
+    await userEvent.upload(fileInput(), fileOfSize(400 * MIB));
 
     await waitFor(() => expect(mockUploadAttachment).toHaveBeenCalledOnce());
     expect(mockUploadAttachment.mock.calls[0][2]).toBeNull();
@@ -592,7 +715,7 @@ describe("composer upload limit resolution", () => {
     );
     renderComposer();
 
-    await userEvent.upload(fileInput(), fileOfSize(900 * MIB));
+    await userEvent.upload(fileInput(), fileOfSize(400 * MIB));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "O arquivo excede o limite permitido.",

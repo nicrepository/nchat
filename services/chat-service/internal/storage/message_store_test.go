@@ -165,6 +165,7 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // link safety fingerprint
 			pgxmock.AnyArg(), // create request fingerprint
 			pgxmock.AnyArg(), // initial link safety state
+			pgxmock.AnyArg(), // aggregate attachment byte limit
 		).
 		WillReturnRows(rows)
 }
@@ -218,6 +219,7 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
 				).
 				WillReturnError(dbErr)
@@ -565,7 +567,7 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -588,7 +590,7 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"11111111-1111-1111-1111-111111111111"},
 			[]string{"22222222-2222-2222-2222-222222222222"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -617,7 +619,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(),
 			[]string{"99999999-9999-9999-9999-999999999999"},
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))

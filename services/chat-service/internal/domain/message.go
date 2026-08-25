@@ -243,12 +243,13 @@ type Message struct {
 // MaxMessageAttachments bounds how many attachments one message may be created
 // with.
 //
-// It is one because the composer uploads one file at a time and keeps a single
-// pending attachment; the API is nonetheless a list so raising this is a
-// constant and a UI change rather than a new field. It is enforced server-side
-// and is not a UI convenience: an unbounded list is an unbounded amount of
-// validation work per request.
-const MaxMessageAttachments = 1
+// The associative table stores positions 0..9, so ten is both the product
+// policy and the storage ceiling. It is enforced server-side: an unbounded list
+// would turn one message request into unbounded authorization work.
+const (
+	MaxMessageAttachments            = 10
+	DefaultMaxMessageAttachmentBytes = int64(512 << 20)
+)
 
 // MessageAttachment is the metadata a message viewer may see about a file bound
 // to a message.

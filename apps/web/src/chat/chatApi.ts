@@ -94,7 +94,14 @@ interface SidebarDMResponse {
 
 interface SidebarResponse {
   current_user_id: string;
-  workspace: { id: string; name: string; slug: string; max_upload_bytes?: number };
+  workspace: {
+    id: string;
+    name: string;
+    slug: string;
+    max_upload_bytes?: number;
+    max_message_attachments?: number;
+    max_message_attachment_bytes?: number;
+  };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
 }
@@ -517,6 +524,31 @@ export async function fetchWorkspaceUploadLimit(): Promise<number | null> {
     return null;
   }
   return raw;
+}
+
+export interface MessageAttachmentLimits {
+  maxFiles: number;
+  maxBytes: number;
+}
+
+/** Missing fields mean an older backend, so batching stays disabled. */
+export async function fetchWorkspaceMessageAttachmentLimits(): Promise<MessageAttachmentLimits> {
+  const sidebar = await fetchSidebar();
+  const maxFiles = sidebar.workspace?.max_message_attachments;
+  const maxBytes = sidebar.workspace?.max_message_attachment_bytes;
+  return {
+    maxFiles:
+      typeof maxFiles === "number" &&
+      Number.isSafeInteger(maxFiles) &&
+      maxFiles >= 1 &&
+      maxFiles <= 10
+        ? maxFiles
+        : 1,
+    maxBytes:
+      typeof maxBytes === "number" && Number.isSafeInteger(maxBytes) && maxBytes > 0
+        ? maxBytes
+        : Number.MAX_SAFE_INTEGER,
+  };
 }
 
 export async function searchDMCandidates(
@@ -1159,6 +1191,7 @@ export interface PostMessageOptions {
    * re-validates each id against the destination before it links anything.
    */
   attachmentIds?: string[];
+  idempotencyKey?: string;
   signal?: AbortSignal;
 }
 
@@ -1181,7 +1214,10 @@ export async function postChannelMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v3", options),
     signal: options.signal,
   });
@@ -1357,7 +1393,10 @@ export async function postDMMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v2", options),
     signal: options.signal,
   });

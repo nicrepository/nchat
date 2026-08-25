@@ -45,7 +45,9 @@ type sidebarWorkspaceJSON struct {
 	// nothing, and file-service re-reads it from the destination's own row on
 	// every upload, so a client that ignores or edits this value changes only
 	// which error it receives.
-	MaxUploadBytes int64 `json:"max_upload_bytes"`
+	MaxUploadBytes            int64 `json:"max_upload_bytes"`
+	MaxMessageAttachments     int   `json:"max_message_attachments"`
+	MaxMessageAttachmentBytes int64 `json:"max_message_attachment_bytes"`
 }
 
 // sidebarChannelJSON is the JSON shape for a channel in the sidebar response.
@@ -140,13 +142,29 @@ type sidebarResponseBody struct {
 
 // SidebarHandler handles GET /api/chat/sidebar.
 type SidebarHandler struct {
-	svc sidebarProvider
+	svc                       sidebarProvider
+	maxMessageAttachments     int
+	maxMessageAttachmentBytes int64
 }
 
 // NewSidebarHandler returns a SidebarHandler backed by svc. When svc is nil,
 // all requests return 503 (service not yet wired).
 func NewSidebarHandler(svc sidebarProvider) *SidebarHandler {
-	return &SidebarHandler{svc: svc}
+	return &SidebarHandler{
+		svc:                       svc,
+		maxMessageAttachments:     domain.MaxMessageAttachments,
+		maxMessageAttachmentBytes: domain.DefaultMaxMessageAttachmentBytes,
+	}
+}
+
+func (h *SidebarHandler) WithMessageAttachmentLimits(count int, bytes int64) *SidebarHandler {
+	if count > 0 && count <= domain.MaxMessageAttachments {
+		h.maxMessageAttachments = count
+	}
+	if bytes > 0 {
+		h.maxMessageAttachmentBytes = bytes
+	}
+	return h
 }
 
 // Ready reports whether the handler is wired to a real sidebar service.
@@ -183,10 +201,12 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body := sidebarResponseBody{
 		CurrentUserID: userID,
 		Workspace: sidebarWorkspaceJSON{
-			ID:             data.Workspace.ID,
-			Name:           data.Workspace.Name,
-			Slug:           data.Workspace.Slug,
-			MaxUploadBytes: domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
+			ID:                        data.Workspace.ID,
+			Name:                      data.Workspace.Name,
+			Slug:                      data.Workspace.Slug,
+			MaxUploadBytes:            domain.EffectiveMaxUploadBytes(data.Workspace.MaxUploadBytes),
+			MaxMessageAttachments:     h.maxMessageAttachments,
+			MaxMessageAttachmentBytes: h.maxMessageAttachmentBytes,
 		},
 		Channels:         mapChannels(data.Channels),
 		DMConvs:          mapDMs(data.DMs),

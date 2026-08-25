@@ -44,6 +44,7 @@ import {
   MessageEditError,
   fetchSidebarData,
   fetchWorkspaceUploadLimit,
+  fetchWorkspaceMessageAttachmentLimits,
   messagesPath,
   pinMessage,
   postChannelMessage,
@@ -3465,5 +3466,38 @@ describe("fetchWorkspaceUploadLimit", () => {
       expect.stringContaining("/sidebar"),
       expect.objectContaining({ method: "GET" }),
     );
+  });
+});
+
+describe("fetchWorkspaceMessageAttachmentLimits", () => {
+  it("uses published batch limits", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: {
+          id: "ws-1",
+          name: "NIC Labs",
+          slug: "default",
+          max_message_attachments: 10,
+          max_message_attachment_bytes: 536870912,
+        },
+        channels: [],
+        dm_conversations: [],
+      },
+    });
+    await expect(fetchWorkspaceMessageAttachmentLimits()).resolves.toEqual({
+      maxFiles: 10,
+      maxBytes: 536870912,
+    });
+  });
+
+  it("falls back to one file for an older backend", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+        channels: [],
+        dm_conversations: [],
+      },
+    });
+    await expect(fetchWorkspaceMessageAttachmentLimits()).resolves.toMatchObject({ maxFiles: 1 });
   });
 });

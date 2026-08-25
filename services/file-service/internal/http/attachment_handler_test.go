@@ -88,6 +88,9 @@ type fakeUseCases struct {
 	listViews []service.AttachmentView
 	listErr   error
 	listInput service.ListDestinationAttachmentsInput
+
+	cancelErr   error
+	cancelInput service.CancelDraftInput
 }
 
 // AuthorizeUpload stands in for the destination lookup the handler now performs
@@ -152,6 +155,13 @@ func (f *fakeUseCases) Upload(_ context.Context, input service.UploadInput) (ser
 		return service.AttachmentView{}, f.uploadErr
 	}
 	return f.uploadView, nil
+}
+
+func (f *fakeUseCases) CancelDraft(_ context.Context, input service.CancelDraftInput) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelInput = input
+	return f.cancelErr
 }
 
 func (f *fakeUseCases) Metadata(_ context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error) {
@@ -337,6 +347,59 @@ func TestUploadToChannelSucceeds(t *testing.T) {
 	}
 	if string(useCases.body()) != "hello world" {
 		t.Fatalf("unexpected streamed body %q", useCases.body())
+	}
+}
+
+func TestUploadAcceptsServerRecognizedMessageDraftPurpose(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+	purpose := filePart{field: "purpose", content: []byte(service.UploadPurposeMessageDraft)}
+	router.ServeHTTP(response, uploadRequest(
+		t, channelUploadPath(testChannelID), purpose, fileOf("hello world"),
+	))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+	}
+	if got := useCases.call().Purpose; got != service.UploadPurposeMessageDraft {
+		t.Fatalf("expected draft purpose, got %q", got)
+	}
+}
+
+func TestDeleteAttachmentDraftIsRegistered(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	request := httptest.NewRequest(http.MethodDelete, "/attachments/"+testChannelID, nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", response.Code, response.Body.String())
+	}
+	if useCases.cancelInput.AttachmentID != testChannelID ||
+		useCases.cancelInput.UploaderID != testUserID {
+		t.Fatalf("cancel must use the path id and authenticated uploader: %+v", useCases.cancelInput)
+	}
+}
+
+func TestDeleteAttachmentDraftIsAuthenticatedAndNonEnumerating(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.cancelErr = domain.ErrNotFound
+	router := newTestRouter(t, useCases, enabledConfig())
+
+	unauthenticated := httptest.NewRequest(http.MethodDelete, "/attachments/"+testChannelID, nil)
+	unauthenticatedResponse := httptest.NewRecorder()
+	router.ServeHTTP(unauthenticatedResponse, unauthenticated)
+	if unauthenticatedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated cancel to return 401, got %d", unauthenticatedResponse.Code)
+	}
+
+	missing := httptest.NewRequest(http.MethodDelete, "/attachments/"+testChannelID, nil)
+	missing.Header.Set("Authorization", "Bearer "+testToken)
+	missingResponse := httptest.NewRecorder()
+	router.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusNotFound {
+		t.Fatalf("foreign, associated and missing drafts must share 404, got %d", missingResponse.Code)
 	}
 }
 
@@ -1201,7 +1264,7 @@ func TestAttachmentRoutesRejectTheWrongMethod(t *testing.T) {
 		// so the unrouted method asserted here is PUT.
 		{method: http.MethodPut, path: channelUploadPath(testChannelID)},
 		{method: http.MethodPut, path: dmUploadPath(testDMID)},
-		{method: http.MethodDelete, path: "/attachments/" + uuid.NewString()},
+		{method: http.MethodPatch, path: "/attachments/" + uuid.NewString()},
 		{method: http.MethodPost, path: "/attachments/" + uuid.NewString() + "/content"},
 	}
 	for _, tt := range tests {

@@ -1,7 +1,7 @@
 // Package worker runs file-service's background work.
 //
-// Three jobs share one loop: attachment previews (RF-31), object cleanup
-// (SR-002) and antimalware scanning (RF-22). Each names itself in its log
+// Background jobs share one loop: attachment previews (RF-31), object cleanup
+// (SR-002), antimalware scanning (RF-22), URL scans and draft expiry. Each names itself in its log
 // lines, so the shared loop stays one implementation without its failures
 // becoming indistinguishable. It follows the
 // shape auth's e-mail outbox worker already established in this repository —
@@ -33,6 +33,8 @@ const previewPollInterval = 10 * time.Second
 // promptly without turning a storage outage into a tight retry loop.
 const cleanupPollInterval = 30 * time.Second
 
+const draftExpiryPollInterval = time.Minute
+
 // scanPollInterval is how often outstanding antimalware scans are claimed
 // (RF-22).
 //
@@ -56,14 +58,26 @@ type PreviewProcessor interface {
 }
 
 // Worker names, used as the `worker` log attribute. A closed set decided here,
-// so the identity in a log line can only ever be one of the three loops that
+// so the identity in a log line can only ever be one of the loops that
 // actually run — the same discipline the scan results follow.
 const (
 	workerNamePreview       = "preview"
 	workerNameObjectCleanup = "object_cleanup"
 	workerNameMalwareScan   = "malware_scan"
 	workerNameLinkScan      = "link_scan"
+	workerNameDraftExpiry   = "draft_expiry"
 )
+
+// NewDraftExpiry builds the bounded sweeper for unpublished message drafts.
+func NewDraftExpiry(processor PreviewProcessor, logger *slog.Logger) *Preview {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Preview{
+		processor: processor, interval: draftExpiryPollInterval,
+		name: workerNameDraftExpiry, logger: logger,
+	}
+}
 
 // linkScanPollInterval is how often outstanding RF-21 URL scans are advanced.
 //
@@ -121,8 +135,8 @@ func NewObjectCleanup(processor PreviewProcessor, logger *slog.Logger) *Preview 
 	}
 }
 
-// Preview polls for work and processes it. Three jobs share it — previews,
-// object cleanup and antimalware scans — so it carries the name it runs under:
+// Preview polls for work and processes it. The bounded background jobs share
+// it, so it carries the name it runs under:
 // a failure logged without one is indistinguishable between the three, which is
 // precisely when an operator needs to tell them apart.
 type Preview struct {

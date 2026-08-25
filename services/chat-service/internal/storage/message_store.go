@@ -89,6 +89,9 @@ type CreateMessageInput struct {
 	// database in the same statement that inserts the message, and a message is
 	// not created at all when any of them fails.
 	AttachmentIDs []string
+	// MaxAttachmentBytes is the server-owned aggregate size ceiling applied in
+	// the same statement that locks and associates all candidate attachments.
+	MaxAttachmentBytes int64
 
 	// Status is the lifecycle state the message is created in. Empty means
 	// active, which is what every path that carries no link uses.
@@ -671,6 +674,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	if bodyFormat == "" {
 		bodyFormat = domain.MessageBodyFormatV1
 	}
+	maxAttachmentBytes := input.MaxAttachmentBytes
+	if maxAttachmentBytes <= 0 {
+		maxAttachmentBytes = domain.DefaultMaxMessageAttachmentBytes
+	}
 	// Authorization and reference integrity are enforced atomically in one INSERT.
 	//
 	// The auth subquery (UNION ALL of channel branch + DM branch) yields exactly one
@@ -709,6 +716,22 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				SELECT id::uuid AS attachment_id, ord
 				FROM unnest($13::text[]) WITH ORDINALITY AS ids(id, ord)
 			),
+			authorized_attachments AS MATERIALIZED (
+				SELECT a.id AS attachment_id, a.size_bytes, candidate.ord
+				FROM attachment_candidates candidate
+				JOIN files.attachments a ON a.id = candidate.attachment_id
+				WHERE a.workspace_id = $1::uuid
+				  AND a.channel_id IS NOT DISTINCT FROM $2::uuid
+				  AND a.conversation_id IS NOT DISTINCT FROM $3::uuid
+				  AND a.uploader_id = $4::uuid
+				  AND a.status IN ('pending_scan', 'clean')
+				  AND a.deleted_at IS NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM chat.message_attachments existing
+					WHERE existing.attachment_id = a.id
+				  )
+				FOR UPDATE OF a
+			),
 			-- RF-32 attachment authorization. A client sends only ids, so every
 			-- property that decides whether a link may exist is re-read here from
 			-- files.attachments — never taken from the request:
@@ -734,22 +757,9 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			-- invalid reference produces.
 			invalid_attachments AS (
 				SELECT 1
-				FROM attachment_candidates candidate
-				WHERE NOT EXISTS (
-					SELECT 1
-					FROM files.attachments a
-					WHERE a.id = candidate.attachment_id
-					  AND a.workspace_id = $1::uuid
-					  AND a.channel_id IS NOT DISTINCT FROM $2::uuid
-					  AND a.conversation_id IS NOT DISTINCT FROM $3::uuid
-					  AND a.uploader_id = $4::uuid
-					  AND a.status IN ('pending_scan', 'clean')
-					  AND a.deleted_at IS NULL
-					  AND NOT EXISTS (
-						SELECT 1 FROM chat.message_attachments existing
-						WHERE existing.attachment_id = a.id
-					  )
-				)
+				WHERE (SELECT COUNT(*) FROM authorized_attachments) <>
+				      (SELECT COUNT(*) FROM attachment_candidates)
+				   OR (SELECT COALESCE(SUM(size_bytes), 0) FROM authorized_attachments) > $20::bigint
 			),
 			invalid_refs AS (
 			SELECT 1 FROM (VALUES (1)) v(x)
@@ -904,8 +914,15 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			INSERT INTO chat.message_attachments (message_id, attachment_id, position)
 			SELECT inserted.id, candidate.attachment_id, candidate.ord - 1
 			FROM inserted
-			CROSS JOIN attachment_candidates candidate
+			CROSS JOIN authorized_attachments candidate
 			RETURNING attachment_id
+		),
+		published_attachments AS (
+			UPDATE files.attachments AS a
+			SET draft_expires_at = NULL, updated_at = now()
+			FROM attachment_links AS linked
+			WHERE a.id = linked.attachment_id
+			RETURNING a.id
 		),
 		-- RF-21. Same statement again, for the same reason: a withheld message
 		-- and the URLs it is waiting on are one atomic fact. A commit in which
@@ -945,6 +962,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		input.LinkSafetyFingerprint,
 		input.RequestFingerprint,
 		string(input.LinkSafetyState),
+		maxAttachmentBytes,
 	)
 	msg, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {

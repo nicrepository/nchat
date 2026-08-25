@@ -25,6 +25,7 @@ import ComposerToolbar from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
 import type { CodecFormat } from "./tiptapSerializer";
 import type { Message, MessageBodyFormat } from "./chatTypes";
+import { formatFileSize } from "./conversationDetailsDisplay";
 import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
 
@@ -183,8 +184,10 @@ export default function ChatComposer({
   const [dragActive, setDragActive] = useState(false);
   const upload = useAttachmentUpload(uploadTarget, onAttachmentUploaded);
   const attachEnabled = uploadTarget !== null && !disabled;
-  const uploading = upload.status === "uploading";
-  const pendingAttachment = upload.uploadedAttachment;
+  const uploading = upload.busy;
+  const pendingAttachments = upload.items
+    .map((item) => item.attachment)
+    .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
 
   /**
    * The one place a send is assembled (RF-32).
@@ -201,8 +204,11 @@ export default function ChatComposer({
    */
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
-    const result = await onSend(body, pendingAttachment ? [pendingAttachment.id] : undefined);
-    if (result.status === "sent") upload.dismiss();
+    const result = await onSend(
+      body,
+      pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
+    );
+    if (result.status === "sent") upload.resetAfterPublish();
     return result;
   };
 
@@ -213,20 +219,20 @@ export default function ChatComposer({
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
-    canSendEmpty: pendingAttachment !== null && !uploading,
+    canSendEmpty: pendingAttachments.length > 0 && !uploading,
     onSend: handleComposerSend,
     onActivity,
   });
 
   // Both entry points funnel here, so there is exactly one place that decides
   // whether a file may be taken and exactly one validation path behind it.
-  const acceptFile = (file: File | undefined) => {
-    if (!attachEnabled || !file) return;
-    upload.selectFile(file);
+  const acceptFiles = (files: Iterable<File> | undefined) => {
+    if (!attachEnabled || !files) return;
+    upload.selectFiles(files);
   };
 
   const handlePickerChange = (event: ChangeEvent<HTMLInputElement>) => {
-    acceptFile(event.target.files?.[0]);
+    acceptFiles(event.target.files ?? undefined);
     // Clearing the value is what lets the same file be chosen again after a
     // failure: without it the input reports no change and fires nothing.
     event.target.value = "";
@@ -260,9 +266,7 @@ export default function ChatComposer({
     // navigates away to the dropped file.
     event.preventDefault();
     setDragActive(false);
-    // One file per request is the whole contract file-service accepts; a
-    // multi-file drop takes the first rather than silently starting several.
-    acceptFile(event.dataTransfer.files?.[0]);
+    acceptFiles(event.dataTransfer.files ?? undefined);
   };
 
   useEffect(() => {
@@ -329,57 +333,111 @@ export default function ChatComposer({
           )}
           <EditorContent editor={editor} />
         </div>
-        {uploadTarget && (upload.status !== "idle" || dragActive) && (
+        {uploadTarget && (upload.items.length > 0 || dragActive || upload.notice) && (
           <div
             className="chat-msg-area__composer-upload"
             data-testid="chat-composer-upload-status"
             role={upload.status === "failed" ? "alert" : "status"}
           >
-            {dragActive && upload.status === "idle" && <span>Solte o arquivo para enviar.</span>}
-            {uploading && (
-              <>
-                <span>
-                  Enviando arquivo…
-                  {upload.progress && ` ${uploadPercent(upload.progress)}%`}
+            <div className="chat-msg-area__composer-upload-header">
+              <span className="material-symbols-outlined" aria-hidden="true">
+                attach_file
+              </span>
+              <strong>
+                {upload.items.length === 1
+                  ? "1 arquivo anexado"
+                  : `${upload.items.length} arquivos anexados`}
+              </strong>
+              {upload.aggregateProgress && upload.items.length > 1 && (
+                <span className="chat-msg-area__composer-upload-total">
+                  {uploadPercent(upload.aggregateProgress)}% no total
                 </span>
-                {/* Determinate only when the transport actually counted the
-                    bytes. With nothing measured the element is omitted rather
-                    than rendered value-less, so the text above stays the only
-                    claim being made. */}
-                {upload.progress && (
-                  <progress
-                    className="chat-msg-area__composer-progress"
-                    data-testid="chat-composer-upload-progress"
-                    aria-label="Progresso do envio"
-                    value={upload.progress.loaded}
-                    max={upload.progress.total}
-                  />
-                )}
-              </>
+              )}
+            </div>
+            {dragActive && upload.status === "idle" && (
+              <span className="chat-msg-area__composer-upload-notice">Solte os arquivos aqui.</span>
             )}
-            {/* The file is uploaded but not yet sent. Saying so is the whole
-                point: the previous copy read "Arquivo enviado", which described
-                a message that did not exist. */}
-            {upload.status === "success" && (
-              <span data-testid="chat-composer-pending-attachment">
-                Anexo pronto para envio: {upload.uploadedName}
+            {upload.notice && (
+              <span className="chat-msg-area__composer-upload-notice" role="status">
+                {upload.notice}
               </span>
             )}
-            {upload.status === "failed" && <span>{upload.error}</span>}
-            {(upload.status === "failed" || upload.status === "success") && (
-              <button
-                type="button"
-                className="chat-msg-area__composer-quote-close"
-                aria-label={
-                  upload.status === "success" ? "Remover anexo" : "Dispensar aviso de anexo"
-                }
-                data-testid="chat-composer-remove-attachment"
-                onClick={upload.dismiss}
-              >
-                <span className="material-symbols-outlined" aria-hidden="true">
-                  close
-                </span>
-              </button>
+            <div className="chat-msg-area__composer-upload-list">
+              {upload.items.map((item) => (
+                <div
+                  key={item.localId}
+                  className="chat-msg-area__composer-upload-item"
+                  data-testid={
+                    item.status === "success" ? "chat-composer-pending-attachment" : undefined
+                  }
+                >
+                  <span className="chat-msg-area__composer-upload-icon" aria-hidden="true">
+                    <span className="material-symbols-outlined">draft</span>
+                  </span>
+                  <div className="chat-msg-area__composer-upload-body">
+                    <span className="chat-msg-area__composer-upload-name" title={item.file.name}>
+                      {item.file.name}
+                    </span>
+                    <span
+                      className={`chat-msg-area__composer-upload-state chat-msg-area__composer-upload-state--${item.status}`}
+                    >
+                      {item.status === "queued" && "Aguardando envio"}
+                      {item.status === "uploading" &&
+                        `Enviando arquivo…${item.progress ? ` ${uploadPercent(item.progress)}%` : ""}`}
+                      {item.status === "success" && "Pronto para enviar"}
+                      {item.status === "failed" && item.error}
+                    </span>
+                    <span className="chat-msg-area__composer-upload-size">
+                      {formatFileSize(item.file.size)}
+                    </span>
+                    {item.status === "uploading" && item.progress && (
+                      <progress
+                        className="chat-msg-area__composer-progress"
+                        data-testid="chat-composer-upload-progress"
+                        aria-label={
+                          upload.items.length === 1
+                            ? "Progresso do envio"
+                            : `Progresso do envio de ${item.file.name}`
+                        }
+                        value={item.progress.loaded}
+                        max={item.progress.total}
+                      />
+                    )}
+                    {item.status === "failed" && (
+                      <button
+                        type="button"
+                        className="chat-msg-area__composer-upload-retry"
+                        onClick={() => upload.retry(item.localId)}
+                      >
+                        Tentar novamente
+                      </button>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    className="chat-msg-area__composer-quote-close"
+                    aria-label={
+                      upload.items.length === 1
+                        ? "Remover anexo"
+                        : `Remover anexo ${item.file.name}`
+                    }
+                    data-testid="chat-composer-remove-attachment"
+                    onClick={() => upload.remove(item.localId)}
+                  >
+                    <span className="material-symbols-outlined" aria-hidden="true">
+                      close
+                    </span>
+                  </button>
+                </div>
+              ))}
+            </div>
+            {upload.aggregateProgress && upload.items.length > 1 && (
+              <progress
+                className="chat-msg-area__composer-progress chat-msg-area__composer-progress--total"
+                aria-label="Progresso total dos anexos"
+                value={upload.aggregateProgress.loaded}
+                max={upload.aggregateProgress.total}
+              />
             )}
           </div>
         )}
@@ -390,6 +448,7 @@ export default function ChatComposer({
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 className="chat-msg-area__composer-file-input"
                 data-testid="chat-composer-file-input"
                 aria-label="Escolher arquivo para anexar"
@@ -400,7 +459,7 @@ export default function ChatComposer({
                 type="button"
                 className="composer-toolbar__btn"
                 aria-label="Anexar arquivo"
-                disabled={!attachEnabled || uploading}
+                disabled={!attachEnabled || upload.items.length >= 10}
                 data-testid="chat-composer-attach-btn"
                 onClick={() => fileInputRef.current?.click()}
               >

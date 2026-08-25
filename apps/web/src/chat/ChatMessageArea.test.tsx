@@ -163,6 +163,10 @@ vi.mock("./chatApi", () => ({
   fetchSidebarData: vi.fn(),
   fetchChannels: vi.fn(),
   fetchDMs: vi.fn(),
+  fetchWorkspaceMessageAttachmentLimits: vi.fn().mockResolvedValue({
+    maxFiles: 10,
+    maxBytes: 512 * 1024 * 1024,
+  }),
   fetchChannelMessages: (channelId: string, beforeCursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(channelId, beforeCursor, signal),
   fetchChannelMessage: mockFetchChannelMessage,
@@ -2697,7 +2701,12 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 3)).toEqual([
       "destination",
       "seguro",
-      { parentMessageId: undefined, referencedMessageId: undefined, attachmentIds: undefined },
+      {
+        parentMessageId: undefined,
+        referencedMessageId: undefined,
+        attachmentIds: undefined,
+        idempotencyKey: expect.any(String),
+      },
     ]);
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(mockFetchDMMessage).not.toHaveBeenCalled();
@@ -3024,6 +3033,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         parentMessageId: undefined,
         referencedMessageId: rf09SourceMessageID,
         attachmentIds: undefined,
+        idempotencyKey: expect.any(String),
       },
     ]);
     await waitFor(() =>

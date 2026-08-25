@@ -8,7 +8,12 @@ vi.mock("../lib/authClient", () => ({
   authenticatedFetch: (...args: unknown[]) => mockAuthFetch(...args),
 }));
 
-import { fetchAttachmentContent, fetchConversationAttachments, uploadAttachment } from "./filesApi";
+import {
+  deleteAttachmentDraft,
+  fetchAttachmentContent,
+  fetchConversationAttachments,
+  uploadAttachment,
+} from "./filesApi";
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -236,6 +241,7 @@ describe("uploadAttachment", () => {
     expect(url).toBe("/api/files/channels/ch%201/attachments");
     expect(init.method).toBe("POST");
     expect(init.body).toBeInstanceOf(FormData);
+    expect((init.body as FormData).get("purpose")).toBe("message_draft");
     expect((init.body as FormData).get("file")).toBeInstanceOf(File);
   });
 
@@ -410,5 +416,17 @@ describe("fetchAttachmentContent", () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "file_not_scanned", "nope"));
 
     await expect(fetchAttachmentContent("a-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("deleteAttachmentDraft", () => {
+  it("uses the authenticated non-enumerating cancellation route", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    await deleteAttachmentDraft("draft 1");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/files/attachments/draft%201",
+      { method: "DELETE" },
+      expect.any(Function),
+    );
   });
 });

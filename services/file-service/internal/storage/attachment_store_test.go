@@ -77,9 +77,74 @@ func TestCreatePendingAlwaysStartsAtPendingUpload(t *testing.T) {
 		newAttachment(domain.DestinationKindChannel, testChannelID)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	status, ok := pool.lastArgs[len(pool.lastArgs)-1].(string)
+	status, ok := pool.lastArgs[len(pool.lastArgs)-2].(string)
 	if !ok || status != string(domain.StatusPendingUpload) {
-		t.Fatalf("expected pending_upload, got %v", pool.lastArgs[len(pool.lastArgs)-1])
+		t.Fatalf("expected pending_upload, got %v", pool.lastArgs[len(pool.lastArgs)-2])
+	}
+}
+
+func TestCreatePendingPersistsDraftExpiry(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	attachment := newAttachment(domain.DestinationKindChannel, testChannelID)
+	attachment.DraftExpiresAt = &expiresAt
+	pool := &fakePool{}
+	if err := storage.NewPGXAttachmentStore(pool).CreatePending(context.Background(), attachment); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := pool.lastArgs[len(pool.lastArgs)-1]; got != attachment.DraftExpiresAt {
+		t.Fatalf("expected draft expiry %v, got %v", attachment.DraftExpiresAt, got)
+	}
+}
+
+func TestCancelDraftIsNonEnumeratingAndQueuesCleanupAtomically(t *testing.T) {
+	pool := &fakePool{queryRow: func(sql string, _ ...any) pgx.Row {
+		for _, fragment := range []string{
+			"uploader_id = $2", "draft_expires_at IS NOT NULL",
+			"chat.message_attachments", "FOR UPDATE OF a", "object_cleanup_jobs",
+		} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("cancel query missing %q", fragment)
+			}
+		}
+		return valueRow{values: []any{true}}
+	}}
+	if err := storage.NewPGXAttachmentStore(pool).CancelDraft(
+		context.Background(), testAttachmentID, testUserID,
+	); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCancelDraftReturnsTheSameNotFoundForEveryIneligibleCandidate(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{false}}
+	}}
+	err := storage.NewPGXAttachmentStore(pool).CancelDraft(
+		context.Background(), testAttachmentID, testUserID,
+	)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected non-enumerating ErrNotFound, got %v", err)
+	}
+}
+
+func TestExpireDraftsUsesBoundedSkipLockedClaim(t *testing.T) {
+	pool := &fakePool{queryRow: func(sql string, args ...any) pgx.Row {
+		for _, fragment := range []string{
+			"draft_expires_at <= now()", "FOR UPDATE OF a SKIP LOCKED",
+			"chat.message_attachments", "LIMIT $1", "object_cleanup_jobs",
+		} {
+			if !strings.Contains(sql, fragment) {
+				t.Fatalf("expiry query missing %q", fragment)
+			}
+		}
+		if len(args) != 1 || args[0] != 25 {
+			t.Fatalf("unexpected expiry arguments: %v", args)
+		}
+		return valueRow{values: []any{3}}
+	}}
+	got, err := storage.NewPGXAttachmentStore(pool).ExpireDrafts(context.Background(), 25)
+	if err != nil || got != 3 {
+		t.Fatalf("expected three expired drafts, got %d, %v", got, err)
 	}
 }
 
@@ -364,6 +429,7 @@ func TestGetAuthorizedReEvaluatesMembershipInTheSameQuery(t *testing.T) {
 		"chat.channel_visible_to_user(c.id, active.user_id)",
 		"chat.dm_members",
 		"a.deleted_at IS NULL",
+		"m.status <> 'active'",
 		"a.workspace_id",
 	} {
 		if !strings.Contains(pool.lastSQL, fragment) {
