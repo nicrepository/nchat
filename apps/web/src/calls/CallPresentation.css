@@ -103,6 +103,46 @@
   opacity: 0.7;
 }
 
+/*
+ * #616 redesign: the shared `.incoming-call, .outgoing-call { color: var(--color-text,
+ * #f8fafc) }` rule above falls back to a near-white value because this app never
+ * defines --color-text/--color-text-muted (the real tokens are --color-ink/--color-muted,
+ * see tokens.css) — so the caller name rendered nearly invisible on the near-white
+ * card. Scoped to .incoming-call only: outgoing (#615, just validated) is left as-is.
+ */
+.incoming-call {
+  color: var(--color-ink, #102a33);
+}
+.incoming-call__identity span {
+  color: var(--color-muted, #5c7380);
+}
+.incoming-call__name {
+  display: block;
+  overflow: hidden;
+  font-size: 1.05rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.incoming-call__actions {
+  min-height: 2.5rem;
+  margin-top: 0.6rem;
+}
+.incoming-call__reject:focus-visible,
+.incoming-call__accept:focus-visible,
+.incoming-call__retry:focus-visible {
+  outline: 3px solid var(--color-ink, #102a33);
+  outline-offset: 2px;
+}
+
+@media (max-width: 420px) {
+  .incoming-call__actions {
+    flex-wrap: wrap;
+  }
+  .incoming-call__actions > button {
+    flex: 1 1 auto;
+  }
+}
+
 .floating-call {
   top: 0;
   left: 0;

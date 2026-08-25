@@ -7,23 +7,17 @@ import "./CallPresentation.css";
 interface IncomingCallPopupProps {
   name: string;
   avatarUrl?: string;
-  targetKind: "user" | "dm" | "channel";
   callType: "audio" | "video";
-  participantCount?: number;
   onAccept: () => unknown;
   onReject: () => unknown;
   identityStatus?: "loading" | "ready" | "error";
   onRetryIdentity?: () => unknown;
 }
 
-const kindLabel = { user: "DM", dm: "Grupo", channel: "Canal" } as const;
-
 export default function IncomingCallPopup({
   name,
   avatarUrl,
-  targetKind,
   callType,
-  participantCount,
   onAccept,
   onReject,
   identityStatus = "ready",
@@ -55,15 +49,10 @@ export default function IncomingCallPopup({
           />
         </div>
         <div>
-          <strong>{name}</strong>
-          <span>
-            {kindLabel[targetKind]} · chamada de {callType === "video" ? "vídeo" : "áudio"}
+          <strong className="incoming-call__name">{name}</strong>
+          <span className="incoming-call__type">
+            {callType === "video" ? "Chamada de vídeo" : "Chamada de voz"}
           </span>
-          {participantCount !== undefined && (
-            <span>
-              {participantCount} participante{participantCount === 1 ? "" : "s"}
-            </span>
-          )}
         </div>
       </div>
       <div className="incoming-call__actions">
@@ -72,16 +61,35 @@ export default function IncomingCallPopup({
         ) : identityStatus === "error" ? (
           <>
             <span role="alert">Não foi possível preparar a chamada.</span>
-            <button type="button" disabled={retrying} onClick={retryIdentity}>
+            <button
+              type="button"
+              className="incoming-call__retry"
+              disabled={retrying}
+              onClick={retryIdentity}
+            >
               Tentar novamente
             </button>
           </>
         ) : (
           <>
-            <button type="button" className="incoming-call__reject" onClick={onReject}>
+            <button
+              type="button"
+              className="incoming-call__reject"
+              aria-label={`Recusar chamada de ${name}`}
+              onClick={onReject}
+            >
               Recusar
             </button>
-            <button type="button" className="incoming-call__accept" onClick={onAccept}>
+            <button
+              type="button"
+              className="incoming-call__accept"
+              aria-label={
+                callType === "video"
+                  ? `Atender com câmera a chamada de vídeo de ${name}`
+                  : `Atender chamada de ${name}`
+              }
+              onClick={onAccept}
+            >
               {callType === "video" ? "Atender com câmera" : "Atender"}
             </button>
           </>
