@@ -18,7 +18,6 @@ import (
 // attachment is accepted as a message's whole content.
 
 const attachmentA = "11111111-2222-4333-8444-555555555551"
-const attachmentB = "11111111-2222-4333-8444-555555555552"
 
 func attachmentIDs(count int) []string {
 	ids := make([]string, count)
