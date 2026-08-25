@@ -42,6 +42,8 @@ import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetails } from "./useConversationDetails";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import ConversationSystemMessage from "./ConversationSystemMessage";
+import { systemScopeFor, type SystemMessageScope } from "./conversationSystemMessage";
 import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
 import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
@@ -524,6 +526,12 @@ interface MessageListProps {
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   editDisabledIds: Set<string>;
   channelId?: string;
+  /**
+   * Whether a system message in this timeline says "canal", "grupo" or
+   * "conversa" (issue #527). The kind comes from the conversation record, never
+   * from the route or the name.
+   */
+  systemScope: SystemMessageScope;
   /** The conversation on screen, so a sender's presence is resolved in it. */
   presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -554,6 +562,7 @@ function MessageList({
   onDeleteMessage,
   editDisabledIds,
   channelId,
+  systemScope,
   presenceTarget,
   onTogglePin,
   pinnedIds,
@@ -768,6 +777,16 @@ function MessageList({
           <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
             {item.label}
           </div>
+        ) : item.message.kind === "system" ? (
+          // A conversation event is not something a person said, so it never
+          // becomes a MessageBubble: no bubble, no avatar, and none of the
+          // message actions — editing "Fulano saiu do grupo" is not a thing
+          // (issue #527).
+          <ConversationSystemMessage
+            key={item.message.id}
+            message={item.message}
+            scope={systemScope}
+          />
         ) : (
           <MessageBubble
             key={item.message.id}
@@ -1502,6 +1521,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           <MessageList
             messages={state.messages}
             currentUserId={ctx.currentUserId}
+            // "canal" / "grupo" / "conversa" for this timeline's system
+            // messages (issue #527).
+            systemScope={systemScopeFor(detailsKind, kind)}
             hasMore={state.nextCursor !== ""}
             loadingMore={state.loadingMore}
             lastMutation={state.lastMutation}
