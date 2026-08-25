@@ -175,6 +175,187 @@
   outline-offset: 2px;
 }
 
+/*
+ * #642: persistent, compact resource (channel/group-DM) call bar inside the
+ * conversation view — the `.voicebanner` concept from
+ * prototype/claude-design-v1/nic-chat/chamada.html, restyled with this app's
+ * real tokens (the prototype's --space-* and --radius-pill do not exist in
+ * tokens.css, so literal rem/px values are used instead, matching the rest
+ * of this file). The prototype's search field is explicitly out of scope.
+ */
+.voicebanner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--color-border, #dbe7eb);
+  border-left: 3px solid var(--color-primary, #0e7490);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #102a33);
+}
+.voicebanner__open {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.voicebanner__open:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+  border-radius: 0.35rem;
+}
+.voicebanner__icon {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+}
+.voicebanner__icon .material-symbols-outlined {
+  font-size: 1.1rem;
+}
+.voicebanner__info {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.voicebanner__title {
+  overflow: hidden;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voicebanner__meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  overflow: hidden;
+  color: var(--color-muted, #5c7380);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voicebanner__dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-danger, #dc2626);
+  animation: voicebanner-pulse 1.4s infinite;
+}
+@keyframes voicebanner-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.voicebanner__avatars {
+  display: flex;
+  flex: 0 0 auto;
+}
+.voicebanner__avatar {
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  margin-left: -0.5rem;
+  border: 2px solid var(--color-surface, #fff);
+  border-radius: 50%;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+.voicebanner__avatar:first-child {
+  margin-left: 0;
+}
+.voicebanner__avatar--speaking {
+  box-shadow: 0 0 0 2px var(--color-success, #16a34a);
+}
+.voicebanner__avatar--overflow {
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink-2, #264653);
+}
+.voicebanner__controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.4rem;
+}
+.voicebanner__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 2rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--color-border, #dbe7eb);
+  border-radius: 999px;
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink-2, #264653);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.voicebanner__btn .material-symbols-outlined {
+  font-size: 1rem;
+}
+.voicebanner__btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+.voicebanner__btn:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+}
+.voicebanner__btn--end {
+  border-color: var(--color-danger, #dc2626);
+  background: var(--color-danger, #dc2626);
+  color: #fff;
+}
+.voicebanner__btn--end:focus-visible {
+  outline-color: var(--color-danger, #dc2626);
+}
+.voicebanner__sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+@media (max-width: 420px) {
+  .voicebanner {
+    flex-wrap: wrap;
+  }
+  .voicebanner__open {
+    flex: 1 1 100%;
+  }
+  .voicebanner__avatars {
+    order: 3;
+  }
+  .voicebanner__controls {
+    order: 4;
+    flex: 1 1 auto;
+    justify-content: flex-end;
+  }
+}
+
 .floating-call {
   top: 0;
   left: 0;
@@ -598,7 +779,8 @@
   .floating-call,
   .global-call-indicator,
   .call-presentation__control,
-  .call-speaker-surface::after {
+  .call-speaker-surface::after,
+  .voicebanner__dot {
     scroll-behavior: auto;
     transition: none;
     animation: none;

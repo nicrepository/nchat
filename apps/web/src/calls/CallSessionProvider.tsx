@@ -96,6 +96,35 @@ export interface CallSessionContextValue {
    */
   leaveDedicated: (callId: string) => Promise<void>;
   /**
+   * The local user's call-presentation identity (issue #612), reused from
+   * the shared session-scoped profile cache — never a second GET /auth/me.
+   * Exposed on the context so a view-scoped surface (e.g. #642's
+   * ActiveResourceCallBar, rendered by ChatMessageArea/ChatShell) can show
+   * the local avatar/name without its own profile fetch.
+   */
+  localIdentity: { name: string; initials: string; avatarUrl?: string };
+  /**
+   * Minimal, view-scoped exit for a resource-call participation (issue
+   * #642) — reuses endResourceParticipation exactly as leaveDedicated
+   * already does, never resource.leave() directly, so the same
+   * leaving/left cross-tab convergence and ownership semantics apply
+   * regardless of whether the user left via the dedicated tab, the
+   * FloatingCallWindow, or this.
+   */
+  leaveResourceParticipation: () => Promise<void>;
+  /**
+   * The single derived authority for "this resource participation is
+   * stable enough to present as #642's compact ActiveResourceCallBar
+   * instead of the floating window" — null in every other state
+   * (connecting, reconnecting, error, remote ownership, a stale/mismatched
+   * discovery call_id, or a participation already leaving/left). Non-null
+   * carries the exact, proven Call this tab is participating in, so a
+   * view-scoped consumer (ChatShell) derives callId/startedAt from the SAME
+   * validated source CallSessionProvider itself used to suppress
+   * FloatingCallWindow — never a second, independently-computed guess.
+   */
+  resourcePresentationCall: Call | null;
+  /**
    * Registers a fresh resource-call participation for callId — the causal
    * counterpart to leaveDedicated/endResourceParticipation (issue #570
    * follow-up). Must be called once, right after resource.join() itself
@@ -970,6 +999,43 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     resourceParticipationPhase !== "leaving" && resourceParticipationPhase !== "left";
   const activeCallId =
     directActive?.call_id ?? (resource.callId && resourceCallReconnectable ? resource.callId : "");
+  const resourceTarget = directActive ? null : resource.active;
+  // The callId this participation may still reconnect/present as — the SAME
+  // authority activeCallId above already reads (resourceCallReconnectable),
+  // so "leaving"/"left" clears this synchronously (issue #642 review,
+  // blocker 4), before endResourceParticipation's own server round trip
+  // ever resolves. Never a second local "isLeaving" flag.
+  const resourcePresentationCallId =
+    resource.callId && resourceCallReconnectable ? resource.callId : null;
+  // The discovery observation for the target this tab is actually
+  // participating in — call.admitted and call.accepted are independent,
+  // unordered messages (resourceCallSignaling.ts), so discovery can still
+  // briefly hold an OLDER call_id for the very same channel/group-DM while
+  // this participation's own callId is already current. Only ever used to
+  // gate #642's presentation handoff below — every other resource-call path
+  // (join/leave/reconnect) stays entirely independent of discovery.
+  const resourceDiscoveredForTarget = resourceTarget
+    ? getResourceCall(resourceTarget.kind, resourceTarget.id)
+    : null;
+  // #642 review fix — the single derived authority for "this resource
+  // participation is stable enough that a compact bar may replace the
+  // floating window": a PROVEN call_id match (never merely "some call
+  // exists for this target"), resource/media both settled (never
+  // connecting/reconnecting/error — states only the floating window has UI
+  // for), and this tab actually holding local ownership (never remote,
+  // which keeps using GlobalCallIndicator). Carries the exact Call so the
+  // FloatingCallWindow suppression below and #642's ActiveResourceCallBar
+  // (via ChatShell, over context) derive callId/startedAt from the SAME
+  // validated source, never two independent guesses that could disagree.
+  const resourcePresentationCall =
+    resourcePresentationCallId &&
+    resourceDiscoveredForTarget?.status === "active" &&
+    resourceDiscoveredForTarget.call_id === resourcePresentationCallId &&
+    resource.status === "active" &&
+    media.status === "connected" &&
+    ownerState === "local"
+      ? resourceDiscoveredForTarget
+      : null;
 
   // Ownership fence for screen-share START only (issue #611) — requirements
   // traceability that only the CURRENT owner of THIS specific call may begin
@@ -1519,6 +1585,16 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     },
     [endResourceParticipation, releaseDedicated],
   );
+  // #642's view-scoped exit: same endResourceParticipation leaveDedicated
+  // already reuses above — never resource.leave() directly, so it leaves
+  // exactly the same leaving/left cross-tab state a FloatingCallWindow leave
+  // would.
+  const leaveResourceParticipation = endResourceParticipation;
+
+  const localIdentity = useMemo(
+    () => ({ name: localName, initials: localInitials, avatarUrl: selfAvatarUrl }),
+    [localName, localInitials, selfAvatarUrl],
+  );
 
   const value = useMemo(
     () => ({
@@ -1538,6 +1614,9 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       releaseDedicated,
       releaseDirectTerminal,
       leaveDedicated,
+      localIdentity,
+      leaveResourceParticipation,
+      resourcePresentationCall,
       beginResourceParticipation,
       joinResourceParticipation,
       activateResourceParticipation,
@@ -1556,6 +1635,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       getResourceCall,
       joinResourceParticipation,
       leaveDedicated,
+      localIdentity,
+      leaveResourceParticipation,
       wrappedMedia,
       ownerState,
       presentation,
@@ -1565,6 +1646,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       releaseDirectTerminal,
       requestResourceCallSync,
       resource,
+      resourcePresentationCall,
       takeOver,
     ],
   );
@@ -1601,7 +1683,6 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       ? directOutgoing.callee_id
       : (directIncoming?.caller_id ?? "");
   const peer = directory?.dms.find((dm) => dm.counterpart?.userId === peerId)?.counterpart;
-  const resourceTarget = directActive ? null : resource.active;
   const title = peer?.displayName ?? resourceTarget?.name ?? "Participante";
   // Real identity seed for the floating remote fallback avatar's color —
   // peerId itself (not peer?.userId) so a direct call still gets a stable,
@@ -1717,43 +1798,65 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
             onReturn={() => void takeOver()}
           />
         )}
-      {!dedicated && activeCallId && ownerState !== "remote" && (
-        <FloatingCallWindow
-          title={title}
-          status={floatingStatus}
-          participantCount={participantCount}
-          activeSpeaker={activeSpeaker}
-          screenShareLabel={screenShareLabel}
-          hasRemoteVideo={media.hasRemoteVideo}
-          remoteSeed={remoteSeed}
-          avatarUrl={peer?.avatarUrl}
-          hasLocalVideo={media.hasLocalVideo}
-          localSeed={localSeed}
-          localName={localName}
-          localInitials={localInitials}
-          localAvatarUrl={selfAvatarUrl}
-          controls={controls}
-          onExpand={expand}
-          bindLocalMedia={media.bindLocalMedia}
-          bindRemoteMedia={media.bindRemoteMedia}
-          testId={resourceTarget ? "resource-call-panel" : "floating-call-window"}
-          activationRequired={Boolean(directActive && calls.mediaActivationRequired)}
-          activationLabel={
-            directActive?.call_type === "audio"
-              ? "Permitir microfone"
-              : "Permitir câmera e microfone"
-          }
-          onActivate={() => void calls.activateMedia()}
-          identityStatus={directActive ? identity.status : "ready"}
-          onRetryIdentity={() => identity.retry?.()}
-          error={calls.error ?? resource.error ?? media.error}
-          onRetry={() =>
-            directActive
-              ? void calls.retryMedia()
-              : void resource.reconnect().catch(() => undefined)
-          }
-        />
-      )}
+      {!dedicated &&
+        activeCallId &&
+        ownerState !== "remote" &&
+        // #642 (review fix): a resource call's own view (ChatMessageArea/
+        // ChatShell) shows ActiveResourceCallBar instead, but ONLY once
+        // resourcePresentationCall proves the handoff is atomic — same
+        // route target, proven call_id (never a stale/different call for
+        // the same channel/group-DM), resource+media settled (never
+        // connecting/reconnecting/error, which only this floating window
+        // presents), and local ownership. Anything less and the floating
+        // window stays put, so there is never a frame with NO call surface
+        // at all. Direct calls are unaffected: resourceTarget is null
+        // whenever directActive is set. Navigating away restores the
+        // floating window (routeResourceTarget stops matching); navigating
+        // back suppresses it again — no ownership/lifecycle change, purely
+        // derived from state that already exists.
+        !(
+          resourceTarget &&
+          routeResourceTarget &&
+          routeResourceTarget.kind === resourceTarget.kind &&
+          routeResourceTarget.id === resourceTarget.id &&
+          resourcePresentationCall
+        ) && (
+          <FloatingCallWindow
+            title={title}
+            status={floatingStatus}
+            participantCount={participantCount}
+            activeSpeaker={activeSpeaker}
+            screenShareLabel={screenShareLabel}
+            hasRemoteVideo={media.hasRemoteVideo}
+            remoteSeed={remoteSeed}
+            avatarUrl={peer?.avatarUrl}
+            hasLocalVideo={media.hasLocalVideo}
+            localSeed={localSeed}
+            localName={localName}
+            localInitials={localInitials}
+            localAvatarUrl={selfAvatarUrl}
+            controls={controls}
+            onExpand={expand}
+            bindLocalMedia={media.bindLocalMedia}
+            bindRemoteMedia={media.bindRemoteMedia}
+            testId={resourceTarget ? "resource-call-panel" : "floating-call-window"}
+            activationRequired={Boolean(directActive && calls.mediaActivationRequired)}
+            activationLabel={
+              directActive?.call_type === "audio"
+                ? "Permitir microfone"
+                : "Permitir câmera e microfone"
+            }
+            onActivate={() => void calls.activateMedia()}
+            identityStatus={directActive ? identity.status : "ready"}
+            onRetryIdentity={() => identity.retry?.()}
+            error={calls.error ?? resource.error ?? media.error}
+            onRetry={() =>
+              directActive
+                ? void calls.retryMedia()
+                : void resource.reconnect().catch(() => undefined)
+            }
+          />
+        )}
       {!dedicated && !activeCallId && globalCallError && (
         <p className="call-global-error" role="alert">
           {globalCallError}

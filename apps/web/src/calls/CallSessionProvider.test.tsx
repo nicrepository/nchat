@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -262,6 +262,9 @@ function Probe() {
       <span data-testid="discovery-dm-1">
         {session.getResourceCall("dm", "dm-1")?.status ?? "none"}
       </span>
+      <span data-testid="resource-presentation-call">
+        {session.resourcePresentationCall?.call_id ?? "none"}
+      </span>
       <button type="button" onClick={() => navigate("/profile")}>
         Perfil
       </button>
@@ -270,6 +273,9 @@ function Probe() {
       </button>
       <button type="button" onClick={() => navigate(`/chat/channel/${channelId}`)}>
         Canal X
+      </button>
+      <button type="button" onClick={() => navigate(`/chat/channel/${channelYId}`)}>
+        Canal Y
       </button>
       <button type="button" onClick={() => navigate("/chat/dm/dm-1")}>
         DM direta
@@ -375,6 +381,16 @@ function Probe() {
       </button>
       <button type="button" onClick={() => void session.leaveDedicated(callId)}>
         Leave dedicated probe
+      </button>
+      <button
+        type="button"
+        // Mirrors every real call site (ChatShell's onLeave, issue #642
+        // review blocker 5): leaveResourceParticipation deliberately
+        // rethrows on failure, and the caller is always the one that must
+        // swallow it — never left unhandled here either.
+        onClick={() => void session.leaveResourceParticipation().catch(() => undefined)}
+      >
+        Leave resource participation probe
       </button>
       <button type="button" onClick={() => void session.beginResourceParticipation(callId)}>
         Begin participation probe
@@ -2203,6 +2219,384 @@ describe("CallSessionProvider", () => {
 
     expect(screen.getByTestId("discovery-channel-y")).toHaveTextContent("none");
     expect(screen.getByTestId("discovery-channel-x")).toHaveTextContent("active");
+  });
+
+  // ── #642 active resource call bar vs FloatingCallWindow (review fixes) ───
+
+  function activeResourceCall(overrides: Partial<Call> = {}): Call {
+    return {
+      call_id: callId,
+      request_id: "req-resource",
+      caller_id: userA,
+      callee_id: "",
+      target_type: "channel",
+      target_id: channelId,
+      call_type: "audio",
+      status: "active",
+      version: 1,
+      created_at: "2026-08-18T12:00:00Z",
+      occurred_at: "2026-08-18T12:00:00Z",
+      expires_at: "2026-08-18T13:00:00Z",
+      ...overrides,
+    } satisfies Call;
+  }
+
+  // Satisfies EVERY ingredient resourcePresentationCall requires: local
+  // participation, matching discovery, resource+media settled, local
+  // ownership — the full atomic predicate, never just resource.active alone
+  // (issue #642 review, blockers 1-3). Broadcasts discovery the same way
+  // the real server would (a resource lifecycle event, never a direct
+  // field write) and drives ownership through the real ownedMedia.connect
+  // bridge (via the mocked useResourceCallSession's own `owned` bridge arg)
+  // so ownerState genuinely becomes "local", not just asserted.
+  async function makeResourcePresentationReady(targetChannelId = channelId, targetCallId = callId) {
+    resource.active = { kind: "channel", id: targetChannelId, name: "Produto" };
+    resource.callId = targetCallId;
+    resource.status = "active";
+    media.status = "connected";
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: `discovery-${targetCallId}`,
+          target_type: "channel",
+          target_id: targetChannelId,
+          call: activeResourceCall({ call_id: targetCallId, target_id: targetChannelId }),
+        },
+        1,
+      ),
+    );
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() =>
+      owned.connect(
+        { call_id: targetCallId, call_type: "audio" } as never,
+        "token",
+        "wss://livekit",
+        "fresh",
+      ),
+    );
+  }
+
+  it("suppresses the resource FloatingCallWindow only once EVERY ingredient of resourcePresentationCall holds", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the floating window when discovery still shows a DIFFERENT call_id for the same target (call.admitted/call.accepted have no ordering guarantee)", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    media.status = "connected";
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    // Discovery still holds the OLD call for this exact target — a stale
+    // observation that has not yet converged to this participation's callId.
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "discovery-old",
+          target_type: "channel",
+          target_id: channelId,
+          call: activeResourceCall({ call_id: "00000000-0000-4000-8000-000000000999" }),
+        },
+        1,
+      ),
+    );
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() =>
+      owned.connect(
+        { call_id: callId, call_type: "audio" } as never,
+        "token",
+        "wss://livekit",
+        "fresh",
+      ),
+    );
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("keeps the floating window when discovery for this target is terminal (never active)", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    media.status = "connected";
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.ended",
+          event_id: "discovery-ended",
+          target_type: "channel",
+          target_id: channelId,
+          call: activeResourceCall({ status: "ended" }),
+        },
+        1,
+      ),
+    );
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() =>
+      owned.connect(
+        { call_id: callId, call_type: "audio" } as never,
+        "token",
+        "wss://livekit",
+        "fresh",
+      ),
+    );
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("keeps the floating window while this target has no discovery observation at all yet", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "active";
+    media.status = "connected";
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    const owned = vi.mocked(useResourceCallSession).mock.calls.at(-1)![0];
+    await act(() =>
+      owned.connect(
+        { call_id: callId, call_type: "audio" } as never,
+        "token",
+        "wss://livekit",
+        "fresh",
+      ),
+    );
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("keeps the floating window while resource.status is connecting, even at the matching route with valid discovery", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "connecting";
+    media.status = "connected";
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "discovery-connecting",
+          target_type: "channel",
+          target_id: channelId,
+          call: activeResourceCall(),
+        },
+        1,
+      ),
+    );
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+  });
+
+  it("keeps the floating window (showing its own status) while media is reconnecting, never handing off to the bar mid-reconnect", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
+    );
+
+    // Media drops to reconnecting — the bar has no UI for this state.
+    media.status = "reconnecting";
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+    expect(within(screen.getByTestId("resource-call-panel")).getByRole("status")).toHaveTextContent(
+      "Reconectando",
+    );
+  });
+
+  it("keeps the floating window (with its own error/retry UI) on a resource error, never hiding the retry affordance behind the bar", async () => {
+    resource.active = { kind: "channel", id: channelId, name: "Produto" };
+    resource.callId = callId;
+    resource.status = "error";
+    resource.error = "Falha no canal";
+    media.status = "connected";
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    act(() =>
+      socketListener.onMessage?.(
+        {
+          type: "call.accepted",
+          event_id: "discovery-error",
+          target_type: "channel",
+          target_id: channelId,
+          call: activeResourceCall(),
+        },
+        1,
+      ),
+    );
+
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    const panel = await screen.findByTestId("resource-call-panel");
+    // resource.error surfaces through FloatingCallWindow's own role="alert"
+    // recovery text (never floatingStatus's role="status" header, which
+    // tracks media.status, left "connected" here on purpose) — the retry
+    // affordance the bar has no UI for.
+    expect(within(panel).getByRole("alert")).toHaveTextContent("Falha no canal");
+    expect(within(panel).getByRole("button", { name: "Tentar mídia novamente" })).toBeEnabled();
+  });
+
+  it("restores the floating window when navigating away, suppresses it again on return, never duplicated", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+    await waitFor(() =>
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Canal Y" }));
+    expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
+    expect(screen.getAllByTestId("resource-call-panel")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
+    );
+    // Navigating A -> B -> A never reconnected media.
+    expect(media.stop).not.toHaveBeenCalled();
+  });
+
+  it("keeps GlobalCallIndicator (never FloatingCallWindow, never the bar) when ownerState is remote, even at the matching route", async () => {
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+    await waitFor(() =>
+      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
+    );
+
+    act(() => ownershipLost());
+    await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument();
+    expect(screen.getByText("Chamada aberta em outra aba")).toBeInTheDocument();
+  });
+
+  it("clears resourcePresentationCall the instant leaving starts — before endResourceParticipation's own server round trip resolves", async () => {
+    let resolveLeave!: (released: boolean) => void;
+    resource.leave.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveLeave = resolve;
+      }),
+    );
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave resource participation probe" }));
+    // Still unresolved — resource.leave()'s own promise is deliberately
+    // deferred — yet the participation authority already reflects "leaving"
+    // synchronously (continueResourceParticipation runs before any await),
+    // so resourcePresentationCall must already be null right now.
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none"),
+    );
+    expect(resource.leave).toHaveBeenCalled();
+
+    resolveLeave(true);
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "left", callId }),
+      ),
+    );
+    // Stays removed once the leave actually succeeds.
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+  });
+
+  it("a leave failure restores participation but keeps the bar ineligible while the resource error is presented by the floating window", async () => {
+    // Models the REAL useResourceCallSession.leave() rejection branch
+    // exactly (issue #642 review follow-up): a genuine rejection sets
+    // resource.status "error" and resource.error alongside throwing — never
+    // just a bare throw with resource.status left untouched. The mutation
+    // happens synchronously inside the mock so it's already in place by the
+    // time endResourceParticipation's own "leave-cancelled" participation
+    // update (a real setState) triggers the re-render that reads it — no
+    // extra artificial test-only rerender trigger needed.
+    resource.leave.mockImplementationOnce(async () => {
+      resource.status = "error";
+      resource.error = "Não foi possível sair da chamada. Tente novamente.";
+      throw new Error("leave failed");
+    });
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    await makeResourcePresentationReady();
+    // 1. resourcePresentationCall existed before leaving.
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Leave resource participation probe" }));
+    // 2. Gone immediately once leaving starts, Promise still in flight.
+    await waitFor(() =>
+      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none"),
+    );
+
+    // 3 & 4. The rejection converges participation back to "participating"
+    // — continueResourceParticipation("leave-cancelled") — purely via the
+    // SAME participationRecords authority activeCallId already reads, never
+    // a second local "isLeaving"/error flag.
+    await waitFor(() =>
+      expect(ownership.post).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "leave-cancelled", callId }),
+      ),
+    );
+    // 5. resourcePresentationCall stays "none": participation is
+    // reconnectable again, but resource.status is now "error", not
+    // "active" — the predicate's own resource.status === "active"
+    // requirement is exactly what keeps the bar from wrongly reappearing
+    // over a call that just failed to leave cleanly.
+    expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent("none");
+    // 6, 7 & 8. FloatingCallWindow is what actually presents this failure —
+    // its own role="alert" and retry affordance, the existing authority,
+    // never anything reinvented in the bar.
+    const panel = await screen.findByTestId("resource-call-panel");
+    expect(within(panel).getByRole("alert")).toHaveTextContent(
+      "Não foi possível sair da chamada. Tente novamente.",
+    );
+    expect(within(panel).getByRole("button", { name: "Tentar mídia novamente" })).toBeEnabled();
+  });
+
+  it("a direct call's FloatingCallWindow is unaffected by the #642 route-suppression condition", async () => {
+    calls.call = activeDirect();
+    renderProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+    fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
+    // resourceTarget is null whenever a direct call is active — the new
+    // suppression clause can never apply to it, route or no route.
+    expect(await screen.findByTestId("floating-call-window")).toBeInTheDocument();
   });
 });
 
