@@ -336,12 +336,17 @@ function announceMessage(
   event: WSMessageCreatedEvent,
   currentUserId: string,
   activeTarget: WSSubscriptionTarget | undefined,
+  isMuted: boolean,
   onNavigate: (path: string) => void,
 ): boolean {
   const payload = event.payload;
   if (!payload) return false;
   const classified = classifySoundEvent(payload, event.target_type, currentUserId);
-  const isWindowFocused = document.visibilityState === "visible";
+  if (isMuted) return classified.isMentioned;
+  const isWindowFocused =
+    document.visibilityState === "visible" &&
+    typeof document.hasFocus === "function" &&
+    document.hasFocus();
   const play = shouldPlayMessageSound({
     mode: getSoundNotificationMode(),
     // Already past the seenRealtimeMessageIds check at the call site — this
@@ -613,10 +618,20 @@ export function useChatSidebar() {
       }
       const isMentioned =
         state.status === "ready" &&
-        announceMessage(event, state.currentUserId, openedTarget, (path) => {
-          navigate(path);
-          refreshSidebar();
-        });
+        announceMessage(
+          event,
+          state.currentUserId,
+          openedTarget,
+          Boolean(
+            (event.target_type === "channel" ? state.channels : state.dms).find(
+              ({ id }) => id === event.target_id,
+            )?.muted,
+          ),
+          (path) => {
+            navigate(path);
+            refreshSidebar();
+          },
+        );
       dispatch({
         type: "message_created",
         target: { kind: event.target_type, targetId: event.target_id },
