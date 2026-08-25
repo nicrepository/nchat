@@ -197,6 +197,7 @@ export default function MessageAttachments({
   attachments: ChannelAttachment[] | undefined;
 }) {
   const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
+  const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
   if (!attachments || attachments.length === 0) return null;
 
@@ -208,23 +209,79 @@ export default function MessageAttachments({
     setLightbox(null);
   }
 
+  const segments: Array<
+    | { kind: "images"; attachments: ChannelAttachment[] }
+    | { kind: "file"; attachment: ChannelAttachment }
+  > = [];
+  for (const attachment of attachments) {
+    if (isImageAttachment(attachment)) {
+      const last = segments.at(-1);
+      if (last?.kind === "images") last.attachments.push(attachment);
+      else segments.push({ kind: "images", attachments: [attachment] });
+    } else {
+      segments.push({ kind: "file", attachment });
+    }
+  }
+
+  const openImage = (openedAttachment: ChannelAttachment, payload: AttachmentImageOpenPayload) =>
+    setLightbox({
+      attachment: openedAttachment,
+      trigger: payload.trigger,
+      url: payload.url,
+      isOriginal: payload.isOriginal,
+    });
+
   return (
     <>
       <ul className="chat-msg-area__attachments" aria-label="Anexos da mensagem">
-        {attachments.map((attachment) => (
-          <MessageAttachment
-            key={attachment.id}
-            attachment={attachment}
-            onOpenImage={(openedAttachment, payload) =>
-              setLightbox({
-                attachment: openedAttachment,
-                trigger: payload.trigger,
-                url: payload.url,
-                isOriginal: payload.isOriginal,
-              })
-            }
-          />
-        ))}
+        {segments.map((segment, index) => {
+          if (segment.kind === "file") {
+            return (
+              <MessageAttachment
+                key={segment.attachment.id}
+                attachment={segment.attachment}
+                onOpenImage={openImage}
+              />
+            );
+          }
+          const expanded = expandedRuns.has(index);
+          const visible = expanded ? segment.attachments : segment.attachments.slice(0, 4);
+          const hidden = segment.attachments.length - visible.length;
+          return (
+            <li key={`images-${segment.attachments[0].id}`} className="chat-msg-area__image-run">
+              <ul
+                className={`chat-msg-area__image-grid chat-msg-area__image-grid--${Math.min(segment.attachments.length, 4)}`}
+                data-testid="chat-message-image-grid"
+                data-count={segment.attachments.length}
+                aria-label={`${segment.attachments.length} imagens anexadas`}
+              >
+                {visible.map((attachment) => (
+                  <MessageAttachment
+                    key={attachment.id}
+                    attachment={attachment}
+                    onOpenImage={openImage}
+                  />
+                ))}
+              </ul>
+              {hidden > 0 && (
+                <button
+                  type="button"
+                  className="chat-msg-area__image-grid-more"
+                  aria-label={`Mostrar mais ${hidden} ${hidden === 1 ? "imagem" : "imagens"}`}
+                  onClick={() =>
+                    setExpandedRuns((current) => {
+                      const next = new Set(current);
+                      next.add(index);
+                      return next;
+                    })
+                  }
+                >
+                  +{hidden}
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
       {lightbox && (
         <AttachmentLightbox

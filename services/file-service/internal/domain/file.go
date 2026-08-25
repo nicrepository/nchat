@@ -15,10 +15,11 @@ import (
 // Error categories. Handlers map these to HTTP statuses; nothing below ever
 // carries storage topology, driver text or crypto material.
 var (
-	ErrInvalidInput = errors.New("invalid input")
-	ErrUnauthorized = errors.New("unauthorized")
-	ErrNotFound     = errors.New("not found")
-	ErrUnavailable  = errors.New("service unavailable")
+	ErrInvalidInput     = errors.New("invalid input")
+	ErrUnauthorized     = errors.New("unauthorized")
+	ErrNotFound         = errors.New("not found")
+	ErrUnavailable      = errors.New("service unavailable")
+	ErrUnsupportedMedia = fmt.Errorf("%w: unsupported media type", ErrInvalidInput)
 
 	// ErrTooLarge is returned when the plaintext exceeds the configured cap.
 	ErrTooLarge = errors.New("file too large")

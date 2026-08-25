@@ -224,6 +224,30 @@ describe("useChatSidebar identity retry", () => {
     websocket.onConversationAvailable = null;
   });
 
+  it("keeps attachment limits from the canonical sidebar response", async () => {
+    mockFetchSidebarData.mockResolvedValueOnce({
+      currentUserId,
+      workspaceId: "workspace-1",
+      maxUploadBytes: 8 * 1024 * 1024,
+      maxFiles: 10,
+      maxBytes: 512 * 1024 * 1024,
+      channels: [],
+      dms: [],
+      categories: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    if (result.current.state.status !== "ready") throw new Error("sidebar not ready");
+    expect(result.current.state.attachmentLimits).toEqual({
+      maxUploadBytes: 8 * 1024 * 1024,
+      maxFiles: 10,
+      maxBytes: 512 * 1024 * 1024,
+    });
+    expect(mockFetchSidebarData).toHaveBeenCalledOnce();
+  });
+
   it("shares one retry request and allows another attempt after failure", async () => {
     mockFetchSidebarData.mockRejectedValueOnce(new Error("offline"));
     const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });

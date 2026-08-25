@@ -94,7 +94,14 @@ interface SidebarDMResponse {
 
 interface SidebarResponse {
   current_user_id: string;
-  workspace: { id: string; name: string; slug: string; max_upload_bytes?: number };
+  workspace: {
+    id: string;
+    name: string;
+    slug: string;
+    max_upload_bytes?: number;
+    max_message_attachments?: number;
+    max_message_attachment_bytes?: number;
+  };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
 }
@@ -417,6 +424,9 @@ function placeInCategory(
 export async function fetchSidebarData(): Promise<{
   currentUserId: string;
   workspaceId: string;
+  maxUploadBytes?: number | null;
+  maxFiles?: number;
+  maxBytes?: number;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -451,9 +461,29 @@ export async function fetchSidebarData(): Promise<{
   }
 
   const dms = mapSidebarDMs(sidebar.dm_conversations);
+  const rawMaxUploadBytes = sidebar.workspace?.max_upload_bytes;
+  const rawMaxFiles = sidebar.workspace?.max_message_attachments;
+  const rawMaxBytes = sidebar.workspace?.max_message_attachment_bytes;
   return {
     currentUserId: sidebar.current_user_id ?? "",
     workspaceId: sidebar.workspace?.id ?? "",
+    maxUploadBytes:
+      typeof rawMaxUploadBytes === "number" &&
+      Number.isSafeInteger(rawMaxUploadBytes) &&
+      rawMaxUploadBytes > 0
+        ? rawMaxUploadBytes
+        : null,
+    maxFiles:
+      typeof rawMaxFiles === "number" &&
+      Number.isSafeInteger(rawMaxFiles) &&
+      rawMaxFiles >= 1 &&
+      rawMaxFiles <= 10
+        ? rawMaxFiles
+        : 1,
+    maxBytes:
+      typeof rawMaxBytes === "number" && Number.isSafeInteger(rawMaxBytes) && rawMaxBytes > 0
+        ? rawMaxBytes
+        : Number.MAX_SAFE_INTEGER,
     channels,
     dms,
     categories,
@@ -510,13 +540,10 @@ export async function markConversationRead(
  * its pre-flight check, and file-service — which re-reads the policy on every
  * upload — remains the only thing that decides.
  */
-export async function fetchWorkspaceUploadLimit(): Promise<number | null> {
-  const sidebar = await fetchSidebar();
-  const raw = sidebar.workspace?.max_upload_bytes;
-  if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw <= 0) {
-    return null;
-  }
-  return raw;
+export interface WorkspaceAttachmentLimits {
+  maxUploadBytes: number | null;
+  maxFiles: number;
+  maxBytes: number;
 }
 
 export async function searchDMCandidates(
@@ -1159,6 +1186,7 @@ export interface PostMessageOptions {
    * re-validates each id against the destination before it links anything.
    */
   attachmentIds?: string[];
+  idempotencyKey?: string;
   signal?: AbortSignal;
 }
 
@@ -1181,7 +1209,10 @@ export async function postChannelMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("channel", channelId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v3", options),
     signal: options.signal,
   });
@@ -1357,7 +1388,10 @@ export async function postDMMessage(
 ): Promise<Message> {
   const res = await authenticatedFetch<MessageEnvelope>(messagesPath("dm", conversationId), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: postMessageBody(bodyText, "v2", options),
     signal: options.signal,
   });

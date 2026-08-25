@@ -964,3 +964,25 @@ func TestScanDownMigrationDropsOnlySchedulingState(t *testing.T) {
 		t.Fatal("the down migration must be transactional")
 	}
 }
+
+func TestMessageDraftMigrationIsReversibleAndIndexed(t *testing.T) {
+	up := readFilesMigration(t, "000014_message_attachment_drafts.up.sql")
+	down := readFilesMigration(t, "000014_message_attachment_drafts.down.sql")
+	for _, required := range []string{
+		"ADD COLUMN draft_expires_at TIMESTAMPTZ",
+		"WHERE draft_expires_at IS NOT NULL AND deleted_at IS NULL",
+		"BEGIN;", "COMMIT;",
+	} {
+		if !strings.Contains(up, required) {
+			t.Fatalf("draft migration missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"DROP INDEX IF EXISTS files.attachments_expired_message_drafts_idx",
+		"DROP COLUMN IF EXISTS draft_expires_at", "BEGIN;", "COMMIT;",
+	} {
+		if !strings.Contains(down, required) {
+			t.Fatalf("draft rollback missing %q", required)
+		}
+	}
+}

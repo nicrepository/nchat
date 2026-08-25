@@ -1664,6 +1664,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           // the very pair the composer is keyed by — so an attachment can never
           // be posted to the destination the user just navigated away from.
           uploadTarget={targetId ? { kind, id: targetId } : null}
+          attachmentLimits={ctx.attachmentLimits}
           // An upload adds a file to the destination without creating a message
           // — the message comes later, when the user presses Enviar (RF-32) —
           // so the details panel's file list still has to reconcile here.

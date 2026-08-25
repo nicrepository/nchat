@@ -10,6 +10,7 @@ import type { ResourceCallKind } from "./callApi";
 import type { Call, CallType } from "./callState";
 import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 /**
@@ -23,9 +24,29 @@ function readySidebar(state: SidebarState): {
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
+  attachmentLimits: WorkspaceAttachmentLimits;
 } {
-  if (state.status !== "ready") return { currentUserId: "", channels: [], dms: [] };
-  return { currentUserId: state.currentUserId, channels: state.channels, dms: state.dms };
+  if (state.status !== "ready")
+    return {
+      currentUserId: "",
+      channels: [],
+      dms: [],
+      attachmentLimits: {
+        maxUploadBytes: null,
+        maxFiles: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      },
+    };
+  return {
+    currentUserId: state.currentUserId,
+    channels: state.channels,
+    dms: state.dms,
+    attachmentLimits: state.attachmentLimits ?? {
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    },
+  };
 }
 
 /**
@@ -60,6 +81,7 @@ export interface ChatOutletContext {
   currentUserId: string;
   channels: Channel[];
   dms: DMConversation[];
+  attachmentLimits?: WorkspaceAttachmentLimits;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
    * Discovery only (issue #622 round 2): whether a channel/group-DM has an
@@ -245,6 +267,7 @@ export default function ChatShell() {
     currentUserId: ready.currentUserId,
     channels: ready.channels,
     dms: ready.dms,
+    attachmentLimits: ready.attachmentLimits,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,

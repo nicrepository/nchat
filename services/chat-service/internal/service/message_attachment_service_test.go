@@ -3,6 +3,8 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -16,7 +18,14 @@ import (
 // attachment is accepted as a message's whole content.
 
 const attachmentA = "11111111-2222-4333-8444-555555555551"
-const attachmentB = "11111111-2222-4333-8444-555555555552"
+
+func attachmentIDs(count int) []string {
+	ids := make([]string, count)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("11111111-2222-4333-8444-%012d", i+1)
+	}
+	return ids
+}
 
 func TestMessageService_CreateChannelMessage_AttachmentOnlyIsValid(t *testing.T) {
 	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
@@ -106,14 +115,13 @@ func TestMessageService_CreateMessage_RejectsMalformedAttachmentLists(t *testing
 	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs)
 
 	for name, attachmentIDs := range map[string][]string{
-		"not a uuid":     {"not-a-uuid"},
-		"empty id":       {""},
-		"blank id":       {"   "},
-		"nil uuid":       {"00000000-0000-0000-0000-000000000000"},
-		"duplicate":      {attachmentA, attachmentA},
-		"more than one":  {attachmentA, attachmentB},
-		"trailing junk":  {attachmentA + "x"},
-		"too many again": {attachmentA, attachmentB, attachmentA},
+		"not a uuid":    {"not-a-uuid"},
+		"empty id":      {""},
+		"blank id":      {"   "},
+		"nil uuid":      {"00000000-0000-0000-0000-000000000000"},
+		"duplicate":     {attachmentA, attachmentA},
+		"trailing junk": {attachmentA + "x"},
+		"more than ten": attachmentIDs(11),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := svc.CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
@@ -128,6 +136,52 @@ func TestMessageService_CreateMessage_RejectsMalformedAttachmentLists(t *testing
 	}
 	if msgs.createCalls != 0 {
 		t.Fatalf("no malformed list may reach storage, got %d create calls", msgs.createCalls)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_PreservesTenAttachmentIDsInOrder(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-1"}}
+	want := attachmentIDs(10)
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: "lote", BodyFormat: domain.MessageBodyFormatV3, AttachmentIDs: want,
+		})
+	if err != nil {
+		t.Fatalf("ten attachments must be accepted: %v", err)
+	}
+	if !slices.Equal(msgs.lastCreateInput.AttachmentIDs, want) {
+		t.Fatalf("order changed: got %v want %v", msgs.lastCreateInput.AttachmentIDs, want)
+	}
+}
+
+func TestMessageService_MessageAttachmentLimitsReachValidationAndAtomicStore(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-1"}}
+	svc := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		WithMessageAttachmentLimits(2, 12345)
+
+	_, err := svc.CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		BodyText: "lote", BodyFormat: domain.MessageBodyFormatV3,
+		AttachmentIDs: attachmentIDs(3),
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("configured count was not enforced before storage: err=%v calls=%d", err, msgs.createCalls)
+	}
+
+	_, err = svc.CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+		BodyText: "lote", BodyFormat: domain.MessageBodyFormatV3,
+		AttachmentIDs: attachmentIDs(2),
+	})
+	if err != nil {
+		t.Fatalf("configured count should accept two: %v", err)
+	}
+	if msgs.lastCreateInput.MaxAttachmentBytes != 12345 {
+		t.Fatalf("aggregate limit did not reach atomic store: %d", msgs.lastCreateInput.MaxAttachmentBytes)
 	}
 }
 

@@ -43,6 +43,7 @@ import {
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
 import { ApiRequestError } from "../lib/api";
+import { randomId } from "../lib/randomId";
 import {
   normalizeBodyFormat,
   normalizeLinkSafety,
@@ -1208,6 +1209,7 @@ export function useMessages({
   const deletedMessageTombstonesRef = useRef<Map<string, string | null>>(new Map());
   const deletedMessageTombstoneTargetRef = useRef(`${kind}:${targetId}`);
   const pendingReactionTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingSendIdentityRef = useRef<{ signature: string; key: string } | null>(null);
   const onMessageRemovedRef = useRef(onMessageRemoved);
   useLayoutEffect(() => {
     onMessageRemovedRef.current = onMessageRemoved;
@@ -1499,7 +1501,22 @@ export function useMessages({
       dispatch({ type: "sending" });
 
       try {
-        const options = { parentMessageId, referencedMessageId, attachmentIds };
+        const signature = JSON.stringify({
+          target: sendKey,
+          body,
+          parentMessageId,
+          referencedMessageId,
+          attachmentIds: attachmentIds ?? [],
+        });
+        if (pendingSendIdentityRef.current?.signature !== signature) {
+          pendingSendIdentityRef.current = { signature, key: randomId() };
+        }
+        const options = {
+          parentMessageId,
+          referencedMessageId,
+          attachmentIds,
+          idempotencyKey: pendingSendIdentityRef.current.key,
+        };
         const sendFn =
           kind === "channel"
             ? () => postChannelMessage(targetId, body, options)
@@ -1508,6 +1525,7 @@ export function useMessages({
         const msg = await sendFn();
 
         if (stateRef.current.target !== sendKey) return { status: "stale" };
+        pendingSendIdentityRef.current = null;
         dispatch({ type: "sent", message: sanitizeTombstonedMessage(msg) });
         return { status: "sent" };
       } catch (err: unknown) {

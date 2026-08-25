@@ -79,7 +79,9 @@ func TestPGXMessageStoreCreateMessageAttachmentsPostgreSQL(t *testing.T) {
 			size_bytes        BIGINT NOT NULL DEFAULT 0,
 			status            TEXT NOT NULL,
 			preview_status    TEXT NOT NULL DEFAULT 'pending',
-			deleted_at        TIMESTAMPTZ
+			deleted_at        TIMESTAMPTZ,
+			draft_expires_at  TIMESTAMPTZ,
+			updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`); err != nil {
 		t.Fatalf("prepare files schema: %v", err)
 	}

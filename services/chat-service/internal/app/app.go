@@ -211,7 +211,8 @@ func New(cfg config.Config) (*App, error) {
 				WithPins(sidebarPinStore).
 				WithReadState(conversationReadStateStore).
 				WithNotificationPrefs(storage.NewPGXNotificationPrefStore(pool))
-			messageSvc = service.NewMessageService(channelStore, dmStore, messages)
+			messageSvc = service.NewMessageService(channelStore, dmStore, messages).
+				WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
 			// RF-21. Wired here, where the message service exists, and fatal:
 			// starting with the flag on and no gate would accept links nobody
 			// checked. A deployment without a database never reaches this block
@@ -235,7 +236,8 @@ func New(cfg config.Config) (*App, error) {
 		}
 	}
 
-	sidebar := httpapi.NewSidebarHandler(sidebarSvc)
+	sidebar := httpapi.NewSidebarHandler(sidebarSvc).
+		WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
 	messageHandler := httpapi.NewMessageHandler(workspaceStore, messageSvc, nil)
 	if mentionSvc != nil {
 		messageHandler = httpapi.NewMessageHandler(workspaceStore, messageSvc, mentionSvc)

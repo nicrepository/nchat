@@ -12,20 +12,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * upload to the send, and about the bytes never travelling twice.
  */
 
-const { mockFetchMentionCandidates, mockUploadLimit, mockUploadAttachment } = vi.hoisted(() => ({
-  mockFetchMentionCandidates: vi.fn(),
-  mockUploadLimit: vi.fn(),
-  mockUploadAttachment: vi.fn(),
-}));
+const { mockFetchMentionCandidates, mockUploadAttachment, mockDeleteAttachment } = vi.hoisted(
+  () => ({
+    mockFetchMentionCandidates: vi.fn(),
+    mockUploadAttachment: vi.fn(),
+    mockDeleteAttachment: vi.fn(),
+  }),
+);
 
 vi.mock("./chatApi", () => ({
   fetchMentionCandidates: (...args: unknown[]) => mockFetchMentionCandidates(...args),
-  fetchWorkspaceUploadLimit: () => mockUploadLimit(),
 }));
 
 vi.mock("./filesApi", async () => {
   const actual = await vi.importActual<typeof import("./filesApi")>("./filesApi");
-  return { ...actual, uploadAttachment: (...args: unknown[]) => mockUploadAttachment(...args) };
+  return {
+    ...actual,
+    uploadAttachment: (...args: unknown[]) => mockUploadAttachment(...args),
+    deleteAttachmentDraft: (...args: unknown[]) => mockDeleteAttachment(...args),
+  };
 });
 
 import ChatComposer from "./ChatComposer";
@@ -58,6 +63,11 @@ function renderComposer(
       placeholder="Mensagem..."
       onSend={onSend}
       uploadTarget={target}
+      attachmentLimits={{
+        maxUploadBytes: 8 * 1024 * 1024,
+        maxFiles: 10,
+        maxBytes: 512 * 1024 * 1024,
+      }}
     />,
   );
 }
@@ -93,8 +103,8 @@ async function fillEditor(text: string) {
 
 beforeEach(() => {
   mockFetchMentionCandidates.mockReset().mockResolvedValue([]);
-  mockUploadLimit.mockReset().mockResolvedValue(8 * 1024 * 1024);
   mockUploadAttachment.mockReset().mockResolvedValue(attachment);
+  mockDeleteAttachment.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -136,6 +146,7 @@ describe("composer attachment send", () => {
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
     expect(onSend).toHaveBeenCalledWith("", ["att-1"]);
+    expect(mockDeleteAttachment).not.toHaveBeenCalled();
     // The bytes went up when the file was chosen. Pressing Enviar links a
     // reference; it must never upload anything again.
     expect(mockUploadAttachment).toHaveBeenCalledTimes(1);
