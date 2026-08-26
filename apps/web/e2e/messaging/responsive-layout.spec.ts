@@ -101,6 +101,39 @@ async function openChannel(page: Page, testInfo: Parameters<typeof uniqueId>[0])
 }
 
 /**
+ * The same channel, with a conversation list far taller than any viewport.
+ *
+ * This is the shape that exposed the bug: enough rows that the sidebar's nav has
+ * to scroll internally, which is exactly when an unclipped descendant of it can
+ * grow the *document's* scroll area instead. The rows are real fixture channels,
+ * never a CSS trick — a list that had been shortened, or a nav switched to
+ * `overflow: hidden`, would make the assertion pass while proving nothing.
+ */
+async function openChannelWithLongSidebar(page: Page, testInfo: Parameters<typeof uniqueId>[0]) {
+  const targetId = uniqueId(testInfo, "long-sidebar");
+  const scenario = createScenario({
+    kind: "channel",
+    targetId,
+    targetName: LONG_NAME,
+    messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Primeira mensagem" })],
+  });
+  for (let index = 0; index < 40; index += 1) {
+    scenario.sidebarChannels.push({
+      id: `${targetId}-extra-${index}`,
+      slug: `canal-extra-${index}`,
+      display_name: `Canal de acompanhamento ${index}`,
+      type: "public",
+      can_write: true,
+      unread_count: 0,
+    });
+  }
+  await installMessagingMocks(page, scenario);
+  await page.goto(`/chat/channel/${targetId}`);
+  await expect(page.getByTestId("chat-msg-header")).toBeVisible();
+  return { scenario, targetId };
+}
+
+/**
  * The acceptance criterion "no global horizontal scrolling", asserted on the
  * document itself rather than on any one element: a bubble, a URL or an
  * attachment card that widened the page shows up here whatever produced it.
@@ -115,6 +148,67 @@ async function expectNoHorizontalScroll(page: Page) {
     );
   });
   expect(overflow).toBeLessThanOrEqual(1);
+}
+
+/**
+ * The document's own scroll geometry, plus where the shell actually sits in it.
+ *
+ * Reported as numbers rather than asserted in place because the failure this
+ * guards against is a band of empty page below a correctly sized shell — and
+ * the only way to tell that apart from a shell that is simply too short is to
+ * read both at once.
+ */
+async function readRootGeometry(page: Page) {
+  return page.evaluate(() => {
+    const root = document.documentElement;
+    const element = document.querySelector('[data-testid="chat-shell"]');
+    const rect = element?.getBoundingClientRect();
+    return {
+      scrollY: window.scrollY,
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+      shell: rect ? { top: rect.top, bottom: rect.bottom, height: rect.height } : null,
+    };
+  });
+}
+
+/**
+ * A chat route is a full-screen surface: the document under it never scrolls
+ * (issue #467 follow-up).
+ *
+ * Three facts, and all three are needed. `scrollY === 0` alone passes on a page
+ * that *can* scroll and merely happens to be at the top; `scrollHeight` alone
+ * passes on a shell that has drifted off the top of a document that fits. The
+ * shell's own edges are what prove the fix is geometry and not a hidden
+ * overflow painted over the symptom. One pixel of tolerance for sub-pixel
+ * layout rounding, nothing more.
+ */
+async function expectNoRootScroll(page: Page, label: string) {
+  const geometry = await readRootGeometry(page);
+  expect(geometry, label).toMatchObject({ scrollY: 0 });
+  expect(geometry.scrollHeight, `${label}: altura de rolagem do documento`).toBeLessThanOrEqual(
+    geometry.clientHeight + 1,
+  );
+  expect(geometry.shell, `${label}: shell ausente`).not.toBeNull();
+  expect(Math.abs(geometry.shell!.top), `${label}: topo do shell`).toBeLessThanOrEqual(1);
+  expect(
+    Math.abs(geometry.shell!.bottom - geometry.clientHeight),
+    `${label}: base do shell`,
+  ).toBeLessThanOrEqual(1);
+  return geometry;
+}
+
+/** The sidebar's scrollport — the container long conversation lists belong in. */
+async function readSidebarNav(page: Page) {
+  return page.evaluate(() => {
+    const nav = document.querySelector(".chat-sidebar__nav");
+    if (!nav) return null;
+    return {
+      clientHeight: nav.clientHeight,
+      scrollHeight: nav.scrollHeight,
+      scrollTop: nav.scrollTop,
+    };
+  });
 }
 
 const navToggle = (page: Page) => page.getByTestId("chat-nav-toggle");
@@ -272,6 +366,153 @@ test.describe("layout responsivo", () => {
     await expectNoHorizontalScroll(page);
   });
 
+  /**
+   * ISSUE #467 follow-up — the document under a chat route must not scroll.
+   *
+   * The defect these cover was a full-height shell sitting inside a document
+   * that was taller than the viewport, so the page scrolled the shell off the
+   * top and left a band of empty background below it.
+   */
+  test("lista longa de conversas rola na sidebar, nunca no documento", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openChannelWithLongSidebar(page, testInfo);
+
+    const geometry = await expectNoRootScroll(page, "sidebar longa");
+    const nav = await readSidebarNav(page);
+
+    // The point of the scenario: there IS more content than fits, and it is in
+    // the sidebar's own scrollport rather than in the document.
+    expect(nav).not.toBeNull();
+    expect(nav!.scrollHeight, "a nav precisa ter conteúdo excedente").toBeGreaterThan(
+      nav!.clientHeight,
+    );
+
+    // Scrolling the nav to its end moves the nav and nothing else.
+    await page.evaluate(() => {
+      const el = document.querySelector(".chat-sidebar__nav")!;
+      el.scrollTop = el.scrollHeight;
+    });
+    const scrolled = await readSidebarNav(page);
+    expect(scrolled!.scrollTop, "a nav precisa ter rolado").toBeGreaterThan(0);
+    await expectNoRootScroll(page, "sidebar rolada até o fim");
+
+    // Reported so a failure carries the real numbers, not just a boolean.
+    console.log(
+      `[#467] root scrollY=${geometry.scrollY} scrollHeight=${geometry.scrollHeight} ` +
+        `clientHeight=${geometry.clientHeight} shell=[${geometry.shell!.top}, ${geometry.shell!.bottom}] ` +
+        `nav client=${scrolled!.clientHeight} scroll=${scrolled!.scrollHeight} top=${scrolled!.scrollTop}`,
+    );
+  });
+
+  test("navegar, abrir detalhes e usar o composer não introduz rolagem no documento", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openChannelWithLongSidebar(page, testInfo);
+    await expectNoRootScroll(page, "carregado");
+
+    // A row near the end of a list taller than the viewport: reaching it is
+    // what used to scroll the document rather than the nav.
+    const lastRow = page.getByRole("option", { name: "Canal de acompanhamento 39" });
+    await lastRow.scrollIntoViewIfNeeded();
+    await expectNoRootScroll(page, "última linha da sidebar visível");
+
+    await lastRow.click();
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Canal de acompanhamento 39");
+    await expectNoRootScroll(page, "conversa selecionada");
+
+    await detailsToggle(page).click();
+    await expect(page.getByTestId("chat-conversation-details")).toBeVisible();
+    await expectNoRootScroll(page, "detalhes abertos");
+
+    await page.getByRole("button", { name: "Fechar detalhes do canal" }).click();
+    await expect(page.getByTestId("chat-conversation-details")).toBeHidden();
+    await expectNoRootScroll(page, "detalhes fechados");
+
+    // The footer is the bottom-most focusable thing in the sidebar; focusing it
+    // is the gesture most likely to ask the browser to scroll an ancestor.
+    await page.getByRole("link", { name: /Meu perfil/ }).focus();
+    await expectNoRootScroll(page, "rodapé focado");
+
+    await fillComposer(page, "mensagem digitada sem mover o documento");
+    await expectNoRootScroll(page, "composer em uso");
+  });
+
+  test("desktop → tablet → celular → desktop sem reload mantém o documento sem rolagem", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(WIDE);
+    await openChannelWithLongSidebar(page, testInfo);
+    await expectNoRootScroll(page, "desktop");
+
+    for (const [label, viewport] of [
+      ["tablet", TABLET],
+      ["celular", PHONE],
+      ["desktop de volta", WIDE],
+    ] as const) {
+      await page.setViewportSize(viewport);
+      await expect(page.getByTestId("chat-msg-header")).toBeVisible();
+      await expectNoRootScroll(page, label);
+    }
+  });
+
+  test("rolar o histórico move a lista de mensagens, não a janela", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const targetId = uniqueId(testInfo, "long-history");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: LONG_NAME,
+      messages: Array.from({ length: 60 }, (_, index) =>
+        makeMessage({
+          id: `${targetId}-m${index}`,
+          body_text: `Mensagem número ${index} do histórico longo desta conversa.`,
+        }),
+      ),
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-msg-header")).toBeVisible();
+
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(async () => list.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(0);
+
+    await list.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await list.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    expect(await list.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+    await expectNoRootScroll(page, "histórico rolado");
+  });
+
+  /**
+   * The lock is scoped to the shell, so leaving the chat has to give the
+   * document its ordinary scrolling back — otherwise a taller route silently
+   * loses its bottom half.
+   */
+  test("sair do chat devolve a rolagem normal ao documento", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openChannelWithLongSidebar(page, testInfo);
+    await expectNoRootScroll(page, "no chat");
+
+    await page.getByRole("link", { name: /Meu perfil/ }).click();
+    await expect(page).toHaveURL(/\/profile$/);
+    await expect(page.getByTestId("chat-shell")).toHaveCount(0);
+
+    const unlocked = await page.evaluate(() => ({
+      html: document.documentElement.classList.contains("chat-root-locked"),
+      body: document.body.classList.contains("chat-root-locked"),
+      overflowY: getComputedStyle(document.documentElement).overflowY,
+    }));
+    expect(unlocked).toEqual({ html: false, body: false, overflowY: "visible" });
+  });
+
   for (const viewport of VIEWPORT_MATRIX) {
     test(`${viewport.width}x${viewport.height}: sem rolagem horizontal com conteúdo longo, detalhes abertos e fechados`, async ({
       page,
@@ -283,14 +524,17 @@ test.describe("layout responsivo", () => {
       await expect(page.getByTestId("chat-msg-header")).toBeVisible();
       await expect(composer(page)).toBeVisible();
       await expectNoHorizontalScroll(page);
+      await expectNoRootScroll(page, "inicial");
 
       await detailsToggle(page).click();
       await expect(page.getByTestId("chat-conversation-details")).toBeVisible();
       await expectNoHorizontalScroll(page);
+      await expectNoRootScroll(page, "detalhes abertos");
 
       await page.getByRole("button", { name: "Fechar detalhes do canal" }).click();
       await expect(page.getByTestId("chat-conversation-details")).toBeHidden();
       await expectNoHorizontalScroll(page);
+      await expectNoRootScroll(page, "detalhes fechados");
     });
   }
 });
