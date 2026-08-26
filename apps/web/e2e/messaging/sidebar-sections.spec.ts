@@ -607,6 +607,18 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
 
     const settings = page.getByRole("link", { name: "Configurações" });
     await expect(settings).toBeVisible();
+    // The drawer slides in over 180ms, and its `visibility` flips on the very
+    // first frame — so the link is "visible" while the panel is still moving.
+    // boundingBox() does not wait for stability and the two reads below are two
+    // separate round-trips, which would sample the sidebar's edge earlier (and
+    // therefore further left) than the link's: an apparent overflow produced
+    // entirely by the animation. Waiting for the slide to settle is what makes
+    // both reads describe the same, final layout. Nothing about the assertion
+    // itself changes.
+    await page.waitForFunction(() => {
+      const drawer = document.querySelector('[data-testid="chat-sidebar"]');
+      return drawer !== null && getComputedStyle(drawer).transform === "none";
+    });
 
     // The settings control stays inside the sidebar instead of being pushed out.
     const sidebar = await page.getByTestId("chat-sidebar").boundingBox();
