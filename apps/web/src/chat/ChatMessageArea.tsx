@@ -31,7 +31,9 @@ import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
 
 import "./ChatMessageArea.css";
-import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
+import ActiveResourceCallBar, {
+  type ActiveResourceCallBarProps,
+} from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
@@ -285,49 +287,30 @@ function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
 /**
  * A channel/group-DM header's resource-call state (issue #622 round 2,
  * section 14). Discovery ("is there a call") is kept strictly separate from
- * participation ("am I in it") — neither ever depends on a participant
- * count, which this issue explicitly does not implement.
+ * participation ("am I in it").
  *
- * - none: no active call — "Chamada" starts one. `disabled` covers the
- *   pre-existing RF-23×RF-24 arbitration case where a direct call is busy
- *   before any resource call even exists yet — the action is unavailable,
- *   never hidden.
- * - active: a call exists. `disabled` is false when this user is free to
- *   join ("Chamada ativa" + enabled "Entrar na chamada") and true when they
- *   cannot right now — a direct call is active, or they are already in a
- *   DIFFERENT resource call — which shows the identical indicator with a
- *   disabled join button, never hidden.
- * - participating: this user is already in this exact call — nothing extra
- *   to show here; the floating/dedicated call surface already covers it.
+ * #657: The header only renders the "Chamada" start button.
+ * Once a call is active (or we are participating in one), the
+ * ActiveResourceCallBar takes over presentation completely, and
+ * the header suppresses its own call actions by receiving undefined.
  */
-export type ResourceCallHeaderState =
-  | { kind: "none"; onCall: () => void; disabled?: boolean }
-  | { kind: "active"; onJoin: () => void; disabled: boolean }
-  | { kind: "participating" };
+export type ResourceCallHeaderState = { onCall: () => void; disabled?: boolean };
 
 /**
- * RF-24 channel/group entry (issue #540 follow-up; states added by issue
- * #622 round 2). A resource room is one multiparty call, never separate
- * "audio" and "video" rooms, so there is a single action instead of RF-23's
- * two — camera and microphone are controls within the call, chosen once
- * inside ResourceCallPanel.
+ * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
+ * multiparty call, never separate "audio" and "video" rooms, so there is a
+ * single action instead of RF-23's two.
  */
 function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
-  if (state.kind === "participating") return null;
   return (
     <div className="chat-msg-area__call-actions" aria-label="Chamada">
-      {state.kind === "active" && (
-        <span className="chat-msg-area__call-status" data-testid="resource-call-status">
-          Chamada ativa
-        </span>
-      )}
       <button
         type="button"
-        aria-label={state.kind === "active" ? "Entrar na chamada" : "Iniciar chamada"}
-        onClick={state.kind === "active" ? state.onJoin : state.onCall}
+        aria-label="Iniciar chamada"
+        onClick={state.onCall}
         disabled={Boolean(state.disabled)}
       >
-        {state.kind === "active" ? "Entrar na chamada" : "Chamada"}
+        Chamada
       </button>
     </div>
   );
@@ -1444,33 +1427,23 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     resourceCallKind && targetId
       ? (ctx.isParticipatingIn?.(resourceCallKind, targetId) ?? false)
       : false;
+
+  // #657: Deduplicate the header. If there's an active call (or if we are
+  // participating), the header actions are completely suppressed (undefined)
+  // because the ActiveResourceCallBar takes over. The "Chamada" start button
+  // is preserved only when no call exists and we are not in one.
   const resourceCallHeaderState: ResourceCallHeaderState | undefined =
-    !resourceCallKind || !targetId
+    !resourceCallKind || !targetId || resourceCallExists || participatingHere
       ? undefined
-      : participatingHere
-        ? { kind: "participating" }
-        : resourceCallExists
-          ? {
-              kind: "active",
-              disabled: !ctx.joinResourceCall,
-              onJoin: () =>
-                ctx.joinResourceCall?.({
-                  kind: resourceCallKind,
-                  id: targetId,
-                  name: resolvedName,
-                  callId: discoveredResourceCall.call_id,
-                }),
-            }
-          : {
-              kind: "none",
-              disabled: !ctx.joinResourceCall,
-              onCall: () =>
-                ctx.joinResourceCall?.({
-                  kind: resourceCallKind,
-                  id: targetId,
-                  name: resolvedName,
-                }),
-            };
+      : {
+          disabled: !ctx.joinResourceCall,
+          onCall: () =>
+            ctx.joinResourceCall?.({
+              kind: resourceCallKind,
+              id: targetId,
+              name: resolvedName,
+            }),
+        };
 
   // #642: channel keeps the "#" prefix already used everywhere else in this
   // header; a group DM has no channel-style handle, so it uses the bare
@@ -1480,9 +1453,52 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // useResourceCallSession.join()'s own hardcoded "audio"), so "Chamada de
   // voz" is a real invariant here, not a hardcoded guess.
   const activeResourceCallBarTitle =
-    resourceCallKind === "channel"
-      ? `Chamada de voz — #${resolvedName}`
-      : `Chamada de voz — ${resolvedName}`;
+    detailsKind === "group"
+      ? `Chamada de voz — ${resolvedName}`
+      : `Chamada de voz — #${resolvedName}`;
+
+  let activeResourceCallBarProps: ActiveResourceCallBarProps | null = null;
+  if (resourceCallExists) {
+    if (participatingHere && ctx.resourceCallSession) {
+      activeResourceCallBarProps = {
+        mode: "participating-local",
+        title: activeResourceCallBarTitle,
+        startedAt: discoveredResourceCall.created_at,
+        participants: ctx.resourceCallSession.participants,
+        localId: ctx.resourceCallSession.localId,
+        localName: ctx.resourceCallSession.localName,
+        localInitials: ctx.resourceCallSession.localInitials,
+        localAvatarUrl: ctx.resourceCallSession.localAvatarUrl,
+        activeSpeakerId: ctx.resourceCallSession.activeSpeakerId,
+        microphoneEnabled: ctx.resourceCallSession.microphoneEnabled,
+        microphonePending: ctx.resourceCallSession.microphonePending,
+        onToggleMicrophone: ctx.resourceCallSession.onToggleMicrophone,
+        onLeave: ctx.resourceCallSession.onLeave,
+        onOpenFullCall: ctx.resourceCallSession.onOpenFullCall,
+      };
+    } else if (participatingHere) {
+      activeResourceCallBarProps = {
+        mode: "participating-info",
+        title: activeResourceCallBarTitle,
+        startedAt: discoveredResourceCall.created_at,
+      };
+    } else {
+      // Not participating, but discovery shows an active call.
+      activeResourceCallBarProps = {
+        mode: "available",
+        title: activeResourceCallBarTitle,
+        startedAt: discoveredResourceCall.created_at,
+        joinDisabled: !ctx.joinResourceCall,
+        onJoin: () =>
+          ctx.joinResourceCall?.({
+            kind: resourceCallKind!,
+            id: targetId,
+            name: resolvedName,
+            callId: discoveredResourceCall.call_id,
+          }),
+      };
+    }
+  }
 
   return (
     <div
@@ -1532,32 +1548,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         )}
 
         {/*
-          #642 (review fix): ctx.resourceCallSession is present only once
-          CallSessionProvider's own resourcePresentationCall authority has
-          proven a call_id match against discovery — never re-derived here
-          from a second, independent discoveredResourceCall lookup, which
-          could momentarily disagree during the exact window blocker 2
-          exists to close. participatingHere still proves this is the SAME
-          target the route is showing, never a different one this tab also
-          happens to participate in.
+          #657: The bar is shown based on discovery (available) or participation
+          (participating-local or participating-info).
         */}
-        {participatingHere && ctx.resourceCallSession && (
-          <ActiveResourceCallBar
-            title={activeResourceCallBarTitle}
-            startedAt={ctx.resourceCallSession.startedAt}
-            participants={ctx.resourceCallSession.participants}
-            localId={ctx.resourceCallSession.localId}
-            localName={ctx.resourceCallSession.localName}
-            localInitials={ctx.resourceCallSession.localInitials}
-            localAvatarUrl={ctx.resourceCallSession.localAvatarUrl}
-            activeSpeakerId={ctx.resourceCallSession.activeSpeakerId}
-            microphoneEnabled={ctx.resourceCallSession.microphoneEnabled}
-            microphonePending={ctx.resourceCallSession.microphonePending}
-            onToggleMicrophone={ctx.resourceCallSession.onToggleMicrophone}
-            onLeave={ctx.resourceCallSession.onLeave}
-            onOpenFullCall={ctx.resourceCallSession.onOpenFullCall}
-          />
-        )}
+        {activeResourceCallBarProps && <ActiveResourceCallBar {...activeResourceCallBarProps} />}
 
         <PinnedBar pin={latestPin} onUnpin={togglePin} />
 

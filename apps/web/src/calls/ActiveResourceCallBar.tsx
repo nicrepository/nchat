@@ -9,10 +9,23 @@ export interface ActiveResourceCallBarParticipant {
   displayName: string;
 }
 
-interface ActiveResourceCallBarProps {
+// ── Discriminated union: every mode carries exactly its valid fields ─────────
+
+interface BarBase {
   title: string;
   /** Authoritative call-start instant (Call.created_at) — never Date.now() at mount. */
   startedAt: string;
+}
+
+export interface BarAvailable extends BarBase {
+  mode: "available";
+  /** True while lifecycle/arbitration forbids joining (e.g. direct call busy). */
+  joinDisabled: boolean;
+  onJoin: () => void;
+}
+
+export interface BarParticipatingLocal extends BarBase {
+  mode: "participating-local";
   /** Remote participants only; the local user is added internally. */
   participants: ActiveResourceCallBarParticipant[];
   localId: string;
@@ -27,6 +40,15 @@ interface ActiveResourceCallBarProps {
   onOpenFullCall: () => void;
 }
 
+export interface BarParticipatingInfo extends BarBase {
+  mode: "participating-info";
+}
+
+export type ActiveResourceCallBarProps =
+  | BarAvailable
+  | BarParticipatingLocal
+  | BarParticipatingInfo;
+
 const MAX_VISIBLE_AVATARS = 3;
 
 function formatElapsed(elapsedMs: number): string {
@@ -40,34 +62,114 @@ function formatElapsed(elapsedMs: number): string {
 }
 
 /**
- * Persistent, compact "you're in this call" bar for a channel/group-DM view
- * (issue #642) — the `.voicebanner` concept from
- * prototype/claude-design-v1/nic-chat/chamada.html. Presentation only: no
- * lifecycle beyond the elapsed-time tick, no owned mute state — every control
- * calls back into the authoritative CallSessionProvider-derived callbacks the
- * caller supplies.
+ * Persistent, compact call-status bar for a channel/group-DM view (issue #642,
+ * updated by issue #657). Renders in three modes:
+ *
+ * - **available**: an active call exists but this user is NOT in it. Shows
+ *   title, timer, and a "Entrar na chamada" button. Never shows fake
+ *   participant counts or avatars.
+ *
+ * - **participating-local**: this user is in the call AND the local session
+ *   (resourcePresentationCall) is ready. Shows roster, active speaker, mute,
+ *   leave, and open-full-call. FloatingCallWindow coexists — this bar never
+ *   replaces it.
+ *
+ * - **participating-info**: this user is in the call but the local session is
+ *   not ready (connecting, reconnecting, error, remote ownership). Shows
+ *   title and timer only — no controls, no join button. The actual call
+ *   surface (FloatingCallWindow / GlobalCallIndicator) handles the
+ *   operational state.
+ *
+ * Presentation only: no lifecycle beyond the elapsed-time tick, no owned mute
+ * state — every control calls back into the authoritative CallSessionProvider-
+ * derived callbacks the caller supplies.
  */
-export default function ActiveResourceCallBar({
-  title,
-  startedAt,
-  participants,
-  localId,
-  localName,
-  localInitials,
-  localAvatarUrl,
-  activeSpeakerId,
-  microphoneEnabled,
-  microphonePending,
-  onToggleMicrophone,
-  onLeave,
-  onOpenFullCall,
-}: ActiveResourceCallBarProps) {
+export default function ActiveResourceCallBar(props: ActiveResourceCallBarProps) {
+  const { title, startedAt, mode } = props;
   const startedAtMs = Date.parse(startedAt);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
+
+  const elapsed = formatElapsed(now - startedAtMs);
+
+  if (mode === "available") {
+    return (
+      <div
+        className="voicebanner"
+        data-testid="active-resource-call-bar"
+        role="group"
+        aria-label="Chamada ativa"
+      >
+        <div className="voicebanner__open voicebanner__open--info">
+          <span className="voicebanner__icon" aria-hidden="true">
+            <span className="material-symbols-outlined">headphones</span>
+          </span>
+          <span className="voicebanner__info">
+            <span className="voicebanner__title">{title}</span>
+            <span className="voicebanner__meta">
+              <span className="voicebanner__dot" aria-hidden="true" />
+              <span>{elapsed}</span>
+            </span>
+          </span>
+        </div>
+        <div className="voicebanner__controls">
+          <button
+            type="button"
+            className="voicebanner__btn voicebanner__btn--join"
+            disabled={props.joinDisabled}
+            onClick={props.onJoin}
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              call
+            </span>
+            Entrar na chamada
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (mode === "participating-info") {
+    return (
+      <div
+        className="voicebanner"
+        data-testid="active-resource-call-bar"
+        role="group"
+        aria-label="Chamada ativa"
+      >
+        <div className="voicebanner__open voicebanner__open--info">
+          <span className="voicebanner__icon" aria-hidden="true">
+            <span className="material-symbols-outlined">headphones</span>
+          </span>
+          <span className="voicebanner__info">
+            <span className="voicebanner__title">{title}</span>
+            <span className="voicebanner__meta">
+              <span className="voicebanner__dot" aria-hidden="true" />
+              <span>{elapsed}</span>
+            </span>
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // mode === "participating-local"
+  const {
+    participants,
+    localId,
+    localName,
+    localInitials,
+    localAvatarUrl,
+    activeSpeakerId,
+    microphoneEnabled,
+    microphonePending,
+    onToggleMicrophone,
+    onLeave,
+    onOpenFullCall,
+  } = props;
 
   const participantCount = Math.max(1, participants.length + 1);
   const stack = [
@@ -102,7 +204,6 @@ export default function ActiveResourceCallBar({
   const overflow = stack.length - visible.length;
   const speaking = stack.find((entry) => entry.id === activeSpeakerId);
 
-  const elapsed = formatElapsed(now - startedAtMs);
   const participantCountLabel = `${participantCount} participante${participantCount === 1 ? "" : "s"}`;
   // The visual meta line is a plain (non-live) span — never announced
   // proactively — but duration/count must still be DISCOVERABLE without

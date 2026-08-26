@@ -106,7 +106,7 @@ export interface ChatOutletContext {
    * abort this brand-new attempt before it registers.
    */
   joinResourceCall?: (target: ResourceCallTarget) => void;
-  /** Present only while participating in a resource call with local ownership (issue #642). */
+  /** Present only while participating in a resource call with local ownership (issue #642/#657). */
   resourceCallSession?: ActiveResourceCallSession;
 }
 
@@ -355,15 +355,11 @@ export default function ChatShell() {
     closeNav();
   }
 
-  // #642 (review fix): gated on resourcePresentationCall alone — the single
-  // authority CallSessionProvider also uses to suppress its own
-  // FloatingCallWindow — never a looser, independently-recomputed check.
-  // Never undefined -> present the instant discovery/resource/media catch
-  // up out of a connecting/reconnecting/error/leaving state, and never
-  // present a frame earlier: that authority already accounts for a stale
-  // discovery call_id (call.admitted/call.accepted have no ordering
-  // guarantee) and for the "leaving" participation phase clearing
-  // synchronously, before the leave's own server round trip resolves.
+  // #657 fix (was #642 review fix): gated on resourcePresentationCall —
+  // the authority for whether the bar's local-control mode is safe.
+  // FloatingCallWindow is ALWAYS shown alongside it; this bar never
+  // replaces it. Undefined -> present the instant discovery/resource/media
+  // catch up, and never present a frame earlier.
   const resourceCallSession: ActiveResourceCallSession | undefined = resourcePresentationCall
     ? {
         callId: resourcePresentationCall.call_id,
