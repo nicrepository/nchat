@@ -462,6 +462,68 @@ test.describe("chamada 1:1", () => {
     await end.press("Enter");
     await expectCommandCount(page, "call.end", 1);
   });
+
+  // ── issue #673: icon call controls + persistent direct call bar ──────────
+
+  test("cabeçalho da DM não exibe mais texto 'Áudio'/'Vídeo' — apenas icon buttons acessíveis", async ({
+    page,
+  }, testInfo) => {
+    await openCallConversation(page, testInfo, "E2E Participante");
+
+    await expect(page.getByRole("button", { name: "Iniciar chamada de áudio" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Iniciar chamada de vídeo" })).toBeVisible();
+    await expect(page.getByText("Áudio", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Vídeo", { exact: true })).toHaveCount(0);
+  });
+
+  test("nunca exibe a barra persistente enquanto a chamada está apenas ringing — IncomingCallPopup segue sendo a única superfície", async ({
+    page,
+  }, testInfo) => {
+    const call = await openCallConversation(page, testInfo, "E2E Participante");
+
+    await emitCallEvent(page, callEvent(call, "ringing", 1));
+
+    await expect(page.getByRole("dialog", { name: "Chamada recebida" })).toBeVisible();
+    await expect(page.getByTestId("active-direct-call-bar")).toHaveCount(0);
+  });
+
+  test("mantém apenas a superfície de ativação — nunca a barra persistente — antes da mídia conectar, e limpa tudo ao encerrar", async ({
+    page,
+  }, testInfo) => {
+    const participantName = "E2E Participante";
+    const call = await openCallConversation(page, testInfo, participantName);
+
+    // Pushed directly as "active" (never locally accepted in this tab) —
+    // the exact shape of a call restored by reload/reconnect/call.sync, same
+    // as the RF-23 activation tests above.
+    await emitCallEvent(page, callEvent(call, "active", 1));
+
+    const floating = page.getByLabel(`Chamada com ${participantName}`);
+    await expect(floating).toBeVisible();
+    await expect(
+      floating.getByRole("button", { name: "Permitir câmera e microfone" }),
+    ).toBeVisible();
+    // directPresentationCall (issue #673) requires a genuinely connected
+    // local media session — this E2E project has no real LiveKit/media-
+    // service to reach that state deterministically (see
+    // call-floating-handoff.spec.ts's own file header for the same
+    // constraint). This asserts the always-true half of the invariant that
+    // IS deterministic here: an active-but-not-yet-connected call must never
+    // show the persistent bar, only ringing→active is not enough on its own.
+    await expect(page.getByTestId("active-direct-call-bar")).toHaveCount(0);
+
+    await floating.getByRole("button", { name: "Encerrar chamada" }).click();
+    await expectCommandCount(page, "call.end", 1);
+
+    await emitCallEvent(page, callEvent(call, "ended", 2));
+
+    await expect(floating).toHaveCount(0);
+    await expect(page.getByTestId("active-direct-call-bar")).toHaveCount(0);
+    // Cleanup: the header's own call actions return once the call is gone —
+    // never left disabled/stale from the ended call.
+    await expect(page.getByRole("button", { name: "Iniciar chamada de áudio" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Iniciar chamada de vídeo" })).toBeVisible();
+  });
 });
 
 test.describe("permissões de mídia (RF-23)", () => {

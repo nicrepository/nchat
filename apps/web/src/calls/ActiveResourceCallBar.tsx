@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
-
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
 import { PersonAvatarImage } from "../chat/PersonAvatarImage";
+import { useElapsedLabel } from "./callBarTiming";
 import "./CallPresentation.css";
 
 export interface ActiveResourceCallBarParticipant {
@@ -51,16 +50,6 @@ export type ActiveResourceCallBarProps =
 
 const MAX_VISIBLE_AVATARS = 3;
 
-function formatElapsed(elapsedMs: number): string {
-  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const mm = String(minutes).padStart(2, "0");
-  const ss = String(seconds).padStart(2, "0");
-  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
-}
-
 /**
  * Persistent, compact call-status bar for a channel/group-DM view (issue #642,
  * updated by issue #657). Renders in three modes:
@@ -86,14 +75,7 @@ function formatElapsed(elapsedMs: number): string {
  */
 export default function ActiveResourceCallBar(props: ActiveResourceCallBarProps) {
   const { title, startedAt, mode } = props;
-  const startedAtMs = Date.parse(startedAt);
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const elapsed = formatElapsed(now - startedAtMs);
+  const elapsed = useElapsedLabel(startedAt);
 
   if (mode === "available") {
     return (

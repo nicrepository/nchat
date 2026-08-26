@@ -12,7 +12,11 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
 
-import type { ActiveResourceCallSession, ChatOutletContext } from "./ChatShell";
+import type {
+  ActiveDirectCallSession,
+  ActiveResourceCallSession,
+  ChatOutletContext,
+} from "./ChatShell";
 import type { Call } from "./callState";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1800,6 +1804,441 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
     ).not.toBeInTheDocument();
     expect(within(bar).queryByRole("button", { name: /Mutar/ })).not.toBeInTheDocument();
     expect(within(bar).queryByRole("button", { name: /Sair/ })).not.toBeInTheDocument();
+  });
+});
+
+// ── #673: icon call controls (channel/group + DM) ───────────────────────────
+
+describe("ChatMessageArea — #673 icon call controls", () => {
+  it("channel header: no visible 'Chamada' text, an accessible icon button preserves the join callback", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => null,
+                  isParticipatingIn: () => false,
+                  joinResourceCall: () => onCall(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).queryByText("Chamada")).not.toBeInTheDocument();
+    const button = within(header).getByRole("button", { name: "Iniciar chamada" });
+    expect(button.tagName).toBe("BUTTON");
+    fireEvent.click(button);
+    expect(onCall).toHaveBeenCalledOnce();
+  });
+
+  it("DM header: no visible 'Áudio'/'Vídeo' text, two separate icon buttons each fire only their own call type", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const startCall = vi.fn(() => true);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-1",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [],
+                      counterpart: { userId: "user-jl", displayName: "Juliane" },
+                    },
+                  ],
+                  startCall,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).queryByText("Áudio")).not.toBeInTheDocument();
+    expect(within(header).queryByText("Vídeo")).not.toBeInTheDocument();
+
+    const audioBtn = within(header).getByRole("button", { name: "Iniciar chamada de áudio" });
+    const videoBtn = within(header).getByRole("button", { name: "Iniciar chamada de vídeo" });
+    expect(audioBtn.tagName).toBe("BUTTON");
+    expect(videoBtn.tagName).toBe("BUTTON");
+
+    fireEvent.click(audioBtn);
+    expect(startCall).toHaveBeenNthCalledWith(1, "user-jl", "audio");
+    fireEvent.click(videoBtn);
+    expect(startCall).toHaveBeenNthCalledWith(2, "user-jl", "video");
+    expect(startCall).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── #673: active direct 1:1 call bar ────────────────────────────────────────
+
+function directCallSession(overrides: Partial<ActiveDirectCallSession> = {}) {
+  const session: ActiveDirectCallSession = {
+    callId: "direct-call-1",
+    startedAt: "2024-01-01T12:00:00.000Z",
+    callType: "audio",
+    peerUserId: "user-jl",
+    microphoneEnabled: true,
+    microphonePending: false,
+    onToggleMicrophone: vi.fn(),
+    onLeave: vi.fn(),
+    onOpenFullCall: vi.fn(),
+    ...overrides,
+  };
+  return session;
+}
+
+const directDM = {
+  id: "dm-1",
+  type: "1:1" as const,
+  name: "Juliane",
+  participants: [],
+  counterpart: { userId: "user-jl", displayName: "Juliane Lino", avatarUrl: "/avatar.png" },
+};
+
+describe("ChatMessageArea — #673 active direct call bar", () => {
+  it("shows the bar for an active direct call matching this DM's own counterpart", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — Juliane Lino");
+
+    // The header suppresses its own call actions once the bar takes over.
+    const header = screen.getByTestId("chat-msg-header");
+    expect(
+      within(header).queryByRole("button", { name: /Iniciar chamada/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows "Chamada de vídeo" for a video call type', async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ callType: "video" }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    expect(bar).toHaveTextContent("Chamada de vídeo — Juliane Lino");
+  });
+
+  it("never shows the bar for a DIFFERENT open DM, even when a direct call session is present", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-other"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [
+                    directDM,
+                    {
+                      id: "dm-other",
+                      type: "1:1" as const,
+                      name: "Outra Pessoa",
+                      participants: [],
+                      counterpart: { userId: "user-other", displayName: "Outra Pessoa" },
+                    },
+                  ],
+                  // The session's peerUserId ("user-jl") does not match this
+                  // DM's own counterpart ("user-other") — a call belonging
+                  // to a different 1:1 must never render here.
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("never shows the bar for a group DM, even if a directCallSession is somehow present", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("never shows the bar for a channel, even if a directCallSession is somehow present", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("shows no bar when directCallSession is absent (e.g. only ringing — IncomingCallPopup owns that surface)", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: undefined,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("wires the bar's leave button to ctx.directCallSession.onLeave", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onLeave = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ onLeave }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: /Sair/ }));
+    expect(onLeave).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's mute button to ctx.directCallSession.onToggleMicrophone and reflects the real mic state", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onToggleMicrophone = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({
+                    onToggleMicrophone,
+                    microphoneEnabled: false,
+                  }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    const muteButton = within(bar).getByRole("button", { name: "Ativar microfone" });
+    fireEvent.click(muteButton);
+    expect(onToggleMicrophone).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's main area to ctx.directCallSession.onOpenFullCall", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onOpenFullCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ onOpenFullCall }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: /Abrir chamada/ }));
+    expect(onOpenFullCall).toHaveBeenCalledOnce();
+  });
+
+  it("re-render/navigation away and back reuses the same bar — never duplicated", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("active-direct-call-bar");
+
+    rerender(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByTestId("active-direct-call-bar")).toHaveLength(1);
   });
 });
 
