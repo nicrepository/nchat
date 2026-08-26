@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Target SHA to rebuild and deploy'
+        description: "Target SHA to rebuild and deploy"
         required: true
         type: string
 
