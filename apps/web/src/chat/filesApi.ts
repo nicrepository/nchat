@@ -144,6 +144,16 @@ export async function fetchDocumentPreviewPage(
   );
 }
 
+export async function regenerateDocumentPreview(
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/document-preview/regenerate`,
+    { method: "POST", signal },
+  );
+}
+
 /**
  * A spreadsheet/CSV preview's one bounded page (task #494's sheet phase) —
  * the server's own sheetPreview shape, never arbitrary JSON. Cell values are

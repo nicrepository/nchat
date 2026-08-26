@@ -40,7 +40,7 @@ import DocumentPreviewViewer from "./DocumentPreviewViewer";
 import { isImageAttachment } from "./attachmentImageRules";
 import { fetchAttachmentContent } from "./filesApi";
 import { formatFileSize } from "./conversationDetailsDisplay";
-import type { ChannelAttachment } from "./chatTypes";
+import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
 
 /** Same mapping the details panel uses, kept local so neither owns the other. */
 function fileIconFor(contentType: string): string {
@@ -222,7 +222,7 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
         </div>
         {attachment.status === "clean" && (
           <div className="chat-msg-area__attachment-actions">
-            {attachment.previewStatus === "ready" && (
+            {isPreviewAvailable(attachment.previewStatus) && (
               <button
                 type="button"
                 className="chat-msg-area__attachment-action"

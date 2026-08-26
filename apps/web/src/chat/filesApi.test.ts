@@ -65,13 +65,13 @@ describe("fetchChannelAttachments", () => {
       contentType: "application/pdf",
       size: 2048,
       status: "clean",
-      previewStatus: "ready",
+      previewStatus: "available",
       createdAt: "2026-07-15T12:00:00Z",
     });
     expect(attachments[1].status).toBe("rejected");
     // A server that publishes no preview state at all is read as "there is
     // none", never as one the UI could try to load.
-    expect(attachments[1].previewStatus).toBe("unsupported");
+    expect(attachments[1].previewStatus).toBe("blocked");
   });
 
   it("keeps every preview state the contract defines and refuses the rest", async () => {
@@ -82,6 +82,9 @@ describe("fetchChannelAttachments", () => {
           { id: "a-2", previewStatus: "ready" },
           { id: "a-3", previewStatus: "failed" },
           { id: "a-4", previewStatus: "unsupported" },
+          { id: "a-8", previewStatus: "scanning" },
+          { id: "a-9", previewStatus: "generating" },
+          { id: "a-10", previewStatus: "expired" },
           { id: "a-5", previewStatus: "READY" },
           { id: "a-6", previewStatus: 7 },
           { id: "a-7" },
@@ -93,14 +96,17 @@ describe("fetchChannelAttachments", () => {
 
     expect(attachments.map((item) => item.previewStatus)).toEqual([
       "pending",
-      "ready",
+      "available",
       "failed",
-      "unsupported",
+      "blocked",
+      "scanning",
+      "generating",
+      "expired",
       // Anything outside the closed set falls back to the icon, never to a
       // preview the client would then fail to load.
-      "unsupported",
-      "unsupported",
-      "unsupported",
+      "blocked",
+      "blocked",
+      "blocked",
     ]);
   });
 

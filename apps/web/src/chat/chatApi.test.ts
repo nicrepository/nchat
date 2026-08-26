@@ -1943,7 +1943,7 @@ describe("message attachments", () => {
         contentType: "application/pdf",
         size: 2048,
         status: "clean",
-        previewStatus: "ready",
+        previewStatus: "available",
         createdAt: "",
       },
     ]);
@@ -1960,7 +1960,7 @@ describe("message attachments", () => {
     const message = await postChannelMessage("geral", "veja");
     expect(message.attachments?.[0]).toMatchObject({
       status: "pending_scan",
-      previewStatus: "unsupported",
+      previewStatus: "blocked",
     });
   });
 

@@ -46,11 +46,11 @@
  * (image or table) in DocumentPreviewViewer.
  */
 
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
-import { fetchDocumentPreviewPage } from "./filesApi";
-import type { ChannelAttachment } from "./chatTypes";
+import { fetchDocumentPreviewPage, regenerateDocumentPreview } from "./filesApi";
+import { isPreviewAvailable, isPreviewPending, type ChannelAttachment } from "./chatTypes";
 
 /**
  * Module-scoped so its identity is stable across renders — useAttachmentBlobUrl
@@ -99,19 +99,46 @@ export default function AttachmentDocumentPreview({
   // useAttachmentBlobUrl never fetches, and the early return below (after
   // every hook has run) is what actually keeps this component from
   // rendering anything for it. See the module comment.
-  const eligible = isImageDocument && attachment.previewStatus === "ready";
+  const eligible = isImageDocument && isPreviewAvailable(attachment.previewStatus);
+  const [regenerating, setRegenerating] = useState(false);
+  const expiredAttempted = useRef(false);
+  useEffect(() => {
+    if (attachment.previewStatus !== "expired" || expiredAttempted.current) return;
+    expiredAttempted.current = true;
+    setRegenerating(true);
+    void regenerateDocumentPreview(attachment.id).catch(() => setRegenerating(false));
+  }, [attachment.id, attachment.previewStatus]);
   const { url, failed, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
     eligible,
     firstDocumentPreviewPage,
   );
 
-  if (!isImageDocument) {
-    return null;
+  if (
+    isPreviewPending(attachment.previewStatus) ||
+    attachment.previewStatus === "expired" ||
+    regenerating
+  ) {
+    return <Skeleton attachmentId={attachment.id} />;
   }
 
-  if (attachment.previewStatus === "pending") {
-    return <Skeleton attachmentId={attachment.id} />;
+  if (attachment.previewStatus === "failed") {
+    return (
+      <button
+        type="button"
+        className="chat-msg-area__attachment-action"
+        onClick={() => {
+          setRegenerating(true);
+          void regenerateDocumentPreview(attachment.id).catch(() => setRegenerating(false));
+        }}
+      >
+        Tentar novamente
+      </button>
+    );
+  }
+
+  if (!isImageDocument) {
+    return null;
   }
 
   if (!eligible) {

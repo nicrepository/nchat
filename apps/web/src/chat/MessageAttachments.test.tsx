@@ -11,14 +11,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * is a separate obligation and the one a user actually sees.
  */
 
-const { mockPreview, mockContent, mockDocumentManifest, mockDocumentPage, mockDocumentSheet } =
-  vi.hoisted(() => ({
-    mockPreview: vi.fn(),
-    mockContent: vi.fn(),
-    mockDocumentManifest: vi.fn(),
-    mockDocumentPage: vi.fn(),
-    mockDocumentSheet: vi.fn(),
-  }));
+const {
+  mockPreview,
+  mockContent,
+  mockDocumentManifest,
+  mockDocumentPage,
+  mockDocumentSheet,
+  mockRegenerate,
+} = vi.hoisted(() => ({
+  mockPreview: vi.fn(),
+  mockContent: vi.fn(),
+  mockDocumentManifest: vi.fn(),
+  mockDocumentPage: vi.fn(),
+  mockDocumentSheet: vi.fn(),
+  mockRegenerate: vi.fn(),
+}));
 
 vi.mock("./filesApi", () => ({
   fetchAttachmentPreview: (...args: unknown[]) => mockPreview(...args),
@@ -26,6 +33,7 @@ vi.mock("./filesApi", () => ({
   fetchDocumentPreviewManifest: (...args: unknown[]) => mockDocumentManifest(...args),
   fetchDocumentPreviewPage: (...args: unknown[]) => mockDocumentPage(...args),
   fetchDocumentPreviewSheet: (...args: unknown[]) => mockDocumentSheet(...args),
+  regenerateDocumentPreview: (...args: unknown[]) => mockRegenerate(...args),
 }));
 
 import MessageAttachments from "./MessageAttachments";
@@ -63,6 +71,7 @@ beforeEach(() => {
     truncatedColumns: false,
     totalRowsRead: 1,
   });
+  mockRegenerate.mockReset().mockResolvedValue(undefined);
 });
 
 describe("message attachments — document viewer", () => {
@@ -151,14 +160,20 @@ describe("message attachments — document viewer", () => {
     await user.click(trigger);
 
     const dialog = await screen.findByRole("dialog", { name: "planilha.csv" });
-    await waitFor(() => expect(mockDocumentSheet).toHaveBeenCalledWith("att-1", 1, expect.any(AbortSignal)));
+    await waitFor(() =>
+      expect(mockDocumentSheet).toHaveBeenCalledWith("att-1", 1, expect.any(AbortSignal)),
+    );
     expect(mockDocumentPage).not.toHaveBeenCalled();
 
     expect(within(dialog).getByRole("cell", { name: "1" })).toBeInTheDocument();
     expect(within(dialog).getByRole("columnheader", { name: "A" })).toBeInTheDocument();
     expect(within(dialog).getByText(/500/)).toBeInTheDocument();
-    expect(within(dialog).queryByRole("button", { name: "Página anterior" })).not.toBeInTheDocument();
-    expect(within(dialog).queryByRole("button", { name: "Próxima página" })).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Página anterior" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Próxima página" }),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -215,9 +230,7 @@ describe("message attachments", () => {
     // A blocked file's content is never fetched, preview included — nothing
     // authorized to show and nothing requested.
     expect(mockDocumentPage).not.toHaveBeenCalled();
-    expect(
-      screen.queryByTestId("chat-message-attachment-document-att-1"),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-message-attachment-document-att-1")).not.toBeInTheDocument();
     expect(
       screen.queryByTestId("chat-message-attachment-document-loading-att-1"),
     ).not.toBeInTheDocument();
@@ -240,18 +253,36 @@ describe("message attachments", () => {
     expect(mockDocumentPage).not.toHaveBeenCalled();
   });
 
-  it("falls back to a plain note when a pdf's preview failed or is unsupported", () => {
+  it("offers retry when a pdf preview failed", () => {
     render(
       <MessageAttachments
         attachments={[attachment({ status: "clean", previewStatus: "failed" })]}
       />,
     );
 
-    expect(screen.getByText("Pré-visualização indisponível.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Tentar novamente" })).toBeInTheDocument();
     expect(mockDocumentPage).not.toHaveBeenCalled();
     // The file itself is still downloadable — only its preview gave up.
     expect(downloadButton()).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Visualizar relatorio.pdf" })).toBeNull();
+  });
+
+  it("regenerates an expired preview exactly once while keeping the skeleton", async () => {
+    const { rerender } = render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "expired" })]}
+      />,
+    );
+    await waitFor(() => expect(mockRegenerate).toHaveBeenCalledTimes(1));
+    expect(
+      screen.getByRole("status", { name: "Carregando pré-visualização…" }),
+    ).toBeInTheDocument();
+    rerender(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "expired" })]}
+      />,
+    );
+    expect(mockRegenerate).toHaveBeenCalledTimes(1);
   });
 
   it("shows the pdf's first-page preview, filename, size and both actions once ready", async () => {
@@ -308,7 +339,9 @@ describe("message attachments", () => {
     // stands in for "a type that is genuinely never a document".
     const audio = (overrides: Partial<ChannelAttachment> = {}) =>
       attachment({ filename: "audio.mp3", contentType: "audio/mpeg", ...overrides });
-    const { rerender } = render(<MessageAttachments attachments={[audio({ previewStatus: "ready" })]} />);
+    const { rerender } = render(
+      <MessageAttachments attachments={[audio({ previewStatus: "ready" })]} />,
+    );
     // pending_scan + ready preview: still nothing, because the scan decides.
     expect(mockPreview).not.toHaveBeenCalled();
 
