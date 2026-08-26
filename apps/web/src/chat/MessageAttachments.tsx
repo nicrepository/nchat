@@ -35,6 +35,7 @@ import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./Attac
 import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
+import DocumentPreviewViewer from "./DocumentPreviewViewer";
 import { isImageAttachment } from "./attachmentImageRules";
 import { fetchAttachmentContent } from "./filesApi";
 import { formatFileSize } from "./conversationDetailsDisplay";
@@ -48,6 +49,19 @@ function fileIconFor(contentType: string): string {
   if (contentType === "application/pdf") return "picture_as_pdf";
   if (contentType.startsWith("text/")) return "description";
   return "draft";
+}
+
+function isDocumentAttachment(attachment: ChannelAttachment): boolean {
+  const type = attachment.contentType.toLowerCase();
+  return (
+    type === "application/pdf" ||
+    type === "text/csv" ||
+    type.includes("officedocument") ||
+    type.includes("msword") ||
+    type.includes("ms-excel") ||
+    type.includes("ms-powerpoint") ||
+    type.includes("opendocument")
+  );
 }
 
 /**
@@ -113,9 +127,10 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
 interface MessageAttachmentProps {
   attachment: ChannelAttachment;
   onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
+  onOpenDocument: (attachment: ChannelAttachment, trigger: HTMLButtonElement) => void;
 }
 
-function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) {
+function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageAttachmentProps) {
   const icon = (
     <span className="chat-msg-area__attachment-icon" aria-hidden="true">
       <span className="material-symbols-outlined">{fileIconFor(attachment.contentType)}</span>
@@ -173,7 +188,20 @@ function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) 
       <div className="chat-msg-area__attachment-row">
         {/* The thumbnail draws itself only for an approved file with a ready
             preview; everything else falls back to the type icon. */}
-        <AttachmentThumbnail attachment={attachment} fallback={icon} />
+        {isDocumentAttachment(attachment) &&
+        attachment.status === "clean" &&
+        attachment.previewStatus === "ready" ? (
+          <button
+            type="button"
+            className="chat-msg-area__attachment-preview-button"
+            aria-label={`Visualizar ${attachment.filename}`}
+            onClick={(event) => onOpenDocument(attachment, event.currentTarget)}
+          >
+            <AttachmentThumbnail attachment={attachment} fallback={icon} />
+          </button>
+        ) : (
+          <AttachmentThumbnail attachment={attachment} fallback={icon} />
+        )}
         {meta}
         {download}
       </div>
@@ -197,6 +225,10 @@ export default function MessageAttachments({
   attachments: ChannelAttachment[] | undefined;
 }) {
   const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
+  const [documentViewer, setDocumentViewer] = useState<{
+    attachment: ChannelAttachment;
+    trigger: HTMLButtonElement;
+  } | null>(null);
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
   if (!attachments || attachments.length === 0) return null;
@@ -241,6 +273,7 @@ export default function MessageAttachments({
                 key={segment.attachment.id}
                 attachment={segment.attachment}
                 onOpenImage={openImage}
+                onOpenDocument={(attachment, trigger) => setDocumentViewer({ attachment, trigger })}
               />
             );
           }
@@ -260,6 +293,9 @@ export default function MessageAttachments({
                     key={attachment.id}
                     attachment={attachment}
                     onOpenImage={openImage}
+                    onOpenDocument={(attachment, trigger) =>
+                      setDocumentViewer({ attachment, trigger })
+                    }
                   />
                 ))}
               </ul>
@@ -289,6 +325,15 @@ export default function MessageAttachments({
           inlineUrl={lightbox.url}
           inlineIsOriginal={lightbox.isOriginal}
           onClose={closeLightbox}
+        />
+      )}
+      {documentViewer && (
+        <DocumentPreviewViewer
+          attachment={documentViewer.attachment}
+          onClose={() => {
+            documentViewer.trigger.focus();
+            setDocumentViewer(null);
+          }}
         />
       )}
     </>

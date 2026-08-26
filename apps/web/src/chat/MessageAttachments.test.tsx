@@ -11,14 +11,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * is a separate obligation and the one a user actually sees.
  */
 
-const { mockPreview, mockContent } = vi.hoisted(() => ({
+const { mockPreview, mockContent, mockDocumentManifest, mockDocumentPage } = vi.hoisted(() => ({
   mockPreview: vi.fn(),
   mockContent: vi.fn(),
+  mockDocumentManifest: vi.fn(),
+  mockDocumentPage: vi.fn(),
 }));
 
 vi.mock("./filesApi", () => ({
   fetchAttachmentPreview: (...args: unknown[]) => mockPreview(...args),
   fetchAttachmentContent: (...args: unknown[]) => mockContent(...args),
+  fetchDocumentPreviewManifest: (...args: unknown[]) => mockDocumentManifest(...args),
+  fetchDocumentPreviewPage: (...args: unknown[]) => mockDocumentPage(...args),
 }));
 
 import MessageAttachments from "./MessageAttachments";
@@ -42,6 +46,68 @@ const downloadButton = () => screen.queryByTestId("chat-message-attachment-downl
 beforeEach(() => {
   mockPreview.mockReset().mockRejectedValue(new Error("no preview"));
   mockContent.mockReset().mockResolvedValue(new Blob(["bytes"]));
+  mockDocumentManifest.mockReset().mockResolvedValue({
+    attachmentId: "att-1",
+    kind: "pages",
+    pageCount: 2,
+    labels: ["Página 1", "Página 2"],
+  });
+  mockDocumentPage.mockReset().mockResolvedValue(new Blob(["jpeg-page"]));
+});
+
+describe("message attachments — document viewer", () => {
+  beforeEach(() => {
+    let objectIndex = 0;
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => `blob:document-${++objectIndex}`),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("opens an approved document preview without downloading and navigates its raster pages", async () => {
+    const user = userEvent.setup();
+    mockPreview.mockResolvedValue(new Blob(["thumbnail"]));
+    render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
+      />,
+    );
+
+    const trigger = await screen.findByRole("button", { name: "Visualizar relatorio.pdf" });
+    await user.click(trigger);
+
+    const dialog = await screen.findByRole("dialog", { name: "relatorio.pdf" });
+    expect(within(dialog).getByText("Página 1 de 2")).toBeInTheDocument();
+    expect(mockDocumentPage).toHaveBeenCalledWith("att-1", 1, expect.any(AbortSignal));
+    expect(mockContent).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole("button", { name: "Próxima página" }));
+    await waitFor(() =>
+      expect(mockDocumentPage).toHaveBeenCalledWith("att-1", 2, expect.any(AbortSignal)),
+    );
+    expect(within(dialog).getByText("Página 2 de 2")).toBeInTheDocument();
+  });
+
+  it("closes with Escape and restores focus to the document preview trigger", async () => {
+    const user = userEvent.setup();
+    mockPreview.mockResolvedValue(new Blob(["thumbnail"]));
+    render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
+      />,
+    );
+
+    const trigger = await screen.findByRole("button", { name: "Visualizar relatorio.pdf" });
+    await user.click(trigger);
+    await screen.findByRole("dialog", { name: "relatorio.pdf" });
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+  });
 });
 
 afterEach(() => {
@@ -120,6 +186,22 @@ describe("message attachments", () => {
 
     expect(screen.queryByTestId("chat-details-file-video")).not.toBeInTheDocument();
     expect(mockContent).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a ready video preview into a document viewer", () => {
+    render(
+      <MessageAttachments
+        attachments={[
+          attachment({
+            filename: "clip.mp4",
+            contentType: "video/mp4",
+            status: "clean",
+            previewStatus: "ready",
+          }),
+        ]}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Visualizar clip.mp4" })).not.toBeInTheDocument();
   });
 });
 
