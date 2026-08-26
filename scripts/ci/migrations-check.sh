@@ -304,6 +304,21 @@ done
 echo
 
 # ---------------------------------------------------------------------------
+# 10. Blue/Green expand-contract compatibility (issue #626)
+#
+#     Delegated to scripts/ci/blue-green-migration-gate.sh, which is sourceable
+#     so that scripts/ci/test_blue_green_migration_gate.sh can exercise every
+#     pattern against fixtures rather than against the repository's own history.
+# ---------------------------------------------------------------------------
+echo "--- blue/green expand-contract compatibility ---"
+if "$ROOT_DIR/scripts/ci/blue-green-migration-gate.sh" "$MIGRATIONS_DIR"; then
+  ok "no up migration breaks the previous release slot"
+else
+  fail "see the findings above; declare a contract phase in the file or split the change across releases"
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 if [ "$ERRORS" -gt 0 ]; then

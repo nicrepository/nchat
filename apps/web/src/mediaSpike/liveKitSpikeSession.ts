@@ -57,8 +57,12 @@ export interface LiveKitSpikeSessionCallbacks {
   // muting is not "no video", it is "temporarily no usable frame" — so the
   // consumer must stop treating it as available (RF-24 grid fallback) without
   // losing the element, and restore it on unmute. Never fired for a
-  // microphone (local or remote): see onMicrophoneStateChanged for that.
+  // microphone: see onMicrophoneStateChanged/onRemoteAudioAvailabilityChanged.
   onRemoteVideoAvailabilityChanged(identity: string, available: boolean): void;
+  // Mirrors the remote microphone publication's effective mute state. This
+  // updates the existing RF-24 participant entry; it never creates a second
+  // roster for presentation consumers.
+  onRemoteAudioAvailabilityChanged(identity: string, available: boolean): void;
   onActiveSpeakersChanged(identities: string[]): void;
   onScreenShareChanged(enabled: boolean): void;
   // Local screen-share preview only — deliberately separate from
@@ -176,6 +180,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     // subscribed track when the publisher already muted it — no future
     // TrackMuted is guaranteed for a mute that happened before we arrived.
     this.syncRemoteVideoAvailability();
+    this.syncRemoteAudioAvailability();
   }
 
   async startAudio(): Promise<void> {
@@ -333,6 +338,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       this.callbacks.onRemoteElement(element);
     }
     if (track.kind === Track.Kind.Audio) {
+      if (publication.source === Track.Source.Microphone && publication.isMuted) {
+        this.callbacks.onRemoteAudioAvailabilityChanged(participant.identity, false);
+      }
       void element.play().catch(() => {
         if (!this.disposed) this.callbacks.onAudioPlaybackChanged(false);
       });
@@ -380,6 +388,7 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     // matches the SDK after Reconnected.
     this.notifyMicrophoneState();
     this.syncRemoteVideoAvailability();
+    this.syncRemoteAudioAvailability();
     this.syncLocalScreenShareState();
     this.callbacks.onReconnected();
   };
@@ -418,6 +427,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       this.callbacks.onScreenShareChanged(false);
       return;
     }
+    if (this.isRemoteMicrophone(publication, participant)) {
+      this.callbacks.onRemoteAudioAvailabilityChanged(participant.identity, false);
+      return;
+    }
     if (this.isRemoteCamera(publication, participant)) {
       this.callbacks.onRemoteVideoAvailabilityChanged(participant.identity, false);
     }
@@ -434,6 +447,10 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
     }
     if (this.isLocalScreenShare(publication, participant)) {
       this.callbacks.onScreenShareChanged(true);
+      return;
+    }
+    if (this.isRemoteMicrophone(publication, participant)) {
+      this.callbacks.onRemoteAudioAvailabilityChanged(participant.identity, true);
       return;
     }
     if (this.isRemoteCamera(publication, participant)) {
@@ -459,6 +476,12 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
   // remote participant's camera going away.
   private isRemoteCamera(publication: TrackPublication, participant: Participant): boolean {
     return participant !== this.room.localParticipant && publication.source === Track.Source.Camera;
+  }
+
+  private isRemoteMicrophone(publication: TrackPublication, participant: Participant): boolean {
+    return (
+      participant !== this.room.localParticipant && publication.source === Track.Source.Microphone
+    );
   }
 
   // A track callback can arrive after its participant already disconnected
@@ -490,6 +513,15 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       const publication = participant.getTrackPublication(Track.Source.Camera);
       if (!publication?.isSubscribed) continue;
       this.callbacks.onRemoteVideoAvailabilityChanged(participant.identity, !publication.isMuted);
+    }
+  }
+
+  private syncRemoteAudioAvailability(): void {
+    if (this.disposed) return;
+    for (const participant of this.room.remoteParticipants.values()) {
+      const publication = participant.getTrackPublication(Track.Source.Microphone);
+      if (!publication?.isSubscribed) continue;
+      this.callbacks.onRemoteAudioAvailabilityChanged(participant.identity, !publication.isMuted);
     }
   }
 

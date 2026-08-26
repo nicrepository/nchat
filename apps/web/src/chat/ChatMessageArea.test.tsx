@@ -1289,7 +1289,45 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
     expect(bar).toHaveTextContent("2 participantes");
   });
 
-  it("shows no bar when not participating in a resource call", async () => {
+  it("shows the bar in 'available' mode when not participating in a resource call", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const call = makeResourceCall();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => call,
+                  isParticipatingIn: () => false,
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — #geral");
+    // Should have join button but no mute/leave controls
+    expect(within(bar).getByRole("button", { name: "Entrar na chamada" })).toBeInTheDocument();
+    expect(within(bar).queryByRole("button", { name: /Mutar/ })).not.toBeInTheDocument();
+
+    // Header should not duplicate "Entrar na chamada"
+    const header = screen.getByTestId("chat-msg-header");
+    expect(
+      within(header).queryByRole("button", { name: "Entrar na chamada" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps an available call visible but disables join when joinResourceCall is unavailable", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     render(
       <MemoryRouter initialEntries={["/chat/channel/geral"]}>
@@ -1304,6 +1342,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
                   dms: [],
                   getResourceCall: () => makeResourceCall(),
                   isParticipatingIn: () => false,
+                  joinResourceCall: undefined,
                 }}
               />
             }
@@ -1313,11 +1352,19 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
         </Routes>
       </MemoryRouter>,
     );
-    await screen.findByTestId("chat-msg-header");
-    expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument();
+
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(within(bar).getByRole("button", { name: "Entrar na chamada" })).toBeDisabled();
+    const header = screen.getByTestId("chat-msg-header");
+    expect(
+      within(header).queryByRole("button", { name: "Entrar na chamada" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(header).queryByRole("button", { name: "Iniciar chamada" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("shows no bar when participating in a DIFFERENT resource target than the one open in this view", async () => {
+  it("shows no bar when participating in a DIFFERENT resource target and this target has no active call", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     render(
       <MemoryRouter initialEntries={["/chat/channel/geral"]}>
@@ -1333,7 +1380,7 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
                     { id: "outro", name: "outro", type: "public", canWrite: true },
                   ],
                   dms: [],
-                  getResourceCall: () => makeResourceCall(),
+                  getResourceCall: () => null, // no call in "geral"
                   // Mirrors ChatShell's real isParticipatingIn semantics: true
                   // only for the exact target the user is in — "outro", not
                   // "geral", the one this view has open.
@@ -1417,6 +1464,44 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
     const bar = await screen.findByTestId("active-resource-call-bar");
     expect(bar).toHaveTextContent("Chamada de voz — Infra Squad");
     expect(bar).not.toHaveTextContent("#Infra Squad");
+  });
+
+  it("shows an available group-DM call to an outsider without duplicating join in the header", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/grupo-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [{ id: "grupo-1", type: "group", name: "Infra Squad", participants: [] }],
+                  getResourceCall: () =>
+                    makeResourceCall({ target_type: "dm", target_id: "grupo-1" }),
+                  isParticipatingIn: () => false,
+                  joinResourceCall: vi.fn(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — Infra Squad");
+    expect(bar).not.toHaveTextContent("#Infra Squad");
+    expect(within(bar).getByRole("button", { name: "Entrar na chamada" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("chat-msg-header")).queryByRole("button", {
+        name: "Entrar na chamada",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("includes #<name> in the title when participating in a channel's resource call", async () => {
@@ -1576,6 +1661,145 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
     await screen.findByTestId("active-resource-call-bar");
     expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
     expect(document.querySelector(".voicebanner input")).toBeNull();
+  });
+
+  it("never renders the bar if discovery is terminal (not active), even if participatingHere is true (issue #657)", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const terminalCall = makeResourceCall({ status: "ended" });
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => terminalCall,
+                  isParticipatingIn: () => true, // Still converging
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("removes the bar when the same view converges from an active call to an ended call", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    let call = makeResourceCall();
+    const view = () => (
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => call,
+                  isParticipatingIn: () => false,
+                  joinResourceCall: vi.fn(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>
+    );
+    const { rerender } = render(view());
+    expect(await screen.findByTestId("active-resource-call-bar")).toBeInTheDocument();
+
+    call = makeResourceCall({ status: "ended" });
+    rerender(view());
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("passes exact callId to joinResourceCall for an outsider joining an available call", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const joinResourceCall = vi.fn();
+    const call = makeResourceCall({ call_id: "exact-call-123" });
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => call,
+                  isParticipatingIn: () => false,
+                  joinResourceCall,
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: "Entrar na chamada" }));
+    expect(joinResourceCall).toHaveBeenCalledWith({
+      kind: "channel",
+      id: "geral",
+      name: "geral",
+      callId: "exact-call-123",
+    });
+  });
+
+  it("shows participating-info when participating but resourceCallSession is undefined", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: undefined, // Missing local session
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — #geral");
+    // Controls should not exist
+    expect(
+      within(bar).queryByRole("button", { name: "Entrar na chamada" }),
+    ).not.toBeInTheDocument();
+    expect(within(bar).queryByRole("button", { name: /Mutar/ })).not.toBeInTheDocument();
+    expect(within(bar).queryByRole("button", { name: /Sair/ })).not.toBeInTheDocument();
   });
 });
 
@@ -5202,6 +5426,24 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Fechar detalhes do canal" }));
 
+    expect(detailsToggle()).toHaveFocus();
+  });
+
+  // Issue #467: below the wide-desktop threshold the panel covers the
+  // conversation, and a keyboard user has to be able to get back out of it.
+  // Wired once rather than by width, so the gesture is the same in both
+  // compositions.
+  it("closes on Escape and returns focus to the header control", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
     expect(detailsToggle()).toHaveFocus();
   });
 

@@ -38,7 +38,13 @@ interface ConversationActionsMenuProps {
   open: boolean;
   /** Asks the sidebar to make this row's menu the open one, or to close it. */
   onOpenChange: (open: boolean) => void;
-  onAction: (id: ConversationActionId) => void;
+  /**
+   * Runs one action, and hands the caller the trigger it was run from
+   * (issue #467, code quality review): an action that opens a surface elsewhere
+   * — the details panel — has to know where to send focus back to, and this
+   * button is the only element that knows which row it belongs to.
+   */
+  onAction: (id: ConversationActionId, trigger: HTMLButtonElement | null) => void;
 }
 
 function IconMore() {
@@ -239,7 +245,7 @@ export default function ConversationActionsMenu({
 
   function runAction(id: ConversationActionId) {
     close(true);
-    onAction(id);
+    onAction(id, triggerRef.current);
   }
 
   return (

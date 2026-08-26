@@ -46,6 +46,94 @@ test.afterEach(async ({ page }) => {
 });
 
 test.describe("chamada 1:1", () => {
+  test("toca apenas para incoming direto e para ao recusar", async ({ page }, testInfo) => {
+    await instrumentIncomingCallRingtone(page);
+    const call = await openCallConversation(page, testInfo, "E2E Participante");
+
+    await emitCallEvent(page, callEvent(call, "ringing", 1));
+    await expect.poll(() => incomingCallRingtoneCounts(page)).toEqual({ play: 1, pause: 0 });
+
+    await page.getByRole("button", { name: "Recusar" }).click();
+    await expectCommandCount(page, "call.decline", 1);
+    await emitCallEvent(page, callEvent(call, "ended", 2));
+    await expect.poll(() => incomingCallRingtoneCounts(page)).toEqual({ play: 1, pause: 1 });
+
+    const outgoing = {
+      callId: uniqueId(testInfo, "outgoing-call"),
+      requestId: uniqueId(testInfo, "outgoing-request"),
+      createdAt: call.createdAt,
+    } satisfies CallFixture;
+    const outgoingEvent = callEvent(outgoing, "ringing", 1);
+    outgoingEvent.call.caller_id = CURRENT_USER_ID;
+    outgoingEvent.call.callee_id = OTHER_USER_ID;
+    await emitCallEvent(page, outgoingEvent);
+    await waitForReactEffects(page);
+    expect(await incomingCallRingtoneCounts(page)).toEqual({ play: 1, pause: 1 });
+
+    const resourceEvent = callEvent(
+      {
+        callId: uniqueId(testInfo, "resource-call"),
+        requestId: uniqueId(testInfo, "resource-request"),
+        createdAt: call.createdAt,
+      },
+      "ringing",
+      1,
+    );
+    resourceEvent.target_type = "channel";
+    await emitCallEvent(page, resourceEvent);
+    await waitForReactEffects(page);
+    expect(await incomingCallRingtoneCounts(page)).toEqual({ play: 1, pause: 1 });
+  });
+
+  test("mantém uma única apresentação sonora entre duas abas main", async ({
+    page,
+    context,
+  }, testInfo) => {
+    const secondPage = await context.newPage();
+    const targetId = uniqueId(testInfo, "two-main-tabs");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "E2E Participante",
+      messages: [],
+    });
+    await Promise.all([
+      installMessagingMocks(page, scenario),
+      installMessagingMocks(secondPage, scenario),
+      instrumentIncomingCallRingtone(page),
+      instrumentIncomingCallRingtone(secondPage),
+    ]);
+    await Promise.all([page.goto(`/chat/dm/${targetId}`), secondPage.goto(`/chat/dm/${targetId}`)]);
+    await Promise.all([
+      expect.poll(() => commandCount(page, "call.sync")).toBe(1),
+      expect.poll(() => commandCount(secondPage, "call.sync")).toBe(1),
+    ]);
+    const call = {
+      callId: uniqueId(testInfo, "two-main-tabs-call"),
+      requestId: uniqueId(testInfo, "two-main-tabs-request"),
+      createdAt: "2026-08-03T12:00:00.000Z",
+    } satisfies CallFixture;
+
+    await Promise.all([
+      emitCallEvent(page, callEvent(call, "ringing", 1)),
+      emitCallEvent(secondPage, callEvent(call, "ringing", 1)),
+    ]);
+
+    await Promise.all([
+      expect(page.getByRole("dialog", { name: "Chamada recebida" })).toBeVisible(),
+      expect(secondPage.getByRole("dialog", { name: "Chamada recebida" })).toBeVisible(),
+    ]);
+    await expect
+      .poll(async () => {
+        const [first, second] = await Promise.all([
+          incomingCallRingtoneCounts(page),
+          incomingCallRingtoneCounts(secondPage),
+        ]);
+        return first.play + second.play;
+      })
+      .toBe(1);
+  });
+
   test("mantém o chat utilizável quando call.sync não encontra chamada", async ({
     page,
   }, testInfo) => {
@@ -618,6 +706,48 @@ async function instrumentGetUserMediaHold(page: Page) {
       });
     };
   });
+}
+
+async function instrumentIncomingCallRingtone(page: Page) {
+  await page.addInitScript(() => {
+    const target = window as unknown as {
+      __e2eIncomingCallRingtone: { play: number; pause: number };
+    };
+    target.__e2eIncomingCallRingtone = { play: 0, pause: 0 };
+    const originalPlay = HTMLMediaElement.prototype.play;
+    const originalPause = HTMLMediaElement.prototype.pause;
+    HTMLMediaElement.prototype.play = function () {
+      if (this.src.endsWith("/sounds/incoming-call.wav")) {
+        target.__e2eIncomingCallRingtone.play += 1;
+        return Promise.resolve();
+      }
+      return originalPlay.call(this);
+    };
+    HTMLMediaElement.prototype.pause = function () {
+      if (this.src.endsWith("/sounds/incoming-call.wav")) {
+        target.__e2eIncomingCallRingtone.pause += 1;
+        return;
+      }
+      return originalPause.call(this);
+    };
+  });
+}
+
+async function incomingCallRingtoneCounts(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as unknown as { __e2eIncomingCallRingtone: { play: number; pause: number } })
+        .__e2eIncomingCallRingtone,
+  );
+}
+
+async function waitForReactEffects(page: Page) {
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  );
 }
 
 async function resolveHeldGetUserMedia(page: Page) {

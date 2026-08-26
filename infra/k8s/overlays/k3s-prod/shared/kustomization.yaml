@@ -1,0 +1,316 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Everything in production that a release does NOT change (issue #626).
+#
+# The split matters operationally: this Kustomization is applied once when the
+# namespace is bootstrapped and then only when the platform itself changes,
+# while ../slots/blue and ../slots/green are applied per release. Keeping the
+# ConfigMap, the ServiceAccounts, the quota, the network policies, the
+# certificate, the edge and the shared workloads out of the slots is what makes
+# "Blue and Green differ only by image" true by construction rather than by
+# discipline.
+#
+# The stateful layer — PostgreSQL, Valkey, SeaweedFS, Keycloak, LiveKit and
+# coturn — is a prerequisite of this namespace, not a resource of it. Blue and
+# Green share one of each; see docs/runbooks/production-blue-green-deployment.md
+# for what must exist before the first apply.
+namespace: nchat-prod
+components:
+  # The same least-privilege posture nchat-dev runs, not a second set written
+  # for production. Its rules select on app.kubernetes.io/component, which both
+  # slots carry identically, so neither slot can be granted access the other
+  # lacks.
+  - ../../../components/least-privilege-network-policies
+resources:
+  # The whole base, minus the nine release workloads, which are removed by
+  # delete-slot-workloads.yaml below. Their Services stay: those are the stable,
+  # slot-selecting front doors production traffic arrives on.
+  - ../../../base
+  # ClamAV is not a resource of base/kustomization.yaml — k3s-dev and
+  # k3s-staging do not enable uploads. Production does, and it runs one shared
+  # scanner: a pinned image no NChat release changes, so a slot of its own would
+  # add a moving part to a cutover without adding safety. upload-guard, which
+  # base does ship, is shared for the same reason.
+  - ../../../base/services/clamav
+  - certificate.yaml
+  - ingress.yaml
+  - preview.yaml
+configMapGenerator:
+  - name: nchat-prod-topology
+    envs:
+      - topology.env
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  # The nine release workloads do not belong to the shared half of production:
+  # each exists twice, under ../slots/blue and ../slots/green, with a
+  # nchat.io/release-slot label in its selector. base ships them alongside their
+  # Services; the Services stay and become the stable front doors, the
+  # Deployments are removed here.
+  #
+  # A workload added to base and not to ../slots/workloads would survive this
+  # list and render into production without a slot;
+  # scripts/ci/prod-blue-green-check.sh fails on any unslotted Deployment.
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nchat-web
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nchat-admin-web
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: auth-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: chat-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: file-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: notification-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: admin-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: search-service
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: media-service
+        namespace: nchat
+      $patch: delete
+  # The cutover mechanism, in one field: a stable Service keeps its name, its
+  # ports and its Ingress backend forever, and a release only moves which slot
+  # its selector points at. blue is the bootstrap value because the first
+  # production release is Blue by definition; from then on the value in the
+  # cluster is the source of truth and the scripts read it back from the
+  # Service, never from a file or a variable.
+  #
+  # The name pattern is what keeps this off upload-guard and clamav: those have
+  # no slot, and a slot key in their selector would make them select nothing.
+  - target:
+      kind: Service
+      name: ^(nchat-web|nchat-admin-web|auth-service|chat-service|file-service|notification-service|admin-service|search-service|media-service)$
+    patch: |-
+      - op: add
+        path: /spec/selector/nchat.io~1release-slot
+        value: blue
+  - path: configmap-patch.yaml
+  - path: quota-patch.yaml
+  - target:
+      kind: Namespace
+      name: nchat
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: nchat-prod
+  # base names its quota and limit range after the environment they were first
+  # written for. In a production namespace those names read as a mistake, and an
+  # operator reading `kubectl get resourcequota` during an incident should not
+  # have to decide whether they are looking at the wrong cluster.
+  - target:
+      kind: ResourceQuota
+      name: nchat-dev-quota
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: nchat-prod-quota
+  - target:
+      kind: LimitRange
+      name: nchat-dev-limits
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: nchat-prod-limits
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-prod
+# NOTE: a replacement target's select.kind/select.name are compared as plain
+# strings, not regexes — `kind: Ingress` cannot match `IngressRoute`, and
+# anchoring a value would stop it matching at all.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-prod-tls
+        fieldPaths:
+          - spec.dnsNames.0
+      - select:
+          kind: Ingress
+          name: nchat-prod
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+      - select:
+          kind: IngressRoute
+          name: nchat-prod-uploads
+        fieldPaths:
+          - spec.routes.0.match
+        options:
+          delimiter: "`"
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-prod-http
+        fieldPaths:
+          - spec.rules.0.host
+  # The administrative console host: the fixed label "admin" under the
+  # deployment host, derived rather than configured so it cannot drift. The
+  # targets hold "admin.REPLACE_ME_ADMIN_HOST"; the delimiter splits on the
+  # first dot and replaces only the second segment.
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-prod-tls
+        fieldPaths:
+          - spec.dnsNames.1
+        options:
+          delimiter: "."
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-prod-admin
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-prod-http
+        fieldPaths:
+          - spec.rules.1.host
+        options:
+          delimiter: "."
+          index: 1
+  # The preview hosts, derived the same way from the same single source: the
+  # targets hold "<slot>.preview.REPLACE_ME_PREVIEW_HOST" and only the third
+  # segment is replaced, so the slot label and the "preview" label survive.
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-prod-tls
+        fieldPaths:
+          - spec.dnsNames.2
+          - spec.dnsNames.3
+          - spec.dnsNames.4
+          - spec.dnsNames.5
+        options:
+          delimiter: "."
+          index: 2
+      - select:
+          kind: Ingress
+          name: nchat-prod-preview-blue
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 2
+      - select:
+          kind: Ingress
+          name: nchat-prod-preview-green
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 2
+      - select:
+          kind: Ingress
+          name: nchat-prod-preview-admin-blue
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 2
+      - select:
+          kind: Ingress
+          name: nchat-prod-preview-admin-green
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 2
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_PUBLIC_URL
+    targets:
+      - select:
+          kind: ConfigMap
+          name: nchat-config
+        fieldPaths:
+          - data.AUTH_PUBLIC_WEB_BASE_URL
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_LIVEKIT_CONNECT_SRC
+    targets:
+      - select:
+          kind: ConfigMap
+          name: nchat-config
+        fieldPaths:
+          - data.NCHAT_WEB_LIVEKIT_CONNECT_SRC
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_PREVIEW_ALLOW_CIDR
+    targets:
+      - select:
+          kind: Middleware
+          name: preview-allowlist
+        fieldPaths:
+          - spec.ipAllowList.sourceRange.0

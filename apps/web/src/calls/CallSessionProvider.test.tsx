@@ -15,6 +15,12 @@ import CallSessionProvider, { useCallSession } from "./CallSessionProvider";
 import { _resetSelfProfile } from "../profile/selfProfile";
 import type { SelfProfile } from "../profile/profileApi";
 
+const { mockRingtoneEnabled, mockStartRingtone, mockStopRingtone } = vi.hoisted(() => ({
+  mockRingtoneEnabled: vi.fn(() => true),
+  mockStartRingtone: vi.fn(),
+  mockStopRingtone: vi.fn(),
+}));
+
 vi.mock("../chat/useCallMedia", () => ({ useCallMedia: vi.fn() }));
 vi.mock("../chat/useCallSignaling", () => ({ useCallSignaling: vi.fn() }));
 vi.mock("../chat/useResourceCallSession", () => ({ useResourceCallSession: vi.fn() }));
@@ -40,6 +46,11 @@ vi.mock("../chat/resourceCallSignaling", async (importOriginal) => ({
 vi.mock("./callOwnership", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./callOwnership")>()),
   createOwnershipCoordinator: vi.fn(),
+}));
+vi.mock("./incomingCallRingtone", () => ({
+  getIncomingCallRingtoneEnabled: mockRingtoneEnabled,
+  startIncomingCallRingtone: mockStartRingtone,
+  stopIncomingCallRingtone: mockStopRingtone,
 }));
 
 // ── Mock profileApi (the local participant's identity source, issue #612) ────
@@ -508,6 +519,7 @@ describe("CallSessionProvider", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    mockRingtoneEnabled.mockReturnValue(true);
     _resetSelfProfile();
     mockFetchMyProfile.mockResolvedValue({ id: userB, displayName: "" });
     _resetSelfProfile();
@@ -544,6 +556,88 @@ describe("CallSessionProvider", () => {
     vi.mocked(acquireChatSocket).mockImplementation((listener) => {
       socketListener = listener;
       return { send: vi.fn(), isOpen: vi.fn(), generation: vi.fn(), release: vi.fn() };
+    });
+  });
+
+  describe("incoming direct-call ringtone", () => {
+    it("starts once for the callee's authoritative directIncoming call", async () => {
+      calls.call = { ...activeDirect(), status: "ringing" };
+      const view = renderProvider();
+
+      await waitFor(() => expect(mockStartRingtone).toHaveBeenCalledWith(callId));
+      expect(mockStartRingtone).toHaveBeenCalledOnce();
+
+      view.rerender(providerTree());
+      expect(mockStartRingtone).toHaveBeenCalledOnce();
+    });
+
+    it("never starts for the caller", () => {
+      // Directory must already be registered before the call turns
+      // "ringing" — directIncoming's `!directory ||` fallback (Call
+      // SessionProvider) only tells this tab's own outgoing call apart from
+      // a real incoming one once the directory is loaded, exactly like a
+      // real caller can't start a call without the directory loaded first.
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      calls.call = outgoingRinging();
+      view.rerender(providerTree());
+      expect(mockStartRingtone).not.toHaveBeenCalled();
+    });
+
+    it("never starts for resource/channel/group calls", () => {
+      resource.active = { kind: "channel", id: channelId, name: "Produto" };
+      resource.callId = callId;
+      resource.status = "active";
+      renderProvider();
+      expect(mockStartRingtone).not.toHaveBeenCalled();
+    });
+
+    it.each(["active", "declined", "cancelled", "timed_out", "ended"])(
+      "stops when directIncoming converges from ringing to %s",
+      async (status) => {
+        calls.call = { ...activeDirect(), status: "ringing" };
+        const view = renderProvider();
+        fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+        await waitFor(() => expect(mockStartRingtone).toHaveBeenCalledWith(callId));
+
+        calls.call = { ...activeDirect(), status };
+        view.rerender(providerTree());
+
+        expect(mockStopRingtone).toHaveBeenCalled();
+      },
+    );
+
+    it("stops the old cycle and starts the replacement call id", async () => {
+      calls.call = { ...activeDirect(), status: "ringing" };
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await waitFor(() => expect(mockStartRingtone).toHaveBeenCalledWith(callId));
+
+      const replacementId = "00000000-0000-4000-8000-000000000663";
+      calls.call = { ...activeDirect(), call_id: replacementId, status: "ringing" };
+      view.rerender(providerTree());
+
+      expect(mockStopRingtone).toHaveBeenCalled();
+      expect(mockStartRingtone).toHaveBeenLastCalledWith(replacementId);
+    });
+
+    it("stops on provider unmount", async () => {
+      calls.call = { ...activeDirect(), status: "ringing" };
+      const view = renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      await waitFor(() => expect(mockStartRingtone).toHaveBeenCalledWith(callId));
+
+      view.unmount();
+
+      expect(mockStopRingtone).toHaveBeenCalled();
+    });
+
+    it("does not start when the independent ringtone preference is off", () => {
+      mockRingtoneEnabled.mockReturnValue(false);
+      calls.call = { ...activeDirect(), status: "ringing" };
+      renderProvider();
+      fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
+      expect(mockStartRingtone).not.toHaveBeenCalled();
     });
   });
 
@@ -2277,7 +2371,7 @@ describe("CallSessionProvider", () => {
     );
   }
 
-  it("suppresses the resource FloatingCallWindow only once EVERY ingredient of resourcePresentationCall holds", async () => {
+  it("never suppresses the resource FloatingCallWindow even when resourcePresentationCall is fully ready (issue #657 regression fix)", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
@@ -2286,9 +2380,18 @@ describe("CallSessionProvider", () => {
     await waitFor(() =>
       expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
     );
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    // #657: FloatingCallWindow coexists with the bar, it is never suppressed.
+    // It must still provide the full surface controls (camera, screen share, open in new tab).
+    const panel = screen.getByTestId("resource-call-panel");
+    expect(panel).toBeInTheDocument();
+
+    // Prove it still offers camera, screen share, and "Expandir em nova aba"
+    const cameraBtn = within(panel).getByRole("button", { name: "Ativar câmera" });
+    const screenShareBtn = within(panel).getByRole("button", { name: "Compartilhar tela" });
+    expect(within(panel).getByRole("button", { name: "Expandir em nova aba" })).toBeInTheDocument();
+
+    expect(cameraBtn).toBeEnabled();
+    expect(screenShareBtn).toBeEnabled();
   });
 
   it("keeps the floating window when discovery still shows a DIFFERENT call_id for the same target (call.admitted/call.accepted have no ordering guarantee)", async () => {
@@ -2413,12 +2516,7 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
-    );
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     // Media drops to reconnecting — the bar has no UI for this state.
     media.status = "reconnecting";
@@ -2463,23 +2561,19 @@ describe("CallSessionProvider", () => {
     expect(within(panel).getByRole("button", { name: "Tentar mídia novamente" })).toBeEnabled();
   });
 
-  it("restores the floating window when navigating away, suppresses it again on return, never duplicated", async () => {
+  it("keeps the floating window when navigating away and on return, never duplicated (issue #657)", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Canal Y" }));
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
     expect(screen.getAllByTestId("resource-call-panel")).toHaveLength(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
     // Navigating A -> B -> A never reconnected media.
     expect(media.stop).not.toHaveBeenCalled();
   });
@@ -2489,9 +2583,7 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     act(() => ownershipLost());
     await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));

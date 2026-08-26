@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE chat.messages ALTER COLUMN author_id SET NOT NULL;
+COMMIT;

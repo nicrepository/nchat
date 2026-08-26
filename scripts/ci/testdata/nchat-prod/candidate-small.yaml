@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-blue
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: alpha
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-blue
+spec:
+  ports:
+    - port: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beta-blue
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: beta
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+        - name: sidecar
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi

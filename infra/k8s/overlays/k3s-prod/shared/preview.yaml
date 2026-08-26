@@ -1,0 +1,304 @@
+# Restricted per-slot preview (issue #626).
+#
+# A candidate slot has to be reachable before it carries production traffic, and
+# it must be reachable in a way that can never become the cutover. Four routers
+# are that mechanism — the chat surface and the administrative console, for each
+# of the two slots:
+#
+#   blue.preview.<host>        -> the Blue slot's own chat Services, always
+#   green.preview.<host>       -> the Green slot's own chat Services, always
+#   admin-blue.preview.<host>  -> the Blue slot's own admin Services, always
+#   admin-green.preview.<host> -> the Green slot's own admin Services, always
+#
+# The admin pair is defined further down this file. Every one of them points at
+# per-slot Services — nchat-web-blue, admin-service-green and friends — never at
+# the stable ones, so promoting a slot is impossible from here: no selector this
+# file touches decides which slot serves a public host.
+#
+# Access is restricted in the configuration, not in a comment: every request is
+# filtered by preview-allowlist below before it reaches a pod, TLS is the same
+# certificate the production hosts use, and the application's own
+# authentication is untouched — a preview visitor still has to sign in.
+#
+# Keycloak must list all four preview callbacks as additional Valid Redirect
+# URIs on the production client for sign-in to complete on any of them; the two
+# administrative hosts need it as much as the chat ones, since the console signs
+# in through the same provider. The application's own AUTH_PUBLIC_WEB_BASE_URL
+# still names the stable host, so no slot ever advertises itself as the address
+# of NChat.
+#
+# To disable previews entirely, delete all four Ingresses; the slot Services stay
+# and the candidate remains deployable and smoke-testable from inside the
+# cluster.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: preview-allowlist
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  ipAllowList:
+    # Filled from topology.env. An unset value renders as a REPLACE_ME_* token
+    # and is refused before kubectl, which is what stops a preview host from
+    # ever being published open by omission.
+    sourceRange:
+      - REPLACE_ME_PREVIEW_ALLOW_CIDR
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-preview-blue
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+    nchat.io/release-slot: blue
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-preview-allowlist@kubernetescrd,nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-media-api-prefix@kubernetescrd,nchat-prod-strip-files-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - blue.preview.REPLACE_ME_PREVIEW_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: blue.preview.REPLACE_ME_PREVIEW_HOST
+      http:
+        paths:
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service-blue
+                port:
+                  name: http
+          - path: /api/chat
+            pathType: Prefix
+            backend:
+              service:
+                name: chat-service-blue
+                port:
+                  name: http
+          - path: /api/files
+            pathType: Prefix
+            backend:
+              service:
+                name: file-service-blue
+                port:
+                  name: http
+          - path: /api/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service-blue
+                port:
+                  name: http
+          - path: /api/search
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service-blue
+                port:
+                  name: http
+          - path: /api/media
+            pathType: Prefix
+            backend:
+              service:
+                name: media-service-blue
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-web-blue
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-preview-green
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+    nchat.io/release-slot: green
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-preview-allowlist@kubernetescrd,nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-media-api-prefix@kubernetescrd,nchat-prod-strip-files-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - green.preview.REPLACE_ME_PREVIEW_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: green.preview.REPLACE_ME_PREVIEW_HOST
+      http:
+        paths:
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service-green
+                port:
+                  name: http
+          - path: /api/chat
+            pathType: Prefix
+            backend:
+              service:
+                name: chat-service-green
+                port:
+                  name: http
+          - path: /api/files
+            pathType: Prefix
+            backend:
+              service:
+                name: file-service-green
+                port:
+                  name: http
+          - path: /api/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service-green
+                port:
+                  name: http
+          - path: /api/search
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service-green
+                port:
+                  name: http
+          - path: /api/media
+            pathType: Prefix
+            backend:
+              service:
+                name: media-service-green
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-web-green
+                port:
+                  name: http
+---
+# The administrative console of a candidate slot.
+#
+# admin-web and admin-service are part of every release, so a candidate can be
+# entirely Ready with a broken console and nothing would notice until after the
+# cutover — the stable admin host serves the ACTIVE slot by definition, so it
+# can never exercise the candidate.
+#
+# Same shape as the chat preview above and the same controls: the allowlist
+# middleware, the shared certificate, and the console's own authentication,
+# which is deliberately untouched. Backends are the per-slot Services, so this
+# host can never promote anything and never carries normal administrative
+# traffic — admin.<host> keeps doing that, against the stable Services.
+#
+# The three backends are exactly the ones the stable admin host publishes, so
+# the browser sees the same single origin the __Host- cookie, SameSite, the
+# CSRF double-submit and the OIDC callback all depend on.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-preview-admin-blue
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+    nchat.io/release-slot: blue
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-preview-allowlist@kubernetescrd,nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-admin-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - admin-blue.preview.REPLACE_ME_PREVIEW_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: admin-blue.preview.REPLACE_ME_PREVIEW_HOST
+      http:
+        paths:
+          - path: /api/admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service-blue
+                port:
+                  name: http
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service-blue
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web-blue
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-preview-admin-green
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+    nchat.io/release-slot: green
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-preview-allowlist@kubernetescrd,nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-admin-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - admin-green.preview.REPLACE_ME_PREVIEW_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: admin-green.preview.REPLACE_ME_PREVIEW_HOST
+      http:
+        paths:
+          - path: /api/admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service-green
+                port:
+                  name: http
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service-green
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web-green
+                port:
+                  name: http

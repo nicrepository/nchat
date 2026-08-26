@@ -1,0 +1,40 @@
+# Migrations that predate the Blue/Green release policy of issue #626.
+#
+# These files have already been applied to running environments. The migration
+# runner stores a SHA-256 of each file (scripts/db/migrate.sh migration_checksum)
+# and refuses to continue when it changes, so annotating them in place would
+# block every deployment that has already run them. The exception is recorded
+# here instead, where it costs nothing and is just as visible in review.
+#
+# This list is closed. A migration written from now on declares a contract-phase
+# operation in the file itself:
+#
+#     -- nchat:blue-green contract-phase <why this is safe now>
+#
+# Do not add entries to this list to get a new migration past the gate.
+#
+# Format: <domain>/<filename>, one per line.
+
+# Widening a CHECK constraint: each of these drops a constraint and immediately
+# adds a broader one in the same transaction. Under Blue/Green that is an expand
+# operation and would pass on its own merits, but the gate cannot tell a widening
+# DROP CONSTRAINT from a removal without parsing SQL, so it asks for a declaration
+# and these files cannot carry one.
+auth/000005_smtp_worker_login_audit.up.sql
+auth/000007_oidc_keycloak_provider.up.sql
+chat/000002_chat_enforce_channel_workspace_isolation.up.sql
+chat/000006_chat_mentions.up.sql
+chat/000012_message_parent_reply.up.sql
+chat/000014_cross_channel_message_reference.up.sql
+chat/000022_workspace_moderator_and_guest_channel_scope.up.sql
+chat/000024_message_link_safety.up.sql
+chat/000026_link_scan_inconclusive.up.sql
+files/000007_link_scan_capacity.up.sql
+files/000008_link_scan_inconclusive.up.sql
+
+# Issue #546. Adds target_type/target_id, backfills them and makes them NOT NULL
+# in one transaction, which would reject an INSERT from a slot running the
+# previous code. It was applied under single-slot deploys, where no older version
+# was live. A migration doing this today must split into an expand release
+# (nullable column plus backfill) and a later contract release.
+chat/000028_resource_call_lifecycle.up.sql

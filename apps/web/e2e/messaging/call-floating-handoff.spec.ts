@@ -278,6 +278,45 @@ test.describe("dedicated tab ownership lease — deterministic, no LiveKit requi
   });
 });
 
+test.describe("issue #657: outsider discovery and active resource call bar", () => {
+  test("shows ActiveResourceCallBar and deduplicates header for an outsider", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-target");
+    const callId = randomUUID();
+    const requestId = uniqueId(testInfo, "channel-request");
+
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "canal-e2e",
+      messages: [],
+    });
+
+    await installMessagingMocks(page, scenario, {
+      knownCalls: [
+        {
+          callId,
+          event: resourceCallEvent({ callId, requestId, targetId, targetType: "channel" }),
+        },
+      ],
+    });
+
+    await page.goto(`/chat/channel/${targetId}`);
+
+    // The user is not participating (no ownership claimed), so they are an outsider.
+    // The bar must be visible with "Entrar na chamada".
+    const bar = page.getByTestId("active-resource-call-bar");
+    await expect(bar).toBeVisible();
+    await expect(bar.getByRole("button", { name: "Entrar na chamada" })).toBeVisible();
+
+    // The header must not duplicate "Entrar na chamada".
+    const header = page.getByTestId("chat-msg-header");
+    await expect(header).toBeVisible();
+    await expect(header.getByRole("button", { name: "Entrar na chamada" })).not.toBeVisible();
+  });
+});
+
 test.describe
   .skip("full floating → dedicated handoff with an active LiveKit session (requires real media-service/LiveKit — not available to this E2E project, see file header)", () => {
   test("chamada ativa aparece como janela flutuante", () => {});

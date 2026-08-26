@@ -1,10 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { Outlet, useLocation } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
 import type { ParticipantMedia } from "./useCallMedia";
 import "./ChatShell.css";
-import ChatSidebar from "./ChatSidebar";
+import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
+import { useNavDrawer } from "./useNavDrawer";
 import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
 import type { ResourceCallKind } from "./callApi";
 import type { Call, CallType } from "./callState";
@@ -105,7 +113,7 @@ export interface ChatOutletContext {
    * abort this brand-new attempt before it registers.
    */
   joinResourceCall?: (target: ResourceCallTarget) => void;
-  /** Present only while participating in a resource call with local ownership (issue #642). */
+  /** Present only while participating in a resource call with local ownership (issue #642/#657). */
   resourceCallSession?: ActiveResourceCallSession;
 }
 
@@ -146,7 +154,124 @@ function detailsTargetExists(
   return collection.some((item) => item.id === target.id);
 }
 
+/**
+ * Hands focus back to whatever opened the sidebar's details panel
+ * (issue #467, code quality review).
+ *
+ * The opener is a sidebar row's "…" trigger, and whether it can still take
+ * focus depends on the composition the panel was closed in:
+ *
+ *  - a column sidebar: the row is right there and takes it;
+ *  - a drawer: the row is still mounted and still connected, but the drawer was
+ *    closed when the panel opened, and a hidden element cannot hold focus.
+ *
+ * Rather than predicting that from the viewport — which would duplicate the
+ * responsive policy in JavaScript — this asks the DOM: focus the opener, then
+ * see whether it actually took. The fallback is the navigation toggle, the one
+ * control that is on screen in every drawer state, so focus never lands on
+ * `<body>`. `focus()` on a detached or hidden element is a no-op, never a
+ * throw, so neither step needs a guard of its own.
+ */
+function restoreDetailsFocus(opener: HTMLElement | null, fallback: HTMLElement | null) {
+  if (opener?.isConnected) opener.focus();
+  if (opener && document.activeElement === opener) return;
+  fallback?.focus();
+}
+
+/**
+ * A boolean as a data attribute: present and `"true"`, or absent entirely.
+ *
+ * Absent rather than `"false"` because that is what the CSS reads — a state
+ * selector matches on the attribute existing — and because the two states of a
+ * layout flag are "this mode" and "not this mode", never a third value.
+ */
+function dataFlag(on: boolean): "true" | undefined {
+  return on ? "true" : undefined;
+}
+
+/**
+ * The drawer's disclosure control (issue #467).
+ *
+ * A component of its own rather than three ternaries inside the shell: the
+ * label, the icon and the state it reports are one decision about one control,
+ * and the shell has enough to hold already.
+ *
+ * Only rendered as a bar below the drawer breakpoint; above it the sidebar is a
+ * permanent column and this is display:none. It sits in its own grid row, above
+ * the drawer rather than under it, so the control that opened the drawer stays
+ * visible and focused while it is open — the disclosure pattern, with the panel
+ * it controls next in DOM order. Every chat route is inside this shell, so one
+ * control serves all of them instead of each surface growing its own.
+ */
+function ChatNavBar({
+  open,
+  onToggle,
+  toggleRef,
+}: Readonly<{
+  open: boolean;
+  onToggle: () => void;
+  toggleRef: React.RefObject<HTMLButtonElement | null>;
+}>) {
+  return (
+    <div className="chat-app__nav-bar">
+      <button
+        ref={toggleRef}
+        type="button"
+        className="chat-app__nav-toggle"
+        aria-controls={chatNavigationId}
+        aria-expanded={open}
+        onClick={onToggle}
+        data-testid="chat-nav-toggle"
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          {open ? "close" : "menu"}
+        </span>
+        {open ? "Fechar conversas" : "Conversas"}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Keeps the document itself unscrollable for as long as the chat is on screen
+ * (issue #467 follow-up).
+ *
+ * The shell is exactly one viewport tall and clips its own content, so on a
+ * correct layout the document has nothing to scroll and this changes nothing.
+ * It is here because "nothing to scroll" is a property of every descendant at
+ * once: an out-of-flow box whose containing block is the initial one — the
+ * `.sr-only` badge that produced this bug — is not clipped by any of the
+ * shell's `overflow` rules, and grows the document's scroll area from wherever
+ * it happens to sit. One statement about the surface costs less than trusting
+ * every future descendant to stay inside a scrollport.
+ *
+ * Scoped to the shell's lifetime rather than declared on `html` in a
+ * stylesheet: login, profile and admin are ordinary documents that scroll.
+ * `useLayoutEffect` so the lock and the reset land in the same frame as the
+ * first paint, and the reset is instant — a smooth scroll would animate a jump
+ * the user never asked for. Both run once: this is about the surface being
+ * mounted, not about anything that changes while it is.
+ */
+function useRootScrollLock() {
+  useLayoutEffect(() => {
+    const { documentElement, body } = document;
+    // `overflow: hidden` freezes a scroll position rather than discarding it,
+    // so arriving from a scrolled route has to be normalised, not just locked.
+    window.scrollTo(0, 0);
+    documentElement.classList.add(ROOT_LOCK_CLASS);
+    body.classList.add(ROOT_LOCK_CLASS);
+    return () => {
+      documentElement.classList.remove(ROOT_LOCK_CLASS);
+      body.classList.remove(ROOT_LOCK_CLASS);
+    };
+  }, []);
+}
+
+/** Named once, because ChatShell.css and ChatShell.test.tsx both spell it. */
+export const ROOT_LOCK_CLASS = "chat-root-locked";
+
 export default function ChatShell() {
+  useRootScrollLock();
   const {
     state,
     retry,
@@ -215,27 +340,72 @@ export default function ChatShell() {
       activeResourceTarget?.kind === kind && activeResourceTarget.id === id,
     [activeResourceTarget],
   );
+  // The navigation is a column on wide viewports and a drawer below them
+  // (issue #467). Only the open/closed boolean lives here; which of the two it
+  // is at a given width is decided in ChatShell.css.
+  const {
+    open: navOpen,
+    modal: navModal,
+    toggle: toggleNav,
+    close: setNavClosed,
+  } = useNavDrawer(pathname);
+  const navToggleRef = useRef<HTMLButtonElement>(null);
+  // Closing always hands focus back to the control that opened the drawer: it
+  // is the one element that is on screen in every drawer state, so a keyboard
+  // user never lands nowhere.
+  const closeNav = useCallback(() => {
+    setNavClosed();
+    navToggleRef.current?.focus();
+  }, [setNavClosed]);
+  // The row control the panel was opened from, kept so closing can hand focus
+  // back to it. A ref rather than state: nothing renders from it, and it must
+  // survive the render that closes the panel. Captured here rather than read
+  // from `document.activeElement`, which by this point is still the menu item
+  // that is about to unmount — the menu restores its own trigger in an effect,
+  // one commit later.
+  const detailsOpenerRef = useRef<HTMLElement | null>(null);
   const openSidebarDetails = useCallback(
-    (kind: "channel" | "dm", targetId: string) => {
+    (kind: "channel" | "dm", targetId: string, opener: HTMLElement | null) => {
       const resolved = resolveDetailsTarget(
         kind,
         targetId,
         state.status === "ready" ? state.dms : [],
       );
-      if (resolved) setSidebarDetails({ ...resolved, pathname });
+      if (!resolved) return;
+      detailsOpenerRef.current = opener;
+      setSidebarDetails({ ...resolved, pathname });
+      // The row menu that asked for this is inside the drawer, and the panel
+      // covers the same area the drawer does. Closing it is what keeps the two
+      // from being stacked over each other on a phone.
+      closeNav();
     },
-    [state, pathname],
+    [state, pathname, closeNav],
   );
+  // The panel's single close path — the close button and Escape both arrive
+  // here through the same `onClose` — so focus is restored once, from one place,
+  // whichever gesture closed it.
+  const closeSidebarDetails = useCallback(() => {
+    setSidebarDetails(null);
+    restoreDetailsFocus(detailsOpenerRef.current, navToggleRef.current);
+    detailsOpenerRef.current = null;
+  }, []);
 
-  // #642 (review fix): gated on resourcePresentationCall alone — the single
-  // authority CallSessionProvider also uses to suppress its own
-  // FloatingCallWindow — never a looser, independently-recomputed check.
-  // Never undefined -> present the instant discovery/resource/media catch
-  // up out of a connecting/reconnecting/error/leaving state, and never
-  // present a frame earlier: that authority already accounts for a stale
-  // discovery call_id (call.admitted/call.accepted have no ordering
-  // guarantee) and for the "leaving" participation phase clearing
-  // synchronously, before the leave's own server round trip resolves.
+  function handleShellKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (!navModal || event.key !== "Escape") return;
+    // React bubbles a portal's events to its React parent rather than its DOM
+    // one, so the Escape that dismisses a dialog opened from inside the drawer —
+    // "Nova conversa", renaming, leaving — would otherwise close the drawer
+    // underneath it as well. Only a keystroke that really happened inside the
+    // shell closes the drawer.
+    if (!event.currentTarget.contains(event.target as Node)) return;
+    closeNav();
+  }
+
+  // #657 fix (was #642 review fix): gated on resourcePresentationCall —
+  // the authority for whether the bar's local-control mode is safe.
+  // FloatingCallWindow is ALWAYS shown alongside it; this bar never
+  // replaces it. Undefined -> present the instant discovery/resource/media
+  // catch up, and never present a frame earlier.
   const resourceCallSession: ActiveResourceCallSession | undefined = resourcePresentationCall
     ? {
         callId: resourcePresentationCall.call_id,
@@ -286,7 +456,17 @@ export default function ChatShell() {
   };
 
   return (
-    <div className="chat-app" data-testid="chat-shell">
+    <div
+      className="chat-app"
+      data-testid="chat-shell"
+      data-nav-open={dataFlag(navOpen)}
+      data-details-open={dataFlag(openDetailsTarget !== null)}
+      onKeyDown={handleShellKeyDown}
+    >
+      {/* The toggle keeps focus through open and close alike, so closing from
+          here needs no focus restoration of its own — unlike the backdrop, the
+          Escape key and the row menu below, which all hand it back. */}
+      <ChatNavBar open={navOpen} onToggle={toggleNav} toggleRef={navToggleRef} />
       <ChatSidebar
         state={state}
         retry={retry}
@@ -298,13 +478,27 @@ export default function ChatShell() {
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}
       />
-      <main className="chat-app__main" aria-label="Área de mensagens">
+      {/* Pointer half of "the background is not interactive while the drawer is
+          open"; `inert` below is the keyboard and assistive-technology half.
+          A real named button rather than a decorative overlay: it sits between
+          the drawer and the conversation in tab order, so tabbing past the end
+          of the drawer reaches an explicit way out instead of nothing. */}
+      {navModal && (
+        <button
+          type="button"
+          className="chat-app__nav-backdrop"
+          aria-label="Fechar a navegação"
+          onClick={closeNav}
+          data-testid="chat-nav-backdrop"
+        />
+      )}
+      <main className="chat-app__main" aria-label="Área de mensagens" inert={navModal}>
         <Outlet context={outletContext} />
       </main>
       <SidebarDetailsPanel
         target={openDetailsTarget}
         currentUserId={ready.currentUserId}
-        onClose={() => setSidebarDetails(null)}
+        onClose={closeSidebarDetails}
       />
     </div>
   );

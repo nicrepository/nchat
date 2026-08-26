@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -98,7 +100,7 @@ func TestNew_WithWorkerEnabledWithoutDecryptorDoesNotStartWorker(t *testing.T) {
 	newEncryptor = func(string) (*emailcrypto.Encryptor, error) { return nil, errors.New("invalid key") }
 
 	started := false
-	startSMTPWorker = func(smtpWorker) { started = true }
+	startSMTPWorker = func(context.Context, smtpWorker) { started = true }
 
 	app := New(validWorkerConfig())
 	if app == nil || app.Handler == nil {
@@ -118,7 +120,7 @@ func TestNew_WithInvalidSMTPSenderDoesNotStartWorker(t *testing.T) {
 	}
 
 	started := false
-	startSMTPWorker = func(smtpWorker) { started = true }
+	startSMTPWorker = func(context.Context, smtpWorker) { started = true }
 
 	app := New(validWorkerConfig())
 	if app == nil || app.Handler == nil {
@@ -137,18 +139,27 @@ func TestNew_WithReadyWorkerStartsSMTPWorker(t *testing.T) {
 		return &worker.NetSMTPSender{}, nil
 	}
 
-	starter := &fakeSMTPWorkerStarter{}
+	starter := newFakeSMTPWorkerStarter()
 	newSMTPWorker = func(config.Config, storage.OutboxStore, *emailcrypto.Encryptor, worker.Sender, *slog.Logger) smtpWorker {
 		return starter
 	}
-	startSMTPWorker = func(w smtpWorker) { w.Start(context.Background()) }
+	startSMTPWorker = func(ctx context.Context, w smtpWorker) { w.Start(ctx) }
 
 	app := New(validWorkerConfig())
 	if app == nil || app.Handler == nil {
 		t.Fatalf("expected initialized app, got %+v", app)
 	}
-	if !starter.started {
+	select {
+	case <-starter.started:
+	case <-time.After(2 * time.Second):
 		t.Fatal("expected smtp worker to start")
+	}
+	// Shutdown must cancel the worker's context and wait for it to return.
+	if err := app.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if starter.ctx.Err() == nil {
+		t.Fatal("Shutdown did not cancel the worker context")
 	}
 }
 
@@ -161,9 +172,23 @@ func (fakePool) Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 	return pgconn.CommandTag{}, nil
 }
 
-type fakeSMTPWorkerStarter struct{ started bool }
+// The worker now runs on a goroutine the App owns, so "did it start" is only
+// answerable once. The channel is what makes the assertion deterministic
+// instead of a race against the scheduler.
+type fakeSMTPWorkerStarter struct {
+	started chan struct{}
+	ctx     context.Context
+}
 
-func (f *fakeSMTPWorkerStarter) Start(context.Context) { f.started = true }
+func newFakeSMTPWorkerStarter() *fakeSMTPWorkerStarter {
+	return &fakeSMTPWorkerStarter{started: make(chan struct{})}
+}
+
+func (f *fakeSMTPWorkerStarter) Start(ctx context.Context) {
+	f.ctx = ctx
+	close(f.started)
+	<-ctx.Done()
+}
 
 func restoreFactories(t *testing.T) {
 	t.Helper()
@@ -201,4 +226,8 @@ func validWorkerConfig() config.Config {
 
 func validEncryptionKey() string {
 	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+}
+
+func quietTestLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

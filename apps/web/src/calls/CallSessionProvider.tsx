@@ -56,6 +56,11 @@ import { emitCallTechnicalEvent } from "./callTelemetry";
 import FloatingCallWindow, { type FloatingActiveSpeaker } from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 import IncomingCallPopup from "./IncomingCallPopup";
+import {
+  getIncomingCallRingtoneEnabled,
+  startIncomingCallRingtone,
+  stopIncomingCallRingtone,
+} from "./incomingCallRingtone";
 import OutgoingCallPopup from "./OutgoingCallPopup";
 
 type OwnerState = "none" | "local" | "remote";
@@ -114,14 +119,14 @@ export interface CallSessionContextValue {
   leaveResourceParticipation: () => Promise<void>;
   /**
    * The single derived authority for "this resource participation is
-   * stable enough to present as #642's compact ActiveResourceCallBar
-   * instead of the floating window" — null in every other state
-   * (connecting, reconnecting, error, remote ownership, a stale/mismatched
-   * discovery call_id, or a participation already leaving/left). Non-null
-   * carries the exact, proven Call this tab is participating in, so a
-   * view-scoped consumer (ChatShell) derives callId/startedAt from the SAME
-   * validated source CallSessionProvider itself used to suppress
-   * FloatingCallWindow — never a second, independently-computed guess.
+   * stable enough to present the compact local-control mode in
+   * ActiveResourceCallBar" — null in every other state (connecting,
+   * reconnecting, error, remote ownership, a stale/mismatched discovery
+   * call_id, or a participation already leaving/left). Non-null carries
+   * the exact, proven Call this tab is participating in, so a view-scoped
+   * consumer (ChatShell) derives callId/startedAt from the SAME validated
+   * source. The bar COEXISTS with FloatingCallWindow — this authority
+   * never suppresses or replaces the floating window (#657).
    */
   resourcePresentationCall: Call | null;
   /**
@@ -1012,21 +1017,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   // unordered messages (resourceCallSignaling.ts), so discovery can still
   // briefly hold an OLDER call_id for the very same channel/group-DM while
   // this participation's own callId is already current. Only ever used to
-  // gate #642's presentation handoff below — every other resource-call path
+  // gate the resourcePresentationCall below — every other resource-call path
   // (join/leave/reconnect) stays entirely independent of discovery.
   const resourceDiscoveredForTarget = resourceTarget
     ? getResourceCall(resourceTarget.kind, resourceTarget.id)
     : null;
-  // #642 review fix — the single derived authority for "this resource
-  // participation is stable enough that a compact bar may replace the
-  // floating window": a PROVEN call_id match (never merely "some call
-  // exists for this target"), resource/media both settled (never
-  // connecting/reconnecting/error — states only the floating window has UI
-  // for), and this tab actually holding local ownership (never remote,
-  // which keeps using GlobalCallIndicator). Carries the exact Call so the
-  // FloatingCallWindow suppression below and #642's ActiveResourceCallBar
-  // (via ChatShell, over context) derive callId/startedAt from the SAME
-  // validated source, never two independent guesses that could disagree.
+  // #657 fix (was #642 review fix) — the single derived authority for
+  // "this resource participation is stable enough to present the compact
+  // local-control mode in ActiveResourceCallBar" — null in every other state
+  // (connecting, reconnecting, error, remote ownership, a stale/mismatched
+  // discovery call_id, or a participation already leaving/left). Non-null
+  // carries the exact, proven Call this tab is participating in. The bar
+  // COEXISTS with FloatingCallWindow — this authority never suppresses or
+  // replaces the floating window (issue #657 regression 1 fix).
   const resourcePresentationCall =
     resourcePresentationCallId &&
     resourceDiscoveredForTarget?.status === "active" &&
@@ -1656,6 +1659,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     (!directory || calls.call.callee_id === directory.currentUserId)
       ? calls.call
       : null;
+  const incomingRingtoneCallId =
+    !dedicated && directIncoming && getIncomingCallRingtoneEnabled()
+      ? directIncoming.call_id
+      : null;
+  useEffect(() => {
+    if (!incomingRingtoneCallId) return;
+    startIncomingCallRingtone(incomingRingtoneCallId);
+    return stopIncomingCallRingtone;
+  }, [incomingRingtoneCallId]);
   // The CALLER's own surface for the exact same call.ringing (issue #615) —
   // authoritative only: gated on calls.call itself, never on calls.pending
   // (a start() preflight that never reaches the server, or one that fails
@@ -1798,65 +1810,47 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
             onReturn={() => void takeOver()}
           />
         )}
-      {!dedicated &&
-        activeCallId &&
-        ownerState !== "remote" &&
-        // #642 (review fix): a resource call's own view (ChatMessageArea/
-        // ChatShell) shows ActiveResourceCallBar instead, but ONLY once
-        // resourcePresentationCall proves the handoff is atomic — same
-        // route target, proven call_id (never a stale/different call for
-        // the same channel/group-DM), resource+media settled (never
-        // connecting/reconnecting/error, which only this floating window
-        // presents), and local ownership. Anything less and the floating
-        // window stays put, so there is never a frame with NO call surface
-        // at all. Direct calls are unaffected: resourceTarget is null
-        // whenever directActive is set. Navigating away restores the
-        // floating window (routeResourceTarget stops matching); navigating
-        // back suppresses it again — no ownership/lifecycle change, purely
-        // derived from state that already exists.
-        !(
-          resourceTarget &&
-          routeResourceTarget &&
-          routeResourceTarget.kind === resourceTarget.kind &&
-          routeResourceTarget.id === resourceTarget.id &&
-          resourcePresentationCall
-        ) && (
-          <FloatingCallWindow
-            title={title}
-            status={floatingStatus}
-            participantCount={participantCount}
-            activeSpeaker={activeSpeaker}
-            screenShareLabel={screenShareLabel}
-            hasRemoteVideo={media.hasRemoteVideo}
-            remoteSeed={remoteSeed}
-            avatarUrl={peer?.avatarUrl}
-            hasLocalVideo={media.hasLocalVideo}
-            localSeed={localSeed}
-            localName={localName}
-            localInitials={localInitials}
-            localAvatarUrl={selfAvatarUrl}
-            controls={controls}
-            onExpand={expand}
-            bindLocalMedia={media.bindLocalMedia}
-            bindRemoteMedia={media.bindRemoteMedia}
-            testId={resourceTarget ? "resource-call-panel" : "floating-call-window"}
-            activationRequired={Boolean(directActive && calls.mediaActivationRequired)}
-            activationLabel={
-              directActive?.call_type === "audio"
-                ? "Permitir microfone"
-                : "Permitir câmera e microfone"
-            }
-            onActivate={() => void calls.activateMedia()}
-            identityStatus={directActive ? identity.status : "ready"}
-            onRetryIdentity={() => identity.retry?.()}
-            error={calls.error ?? resource.error ?? media.error}
-            onRetry={() =>
-              directActive
-                ? void calls.retryMedia()
-                : void resource.reconnect().catch(() => undefined)
-            }
-          />
-        )}
+      {!dedicated && activeCallId && ownerState !== "remote" && (
+        // #657: FloatingCallWindow is ALWAYS rendered when active+local-owner.
+        // ActiveResourceCallBar coexists alongside it — it never replaces the
+        // full call surface. Camera, screen share, video, and "Expandir em
+        // nova aba" remain available through FloatingCallWindow at all times.
+        <FloatingCallWindow
+          title={title}
+          status={floatingStatus}
+          participantCount={participantCount}
+          activeSpeaker={activeSpeaker}
+          screenShareLabel={screenShareLabel}
+          hasRemoteVideo={media.hasRemoteVideo}
+          remoteSeed={remoteSeed}
+          avatarUrl={peer?.avatarUrl}
+          hasLocalVideo={media.hasLocalVideo}
+          localSeed={localSeed}
+          localName={localName}
+          localInitials={localInitials}
+          localAvatarUrl={selfAvatarUrl}
+          controls={controls}
+          onExpand={expand}
+          bindLocalMedia={media.bindLocalMedia}
+          bindRemoteMedia={media.bindRemoteMedia}
+          testId={resourceTarget ? "resource-call-panel" : "floating-call-window"}
+          activationRequired={Boolean(directActive && calls.mediaActivationRequired)}
+          activationLabel={
+            directActive?.call_type === "audio"
+              ? "Permitir microfone"
+              : "Permitir câmera e microfone"
+          }
+          onActivate={() => void calls.activateMedia()}
+          identityStatus={directActive ? identity.status : "ready"}
+          onRetryIdentity={() => identity.retry?.()}
+          error={calls.error ?? resource.error ?? media.error}
+          onRetry={() =>
+            directActive
+              ? void calls.retryMedia()
+              : void resource.reconnect().catch(() => undefined)
+          }
+        />
+      )}
       {!dedicated && !activeCallId && globalCallError && (
         <p className="call-global-error" role="alert">
           {globalCallError}

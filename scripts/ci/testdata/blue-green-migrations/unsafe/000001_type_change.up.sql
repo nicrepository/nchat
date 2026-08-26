@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE chat.messages ALTER COLUMN edit_count TYPE BIGINT;
+COMMIT;
