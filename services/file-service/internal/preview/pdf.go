@@ -48,9 +48,11 @@ import (
 // steady-state footprint of file-service exactly where it was.
 const (
 	// pdfMemoryLimitPages caps the sandbox's linear memory, in 64 KiB
-	// WebAssembly pages. 2048 pages is 128 MiB: comfortably more than a first
-	// page render needs, and a hard ceiling a hostile document cannot talk its
-	// way past. Exceeding it fails the render; it never grows the process.
+	// WebAssembly pages. 2048 pages is 128 MiB: a raw RGBA bitmap at
+	// domain.MaxPreviewDimension (1280) is at most ~6.5 MiB, so this stays
+	// comfortably above what any single page render needs even at the current
+	// resolution, and a hard ceiling a hostile document cannot talk its way
+	// past. Exceeding it fails the render; it never grows the process.
 	pdfMemoryLimitPages = 2048
 
 	// pdfFirstPage is PDFium's zero-based index of the first page, used both

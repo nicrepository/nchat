@@ -84,10 +84,13 @@ const (
 
 	// MaxPreviewDimension is the longest edge of the produced thumbnail. The
 	// aspect ratio is preserved, so this bounds the output on both axes.
-	MaxPreviewDimension = 512
+	// 1280 puts a 16:9 source at exactly 1280x720 — 720p on the long edge —
+	// which is the floor a document preview needs to stay legible when a user
+	// zooms in, not just recognisable as a thumbnail.
+	MaxPreviewDimension = 1280
 
-	// PreviewJPEGQuality is the encoder quality. 80 is the usual thumbnail
-	// trade-off: a 512px preview lands in tens of kilobytes.
+	// PreviewJPEGQuality is the encoder quality. 80 is the usual trade-off; at
+	// 1280px a preview lands in the hundreds of kilobytes rather than tens.
 	PreviewJPEGQuality = 80
 
 	// MaxPreviewPDFPages bounds how many pages of one PDF this service will
