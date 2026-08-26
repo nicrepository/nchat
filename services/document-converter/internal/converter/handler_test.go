@@ -65,6 +65,7 @@ func TestHandlerRejectsDisguisedOrActiveDocumentsBeforeRunner(t *testing.T) {
 		{"external relationship", "docx", zipDocument(t, map[string]string{"word/document.xml": "x", "word/_rels/document.xml.rels": `<Relationship TargetMode="External" Target="https://example.test"/>`})},
 		{"xml entity", "odt", zipDocument(t, map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>`})},
 		{"unknown format", "exe", []byte("MZ")},
+		{"forged CFB header", "ppt", append([]byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}, make([]byte, 504)...)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"path"
 	"strings"
+
+	"github.com/richardlehane/mscfb"
 )
 
 const (
@@ -186,9 +188,33 @@ func externalReference(xml string) bool {
 }
 
 func validatePPT(data []byte) error {
-	// CFB signature. Stream-directory validation is performed by the runner
-	// immediately before invoking LibreOffice.
 	if len(data) < 8 || !bytes.Equal(data[:8], []byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}) {
+		return ErrBlocked
+	}
+	container, err := mscfb.New(bytes.NewReader(data))
+	if err != nil {
+		return ErrBlocked
+	}
+	foundPowerPoint := false
+	for count := 0; count < 4096; count++ {
+		entry, nextErr := container.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return ErrBlocked
+		}
+		name := strings.ToLower(entry.Name)
+		if name == "powerpoint document" {
+			foundPowerPoint = true
+		}
+		for _, active := range []string{"vba", "macros", "_vba_project_cur", "activex", "objectpool", "embedded", "ole10native"} {
+			if strings.Contains(name, active) {
+				return ErrBlocked
+			}
+		}
+	}
+	if !foundPowerPoint {
 		return ErrBlocked
 	}
 	return nil
