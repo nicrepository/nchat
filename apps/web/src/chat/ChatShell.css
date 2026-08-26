@@ -31,6 +31,16 @@
  * Nothing else about the layout is duplicated outside this file.
  */
 
+/* ── Root scroll lock ───────────────────────────────────────────────────────────
+   Added to <html> and <body> by ChatShell for exactly as long as it is mounted,
+   and removed on unmount so auth, profile and admin keep the document scroll
+   they rely on. See useRootScrollLock in ChatShell.tsx for why the shell's own
+   `overflow: hidden` is not enough on its own. */
+html.chat-root-locked,
+body.chat-root-locked {
+  overflow: hidden;
+}
+
 /* ── Scoped tokens ──────────────────────────────────────────────────────────── */
 .chat-app {
   /* Prototype purple accent */

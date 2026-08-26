@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { Outlet, useLocation } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
@@ -225,7 +232,46 @@ function ChatNavBar({
   );
 }
 
+/**
+ * Keeps the document itself unscrollable for as long as the chat is on screen
+ * (issue #467 follow-up).
+ *
+ * The shell is exactly one viewport tall and clips its own content, so on a
+ * correct layout the document has nothing to scroll and this changes nothing.
+ * It is here because "nothing to scroll" is a property of every descendant at
+ * once: an out-of-flow box whose containing block is the initial one — the
+ * `.sr-only` badge that produced this bug — is not clipped by any of the
+ * shell's `overflow` rules, and grows the document's scroll area from wherever
+ * it happens to sit. One statement about the surface costs less than trusting
+ * every future descendant to stay inside a scrollport.
+ *
+ * Scoped to the shell's lifetime rather than declared on `html` in a
+ * stylesheet: login, profile and admin are ordinary documents that scroll.
+ * `useLayoutEffect` so the lock and the reset land in the same frame as the
+ * first paint, and the reset is instant — a smooth scroll would animate a jump
+ * the user never asked for. Both run once: this is about the surface being
+ * mounted, not about anything that changes while it is.
+ */
+function useRootScrollLock() {
+  useLayoutEffect(() => {
+    const { documentElement, body } = document;
+    // `overflow: hidden` freezes a scroll position rather than discarding it,
+    // so arriving from a scrolled route has to be normalised, not just locked.
+    window.scrollTo(0, 0);
+    documentElement.classList.add(ROOT_LOCK_CLASS);
+    body.classList.add(ROOT_LOCK_CLASS);
+    return () => {
+      documentElement.classList.remove(ROOT_LOCK_CLASS);
+      body.classList.remove(ROOT_LOCK_CLASS);
+    };
+  }, []);
+}
+
+/** Named once, because ChatShell.css and ChatShell.test.tsx both spell it. */
+export const ROOT_LOCK_CLASS = "chat-root-locked";
+
 export default function ChatShell() {
+  useRootScrollLock();
   const {
     state,
     retry,
