@@ -11,7 +11,28 @@ import (
 
 const RouteMetrics = "/metrics"
 
-func NewRouter(cfg config.Config, logger *slog.Logger) http.Handler {
+// Option configures the router. Variadic so the existing two-argument calls,
+// including every test, keep working unchanged.
+type Option func(*routerOptions)
+
+type routerOptions struct {
+	// smtpWorkerProbe reports whether the SMTP worker is alive. Nil when the
+	// caller has no worker to report on, in which case readiness judges the
+	// configuration alone.
+	smtpWorkerProbe func() bool
+}
+
+// WithSMTPWorkerProbe lets readiness observe the worker rather than only the
+// configuration that was supposed to start it.
+func WithSMTPWorkerProbe(probe func() bool) Option {
+	return func(o *routerOptions) { o.smtpWorkerProbe = probe }
+}
+
+func NewRouter(cfg config.Config, logger *slog.Logger, opts ...Option) http.Handler {
+	options := routerOptions{}
+	for _, apply := range opts {
+		apply(&options)
+	}
 	_ = logger
 
 	obsCfg := observability.LoadConfig(cfg.ServiceName)
@@ -19,7 +40,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.Handle(RouteHealthz, httputil.MethodNotAllowed(http.MethodGet, Healthz(cfg)))
-	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg)))
+	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg, options)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

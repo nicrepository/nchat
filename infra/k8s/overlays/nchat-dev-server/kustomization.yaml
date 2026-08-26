@@ -1,6 +1,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: nchat-dev
+components:
+  - ../../components/least-privilege-network-policies
 resources:
   - ../../base
   # ClamAV is referenced here and only here. It lives under base/services/ so
@@ -12,7 +14,6 @@ resources:
   - certificate.yaml
   - ingress.yaml
   - media.yaml
-  - network-policies.yaml
 configMapGenerator:
   - name: nchat-dev-topology
     envs:
@@ -29,8 +30,6 @@ patches:
         value: nchat-dev
   - path: configmap-patch.yaml
   - path: quota-patch.yaml
-  - path: delete-same-namespace-network-policy.yaml
-  - path: delete-traefik-network-policy.yaml
   - path: patches/web.yaml
   - path: patches/auth-service.yaml
   - path: patches/chat-service.yaml

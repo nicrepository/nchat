@@ -1,0 +1,258 @@
+# Production edge (issue #626).
+#
+# Every backend below is a stable Service name. Nothing here mentions blue or
+# green, and nothing here changes during a release: the cutover moves the
+# Services' selectors, so the routing table Traefik holds is the same before
+# and after. That is the property that makes rollback a single write instead of
+# an edge reconfiguration.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    # The three public-prefix rewrites, identical in shape to every other
+    # overlay and to the local gateway: auth-service registers /auth/*,
+    # media-service /media/*, file-service /attachments/*. They act on mutually
+    # exclusive prefixes, so chaining them is order-independent.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-media-api-prefix@kubernetescrd,nchat-prod-strip-files-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - REPLACE_ME_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: REPLACE_ME_HOST
+      http:
+        paths:
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  name: http
+          - path: /api/chat
+            pathType: Prefix
+            backend:
+              service:
+                name: chat-service
+                port:
+                  name: http
+          - path: /api/files
+            pathType: Prefix
+            backend:
+              service:
+                name: file-service
+                port:
+                  name: http
+          - path: /api/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  name: http
+          # No /api/admin here: the Admin API is published only on the
+          # administrative host, so the chat origin cannot reach it.
+          - path: /api/search
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service
+                port:
+                  name: http
+          - path: /api/media
+            pathType: Prefix
+            backend:
+              service:
+                name: media-service
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-web
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-admin
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-auth-api-prefix@kubernetescrd,nchat-prod-admin-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - admin.REPLACE_ME_ADMIN_HOST
+      secretName: nchat-prod-tls
+  rules:
+    - host: admin.REPLACE_ME_ADMIN_HOST
+      http:
+        paths:
+          - path: /api/admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service
+                port:
+                  name: http
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web
+                port:
+                  name: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/auth/(.*)"
+    replacement: "/auth/${1}"
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: media-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/media/(.*)"
+    replacement: "/${1}"
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: admin-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/admin/(.*)"
+    replacement: "/${1}"
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-files-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  stripPrefix:
+    prefixes:
+      - /api/files
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: upload-inflight
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  inFlightReq:
+    amount: 16
+---
+# The two attachment upload routes, and only those, go through the upload
+# guard, which caps the request body while streaming it. The guard is shared by
+# both slots rather than duplicated: it is a pinned nginx that no NChat release
+# changes, so giving it a slot would add a moving part without adding safety.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-prod-uploads
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`REPLACE_ME_HOST`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      middlewares:
+        - name: upload-inflight
+        - name: strip-files-prefix
+      services:
+        - name: upload-guard
+          port: 8080
+  tls:
+    secretName: nchat-prod-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-prod-http
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-prod-redirect-https@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: REPLACE_ME_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-web
+                port:
+                  name: http
+    - host: admin.REPLACE_ME_ADMIN_HOST
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web
+                port:
+                  name: http

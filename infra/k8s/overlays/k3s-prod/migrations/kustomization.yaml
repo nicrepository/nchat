@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The production schema migration, applied as its own step (issue #626).
+#
+# Blue and Green share one database, so this Job runs once per release, before
+# the candidate slot is deployed, and its failure stops the release. The Job's
+# shape is base's — the same one nchat-dev has been running — so production is
+# not the first place a different migration mechanism is tried.
+namespace: nchat-prod
+resources:
+  - ../../../base/migrations
+images:
+  - name: ghcr.io/nicrepository/nchat/migrations
+    newTag: sha-placeholder
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-prod
