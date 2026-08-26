@@ -1,0 +1,2 @@
+Running|node-a|500m 1Gi 64Mi
+Running|node-a|100m 256Mi 64Mi

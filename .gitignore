@@ -154,3 +154,8 @@ results.sarif
 semgrep_results.json
 trivy_results.json
 kustomize_render.yaml
+
+# Python bytecode. The repository versions Python under scripts/ci and
+# scripts/deploy, so running or importing any of it leaves these behind.
+__pycache__/
+*.py[cod]

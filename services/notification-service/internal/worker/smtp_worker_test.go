@@ -43,7 +43,16 @@ type failureCall struct {
 	status      string
 }
 
-func (f *fakeOutboxStore) ClaimBatch(_ context.Context, maxAttempts, deadlineSeconds, batchSize int) ([]storage.OutboxRow, error) {
+// The store honours the context it is given.
+//
+// It used to ignore it, which let tests assert timeout behaviour that the code
+// did not actually have: a cancelled context still produced a successful claim
+// and a successful finalise, so a test could pass while the real store would
+// have failed.
+func (f *fakeOutboxStore) ClaimBatch(ctx context.Context, maxAttempts, deadlineSeconds, batchSize int) ([]storage.OutboxRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.claimCalls = append(f.claimCalls, claimCall{maxAttempts: maxAttempts, deadlineSeconds: deadlineSeconds, batchSize: batchSize})
 	if f.claimCh != nil {
 		select {
@@ -59,12 +68,18 @@ func (f *fakeOutboxStore) ClaimBatch(_ context.Context, maxAttempts, deadlineSec
 	return rows, nil
 }
 
-func (f *fakeOutboxStore) FinaliseSuccess(_ context.Context, id string) error {
+func (f *fakeOutboxStore) FinaliseSuccess(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.successCalls = append(f.successCalls, id)
 	return f.finaliseSuccessErr
 }
 
-func (f *fakeOutboxStore) FinaliseFailure(_ context.Context, id string, attempts int, lastError string, backoffSec int, maxAttempts int) error {
+func (f *fakeOutboxStore) FinaliseFailure(ctx context.Context, id string, attempts int, lastError string, backoffSec int, maxAttempts int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	status := "pending"
 	if attempts >= maxAttempts {
 		status = "failed"

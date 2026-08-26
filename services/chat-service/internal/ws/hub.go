@@ -1095,16 +1095,43 @@ func (h *Hub) deliverToLocalUserSessions(evt Event, data []byte) {
 // so it is responsible for closing it. Callers must not call bus.Close()
 // separately after hub.Shutdown() — BroadcastBus.Close is idempotent and
 // handles double-close safely.
+// Shutdown stops the hub and waits for its goroutines without a deadline.
+// Retained for callers that have none of their own.
 func (h *Hub) Shutdown() {
+	_ = h.ShutdownContext(context.Background())
+}
+
+// ShutdownContext stops the hub, giving up the wait when ctx expires.
+//
+// The waits below are for goroutines that have just been told to stop, so they
+// normally return at once. "Normally" is not a guarantee, and an unbounded wait
+// here holds the whole process past its termination grace period — at which
+// point the kubelet kills it mid-cleanup, which is worse than reporting that
+// the hub did not stop in time.
+func (h *Hub) ShutdownContext(ctx context.Context) error {
 	// Before anything is torn down: the assertions this instance made are keyed
 	// by subscriptions that close(h.quit) is about to discard, and a clean
 	// departure is worth saying while it can still be said (RF-58).
 	h.withdrawLocalPresence()
 	h.busCancel()
 	close(h.quit)
-	<-h.done
-	<-h.broadcastDone
+	if err := awaitClose(ctx, h.done); err != nil {
+		return err
+	}
+	if err := awaitClose(ctx, h.broadcastDone); err != nil {
+		return err
+	}
 	h.bus.Close() // stop subscriber goroutines; idempotent
+	return nil
+}
+
+func awaitClose(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // run is the hub's main coordination goroutine.

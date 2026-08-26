@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+# One ConfigMap, mounted identically by both slots. Every key here is a
+# deliberate production value, not a default that happens to be right: a slot
+# that inherited a different implicit default from the other would be an
+# untested configuration rather than an untested version, which is the one thing
+# Blue/Green must never be.
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  # Filled from topology.env by the replacement in kustomization.yaml. Both
+  # slots read this one value, which is what keeps the public callback on the
+  # stable host: a slot must never publish itself as the application's address.
+  AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
+  # k3s pod CIDR. The gateway is the only trusted hop in front of the services.
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
+
+  # --- realtime ---------------------------------------------------------
+  # Not optional in production, and stated rather than defaulted (the code
+  # default is false).
+  #
+  # chat-service falls back to ws.NopBus and pod-local presence when this is
+  # off. Production runs two replicas of chat-service in the active slot alone,
+  # and during a release the previous slot's replicas are still holding the
+  # WebSockets that have not reconnected yet. Without the Valkey bus a message
+  # published on one pod never reaches a subscriber on another, so a user would
+  # see their own messages and nobody else's — and the failure would look like
+  # a realtime bug rather than a missing key.
+  VALKEY_WS_BROADCAST_ENABLED: "true"
+  # chat-service sends 1 call.sync + 12 subscribe messages right after open
+  # (issue #455); raising only the burst absorbs that spike while the sustained
+  # rate stays at the code default.
+  WS_INBOUND_BURST: "60"
+
+  # --- attachments ------------------------------------------------------
+  # Uploads are a production feature, so the flag is on. With it off the routes
+  # answer 503 "attachment uploads are disabled", which is the documented
+  # behaviour of the default and not a fault — which is exactly why leaving it
+  # implicit would have shipped a silently crippled production.
+  FILE_UPLOADS_ENABLED: "true"
+  # Never false. A fresh upload stays in pending_scan and no byte derived from
+  # it is served until a real scan approves it.
+  FILE_MALWARE_SCAN_REQUIRED: "true"
+  # The shared ClamAV Service rendered by this same overlay
+  # (base/services/clamav/service.yaml, port 3310). Plain host:port dial target:
+  # no scheme, no path, no credentials. One scanner for both slots — an
+  # attachment accepted while Blue serves must be readable after the cutover.
+  FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
+  # The external, fail-closed authority over one scan. It must stay below
+  # clamd's own MaxScanTime (420000 ms) and it derives the worker's claim lease;
+  # the ordering 300 < 330 < 420 is asserted in CI.
+  FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"
+
+  # --- calls ------------------------------------------------------------
+  LIVEKIT_ENABLED: "true"
+  LIVEKIT_TTL_SECONDS: "300"
+  # The browser's connect-src allowlist for the media plane, filled from
+  # topology.env. Both slots read this one key, so the two of them address the
+  # same shared LiveKit — LiveKit is deliberately not part of the Blue/Green
+  # rotation. An empty value with LIVEKIT_ENABLED=true would leave the CSP
+  # blocking the very connection the feature needs, so
+  # scripts/ci/prod-blue-green-check.sh refuses that combination.
+  NCHAT_WEB_LIVEKIT_CONNECT_SRC: REPLACE_ME_LIVEKIT_CONNECT_SRC
+
+  # --- identity ---------------------------------------------------------
+  OIDC_ENABLED: "true"
+  OIDC_AUTO_PROVISION_ENABLED: "true"
+
+  # --- link safety ------------------------------------------------------
+  # Written out rather than left absent: the application default is also false,
+  # so a silently missing key and a deliberate "no" would look identical. Off
+  # until the provider's behaviour is judged fit to gate production messages;
+  # turning it on requires the nchat-link-safety Secret to exist first, because
+  # both services refuse to start rather than accept links nobody checked.
+  CHAT_LINK_SAFETY_ENABLED: "false"
+  FILE_LINK_SAFETY_ENABLED: "false"
+
+  SMTP_WORKER_ENABLED: "true"

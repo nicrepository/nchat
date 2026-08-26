@@ -1,0 +1,152 @@
+# One PodDisruptionBudget per workload (issue #626).
+#
+# An earlier revision used a single slot-wide budget with maxUnavailable: 1.
+# That was wrong in a way that only shows up during a node drain: the budget was
+# satisfied by the eighteen other pods in the slot, so the eviction of
+# auth-service's only pod was always permitted and the service disappeared while
+# the budget still read as healthy. A budget has to describe one unit of
+# availability, and these workloads are not one unit.
+#
+# So each workload that runs two replicas gets minAvailable: 1 — a drain may take
+# one of its pods and must wait for the replacement before taking the other.
+#
+# auth-service deliberately has NO budget. It runs a single replica because its
+# avatar volume is ReadWriteOnce and a single replica owns writes (see
+# base/services/auth-service/avatar-pvc.yaml), and a budget over one replica can
+# only be honest in one of two ways: minAvailable: 1 would block every voluntary
+# eviction, making node drains impossible without an operator deleting the
+# budget, or maxUnavailable: 1 would permit exactly the eviction it appears to
+# guard. Neither is a guarantee, so none is claimed. The real fix is horizontal
+# scaling, which needs RWX or avatars in object storage — a data-model change,
+# not part of this issue. The limitation is recorded in the runbook.
+#
+# The slot label reaches every selector below through the slot Kustomization, so
+# no budget can match the other slot's pods.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nchat-web
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: web
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nchat-admin-web
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: admin-web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: admin-web
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chat-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: chat
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: chat
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: file-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: file
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: file
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: notification-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: notification
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: notification
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: admin-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: admin
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: admin
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: search-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: search
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: search
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: media-service
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: media
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: media

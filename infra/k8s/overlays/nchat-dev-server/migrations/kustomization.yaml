@@ -2,7 +2,18 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: nchat-dev
 resources:
-  - job.yaml
+  - ../../../base/migrations
+patches:
+  # The dev server is a single named node and its PostgreSQL PersistentVolume is
+  # bound to it; the Job has to run where the database is.
+  - target:
+      kind: Job
+      name: nchat-migrations
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          kubernetes.io/hostname: srv-apps-01
 images:
   - name: ghcr.io/nicrepository/nchat/migrations
     newTag: sha-placeholder

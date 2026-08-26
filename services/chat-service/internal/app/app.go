@@ -76,42 +76,92 @@ type App struct {
 func (a *App) Shutdown(ctx context.Context) error {
 	var err error
 	a.shutdownOnce.Do(func() {
-		if a.callWorkerCancel != nil {
-			a.callWorkerCancel()
-			a.callWorkerWG.Wait()
-		}
-		// Before the hub: the link-scan worker publishes through it, so stopping
-		// it first is what keeps a promotion from racing the hub's shutdown.
-		if a.linkScanCancel != nil {
-			a.linkScanCancel()
-			a.linkScanWG.Wait()
-		}
-		a.hub.Shutdown()
-		a.presence.Stop()
-		// After the hub, which is the only writer to it.
-		if a.presenceDirectory != nil {
-			a.presenceDirectory.Close()
-		}
-		if a.mentionCache != nil {
-			a.mentionCache.Close()
-		}
-		if a.reactionLimiter != nil {
-			a.reactionLimiter.Close()
-		}
-		if a.typingLimiter != nil {
-			a.typingLimiter.Close()
-		}
-		if a.typingStore != nil {
-			a.typingStore.Close()
-		}
-		// Close the DB pool only after the hub has drained connections that
-		// may still be issuing queries.
-		if a.closeDB != nil {
-			a.closeDB()
-		}
-		err = a.TracingShutdown(ctx)
+		err = a.shutdownComponents(ctx)
 	})
 	return err
+}
+
+// shutdownComponents stops everything in dependency order, bounded by ctx.
+//
+// Every wait here is for something that has just been cancelled, so the normal
+// path is immediate. The deadline matters for the path that is not normal: a
+// worker that will not return, or a hub goroutine wedged on a slow bus, used to
+// hold the process open indefinitely while the kubelet's grace period ran out.
+func (a *App) shutdownComponents(ctx context.Context) error {
+	workerErr := a.stopWorkers(ctx)
+	// Before the hub: the link-scan worker publishes through it, so stopping it
+	// first is what keeps a promotion from racing the hub's shutdown.
+	hubErr := a.hub.ShutdownContext(ctx)
+	a.presence.Stop()
+	a.closeResources()
+	return firstShutdownError(workerErr, hubErr, a.TracingShutdown(ctx))
+}
+
+func (a *App) stopWorkers(ctx context.Context) error {
+	var callErr, linkErr error
+	if a.callWorkerCancel != nil {
+		a.callWorkerCancel()
+		callErr = awaitWaitGroup(ctx, a.callWorkerWG)
+	}
+	if a.linkScanCancel != nil {
+		a.linkScanCancel()
+		linkErr = awaitWaitGroup(ctx, a.linkScanWG)
+	}
+	return firstShutdownError(callErr, linkErr)
+}
+
+// closeResources releases what the hub was using, in the order that keeps the
+// database open until nothing can still query it.
+func (a *App) closeResources() {
+	// After the hub, which is the only writer to it.
+	if a.presenceDirectory != nil {
+		a.presenceDirectory.Close()
+	}
+	if a.mentionCache != nil {
+		a.mentionCache.Close()
+	}
+	if a.reactionLimiter != nil {
+		a.reactionLimiter.Close()
+	}
+	if a.typingLimiter != nil {
+		a.typingLimiter.Close()
+	}
+	if a.typingStore != nil {
+		a.typingStore.Close()
+	}
+	// Close the DB pool only after the hub has drained connections that may
+	// still be issuing queries.
+	if a.closeDB != nil {
+		a.closeDB()
+	}
+}
+
+// awaitWaitGroup waits, but not past the deadline.
+//
+// sync.WaitGroup has no context-aware Wait. The goroutine below outlives a
+// timeout, which is acceptable precisely because the workers it waits on have
+// already been cancelled: it ends when they do, rather than never.
+func awaitWaitGroup(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func firstShutdownError(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // New assembles the application. Bootstrap outcomes by state:

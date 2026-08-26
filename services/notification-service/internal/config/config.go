@@ -57,6 +57,39 @@ func Load() Config {
 	}
 }
 
+// SMTPLeaseSeconds is how long a claimed outbox row is held. SMTPFinaliseGrace
+// is what is reserved, after the send returns, to record the outcome.
+//
+// They live here rather than in the worker because three places need the same
+// rule — the worker before it starts, App before it starts the worker, and
+// readiness — and only config is below all three. Duplicating the arithmetic is
+// how a lease and a timeout drift into incompatibility unnoticed.
+const (
+	SMTPLeaseSeconds         = 30
+	SMTPFinaliseGraceSeconds = 5
+)
+
+// SMTPProtectedProcessingSeconds is the longest one message may occupy its
+// lease: the send, plus recording what happened.
+func (c Config) SMTPProtectedProcessingSeconds() int {
+	seconds := c.SMTPTimeoutSeconds
+	if seconds <= 0 {
+		seconds = 10
+	}
+	return seconds + SMTPFinaliseGraceSeconds
+}
+
+// SMTPLeaseCoversProcessing reports whether a claimed row stays claimed for at
+// least as long as the worker may spend on it.
+//
+// When it does not, a second worker can reclaim a row the first is still
+// sending — and with Blue/Green there is always a second worker. The worker
+// refuses to run in that state, so the condition has to be visible to
+// readiness too, or the pod stays green with no worker behind it.
+func (c Config) SMTPLeaseCoversProcessing() bool {
+	return SMTPLeaseSeconds > c.SMTPProtectedProcessingSeconds()
+}
+
 // SMTPWorkerReady returns (true, "") when the worker is enabled and properly
 // configured. Returns (false, reason) otherwise.
 func (c Config) SMTPWorkerReady() (bool, string) {
@@ -71,6 +104,9 @@ func (c Config) SMTPWorkerReady() (bool, string) {
 	}
 	if c.SMTPTLSMode == "none" && c.Env != "development" && c.Env != "test" && c.Env != "local" {
 		return false, "SMTP_TLS_MODE=none is only allowed in development/test/local environments"
+	}
+	if !c.SMTPLeaseCoversProcessing() {
+		return false, "SMTP_TIMEOUT_SECONDS leaves no room to record a delivery inside the outbox lease"
 	}
 	return true, ""
 }
