@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import ConversationSystemMessage from "./ConversationSystemMessage";
+import ConversationSystemMessage from "./ConversationSystemMessage.tsx";
 import type { Message } from "./chatTypes";
 import { systemMessagePresentation } from "./conversationSystemMessage";
 

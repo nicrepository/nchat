@@ -231,6 +231,8 @@ test.describe("chamada 1:1", () => {
 
     initialSidebar.resolve();
     const retry = unresolvedDialog.getByRole("button", { name: "Tentar novamente" });
+    await expect(retry).toBeVisible();
+    expect(sidebarRequests).toBe(1);
     await retry.click();
     await expect.poll(() => sidebarRequests).toBe(2);
     await expect(retry).toHaveCount(0);
@@ -241,6 +243,7 @@ test.describe("chamada 1:1", () => {
 
     const dialog = page.getByLabel(`Chamada com ${participantName}`);
     await expect(dialog.getByRole("button", { name: "Encerrar chamada" })).toBeVisible();
+    expect(sidebarRequests).toBe(2);
     // RF-23: an active call restored this way (never locally started or
     // accepted by this tab) must not request media on its own, however long
     // identity took to resolve — only the explicit activation click may.

@@ -618,7 +618,12 @@ describe("composer drafts never cross conversation targets", () => {
     expect(api.postChannelMessage).toHaveBeenCalledWith(
       channelId,
       "mensagem nova para o canal geral",
-      { parentMessageId: undefined, referencedMessageId: undefined, attachmentIds: undefined },
+      {
+        parentMessageId: undefined,
+        referencedMessageId: undefined,
+        attachmentIds: undefined,
+        idempotencyKey: expect.any(String),
+      },
     );
     expect(api.postChannelMessage).not.toHaveBeenCalledWith(
       expect.anything(),

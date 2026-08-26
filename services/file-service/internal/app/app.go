@@ -60,6 +60,8 @@ type App struct {
 	linkPreviewLimiter *httpapi.UserRateLimiter
 	cleanupCancel      context.CancelFunc
 	cleanupDone        <-chan struct{}
+	draftExpiryCancel  context.CancelFunc
+	draftExpiryDone    <-chan struct{}
 	scanCancel         context.CancelFunc
 	scanDone           <-chan struct{}
 	// linkScanCancel/linkScanDone own the RF-21 URL scan worker, on exactly the
@@ -296,9 +298,10 @@ func (a *App) wireAttachments(
 	a.rateLimiter = limiter
 
 	routerDeps.TokenValidator = validator
+	attachmentStore := storage.NewPGXAttachmentStore(pool)
 	routerDeps.Attachments = service.NewAttachmentService(
 		storage.NewPGXDestinationAuthorizer(pool),
-		storage.NewPGXAttachmentStore(pool),
+		attachmentStore,
 		objects,
 		keys,
 		cfg.MaxUploadBytes,
@@ -333,6 +336,7 @@ func (a *App) wireAttachments(
 	a.startCleanupWorker(service.NewObjectCleanupService(
 		cleanupStore, objects, attachmentMetrics, logger,
 	), logger)
+	a.startDraftExpiryWorker(service.NewDraftExpiryService(attachmentStore, 50), logger)
 	a.startMalwareScanWorker(cfg, pool, fence, objects, keys, attachmentMetrics, logger)
 	return nil
 }
@@ -467,6 +471,17 @@ func (a *App) startCleanupWorker(cleanups *service.ObjectCleanupService, logger 
 	a.cleanupDone = done
 }
 
+func (a *App) startDraftExpiryWorker(expiry *service.DraftExpiryService, logger *slog.Logger) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.NewDraftExpiry(expiry, logger).Start(ctx)
+	}()
+	a.draftExpiryCancel = cancel
+	a.draftExpiryDone = done
+}
+
 // startLinkScanWorker drains the RF-21 URL scan queue for as long as the app
 // lives (issue #135).
 //
@@ -508,9 +523,10 @@ func (a *App) Shutdown(ctx context.Context) error {
 		// Both workers hold the pool, so both must be stopped before it closes.
 		previewStopped := a.stopPreviewWorker(ctx)
 		cleanupStopped := a.stopWorker(ctx, a.cleanupCancel, a.cleanupDone)
+		draftExpiryStopped := a.stopWorker(ctx, a.draftExpiryCancel, a.draftExpiryDone)
 		scanStopped := a.stopWorker(ctx, a.scanCancel, a.scanDone)
 		linkScanStopped := a.stopWorker(ctx, a.linkScanCancel, a.linkScanDone)
-		if previewStopped && cleanupStopped && scanStopped && linkScanStopped {
+		if previewStopped && cleanupStopped && draftExpiryStopped && scanStopped && linkScanStopped {
 			if a.pool != nil {
 				a.pool.Close()
 			}

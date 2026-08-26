@@ -193,7 +193,7 @@ func (h *attrCapturingHandler) value(key string) string {
 	return found
 }
 
-// Three jobs share this loop, so a failure has to say which one failed.
+// Several jobs share this loop, so a failure has to say which one failed.
 //
 // The assertion is on the `worker` attribute alone and not on the message: the
 // wording is free to change, but an operator triaging a stuck scan queue must
@@ -207,6 +207,7 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 		{"preview", worker.NewPreview, "preview"},
 		{"cleanup", worker.NewObjectCleanup, "object_cleanup"},
 		{"scan", worker.NewMalwareScan, "malware_scan"},
+		{"draft expiry", worker.NewDraftExpiry, "draft_expiry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			handler := newAttrCapturingHandler()
@@ -239,6 +240,35 @@ func TestAFailedPassNamesTheWorkerThatFailed(t *testing.T) {
 				t.Fatalf("worker attribute = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDraftExpiryUsesSafeDefaultLoggerAndRuns(t *testing.T) {
+	processor := newCountingProcessor()
+	job := worker.NewDraftExpiry(processor, nil)
+	job.SetIntervalForTest(10 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		job.Start(ctx)
+	}()
+	select {
+	case <-processor.signal:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("draft expiry worker never processed a pass")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("draft expiry worker did not stop after cancellation")
+	}
+	if got := processor.callCount(); got < 1 {
+		t.Fatalf("draft expiry passes = %d, want at least one", got)
 	}
 }
 

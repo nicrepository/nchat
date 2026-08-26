@@ -21,7 +21,7 @@ func rangeFixture(t *testing.T, size int) (*fixture, []byte) {
 	for i := range payload {
 		// A repeating but non-uniform pattern: a wrong offset produces visibly
 		// wrong bytes rather than accidentally matching.
-		payload[i] = byte(i*7 + i/251)
+		payload[i] = byte('a' + (i*7+i/251)%26)
 	}
 	f.store.authorized = storedAttachment(t, f, payload, domain.StatusClean)
 	return f, payload

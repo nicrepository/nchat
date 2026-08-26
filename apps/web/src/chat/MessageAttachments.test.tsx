@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -210,6 +210,34 @@ describe("message attachments — image preview and lightbox", () => {
 
     await screen.findByTestId("chat-message-attachment-image-webp-1");
     expect(mockContent).toHaveBeenCalledWith("webp-1", expect.any(AbortSignal));
+  });
+
+  it("groups contiguous images, keeps mixed document order and expands the +N remainder", async () => {
+    const images = Array.from({ length: 5 }, (_, index) =>
+      imageAttachment({ id: `img-${index + 1}`, filename: `${index + 1}.png` }),
+    );
+    render(
+      <MessageAttachments
+        attachments={[...images, attachment({ id: "doc-1", filename: "fim.pdf" })]}
+      />,
+    );
+
+    const grid = screen.getByTestId("chat-message-image-grid");
+    expect(grid).toHaveAttribute("data-count", "5");
+    for (let index = 1; index <= 4; index += 1) {
+      const card = screen.getByTestId(`chat-message-attachment-img-${index}`);
+      expect(card.querySelector(".chat-msg-area__attachment-row")).not.toBeNull();
+      expect(within(card).getByText(`${index}.png`)).toBeInTheDocument();
+      expect(within(card).getByText("Verificado")).toBeInTheDocument();
+      expect(within(card).getByRole("button", { name: `Baixar ${index}.png` })).toBeInTheDocument();
+    }
+    expect(screen.queryByTestId("chat-message-attachment-img-5")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Mostrar mais 1 imagem" }));
+    expect(screen.getByTestId("chat-message-attachment-img-5")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("chat-message-attachment-doc-1").compareDocumentPosition(grid) &
+        Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
   });
 
   it("respects prefers-reduced-motion end to end: a GIF shows the static preview, not the animated original", async () => {

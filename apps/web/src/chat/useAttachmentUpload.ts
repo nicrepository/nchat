@@ -1,27 +1,13 @@
-/**
- * useAttachmentUpload — the composer's one attachment pipeline (RF-32, #458).
- *
- * There is a single entry point, `selectFile`, and both ways of choosing a file
- * go through it: the toolbar's file input and a drop on the composer. Limit
- * lookup, size validation, the POST, error normalisation and the busy state all
- * live here once, so the picker and the drop cannot drift apart or validate
- * differently.
- *
- * The hook is destination-agnostic: it takes the target the composer is already
- * bound to, so a channel and a DM use the same code and differ only in the
- * route `uploadAttachment` derives from `target.kind`.
- *
- * Security: nothing here is a control. file-service authenticates, authorises
- * the destination, re-reads the workspace's policy and counts the bytes it
- * actually receives; the size check below only spares the user an upload that
- * cannot succeed, and its verdict is always superseded by the service's.
- */
-
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { UploadProgress } from "../lib/api";
-import { fetchWorkspaceUploadLimit } from "./chatApi";
-import { AttachmentUploadError, tooLargeMessage, uploadAttachment } from "./filesApi";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
+import {
+  AttachmentUploadError,
+  deleteAttachmentDraft,
+  tooLargeMessage,
+  uploadAttachment,
+} from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";
 
 export interface AttachmentUploadTarget {
@@ -29,197 +15,324 @@ export interface AttachmentUploadTarget {
   id: string;
 }
 
-export type AttachmentUploadStatus = "idle" | "uploading" | "failed" | "success";
+export type AttachmentUploadStatus = "queued" | "uploading" | "failed" | "success";
 
-export interface AttachmentUploadState {
+export interface AttachmentUploadItem {
+  localId: string;
+  file: File;
   status: AttachmentUploadStatus;
-  /** User-facing message for a failure. Never server text. */
-  error: string | null;
-  /** Name of the last successfully uploaded file, for the success notice. */
-  uploadedName: string | null;
-  /**
-   * The persisted attachment the last successful upload produced (RF-32).
-   *
-   * It is kept, not discarded, because the upload and the message are two
-   * separate acts: the bytes are already on the server, and this is the
-   * reference the composer sends when the user finally presses Enviar. Nothing
-   * is re-uploaded at that point.
-   *
-   * Null in every other state, including after `dismiss`, so the composer's
-   * pending attachment and this value are the same fact.
-   */
-  uploadedAttachment: ChannelAttachment | null;
-  /**
-   * Bytes actually sent, as the transport reports them, or null when it has
-   * reported none yet — which is also what a body of unknown length looks like.
-   *
-   * Null is the instruction to show an indeterminate state. It is never
-   * substituted with a guess, a timer or a percentage derived from the file's
-   * own size: those would describe a transfer nothing observed.
-   */
   progress: UploadProgress | null;
-  selectFile: (file: File) => void;
-  /** Clears a finished outcome so the composer returns to its resting state. */
-  dismiss: () => void;
+  error: string | null;
+  attachment: ChannelAttachment | null;
 }
 
-/**
- * @param target      destination the composer is bound to.
- * @param onUploaded  called after a successful upload so the caller can
- *                    reconcile whatever renders the destination's files.
- */
+export interface AttachmentUploadState {
+  items: AttachmentUploadItem[];
+  status: "idle" | "uploading" | "failed" | "success";
+  error: string | null;
+  uploadedName: string | null;
+  uploadedAttachment: ChannelAttachment | null;
+  progress: UploadProgress | null;
+  aggregateProgress: UploadProgress | null;
+  busy: boolean;
+  notice: string | null;
+  selectFile: (file: File) => void;
+  selectFiles: (files: Iterable<File>) => void;
+  remove: (localId: string) => void;
+  retry: (localId: string) => void;
+  dismiss: () => void;
+  resetAfterPublish: () => void;
+}
+
+const MAX_CONCURRENT = 2;
+
+const fileKey = (file: File) => `${file.name}\0${file.size}\0${file.lastModified}`;
+const explicitlyUnsupportedFile = (file: File) => {
+  const type = file.type.toLowerCase();
+  const extension = file.name.toLowerCase().split(".").pop() ?? "";
+  return (
+    type === "image/svg+xml" ||
+    type === "text/html" ||
+    type === "application/x-msdownload" ||
+    type === "application/x-executable" ||
+    ["exe", "dll", "com", "bat", "cmd", "msi"].includes(extension)
+  );
+};
+const failureMessage = (cause: unknown) =>
+  cause instanceof AttachmentUploadError ? cause.message : "Não foi possível enviar o arquivo.";
+
 export function useAttachmentUpload(
   target: AttachmentUploadTarget | null,
+  limits: WorkspaceAttachmentLimits,
   onUploaded?: () => void,
 ): AttachmentUploadState {
-  const [status, setStatus] = useState<AttachmentUploadStatus>("idle");
-  const [error, setError] = useState<string | null>(null);
-  const [uploadedName, setUploadedName] = useState<string | null>(null);
-  const [uploadedAttachment, setUploadedAttachment] = useState<ChannelAttachment | null>(null);
-  const [progress, setProgress] = useState<UploadProgress | null>(null);
-
-  // Guards every state write, so an upload that resolves after the composer
-  // unmounted (target switch, navigation) dispatches nothing.
+  const [items, setItems] = useState<AttachmentUploadItem[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
+  const itemsRef = useRef(items);
   const mountedRef = useRef(true);
-  // Distinct from `status`: it is read synchronously inside selectFile, which
-  // is what actually stops a second drop landing before React re-renders.
-  const busyRef = useRef(false);
+  const activeRef = useRef(0);
+  const sequenceRef = useRef(0);
+  const startedRef = useRef(new Set<string>());
+  const controllersRef = useRef(new Map<string, AbortController>());
+  const targetRef = useRef(target);
+  targetRef.current = target;
+  const pumpRef = useRef<() => void>(() => undefined);
+  const targetKey = target ? `${target.kind}:${target.id}` : "";
+  const ownerRef = useRef(targetKey);
+  const limitsRef = useRef(limits);
+  limitsRef.current = limits;
+
+  const replaceItems = useCallback(
+    (update: (current: AttachmentUploadItem[]) => AttachmentUploadItem[]) => {
+      if (!mountedRef.current) return;
+      setItems((current) => {
+        const next = update(current);
+        itemsRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
+
+  const runItem = useCallback(
+    async (item: AttachmentUploadItem) => {
+      const currentTarget = targetRef.current;
+      if (!currentTarget) return;
+      activeRef.current += 1;
+      const controller = new AbortController();
+      controllersRef.current.set(item.localId, controller);
+      replaceItems((current) =>
+        current.map((entry) =>
+          entry.localId === item.localId ? { ...entry, status: "uploading", error: null } : entry,
+        ),
+      );
+      try {
+        const limit = limitsRef.current.maxUploadBytes;
+        if (limit !== null && item.file.size > limit) {
+          throw new AttachmentUploadError("too_large", tooLargeMessage(limit));
+        }
+        const attachment = await uploadAttachment(
+          currentTarget,
+          item.file,
+          limit,
+          controller.signal,
+          (progress) =>
+            replaceItems((current) =>
+              current.map((entry) =>
+                entry.localId === item.localId ? { ...entry, progress } : entry,
+              ),
+            ),
+        );
+        const stillOwned =
+          mountedRef.current &&
+          controllersRef.current.get(item.localId) === controller &&
+          itemsRef.current.some((entry) => entry.localId === item.localId);
+        if (!stillOwned) {
+          void deleteAttachmentDraft(attachment.id).catch(() => undefined);
+          return;
+        }
+        replaceItems((current) =>
+          current.map((entry) =>
+            entry.localId === item.localId
+              ? { ...entry, status: "success", progress: null, attachment }
+              : entry,
+          ),
+        );
+        onUploaded?.();
+      } catch (cause) {
+        if (!(cause instanceof DOMException && cause.name === "AbortError")) {
+          replaceItems((current) =>
+            current.map((entry) =>
+              entry.localId === item.localId
+                ? { ...entry, status: "failed", progress: null, error: failureMessage(cause) }
+                : entry,
+            ),
+          );
+        }
+      } finally {
+        controllersRef.current.delete(item.localId);
+        activeRef.current -= 1;
+        queueMicrotask(() => pumpRef.current());
+      }
+    },
+    [onUploaded, replaceItems],
+  );
+
+  pumpRef.current = () => {
+    if (!mountedRef.current || !targetRef.current) return;
+    while (activeRef.current < MAX_CONCURRENT) {
+      const next = itemsRef.current.find(
+        (item) => item.status === "queued" && !startedRef.current.has(item.localId),
+      );
+      if (!next) break;
+      startedRef.current.add(next.localId);
+      void runItem(next);
+    }
+  };
+
+  const applySelection = useCallback(
+    (selected: readonly File[], limits: { maxFiles: number; maxBytes: number }) => {
+      const existing = new Set(itemsRef.current.map((item) => fileKey(item.file)));
+      const additions: AttachmentUploadItem[] = [];
+      let total = itemsRef.current.reduce((sum, item) => sum + item.file.size, 0);
+      let duplicate = false;
+      let unsupported = false;
+      let tooMany = false;
+      let tooLarge = false;
+      for (const file of selected) {
+        if (itemsRef.current.length + additions.length >= limits.maxFiles) {
+          tooMany = true;
+          break;
+        }
+        const key = fileKey(file);
+        if (explicitlyUnsupportedFile(file)) {
+          unsupported = true;
+          continue;
+        }
+        if (existing.has(key)) {
+          duplicate = true;
+          continue;
+        }
+        if (total + file.size > limits.maxBytes) {
+          tooLarge = true;
+          continue;
+        }
+        existing.add(key);
+        total += file.size;
+        additions.push({
+          localId: `attachment-${++sequenceRef.current}`,
+          file,
+          status: "queued",
+          progress: null,
+          error: null,
+          attachment: null,
+        });
+      }
+      const messages: string[] = [];
+      if (duplicate) messages.push("Arquivos duplicados foram ignorados.");
+      if (unsupported) messages.push("HTML, SVG e executáveis não podem ser anexados.");
+      if (tooMany)
+        messages.push(`Esta conversa permite até ${limits.maxFiles} anexos por mensagem.`);
+      if (tooLarge) messages.push("O tamanho total dos anexos excede o limite da conversa.");
+      setNotice(messages.length ? messages.join(" ") : null);
+      if (additions.length === 0) return;
+      replaceItems((current) => [...current, ...additions]);
+      queueMicrotask(() => pumpRef.current());
+    },
+    [replaceItems],
+  );
+
+  const selectFiles = useCallback(
+    (selected: Iterable<File>) => {
+      if (!targetRef.current) return;
+      const files = Array.from(selected);
+      if (files.length === 0) return;
+      applySelection(files, limitsRef.current);
+    },
+    [applySelection],
+  );
+
+  const remove = useCallback(
+    (localId: string) => {
+      const completed = itemsRef.current.find((item) => item.localId === localId)?.attachment;
+      if (completed) void deleteAttachmentDraft(completed.id).catch(() => undefined);
+      controllersRef.current.get(localId)?.abort();
+      controllersRef.current.delete(localId);
+      startedRef.current.delete(localId);
+      replaceItems((current) => current.filter((item) => item.localId !== localId));
+      queueMicrotask(() => pumpRef.current());
+    },
+    [replaceItems],
+  );
+
+  const retry = useCallback(
+    (localId: string) => {
+      startedRef.current.delete(localId);
+      replaceItems((current) =>
+        current.map((item) =>
+          item.localId === localId
+            ? { ...item, status: "queued", progress: null, error: null, attachment: null }
+            : item,
+        ),
+      );
+      queueMicrotask(() => pumpRef.current());
+    },
+    [replaceItems],
+  );
+
+  const dismiss = useCallback(() => {
+    for (const item of itemsRef.current) {
+      if (item.attachment) void deleteAttachmentDraft(item.attachment.id).catch(() => undefined);
+    }
+    for (const controller of controllersRef.current.values()) controller.abort();
+    controllersRef.current.clear();
+    startedRef.current.clear();
+    replaceItems(() => []);
+    setNotice(null);
+  }, [replaceItems]);
+
+  const resetAfterPublish = useCallback(() => {
+    controllersRef.current.clear();
+    startedRef.current.clear();
+    replaceItems(() => []);
+    setNotice(null);
+  }, [replaceItems]);
+
+  useEffect(() => {
+    if (ownerRef.current !== targetKey) {
+      ownerRef.current = targetKey;
+      dismiss();
+    }
+  }, [dismiss, targetKey]);
+
+  useEffect(() => {
+    itemsRef.current = items;
+    pumpRef.current();
+  }, [items]);
 
   useEffect(() => {
     mountedRef.current = true;
+    const controllers = controllersRef.current;
     return () => {
+      for (const controller of controllers.values()) controller.abort();
+      controllers.clear();
+      for (const item of itemsRef.current) {
+        if (item.attachment) void deleteAttachmentDraft(item.attachment.id).catch(() => undefined);
+      }
       mountedRef.current = false;
     };
   }, []);
 
-  const dismiss = useCallback(() => {
-    if (!mountedRef.current) return;
-    setStatus("idle");
-    setError(null);
-    setUploadedName(null);
-    setUploadedAttachment(null);
-    setProgress(null);
-  }, []);
+  const busy = items.some((item) => item.status !== "success");
+  const failed = items.find((item) => item.status === "failed");
+  const single = items.length === 1 ? items[0] : null;
+  const status = items.length === 0 ? "idle" : failed ? "failed" : busy ? "uploading" : "success";
+  const aggregateProgress = useMemo(() => {
+    if (!items.some((item) => item.status === "uploading")) return null;
+    const total = items.reduce((sum, item) => sum + item.file.size, 0);
+    const loaded = items.reduce(
+      (sum, item) =>
+        sum + (item.status === "success" ? item.file.size : (item.progress?.loaded ?? 0)),
+      0,
+    );
+    return total > 0 ? { loaded, total } : null;
+  }, [items]);
 
-  /**
-   * A finished upload belongs to the destination it was uploaded to, and to no
-   * other. Switching channel, opening a DM, or navigating away therefore drops
-   * it: the server would refuse the link anyway — it re-reads the attachment's
-   * own destination — but a stale pending file must never even appear in the
-   * new conversation's composer, which would suggest it is about to be sent
-   * there.
-   *
-   * Keyed on kind *and* id, so the two ways a destination can change are one
-   * rule. An in-flight upload is not cancelled here; its own mountedRef and
-   * target guards already stop it from writing into the new destination's
-   * state.
-   *
-   * Adjusted during render rather than from an effect — React's documented
-   * pattern for state that must follow a prop — so no frame is ever painted in
-   * which the new destination's composer shows the previous one's file.
-   */
-  const targetKey = target ? `${target.kind}:${target.id}` : "";
-  const [stateOwner, setStateOwner] = useState(targetKey);
-  if (stateOwner !== targetKey) {
-    setStateOwner(targetKey);
-    setStatus("idle");
-    setError(null);
-    setUploadedName(null);
-    setUploadedAttachment(null);
-    setProgress(null);
-  }
-
-  /**
-   * Reads the workspace's current limit.
-   *
-   * Deliberately not cached — not for the life of the composer, not behind a
-   * TTL, not in a module-level map. An administrator can change the policy at
-   * any moment, and a composer that has been open since before the change would
-   * otherwise validate against a limit that no longer exists: refusing files the
-   * workspace now accepts, or promising a size the service will reject. One read
-   * per attempt is one request against an action the user takes rarely and that
-   * is about to move far more bytes than the lookup costs.
-   *
-   * The workspace is never passed in: fetchWorkspaceUploadLimit resolves it from
-   * the caller's own session, so the value always belongs to the workspace the
-   * session is in and a stale identifier cannot be carried in a closure.
-   *
-   * A failure resolves to null — "unknown" — rather than to a compiled-in
-   * default: substituting one would replace the administrator's policy with a
-   * number this client invented. Unknown means the pre-flight check is skipped
-   * and file-service decides, which is the safe direction: enforcement is never
-   * weakened, only the local courtesy check is lost.
-   */
-  const resolveLimit = useCallback(async (): Promise<number | null> => {
-    try {
-      return await fetchWorkspaceUploadLimit();
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const selectFile = useCallback(
-    (file: File) => {
-      if (!target || busyRef.current) return;
-      busyRef.current = true;
-      setStatus("uploading");
-      // A new attempt clears the previous outcome, so a stale error is never
-      // shown next to a running upload.
-      setError(null);
-      setUploadedName(null);
-      // A new attempt also replaces the pending attachment: the composer holds
-      // one at a time, and the previous one stops being the file about to be
-      // sent the moment another is chosen.
-      setUploadedAttachment(null);
-      // A fresh attempt starts unmeasured: the previous attempt's byte counts
-      // describe a request that is over, and the limit lookup below runs before
-      // a single byte of this one is sent.
-      setProgress(null);
-
-      void (async () => {
-        try {
-          // Read on every attempt, so a policy changed between two tries is the
-          // one the second try is judged against.
-          const limit = await resolveLimit();
-          if (limit !== null && file.size > limit) {
-            // Rejected locally: no request is made at all.
-            throw new AttachmentUploadError("too_large", tooLargeMessage(limit));
-          }
-          const attachment: ChannelAttachment = await uploadAttachment(
-            target,
-            file,
-            limit,
-            undefined,
-            (sent) => {
-              // Guarded like every other write here: progress keeps arriving
-              // for a moment after the composer unmounts.
-              if (mountedRef.current) setProgress(sent);
-            },
-          );
-          if (!mountedRef.current) return;
-          setStatus("success");
-          setUploadedName(attachment.filename || file.name);
-          setUploadedAttachment(attachment);
-          onUploaded?.();
-        } catch (cause) {
-          if (!mountedRef.current) return;
-          setStatus("failed");
-          setError(
-            cause instanceof AttachmentUploadError
-              ? cause.message
-              : "Não foi possível enviar o arquivo.",
-          );
-        } finally {
-          // Released on every path, so a failure always leaves the composer
-          // able to accept the same file again.
-          busyRef.current = false;
-          // The bar belongs to a request in flight; neither outcome has one.
-          if (mountedRef.current) setProgress(null);
-        }
-      })();
-    },
-    [onUploaded, resolveLimit, target],
-  );
-
-  return { status, error, uploadedName, uploadedAttachment, progress, selectFile, dismiss };
+  return {
+    items,
+    status,
+    error: failed?.error ?? null,
+    uploadedName: single?.attachment?.filename ?? null,
+    uploadedAttachment: single?.attachment ?? null,
+    progress: single?.progress ?? null,
+    aggregateProgress,
+    busy,
+    notice,
+    selectFile: (file) => selectFiles([file]),
+    selectFiles,
+    remove,
+    retry,
+    dismiss,
+    resetAfterPublish,
+  };
 }

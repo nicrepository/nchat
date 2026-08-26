@@ -224,6 +224,30 @@ describe("useChatSidebar identity retry", () => {
     websocket.onConversationAvailable = null;
   });
 
+  it("keeps attachment limits from the canonical sidebar response", async () => {
+    mockFetchSidebarData.mockResolvedValueOnce({
+      currentUserId,
+      workspaceId: "workspace-1",
+      maxUploadBytes: 8 * 1024 * 1024,
+      maxFiles: 10,
+      maxBytes: 512 * 1024 * 1024,
+      channels: [],
+      dms: [],
+      categories: [],
+    });
+
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    if (result.current.state.status !== "ready") throw new Error("sidebar not ready");
+    expect(result.current.state.attachmentLimits).toEqual({
+      maxUploadBytes: 8 * 1024 * 1024,
+      maxFiles: 10,
+      maxBytes: 512 * 1024 * 1024,
+    });
+    expect(mockFetchSidebarData).toHaveBeenCalledOnce();
+  });
+
   it("shares one retry request and allows another attempt after failure", async () => {
     mockFetchSidebarData.mockRejectedValueOnce(new Error("offline"));
     const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
@@ -530,6 +554,7 @@ describe("useChatSidebar notification sound", () => {
   });
 
   it("does not play a sound for a DM message in the currently active DM", async () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
     const { result } = renderHook(() => useChatSidebar(), {
       wrapper: wrapper(`/chat/dm/${dmC}`),
     });
@@ -719,9 +744,26 @@ describe("useChatSidebar native browser notification", () => {
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
   });
 
-  it("never attempts a native notification while the tab is visible", async () => {
+  it("uses a native notification when the page is visible but another application has focus", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("native-unfocused", channelA)));
+
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("never attempts a native notification while the page and window are focused", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
     const { result } = renderHook(() => useChatSidebar(), {
       wrapper: wrapper(`/chat/channel/${channelB}`),
     });
@@ -731,6 +773,29 @@ describe("useChatSidebar native browser notification", () => {
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a muted conversation unread without a native notification or chime", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, muted: true },
+        { id: channelB, name: "B", type: "private", canWrite: true, muted: false },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], muted: false }],
+    });
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("native-muted", channelA)));
+
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
   });
 
   it("attempts a native notification at most once for a duplicate delivery", async () => {
@@ -1023,6 +1088,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
   it("plays a sound for a DM in the active conversation once the window loses focus", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
     const { result } = renderHook(() => useChatSidebar(), {
       wrapper: wrapper(`/chat/dm/${dmC}`),
     });

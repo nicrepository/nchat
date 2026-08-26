@@ -1142,17 +1142,21 @@ export default function ChatSidebar({
     <aside
       id={chatNavigationId}
       className="chat-sidebar"
-      aria-label="Navegação do workspace NIC Chat"
+      aria-label="Navegação do workspace Nchat"
       data-testid="chat-sidebar"
     >
       {/* ── Brand ── */}
-      <Link to="/chat" className="chat-sidebar__brand" aria-label="NIC Chat — Workspace NIC-Labs">
-        <div className="chat-sidebar__brand-mark">
-          <img src="/assets/nic-labs-icon.png" alt="NIC-Labs" className="chat-sidebar__brand-img" />
-        </div>
-        <div>
-          <p className="chat-sidebar__brand-title">NIC Chat</p>
-          <p className="chat-sidebar__brand-sub">Workspace NIC-Labs</p>
+      <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
+        <img
+          src="/assets/icononly_transparent.png"
+          alt=""
+          width={30}
+          height={34}
+          className="chat-sidebar__brand-img"
+        />
+        <div className="chat-sidebar__brand-copy">
+          <p className="chat-sidebar__brand-title">Nchat</p>
+          <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
         </div>
       </Link>
 

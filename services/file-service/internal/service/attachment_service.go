@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,11 @@ const sniffLimit = 512
 // on a context detached from the request so a client that has already hung up
 // cannot leave an object behind.
 const compensationTimeout = 10 * time.Second
+
+const (
+	UploadPurposeMessageDraft = "message_draft"
+	messageDraftTTL           = 24 * time.Hour
+)
 
 // Failure codes persisted on a failed row. They are short, closed and
 // sanitised: no driver text, no storage host, no key material.
@@ -92,6 +98,7 @@ type NewAttachment struct {
 	// fence that only engaged at finalisation would let such a build create the
 	// row in the first place.
 	KeyWrapVersion int
+	DraftExpiresAt *time.Time
 }
 
 // UploadedAttachment finalises a row once its object is durable. It carries the
@@ -290,6 +297,19 @@ type AttachmentStore interface {
 	ListDestinationAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
 }
 
+// DraftAttachmentStore owns the short-lived lifecycle used only by message
+// composer uploads. It is kept separate so legacy upload-store fakes remain
+// valid and a partially deployed database fails closed on draft operations.
+type DraftAttachmentStore interface {
+	CancelDraft(ctx context.Context, attachmentID, uploaderID string) error
+	ExpireDrafts(ctx context.Context, limit int) (int, error)
+}
+
+type CancelDraftInput struct {
+	AttachmentID string
+	UploaderID   string
+}
+
 // ListDestinationAttachmentsInput asks for one destination's most recent
 // attachments. The workspace is absent by design — it is derived from the
 // destination row during authorization, exactly like an upload's.
@@ -347,6 +367,7 @@ type UploadInput struct {
 	Target       UploadTarget
 	Filename     string
 	DeclaredMIME string
+	Purpose      string
 	Content      io.Reader
 }
 
@@ -435,14 +456,54 @@ func (s *AttachmentService) Ready() bool {
 		s.objects != nil && s.keys != nil && s.maxUploadBytes > 0
 }
 
+// CancelDraft removes an unassociated message draft. The store deliberately
+// returns the same not-found result for absence, another uploader and a draft
+// that has already been published.
+func (s *AttachmentService) CancelDraft(ctx context.Context, input CancelDraftInput) error {
+	if input.AttachmentID == "" || input.UploaderID == "" {
+		return fmt.Errorf("%w: attachment and uploader are required", domain.ErrInvalidInput)
+	}
+	if _, err := uuid.Parse(input.AttachmentID); err != nil {
+		return fmt.Errorf("%w: invalid attachment id", domain.ErrInvalidInput)
+	}
+	if _, err := uuid.Parse(input.UploaderID); err != nil {
+		return fmt.Errorf("%w: invalid uploader id", domain.ErrInvalidInput)
+	}
+	drafts, ok := s.store.(DraftAttachmentStore)
+	if !ok {
+		return domain.ErrDependenciesUnavailable
+	}
+	return drafts.CancelDraft(ctx, input.AttachmentID, input.UploaderID)
+}
+
+type DraftExpiryService struct {
+	store DraftAttachmentStore
+	limit int
+}
+
+func NewDraftExpiryService(store DraftAttachmentStore, limit int) *DraftExpiryService {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	return &DraftExpiryService{store: store, limit: limit}
+}
+
+func (s *DraftExpiryService) ProcessDue(ctx context.Context) (int, error) {
+	if s == nil || s.store == nil {
+		return 0, domain.ErrDependenciesUnavailable
+	}
+	return s.store.ExpireDrafts(ctx, s.limit)
+}
+
 // uploadTarget is the authorised destination of an upload, with every value
 // the server decided itself: the caller supplies none of them directly.
 type uploadTarget struct {
-	destination  domain.Destination
-	workspaceID  string
-	uploaderID   string
-	filename     string
-	declaredMIME string
+	destination    domain.Destination
+	workspaceID    string
+	uploaderID     string
+	filename       string
+	declaredMIME   string
+	draftExpiresAt *time.Time
 	// maxUploadBytes is the limit this one upload is judged against: the
 	// destination workspace's administrative policy, narrowed by the deployment
 	// ceiling. Resolved once, here, so the policy cannot change underneath a
@@ -454,6 +515,7 @@ type uploadTarget struct {
 type sniffedContent struct {
 	head         []byte
 	detectedMIME string
+	scanMarkup   bool
 }
 
 // pendingAttachment is a row in pending_upload whose object write has been
@@ -470,6 +532,7 @@ type pendingAttachment struct {
 	workspaceID uuid.UUID
 	objectKey   string
 	dataKey     []byte
+	markupScan  *activeMarkupReader
 }
 
 // AuthorizeUpload resolves and authorises an upload destination without
@@ -573,12 +636,22 @@ func (s *AttachmentService) resolveUploadTarget(input UploadInput) (uploadTarget
 		input.Target.MaxUploadBytes <= 0 {
 		return uploadTarget{}, domain.ErrUnauthorized
 	}
+	var draftExpiresAt *time.Time
+	switch input.Purpose {
+	case "":
+	case UploadPurposeMessageDraft:
+		expiresAt := time.Now().UTC().Add(messageDraftTTL)
+		draftExpiresAt = &expiresAt
+	default:
+		return uploadTarget{}, fmt.Errorf("%w: unsupported upload purpose", domain.ErrInvalidInput)
+	}
 	return uploadTarget{
 		destination:    input.Target.Destination,
 		workspaceID:    input.Target.WorkspaceID,
 		uploaderID:     input.Target.UploaderID,
 		filename:       filename,
 		declaredMIME:   domain.NormalizeDeclaredMIME(input.DeclaredMIME),
+		draftExpiresAt: draftExpiresAt,
 		maxUploadBytes: input.Target.MaxUploadBytes,
 	}, nil
 }
@@ -593,7 +666,43 @@ func sniffContent(source io.Reader) (sniffedContent, error) {
 	if len(head) == 0 {
 		return sniffedContent{}, domain.ErrEmptyFile
 	}
-	return sniffedContent{head: head, detectedMIME: http.DetectContentType(head)}, nil
+	detected := http.DetectContentType(head)
+	if !allowedUploadContent(detected, head) {
+		return sniffedContent{}, domain.ErrUnsupportedMedia
+	}
+	return sniffedContent{
+		head: head, detectedMIME: detected,
+		scanMarkup: domain.NormalizeDetectedMIME(detected) == "text/plain",
+	}, nil
+}
+
+func allowedUploadContent(detected string, head []byte) bool {
+	mediaType := domain.NormalizeDetectedMIME(detected)
+	if mediaType == "text/plain" {
+		prefix := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(string(head), "\ufeff")))
+		for _, active := range []string{"<!doctype html", "<html", "<script", "<svg", "<?xml"} {
+			if strings.Contains(prefix, active) {
+				return false
+			}
+		}
+	}
+	// Legacy Office documents use the Compound File Binary signature. It is a
+	// recognized container, not an arbitrary octet stream; PE/executable magic
+	// and every other unknown binary remain rejected.
+	if mediaType == "application/octet-stream" && len(head) >= 8 &&
+		bytes.Equal(head[:8], []byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}) {
+		return true
+	}
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp",
+		"application/pdf", "application/zip", "application/gzip",
+		"text/plain", "text/csv", "application/json",
+		"audio/mpeg", "audio/ogg", "audio/wav", "audio/wave", "audio/x-wav", "application/ogg",
+		"video/mp4", "video/webm", "video/quicktime", "video/x-msvideo":
+		return true
+	default:
+		return false
+	}
 }
 
 // preparePendingAttachment does everything that must succeed before the first
@@ -619,9 +728,13 @@ func (s *AttachmentService) preparePendingAttachment(
 	if err != nil {
 		return pendingAttachment{}, nil, fmt.Errorf("prepare attachment key: %w", err)
 	}
-	encrypted, err := crypto.NewEncryptingReader(
-		io.MultiReader(bytes.NewReader(content.head), source), dataKey, attachmentID,
-	)
+	plaintext := io.MultiReader(bytes.NewReader(content.head), source)
+	var markupScan *activeMarkupReader
+	if content.scanMarkup {
+		markupScan = &activeMarkupReader{source: plaintext}
+		plaintext = markupScan
+	}
+	encrypted, err := crypto.NewEncryptingReader(plaintext, dataKey, attachmentID)
 	if err != nil {
 		return pendingAttachment{}, nil, fmt.Errorf("prepare attachment envelope: %w", err)
 	}
@@ -631,6 +744,7 @@ func (s *AttachmentService) preparePendingAttachment(
 		workspaceID: workspaceID,
 		objectKey:   domain.StorageObjectKey(attachmentID),
 		dataKey:     dataKey,
+		markupScan:  markupScan,
 	}
 	// The row is created without any key material. It cannot be: the wrapped
 	// form authenticates the plaintext length, which nothing knows yet. A
@@ -647,6 +761,7 @@ func (s *AttachmentService) preparePendingAttachment(
 		StorageObjectKey: pending.objectKey,
 		EnvelopeVersion:  crypto.EnvelopeVersion,
 		KeyWrapVersion:   crypto.KeyWrapVersion,
+		DraftExpiresAt:   target.draftExpiresAt,
 	}); err != nil {
 		// The insert failed, so no row and no object exist: nothing to undo.
 		return pendingAttachment{}, nil, fmt.Errorf("persist attachment metadata: %w", err)
@@ -665,7 +780,7 @@ func (s *AttachmentService) persistEncryptedObject(
 		return ciphertextSize, nil
 	}
 	return 0, s.compensatePersistedObject(ctx, pending, failureStorageWrite,
-		uploadFailureCause(err, source))
+		uploadFailureCause(err, source, pending.markupScan))
 }
 
 // finalizeUpload advances the row once the object is durable. Only here can an
@@ -748,7 +863,10 @@ func (s *AttachmentService) finalizeUpload(
 
 // uploadFailureCause attributes a storage write failure to whichever side
 // actually broke: a client stream that stopped, or storage itself.
-func uploadFailureCause(storageErr error, source *boundedSource) error {
+func uploadFailureCause(storageErr error, source *boundedSource, markup *activeMarkupReader) error {
+	if markup != nil && markup.err != nil {
+		return markup.err
+	}
 	if source.err != nil {
 		return uploadSourceError(source.err)
 	}
@@ -1244,6 +1362,42 @@ func uploadSourceError(err error) error {
 	default:
 		return fmt.Errorf("%w: upload stream failed", domain.ErrInvalidInput)
 	}
+}
+
+var activeMarkupTokens = [][]byte{
+	[]byte("<!doctype html"), []byte("<html"), []byte("<script"),
+	[]byte("<svg"), []byte("<?xml"),
+}
+
+// activeMarkupReader scans the complete text stream, including token matches
+// split across read boundaries. Detection after object persistence begins is
+// still safe: the upload pipeline treats this error like any failed write and
+// deletes the partial encrypted object before returning 415.
+type activeMarkupReader struct {
+	source io.Reader
+	tail   []byte
+	err    error
+}
+
+func (r *activeMarkupReader) Read(p []byte) (int, error) {
+	n, err := r.source.Read(p)
+	if n == 0 {
+		return n, err
+	}
+	window := make([]byte, 0, len(r.tail)+n)
+	window = append(window, r.tail...)
+	window = append(window, p[:n]...)
+	lower := bytes.ToLower(window)
+	for _, token := range activeMarkupTokens {
+		if bytes.Contains(lower, token) {
+			r.err = fmt.Errorf("%w: active markup in text upload", domain.ErrUnsupportedMedia)
+			return n, r.err
+		}
+	}
+	const longestToken = len("<!doctype html")
+	keep := min(len(window), longestToken-1)
+	r.tail = append(r.tail[:0], window[len(window)-keep:]...)
+	return n, err
 }
 
 // boundedSource enforces the effective RF-32 cap on the bytes actually read,

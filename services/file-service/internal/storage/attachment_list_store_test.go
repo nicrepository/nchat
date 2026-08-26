@@ -87,6 +87,7 @@ func TestListDestinationAttachmentsUsesAnIndexablePredicatePerKind(t *testing.T)
 				"a.workspace_id = $1",
 				tt.wantColumn,
 				"a.status = ANY($3)",
+				"m.status <> 'active'",
 				"ORDER BY a.created_at DESC, a.id DESC",
 				"LIMIT $4",
 			} {

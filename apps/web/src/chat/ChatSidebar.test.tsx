@@ -223,23 +223,28 @@ describe("ChatShell — shell structure", () => {
     expect(await screen.findByTestId("chat-sidebar")).toBeInTheDocument();
   });
 
-  it("sidebar has NIC Chat branding", async () => {
+  it("sidebar presents the official Nchat product and workspace names", async () => {
     mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: [], dms: [] });
     renderChat();
 
     const sidebar = await screen.findByTestId("chat-sidebar");
-    expect(sidebar).toHaveTextContent("NIC Chat");
-    expect(sidebar).toHaveTextContent("Workspace NIC-Labs");
+    const brand = within(sidebar).getByRole("link", { name: "Nchat — Workspace Nic-Labs" });
+    expect(brand).toHaveTextContent("Nchat");
+    expect(brand).toHaveTextContent("Workspace Nic-Labs");
+    expect(brand).not.toHaveTextContent("NIC Chat");
+    expect(brand).not.toHaveTextContent("Workspace NIC-Labs");
+    expect(brand).toHaveAttribute("href", "/chat");
   });
 
-  it("sidebar header renders NIC-Labs logo with accessible alt text", async () => {
+  it("sidebar header renders the official logo as a decorative image", async () => {
     mockFetchSidebarData.mockResolvedValue({ currentUserId: "", channels: [], dms: [] });
     renderChat();
 
-    await screen.findByTestId("chat-sidebar");
-    const logo = screen.getByRole("img", { name: /nic-labs/i });
+    const sidebar = await screen.findByTestId("chat-sidebar");
+    const logo = sidebar.querySelector<HTMLImageElement>(".chat-sidebar__brand-img");
     expect(logo).toBeInTheDocument();
-    expect(logo).toHaveAttribute("src", "/assets/nic-labs-icon.png");
+    expect(logo).toHaveAttribute("src", "/assets/icononly_transparent.png");
+    expect(logo).toHaveAttribute("alt", "");
   });
 });
 

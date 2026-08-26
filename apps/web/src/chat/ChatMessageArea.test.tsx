@@ -12,7 +12,8 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
 
-import type { ChatOutletContext } from "./ChatShell";
+import type { ActiveResourceCallSession, ChatOutletContext } from "./ChatShell";
+import type { Call } from "./callState";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
@@ -1211,6 +1212,370 @@ describe("ChatMessageArea — channel header", () => {
     renderDMArea();
 
     expect(await screen.findByTestId("chat-message-area")).toBeInTheDocument();
+  });
+});
+
+// ── #642 active resource call bar ──────────────────────────────────────────────
+
+function makeResourceCall(overrides: Partial<Call> = {}): Call {
+  return {
+    call_id: "call-1",
+    request_id: "req-1",
+    caller_id: "user-an",
+    callee_id: "",
+    target_type: "channel",
+    target_id: "geral",
+    call_type: "audio",
+    status: "active",
+    version: 1,
+    created_at: "2024-01-01T12:00:00.000Z",
+    occurred_at: "2024-01-01T12:05:00.000Z",
+    expires_at: "2024-01-01T13:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function resourceCallSession(overrides: Partial<ActiveResourceCallSession> = {}) {
+  const session: ActiveResourceCallSession = {
+    // Matches makeResourceCall()'s own defaults — this is exactly what
+    // CallSessionProvider's resourcePresentationCall would carry once it
+    // proves the call_id match (issue #642 review, blocker 2).
+    callId: "call-1",
+    startedAt: "2024-01-01T12:00:00.000Z",
+    participants: [{ identity: "user-jl", displayName: "Juliane Lino" } as never],
+    localId: "user-an",
+    localName: "Álvaro Neto (você)",
+    localInitials: "AN",
+    activeSpeakerId: null,
+    microphoneEnabled: true,
+    microphonePending: false,
+    onToggleMicrophone: vi.fn(),
+    onLeave: vi.fn(),
+    onOpenFullCall: vi.fn(),
+    ...overrides,
+  };
+  return session;
+}
+
+describe("ChatMessageArea — #642 active resource call bar", () => {
+  it("shows the bar when participating in the current channel's resource call, with title/timer/count", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const call = makeResourceCall();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => call,
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — #geral");
+    expect(bar).toHaveTextContent("2 participantes");
+  });
+
+  it("shows no bar when not participating in a resource call", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => false,
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("shows no bar when participating in a DIFFERENT resource target than the one open in this view", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [
+                    { id: "geral", name: "geral", type: "public", canWrite: true },
+                    { id: "outro", name: "outro", type: "public", canWrite: true },
+                  ],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  // Mirrors ChatShell's real isParticipatingIn semantics: true
+                  // only for the exact target the user is in — "outro", not
+                  // "geral", the one this view has open.
+                  isParticipatingIn: (_kind, id) => id === "outro",
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("never shows the bar for a direct 1:1 DM, even if resourceCallSession is somehow present", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-1",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [],
+                      counterpart: { userId: "user-jl", displayName: "Juliane" },
+                    },
+                  ],
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-resource-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("uses the group's bare name (no #) when participating in a group DM's resource call", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/grupo-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [{ id: "grupo-1", type: "group", name: "Infra Squad", participants: [] }],
+                  getResourceCall: () =>
+                    makeResourceCall({ target_type: "dm", target_id: "grupo-1" }),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — Infra Squad");
+    expect(bar).not.toHaveTextContent("#Infra Squad");
+  });
+
+  it("includes #<name> in the title when participating in a channel's resource call", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/infraestrutura"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [
+                    {
+                      id: "infraestrutura",
+                      name: "infraestrutura",
+                      type: "public",
+                      canWrite: true,
+                    },
+                  ],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall({ target_id: "infraestrutura" }),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — #infraestrutura");
+  });
+
+  it("wires the bar's leave button to ctx.resourceCallSession.onLeave", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onLeave = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession({ onLeave }),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("active-resource-call-bar");
+    fireEvent.click(screen.getByRole("button", { name: /Sair/ }));
+    expect(onLeave).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's mute button to ctx.resourceCallSession.onToggleMicrophone", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onToggleMicrophone = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession({ onToggleMicrophone }),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("active-resource-call-bar");
+    fireEvent.click(screen.getByRole("button", { name: "Mutar microfone" }));
+    expect(onToggleMicrophone).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's main area to ctx.resourceCallSession.onOpenFullCall", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onOpenFullCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession({ onOpenFullCall }),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-resource-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: /Abrir chamada/ }));
+    expect(onOpenFullCall).toHaveBeenCalledOnce();
+  });
+
+  it("never renders the chamada.html search bar as part of this feature", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => makeResourceCall(),
+                  isParticipatingIn: () => true,
+                  resourceCallSession: resourceCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("active-resource-call-bar");
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(document.querySelector(".voicebanner input")).toBeNull();
   });
 });
 
@@ -2697,7 +3062,12 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
     expect(mockPostChannelMessage.mock.calls[0]?.slice(0, 3)).toEqual([
       "destination",
       "seguro",
-      { parentMessageId: undefined, referencedMessageId: undefined, attachmentIds: undefined },
+      {
+        parentMessageId: undefined,
+        referencedMessageId: undefined,
+        attachmentIds: undefined,
+        idempotencyKey: expect.any(String),
+      },
     ]);
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(mockFetchDMMessage).not.toHaveBeenCalled();
@@ -3024,6 +3394,7 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         parentMessageId: undefined,
         referencedMessageId: rf09SourceMessageID,
         attachmentIds: undefined,
+        idempotencyKey: expect.any(String),
       },
     ]);
     await waitFor(() =>

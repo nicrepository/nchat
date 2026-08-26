@@ -1025,6 +1025,24 @@ func TestIdempotencyKeyCoversTheWholeOperation(t *testing.T) {
 	}
 }
 
+func TestIdempotencyFingerprintTreatsMultipleAttachmentOrderAsMessageContent(t *testing.T) {
+	first := createIdentityFingerprintFor(t, func(in *service.CreateChannelMessageInput) {
+		in.AttachmentIDs = []string{
+			"aabbccdd-1111-4222-8333-000000000001",
+			"aabbccdd-1111-4222-8333-000000000002",
+		}
+	})
+	second := createIdentityFingerprintFor(t, func(in *service.CreateChannelMessageInput) {
+		in.AttachmentIDs = []string{
+			"aabbccdd-1111-4222-8333-000000000002",
+			"aabbccdd-1111-4222-8333-000000000001",
+		}
+	})
+	if first == second {
+		t.Fatal("reordering multiple attachments must produce a different operation identity")
+	}
+}
+
 // createIdentityFingerprintFor recovers the fingerprint the service computes for
 // a given operation, by observing what it asks the store about. Computing it in
 // the test by hand would be re-implementing the thing under test.

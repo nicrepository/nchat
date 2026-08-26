@@ -11,6 +11,7 @@ import {
   setConversationMuted,
   setSidebarConversationPinned,
 } from "./chatApi";
+import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
 import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
 import { playMessageSound } from "./messageSound";
@@ -37,6 +38,7 @@ export type SidebarState =
       status: "ready";
       currentUserId: string;
       workspaceId: string;
+      attachmentLimits?: WorkspaceAttachmentLimits;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -47,6 +49,7 @@ type Action =
       type: "loaded";
       currentUserId: string;
       workspaceId: string;
+      attachmentLimits: WorkspaceAttachmentLimits;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -203,6 +206,7 @@ function applyLoaded(
     status: "ready",
     currentUserId: action.currentUserId,
     workspaceId: action.workspaceId,
+    attachmentLimits: action.attachmentLimits,
     channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
     dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
     categories: action.categories || [],
@@ -332,12 +336,17 @@ function announceMessage(
   event: WSMessageCreatedEvent,
   currentUserId: string,
   activeTarget: WSSubscriptionTarget | undefined,
+  isMuted: boolean,
   onNavigate: (path: string) => void,
 ): boolean {
   const payload = event.payload;
   if (!payload) return false;
   const classified = classifySoundEvent(payload, event.target_type, currentUserId);
-  const isWindowFocused = document.visibilityState === "visible";
+  if (isMuted) return classified.isMentioned;
+  const isWindowFocused =
+    document.visibilityState === "visible" &&
+    typeof document.hasFocus === "function" &&
+    document.hasFocus();
   const play = shouldPlayMessageSound({
     mode: getSoundNotificationMode(),
     // Already past the seenRealtimeMessageIds check at the call site — this
@@ -411,21 +420,37 @@ export function useChatSidebar() {
     dispatch({ type: "reload" });
 
     const loading = fetchSidebarData()
-      .then(({ currentUserId, workspaceId, channels, dms, categories }) => {
-        if (mountedRef.current) {
-          const persistedUnread =
-            currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
-          dispatch({
-            type: "loaded",
-            currentUserId,
-            workspaceId,
-            channels,
-            dms,
-            categories,
-            persistedUnread,
-          });
-        }
-      })
+      .then(
+        ({
+          currentUserId,
+          workspaceId,
+          maxUploadBytes,
+          maxFiles,
+          maxBytes,
+          channels,
+          dms,
+          categories,
+        }) => {
+          if (mountedRef.current) {
+            const persistedUnread =
+              currentUserId && workspaceId ? loadPersistedUnread(currentUserId, workspaceId) : [];
+            dispatch({
+              type: "loaded",
+              currentUserId,
+              workspaceId,
+              attachmentLimits: {
+                maxUploadBytes: maxUploadBytes ?? null,
+                maxFiles: maxFiles ?? 1,
+                maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
+              },
+              channels,
+              dms,
+              categories,
+              persistedUnread,
+            });
+          }
+        },
+      )
       .catch((err: unknown) => {
         if (mountedRef.current) {
           const message =
@@ -501,22 +526,38 @@ export function useChatSidebar() {
     refreshInFlight.current = true;
     const run = () => {
       fetchSidebarData()
-        .then(({ currentUserId, workspaceId, channels, dms, categories }) => {
-          if (mountedRef.current)
-            dispatch({
-              type: "loaded",
-              currentUserId,
-              workspaceId,
-              channels,
-              dms,
-              categories,
-              // previous is always defined at this call site (refreshSidebar
-              // only ever runs once the sidebar is already "ready"), so
-              // mergeUnread never consults this — never worth a localStorage
-              // read here.
-              persistedUnread: [],
-            });
-        })
+        .then(
+          ({
+            currentUserId,
+            workspaceId,
+            maxUploadBytes,
+            maxFiles,
+            maxBytes,
+            channels,
+            dms,
+            categories,
+          }) => {
+            if (mountedRef.current)
+              dispatch({
+                type: "loaded",
+                currentUserId,
+                workspaceId,
+                attachmentLimits: {
+                  maxUploadBytes: maxUploadBytes ?? null,
+                  maxFiles: maxFiles ?? 1,
+                  maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
+                },
+                channels,
+                dms,
+                categories,
+                // previous is always defined at this call site (refreshSidebar
+                // only ever runs once the sidebar is already "ready"), so
+                // mergeUnread never consults this — never worth a localStorage
+                // read here.
+                persistedUnread: [],
+              });
+          },
+        )
         .catch(() => {
           // The sidebar on screen stays valid; the next event or navigation
           // retries. Deliberately no error state and no retry loop — a failed
@@ -577,10 +618,20 @@ export function useChatSidebar() {
       }
       const isMentioned =
         state.status === "ready" &&
-        announceMessage(event, state.currentUserId, openedTarget, (path) => {
-          navigate(path);
-          refreshSidebar();
-        });
+        announceMessage(
+          event,
+          state.currentUserId,
+          openedTarget,
+          Boolean(
+            (event.target_type === "channel" ? state.channels : state.dms).find(
+              ({ id }) => id === event.target_id,
+            )?.muted,
+          ),
+          (path) => {
+            navigate(path);
+            refreshSidebar();
+          },
+        );
       dispatch({
         type: "message_created",
         target: { kind: event.target_type, targetId: event.target_id },

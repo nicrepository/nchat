@@ -287,6 +287,7 @@
   display: flex;
   gap: 10px;
   padding: 2px 0;
+  min-width: 0;
   /* A readable measure on a wide column, the column itself on a narrow one — a
      bubble is never the reason the page scrolls sideways. */
   max-width: min(560px, 100%);
@@ -295,7 +296,6 @@
 .chat-msg-area__msg--mine {
   flex-direction: row-reverse;
   align-self: flex-end;
-  max-width: min(560px, 100%);
 }
 
 .chat-msg-area__msg-avatar {
@@ -319,6 +319,7 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  max-width: 100%;
 }
 
 .chat-msg-area__msg--mine .chat-msg-area__msg-body {
@@ -348,6 +349,8 @@
 }
 
 .chat-msg-area__msg-bubble {
+  box-sizing: border-box;
+  max-width: 100%;
   background: var(--color-surface, #fff);
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: 12px;
@@ -1437,19 +1440,152 @@
 }
 
 .chat-msg-area__composer-upload {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 12px;
+  margin: 0 10px 10px;
+  padding: 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
   font-size: 13px;
   color: var(--color-text-muted, #6b6580);
 }
 
+.chat-msg-area__composer-upload-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-msg-area__composer-upload-header > .material-symbols-outlined {
+  font-size: 17px;
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-upload-header strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.chat-msg-area__composer-upload-total {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-msg-area__composer-upload-notice {
+  display: block;
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  line-height: 1.35;
+}
+
+.chat-msg-area__composer-upload-list {
+  display: grid;
+  gap: 6px;
+}
+
+.chat-msg-area__composer-upload-item {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 8px;
+  background: var(--color-surface, #fff);
+}
+
+.chat-msg-area__composer-upload-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-upload-icon .material-symbols-outlined {
+  font-size: 19px;
+}
+
+.chat-msg-area__composer-upload-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.chat-msg-area__composer-upload-name {
+  overflow: hidden;
+  color: var(--color-ink, #16121f);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-msg-area__composer-upload-state {
+  grid-column: 1;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.chat-msg-area__composer-upload-state--success {
+  color: var(--color-success-strong, #166534);
+}
+
+.chat-msg-area__composer-upload-state--failed {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+.chat-msg-area__composer-upload-size {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  color: var(--color-text-muted, #6b6580);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chat-msg-area__composer-upload-retry {
+  justify-self: start;
+  margin-top: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary, #6d28d9);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-msg-area__composer-upload-retry:hover,
+.chat-msg-area__composer-upload-retry:focus-visible {
+  text-decoration: underline;
+  outline: none;
+}
+
 .chat-msg-area__composer-progress {
-  flex: 1 1 80px;
-  max-width: 160px;
+  grid-column: 1 / -1;
+  width: 100%;
   height: 6px;
+  margin-top: 4px;
+  accent-color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-progress--total {
+  display: block;
+  margin-top: 8px;
 }
 
 .chat-msg-area__composer-quote {
@@ -1951,6 +2087,117 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-msg-area__image-run {
+  position: relative;
+  list-style: none;
+}
+
+.chat-msg-area__image-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  align-items: stretch;
+}
+
+.chat-msg-area__image-grid--1 {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(280px, 38vh);
+}
+
+.chat-msg-area__image-grid--2 {
+  grid-template-rows: minmax(240px, 32vh);
+}
+
+.chat-msg-area__image-grid--3 {
+  grid-template-rows: repeat(2, minmax(190px, 25vh));
+}
+
+.chat-msg-area__image-grid--3 > :first-child {
+  grid-row: span 2;
+}
+
+.chat-msg-area__image-grid--4 {
+  grid-template-rows: repeat(2, minmax(220px, 28vh));
+}
+
+/* Every image owns two explicit tracks: media and footer. The footer therefore
+   consumes space inside its card instead of painting over the next grid row.
+   This is especially important for the first item in the three-image mosaic,
+   whose card spans two rows while its metadata must remain attached to it. */
+.chat-msg-area__image-grid .chat-msg-area__attachment {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-preview {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  border-radius: 0;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment > .chat-msg-area__attachment-note {
+  align-self: center;
+  margin: 0;
+  padding: 12px;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-row {
+  min-width: 0;
+  padding: 8px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-text {
+  min-width: 0;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-action {
+  flex: none;
+  padding-inline: 7px;
+}
+
+.chat-msg-area__image-grid-more {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgb(0 0 0 / 72%);
+  color: #fff;
+  cursor: pointer;
+}
+
+.chat-msg-area__image-grid-more:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+  .chat-msg-area__image-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-auto-rows: minmax(240px, 32vh);
+  }
+
+  .chat-msg-area__image-grid--3 > :first-child {
+    grid-row: auto;
+  }
 }
 
 .chat-msg-area__attachment {
@@ -1961,12 +2208,14 @@
   border: 1px solid var(--color-border, #e8e3f0);
   border-radius: var(--radius-md, 10px);
   background: var(--color-surface-2, #faf8fd);
+  min-width: 0;
 }
 
 .chat-msg-area__attachment-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   flex-wrap: wrap;
 }
 
@@ -2006,7 +2255,10 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
   font-size: 11px;
+  line-height: 1.3;
   color: var(--color-text-muted, #6b6580);
 }
 
