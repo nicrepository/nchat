@@ -6,11 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/httpserver"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/search-service/internal/config"
 	"github.com/nicrepository/nchat/services/search-service/internal/server"
@@ -37,7 +36,14 @@ func run(logger *slog.Logger) error {
 	}
 	obsCfg := observability.LoadConfig(serviceName)
 	shutdown, _ := observability.SetupTracing(context.Background(), obsCfg)
-	defer func() { _ = shutdown(context.Background()) }()
+	// Bounded by whatever the HTTP drain left of the termination budget, not by
+	// an unbounded context: a tracing exporter that cannot reach its collector
+	// would otherwise hold the process open until the kubelet killed it.
+	defer func() {
+		ctx, cancel := httpserver.CleanupContext()
+		defer cancel()
+		_ = shutdown(ctx)
+	}()
 	pool, err := storage.OpenDB(context.Background(), cfg.DatabaseURL, cfg.DBConnectTimeoutSeconds)
 	if err != nil {
 		return fmt.Errorf("database unavailable: %w", err)
@@ -58,21 +64,17 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info("service starting", "service", serviceName, "port", port)
-	errCh := make(chan error, 1)
-	go func() { errCh <- httpServer.ListenAndServe() }()
-	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	select {
-	case serveErr := <-errCh:
-		if serveErr != nil && serveErr != http.ErrServerClosed {
-			return fmt.Errorf("serve: %w", serveErr)
-		}
-	case <-sigCtx.Done():
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(ctx); err != nil {
-			return fmt.Errorf("shutdown: %w", err)
-		}
+	// The same drain every other slot workload uses. search-service had its own
+	// shutdown, which closed the listener the moment SIGTERM arrived — before
+	// the cluster had finished removing this Pod from its Service endpoints, so
+	// requests still being routed here were refused. Sharing the helper is what
+	// makes the drain window a property of the platform rather than of whichever
+	// service happened to implement it.
+	if err := httpserver.Run(httpServer, logger); err != nil {
+		return fmt.Errorf("serve: %w", err)
 	}
+	// The deferred pool.Close and tracing shutdown run after this returns, so
+	// in-flight requests finish against a live database and their spans are
+	// flushed rather than dropped.
 	return nil
 }
