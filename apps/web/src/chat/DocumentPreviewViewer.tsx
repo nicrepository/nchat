@@ -189,8 +189,8 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
             <div className="document-preview__sheet" style={{ zoom }}>
               {(sheet.truncatedRows || sheet.truncatedColumns) && (
                 <p className="document-preview__sheet-note" role="status">
-                  Mostrando {sheet.totalRowsRead}{" "}
-                  {sheet.truncatedRows ? "das primeiras" : ""} linhas
+                  Mostrando {sheet.totalRowsRead} {sheet.truncatedRows ? "das primeiras" : ""}{" "}
+                  linhas
                   {sheet.truncatedColumns ? ` e as primeiras ${sheet.columns.length} colunas` : ""}.
                 </p>
               )}

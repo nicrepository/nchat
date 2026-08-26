@@ -193,13 +193,14 @@ vi.mock("./chatApi", () => ({
 // ── filesApi mock (preview reconciliation) ────────────────────────────────────
 
 const { mockFetchConversationAttachments } = vi.hoisted(() => ({
-  mockFetchConversationAttachments: vi.fn<
-    (
-      target: { kind: "channel" | "dm"; id: string },
-      limit: number,
-      signal?: AbortSignal,
-    ) => Promise<import("./chatTypes").ChannelAttachment[]>
-  >(),
+  mockFetchConversationAttachments:
+    vi.fn<
+      (
+        target: { kind: "channel" | "dm"; id: string },
+        limit: number,
+        signal?: AbortSignal,
+      ) => Promise<import("./chatTypes").ChannelAttachment[]>
+    >(),
 }));
 
 vi.mock("./filesApi", () => ({

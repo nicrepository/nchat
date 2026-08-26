@@ -1066,7 +1066,10 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         let messageChanged = false;
         const attachments = message.attachments.map((item) => {
           const fresh = byId.get(item.id);
-          if (!fresh || (fresh.status === item.status && fresh.previewStatus === item.previewStatus)) {
+          if (
+            !fresh ||
+            (fresh.status === item.status && fresh.previewStatus === item.previewStatus)
+          ) {
             return item;
           }
           messageChanged = true;
