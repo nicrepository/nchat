@@ -139,7 +139,7 @@ describe("message attachments — document viewer", () => {
         attachments={[
           attachment({
             filename: "planilha.csv",
-            contentType: "text/csv",
+            contentType: "text/plain",
             status: "clean",
             previewStatus: "ready",
           }),
@@ -278,7 +278,7 @@ describe("message attachments", () => {
         attachments={[
           attachment({
             filename: "planilha.csv",
-            contentType: "text/csv",
+            contentType: "text/plain",
             status: "clean",
             previewStatus: "ready",
           }),
@@ -302,15 +302,18 @@ describe("message attachments", () => {
   it("requests a preview only for an approved file that has one", () => {
     // A non-document, non-image type still goes through AttachmentThumbnail's
     // small preview fetch — PDFs get their own large first-page preview,
-    // covered separately below.
-    const zip = (overrides: Partial<ChannelAttachment> = {}) =>
-      attachment({ filename: "arquivo.zip", contentType: "application/zip", ...overrides });
-    const { rerender } = render(<MessageAttachments attachments={[zip({ previewStatus: "ready" })]} />);
+    // covered separately below. application/zip and text/plain are excluded
+    // here on purpose: those are exactly the coarse detected types CSV/XLSX
+    // attachments carry (see isDocumentAttachment's own comment), so an MP3
+    // stands in for "a type that is genuinely never a document".
+    const audio = (overrides: Partial<ChannelAttachment> = {}) =>
+      attachment({ filename: "audio.mp3", contentType: "audio/mpeg", ...overrides });
+    const { rerender } = render(<MessageAttachments attachments={[audio({ previewStatus: "ready" })]} />);
     // pending_scan + ready preview: still nothing, because the scan decides.
     expect(mockPreview).not.toHaveBeenCalled();
 
     rerender(
-      <MessageAttachments attachments={[zip({ status: "clean", previewStatus: "ready" })]} />,
+      <MessageAttachments attachments={[audio({ status: "clean", previewStatus: "ready" })]} />,
     );
     expect(mockPreview).toHaveBeenCalledWith("att-1", expect.anything());
   });

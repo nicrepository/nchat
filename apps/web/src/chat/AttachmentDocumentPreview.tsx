@@ -32,17 +32,18 @@
  * both the performance requirement (no duplicate or premature calls) and the
  * security one (never touch content nobody has approved).
  *
- * # Spreadsheets and CSV draw nothing here
+ * # Spreadsheets, CSV and anything else that is not a PDF draw nothing here
  *
  * A spreadsheet/CSV preview (task #494's sheet phase) is bounded table data,
  * not an image — there is no first-page JPEG to fetch. A rasterised table at
  * inline-card size would be illegible anyway (a tiny grid nobody can read,
  * with no room to say "500 rows truncated"), and producing one would mean
  * rendering the table to an image server-side just for this card, undoing
- * the point of sending JSON instead. So this component recognises the
- * content type client-side and renders nothing for it — the row below still
- * shows the icon, filename, size and, once ready, the Visualizar button that
- * opens the full table in DocumentPreviewViewer.
+ * the point of sending JSON instead. So this component only ever fetches for
+ * `application/pdf` — see isImagePreviewableDocument below — and renders
+ * nothing for anything else; the row below still shows the icon, filename,
+ * size and, once ready, the Visualizar button that opens the full preview
+ * (image or table) in DocumentPreviewViewer.
  */
 
 import type { ReactNode } from "react";
@@ -60,15 +61,20 @@ function firstDocumentPreviewPage(attachmentId: string, signal?: AbortSignal): P
   return fetchDocumentPreviewPage(attachmentId, 1, signal);
 }
 
-/** Same MIME-substring style MessageAttachments' isDocumentAttachment uses, narrowed to the formats that render as a table, never an image. */
-function isSpreadsheetAttachment(attachment: ChannelAttachment): boolean {
-  const type = attachment.contentType.toLowerCase();
-  return (
-    type === "text/csv" ||
-    type.includes("spreadsheetml") ||
-    type.includes("ms-excel") ||
-    type.includes("opendocument.spreadsheet")
-  );
+/**
+ * Whether this attachment's first page, once ready, is a JPEG this component
+ * may fetch and show.
+ *
+ * An allowlist rather than a denylist, and deliberately narrow: the detected
+ * type file-service reports is the coarse net/http.DetectContentType sniff
+ * (see MessageAttachments' isDocumentAttachment for the full reasoning), so
+ * `text/plain` and `application/zip` cover CSV/XLSX *and* every other
+ * document type this build does not render as an image — none of them is
+ * ever JPEG-shaped, ready or not. application/pdf is the one detected type
+ * that always is.
+ */
+function isImagePreviewableDocument(attachment: ChannelAttachment): boolean {
+  return attachment.contentType.split(";")[0].trim().toLowerCase() === "application/pdf";
 }
 
 interface AttachmentDocumentPreviewProps {
@@ -87,19 +93,20 @@ export default function AttachmentDocumentPreview({
   attachment,
   onOpen,
 }: AttachmentDocumentPreviewProps) {
-  const isSpreadsheet = isSpreadsheetAttachment(attachment);
+  const isImageDocument = isImagePreviewableDocument(attachment);
   // Hooks run unconditionally on every render — eligible is forced false for
-  // a spreadsheet/CSV attachment so useAttachmentBlobUrl never fetches, and
-  // the early return below (after every hook has run) is what actually keeps
-  // this component from rendering anything for it. See the module comment.
-  const eligible = !isSpreadsheet && attachment.previewStatus === "ready";
+  // anything that is never JPEG-shaped (CSV/XLSX included) so
+  // useAttachmentBlobUrl never fetches, and the early return below (after
+  // every hook has run) is what actually keeps this component from
+  // rendering anything for it. See the module comment.
+  const eligible = isImageDocument && attachment.previewStatus === "ready";
   const { url, failed, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
     eligible,
     firstDocumentPreviewPage,
   );
 
-  if (isSpreadsheet) {
+  if (!isImageDocument) {
     return null;
   }
 
