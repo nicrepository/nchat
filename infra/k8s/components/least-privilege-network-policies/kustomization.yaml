@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+# The namespace's least-privilege network posture, shared by every overlay that
+# runs the full platform (nchat-dev-server and, since issue #626, k3s-prod).
+#
+# It lives here rather than in an overlay because Blue/Green must not invent a
+# second, unreviewed set of rules: production has to get exactly the posture
+# that has been exercised in nchat-dev. Every rule selects on
+# app.kubernetes.io/component, which is identical in both slots, so a slot needs
+# no rule of its own and neither slot can be given access the other lacks.
+#
+# The two patches remove base's blanket allowances — same-namespace ingress and
+# a namespace-wide Traefik allowance — which the granular rules below replace.
+resources:
+  - network-policies.yaml
+patches:
+  - path: delete-same-namespace-network-policy.yaml
+  - path: delete-traefik-network-policy.yaml

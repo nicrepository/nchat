@@ -1,0 +1,25 @@
+# Production runtime shape, applied to both slots identically.
+#
+# The two slots must differ in exactly one thing — the release image — so this
+# patch is deliberately slot-agnostic. A setting that differed between Blue and
+# Green would make the candidate an untested configuration rather than an
+# untested version.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placeholder
+spec:
+  # Two replicas per slot: the smallest number at which one pod can be lost, or
+  # voluntarily evicted under the PodDisruptionBudget, without the workload
+  # going away. The capacity gate in the deploy script is what keeps the second
+  # slot from being scheduled onto a node that cannot hold it.
+  replicas: 2
+  template:
+    spec:
+      # Long enough for an in-flight upload and for chat-service's hub to close
+      # its WebSockets deliberately rather than have them cut. Nothing here
+      # kills the old slot at cutover — draining it is a separate, later
+      # operation — so this budget is only spent when an operator asks for it.
+      terminationGracePeriodSeconds: 60
+      imagePullSecrets:
+        - name: ghcr-pull
