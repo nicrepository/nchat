@@ -24,6 +24,29 @@ func TestPreviewStatusSetIsClosed(t *testing.T) {
 	}
 }
 
+func TestPreviewLifecycleAllowsOnlyDefinedTransitions(t *testing.T) {
+	allowed := [][2]domain.PreviewLifecycleStatus{
+		{domain.PreviewLifecyclePending, domain.PreviewLifecycleScanning},
+		{domain.PreviewLifecycleScanning, domain.PreviewLifecyclePending},
+		{domain.PreviewLifecyclePending, domain.PreviewLifecycleGenerating},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleAvailable},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleFailed},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleBlocked},
+		{domain.PreviewLifecycleAvailable, domain.PreviewLifecycleExpired},
+		{domain.PreviewLifecycleFailed, domain.PreviewLifecyclePending},
+		{domain.PreviewLifecycleExpired, domain.PreviewLifecyclePending},
+	}
+	for _, transition := range allowed {
+		if !transition[0].CanTransitionTo(transition[1]) {
+			t.Errorf("transition %s -> %s rejected", transition[0], transition[1])
+		}
+	}
+	if domain.PreviewLifecycleAvailable.CanTransitionTo(domain.PreviewLifecycleGenerating) ||
+		domain.PreviewLifecycleBlocked.CanTransitionTo(domain.PreviewLifecyclePending) {
+		t.Fatal("invalid lifecycle transition accepted")
+	}
+}
+
 // Only one state may be served, and the check is positive: an unrecognised
 // value must never be treated as a preview that exists.
 func TestOnlyAReadyPreviewIsServable(t *testing.T) {

@@ -20,6 +20,46 @@ var ErrPreviewUnavailable = errors.New("attachment preview not available")
 // The client never supplies it, exactly like Status.
 type PreviewStatus string
 
+type PreviewLifecycleStatus string
+
+const (
+	PreviewLifecyclePending    PreviewLifecycleStatus = "pending"
+	PreviewLifecycleScanning   PreviewLifecycleStatus = "scanning"
+	PreviewLifecycleGenerating PreviewLifecycleStatus = "generating"
+	PreviewLifecycleAvailable  PreviewLifecycleStatus = "available"
+	PreviewLifecycleFailed     PreviewLifecycleStatus = "failed"
+	PreviewLifecycleBlocked    PreviewLifecycleStatus = "blocked"
+	PreviewLifecycleExpired    PreviewLifecycleStatus = "expired"
+)
+
+func (s PreviewLifecycleStatus) Valid() bool {
+	switch s {
+	case PreviewLifecyclePending, PreviewLifecycleScanning, PreviewLifecycleGenerating,
+		PreviewLifecycleAvailable, PreviewLifecycleFailed, PreviewLifecycleBlocked,
+		PreviewLifecycleExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s PreviewLifecycleStatus) CanTransitionTo(next PreviewLifecycleStatus) bool {
+	switch s {
+	case PreviewLifecyclePending:
+		return next == PreviewLifecycleScanning || next == PreviewLifecycleGenerating || next == PreviewLifecycleBlocked
+	case PreviewLifecycleScanning:
+		return next == PreviewLifecyclePending || next == PreviewLifecycleBlocked
+	case PreviewLifecycleGenerating:
+		return next == PreviewLifecycleAvailable || next == PreviewLifecycleFailed || next == PreviewLifecycleBlocked
+	case PreviewLifecycleAvailable:
+		return next == PreviewLifecycleExpired || next == PreviewLifecycleBlocked
+	case PreviewLifecycleFailed, PreviewLifecycleExpired:
+		return next == PreviewLifecyclePending
+	default:
+		return false
+	}
+}
+
 const (
 	// PreviewStatusPending is the state a previewable attachment finishes its
 	// upload in. It is the worker's queue: nothing else selects rows.

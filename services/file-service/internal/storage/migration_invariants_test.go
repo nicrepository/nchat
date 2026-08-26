@@ -622,6 +622,27 @@ func TestPreviewMigrationIndexesTheWorkerQueue(t *testing.T) {
 	}
 }
 
+func TestPreviewLifecycleMigrationIsExpandOnlyAndSynchronizesLegacyAliases(t *testing.T) {
+	up := readFilesMigration(t, "000017_attachment_preview_lifecycle.up.sql")
+	for _, expected := range []string{
+		"preview_lifecycle_status", "preview_failure_reason", "preview_expires_at",
+		"'pending', 'scanning', 'generating', 'available', 'failed', 'blocked', 'expired'",
+		"CREATE FUNCTION files.sync_attachment_preview_lifecycle()",
+		"idx_attachments_preview_lifecycle_pending",
+		"idx_attachments_preview_generating_lease",
+		"idx_attachments_preview_available_expiry",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Fatalf("lifecycle migration must contain %q", expected)
+		}
+	}
+	for _, destructive := range []string{"DROP COLUMN preview_status", "ALTER COLUMN preview_status", "DELETE FROM", "TRUNCATE"} {
+		if strings.Contains(sqlOnly(up), destructive) {
+			t.Fatalf("expand migration must not contain %q", destructive)
+		}
+	}
+}
+
 func TestLinkScanInconclusiveMigrationBlocksLegacyClaims(t *testing.T) {
 	up := readFilesMigration(t, "000008_link_scan_inconclusive.up.sql")
 	for _, expected := range []string{
