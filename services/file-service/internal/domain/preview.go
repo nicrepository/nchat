@@ -143,19 +143,34 @@ const (
 // image/webp is absent: the standard library has no webp decoder and this
 // change adds no dependency for one.
 //
-// DOCX/PPTX/ODT/ODP/ODS/XLS are absent, and deliberately: DOCX/PPTX/ODT/ODP
-// need an isolated conversion daemon this build does not yet have (task #494's
-// later phase); ODS and legacy binary XLS have no renderer wired in yet either
-// (task #494's spreadsheet phase covers CSV and XLSX only — see
-// internal/preview/csv.go and xlsx.go). Adding any of them to this map without
-// a renderer for it would schedule a render job nothing can finish.
+// # Why text/plain and application/zip, not text/csv or the XLSX MIME
+//
+// This allowlist is checked against the *coarse* sniff — net/http.
+// DetectContentType — at upload finalisation, and that detector has no
+// signature for CSV or for any OOXML subtype: it can only ever produce
+// text/plain for delimited text (CSV included, indistinguishable from any
+// other readable text by content alone) and application/zip for any
+// zip-shaped file (XLSX included, indistinguishable at this layer from
+// DOCX, PPTX, ODT/ODS/ODP, or an arbitrary .zip). Allowlisting the specific
+// strings a real upload can never produce would silently never schedule a
+// render for anything — exactly the bug this comment now documents against.
+//
+// The finer classification happens one layer down, inside the renderer
+// itself: internal/preview/xlsx.go calls InspectDocumentContainer to learn
+// which OOXML/ODF subtype a zip-shaped upload actually is, and refuses
+// anything that is not XLSX (DOCX/PPTX/ODT/ODP/ODS included) with
+// ErrUnsupported — the same terminal, non-retried outcome as today, just
+// decided after one cheap render attempt instead of never being attempted.
+// A plain-text file that is not delimited data similarly renders as a
+// (possibly single-column) table rather than being pre-filtered — see
+// internal/preview/csv.go's own comment on that trade-off.
 var previewableMIMEs = map[string]struct{}{
 	"image/jpeg":      {},
 	"image/png":       {},
 	"image/gif":       {},
 	"application/pdf": {},
-	"text/csv":        {},
-	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
+	"text/plain":      {},
+	"application/zip": {},
 }
 
 // NormalizeDetectedMIME reduces a stored detected type to the bare type for

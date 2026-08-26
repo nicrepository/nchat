@@ -20,7 +20,7 @@ func decodeSheet(t *testing.T, page []byte) map[string]any {
 }
 
 func TestRenderCSVParsesCommaDelimitedFiles(t *testing.T) {
-	pages, contentType, err := renderPagesWithType(t, "text/csv", []byte("a,b,c\n1,2,3\n4,5,6\n"))
+	pages, contentType, err := renderPagesWithType(t, "text/plain", []byte("a,b,c\n1,2,3\n4,5,6\n"))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestRenderCSVSniffsSemicolonAndTabDelimiters(t *testing.T) {
 		"tab":       "a\tb\tc\n1\t2\t3\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			pages, _, err := renderPagesWithType(t, "text/csv", []byte(source))
+			pages, _, err := renderPagesWithType(t, "text/plain", []byte(source))
 			if err != nil {
 				t.Fatalf("render: %v", err)
 			}
@@ -62,7 +62,7 @@ func TestRenderCSVSniffsSemicolonAndTabDelimiters(t *testing.T) {
 
 func TestRenderCSVStripsAUTF8BOM(t *testing.T) {
 	source := append([]byte{0xEF, 0xBB, 0xBF}, []byte("a,b\n1,2\n")...)
-	pages, _, err := renderPagesWithType(t, "text/csv", source)
+	pages, _, err := renderPagesWithType(t, "text/plain", source)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -75,21 +75,21 @@ func TestRenderCSVStripsAUTF8BOM(t *testing.T) {
 
 func TestRenderCSVRejectsUTF16(t *testing.T) {
 	source := append([]byte{0xFF, 0xFE}, []byte("a\x00,\x00b\x00\n")...)
-	_, _, err := renderPagesWithType(t, "text/csv", source)
+	_, _, err := renderPagesWithType(t, "text/plain", source)
 	if !errors.Is(err, preview.ErrUnsupported) {
 		t.Fatalf("error = %v, want ErrUnsupported", err)
 	}
 }
 
 func TestRenderCSVRejectsInvalidUTF8(t *testing.T) {
-	_, _, err := renderPagesWithType(t, "text/csv", []byte("a,b\n\xff\xfe,2\n"))
+	_, _, err := renderPagesWithType(t, "text/plain", []byte("a,b\n\xff\xfe,2\n"))
 	if !errors.Is(err, preview.ErrUnsupported) {
 		t.Fatalf("error = %v, want ErrUnsupported", err)
 	}
 }
 
 func TestRenderCSVAcceptsRaggedRows(t *testing.T) {
-	pages, _, err := renderPagesWithType(t, "text/csv", []byte("a,b,c\n1,2\n3,4,5,6\n"))
+	pages, _, err := renderPagesWithType(t, "text/plain", []byte("a,b,c\n1,2\n3,4,5,6\n"))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -103,9 +103,9 @@ func TestRenderCSVAcceptsRaggedRows(t *testing.T) {
 func TestRenderCSVTruncatesExcessRows(t *testing.T) {
 	var b strings.Builder
 	for i := 0; i < domain.MaxPreviewSheetRows+50; i++ {
-		b.WriteString("x\n")
+		b.WriteString("x,y\n")
 	}
-	pages, _, err := renderPagesWithType(t, "text/csv", []byte(b.String()))
+	pages, _, err := renderPagesWithType(t, "text/plain", []byte(b.String()))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestRenderCSVTruncatesExcessColumns(t *testing.T) {
 		}
 		row.WriteByte('x')
 	}
-	pages, _, err := renderPagesWithType(t, "text/csv", []byte(row.String()+"\n"))
+	pages, _, err := renderPagesWithType(t, "text/plain", []byte(row.String()+"\n"))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestRenderCSVTruncatesExcessColumns(t *testing.T) {
 
 func TestRenderCSVTruncatesAnOversizedCell(t *testing.T) {
 	huge := strings.Repeat("x", domain.MaxPreviewCellBytes+100)
-	pages, _, err := renderPagesWithType(t, "text/csv", []byte(huge+"\n"))
+	pages, _, err := renderPagesWithType(t, "text/plain", []byte(huge+",y\n"))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -158,11 +158,22 @@ func TestRenderCSVTruncatesAnOversizedCell(t *testing.T) {
 	}
 }
 
+// Plain prose sniffs to the exact same coarse type as CSV — text/plain — so
+// this is the one place that tells them apart. A file with no delimiter on
+// its first line must not be forced into a one-column "table".
+func TestRenderCSVRejectsUndelimitedPlainText(t *testing.T) {
+	source := "This is just a log file.\nNothing here is tabular data.\n"
+	_, _, err := renderPagesWithType(t, "text/plain", []byte(source))
+	if !errors.Is(err, preview.ErrUnsupported) {
+		t.Fatalf("error = %v, want ErrUnsupported", err)
+	}
+}
+
 func TestRenderCSVRefusesAnEmptyFile(t *testing.T) {
 	// readBounded already refuses a zero-length source before the CSV parser
 	// is ever reached — see preview.go's own "empty source" check, shared by
 	// every renderer.
-	_, _, err := renderPagesWithType(t, "text/csv", []byte(""))
+	_, _, err := renderPagesWithType(t, "text/plain", []byte(""))
 	if !errors.Is(err, preview.ErrRender) {
 		t.Fatalf("error = %v, want ErrRender (from the shared empty-source guard)", err)
 	}
@@ -173,8 +184,8 @@ func TestRenderCSVRefusesAnEmptyFile(t *testing.T) {
 // decides what happens if the file is later reopened in a spreadsheet
 // application — only that it renders the text verbatim here.
 func TestRenderCSVNeverInterpretsFormulaLikeOrHTMLCells(t *testing.T) {
-	source := "note\n=CMD|'/c calc'!A1\n<script>alert(1)</script>\n"
-	pages, _, err := renderPagesWithType(t, "text/csv", []byte(source))
+	source := "note,other\n=CMD|'/c calc'!A1,x\n<script>alert(1)</script>,y\n"
+	pages, _, err := renderPagesWithType(t, "text/plain", []byte(source))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}

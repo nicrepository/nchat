@@ -1561,9 +1561,16 @@ func TestUploadSchedulesAPreviewWithoutWaitingForOne(t *testing.T) {
 		content []byte
 		want    domain.PreviewStatus
 	}{
-		"png":   {content: pngBytes(), want: domain.PreviewStatusPending},
-		"pdf":   {content: []byte("%PDF-1.4 a document"), want: domain.PreviewStatusPending},
-		"other": {content: []byte("PK\x03\x04 an archive"), want: domain.PreviewStatusUnsupported},
+		"png": {content: pngBytes(), want: domain.PreviewStatusPending},
+		"pdf": {content: []byte("%PDF-1.4 a document"), want: domain.PreviewStatusPending},
+		// A zip-shaped upload is scheduled too now — CSV and XLSX both sniff
+		// as coarse types (text/plain, application/zip respectively; see
+		// domain.previewableMIMEs' own comment), so an office document is no
+		// longer distinguishable from "not previewable at all" until the
+		// renderer itself inspects the container. What stays genuinely
+		// outside the allowlist is a type net/http.DetectContentType names
+		// specifically and this service has no renderer for.
+		"other": {content: []byte("ID3\x03\x00\x00\x00\x00\x00\x00an mp3"), want: domain.PreviewStatusUnsupported},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)

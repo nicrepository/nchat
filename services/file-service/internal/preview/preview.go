@@ -93,13 +93,21 @@ func (r *Renderer) Render(
 			return nil, "", err
 		}
 		return pages, domain.PreviewContentTypeJPEG, nil
-	case "text/csv":
+	case "text/plain":
+		// The only sniff net/http.DetectContentType ever produces for
+		// delimited text — CSV included, and indistinguishable from any other
+		// readable text at this layer. See previewableMIMEs' own comment.
 		page, err := renderCSV(data)
 		if err != nil {
 			return nil, "", err
 		}
 		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
-	case xlsxSpreadsheetMIME:
+	case "application/zip":
+		// The only sniff net/http.DetectContentType ever produces for any
+		// zip-shaped upload — XLSX included, indistinguishable at this layer
+		// from DOCX/PPTX/ODT/ODP/ODS or an arbitrary .zip. renderXLSX's own
+		// InspectDocumentContainer call decides which of those this actually
+		// is, and refuses everything but XLSX.
 		page, err := renderXLSX(data)
 		if err != nil {
 			return nil, "", err

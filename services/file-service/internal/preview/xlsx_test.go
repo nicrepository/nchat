@@ -13,7 +13,11 @@ import (
 	"github.com/nicrepository/nchat/services/file-service/internal/preview"
 )
 
-const xlsxMIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+// xlsxMIME is what Render is actually called with in production: the coarse
+// sniff net/http.DetectContentType produces for any zip-shaped upload, XLSX
+// included — never the OOXML-specific string, which that sniffer cannot
+// produce at all. See domain.previewableMIMEs' own comment.
+const xlsxMIME = "application/zip"
 
 // xlsxZipFixture builds a raw, hand-assembled OOXML zip — not a real
 // workbook — so a test can put arbitrary (including hostile) entries in it

@@ -66,8 +66,19 @@ func renderCSV(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("%w: CSV is not valid UTF-8", ErrUnsupported)
 	}
 
+	delimiter, structured := sniffDelimiter(data)
+	if !structured {
+		// text/plain also covers ordinary prose — a log, a README, a code
+		// snippet — that merely happens to be readable text. Rendering that
+		// as a one-column "table" would be honest about the bytes but
+		// dishonest about the intent: this is where the distinction is made,
+		// once, rather than downstream where every caller would have to
+		// repeat it.
+		return nil, fmt.Errorf("%w: no delimiter found, not tabular data", ErrUnsupported)
+	}
+
 	reader := csv.NewReader(bytes.NewReader(data))
-	reader.Comma = sniffDelimiter(data)
+	reader.Comma = delimiter
 	// A hostile or simply irregular file's ragged rows are a data fact to
 	// show, not a parse error — encoding/csv's default (reject on width
 	// mismatch) is turned off deliberately.
@@ -141,7 +152,14 @@ func boundRow(record []string) (row []string, truncatedColumns bool) {
 // sniffDelimiter reads the first non-empty line and picks whichever of the
 // common delimiters appears most often outside quotes. Ties, and a line with
 // none of them, default to comma.
-func sniffDelimiter(data []byte) rune {
+// sniffDelimiter reports the winning delimiter and whether the first line
+// actually contains it at least once. The second return matters as much as
+// the first: net/http.DetectContentType sniffs any readable text — including
+// ordinary prose with no delimiter at all — as text/plain, the same coarse
+// type real CSV bytes produce (see domain.previewableMIMEs' own comment), so
+// this is the one place in the pipeline that can tell "genuinely delimited
+// data" from "a plain text file that merely isn't binary".
+func sniffDelimiter(data []byte) (delimiter rune, structured bool) {
 	line := firstNonEmptyLine(data)
 	candidates := []rune{',', ';', '\t', '|'}
 	best, bestCount := ',', 0
@@ -151,7 +169,7 @@ func sniffDelimiter(data []byte) rune {
 			best, bestCount = candidate, count
 		}
 	}
-	return best
+	return best, bestCount > 0
 }
 
 func firstNonEmptyLine(data []byte) string {

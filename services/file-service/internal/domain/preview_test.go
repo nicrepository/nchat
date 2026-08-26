@@ -58,6 +58,11 @@ func TestOnlyPendingIsNonTerminal(t *testing.T) {
 func TestPreviewSupportedNamesExactlyTheRenderableTypes(t *testing.T) {
 	for _, supported := range []string{
 		"image/jpeg", "image/png", "image/gif", "application/pdf",
+		// text/plain and application/zip are the coarse sniffs
+		// net/http.DetectContentType actually produces for CSV and XLSX —
+		// never the specific strings, which that sniffer cannot name. See
+		// previewableMIMEs' own comment.
+		"text/plain", "application/zip",
 		"IMAGE/PNG", " image/jpeg ", "image/jpeg; charset=binary",
 	} {
 		if !domain.PreviewSupported(supported) {
@@ -65,7 +70,7 @@ func TestPreviewSupportedNamesExactlyTheRenderableTypes(t *testing.T) {
 		}
 	}
 	for _, unsupported := range []string{
-		"", "image/webp", "image/svg+xml", "text/html", "application/zip",
+		"", "image/webp", "image/svg+xml", "text/html",
 		"video/mp4", "application/octet-stream", "application/pdf-something",
 	} {
 		if domain.PreviewSupported(unsupported) {
@@ -92,7 +97,7 @@ func TestInitialPreviewStatusQueuesOnlyWhatCanBeRendered(t *testing.T) {
 	}{
 		"image":            {detected: "image/png", size: 4096, want: domain.PreviewStatusPending},
 		"pdf":              {detected: "application/pdf", size: 4096, want: domain.PreviewStatusPending},
-		"unknown type":     {detected: "application/zip", size: 4096, want: domain.PreviewStatusUnsupported},
+		"unknown type":     {detected: "video/mp4", size: 4096, want: domain.PreviewStatusUnsupported},
 		"empty":            {detected: "image/png", size: 0, want: domain.PreviewStatusUnsupported},
 		"at the limit":     {detected: "image/png", size: domain.MaxPreviewSourceBytes, want: domain.PreviewStatusPending},
 		"beyond the limit": {detected: "image/png", size: domain.MaxPreviewSourceBytes + 1, want: domain.PreviewStatusUnsupported},
