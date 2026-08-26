@@ -31,6 +31,7 @@ import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
 
 import "./ChatMessageArea.css";
+import ActiveDirectCallBar from "../calls/ActiveDirectCallBar";
 import ActiveResourceCallBar, {
   type ActiveResourceCallBarProps,
 } from "../calls/ActiveResourceCallBar";
@@ -270,15 +271,33 @@ interface DirectCallActionsProps {
   onVideo: () => void;
 }
 
-/** RF-23 direct 1:1 call entry: audio and video remain distinct call types. */
+/**
+ * RF-23 direct 1:1 call entry: audio and video remain distinct call types,
+ * each its own icon button (issue #673) — never consolidated into one
+ * control or an intermediate type-picker menu.
+ */
 function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
   return (
-    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
-      <button type="button" aria-label="Iniciar chamada de áudio" onClick={onAudio}>
-        Áudio
+    <div className="chat-msg-area__call-actions">
+      <button
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Iniciar chamada de áudio"
+        onClick={onAudio}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          call
+        </span>
       </button>
-      <button type="button" aria-label="Iniciar chamada de vídeo" onClick={onVideo}>
-        Vídeo
+      <button
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Iniciar chamada de vídeo"
+        onClick={onVideo}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          videocam
+        </span>
       </button>
     </div>
   );
@@ -299,18 +318,23 @@ export type ResourceCallHeaderState = { onCall: () => void; disabled?: boolean }
 /**
  * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
  * multiparty call, never separate "audio" and "video" rooms, so there is a
- * single action instead of RF-23's two.
+ * single action instead of RF-23's two. An icon button (issue #673) rather
+ * than the previous "Chamada" text label — the accessible name, disabled
+ * state, and onCall action are unchanged.
  */
 function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
   return (
-    <div className="chat-msg-area__call-actions" aria-label="Chamada">
+    <div className="chat-msg-area__call-actions">
       <button
         type="button"
+        className="chat-msg-area__header-btn"
         aria-label="Iniciar chamada"
         onClick={state.onCall}
         disabled={Boolean(state.disabled)}
       >
-        Chamada
+        <span className="material-symbols-outlined" aria-hidden="true">
+          call
+        </span>
       </button>
     </div>
   );
@@ -1500,6 +1524,37 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     }
   }
 
+  // #673: the direct 1:1 call bar is derived from ChatShell's own
+  // directCallSession — itself populated only once CallSessionProvider's
+  // directPresentationCall authority is non-null (genuinely active,
+  // media-connected, locally owned; never merely ringing — IncomingCallPopup
+  // keeps owning that surface). Matched against THIS view's own
+  // server-resolved counterpart (never the route or a display name) so the
+  // bar only ever appears in the exact DM the call belongs to — navigating to
+  // a different conversation, or a call belonging to a different DM, never
+  // shows it here.
+  const counterpart = activeDM?.counterpart;
+  const directCallSession = kind === "dm" ? ctx.directCallSession : undefined;
+  const directCallForThisDM =
+    directCallSession && counterpart && counterpart.userId === directCallSession.peerUserId
+      ? directCallSession
+      : undefined;
+  const directCallBarProps =
+    directCallForThisDM && counterpart
+      ? {
+          title: `${directCallForThisDM.callType === "video" ? "Chamada de vídeo" : "Chamada de voz"} — ${counterpart.displayName}`,
+          startedAt: directCallForThisDM.startedAt,
+          peerUserId: directCallForThisDM.peerUserId,
+          peerName: counterpart.displayName,
+          peerAvatarUrl: counterpart.avatarUrl,
+          microphoneEnabled: directCallForThisDM.microphoneEnabled,
+          microphonePending: directCallForThisDM.microphonePending,
+          onToggleMicrophone: directCallForThisDM.onToggleMicrophone,
+          onLeave: directCallForThisDM.onLeave,
+          onOpenFullCall: directCallForThisDM.onOpenFullCall,
+        }
+      : null;
+
   return (
     <div
       className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
@@ -1532,7 +1587,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
             name={resolvedName}
             counterpart={activeDM?.counterpart}
             presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
-            onStartCall={ctx.startCall}
+            // #673: once the direct call bar takes over presentation for this
+            // DM, the header suppresses its own call actions — same pattern
+            // #657 already established for the resource call header action.
+            onStartCall={directCallBarProps ? undefined : ctx.startCall}
             resourceCall={resourceCallHeaderState}
             detailsToggle={
               supportsDetails ? (
@@ -1552,6 +1610,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           (participating-local or participating-info).
         */}
         {activeResourceCallBarProps && <ActiveResourceCallBar {...activeResourceCallBarProps} />}
+
+        {/* #673: the direct 1:1 counterpart of the bar above — mutually
+            exclusive with it by construction (resourceCallKind is null for a
+            1:1 DM, so activeResourceCallBarProps is never set here). */}
+        {directCallBarProps && <ActiveDirectCallBar {...directCallBarProps} />}
 
         <PinnedBar pin={latestPin} onUnpin={togglePin} />
 

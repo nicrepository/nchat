@@ -85,6 +85,31 @@ export interface ActiveResourceCallSession {
   onOpenFullCall: () => void;
 }
 
+/**
+ * Everything ActiveDirectCallBar (issue #673) needs to represent the user's
+ * OWN direct 1:1 call inside the DM view that owns it — populated ONLY when
+ * CallSessionProvider's own directPresentationCall authority is non-null
+ * (mirrors ActiveResourceCallSession/resourcePresentationCall exactly): a
+ * genuinely active, media-connected, locally-owned direct call, never merely
+ * ringing. `callId`/`startedAt`/`callType` come straight from that same
+ * validated Call. `peerUserId` is the server-resolved caller/callee id —
+ * never the route or a display name — so ChatMessageArea can match it
+ * against the open DM's own server-resolved counterpart before rendering
+ * anything, and resolve the peer's display name/avatar from there rather
+ * than from a second identity source.
+ */
+export interface ActiveDirectCallSession {
+  callId: string;
+  startedAt: string;
+  callType: CallType;
+  peerUserId: string;
+  microphoneEnabled: boolean;
+  microphonePending: boolean;
+  onToggleMicrophone: () => void;
+  onLeave: () => void;
+  onOpenFullCall: () => void;
+}
+
 export interface ChatOutletContext {
   currentUserId: string;
   channels: Channel[];
@@ -115,6 +140,8 @@ export interface ChatOutletContext {
   joinResourceCall?: (target: ResourceCallTarget) => void;
   /** Present only while participating in a resource call with local ownership (issue #642/#657). */
   resourceCallSession?: ActiveResourceCallSession;
+  /** Present only while a direct 1:1 call is active, media-connected, and locally owned (issue #673) — never merely ringing. */
+  directCallSession?: ActiveDirectCallSession;
 }
 
 /**
@@ -316,6 +343,7 @@ export default function ChatShell() {
     leaveResourceParticipation,
     localIdentity,
     resourcePresentationCall,
+    directPresentationCall,
   } = useCallSession();
   useEffect(() => registerIdentity(state.status, retry), [registerIdentity, retry, state.status]);
   useEffect(() => {
@@ -433,6 +461,33 @@ export default function ChatShell() {
       }
     : undefined;
 
+  // #673's view-scoped exit/expand for a direct call — same `expand()`
+  // resourceCallSession already reuses above, and `calls.end` is the exact
+  // same authoritative end action FloatingCallWindow's own controls.onEnd
+  // uses for a direct call. No new lifecycle: this bundles read-only
+  // pass-throughs of state CallSessionProvider already computed, never a
+  // second source of media/call truth.
+  const directCallSession: ActiveDirectCallSession | undefined = directPresentationCall
+    ? {
+        callId: directPresentationCall.call_id,
+        startedAt: directPresentationCall.created_at,
+        callType: directPresentationCall.call_type,
+        peerUserId:
+          directPresentationCall.caller_id === ready.currentUserId
+            ? directPresentationCall.callee_id
+            : directPresentationCall.caller_id,
+        microphoneEnabled: media.microphoneEnabled,
+        microphonePending: media.pendingControl === "microphone",
+        onToggleMicrophone: () => void media.toggleMicrophone(),
+        onLeave: () => {
+          calls.end();
+        },
+        onOpenFullCall: () => {
+          expand();
+        },
+      }
+    : undefined;
+
   const outletContext: ChatOutletContext = {
     currentUserId: ready.currentUserId,
     channels: ready.channels,
@@ -442,6 +497,7 @@ export default function ChatShell() {
     getResourceCall,
     isParticipatingIn,
     resourceCallSession,
+    directCallSession,
     // Fresh join/rejoin gesture (issue #594 adversarial follow-up, round
     // 3): must go through joinResourceParticipation, never resourceCall.join
     // directly, so an old "left" for whatever this callId's participation
