@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# A kubectl stand-in for the production Blue/Green script tests (issue #626).
+#
+# The decisions those scripts make -- which slot is active, whether a state is
+# mixed, whether a retry converges or reverses -- are exactly the ones that are
+# unsafe to discover against a real cluster. This fake makes them testable: it
+# keeps the Service selectors in a file, so a patch really does change what the
+# next read returns, and a script run twice sees what it did the first time.
+#
+# State comes from FAKE_STATE_DIR:
+#   services/<name>      the slot that Service selects, or absent
+#   ready/<deployment>   "<desired> <ready>"
+#   context              the current kube context
+#   patch-fails          newline-separated Service names whose patch fails
+#   patch-log            appended to on every successful patch
+set -Eeuo pipefail
+
+STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
+
+prev=""
+read_state() { [[ -f "$STATE/$1" ]] && cat "$STATE/$1" || printf ''; }
+
+# kubectl config current-context
+if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
+  read_state context
+  exit 0
+fi
+
+# kubectl get namespace <name>
+if [[ "${1:-}" == "get" && "${2:-}" == "namespace" ]]; then
+  [[ "$(read_state namespace)" == "${3:-}" ]] || exit 1
+  echo "namespace/${3:-} found"
+  exit 0
+fi
+
+# kubectl patch service <name> -n <ns> --type=merge -p {...}
+if [[ "${1:-}" == "patch" && "${2:-}" == "service" ]]; then
+  service="$3"
+  if grep -Fxq "$service" <<<"$(read_state patch-fails)"; then
+    echo "fake: patch refused for $service" >&2
+    exit 1
+  fi
+  slot="$(grep -o '"blue"\|"green"' <<<"$*" | tr -d '"' | head -1)"
+  printf '%s' "$slot" >"$STATE/services/$service"
+  printf '%s %s\n' "$service" "$slot" >>"$STATE/patch-log"
+  echo "service/$service patched"
+  exit 0
+fi
+
+# kubectl scale deployment/<name> ...
+if [[ "${1:-}" == "scale" ]]; then
+  printf '%s\n' "$2" >>"$STATE/scale-log"
+  echo "$2 scaled"
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "service" ]]; then
+  service="$3"
+  [[ -f "$STATE/services/$service" ]] || exit 1
+  cat "$STATE/services/$service"
+  exit 0
+fi
+
+# A Deployment is described by a rollout record, not by "desired ready".
+#
+# ready/<deployment> holds:
+#   <generation> <observedGeneration> <replicas> <updated> <ready> <available> <unavailable>
+#
+# Modelling only "desired ready" is what let the tests agree with the bug: there
+# was no way to express a stuck rollout whose previous pods are still Ready.
+if [[ "${1:-}" == "get" && "${2:-}" == "deployment" ]]; then
+  deployment="$3"
+  [[ -f "$STATE/ready/$deployment" ]] || exit 1
+  read -r generation observed desired updated ready available unavailable <"$STATE/ready/$deployment"
+  case "$*" in
+    # The rollout record, in the order lib.sh asks for it.
+    *"observedGeneration"*)
+      printf '%s|%s|%s|%s|%s|%s|%s' "$generation" "$observed" "$desired" \
+        "$updated" "$ready" "$available" "$unavailable"
+      ;;
+    *"matchLabels"*) read_state "component/$deployment" ;;
+    *".spec.replicas"*) printf '%s' "$desired" ;;
+    *"readyReplicas"*) printf '%s' "$ready" ;;
+    *"release-sha"*) read_state "sha/$deployment" ;;
+    *"containers[0].image"*) read_state "image/$deployment" ;;
+    *) printf '' ;;
+  esac
+  exit 0
+fi
+
+# Ready pods of a workload, each carrying the release it is actually running.
+# observed/<component>-<slot> holds one release per line.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"release-sha"* ]]; then
+  selector=""
+  for arg in "$@"; do
+    [[ "$prev" == "-l" ]] && selector="$arg"
+    prev="$arg"
+  done
+  component="${selector#*component=}"
+  component="${component%%,*}"
+  slot="${selector##*release-slot=}"
+  slot="${slot%%,*}"
+  read_state "observed/$component-$slot"
+  exit 0
+fi
+
+# Capacity inputs. A fixture that sets none of these leaves the preflight with
+# nothing to read, which is INCONCLUSIVE — the fail-safe answer under test.
+if [[ "${1:-}" == "get" && "${2:-}" == "resourcequota" ]]; then
+  case "$*" in
+    *"hard"*"requests.cpu"*) read_state quota/hard-cpu ;;
+    *"used"*"requests.cpu"*) read_state quota/used-cpu ;;
+    *"hard"*"requests.memory"*) read_state quota/hard-memory ;;
+    *"used"*"requests.memory"*) read_state quota/used-memory ;;
+    *"hard"*"ephemeral-storage"*) read_state quota/hard-storage ;;
+    *"used"*"ephemeral-storage"*) read_state quota/used-storage ;;
+    *"hard"*"pods"*) read_state quota/hard-pods ;;
+    *"used"*"pods"*) read_state quota/used-pods ;;
+    *) printf '' ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "deployments" ]]; then
+  read_state current-slot
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then
+  read_state node-allocatable
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
+  # Two shapes: per-container request lines, and one line per Pod for slots.
+  case "$*" in
+    *"status.phase}|"*) read_state cluster-pod-slots ;;
+    *) read_state cluster-pods ;;
+  esac
+  exit 0
+fi
+
+# Secrets: present when the fixture created the marker file.
+if [[ "${1:-}" == "get" && "${2:-}" == "secret" ]]; then
+  [[ -f "$STATE/secrets/${3:-}" ]] || exit 1
+  echo "secret/${3:-} found"
+  exit 0
+fi
+
+# Deletions are recorded, never silently allowed: a test asserts that no active
+# migration Job is ever deleted.
+if [[ "${1:-}" == "delete" ]]; then
+  printf '%s\n' "$*" >>"$STATE/delete-log"
+  echo "${2:-} deleted"
+  exit 0
+fi
+
+# Migration Jobs. jobs/<name> holds "<succeeded> <failed>"; a missing file means
+# the Job does not exist.
+if [[ "${1:-}" == "get" && "${2:-}" == "job" ]]; then
+  [[ -f "$STATE/jobs/${3:-}" ]] || exit 1
+  read -r succeeded failed <"$STATE/jobs/${3:-}"
+  printf '%s|%s' "$succeeded" "$failed"
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "jobs" ]]; then
+  [[ -d "$STATE/jobs" ]] || exit 0
+  ls -1 "$STATE/jobs" 2>/dev/null
+  exit 0
+fi
+
+if [[ "${1:-}" == "apply" ]]; then
+  printf '%s\n' "$*" >>"$STATE/apply-log"
+  # Applying the migration manifest brings its Job into existence, so the wait
+  # that follows has something to observe.
+  if [[ "$*" == *migrations.yaml* && -n "$(read_state pending-job-name)" ]]; then
+    mkdir -p "$STATE/jobs"
+    printf '0 0\n' >"$STATE/jobs/$(read_state pending-job-name)"
+  fi
+  echo "applied"
+  exit 0
+fi
+
+# The migration Job, and the rollouts that follow it.
+if [[ "${1:-}" == "wait" ]]; then
+  printf '%s\n' "$*" >>"$STATE/wait-log"
+  [[ "$(read_state migration-fails)" != "1" ]] || exit 1
+  # A completed wait marks the Job succeeded, so a second deploy of the same
+  # release finds it Complete instead of creating another.
+  job="${*##*job/}"; job="${job%% *}"
+  [[ -z "$job" || ! -d "$STATE/jobs" ]] || printf '1 0\n' >"$STATE/jobs/$job"
+  echo "job condition met"
+  exit 0
+fi
+
+if [[ "${1:-}" == "logs" || "${1:-}" == "describe" ]]; then
+  echo "(fake diagnostics)"
+  exit 0
+fi
+
+if [[ "${1:-}" == "rollout" ]]; then
+  printf '%s\n' "$*" >>"$STATE/rollout-log"
+  [[ "$(read_state rollout-fails)" != "1" ]] || exit 1
+  echo "rollout complete"
+  exit 0
+fi
+
+if [[ "${1:-}" == "get" && "${2:-}" == "configmap" ]]; then
+  case "$*" in
+    *VALKEY_WS_BROADCAST_ENABLED* | *FILE_UPLOADS_ENABLED* | *LIVEKIT_ENABLED*) printf 'true' ;;
+    *FILE_MALWARE_SCANNER_ADDRESS*) printf 'clamav:3310' ;;
+    *NCHAT_WEB_LIVEKIT_CONNECT_SRC*) printf 'wss://livekit.example https://livekit.example' ;;
+    *) printf '' ;;
+  esac
+  exit 0
+fi
+
+# Health/readiness proxy probes.
+if [[ "${1:-}" == "get" && "${2:-}" == "--request-timeout=10s" ]]; then
+  [[ "$(read_state probes-fail)" != "1" ]] || exit 1
+  echo '{}'
+  exit 0
+fi
+
+echo "fake kubectl: unhandled invocation: $*" >&2
+exit 64
