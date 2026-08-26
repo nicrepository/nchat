@@ -303,6 +303,26 @@ describe("message attachments", () => {
     expect(downloadButton()).toBeInTheDocument();
   });
 
+  it.each([
+    ["documento.docx", "application/zip"],
+    ["documento.odt", "application/zip"],
+    ["apresentacao.pptx", "application/zip"],
+  ])("shows the raster preview generated for %s", async (filename, contentType) => {
+    render(
+      <MessageAttachments
+        attachments={[
+          attachment({ filename, contentType, status: "clean", previewStatus: "available" }),
+        ]}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-message-attachment-document-att-1")).toBeInTheDocument(),
+    );
+    expect(mockDocumentPage).toHaveBeenCalledWith("att-1", 1, expect.anything());
+    expect(screen.getAllByRole("button", { name: `Visualizar ${filename}` })).toHaveLength(2);
+  });
+
   it("keeps a ready CSV/XLSX attachment on the plain icon row, with no large preview box", async () => {
     render(
       <MessageAttachments

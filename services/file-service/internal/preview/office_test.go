@@ -42,19 +42,33 @@ func (s *stubDocumentConverter) Convert(_ context.Context, format converterapi.F
 	return multiPagePDF(2), nil
 }
 
-func TestRenderDocumentConvertsDOCXThenRasterizesPDF(t *testing.T) {
-	document := zipBytes(t, map[string]string{"word/document.xml": `<document/>`})
-	client := &stubDocumentConverter{}
-	renderer := preview.NewWithDocumentConverter(client)
-	pages, contentType, err := renderer.RenderDocument(context.Background(), "application/zip", "report.docx", bytes.NewReader(document))
-	if err != nil {
-		t.Fatalf("RenderDocument: %v", err)
+func TestRenderDocumentConvertsOfficeDocumentsThenRasterizesPDF(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		format   converterapi.Format
+		files    map[string]string
+	}{
+		{name: "DOCX", filename: "report.docx", format: converterapi.FormatDOCX, files: map[string]string{"word/document.xml": `<document/>`}},
+		{name: "ODT", filename: "report.odt", format: converterapi.FormatODT, files: map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<document/>`}},
+		{name: "PPTX", filename: "slides.pptx", format: converterapi.FormatPPTX, files: map[string]string{"ppt/presentation.xml": `<presentation/>`}},
 	}
-	if client.format != converterapi.FormatDOCX || !bytes.Equal(client.body, document) {
-		t.Fatalf("converter received format/body %q/%d bytes", client.format, len(client.body))
-	}
-	if contentType != domain.PreviewContentTypeJPEG || len(pages) != 2 {
-		t.Fatalf("content type/pages = %q/%d", contentType, len(pages))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := zipBytes(t, test.files)
+			client := &stubDocumentConverter{}
+			renderer := preview.NewWithDocumentConverter(client)
+			pages, contentType, err := renderer.RenderDocument(context.Background(), "application/zip", test.filename, bytes.NewReader(document))
+			if err != nil {
+				t.Fatalf("RenderDocument: %v", err)
+			}
+			if client.format != test.format || !bytes.Equal(client.body, document) {
+				t.Fatalf("converter received format/body %q/%d bytes", client.format, len(client.body))
+			}
+			if contentType != domain.PreviewContentTypeJPEG || len(pages) != 2 {
+				t.Fatalf("content type/pages = %q/%d", contentType, len(pages))
+			}
+		})
 	}
 }
 

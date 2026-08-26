@@ -53,6 +53,21 @@ func TestHandlerReturnsPDFForValidatedDOCX(t *testing.T) {
 	}
 }
 
+func TestHandlerAcceptsLibreOfficeODTWithEmptyScriptsElement(t *testing.T) {
+	body := zipDocument(t, map[string]string{
+		"mimetype":    "application/vnd.oasis.opendocument.text",
+		"content.xml": `<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:scripts/></office:document>`,
+	})
+	handler := NewHandler(stubRunner{pdf: []byte("%PDF-1.7\n%%EOF")})
+	req := httptest.NewRequest(http.MethodPost, "/v1/convert", bytes.NewReader(body))
+	req.Header.Set("X-Document-Format", "odt")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestHandlerRejectsDisguisedOrActiveDocumentsBeforeRunner(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -64,6 +79,7 @@ func TestHandlerRejectsDisguisedOrActiveDocumentsBeforeRunner(t *testing.T) {
 		{"wrong subtype", "pptx", zipDocument(t, map[string]string{"word/document.xml": "x"})},
 		{"external relationship", "docx", zipDocument(t, map[string]string{"word/document.xml": "x", "word/_rels/document.xml.rels": `<Relationship TargetMode="External" Target="https://example.test"/>`})},
 		{"xml entity", "odt", zipDocument(t, map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>`})},
+		{"odt script", "odt", zipDocument(t, map[string]string{"mimetype": "application/vnd.oasis.opendocument.text", "content.xml": `<office:scripts><office:script>macro</office:script></office:scripts>`})},
 		{"unknown format", "exe", []byte("MZ")},
 		{"forged CFB header", "ppt", append([]byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}, make([]byte, 504)...)},
 	}

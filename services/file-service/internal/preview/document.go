@@ -3,6 +3,7 @@ package preview
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +65,7 @@ func InspectDocumentContainer(data []byte) (string, error) {
 				return "", readErr
 			}
 			folded := strings.ToLower(string(body))
-			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || strings.Contains(folded, "<office:scripts") || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || hasExternalODFReference(folded) {
+			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || hasNonEmptyScriptsElement(body) || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || hasExternalODFReference(folded) {
 				return "", fmt.Errorf("%w: active xml", ErrUnsafeDocument)
 			}
 		}
@@ -80,6 +81,44 @@ func InspectDocumentContainer(data []byte) (string, error) {
 		return odfMIME, nil
 	default:
 		return "", fmt.Errorf("%w: unsupported package", ErrUnsafeDocument)
+	}
+}
+
+func hasNonEmptyScriptsElement(body []byte) bool {
+	if !bytes.Contains(bytes.ToLower(body), []byte("scripts")) {
+		return false
+	}
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	inScripts := false
+	depth := 0
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return false
+		}
+		if err != nil {
+			return true
+		}
+		switch value := token.(type) {
+		case xml.StartElement:
+			if inScripts {
+				return true
+			}
+			if strings.EqualFold(value.Name.Local, "scripts") {
+				inScripts, depth = true, 1
+			}
+		case xml.EndElement:
+			if inScripts {
+				depth--
+				if depth == 0 {
+					inScripts = false
+				}
+			}
+		case xml.CharData:
+			if inScripts && strings.TrimSpace(string(value)) != "" {
+				return true
+			}
+		}
 	}
 }
 

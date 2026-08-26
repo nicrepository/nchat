@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.work go.work.sum ./
 COPY services/document-converter/go.mod ./services/document-converter/go.mod
 COPY services/document-converter ./services/document-converter
-RUN cd services/document-converter && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/document-converter ./cmd/document-converter
+RUN cd services/document-converter && GOWORK=off CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/document-converter ./cmd/document-converter
 
 FROM debian:bookworm-slim
 RUN apt-get update \

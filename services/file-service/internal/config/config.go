@@ -280,7 +280,7 @@ func Load() Config {
 		ReadHeaderTimeoutSeconds:        positiveInt("READ_HEADER_TIMEOUT_SECONDS", 5),
 		ReadTimeoutSeconds:              positiveInt("READ_TIMEOUT_SECONDS", defaultReadTimeoutSeconds),
 		WriteTimeoutSeconds:             positiveInt("WRITE_TIMEOUT_SECONDS", defaultWriteTimeoutSeconds),
-		DocumentConverterURL:            strings.TrimSpace(platformconfig.GetString("DOCUMENT_CONVERTER_URL", "http://document-converter:8089")),
+		DocumentConverterURL:            strings.TrimSpace(platformconfig.GetString("DOCUMENT_CONVERTER_URL", "http://127.0.0.1:8089")),
 		DocumentConverterTimeoutSeconds: positiveInt("DOCUMENT_CONVERTER_TIMEOUT_SECONDS", 35),
 		UploadsEnabled:                  uploadsEnabled,
 		DatabaseURL:                     strings.TrimSpace(platformconfig.GetString("DATABASE_URL", "")),

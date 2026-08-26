@@ -8,8 +8,8 @@ services:
     image: nchat/document-converter:dev
     container_name: nchat-document-converter
     restart: unless-stopped
-    profiles:
-      - document-preview
+    ports:
+      - "127.0.0.1:${DOCUMENT_CONVERTER_HOST_PORT:-8089}:8089"
     read_only: true
     cap_drop:
       - ALL

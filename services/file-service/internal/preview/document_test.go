@@ -56,7 +56,7 @@ func TestInspectDocumentContainerRejectsTraversalAndMacros(t *testing.T) {
 		{"../escape": "x", "word/document.xml": "x"},
 		{"word/document.xml": "x", "word/vbaProject.bin": "macro"},
 		{"xl/workbook.xml": "x", "xl/externalLinks/externalLink1.xml": "external"},
-		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<office:scripts/>`},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:scripts><office:script>macro</office:script></office:scripts></office:document>`},
 		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<draw:object xlink:href="Object 1"/>`},
 		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<text:a xlink:href="https://example.test/secret"/>`},
 		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<text:a xlink:href='file:///etc/passwd'/>`},
@@ -66,6 +66,16 @@ func TestInspectDocumentContainerRejectsTraversalAndMacros(t *testing.T) {
 		if _, err := InspectDocumentContainer(zipFixture(t, files)); err == nil {
 			t.Fatalf("dangerous container accepted: %v", files)
 		}
+	}
+}
+
+func TestInspectDocumentContainerAcceptsEmptyLibreOfficeScriptsElement(t *testing.T) {
+	data := zipFixture(t, map[string]string{
+		"mimetype":    "application/vnd.oasis.opendocument.text",
+		"content.xml": `<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:scripts/></office:document>`,
+	})
+	if got, err := InspectDocumentContainer(data); err != nil || got != "application/vnd.oasis.opendocument.text" {
+		t.Fatalf("empty scripts element: mime=%q err=%v", got, err)
 	}
 }
 

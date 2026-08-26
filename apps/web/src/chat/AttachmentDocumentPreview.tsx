@@ -40,7 +40,7 @@
  * with no room to say "500 rows truncated"), and producing one would mean
  * rendering the table to an image server-side just for this card, undoing
  * the point of sending JSON instead. So this component only ever fetches for
- * `application/pdf` — see isImagePreviewableDocument below — and renders
+ * PDF and converted office documents — see isImagePreviewableDocument below — and renders
  * nothing for anything else; the row below still shows the icon, filename,
  * size and, once ready, the Visualizar button that opens the full preview
  * (image or table) in DocumentPreviewViewer.
@@ -69,12 +69,16 @@ function firstDocumentPreviewPage(attachmentId: string, signal?: AbortSignal): P
  * type file-service reports is the coarse net/http.DetectContentType sniff
  * (see MessageAttachments' isDocumentAttachment for the full reasoning), so
  * `text/plain` and `application/zip` cover CSV/XLSX *and* every other
- * document type this build does not render as an image — none of them is
- * ever JPEG-shaped, ready or not. application/pdf is the one detected type
- * that always is.
+ * document type this build does not render as an image. The filename is used
+ * only to select the already-authorized presentation path; the server still
+ * identifies and validates the container before ever publishing AVAILABLE.
  */
 function isImagePreviewableDocument(attachment: ChannelAttachment): boolean {
-  return attachment.contentType.split(";")[0].trim().toLowerCase() === "application/pdf";
+  const type = attachment.contentType.split(";")[0].trim().toLowerCase();
+  if (type === "application/pdf") return true;
+  if (type !== "application/zip" && type !== "application/octet-stream") return false;
+  const extension = attachment.filename.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+  return extension === "docx" || extension === "odt" || extension === "ppt" || extension === "pptx";
 }
 
 interface AttachmentDocumentPreviewProps {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -142,7 +143,7 @@ func validateDocument(format Format, data []byte) error {
 				return ErrBlocked
 			}
 			folded := strings.ToLower(string(body))
-			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || strings.Contains(folded, "<office:scripts") || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || externalReference(folded) {
+			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || hasNonEmptyScriptsElement(body) || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || externalReference(folded) {
 				return ErrBlocked
 			}
 		}
@@ -174,6 +175,40 @@ func validateDocument(format Format, data []byte) error {
 		}
 	}
 	return ErrBlocked
+}
+
+func hasNonEmptyScriptsElement(body []byte) bool {
+	if !bytes.Contains(bytes.ToLower(body), []byte("scripts")) {
+		return false
+	}
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	inScripts := false
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return false
+		}
+		if err != nil {
+			return true
+		}
+		switch value := token.(type) {
+		case xml.StartElement:
+			if inScripts {
+				return true
+			}
+			if strings.EqualFold(value.Name.Local, "scripts") {
+				inScripts = true
+			}
+		case xml.EndElement:
+			if inScripts && strings.EqualFold(value.Name.Local, "scripts") {
+				inScripts = false
+			}
+		case xml.CharData:
+			if inScripts && strings.TrimSpace(string(value)) != "" {
+				return true
+			}
+		}
+	}
 }
 
 func externalReference(xml string) bool {

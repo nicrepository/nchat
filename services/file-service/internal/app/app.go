@@ -326,7 +326,7 @@ func (a *App) wireAttachments(
 	cleanupStore := storage.NewPGXObjectCleanupStore(pool)
 	converterURL := cfg.DocumentConverterURL
 	if converterURL == "" {
-		converterURL = "http://document-converter:8089"
+		converterURL = "http://127.0.0.1:8089"
 	}
 	converterTimeout := cfg.DocumentConverterTimeoutSeconds
 	if converterTimeout == 0 {
