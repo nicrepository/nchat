@@ -14,6 +14,11 @@ import {
   type SoundNotificationMode,
 } from "../chat/soundPreference";
 import {
+  getIncomingCallRingtoneEnabled,
+  playIncomingCallRingtonePreview,
+  setIncomingCallRingtoneEnabled,
+} from "../calls/incomingCallRingtone";
+import {
   supportedTimezones,
   validateBio,
   validateDisplayName,
@@ -106,6 +111,9 @@ export default function ProfilePage() {
   // below, so this state never drifts from what's persisted.
   const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() =>
     getSoundNotificationMode(),
+  );
+  const [incomingCallRingtoneEnabled, setIncomingCallRingtoneEnabledState] = useState(() =>
+    getIncomingCallRingtoneEnabled(),
   );
   // Notification.permission is the canonical state (never mirrored to
   // localStorage) — read fresh at mount and re-read on visibilitychange so a
@@ -306,6 +314,12 @@ export default function ProfilePage() {
     const next = event.currentTarget.value as SoundNotificationMode;
     setSoundNotificationMode(next);
     setSoundModeState(next);
+  }, []);
+
+  const onChangeIncomingCallRingtone = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const enabled = event.currentTarget.checked;
+    setIncomingCallRingtoneEnabled(enabled);
+    setIncomingCallRingtoneEnabledState(enabled);
   }, []);
 
   // Only ever invoked by the 'default'-state button's onClick below —
@@ -814,6 +828,25 @@ export default function ProfilePage() {
             Menções e mensagens diretas
           </label>
         </fieldset>
+
+        <div className="profile-page__browser-notifications">
+          <label className="profile-page__checkbox-row" htmlFor="incoming-call-ringtone-enabled">
+            <input
+              id="incoming-call-ringtone-enabled"
+              type="checkbox"
+              checked={incomingCallRingtoneEnabled}
+              onChange={onChangeIncomingCallRingtone}
+            />
+            Tocar som para chamadas recebidas
+          </label>
+          <button
+            type="button"
+            className="profile-page__browser-notifications-button"
+            onClick={playIncomingCallRingtonePreview}
+          >
+            Testar som de chamada
+          </button>
+        </div>
 
         <div className="profile-page__browser-notifications">
           {browserPermission === "granted" && (
