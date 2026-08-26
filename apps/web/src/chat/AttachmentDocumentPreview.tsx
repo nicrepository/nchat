@@ -31,6 +31,18 @@
  * still-scanning or rejected file gets no preview request at all, which is
  * both the performance requirement (no duplicate or premature calls) and the
  * security one (never touch content nobody has approved).
+ *
+ * # Spreadsheets and CSV draw nothing here
+ *
+ * A spreadsheet/CSV preview (task #494's sheet phase) is bounded table data,
+ * not an image — there is no first-page JPEG to fetch. A rasterised table at
+ * inline-card size would be illegible anyway (a tiny grid nobody can read,
+ * with no room to say "500 rows truncated"), and producing one would mean
+ * rendering the table to an image server-side just for this card, undoing
+ * the point of sending JSON instead. So this component recognises the
+ * content type client-side and renders nothing for it — the row below still
+ * shows the icon, filename, size and, once ready, the Visualizar button that
+ * opens the full table in DocumentPreviewViewer.
  */
 
 import type { ReactNode } from "react";
@@ -46,6 +58,17 @@ import type { ChannelAttachment } from "./chatTypes";
  */
 function firstDocumentPreviewPage(attachmentId: string, signal?: AbortSignal): Promise<Blob> {
   return fetchDocumentPreviewPage(attachmentId, 1, signal);
+}
+
+/** Same MIME-substring style MessageAttachments' isDocumentAttachment uses, narrowed to the formats that render as a table, never an image. */
+function isSpreadsheetAttachment(attachment: ChannelAttachment): boolean {
+  const type = attachment.contentType.toLowerCase();
+  return (
+    type === "text/csv" ||
+    type.includes("spreadsheetml") ||
+    type.includes("ms-excel") ||
+    type.includes("opendocument.spreadsheet")
+  );
 }
 
 interface AttachmentDocumentPreviewProps {
@@ -64,12 +87,21 @@ export default function AttachmentDocumentPreview({
   attachment,
   onOpen,
 }: AttachmentDocumentPreviewProps) {
-  const eligible = attachment.previewStatus === "ready";
+  const isSpreadsheet = isSpreadsheetAttachment(attachment);
+  // Hooks run unconditionally on every render — eligible is forced false for
+  // a spreadsheet/CSV attachment so useAttachmentBlobUrl never fetches, and
+  // the early return below (after every hook has run) is what actually keeps
+  // this component from rendering anything for it. See the module comment.
+  const eligible = !isSpreadsheet && attachment.previewStatus === "ready";
   const { url, failed, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
     eligible,
     firstDocumentPreviewPage,
   );
+
+  if (isSpreadsheet) {
+    return null;
+  }
 
   if (attachment.previewStatus === "pending") {
     return <Skeleton attachmentId={attachment.id} />;

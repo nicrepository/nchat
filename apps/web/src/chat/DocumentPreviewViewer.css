@@ -56,6 +56,37 @@
   box-shadow: 0 2px 12px rgb(0 0 0 / 18%);
 }
 
+/* Spreadsheet/CSV preview (task #494's sheet phase): a scrollable table, not
+   a rasterised image — the canvas already scrolls, so the table just has to
+   stay wide enough to read without wrapping every cell. */
+.document-preview__sheet {
+  display: inline-block;
+  min-width: 100%;
+  text-align: left;
+}
+.document-preview__sheet-note {
+  margin: 0 0 0.5rem;
+  color: var(--color-text-muted, #6b6580);
+  font-size: 0.85rem;
+}
+.document-preview__sheet-table {
+  border-collapse: collapse;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 2px 12px rgb(0 0 0 / 18%);
+}
+.document-preview__sheet-table th,
+.document-preview__sheet-table td {
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--color-border, #e8e3f0);
+  white-space: nowrap;
+}
+.document-preview__sheet-table th {
+  position: sticky;
+  top: 0;
+  background: var(--color-surface-2, #faf8fd);
+  font-weight: 600;
+}
+
 @media (max-width: 40rem) {
   .document-preview__backdrop {
     padding: 0;

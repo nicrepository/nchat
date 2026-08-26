@@ -145,6 +145,39 @@ export async function fetchDocumentPreviewPage(
 }
 
 /**
+ * A spreadsheet/CSV preview's one bounded page (task #494's sheet phase) —
+ * the server's own sheetPreview shape, never arbitrary JSON. Cell values are
+ * always strings: the server never sends a number, a formula or anything
+ * this client would have to further interpret.
+ */
+export interface DocumentPreviewSheet {
+  columns: string[];
+  rows: string[][];
+  truncatedRows: boolean;
+  truncatedColumns: boolean;
+  totalRowsRead: number;
+}
+
+/**
+ * Fetches a sheet-kind preview's one page as parsed JSON, the sibling of
+ * fetchDocumentPreviewPage for the shape a spreadsheet/CSV preview actually
+ * is. Same URL, same route, same authorization and scan gate — the manifest's
+ * own `kind` is what tells the caller which of the two fetchers to use, so
+ * there is no guessing and no second route.
+ */
+export async function fetchDocumentPreviewSheet(
+  attachmentId: string,
+  page: number,
+  signal?: AbortSignal,
+): Promise<DocumentPreviewSheet> {
+  return authenticatedFetch<DocumentPreviewSheet>(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/document-preview/pages/${page}`,
+    { method: "GET", signal },
+    (response) => response.json() as Promise<DocumentPreviewSheet>,
+  );
+}
+
+/**
  * Fetches one attachment's decrypted content.
  *
  * Same authentication and the same server-side gates as every other route here:

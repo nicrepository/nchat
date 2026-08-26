@@ -6,7 +6,9 @@ import {
   fetchAttachmentContent,
   fetchDocumentPreviewManifest,
   fetchDocumentPreviewPage,
+  fetchDocumentPreviewSheet,
   type DocumentPreviewManifest,
+  type DocumentPreviewSheet,
 } from "./filesApi";
 import "./DocumentPreviewViewer.css";
 
@@ -21,6 +23,10 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
   const [manifest, setManifest] = useState<DocumentPreviewManifest | null>(null);
   const [page, setPage] = useState(1);
   const [loadedPage, setLoadedPage] = useState<{ page: number; url: string } | null>(null);
+  const [loadedSheet, setLoadedSheet] = useState<{
+    page: number;
+    sheet: DocumentPreviewSheet;
+  } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [failed, setFailed] = useState(false);
 
@@ -33,8 +39,14 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
     return () => controller.abort();
   }, [attachment.id]);
 
+  // A sheet-kind preview (task #494's spreadsheet/CSV phase) is bounded table
+  // data, not an image: it needs its own fetcher and no object URL to revoke.
+  // manifest.kind decides which of the two this effect runs, deterministically
+  // — the client never has to guess or attempt both.
+  const isSheet = manifest?.kind === "sheets";
+
   useEffect(() => {
-    if (!manifest) return;
+    if (!manifest || isSheet) return;
     const controller = new AbortController();
     let url: string | null = null;
     void fetchDocumentPreviewPage(attachment.id, page, controller.signal)
@@ -51,9 +63,25 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
       controller.abort();
       if (url) URL.revokeObjectURL(url);
     };
-  }, [attachment.id, manifest, page]);
+  }, [attachment.id, manifest, isSheet, page]);
 
-  const pageUrl = loadedPage?.page === page ? loadedPage.url : null;
+  useEffect(() => {
+    if (!manifest || !isSheet) return;
+    const controller = new AbortController();
+    void fetchDocumentPreviewSheet(attachment.id, page, controller.signal)
+      .then((sheet) => {
+        if (controller.signal.aborted) return;
+        setLoadedSheet({ page, sheet });
+        setFailed(false);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true);
+      });
+    return () => controller.abort();
+  }, [attachment.id, manifest, isSheet, page]);
+
+  const pageUrl = !isSheet && loadedPage?.page === page ? loadedPage.url : null;
+  const sheet = isSheet && loadedSheet?.page === page ? loadedSheet.sheet : null;
 
   function keyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === "Escape") {
@@ -109,23 +137,28 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
           </div>
         </header>
         <div className="document-preview__toolbar">
-          <button
-            type="button"
-            aria-label="Página anterior"
-            disabled={page <= 1}
-            onClick={() => setPage((value) => value - 1)}
-          >
-            ‹
-          </button>
-          <span>{manifest ? `Página ${page} de ${manifest.pageCount}` : "Carregando…"}</span>
-          <button
-            type="button"
-            aria-label="Próxima página"
-            disabled={!manifest || page >= manifest.pageCount}
-            onClick={() => setPage((value) => value + 1)}
-          >
-            ›
-          </button>
+          {!isSheet && (
+            <>
+              <button
+                type="button"
+                aria-label="Página anterior"
+                disabled={page <= 1}
+                onClick={() => setPage((value) => value - 1)}
+              >
+                ‹
+              </button>
+              <span>{manifest ? `Página ${page} de ${manifest.pageCount}` : "Carregando…"}</span>
+              <button
+                type="button"
+                aria-label="Próxima página"
+                disabled={!manifest || page >= manifest.pageCount}
+                onClick={() => setPage((value) => value + 1)}
+              >
+                ›
+              </button>
+            </>
+          )}
+          {isSheet && <span>{manifest ? "Planilha" : "Carregando…"}</span>}
           <button
             type="button"
             aria-label="Reduzir zoom"
@@ -151,6 +184,39 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
               alt={manifest?.labels[page - 1] ?? `Página ${page}`}
               style={{ width: `${zoom * 100}%` }}
             />
+          )}
+          {sheet && (
+            <div className="document-preview__sheet" style={{ zoom }}>
+              {(sheet.truncatedRows || sheet.truncatedColumns) && (
+                <p className="document-preview__sheet-note" role="status">
+                  Mostrando {sheet.totalRowsRead}{" "}
+                  {sheet.truncatedRows ? "das primeiras" : ""} linhas
+                  {sheet.truncatedColumns ? ` e as primeiras ${sheet.columns.length} colunas` : ""}.
+                </p>
+              )}
+              <table className="document-preview__sheet-table">
+                <thead>
+                  <tr>
+                    {sheet.columns.map((column) => (
+                      <th key={column} scope="col">
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sheet.rows.map((row, rowIndex) => (
+                    // Rows are opaque, positional data with no stable id of
+                    // their own — the index is the only identity there is.
+                    <tr key={rowIndex}>
+                      {row.map((cell, cellIndex) => (
+                        <td key={cellIndex}>{cell}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
           {failed && <p role="alert">Não foi possível carregar a pré-visualização.</p>}
         </div>

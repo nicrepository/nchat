@@ -11,18 +11,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * is a separate obligation and the one a user actually sees.
  */
 
-const { mockPreview, mockContent, mockDocumentManifest, mockDocumentPage } = vi.hoisted(() => ({
-  mockPreview: vi.fn(),
-  mockContent: vi.fn(),
-  mockDocumentManifest: vi.fn(),
-  mockDocumentPage: vi.fn(),
-}));
+const { mockPreview, mockContent, mockDocumentManifest, mockDocumentPage, mockDocumentSheet } =
+  vi.hoisted(() => ({
+    mockPreview: vi.fn(),
+    mockContent: vi.fn(),
+    mockDocumentManifest: vi.fn(),
+    mockDocumentPage: vi.fn(),
+    mockDocumentSheet: vi.fn(),
+  }));
 
 vi.mock("./filesApi", () => ({
   fetchAttachmentPreview: (...args: unknown[]) => mockPreview(...args),
   fetchAttachmentContent: (...args: unknown[]) => mockContent(...args),
   fetchDocumentPreviewManifest: (...args: unknown[]) => mockDocumentManifest(...args),
   fetchDocumentPreviewPage: (...args: unknown[]) => mockDocumentPage(...args),
+  fetchDocumentPreviewSheet: (...args: unknown[]) => mockDocumentSheet(...args),
 }));
 
 import MessageAttachments from "./MessageAttachments";
@@ -53,6 +56,13 @@ beforeEach(() => {
     labels: ["Página 1", "Página 2"],
   });
   mockDocumentPage.mockReset().mockResolvedValue(new Blob(["jpeg-page"]));
+  mockDocumentSheet.mockReset().mockResolvedValue({
+    columns: ["A", "B"],
+    rows: [["1", "2"]],
+    truncatedRows: false,
+    truncatedColumns: false,
+    totalRowsRead: 1,
+  });
 });
 
 describe("message attachments — document viewer", () => {
@@ -107,6 +117,48 @@ describe("message attachments — document viewer", () => {
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(trigger).toHaveFocus();
+  });
+
+  it("renders a CSV/XLSX preview as a table, with no pagination and a truncation note when the server sent one", async () => {
+    const user = userEvent.setup();
+    mockDocumentManifest.mockResolvedValue({
+      attachmentId: "att-1",
+      kind: "sheets",
+      pageCount: 1,
+      labels: ["Planilha"],
+    });
+    mockDocumentSheet.mockResolvedValue({
+      columns: ["A", "B"],
+      rows: [["1", "2"]],
+      truncatedRows: true,
+      truncatedColumns: false,
+      totalRowsRead: 500,
+    });
+    render(
+      <MessageAttachments
+        attachments={[
+          attachment({
+            filename: "planilha.csv",
+            contentType: "text/csv",
+            status: "clean",
+            previewStatus: "ready",
+          }),
+        ]}
+      />,
+    );
+
+    const trigger = await screen.findByRole("button", { name: "Visualizar planilha.csv" });
+    await user.click(trigger);
+
+    const dialog = await screen.findByRole("dialog", { name: "planilha.csv" });
+    await waitFor(() => expect(mockDocumentSheet).toHaveBeenCalledWith("att-1", 1, expect.any(AbortSignal)));
+    expect(mockDocumentPage).not.toHaveBeenCalled();
+
+    expect(within(dialog).getByRole("cell", { name: "1" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("columnheader", { name: "A" })).toBeInTheDocument();
+    expect(within(dialog).getByText(/500/)).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Página anterior" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Próxima página" })).not.toBeInTheDocument();
   });
 });
 
@@ -217,6 +269,33 @@ describe("message attachments", () => {
     // The large preview image is itself a click target, and the explicit
     // Visualizar action beside Baixar is a second, separately reachable one.
     expect(screen.getAllByRole("button", { name: "Visualizar relatorio.pdf" })).toHaveLength(2);
+    expect(downloadButton()).toBeInTheDocument();
+  });
+
+  it("keeps a ready CSV/XLSX attachment on the plain icon row, with no large preview box", async () => {
+    render(
+      <MessageAttachments
+        attachments={[
+          attachment({
+            filename: "planilha.csv",
+            contentType: "text/csv",
+            status: "clean",
+            previewStatus: "ready",
+          }),
+        ]}
+      />,
+    );
+
+    expect(await screen.findByText("planilha.csv")).toBeInTheDocument();
+    // A spreadsheet never gets the large first-page card — see
+    // AttachmentDocumentPreview's own module comment — only the row's
+    // existing icon, name, size and the Visualizar/Baixar actions.
+    expect(screen.queryByTestId("chat-message-attachment-document-att-1")).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("chat-message-attachment-document-loading-att-1"),
+    ).not.toBeInTheDocument();
+    expect(mockDocumentPage).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Visualizar planilha.csv" })).toBeInTheDocument();
     expect(downloadButton()).toBeInTheDocument();
   });
 
