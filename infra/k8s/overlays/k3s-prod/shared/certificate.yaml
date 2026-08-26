@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nchat-prod-tls
+spec:
+  secretName: nchat-prod-tls
+  # One certificate for every production origin: the chat host, the
+  # administrative console host, and the four release-slot preview hosts — chat
+  # and console, for each slot. The preview names are on the same certificate so
+  # that validating a candidate never requires an operator to disable TLS to
+  # reach it, and so that one renewal covers every origin instead of five.
+  dnsNames:
+    - REPLACE_ME_HOST
+    - admin.REPLACE_ME_ADMIN_HOST
+    - blue.preview.REPLACE_ME_PREVIEW_HOST
+    - green.preview.REPLACE_ME_PREVIEW_HOST
+    - admin-blue.preview.REPLACE_ME_PREVIEW_HOST
+    - admin-green.preview.REPLACE_ME_PREVIEW_HOST
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod

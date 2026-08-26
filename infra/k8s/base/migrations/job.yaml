@@ -1,3 +1,14 @@
+# The single logical execution of a schema migration.
+#
+# A Job, not an init container and not a step inside a service: an init
+# container would run once per replica and once per release slot, and Blue and
+# Green share one database. backoffLimit: 0 means a failed run stays failed and
+# visible rather than retrying into a half-applied schema, and the deploy script
+# waits on this Job's completion before anything is promoted — a migration that
+# did not finish blocks the release instead of being discovered afterwards.
+#
+# Which node it runs on, and which image digest it carries, are environment
+# facts: the overlays supply them.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -21,8 +32,6 @@ spec:
       automountServiceAccountToken: false
       imagePullSecrets:
         - name: ghcr-pull
-      nodeSelector:
-        kubernetes.io/hostname: srv-apps-01
       securityContext:
         runAsNonRoot: true
         runAsUser: 70

@@ -23,6 +23,8 @@ interface RemoteDirectTileProps {
   hasVideo: boolean;
   bindVideo?: RefCallback<HTMLDivElement>;
   activeSpeakerId?: string | null;
+  sidebar?: boolean;
+  sharing?: boolean;
 }
 
 function SpeakerIndicator({ active, name }: { active: boolean; name: string }) {
@@ -43,20 +45,22 @@ function ParticipantMediaStatus({
   sharing,
 }: {
   name: string;
-  microphoneEnabled: boolean;
+  microphoneEnabled?: boolean;
   cameraEnabled: boolean;
   sharing: boolean;
 }) {
   return (
     <span className="dedicated-call__participant-status">
-      <span
-        role="img"
-        aria-label={`${name}: microfone ${microphoneEnabled ? "ligado" : "desligado"}`}
-      >
-        <span className="material-symbols-outlined" aria-hidden="true">
-          {microphoneEnabled ? "mic" : "mic_off"}
+      {typeof microphoneEnabled === "boolean" && (
+        <span
+          role="img"
+          aria-label={`${name}: microfone ${microphoneEnabled ? "ligado" : "desligado"}`}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            {microphoneEnabled ? "mic" : "mic_off"}
+          </span>
         </span>
-      </span>
+      )}
       <span
         role="img"
         aria-label={`${name}: c\u00e2mera ${cameraEnabled ? "ligada" : "desligada"}`}
@@ -91,11 +95,13 @@ function RemoteDirectTile({
   hasVideo,
   bindVideo,
   activeSpeakerId,
+  sidebar = false,
+  sharing = false,
 }: RemoteDirectTileProps) {
   const active = identity === activeSpeakerId;
   return (
     <article
-      className={`dedicated-call__tile call-speaker-surface${active ? " call-speaker-surface--active" : ""}`}
+      className={`dedicated-call__tile${sidebar ? " dedicated-call__participant" : ""} call-speaker-surface${active ? " call-speaker-surface--active" : ""}`}
     >
       <div ref={bindVideo} className="dedicated-call__media" />
       {!hasVideo && (
@@ -112,6 +118,9 @@ function RemoteDirectTile({
       )}
       <span className="dedicated-call__name">{displayName}</span>
       <SpeakerIndicator active={active} name={displayName} />
+      {sidebar && (
+        <ParticipantMediaStatus name={displayName} cameraEnabled={hasVideo} sharing={sharing} />
+      )}
     </article>
   );
 }
@@ -204,17 +213,18 @@ export default function DedicatedCallStage({
    * Undefined for a channel/group resource call: those participants arrive
    * through `participants` instead, one tile per real person, never this.
    */
-  remoteDirect?: Omit<RemoteDirectTileProps, "activeSpeakerId">;
+  remoteDirect?: Omit<RemoteDirectTileProps, "activeSpeakerId" | "sidebar" | "sharing">;
   /** Stabilized canonical identity from useCallMedia; null means no highlighted person. */
   activeSpeakerId?: string | null;
-  /** Channel/group resource calls alone opt into the issue #643 layout. */
+  /** Channel/group resource calls source remote sidebar tiles from participants. */
   resourceCall?: boolean;
   /** Canonical identity of the selected remote screen sharer. */
   remoteScreenShareParticipantId?: string;
 }) {
   const localActive = activeSpeakerId != null && localParticipantId === activeSpeakerId;
-  const resourceScreenShareActive =
-    resourceCall && (localScreenShareActive || bindScreenShare != null);
+  const hasActiveScreenShare = localScreenShareActive || bindScreenShare != null;
+  const hasSidebarParticipantSource = resourceCall || remoteDirect != null;
+  const screenShareLayoutActive = hasActiveScreenShare && hasSidebarParticipantSource;
   const screenShareTile = localScreenShareActive ? (
     <article className="dedicated-call__tile dedicated-call__tile--screen">
       <div ref={bindLocalScreenShare} className="dedicated-call__media" />
@@ -285,9 +295,22 @@ export default function DedicatedCallStage({
       </article>
     );
   });
+  const remoteSidebarTiles = resourceCall
+    ? remoteParticipantTiles
+    : remoteDirect
+      ? [
+          <RemoteDirectTile
+            key={remoteDirect.identity}
+            {...remoteDirect}
+            activeSpeakerId={activeSpeakerId}
+            sidebar
+            sharing={remoteDirect.identity === remoteScreenShareParticipantId}
+          />,
+        ]
+      : [];
   return (
     <main
-      className={`dedicated-call${resourceScreenShareActive ? " dedicated-call--screen-share" : ""}`}
+      className={`dedicated-call${screenShareLayoutActive ? " dedicated-call--screen-share" : ""}`}
       aria-label={`Chamada ${title}`}
     >
       <header className="dedicated-call__header">
@@ -321,7 +344,7 @@ export default function DedicatedCallStage({
           </span>
         </button>
       </header>
-      {resourceScreenShareActive ? (
+      {screenShareLayoutActive ? (
         <section
           className="dedicated-call__screen-share-layout"
           aria-label={"Conte\u00fado compartilhado"}
@@ -334,7 +357,7 @@ export default function DedicatedCallStage({
           >
             <div className="dedicated-call__participant-list">
               {localParticipantTile}
-              {remoteParticipantTiles}
+              {remoteSidebarTiles}
             </div>
           </aside>
         </section>

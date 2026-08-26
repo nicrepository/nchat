@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: nchat-dev-quota
+  namespace: nchat
+spec:
+  hard:
+    # Sized for two slots at production capacity plus the rolling-update surge
+    # of one of them. Blue/Green is the reason these numbers are roughly double
+    # the single-slot figures: for the length of a release the namespace really
+    # does hold two complete copies of every stateless workload, and a quota
+    # that only fits one is a cutover that fails halfway.
+    #
+    # requests are what the scheduler reserves, so they stay close to real
+    # usage; limits only cap the sum of declared ceilings and reserve nothing.
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "24"
+    limits.memory: 32Gi
+    # Two slots of nine workloads at two replicas each is 36 pods, plus the
+    # shared scanner, upload guard, the stateful layer and one migration Job.
+    pods: "70"
+    # Stable Services plus one per slot for every slotted workload, plus the
+    # shared and stateful ones.
+    services: "45"
+    # Ephemeral storage, derived rather than guessed. What the manifests
+    # actually request today, at the rollout peak:
+    #
+    #   clamav          1 pod  x 1024Mi (two containers at 512Mi) = 1024Mi
+    #   file-service    2 pods x   64Mi, in each of two slots     =  256Mi
+    #   rollout surge   1 extra file-service pod per slot         =  128Mi
+    #                                                        total ~1408Mi
+    #
+    # 8Gi leaves roughly the same headroom the memory figure above does over its
+    # real usage: room for the shared stateful workloads to declare requests of
+    # their own, and for a workload to start needing scratch space, without a
+    # release being refused by the quota.
+    #
+    # It has to be declared. The capacity preflight reports this dimension
+    # INCONCLUSIVE when the quota omits it, and an inconclusive dimension blocks
+    # a deploy — so leaving it out would make every production release depend on
+    # someone patching the quota by hand.
+    requests.ephemeral-storage: 8Gi
+    persistentvolumeclaims: "8"
+    requests.storage: 110Gi

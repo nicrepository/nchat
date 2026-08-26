@@ -38,6 +38,14 @@ const baseProps = {
   activeSpeakerId: null,
 };
 
+const directPeer = {
+  identity: "peer-1",
+  seed: "peer-1",
+  displayName: "Davi Rocha",
+  avatarUrl: "https://x/peer.png",
+  hasVideo: false,
+};
+
 describe("DedicatedCallStage", () => {
   it("renders the local participant's real name with (você)", () => {
     render(<DedicatedCallStage {...baseProps} />);
@@ -517,22 +525,257 @@ describe("DedicatedCallStage", () => {
       expect(document.querySelector(".dedicated-call__grid")).toBeInTheDocument();
     });
 
-    it("does not apply the resource sidebar to a direct call with screen share", () => {
+    it("continues using the resource roster, not remoteDirect, for resource screen share", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          resourceCall
+          bindScreenShare={vi.fn()}
+          remoteDirect={directPeer}
+        />,
+      );
+
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(sidebar).toHaveTextContent(baseProps.localDisplayName);
+      expect(sidebar).toHaveTextContent("Ana Souza");
+      expect(sidebar).toHaveTextContent("Bruno Lima");
+      expect(sidebar).not.toHaveTextContent("Davi Rocha");
+      expect(container.querySelectorAll(".dedicated-call__participant")).toHaveLength(3);
+    });
+  });
+
+  describe("direct screen-share participant sidebar (issue #661)", () => {
+    it("keeps the normal direct layout when no screen share is active", () => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} participants={[]} remoteDirect={directPeer} />,
+      );
+
+      expect(container.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+      expect(
+        container.querySelector(".dedicated-call__screen-share-layout"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText("Davi Rocha")).toBeInTheDocument();
+      expect(screen.getByText("Davi Rocha").closest(".dedicated-call__grid")).toBeInTheDocument();
+    });
+
+    it("uses the shared screen-share layout for a direct local share", () => {
       const { container } = render(
         <DedicatedCallStage
           {...baseProps}
           participants={[]}
-          bindScreenShare={vi.fn()}
-          remoteDirect={{
-            identity: "peer-1",
-            seed: "peer-1",
-            displayName: "Davi Rocha",
-            hasVideo: false,
-          }}
+          remoteDirect={directPeer}
+          localScreenShareActive
+          bindLocalScreenShare={vi.fn()}
         />,
       );
 
-      expect(screen.getByText("Tela de Participante")).toBeInTheDocument();
+      expect(container.querySelector(".dedicated-call")).toHaveClass(
+        "dedicated-call--screen-share",
+      );
+      expect(container.querySelector(".dedicated-call__screen-stage")).toHaveTextContent(
+        "Sua tela",
+      );
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(sidebar.querySelectorAll(".dedicated-call__participant")).toHaveLength(2);
+      expect(within(sidebar).getByText(baseProps.localDisplayName)).toBeInTheDocument();
+      expect(within(sidebar).getByText("Davi Rocha")).toBeInTheDocument();
+      expect(screen.getAllByText("Davi Rocha")).toHaveLength(1);
+      expect(screen.getByLabelText("Controles da chamada")).toBeInTheDocument();
+    });
+
+    it("uses the same direct sidebar layout for a remote share without duplicating the peer", () => {
+      const { container } = render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+          remoteScreenShareParticipantId="peer-1"
+        />,
+      );
+
+      expect(container.querySelector(".dedicated-call")).toHaveClass(
+        "dedicated-call--screen-share",
+      );
+      expect(container.querySelector(".dedicated-call__screen-stage")).toHaveTextContent(
+        "Tela de Davi Rocha",
+      );
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(sidebar.querySelectorAll(".dedicated-call__participant")).toHaveLength(2);
+      expect(within(sidebar).getByText("Davi Rocha")).toBeInTheDocument();
+      expect(screen.getAllByText("Davi Rocha")).toHaveLength(1);
+    });
+
+    it("keeps local share precedence over a transient direct remote share", () => {
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          localScreenShareActive
+          bindLocalScreenShare={vi.fn()}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+        />,
+      );
+
+      expect(screen.getByText("Sua tela")).toBeInTheDocument();
+      expect(screen.queryByText("Tela de Davi Rocha")).not.toBeInTheDocument();
+      expect(document.querySelectorAll(".dedicated-call__tile--screen")).toHaveLength(1);
+    });
+
+    it("restores the normal direct grid immediately when local sharing stops", () => {
+      const view = render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          localScreenShareActive
+          bindLocalScreenShare={vi.fn()}
+        />,
+      );
+
+      view.rerender(
+        <DedicatedCallStage {...baseProps} participants={[]} remoteDirect={directPeer} />,
+      );
+
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
+      expect(
+        document.querySelector(".dedicated-call__screen-share-layout"),
+      ).not.toBeInTheDocument();
+      expect(document.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+      expect(screen.getByText("Davi Rocha").closest(".dedicated-call__grid")).toBeInTheDocument();
+    });
+
+    it("restores the normal direct grid immediately when remote sharing is removed", () => {
+      const view = render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+        />,
+      );
+
+      view.rerender(
+        <DedicatedCallStage {...baseProps} participants={[]} remoteDirect={directPeer} />,
+      );
+
+      expect(
+        screen.queryByRole("complementary", { name: "Participantes" }),
+      ).not.toBeInTheDocument();
+      expect(document.querySelector(".dedicated-call__tile--screen")).not.toBeInTheDocument();
+      expect(document.querySelector(".dedicated-call__grid")).toBeInTheDocument();
+      expect(screen.getAllByText("Davi Rocha")).toHaveLength(1);
+    });
+
+    it("preserves the direct peer video binding when the camera is on", () => {
+      const bindVideo = vi.fn();
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={{ ...directPeer, hasVideo: true, bindVideo }}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+        />,
+      );
+
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      const peerTile = within(sidebar).getByText("Davi Rocha").closest("article")!;
+      expect(peerTile.querySelector(".dedicated-call__avatar")).not.toBeInTheDocument();
+      expect(bindVideo).toHaveBeenCalledWith(expect.any(HTMLDivElement));
+    });
+
+    it("keeps the direct peer avatar fallback when the camera is off", () => {
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={{ ...directPeer, avatarUrl: undefined }}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+        />,
+      );
+
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      const peerTile = within(sidebar).getByText("Davi Rocha").closest("article")!;
+      expect(peerTile).toHaveTextContent("DR");
+      expect(peerTile.querySelector(".dedicated-call__avatar")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+    });
+
+    it("keeps active-speaker presentation for local and direct remote sidebar tiles", () => {
+      const view = render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          bindScreenShare={vi.fn()}
+          activeSpeakerId="user-1"
+        />,
+      );
+
+      expect(screen.getByText(baseProps.localDisplayName).closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+
+      view.rerender(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          bindScreenShare={vi.fn()}
+          activeSpeakerId="peer-1"
+        />,
+      );
+      expect(screen.getByText("Davi Rocha").closest("article")).toHaveClass(
+        "call-speaker-surface--active",
+      );
+      expect(document.querySelectorAll(".call-speaker-surface--active")).toHaveLength(1);
+    });
+
+    it("exposes authoritative direct camera/share status and omits unknown microphone status", () => {
+      render(
+        <DedicatedCallStage
+          {...baseProps}
+          participants={[]}
+          remoteDirect={directPeer}
+          bindScreenShare={vi.fn()}
+          screenShareName="Davi Rocha"
+          remoteScreenShareParticipantId="peer-1"
+        />,
+      );
+
+      const sidebar = screen.getByRole("complementary", { name: "Participantes" });
+      expect(
+        within(sidebar).getByLabelText("Davi Rocha: c\u00e2mera desligada"),
+      ).toBeInTheDocument();
+      expect(
+        within(sidebar).getByLabelText("Davi Rocha est\u00e1 compartilhando a tela"),
+      ).toBeInTheDocument();
+      expect(
+        within(sidebar).queryByLabelText("Davi Rocha: microfone ligado"),
+      ).not.toBeInTheDocument();
+      expect(
+        within(sidebar).queryByLabelText("Davi Rocha: microfone desligado"),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not enable the direct screen-share layout without an authoritative remote peer", () => {
+      const { container } = render(
+        <DedicatedCallStage {...baseProps} participants={[]} bindScreenShare={vi.fn()} />,
+      );
+
       expect(container.querySelector(".dedicated-call__grid")).toBeInTheDocument();
       expect(
         screen.queryByRole("complementary", { name: "Participantes" }),

@@ -17,9 +17,10 @@ func Healthz(cfg config.Config) http.Handler {
 	return health.LivenessHandler(cfg.ServiceName, info.Version, info.Commit)
 }
 
-func Readyz(cfg config.Config) http.Handler {
+func Readyz(cfg config.Config, options routerOptions) http.Handler {
 	info := buildinfo.Current()
-	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit, readinessChecks(cfg), readinessTimeout)
+	return health.ReadinessHandler(cfg.ServiceName, info.Version, info.Commit,
+		readinessChecks(cfg, options), readinessTimeout)
 }
 
 func Version(cfg config.Config) http.Handler {
@@ -33,12 +34,29 @@ func Version(cfg config.Config) http.Handler {
 	})
 }
 
-func readinessChecks(cfg config.Config) []health.Checker {
+func readinessChecks(cfg config.Config, options routerOptions) []health.Checker {
 	return []health.Checker{
 		health.NewStaticChecker("service-bootstrap", true, health.CheckPass, ""),
 		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
 		smtpWorkerCheck(cfg),
+		smtpWorkerLivenessCheck(cfg, options.smtpWorkerProbe),
 	}
+}
+
+// smtpWorkerLivenessCheck answers "is the worker actually running", which the
+// configuration check cannot: a valid configuration whose worker has since
+// stopped used to leave the pod Ready with nothing sending mail.
+func smtpWorkerLivenessCheck(cfg config.Config, probe func() bool) health.Checker {
+	// Disabled on purpose is not a fault, and a caller with no worker to report
+	// on gets no opinion rather than a failure.
+	if !cfg.SMTPWorkerEnabled || probe == nil {
+		return health.NewStaticChecker("smtp-worker-running", true, health.CheckPass, "")
+	}
+	if !probe() {
+		return health.NewStaticChecker("smtp-worker-running", true, health.CheckFail,
+			"smtp worker is enabled but not running")
+	}
+	return health.NewStaticChecker("smtp-worker-running", true, health.CheckPass, "")
 }
 
 func smtpWorkerCheck(cfg config.Config) health.Checker {

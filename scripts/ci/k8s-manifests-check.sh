@@ -20,6 +20,14 @@ else
     infra/k8s/overlays/nchat-dev-server/data
     infra/k8s/overlays/nchat-dev-server/migrations
     infra/k8s/overlays/nchat-dev-server
+    # Production (issue #626). Every unit a release applies separately, plus the
+    # composed picture; the Blue/Green invariants themselves are asserted by
+    # scripts/ci/prod-blue-green-check.sh.
+    infra/k8s/overlays/k3s-prod/shared
+    infra/k8s/overlays/k3s-prod/slots/blue
+    infra/k8s/overlays/k3s-prod/slots/green
+    infra/k8s/overlays/k3s-prod/migrations
+    infra/k8s/overlays/k3s-prod
     infra/k8s/security/sealed-secrets/controller
   )
 fi

@@ -888,7 +888,7 @@ describe("global and dedicated presentation", () => {
     expect(document.querySelector(".dedicated-call__avatar")).toBeNull();
   });
 
-  it("confines the resource screen-share layout to the viewport with internal sidebar scrolling", () => {
+  it("confines the screen-share layout to the viewport with internal sidebar scrolling", () => {
     expect(presentationCSS).toMatch(
       /\.dedicated-call--screen-share\s*\{[^}]*height:\s*100dvh;[^}]*overflow:\s*hidden;/s,
     );
