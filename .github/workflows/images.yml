@@ -85,6 +85,7 @@ jobs:
             web) dockerfile=Dockerfile.web; build_args= ;;
             admin-web) dockerfile=Dockerfile.admin-web; build_args= ;;
             migrations) dockerfile=Dockerfile.migrations; build_args= ;;
+            document-converter) dockerfile=Dockerfile.document-converter; build_args= ;;
             *) dockerfile=Dockerfile.service; build_args="SERVICE=$IMAGE" ;;
           esac
           echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"

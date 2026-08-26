@@ -6,6 +6,7 @@ use (
 	./services/admin-service
 	./services/auth-service
 	./services/chat-service
+	./services/document-converter
 	./services/file-service
 	./services/media-service
 	./services/notification-service

@@ -1,0 +1,16 @@
+FROM golang:1.25.13-bookworm AS build
+WORKDIR /src
+COPY go.work go.work.sum ./
+COPY services/document-converter/go.mod ./services/document-converter/go.mod
+COPY services/document-converter ./services/document-converter
+RUN cd services/document-converter && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/document-converter ./cmd/document-converter
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y libreoffice-calc libreoffice-impress libreoffice-writer fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin converter
+COPY --from=build /out/document-converter /usr/local/bin/document-converter
+USER 65532:65532
+EXPOSE 8089
+ENTRYPOINT ["/usr/local/bin/document-converter"]

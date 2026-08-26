@@ -54,10 +54,10 @@ load_nchat_dev_image_inventory() {
     NCHAT_DEV_IMAGES+=("$image")
   done <"$inventory"
 
-  [[ "${#NCHAT_DEV_GO_SERVICES[@]}" -eq 7 ]] || return 1
-  [[ "${#NCHAT_DEV_RUNTIME_IMAGES[@]}" -eq 9 ]] || return 1
-  [[ "${#NCHAT_DEV_IMAGES[@]}" -eq 10 ]] || return 1
-  [[ "${#NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}" -eq 9 ]] || return 1
+  [[ "${#NCHAT_DEV_GO_SERVICES[@]}" -eq 8 ]] || return 1
+  [[ "${#NCHAT_DEV_RUNTIME_IMAGES[@]}" -eq 10 ]] || return 1
+  [[ "${#NCHAT_DEV_IMAGES[@]}" -eq 11 ]] || return 1
+  [[ "${#NCHAT_DEV_APPLICATION_DEPLOYMENTS[@]}" -eq 10 ]] || return 1
 }
 
 load_nchat_dev_image_inventory "$NCHAT_DEV_IMAGE_INVENTORY"
