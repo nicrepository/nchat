@@ -1145,7 +1145,15 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         renameChannel: vi.fn(),
       }),
     }));
-    vi.doMock("./ChatSidebar", () => ({ default: () => null }));
+    // Partial: only the component is stubbed out. ChatSidebar also exports
+    // chatNavigationId, which the shell's navigation toggle points
+    // `aria-controls` at (issue #467) — replacing the whole module would take
+    // that named export with it and break rendering for a reason that has
+    // nothing to do with what this test is about.
+    vi.doMock("./ChatSidebar", async () => {
+      const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
+      return { ...actual, default: () => null };
+    });
 
     const { default: ChatShellFresh } = await import("./ChatShell");
 
