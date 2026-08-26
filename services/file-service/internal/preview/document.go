@@ -90,7 +90,7 @@ func readZipEntry(entry *zip.File, limit int) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: open entry", ErrUnsafeDocument)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	body, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
 	if err != nil || len(body) > limit {
 		return nil, fmt.Errorf("%w: read entry", ErrUnsafeDocument)
