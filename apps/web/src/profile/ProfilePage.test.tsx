@@ -17,6 +17,20 @@ const { mockUpload, mockRemove, mockFetchProfile, mockUpdateDisplayName, mockUpd
     mockUpdateProfileFields: vi.fn(),
   }));
 
+const { mockGetRingtoneEnabled, mockSetRingtoneEnabled, mockPlayRingtonePreview } = vi.hoisted(
+  () => ({
+    mockGetRingtoneEnabled: vi.fn(() => true),
+    mockSetRingtoneEnabled: vi.fn(),
+    mockPlayRingtonePreview: vi.fn(),
+  }),
+);
+
+vi.mock("../calls/incomingCallRingtone", () => ({
+  getIncomingCallRingtoneEnabled: mockGetRingtoneEnabled,
+  setIncomingCallRingtoneEnabled: mockSetRingtoneEnabled,
+  playIncomingCallRingtonePreview: mockPlayRingtonePreview,
+}));
+
 vi.mock("./profileApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./profileApi")>();
   return {
@@ -1152,6 +1166,59 @@ describe("ProfilePage — sound notification mode", () => {
     expect(offOption().checked).toBe(false);
     expect(allOption().checked).toBe(false);
     expect(mentionsOption().checked).toBe(true);
+  });
+});
+
+describe("ProfilePage — incoming call ringtone", () => {
+  const ringtoneOption = () =>
+    screen.getByRole("checkbox", {
+      name: "Tocar som para chamadas recebidas",
+    }) as HTMLInputElement;
+
+  beforeEach(() => {
+    mockGetRingtoneEnabled.mockReturnValue(true);
+    mockSetRingtoneEnabled.mockClear();
+    mockPlayRingtonePreview.mockClear();
+  });
+
+  it("defaults to enabled independently from the message sound mode", async () => {
+    localStorage.setItem("nchat.notifications.sound.mode", "off");
+    renderPage();
+    await settled();
+
+    expect(ringtoneOption()).toBeChecked();
+    expect(screen.getByLabelText(/desativado/i)).toBeChecked();
+  });
+
+  it("reflects a disabled persisted preference", async () => {
+    mockGetRingtoneEnabled.mockReturnValue(false);
+    renderPage();
+    await settled();
+
+    expect(ringtoneOption()).not.toBeChecked();
+  });
+
+  it("persists changes through its accessible label", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await settled();
+
+    await user.click(ringtoneOption());
+
+    expect(ringtoneOption()).not.toBeChecked();
+    expect(mockSetRingtoneEnabled).toHaveBeenCalledOnce();
+    expect(mockSetRingtoneEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it("previews exactly once even when automatic ringtone is disabled", async () => {
+    const user = userEvent.setup();
+    mockGetRingtoneEnabled.mockReturnValue(false);
+    renderPage();
+    await settled();
+
+    await user.click(screen.getByRole("button", { name: "Testar som de chamada" }));
+
+    expect(mockPlayRingtonePreview).toHaveBeenCalledOnce();
   });
 });
 
