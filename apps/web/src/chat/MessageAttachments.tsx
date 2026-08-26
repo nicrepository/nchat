@@ -31,6 +31,7 @@
 
 import { useState } from "react";
 
+import AttachmentDocumentPreview from "./AttachmentDocumentPreview";
 import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
 import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
@@ -180,28 +181,57 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
     );
   }
 
+  // Documents (PDF today; other office formats once a later phase renders
+  // them) get the large WhatsApp-style card: a big first-page preview above
+  // the row, an explicit Visualizar action beside Baixar. A file still being
+  // scanned or rejected keeps the plain icon row below unchanged — the same
+  // split AttachmentImagePreview draws for raster types, applied to
+  // documents instead of replacing that branch.
+  if (isDocumentAttachment(attachment)) {
+    return (
+      <li
+        className="chat-msg-area__attachment"
+        data-testid={`chat-message-attachment-${attachment.id}`}
+      >
+        {attachment.status === "clean" && (
+          <AttachmentDocumentPreview
+            attachment={attachment}
+            onOpen={(trigger) => onOpenDocument(attachment, trigger)}
+          />
+        )}
+        <div className="chat-msg-area__attachment-row">
+          {icon}
+          {meta}
+        </div>
+        {attachment.status === "clean" && (
+          <div className="chat-msg-area__attachment-actions">
+            {attachment.previewStatus === "ready" && (
+              <button
+                type="button"
+                className="chat-msg-area__attachment-action"
+                aria-label={`Visualizar ${attachment.filename}`}
+                onClick={(event) => onOpenDocument(attachment, event.currentTarget)}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  visibility
+                </span>
+                Visualizar
+              </button>
+            )}
+            <AttachmentDownloadButton attachment={attachment} />
+          </div>
+        )}
+      </li>
+    );
+  }
+
   return (
     <li
       className="chat-msg-area__attachment"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
       <div className="chat-msg-area__attachment-row">
-        {/* The thumbnail draws itself only for an approved file with a ready
-            preview; everything else falls back to the type icon. */}
-        {isDocumentAttachment(attachment) &&
-        attachment.status === "clean" &&
-        attachment.previewStatus === "ready" ? (
-          <button
-            type="button"
-            className="chat-msg-area__attachment-preview-button"
-            aria-label={`Visualizar ${attachment.filename}`}
-            onClick={(event) => onOpenDocument(attachment, event.currentTarget)}
-          >
-            <AttachmentThumbnail attachment={attachment} fallback={icon} />
-          </button>
-        ) : (
-          <AttachmentThumbnail attachment={attachment} fallback={icon} />
-        )}
+        <AttachmentThumbnail attachment={attachment} fallback={icon} />
         {meta}
         {download}
       </div>

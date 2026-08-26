@@ -160,21 +160,95 @@ describe("message attachments", () => {
     );
     expect(downloadButton()).not.toBeInTheDocument();
     expect(mockContent).not.toHaveBeenCalled();
+    // A blocked file's content is never fetched, preview included — nothing
+    // authorized to show and nothing requested.
+    expect(mockDocumentPage).not.toHaveBeenCalled();
+    expect(
+      screen.queryByTestId("chat-message-attachment-document-att-1"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("chat-message-attachment-document-loading-att-1"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Visualizar relatorio.pdf" })).toBeNull();
+  });
+
+  it("shows a loading placeholder for a pdf whose preview is still being generated, never an error", () => {
+    render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "pending" })]}
+      />,
+    );
+
+    expect(
+      screen.getByTestId("chat-message-attachment-document-loading-att-1"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Pré-visualização indisponível.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Visualizar relatorio.pdf" })).toBeNull();
+    // Nothing is fetched until the server says the page is ready.
+    expect(mockDocumentPage).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a plain note when a pdf's preview failed or is unsupported", () => {
+    render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "failed" })]}
+      />,
+    );
+
+    expect(screen.getByText("Pré-visualização indisponível.")).toBeInTheDocument();
+    expect(mockDocumentPage).not.toHaveBeenCalled();
+    // The file itself is still downloadable — only its preview gave up.
+    expect(downloadButton()).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Visualizar relatorio.pdf" })).toBeNull();
+  });
+
+  it("shows the pdf's first-page preview, filename, size and both actions once ready", async () => {
+    render(
+      <MessageAttachments
+        attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-message-attachment-document-att-1")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("relatorio.pdf")).toBeInTheDocument();
+    expect(screen.getByText("KB", { exact: false })).toBeInTheDocument();
+    // The large preview image is itself a click target, and the explicit
+    // Visualizar action beside Baixar is a second, separately reachable one.
+    expect(screen.getAllByRole("button", { name: "Visualizar relatorio.pdf" })).toHaveLength(2);
+    expect(downloadButton()).toBeInTheDocument();
   });
 
   it("requests a preview only for an approved file that has one", () => {
+    // A non-document, non-image type still goes through AttachmentThumbnail's
+    // small preview fetch — PDFs get their own large first-page preview,
+    // covered separately below.
+    const zip = (overrides: Partial<ChannelAttachment> = {}) =>
+      attachment({ filename: "arquivo.zip", contentType: "application/zip", ...overrides });
+    const { rerender } = render(<MessageAttachments attachments={[zip({ previewStatus: "ready" })]} />);
+    // pending_scan + ready preview: still nothing, because the scan decides.
+    expect(mockPreview).not.toHaveBeenCalled();
+
+    rerender(
+      <MessageAttachments attachments={[zip({ status: "clean", previewStatus: "ready" })]} />,
+    );
+    expect(mockPreview).toHaveBeenCalledWith("att-1", expect.anything());
+  });
+
+  it("requests a PDF's first-page preview only once it is approved and ready", () => {
     const { rerender } = render(
       <MessageAttachments attachments={[attachment({ previewStatus: "ready" })]} />,
     );
     // pending_scan + ready preview: still nothing, because the scan decides.
-    expect(mockPreview).not.toHaveBeenCalled();
+    expect(mockDocumentPage).not.toHaveBeenCalled();
 
     rerender(
       <MessageAttachments
         attachments={[attachment({ status: "clean", previewStatus: "ready" })]}
       />,
     );
-    expect(mockPreview).toHaveBeenCalledWith("att-1", expect.anything());
+    expect(mockDocumentPage).toHaveBeenCalledWith("att-1", 1, expect.anything());
   });
 
   it("never plays a video the scan has not cleared", () => {
