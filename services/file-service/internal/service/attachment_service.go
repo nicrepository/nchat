@@ -864,7 +864,7 @@ func (s *AttachmentService) finalizeUpload(
 
 	// Decided from the detected type and the counted size, both facts by now.
 	// An attachment nothing can render never enters the worker's queue.
-	previewStatus := domain.InitialPreviewStatus(content.detectedMIME, size)
+	previewStatus := domain.InitialDocumentPreviewStatus(content.detectedMIME, target.filename, size)
 
 	if err := s.store.MarkUploaded(ctx, UploadedAttachment{
 		ID:             pending.id.String(),

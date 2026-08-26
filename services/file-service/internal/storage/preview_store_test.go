@@ -33,6 +33,7 @@ func claimedPreviewRow() []any {
 		testAttachmentID,
 		testWorkspaceID,
 		"image/png",
+		"photo.png",
 		int64(4096),
 		testStorageObject,
 		pgtype.Int2{Int16: 1, Valid: true},

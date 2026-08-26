@@ -778,6 +778,7 @@ validate_nchat_dev() {
     nchat-allow-dns-egress \
     nchat-allow-file-clamav-egress \
     nchat-allow-file-data-egress \
+    nchat-allow-file-document-converter-egress \
     nchat-allow-link-safety-egress \
     nchat-allow-livekit-api-egress \
     nchat-allow-media-postgres-egress \

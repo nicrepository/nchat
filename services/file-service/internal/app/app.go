@@ -13,6 +13,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/file-service/internal/config"
+	"github.com/nicrepository/nchat/services/file-service/internal/converter"
 	"github.com/nicrepository/nchat/services/file-service/internal/crypto"
 	"github.com/nicrepository/nchat/services/file-service/internal/events"
 	httpapi "github.com/nicrepository/nchat/services/file-service/internal/http"
@@ -323,11 +324,23 @@ func (a *App) wireAttachments(
 	}
 
 	cleanupStore := storage.NewPGXObjectCleanupStore(pool)
+	converterURL := cfg.DocumentConverterURL
+	if converterURL == "" {
+		converterURL = "http://document-converter:8089"
+	}
+	converterTimeout := cfg.DocumentConverterTimeoutSeconds
+	if converterTimeout == 0 {
+		converterTimeout = 35
+	}
+	converterClient, err := converter.NewClient(converterURL, time.Duration(converterTimeout)*time.Second)
+	if err != nil {
+		return errDependenciesUnavailable
+	}
 	a.startPreviewWorker(service.NewPreviewService(
 		storage.NewPGXPreviewStore(pool),
 		objects,
 		keys,
-		preview.New(),
+		preview.NewWithDocumentConverter(converterClient),
 		fence,
 		cleanupStore,
 		attachmentMetrics,

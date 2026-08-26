@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"mime"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -208,6 +209,19 @@ func InitialPreviewStatus(detectedMIME string, size int64) PreviewStatus {
 		return PreviewStatusUnsupported
 	}
 	return PreviewStatusPending
+}
+
+// InitialDocumentPreviewStatus additionally admits a legacy PowerPoint only
+// as a candidate. The worker still requires the CFB signature and converter
+// validation before the bytes can cross the trust boundary.
+func InitialDocumentPreviewStatus(detectedMIME, originalFilename string, size int64) PreviewStatus {
+	if NormalizeDetectedMIME(detectedMIME) == "application/octet-stream" && strings.EqualFold(filepath.Ext(originalFilename), ".ppt") {
+		if size > 0 && size <= MaxPreviewSourceBytes {
+			return PreviewStatusPending
+		}
+		return PreviewStatusUnsupported
+	}
+	return InitialPreviewStatus(detectedMIME, size)
 }
 
 // PreviewObjectKey derives the SeaweedFS key of a preview object.

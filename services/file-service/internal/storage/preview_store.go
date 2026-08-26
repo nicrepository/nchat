@@ -96,7 +96,7 @@ const claimDuePreviewsQuery = `
 	       updated_at = now()
 	  FROM due
 	 WHERE a.id = due.id
-	RETURNING a.id::text, a.workspace_id::text, COALESCE(a.detected_mime, ''),
+	RETURNING a.id::text, a.workspace_id::text, COALESCE(a.detected_mime, ''), a.original_filename,
 	          a.size_bytes, a.storage_object_key, a.envelope_version,
 	          a.wrapped_dek, COALESCE(a.kek_key_id, ''), a.dek_wrap_version,
 	          a.preview_attempts`
@@ -132,7 +132,7 @@ func (s *PGXPreviewStore) ClaimDuePreviews(
 			attempts        pgtype.Int2
 		)
 		if err := rows.Scan(
-			&job.AttachmentID, &job.WorkspaceID, &job.DetectedMIME,
+			&job.AttachmentID, &job.WorkspaceID, &job.DetectedMIME, &job.OriginalFilename,
 			&job.Size, &job.StorageObjectKey, &envelopeVersion,
 			&job.WrappedDEK, &job.KEKKeyID, &keyWrapVersion, &attempts,
 		); err != nil {

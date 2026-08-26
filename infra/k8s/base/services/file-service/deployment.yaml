@@ -74,6 +74,8 @@ spec:
               value: "8083"
             - name: SERVICE_NAME
               value: file-service
+            - name: DOCUMENT_CONVERTER_URL
+              value: http://document-converter:8089
           ports:
             - name: http
               containerPort: 8083

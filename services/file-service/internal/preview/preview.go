@@ -37,7 +37,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 
+	converterapi "github.com/nicrepository/nchat/services/file-service/internal/converter"
 	"github.com/nicrepository/nchat/services/file-service/internal/domain"
 )
 
@@ -57,10 +60,18 @@ var (
 // Renderer produces previews. It holds no state: a PDF render builds and tears
 // down its own sandbox, so a renderer that is never asked for a PDF costs
 // nothing and a process that has finished one holds nothing.
-type Renderer struct{}
+type DocumentConverter interface {
+	Convert(ctx context.Context, format converterapi.Format, source io.Reader) ([]byte, error)
+}
+
+type Renderer struct{ converter DocumentConverter }
 
 // New returns the renderer used by the preview job.
 func New() *Renderer { return &Renderer{} }
+
+func NewWithDocumentConverter(converter DocumentConverter) *Renderer {
+	return &Renderer{converter: converter}
+}
 
 // Render reads src and returns every rendered page plus the one content type
 // they all share. A raster renderer (image or PDF) returns one JPEG per page,
@@ -76,8 +87,16 @@ func New() *Renderer { return &Renderer{} }
 func (r *Renderer) Render(
 	ctx context.Context, detectedMIME string, src io.Reader,
 ) ([][]byte, string, error) {
+	return r.RenderDocument(ctx, detectedMIME, "", src)
+}
+
+func (r *Renderer) RenderDocument(
+	ctx context.Context, detectedMIME, originalFilename string, src io.Reader,
+) ([][]byte, string, error) {
 	if !domain.PreviewSupported(detectedMIME) {
-		return nil, "", fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
+		if domain.NormalizeDetectedMIME(detectedMIME) != "application/octet-stream" || !strings.EqualFold(filepath.Ext(originalFilename), ".ppt") {
+			return nil, "", fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
+		}
 	}
 	data, err := readBounded(src, domain.MaxPreviewSourceBytes)
 	if err != nil {
@@ -113,6 +132,12 @@ func (r *Renderer) Render(
 			page, err = renderXLSX(data)
 		case odsSpreadsheetMIME:
 			page, err = renderODS(data)
+		case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+			return r.convertAndRasterize(ctx, converterapi.FormatDOCX, data)
+		case "application/vnd.oasis.opendocument.text":
+			return r.convertAndRasterize(ctx, converterapi.FormatODT, data)
+		case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+			return r.convertAndRasterize(ctx, converterapi.FormatPPTX, data)
 		default:
 			return nil, "", fmt.Errorf("%w: no renderer for document container", ErrUnsupported)
 		}
@@ -120,6 +145,11 @@ func (r *Renderer) Render(
 			return nil, "", err
 		}
 		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
+	case "application/octet-stream":
+		if len(data) < 8 || !bytes.Equal(data[:8], []byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}) {
+			return nil, "", fmt.Errorf("%w: legacy PPT candidate is not CFB", ErrUnsupported)
+		}
+		return r.convertAndRasterize(ctx, converterapi.FormatPPT, data)
 	default:
 		image, err := renderImage(data)
 		if err != nil {
@@ -127,6 +157,28 @@ func (r *Renderer) Render(
 		}
 		return [][]byte{image}, domain.PreviewContentTypeJPEG, nil
 	}
+}
+
+func (r *Renderer) convertAndRasterize(ctx context.Context, format converterapi.Format, data []byte) ([][]byte, string, error) {
+	if r.converter == nil {
+		return nil, "", fmt.Errorf("%w: document converter unavailable", ErrUnsupported)
+	}
+	pdf, err := r.converter.Convert(ctx, format, bytes.NewReader(data))
+	if err != nil {
+		switch {
+		case errors.Is(err, converterapi.ErrBlocked):
+			return nil, "", fmt.Errorf("%w: converter blocked document", ErrUnsupported)
+		case errors.Is(err, converterapi.ErrPermanent):
+			return nil, "", fmt.Errorf("%w: converter rejected document", ErrRender)
+		default:
+			return nil, "", err
+		}
+	}
+	pages, err := renderPDFPages(ctx, pdf)
+	if err != nil {
+		return nil, "", err
+	}
+	return pages, domain.PreviewContentTypeJPEG, nil
 }
 
 // readBounded reads at most limit bytes and refuses anything longer.

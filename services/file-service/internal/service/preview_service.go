@@ -91,6 +91,7 @@ type PreviewJob struct {
 	AttachmentID     string
 	WorkspaceID      string
 	DetectedMIME     string
+	OriginalFilename string
 	Size             int64
 	StorageObjectKey string
 	EnvelopeVersion  int
@@ -236,6 +237,10 @@ type FenceHandle interface {
 // returns exactly one page of bounded table JSON.
 type PreviewRenderer interface {
 	Render(ctx context.Context, detectedMIME string, src io.Reader) (pages [][]byte, contentType string, err error)
+}
+
+type documentPreviewRenderer interface {
+	RenderDocument(ctx context.Context, detectedMIME, originalFilename string, src io.Reader) (pages [][]byte, contentType string, err error)
 }
 
 // PreviewObserver counts preview outcomes. It carries no labels beyond the
@@ -459,6 +464,9 @@ func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, 
 	}
 	defer func() { _ = content.Close() }()
 
+	if renderer, ok := s.renderer.(documentPreviewRenderer); ok {
+		return renderer.RenderDocument(ctx, job.DetectedMIME, job.OriginalFilename, content)
+	}
 	return s.renderer.Render(ctx, job.DetectedMIME, content)
 }
 
