@@ -85,6 +85,13 @@ type fakeUseCases struct {
 	previewErr  error
 	previewCall service.AttachmentAuthInput
 
+	documentPage     service.Download
+	documentPageErr  error
+	documentPageCall struct {
+		input service.AttachmentAuthInput
+		page  int
+	}
+
 	listViews []service.AttachmentView
 	listErr   error
 	listInput service.ListDestinationAttachmentsInput
@@ -192,6 +199,18 @@ func (f *fakeUseCases) Preview(_ context.Context, input service.AttachmentAuthIn
 		return service.Download{}, f.previewErr
 	}
 	return f.preview, nil
+}
+
+func (f *fakeUseCases) DocumentPreviewPage(
+	_ context.Context, input service.AttachmentAuthInput, page int,
+) (service.Download, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.documentPageCall.input, f.documentPageCall.page = input, page
+	if f.documentPageErr != nil {
+		return service.Download{}, f.documentPageErr
+	}
+	return f.documentPage, nil
 }
 
 func (f *fakeUseCases) Ready() bool {
@@ -439,6 +458,9 @@ func TestUploadResponseExposesOnlyTheClientProjection(t *testing.T) {
 		// The preview state is a client concern and carries nothing internal:
 		// it is one of four words, never an object id, a key or a URL.
 		"previewStatus": true,
+		// The page count is bounded navigation metadata, not an identifier: a
+		// small integer, never an object id, a key or a URL.
+		"previewPageCount": true,
 	}
 	for field := range envelope.Data {
 		if !allowed[field] {

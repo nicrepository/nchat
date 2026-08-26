@@ -191,14 +191,39 @@ func (s *PGXPreviewStore) RevalidateClaim(
 	return valid, nil
 }
 
-// MarkPreviewReady records a produced preview against its attachment.
+// markPreviewReadyQuery records a produced preview and its extra pages against
+// its attachment in one statement.
 //
-// The whole binding lands in one statement, for the same reason MarkUploaded
-// writes the attachment's: the wrapped key authenticates the length and the
-// identity, so a row that carried some of them would be a preview that cannot
-// be opened. WHERE preview_status = 'pending' is the idempotency fence — a
-// second attempt that arrives late affects no row and is told so, instead of
-// overwriting a preview a client may already be reading.
+// Page one's binding lands on files.attachments exactly as it always has, for
+// the same reason MarkUploaded writes the attachment's: the wrapped key
+// authenticates the length and the identity, so a row that carried some of it
+// would be a preview that cannot be opened. WHERE preview_status = 'pending'
+// is the idempotency fence — a second attempt that arrives late affects no row
+// and is told so, instead of overwriting a preview a client may already be
+// reading.
+//
+// # Why the page rows are cleared and reinserted, not upserted
+//
+// The `updated` CTE is only ever non-empty for an attachment moving out of
+// 'pending', which — because of the same idempotency fence — can only happen
+// once per claim. A DELETE-then-INSERT is therefore never clearing a
+// previously *published* page; it is only ever a defensive statement of the
+// invariant "the page rows for a freshly published preview are exactly the
+// ones this statement inserts", stated the same unconditional way
+// attachments_preview_complete_check states "a ready row has every column its
+// binding needs" — as a fact the statement enforces structurally, not as a
+// case the code above it had to reason its way out of.
+//
+// # unnest, not one row per extra page
+//
+// Passing every extra page as parallel arrays and unnesting them is what keeps
+// this a single statement regardless of how many pages a render produced: the
+// alternative, N separate INSERTs, would be N more round trips inside the same
+// transaction boundary this statement already is on its own. When ExtraPages
+// is empty — every image, every one-page PDF, which is every preview this
+// service produced before multi-page rendering existed — unnest on empty
+// arrays yields zero rows and the INSERT is a no-op, so this degrades to
+// exactly the single-row write it replaces.
 //
 // # The fence
 //
@@ -215,9 +240,54 @@ func (s *PGXPreviewStore) RevalidateClaim(
 // attachment that was clean when it was claimed may be rejected by the time its
 // preview is ready. Re-asserting status = 'clean' in the publishing statement
 // is what makes that window closed rather than merely narrow — the row is not
-// updated, the caller is told it was not recorded, and the object it produced
-// is discarded instead of becoming a thumbnail of a file the scanner has since
+// updated, the caller is told it was not recorded, and the objects it produced
+// are discarded instead of becoming a thumbnail of a file the scanner has since
 // condemned. deleted_at is re-asserted for the same reason.
+// The final SELECT reads only the updated CTE, and deliberately does not
+// reference cleared or inserted: PostgreSQL always executes a data-modifying
+// WITH query to completion, whether or not the primary query reads its
+// output, so the DELETE and the INSERT run regardless. Reading only updated is
+// what keeps this statement returning exactly one row every time — including
+// when ExtraPages is empty and the INSERT's own RETURNING would have produced
+// none — instead of a row count that depends on how many pages were unnested.
+const markPreviewReadyQuery = `
+	WITH updated AS (
+		UPDATE files.attachments
+		   SET preview_status = 'ready',
+		       preview_object_id = $2,
+		       preview_size_bytes = $3,
+		       preview_wrapped_dek = $4,
+		       preview_kek_key_id = $5,
+		       preview_envelope_version = $6,
+		       preview_dek_wrap_version = $7,
+		       preview_page_count = $9,
+		       preview_next_attempt_at = NULL,
+		       updated_at = now()
+		 WHERE id = $1
+		   AND preview_status = 'pending'
+		   AND status = 'clean'
+		   AND deleted_at IS NULL
+		   AND preview_attempts = $8
+		RETURNING id
+	),
+	cleared AS (
+		DELETE FROM files.attachment_preview_pages
+		 WHERE attachment_id IN (SELECT id FROM updated)
+	),
+	inserted AS (
+		INSERT INTO files.attachment_preview_pages
+			(attachment_id, page_number, object_id, size_bytes,
+			 wrapped_dek, kek_key_id, envelope_version, dek_wrap_version)
+		SELECT u.id, p.page_number, p.object_id, p.size_bytes,
+		       p.wrapped_dek, p.kek_key_id, p.envelope_version, p.dek_wrap_version
+		  FROM updated AS u
+		  CROSS JOIN unnest(
+		      $10::smallint[], $11::uuid[], $12::bigint[],
+		      $13::bytea[], $14::text[], $15::smallint[], $16::smallint[]
+		  ) AS p(page_number, object_id, size_bytes, wrapped_dek, kek_key_id, envelope_version, dek_wrap_version)
+	)
+	SELECT count(*) FROM updated`
+
 func (s *PGXPreviewStore) MarkPreviewReady(
 	ctx context.Context, result service.PreviewResult,
 ) (bool, error) {
@@ -232,31 +302,42 @@ func (s *PGXPreviewStore) MarkPreviewReady(
 	if result.ClaimAttempt <= 0 {
 		return false, fmt.Errorf("%w: a preview needs its claim", domain.ErrInvalidInput)
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE files.attachments
-		   SET preview_status = 'ready',
-		       preview_object_id = $2,
-		       preview_size_bytes = $3,
-		       preview_wrapped_dek = $4,
-		       preview_kek_key_id = $5,
-		       preview_envelope_version = $6,
-		       preview_dek_wrap_version = $7,
-		       preview_next_attempt_at = NULL,
-		       updated_at = now()
-		 WHERE id = $1
-		   AND preview_status = 'pending'
-		   AND status = 'clean'
-		   AND deleted_at IS NULL
-		   AND preview_attempts = $8`,
+	pageCount := result.PageCount
+	if pageCount <= 0 {
+		// Every caller before multi-page rendering existed leaves this at its
+		// zero value, and page one alone is what it always meant.
+		pageCount = 1
+	}
+
+	pageNumbers := make([]int16, len(result.ExtraPages))
+	objectIDs := make([]string, len(result.ExtraPages))
+	sizes := make([]int64, len(result.ExtraPages))
+	wrappedDEKs := make([][]byte, len(result.ExtraPages))
+	kekKeyIDs := make([]string, len(result.ExtraPages))
+	envelopeVersions := make([]int16, len(result.ExtraPages))
+	keyWrapVersions := make([]int16, len(result.ExtraPages))
+	for i, page := range result.ExtraPages {
+		pageNumbers[i] = int16(page.PageNumber) //nolint:gosec // G115: bounded by MaxPreviewPDFPages.
+		objectIDs[i] = page.ObjectID
+		sizes[i] = page.Size
+		wrappedDEKs[i] = page.WrappedDEK
+		kekKeyIDs[i] = page.KEKKeyID
+		envelopeVersions[i] = int16(page.EnvelopeVersion) //nolint:gosec // G115: pinned to small constants.
+		keyWrapVersions[i] = int16(page.KeyWrapVersion)   //nolint:gosec // G115: pinned to small constants.
+	}
+
+	var count int
+	err := s.pool.QueryRow(ctx, markPreviewReadyQuery,
 		result.AttachmentID, result.PreviewObjectID, result.Size,
 		result.WrappedDEK, result.KEKKeyID,
 		result.EnvelopeVersion, result.KeyWrapVersion,
-		result.ClaimAttempt,
-	)
+		result.ClaimAttempt, pageCount,
+		pageNumbers, objectIDs, sizes, wrappedDEKs, kekKeyIDs, envelopeVersions, keyWrapVersions,
+	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("mark preview ready: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return count == 1, nil
 }
 
 // MarkPreviewTerminal records an outcome that produced no object.

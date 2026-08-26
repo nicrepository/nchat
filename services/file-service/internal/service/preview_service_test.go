@@ -1350,6 +1350,84 @@ func TestPreviewServesTheStoredPreviewOfAVisibleCleanAttachment(t *testing.T) {
 	}
 }
 
+// DocumentPreviewPage serves page two exactly the way Preview serves page
+// one: same decrypting stream, same content type, its own object identity.
+func TestDocumentPreviewPageServesAStoredExtraPage(t *testing.T) {
+	f := newFixture(t)
+	record := storedPreviewRecord(t, f, []byte("page one bytes"))
+	record.PreviewPageCount = 2
+	f.store.authorized = record
+
+	pageID, workspaceID := uuid.New(), uuid.MustParse(testWorkspaceID)
+	pageImage := []byte("page two bytes")
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		t.Fatalf("data key: %v", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(pageImage), dataKey, pageID)
+	if err != nil {
+		t.Fatalf("encrypting reader: %v", err)
+	}
+	if _, err := f.objects.Put(context.Background(), domain.PreviewObjectKey(pageID), encrypted); err != nil {
+		t.Fatalf("store page: %v", err)
+	}
+	wrapped, keyID, err := f.keys.Wrap(dataKey, crypto.Binding{
+		AttachmentID: pageID, WorkspaceID: workspaceID, PlaintextSize: int64(len(pageImage)),
+		KeyWrapVersion: crypto.KeyWrapVersion, ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	f.store.publishPreviewPage(service.PreviewPage{
+		PageNumber: 2, ObjectID: pageID.String(), Size: int64(len(pageImage)),
+		WrappedDEK: wrapped, KEKKeyID: keyID,
+		EnvelopeVersion: crypto.EnvelopeVersion, KeyWrapVersion: crypto.KeyWrapVersion,
+	})
+
+	page, err := f.service.DocumentPreviewPage(context.Background(), service.AttachmentAuthInput{
+		AttachmentID: record.ID, UserID: testUserID, SessionID: testSessionID,
+	}, 2)
+	if err != nil {
+		t.Fatalf("document preview page: %v", err)
+	}
+	defer func() { _ = page.Content.Close() }()
+
+	if page.ContentType != domain.PreviewContentType {
+		t.Fatalf("content type = %q, want %q", page.ContentType, domain.PreviewContentType)
+	}
+	served, err := io.ReadAll(page.Content)
+	if err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if string(served) != string(pageImage) {
+		t.Fatalf("served %q, want %q", served, pageImage)
+	}
+}
+
+// A page number outside [2, PreviewPageCount] is refused before the store is
+// ever asked for it — the bound is checked against the attachment's own
+// record, not discovered from a missing row.
+func TestDocumentPreviewPageRefusesPagesOutsideTheRecordedCount(t *testing.T) {
+	f := newFixture(t)
+	record := storedPreviewRecord(t, f, []byte("page one bytes"))
+	record.PreviewPageCount = 2
+	f.store.authorized = record
+
+	for _, page := range []int{1, 0, -1, 3} {
+		t.Run(fmt.Sprintf("page_%d", page), func(t *testing.T) {
+			_, err := f.service.DocumentPreviewPage(context.Background(), service.AttachmentAuthInput{
+				AttachmentID: record.ID, UserID: testUserID, SessionID: testSessionID,
+			}, page)
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	if f.store.previewPageCall.page != 0 {
+		t.Fatal("an out-of-range page must never reach the store")
+	}
+}
+
 // The preview is behind the same scan gate as the content, because it *is* the
 // content: a rendering of a file nobody has cleared must not be a way to see it.
 func TestPreviewRefusesAnAttachmentTheScanHasNotCleared(t *testing.T) {

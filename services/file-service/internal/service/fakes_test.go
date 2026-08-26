@@ -94,6 +94,15 @@ type fakeStore struct {
 	listErr    error
 	listQuery  service.ListDestinationAttachmentsQuery
 	listCalled int
+
+	// previewPages models the child table: keyed by page number, empty unless
+	// a test publishes one.
+	previewPages    map[int]service.PreviewPage
+	previewPageErr  error
+	previewPageCall struct {
+		attachmentID string
+		page         int
+	}
 }
 
 func (s *fakeStore) ListDestinationAttachments(
@@ -163,6 +172,32 @@ func (s *fakeStore) GetAuthorized(
 		return service.StoredAttachment{}, s.authorizedErr
 	}
 	return s.authorized, nil
+}
+
+func (s *fakeStore) GetPreviewPage(
+	_ context.Context, attachmentID string, page int,
+) (service.PreviewPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.previewPageCall.attachmentID, s.previewPageCall.page = attachmentID, page
+	if s.previewPageErr != nil {
+		return service.PreviewPage{}, s.previewPageErr
+	}
+	record, ok := s.previewPages[page]
+	if !ok {
+		return service.PreviewPage{}, domain.ErrNotFound
+	}
+	return record, nil
+}
+
+// publishPreviewPage adds one extra page to the fake's child table.
+func (s *fakeStore) publishPreviewPage(page service.PreviewPage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.previewPages == nil {
+		s.previewPages = map[int]service.PreviewPage{}
+	}
+	s.previewPages[page.PageNumber] = page
 }
 
 // statusOf returns the persisted state of the only row, failing the test when

@@ -708,6 +708,7 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		previewKEKKeyID        pgtype.Text
 		previewEnvelopeVersion pgtype.Int2
 		previewKeyWrapVersion  pgtype.Int2
+		previewPageCount       pgtype.Int2
 	)
 	err := s.pool.QueryRow(ctx, authorizedAttachmentQuery,
 		input.SessionID, input.UserID, input.AttachmentID,
@@ -717,6 +718,7 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		&envelopeVersion, &wrappedDEK, &kekKeyID, &keyWrapVersion, &createdAt,
 		&previewStatus, &previewObjectID, &previewSize, &previewWrappedDEK,
 		&previewKEKKeyID, &previewEnvelopeVersion, &previewKeyWrapVersion,
+		&previewPageCount,
 	)
 	if err != nil {
 		return service.StoredAttachment{}, fmt.Errorf("read authorized attachment: %w", err)
@@ -766,6 +768,59 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		PreviewKEKKeyID:        previewKEKKeyID.String,
 		PreviewEnvelopeVersion: int(previewEnvelopeVersion.Int16),
 		PreviewKeyWrapVersion:  int(previewKeyWrapVersion.Int16),
+		PreviewPageCount:       int(previewPageCount.Int16),
+	}, nil
+}
+
+// getPreviewPageQuery reads one page beyond the first. Page one is never read
+// through this: it lives on files.attachments itself and is served by the
+// existing preview path unchanged (see attachment_service.go's
+// DocumentPreviewPage). There is no authorization check here on purpose — the
+// same reason PGXPreviewStore is a separate type from this one: the caller
+// (AttachmentService.DocumentPreviewPage) has already re-authorised and
+// re-checked the scan gate through GetAuthorized before this is ever reached,
+// so this query answers only "does this page exist", nothing about who may see
+// it.
+const getPreviewPageQuery = `
+	SELECT object_id::text, size_bytes, wrapped_dek, kek_key_id, envelope_version, dek_wrap_version
+	  FROM files.attachment_preview_pages
+	 WHERE attachment_id = $1 AND page_number = $2`
+
+// GetPreviewPage reads one extra page's binding. A missing row — the page
+// number is out of range, or the attachment has no multi-page preview at all
+// — is reported as domain.ErrNotFound, the same non-enumerating answer the
+// download and preview routes give for anything a caller may not have.
+func (s *PGXAttachmentStore) GetPreviewPage(
+	ctx context.Context, attachmentID string, page int,
+) (service.PreviewPage, error) {
+	if s == nil || s.pool == nil {
+		return service.PreviewPage{}, domain.ErrDependenciesUnavailable
+	}
+	var (
+		objectID        pgtype.Text
+		size            pgtype.Int8
+		wrappedDEK      []byte
+		kekKeyID        pgtype.Text
+		envelopeVersion pgtype.Int2
+		keyWrapVersion  pgtype.Int2
+	)
+	err := s.pool.QueryRow(ctx, getPreviewPageQuery, attachmentID, page).Scan(
+		&objectID, &size, &wrappedDEK, &kekKeyID, &envelopeVersion, &keyWrapVersion,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return service.PreviewPage{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return service.PreviewPage{}, fmt.Errorf("read preview page: %w", err)
+	}
+	return service.PreviewPage{
+		PageNumber:      page,
+		ObjectID:        objectID.String,
+		Size:            size.Int64,
+		WrappedDEK:      wrappedDEK,
+		KEKKeyID:        kekKeyID.String,
+		EnvelopeVersion: int(envelopeVersion.Int16),
+		KeyWrapVersion:  int(keyWrapVersion.Int16),
 	}, nil
 }
 
@@ -955,7 +1010,8 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		       a.wrapped_dek, a.kek_key_id, a.dek_wrap_version, a.created_at,
 		       a.preview_status, a.preview_object_id, a.preview_size_bytes,
 		       a.preview_wrapped_dek, a.preview_kek_key_id,
-		       a.preview_envelope_version, a.preview_dek_wrap_version
+		       a.preview_envelope_version, a.preview_dek_wrap_version,
+		       a.preview_page_count
 		FROM files.attachments AS a
 		CROSS JOIN active_session AS active
 		WHERE a.id = $3
@@ -1023,6 +1079,7 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		authorized.preview_wrapped_dek,
 		authorized.preview_kek_key_id,
 		authorized.preview_envelope_version,
-		authorized.preview_dek_wrap_version
+		authorized.preview_dek_wrap_version,
+		authorized.preview_page_count
 	FROM (SELECT 1) AS single_row
 	LEFT JOIN authorized ON true`

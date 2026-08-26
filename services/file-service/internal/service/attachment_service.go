@@ -167,6 +167,11 @@ type StoredAttachment struct {
 	PreviewKEKKeyID        string
 	PreviewEnvelopeVersion int
 	PreviewKeyWrapVersion  int
+	// PreviewPageCount is the total number of preview pages, page one
+	// included. It is meaningless unless PreviewStatus is ready, exactly like
+	// the fields above it, and is 1 for every preview this service produced
+	// before multi-page rendering existed.
+	PreviewPageCount int
 }
 
 // ListDestinationAttachmentsQuery is a resolved, already-authorised listing
@@ -295,6 +300,12 @@ type AttachmentStore interface {
 	MarkFailed(ctx context.Context, attachmentID, failureCode string) error
 	GetAuthorized(ctx context.Context, input AttachmentAuthInput) (StoredAttachment, error)
 	ListDestinationAttachments(ctx context.Context, query ListDestinationAttachmentsQuery) ([]ListedAttachment, error)
+	// GetPreviewPage reads one preview page beyond the first (page >= 2).
+	// Page one is never read through this — it lives on the attachment row
+	// and is served by the existing Preview path. Implementations answer
+	// domain.ErrNotFound for a page that does not exist, non-enumerating like
+	// every other absence on this route.
+	GetPreviewPage(ctx context.Context, attachmentID string, page int) (PreviewPage, error)
 }
 
 // DraftAttachmentStore owns the short-lived lifecycle used only by message
@@ -386,9 +397,15 @@ type AttachmentView struct {
 	// fallback contract, which is why it is on every projection rather than
 	// only on the preview route: a client never has to probe for a preview to
 	// discover there is none.
-	PreviewStatus   string    `json:"previewStatus"`
-	DestinationKind string    `json:"destinationKind"`
-	CreatedAt       time.Time `json:"createdAt"`
+	PreviewStatus string `json:"previewStatus"`
+	// PreviewPageCount is only meaningful once PreviewStatus is "ready"; it is
+	// how the document preview viewer learns how many pages to offer without
+	// a second request. 1 for every attachment with a single-page preview,
+	// which is every image and every preview produced before multi-page
+	// rendering existed.
+	PreviewPageCount int       `json:"previewPageCount"`
+	DestinationKind  string    `json:"destinationKind"`
+	CreatedAt        time.Time `json:"createdAt"`
 }
 
 // Download is an authorised, decrypted content stream. Closing Content closes
@@ -884,14 +901,15 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		return AttachmentView{}, err
 	}
 	return AttachmentView{
-		ID:              record.ID,
-		Filename:        record.Filename,
-		ContentType:     contentType(record),
-		Size:            record.Size,
-		Status:          string(record.Status),
-		PreviewStatus:   string(record.PreviewStatus),
-		DestinationKind: string(record.Kind),
-		CreatedAt:       record.CreatedAt,
+		ID:               record.ID,
+		Filename:         record.Filename,
+		ContentType:      contentType(record),
+		Size:             record.Size,
+		Status:           string(record.Status),
+		PreviewStatus:    string(record.PreviewStatus),
+		PreviewPageCount: record.PreviewPageCount,
+		DestinationKind:  string(record.Kind),
+		CreatedAt:        record.CreatedAt,
 	}, nil
 }
 
@@ -1046,6 +1064,74 @@ func (s *AttachmentService) Preview(ctx context.Context, input AttachmentAuthInp
 		ContentType: domain.PreviewContentType,
 		Size:        record.PreviewSize,
 		Content:     content,
+	}, nil
+}
+
+// DocumentPreviewPage returns page N (N >= 2) of a multi-page preview
+// (task #494, Fase 1). Page 1 is deliberately not handled here — it is
+// domain.PreviewObjectKey's existing cover object, served by Preview()/
+// GetPreview unchanged.
+//
+// Authorization and delivery follow Preview() exactly: the same visibility
+// query, the same Status.Downloadable gate, the same requirement that the
+// preview itself be ready. A page number outside [2, PreviewPageCount] is
+// domain.ErrNotFound, non-enumerating like every other bound on this route —
+// it never distinguishes "this attachment has no such page" from "this
+// attachment has no multi-page preview at all".
+func (s *AttachmentService) DocumentPreviewPage(
+	ctx context.Context, input AttachmentAuthInput, page int,
+) (Download, error) {
+	if !s.Ready() {
+		return Download{}, domain.ErrDependenciesUnavailable
+	}
+	record, err := s.downloadableAttachment(ctx, input)
+	if err != nil {
+		return Download{}, err
+	}
+	if !record.PreviewStatus.Servable() {
+		return Download{}, domain.ErrPreviewUnavailable
+	}
+	if page < 2 || page > record.PreviewPageCount {
+		return Download{}, domain.ErrNotFound
+	}
+	pageRecord, err := s.store.GetPreviewPage(ctx, record.ID, page)
+	if err != nil {
+		return Download{}, err
+	}
+	object, err := documentPreviewPageObject(record, pageRecord)
+	if err != nil {
+		return Download{}, err
+	}
+	content, err := s.openEncryptedObject(ctx, object)
+	if err != nil {
+		return Download{}, err
+	}
+	return Download{
+		Filename:    record.Filename,
+		ContentType: domain.PreviewContentType,
+		Size:        pageRecord.Size,
+		Content:     content,
+	}, nil
+}
+
+// documentPreviewPageObject builds an extra page's descriptor exactly the way
+// previewObject builds page one's: the storage key is derived from the page's
+// own object id, never read from a column holding a path, so no stored value
+// can redirect a read.
+func documentPreviewPageObject(record StoredAttachment, page PreviewPage) (encryptedObject, error) {
+	pageID, err := uuid.Parse(page.ObjectID)
+	if err != nil {
+		return encryptedObject{}, domain.ErrPreviewUnavailable
+	}
+	return encryptedObject{
+		objectID:        page.ObjectID,
+		workspaceID:     record.WorkspaceID,
+		objectKey:       domain.PreviewObjectKey(pageID),
+		size:            page.Size,
+		wrappedDEK:      page.WrappedDEK,
+		kekKeyID:        page.KEKKeyID,
+		envelopeVersion: page.EnvelopeVersion,
+		keyWrapVersion:  page.KeyWrapVersion,
 	}, nil
 }
 

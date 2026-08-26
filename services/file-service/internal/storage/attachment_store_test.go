@@ -411,6 +411,7 @@ func authorizedAttachmentRow(status domain.Status) []any {
 		text(testKEKKeyID),
 		pgtype.Int2{Int16: 1, Valid: true},
 		pgtype.Int2{Int16: 2, Valid: true},
+		pgtype.Int2{Int16: 1, Valid: true},
 	}
 }
 
