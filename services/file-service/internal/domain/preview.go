@@ -89,6 +89,14 @@ const (
 	// PreviewJPEGQuality is the encoder quality. 80 is the usual thumbnail
 	// trade-off: a 512px preview lands in tens of kilobytes.
 	PreviewJPEGQuality = 80
+
+	// MaxPreviewPDFPages bounds how many pages of one PDF this service will
+	// ever render and store. It is a cost ceiling, not a product limit: it
+	// keeps a 400-page report's whole render inside the one job that already
+	// renders its cover, instead of multiplying the job's cost by the
+	// document's length. A PDF longer than this is previewed up to the cap;
+	// the rest is reachable only through the full download.
+	MaxPreviewPDFPages = 20
 )
 
 // previewableMIMEs is the allowlist of *detected* content types that have a
@@ -97,6 +105,11 @@ const (
 //
 // image/webp is absent: the standard library has no webp decoder and this
 // change adds no dependency for one.
+//
+// DOCX/XLSX/PPTX/ODT/ODS/ODP/CSV are absent too, and deliberately: they need
+// an isolated conversion daemon this build does not yet have (task #494's
+// later phase), not a change here. Adding one of them to this map without
+// that daemon existing would schedule a render job with no renderer for it.
 var previewableMIMEs = map[string]struct{}{
 	"image/jpeg":      {},
 	"image/png":       {},

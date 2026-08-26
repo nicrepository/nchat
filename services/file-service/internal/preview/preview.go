@@ -61,14 +61,16 @@ type Renderer struct{}
 // New returns the renderer used by the preview job.
 func New() *Renderer { return &Renderer{} }
 
-// Render reads src and returns a JPEG no larger than domain.MaxPreviewDimension
-// on its longest edge.
+// Render reads src and returns one JPEG per page, each no larger than
+// domain.MaxPreviewDimension on its longest edge. Every non-PDF renderer
+// produces exactly one page; a PDF produces up to domain.MaxPreviewPDFPages,
+// bounded by the document's real page count.
 //
 // detectedMIME is the type detected from the content at upload — never a
 // declared type and never an extension. It selects the decoder; the decoder
 // then validates the bytes itself, so a mismatch fails rather than being
 // coerced.
-func (r *Renderer) Render(ctx context.Context, detectedMIME string, src io.Reader) ([]byte, error) {
+func (r *Renderer) Render(ctx context.Context, detectedMIME string, src io.Reader) ([][]byte, error) {
 	if !domain.PreviewSupported(detectedMIME) {
 		return nil, fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
 	}
@@ -80,9 +82,13 @@ func (r *Renderer) Render(ctx context.Context, detectedMIME string, src io.Reade
 		return nil, err
 	}
 	if domain.NormalizeDetectedMIME(detectedMIME) == "application/pdf" {
-		return renderPDFFirstPage(ctx, data)
+		return renderPDFPages(ctx, data)
 	}
-	return renderImage(data)
+	image, err := renderImage(data)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{image}, nil
 }
 
 // readBounded reads at most limit bytes and refuses anything longer.

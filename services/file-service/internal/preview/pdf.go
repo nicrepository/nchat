@@ -53,9 +53,9 @@ const (
 	// way past. Exceeding it fails the render; it never grows the process.
 	pdfMemoryLimitPages = 2048
 
-	// pdfFirstPage is the only page this feature renders. A preview is the
-	// cover of a document, and rendering more would multiply the cost of every
-	// PDF by its length.
+	// pdfFirstPage is PDFium's zero-based index of the first page, used both
+	// as the loop's starting index and as the "does this document have a
+	// page at all" bound.
 	pdfFirstPage = 0
 )
 
@@ -95,15 +95,36 @@ func sandboxConfig(ctx context.Context) webassembly.Config {
 	}
 }
 
-// renderPDFFirstPage rasterises page one and returns it as a JPEG.
+// renderPDFPages rasterises up to domain.MaxPreviewPDFPages pages, starting
+// from the first, and returns each as its own JPEG.
 //
-// The whole sandbox — runtime, module, instance — is built and torn down around
-// this one call. That is deliberate: a long-lived PDFium pool would hold its
+// The whole sandbox — runtime, module, instance, document — is built and torn
+// down around this one call, exactly as it was when this rendered only page
+// one. That is still deliberate: a long-lived PDFium pool would hold its
 // module for the life of the process whether or not another PDF ever arrives,
 // and tearing down is also what makes the timeout real. ctx is the module's
 // context, so an expired deadline closes the module out from under a render
 // that will not finish, instead of leaving a goroutine spinning inside it.
-func renderPDFFirstPage(ctx context.Context, data []byte) ([]byte, error) {
+//
+// # Why a cap and not the document's real page count
+//
+// A preview is bounded work, not a copy of the document: rendering is the
+// dominant per-page cost once the sandbox and the document are already open,
+// so a thousand-page PDF would otherwise turn one worker slot into a
+// thousand-page job. domain.MaxPreviewPDFPages is that ceiling, applied to
+// whichever is smaller — the document's own page count or the cap.
+//
+// # Why a partial result is success, not failure
+//
+// The loop checks ctx.Err() before every page, not just at the start. If the
+// job's deadline (previewJobTimeout, enforced by the caller) arrives after
+// page 6 of a 20-page cap, this returns those 6 pages and no error — the
+// caller publishes a preview with 6 pages rather than none. Only zero
+// rendered pages is a failure: a preview cut short by its own time budget is
+// still a preview, and the alternative — discarding partial work because the
+// clock ran out — would make a slow-but-legitimate document indistinguishable
+// from one this service could never open at all.
+func renderPDFPages(ctx context.Context, data []byte) ([][]byte, error) {
 	pool, err := webassembly.Init(sandboxConfig(ctx))
 	if err != nil {
 		// Building the sandbox failed, which says nothing about the document:
@@ -126,17 +147,53 @@ func renderPDFFirstPage(ctx context.Context, data []byte) ([]byte, error) {
 		_, _ = instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{Document: document.Document})
 	}()
 
-	if err := hasRenderablePage(instance, document.Document); err != nil {
+	pageCount, err := renderablePageCount(instance, document.Document)
+	if err != nil {
 		return nil, err
 	}
+	renderCount := pageCount
+	if renderCount > domain.MaxPreviewPDFPages {
+		renderCount = domain.MaxPreviewPDFPages
+	}
 
-	// PDFium fits the page inside the box and keeps its aspect ratio, so the
-	// dimensions below bound the output on both axes. RenderForm is left off:
-	// form fields, and anything else interactive, are not part of a preview.
+	pages := make([][]byte, 0, renderCount)
+	for index := pdfFirstPage; index < renderCount; index++ {
+		if ctx.Err() != nil {
+			// The deadline is spent. Whatever rendered so far is kept; nothing
+			// past this point is attempted.
+			break
+		}
+		page, err := renderPDFPage(ctx, instance, document.Document, index)
+		if err != nil {
+			if len(pages) > 0 {
+				// A later page failing to rasterise does not invalidate the
+				// ones that already did — the job still publishes a shorter,
+				// genuine preview instead of discarding good work over one
+				// bad page.
+				break
+			}
+			return nil, err
+		}
+		pages = append(pages, page)
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("%w: no page could be rasterised", ErrRender)
+	}
+	return pages, nil
+}
+
+// renderPDFPage rasterises one page and returns it as a JPEG.
+//
+// PDFium fits the page inside the box and keeps its aspect ratio, so the
+// dimensions below bound the output on both axes. RenderForm is left off:
+// form fields, and anything else interactive, are not part of a preview.
+func renderPDFPage(
+	ctx context.Context, instance pdfium.Pdfium, document references.FPDF_DOCUMENT, index int,
+) ([]byte, error) {
 	rendered, err := instance.RenderPageInPixels(&requests.RenderPageInPixels{
 		Page: requests.Page{ByIndex: &requests.PageByIndex{
-			Document: document.Document,
-			Index:    pdfFirstPage,
+			Document: document,
+			Index:    index,
 		}},
 		Width:  domain.MaxPreviewDimension,
 		Height: domain.MaxPreviewDimension,
@@ -177,18 +234,19 @@ func pdfInstanceTimeout(ctx context.Context) time.Duration {
 	return remaining
 }
 
-// hasRenderablePage refuses a document with no first page before any raster is
-// attempted. A structurally valid PDF with zero pages is a real thing to
-// receive, and it is an expected absence rather than a failure.
-func hasRenderablePage(instance pdfium.Pdfium, document references.FPDF_DOCUMENT) error {
+// renderablePageCount refuses a document with no first page before any raster
+// is attempted, and otherwise reports how many pages it has. A structurally
+// valid PDF with zero pages is a real thing to receive, and it is an expected
+// absence rather than a failure.
+func renderablePageCount(instance pdfium.Pdfium, document references.FPDF_DOCUMENT) (int, error) {
 	count, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{Document: document})
 	if err != nil {
-		return fmt.Errorf("%w: page count is unreadable", ErrRender)
+		return 0, fmt.Errorf("%w: page count is unreadable", ErrRender)
 	}
 	if count == nil || count.PageCount <= pdfFirstPage {
-		return fmt.Errorf("%w: document has no renderable page", ErrUnsupported)
+		return 0, fmt.Errorf("%w: document has no renderable page", ErrUnsupported)
 	}
-	return nil
+	return count.PageCount, nil
 }
 
 // openDocumentError classifies a document PDFium refused to open.

@@ -341,7 +341,10 @@ func (q *fakeCleanupQueue) queued() []string {
 type stubRenderer struct {
 	mu sync.Mutex
 
-	image []byte
+	// pages is what Render returns on success. A single-element slice models
+	// every image and every one-page PDF; a longer one models a multi-page
+	// PDF.
+	pages [][]byte
 	err   error
 	// duringRender runs while the renderer is "working", so a test can change
 	// the world underneath a job exactly as a scan verdict would.
@@ -352,7 +355,7 @@ type stubRenderer struct {
 	lastBytes []byte
 }
 
-func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Reader) ([]byte, error) {
+func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Reader) ([][]byte, error) {
 	// Always drain: the real renderer reads the decrypting stream, so an
 	// integrity failure has to surface here exactly as it would in production.
 	read, readErr := io.ReadAll(src)
@@ -373,7 +376,7 @@ func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Rea
 	if r.err != nil {
 		return nil, r.err
 	}
-	return r.image, nil
+	return r.pages, nil
 }
 
 func (r *stubRenderer) callCount() int {
@@ -448,7 +451,7 @@ func newPreviewFixture(t *testing.T) *previewFixture {
 	f := &previewFixture{
 		store:    newFakePreviewStore(),
 		objects:  newFakeObjects(),
-		renderer: &stubRenderer{image: []byte("a rendered jpeg, near enough")},
+		renderer: &stubRenderer{pages: [][]byte{[]byte("a rendered jpeg, near enough")}},
 		fence:    newFakeFence(),
 		cleanup:  &fakeCleanupQueue{},
 		observer: &previewObserver{},
@@ -570,11 +573,83 @@ func TestProcessDueStoresAnEncryptedPreviewAndRecordsIt(t *testing.T) {
 	if result.PreviewObjectID == job.AttachmentID {
 		t.Fatal("the preview must have its own identity, not the attachment's")
 	}
-	if decrypted := string(f.openRecordedPreview(t, result)); decrypted != string(f.renderer.image) {
+	if decrypted := string(f.openRecordedPreview(t, result)); decrypted != string(f.renderer.pages[0]) {
 		t.Fatalf("stored preview decrypts to %q", decrypted)
 	}
 	if results := f.observer.observed(); len(results) != 1 || results[0] != "ready" {
 		t.Fatalf("observed %v, want one ready", results)
+	}
+}
+
+// A multi-page render (a PDF, in production) must persist every page as its
+// own object and record the whole set — page one on the result itself, the
+// rest in ExtraPages — in the one write that publishes the preview.
+func TestProcessDuePersistsEveryRenderedPageAndRecordsThePageCount(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.pages = [][]byte{
+		[]byte("page one bytes"), []byte("page two bytes"), []byte("page three bytes"),
+	}
+	job := f.storeAttachment(t, []byte("a three page pdf, near enough"), "application/pdf")
+	f.store.enqueue(job)
+
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	ready, _ := f.store.recorded()
+	if len(ready) != 1 {
+		t.Fatalf("recorded %d ready results, want 1", len(ready))
+	}
+	result := ready[0]
+	if result.PageCount != 3 {
+		t.Fatalf("page count = %d, want 3", result.PageCount)
+	}
+	if len(result.ExtraPages) != 2 {
+		t.Fatalf("extra pages = %d, want 2", len(result.ExtraPages))
+	}
+	for i, page := range result.ExtraPages {
+		if want := i + 2; page.PageNumber != want {
+			t.Fatalf("extra page %d has number %d, want %d", i, page.PageNumber, want)
+		}
+		if page.ObjectID == result.PreviewObjectID {
+			t.Fatal("an extra page must not share page one's object identity")
+		}
+	}
+	if a, b := result.ExtraPages[0].ObjectID, result.ExtraPages[1].ObjectID; a == b {
+		t.Fatal("the two extra pages must not share an object identity")
+	}
+	// The attachment's own object, plus one stored object per rendered page.
+	if got := f.objects.count(); got != 4 {
+		t.Fatalf("stored objects = %d, want 4 (1 attachment + 3 pages)", got)
+	}
+}
+
+// A publish that loses the race — the row was claimed by a newer attempt, or
+// the scan condemned the attachment mid-render — must discard every page this
+// attempt produced, not only the first. A partial discard would leak every
+// object beyond page one.
+func TestProcessDueDiscardsEveryPageWhenThePreviewIsSuperseded(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.pages = [][]byte{[]byte("page one"), []byte("page two"), []byte("page three")}
+	f.store.readyLost = true
+	job := f.storeAttachment(t, []byte("a three page pdf, near enough"), "application/pdf")
+	f.store.enqueue(job)
+
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	ready, terminal := f.store.recorded()
+	if len(ready) != 0 || len(terminal) != 0 {
+		t.Fatalf("a lost race must record nothing: ready=%v terminal=%v", ready, terminal)
+	}
+	// Only the attachment's own object survives; every page this attempt wrote
+	// must have been deleted, not just the first.
+	if got := f.objects.count(); got != 1 {
+		t.Fatalf("stored objects = %d, want 1 (the attachment only)", got)
+	}
+	if got := len(f.objects.deletedKeys()); got != 3 {
+		t.Fatalf("deleted objects = %d, want 3 (one per rendered page)", got)
 	}
 }
 

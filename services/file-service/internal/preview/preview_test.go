@@ -26,7 +26,20 @@ import (
 // WebAssembly sandbox, which costs a few hundred milliseconds on first use.
 const renderTimeout = 60 * time.Second
 
+// renderBytes renders and returns page one, which is every page for every
+// source these single-page tests use — image renders always produce one page,
+// and the PDF fixtures here are one-page documents. Multi-page PDF rendering
+// has its own tests in pdf_test.go.
 func renderBytes(t *testing.T, detectedMIME string, source []byte) ([]byte, error) {
+	t.Helper()
+	pages, err := renderPages(t, detectedMIME, source)
+	if err != nil {
+		return nil, err
+	}
+	return pages[0], nil
+}
+
+func renderPages(t *testing.T, detectedMIME string, source []byte) ([][]byte, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
 	defer cancel()
@@ -378,7 +391,7 @@ func TestRenderAPDFWithoutADeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	decodePreview(t, rendered)
+	decodePreview(t, rendered[0])
 }
 
 // An encrypted PDF is a legitimate file this service cannot look inside, so it

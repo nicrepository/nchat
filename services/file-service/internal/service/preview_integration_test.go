@@ -1577,7 +1577,7 @@ type renderHook struct {
 	fn    func()
 }
 
-func (r *renderHook) Render(ctx context.Context, detectedMIME string, src io.Reader) ([]byte, error) {
+func (r *renderHook) Render(ctx context.Context, detectedMIME string, src io.Reader) ([][]byte, error) {
 	r.once.Do(r.fn)
 	return r.inner.Render(ctx, detectedMIME, src)
 }
