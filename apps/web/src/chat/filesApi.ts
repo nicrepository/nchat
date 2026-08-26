@@ -114,6 +114,36 @@ export async function fetchAttachmentPreview(
   );
 }
 
+export interface DocumentPreviewManifest {
+  attachmentId: string;
+  kind: "pages" | "sheets";
+  pageCount: number;
+  labels: string[];
+}
+
+export async function fetchDocumentPreviewManifest(
+  attachmentId: string,
+  signal?: AbortSignal,
+): Promise<DocumentPreviewManifest> {
+  const response = await authenticatedFetch<{ data: DocumentPreviewManifest }>(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/document-preview`,
+    { method: "GET", signal },
+  );
+  return response.data;
+}
+
+export async function fetchDocumentPreviewPage(
+  attachmentId: string,
+  page: number,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return authenticatedFetch<Blob>(
+    `${FILES_BASE}/attachments/${encodeURIComponent(attachmentId)}/document-preview/pages/${page}`,
+    { method: "GET", signal },
+    (response) => response.blob(),
+  );
+}
+
 /**
  * Fetches one attachment's decrypted content.
  *

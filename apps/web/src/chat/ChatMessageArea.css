@@ -2199,6 +2199,22 @@
   font-size: 18px;
 }
 
+.chat-msg-area__attachment-preview-button {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.chat-msg-area__attachment-preview-button:focus-visible {
+  outline: 2px solid var(--color-primary, #8b3dff);
+  outline-offset: 2px;
+}
+
 .chat-msg-area__attachment-text {
   flex: 1;
   min-width: 0;
