@@ -30,6 +30,11 @@ import type {
   WSSubscribedEvent,
   WSMessageLinkSafetyChangedEvent,
 } from "./useChatWebSocket";
+import {
+  previewReconcileDelayMs,
+  previewReconcileMaxAttempts,
+  previewReconcileMaxIntervalMs,
+} from "./useConversationDetails";
 import { useMessages } from "./useMessages";
 import type { Message, MessagePage } from "./chatTypes";
 
@@ -185,6 +190,26 @@ vi.mock("./chatApi", () => ({
     mockReconcileMessageLinkSafety(messageId, signal),
 }));
 
+// ── filesApi mock (preview reconciliation) ────────────────────────────────────
+
+const { mockFetchConversationAttachments } = vi.hoisted(() => ({
+  mockFetchConversationAttachments: vi.fn<
+    (
+      target: { kind: "channel" | "dm"; id: string },
+      limit: number,
+      signal?: AbortSignal,
+    ) => Promise<import("./chatTypes").ChannelAttachment[]>
+  >(),
+}));
+
+vi.mock("./filesApi", () => ({
+  fetchConversationAttachments: (
+    target: { kind: "channel" | "dm"; id: string },
+    limit: number,
+    signal?: AbortSignal,
+  ) => mockFetchConversationAttachments(target, limit, signal),
+}));
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const emptyPage: MessagePage = { messages: [], nextCursor: "" };
@@ -322,6 +347,7 @@ beforeEach(() => {
   capturedOnSubscribed = null;
   capturedOnPinUpdated = null;
   vi.clearAllMocks();
+  mockFetchConversationAttachments.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -4162,5 +4188,120 @@ describe("useMessages unknown link-safety states", () => {
 
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
     expect(result.current.state.messages[0].linkSafetyState).toBe("unknown");
+  });
+});
+
+// ── Preview reconciliation for inline attachments ───────────────────────────
+
+function pendingPreviewAttachment(id: string): NonNullable<Message["attachments"]>[number] {
+  return {
+    id,
+    filename: "relatorio.pdf",
+    contentType: "application/pdf",
+    size: 2048,
+    status: "clean",
+    previewStatus: "pending",
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function readyPreviewAttachment(id: string): NonNullable<Message["attachments"]>[number] {
+  return { ...pendingPreviewAttachment(id), previewStatus: "ready" };
+}
+
+describe("useMessages — inline attachment preview reconciliation", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("polls the destination's attachments and patches a preview that finished rendering", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", attachments: [pendingPreviewAttachment("att-1")] })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("pending");
+
+    mockFetchConversationAttachments.mockResolvedValue([readyPreviewAttachment("att-1")]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(previewReconcileDelayMs(0));
+    });
+
+    expect(mockFetchConversationAttachments).toHaveBeenCalledWith(
+      { kind: "channel", id: "ch-1" },
+      expect.any(Number),
+      expect.anything(),
+    );
+    await waitFor(() =>
+      expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("ready"),
+    );
+  });
+
+  it("does not poll when no message carries an attachment still awaiting its preview", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", attachments: [readyPreviewAttachment("att-1")] })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(previewReconcileMaxIntervalMs);
+    });
+
+    expect(mockFetchConversationAttachments).not.toHaveBeenCalled();
+  });
+
+  it("gives up after previewReconcileMaxAttempts unchanged polls, without erroring", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", attachments: [pendingPreviewAttachment("att-1")] })],
+      nextCursor: "",
+    });
+    mockFetchConversationAttachments.mockResolvedValue([pendingPreviewAttachment("att-1")]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    for (let attempt = 0; attempt < previewReconcileMaxAttempts; attempt += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(previewReconcileDelayMs(attempt));
+      });
+    }
+    const callsAtBudget = mockFetchConversationAttachments.mock.calls.length;
+    expect(callsAtBudget).toBe(previewReconcileMaxAttempts);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(previewReconcileMaxIntervalMs);
+    });
+    expect(mockFetchConversationAttachments.mock.calls.length).toBe(callsAtBudget);
+    expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("pending");
+  });
+
+  it("never touches an attachment belonging to a message outside this timeline", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-1", attachments: [pendingPreviewAttachment("att-1")] })],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    mockFetchConversationAttachments.mockResolvedValue([readyPreviewAttachment("att-unrelated")]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(previewReconcileDelayMs(0));
+    });
+
+    expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("pending");
   });
 });
