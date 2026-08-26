@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData, leaveConversation } from "./chatApi";
-import ChatShell, { type ChatOutletContext } from "./ChatShell";
+import ChatShell, { ROOT_LOCK_CLASS, type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
@@ -1301,6 +1301,67 @@ describe("ChatShell — leaving the conversation on screen", () => {
  * stylesheet cannot carry: when the drawer is modal, what closes it, where focus
  * goes, and that changing width is a change of composition and never a remount.
  */
+describe("ChatShell — trava de rolagem do documento", () => {
+  const readingId = "00000000-0000-4000-8000-0000000005c1";
+
+  function renderShell() {
+    return render(
+      <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [{ id: readingId, name: "Plataforma", type: "public" as const, canWrite: true }],
+      dms: [],
+      categories: [],
+    });
+  });
+
+  it("trava o documento enquanto está montado e devolve a rolagem ao desmontar", async () => {
+    const { unmount } = renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(document.documentElement).toHaveClass(ROOT_LOCK_CLASS);
+    expect(document.body).toHaveClass(ROOT_LOCK_CLASS);
+
+    unmount();
+
+    // The cleanup is the whole point: a class left on <html> would follow the
+    // user to login, profile and admin, which are ordinary scrolling documents.
+    expect(document.documentElement).not.toHaveClass(ROOT_LOCK_CLASS);
+    expect(document.body).not.toHaveClass(ROOT_LOCK_CLASS);
+  });
+
+  it("normaliza a rolagem do documento ao montar", async () => {
+    // `overflow: hidden` freezes whatever scroll position it finds, so arriving
+    // from a scrolled route has to be reset rather than merely locked. Asserted
+    // through the browser API the shell calls, not through the class it adds.
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+
+    renderShell();
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(scrollTo).toHaveBeenCalledWith(0, 0);
+    scrollTo.mockRestore();
+  });
+});
+
 describe("ChatShell — navegação responsiva", () => {
   const readingId = "00000000-0000-4000-8000-0000000005b1";
   const otherId = "00000000-0000-4000-8000-0000000005b2";

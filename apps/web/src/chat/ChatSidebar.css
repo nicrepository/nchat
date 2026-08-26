@@ -880,8 +880,22 @@
 
 /* ── Utility ─────────────────────────────────────────────────────────────────── */
 
+/*
+ * Visually hidden, and pinned (issue #467 follow-up — root scroll).
+ *
+ * `top`/`left` are not decoration: without them an absolutely positioned box
+ * with auto offsets stays at its *static* position, and its containing block is
+ * the nearest positioned ancestor — here, none, so the initial containing
+ * block. A scroller only clips descendants whose containing block is inside it,
+ * so a badge sitting 1500px down the sidebar's `overflow-y: auto` nav escaped
+ * both that clip and `.chat-app`'s, and grew the document's scroll area by the
+ * whole length of the conversation list. Pinning the box removes the only thing
+ * about it that ever had a position; it is 1px and fully clipped either way.
+ */
 .sr-only {
   position: absolute;
+  top: 0;
+  left: 0;
   width: 1px;
   height: 1px;
   padding: 0;
