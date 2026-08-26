@@ -357,6 +357,53 @@ func (f *gateFixture) publishPreview(t *testing.T, content []byte) {
 	}
 }
 
+// publishSheetPreview is publishPreview's sheet-kind twin: same authorized
+// encrypted object, same single page, but content carries the bounded JSON
+// table shape and is recorded as such — the fixture's way of putting a
+// finished CSV/XLSX preview on the row without driving the real worker
+// (which needs Postgres this suite deliberately avoids).
+func (f *gateFixture) publishSheetPreview(t *testing.T, content []byte) {
+	t.Helper()
+	previewID := uuid.New()
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		t.Fatalf("preview data key: %v", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(content), dataKey, previewID)
+	if err != nil {
+		t.Fatalf("encrypt preview: %v", err)
+	}
+	ciphertext, err := io.ReadAll(encrypted)
+	if err != nil {
+		t.Fatalf("read preview envelope: %v", err)
+	}
+	wrapped, keyID, err := f.keys.Wrap(dataKey, crypto.Binding{
+		AttachmentID:           previewID,
+		WorkspaceID:            uuid.MustParse(gateWorkspaceID),
+		PlaintextSize:          int64(len(content)),
+		KeyWrapVersion:         crypto.KeyWrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		t.Fatalf("wrap preview key: %v", err)
+	}
+	f.objects.put(domain.PreviewObjectKey(previewID), ciphertext)
+
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	f.store.preview = service.StoredAttachment{
+		PreviewStatus:          domain.PreviewStatusReady,
+		PreviewObjectID:        previewID.String(),
+		PreviewSize:            int64(len(content)),
+		PreviewWrappedDEK:      wrapped,
+		PreviewKEKKeyID:        keyID,
+		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
+		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
+		PreviewPageCount:       1,
+		PreviewContentType:     domain.PreviewContentTypeSheet,
+	}
+}
+
 // publishExtraPage adds one page beyond the first to an attachment that
 // already has publishPreview's page one, exactly as MarkPreviewReady's
 // unnest insert would for a multi-page PDF. It bumps PreviewPageCount to
@@ -626,6 +673,42 @@ func TestDocumentPreviewRoutesCannotBypassScanOrPageBounds(t *testing.T) {
 			t.Fatalf("%s status = %d, want 404", route, response.Code)
 		}
 	}
+}
+
+// A CSV/XLSX preview reports kind:"sheets" and serves its bounded JSON table
+// with the sheet content type — the same authorization and scan gate as a
+// PDF/image preview, just a different payload shape end to end.
+func TestDocumentPreviewManifestAndPageServeASheetPreview(t *testing.T) {
+	fixture := newGateFixture(t)
+	sheetJSON := `{"columns":["A","B"],"rows":[["1","2"]],"truncatedRows":false,"truncatedColumns":false,"totalRowsRead":1}`
+	fixture.publishSheetPreview(t, []byte(sheetJSON))
+	fixture.store.setStatus(domain.StatusClean)
+
+	manifest := fixture.get(t, "/document-preview", nil)
+	if manifest.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d: %s", manifest.Code, manifest.Body.String())
+	}
+	for _, fragment := range []string{`"kind":"sheets"`, `"pageCount":1`, `"labels":["Planilha"]`} {
+		if !strings.Contains(manifest.Body.String(), fragment) {
+			t.Fatalf("manifest missing %q: %s", fragment, manifest.Body.String())
+		}
+	}
+
+	page := fixture.get(t, "/document-preview/pages/1", nil)
+	if page.Code != http.StatusOK {
+		t.Fatalf("page status = %d: %s", page.Code, page.Body.String())
+	}
+	if got := page.Header().Get("Content-Type"); got != domain.PreviewContentTypeSheet {
+		t.Fatalf("page content type = %q, want %q", got, domain.PreviewContentTypeSheet)
+	}
+	if page.Body.String() != sheetJSON {
+		t.Fatalf("page body = %q, want %q", page.Body.String(), sheetJSON)
+	}
+	// The scan gate applies identically to a sheet preview: nothing is served
+	// to a caller before the file is approved.
+	fixture.store.setStatus(domain.StatusPendingScan)
+	assertRefusedWithoutContent(t, fixture.get(t, "/document-preview", nil), fixture.objects)
+	assertRefusedWithoutContent(t, fixture.get(t, "/document-preview/pages/1", nil), fixture.objects)
 }
 
 // The scan verdict is not a substitute for authorization, in either direction.
