@@ -116,6 +116,8 @@ func registerAttachmentRoutes(
 	// and is not rate limited for the same reason the listing is not: it is a
 	// read, and the upload budget exists to protect writes.
 	mux.Handle("GET "+RouteAttachmentPreview, authenticated(http.HandlerFunc(handler.GetPreview)))
+	mux.Handle("GET "+RouteDocumentPreview, authenticated(http.HandlerFunc(handler.GetDocumentPreviewManifest)))
+	mux.Handle("GET "+RouteDocumentPreviewPage, authenticated(http.HandlerFunc(handler.GetDocumentPreviewPage)))
 }
 
 // registerLinkPreviewRoute wires RF-10.

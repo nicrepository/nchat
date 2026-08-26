@@ -505,6 +505,44 @@ func TestACleanAttachmentStillServesItsPreview(t *testing.T) {
 	}
 }
 
+func TestDocumentPreviewManifestAndFirstPageReuseTheAuthorizedPreview(t *testing.T) {
+	fixture := newGateFixture(t)
+	fixture.publishPreview(t, []byte("jpeg-preview-bytes"))
+	fixture.store.setStatus(domain.StatusClean)
+
+	manifest := fixture.get(t, "/document-preview", nil)
+	if manifest.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d: %s", manifest.Code, manifest.Body.String())
+	}
+	if got := manifest.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("manifest cache policy = %q", got)
+	}
+	for _, fragment := range []string{`"attachmentId":"` + fixture.store.attachmentID() + `"`, `"pageCount":1`, `"labels":["Página 1"]`} {
+		if !strings.Contains(manifest.Body.String(), fragment) {
+			t.Fatalf("manifest missing %q: %s", fragment, manifest.Body.String())
+		}
+	}
+
+	page := fixture.get(t, "/document-preview/pages/1", nil)
+	if page.Code != http.StatusOK || page.Body.String() != "jpeg-preview-bytes" {
+		t.Fatalf("page response = %d %q", page.Code, page.Body.String())
+	}
+}
+
+func TestDocumentPreviewRoutesCannotBypassScanOrPageBounds(t *testing.T) {
+	fixture := newGateFixture(t)
+	fixture.publishPreview(t, []byte("jpeg-preview-bytes"))
+	for _, route := range []string{"/document-preview", "/document-preview/pages/1"} {
+		fixture.store.setStatus(domain.StatusPendingScan)
+		assertRefusedWithoutContent(t, fixture.get(t, route, nil), fixture.objects)
+	}
+	fixture.store.setStatus(domain.StatusClean)
+	response := fixture.get(t, "/document-preview/pages/2", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("out-of-range page status = %d, want 404", response.Code)
+	}
+}
+
 // The scan verdict is not a substitute for authorization, in either direction.
 // An attachment the caller cannot see is 404 even when it is clean, and the
 // answer is the same on content and preview: approving a file grants nobody

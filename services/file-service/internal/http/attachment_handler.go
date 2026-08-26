@@ -642,6 +642,57 @@ func (h *AttachmentHandler) GetPreview(w http.ResponseWriter, r *http.Request) {
 	h.logAttachment(r, startedAt, "preview", result, http.StatusOK, r.PathValue("attachmentID"))
 }
 
+type documentPreviewManifest struct {
+	AttachmentID string   `json:"attachmentId"`
+	Kind         string   `json:"kind"`
+	PageCount    int      `json:"pageCount"`
+	Labels       []string `json:"labels"`
+}
+
+// GetDocumentPreviewManifest exposes only bounded navigation metadata. It
+// intentionally reuses Metadata authorization and derives every identifier
+// from the authenticated request and stored attachment.
+func (h *AttachmentHandler) GetDocumentPreviewManifest(w http.ResponseWriter, r *http.Request) {
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	view, err := h.useCases.Metadata(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"), UserID: principal.UserID, SessionID: principal.SessionID,
+	})
+	if err != nil {
+		writeAttachmentError(w, err)
+		return
+	}
+	if view.Status != string(domain.StatusClean) {
+		writeAttachmentError(w, domain.ErrNotDownloadable)
+		return
+	}
+	if view.PreviewStatus != string(domain.PreviewStatusReady) {
+		writeAttachmentError(w, domain.ErrPreviewUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	httputil.WriteJSON(w, http.StatusOK, documentPreviewManifest{
+		AttachmentID: view.ID, Kind: "pages", PageCount: 1, Labels: []string{"Página 1"},
+	})
+}
+
+// GetDocumentPreviewPage is the numbered form of the existing safe JPEG
+// resource. Page one remains byte-for-byte the existing preview; unsupported
+// page numbers are non-enumerating and never open storage.
+func (h *AttachmentHandler) GetDocumentPreviewPage(w http.ResponseWriter, r *http.Request) {
+	page, err := strconv.Atoi(r.PathValue("page"))
+	if err != nil || page != 1 {
+		writeAttachmentError(w, domain.ErrNotFound)
+		return
+	}
+	h.GetPreview(w, r)
+}
+
 // streamExactly copies a decrypted body and reports whether exactly the
 // promised number of bytes arrived.
 //

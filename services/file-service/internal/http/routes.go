@@ -28,7 +28,9 @@ const (
 	// downloadable and have no preview, and a preview is never a substitute for
 	// the file. A query parameter on /content would have made both of those
 	// invisible to a router, a cache and a log.
-	RouteAttachmentPreview = "/attachments/{attachmentID}/preview"
+	RouteAttachmentPreview   = "/attachments/{attachmentID}/preview"
+	RouteDocumentPreview     = "/attachments/{attachmentID}/document-preview"
+	RouteDocumentPreviewPage = "/attachments/{attachmentID}/document-preview/pages/{page}"
 
 	// RF-10 Open Graph preview of an external link. It is not an attachment
 	// resource and shares nothing with the routes above: no attachment exists,
