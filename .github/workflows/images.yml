@@ -3,6 +3,12 @@ name: Build and push images
 on:
   push:
     branches: [develop]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Target SHA to rebuild and deploy'
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -20,7 +26,27 @@ jobs:
     outputs:
       images: ${{ steps.images.outputs.images }}
     steps:
+      - name: Validate manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/develop" ]; then
+            echo "Error: Must run on develop"
+            exit 1
+          fi
+          if ! [[ "$INPUT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Error: Invalid SHA format"
+            exit 1
+          fi
+          if [ "$INPUT_SHA" != "$GITHUB_SHA" ]; then
+            echo "Error: Input SHA must match current branch tip ($GITHUB_SHA)"
+            exit 1
+          fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       - id: images
         run: scripts/deploy/nchat-dev/image-matrix.sh >> "$GITHUB_OUTPUT"
 
@@ -38,6 +64,8 @@ jobs:
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.sha || github.sha }}
       # docker/setup-buildx-action v3.11.1
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       # docker/login-action v3.3.0
@@ -74,7 +102,7 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=nchat-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nchat-${{ matrix.image }}
-          tags: ghcr.io/nicrepository/nchat/${{ matrix.image }}:${{ github.sha }}
+          tags: ghcr.io/nicrepository/nchat/${{ matrix.image }}:${{ inputs.sha || github.sha }}
       - name: Record digest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -88,11 +116,11 @@ jobs:
           retention-days: 7
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/develop'
     needs: build
     permissions:
       actions: read
       contents: read
     uses: ./.github/workflows/deploy-nchat-dev.yml
     with:
-      sha: ${{ github.sha }}
+      sha: ${{ inputs.sha || github.sha }}
