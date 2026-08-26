@@ -61,6 +61,60 @@ func (s *PGXObjectCleanupStore) Enqueue(ctx context.Context, objectKey string) e
 	return nil
 }
 
+const expireDuePreviewsQuery = `
+	WITH due AS (
+		SELECT id, preview_object_id
+		FROM files.attachments
+		WHERE preview_lifecycle_status = 'available'
+		  AND preview_expires_at <= now()
+		  AND deleted_at IS NULL
+		ORDER BY preview_expires_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED
+	), objects AS (
+		SELECT 'nchat/previews/' || preview_object_id::text AS object_key
+		FROM due WHERE preview_object_id IS NOT NULL
+		UNION
+		SELECT 'nchat/previews/' || pages.object_id::text
+		FROM files.attachment_preview_pages AS pages
+		JOIN due ON due.id = pages.attachment_id
+	), queued AS (
+		INSERT INTO files.object_cleanup_jobs (object_key)
+		SELECT object_key FROM objects
+		ON CONFLICT (object_key) DO NOTHING
+	), cleared AS (
+		DELETE FROM files.attachment_preview_pages
+		WHERE attachment_id IN (SELECT id FROM due)
+	)
+	UPDATE files.attachments
+	SET preview_lifecycle_status = 'expired',
+	    preview_failure_reason = 'expired',
+	    preview_object_id = NULL,
+	    preview_size_bytes = NULL,
+	    preview_wrapped_dek = NULL,
+	    preview_kek_key_id = NULL,
+	    preview_envelope_version = NULL,
+	    preview_dek_wrap_version = NULL,
+	    preview_page_count = 1,
+	    preview_content_type = 'image/jpeg',
+	    preview_expires_at = NULL,
+	    updated_at = now()
+	WHERE id IN (SELECT id FROM due)`
+
+func (s *PGXObjectCleanupStore) ExpireDuePreviews(ctx context.Context, limit int) (int, error) {
+	if s == nil || s.pool == nil {
+		return 0, domain.ErrDependenciesUnavailable
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("%w: expiry limit must be positive", domain.ErrInvalidInput)
+	}
+	tag, err := s.pool.Exec(ctx, expireDuePreviewsQuery, limit)
+	if err != nil {
+		return 0, fmt.Errorf("expire document previews: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // claimDueCleanupsQuery leases due jobs, exactly as the preview claim does.
 //
 // The attempt count is the fencing token here too: completing a job requires

@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -767,10 +770,57 @@ func (s *PreviewService) logPreview(
 func (s *PreviewService) logPreviewOutcome(
 	ctx context.Context, level slog.Level, job PreviewJob, result string, duration time.Duration,
 ) {
+	format := previewFormat(job)
+	reason := previewReason(result)
+	workerName, _ := os.Hostname()
 	s.logger.LogAttrs(ctx, level, "attachment preview completed",
 		slog.String("attachment_id", job.AttachmentID),
+		slog.String("format", format),
+		slog.Int64("size_bytes", job.Size),
 		slog.String("result", result),
+		slog.String("reason", reason),
+		slog.String("worker", workerName),
 		slog.Int("attempt", job.Attempts),
 		slog.Int64("duration_ms", duration.Milliseconds()),
 	)
+	if observer, ok := s.observer.(interface {
+		ObserveDocumentPreview(string, string, string, time.Duration)
+	}); ok {
+		observer.ObserveDocumentPreview(format, result, reason, duration)
+	}
+}
+
+func previewFormat(job PreviewJob) string {
+	mime := domain.NormalizeDetectedMIME(job.DetectedMIME)
+	switch {
+	case mime == "application/pdf":
+		return "pdf"
+	case mime == "text/plain":
+		return "csv"
+	case mime == "application/zip":
+		return "office_zip"
+	case mime == "application/octet-stream" && strings.EqualFold(filepath.Ext(job.OriginalFilename), ".ppt"):
+		return "ppt"
+	case strings.HasPrefix(mime, "image/"):
+		return "image"
+	default:
+		return "unknown"
+	}
+}
+
+func previewReason(result string) string {
+	switch result {
+	case previewResultReady:
+		return "none"
+	case previewResultUnsupported:
+		return "unsupported_format"
+	case previewResultFailed:
+		return "render_failed"
+	case previewResultRetry:
+		return "transient"
+	case previewResultSuperseded:
+		return "superseded"
+	default:
+		return "state_write_failed"
+	}
 }

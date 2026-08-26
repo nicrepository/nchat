@@ -30,6 +30,34 @@ func newAttachment(kind domain.DestinationKind, destinationID string) service.Ne
 	}
 }
 
+func TestRegenerateDocumentPreviewUsesAnIdempotentFailedOrExpiredCAS(t *testing.T) {
+	pool := &fakePool{queryRow: func(sql string, args ...any) pgx.Row {
+		for _, fragment := range []string{
+			"preview_lifecycle_status IN ('failed', 'expired')",
+			"preview_lifecycle_status = 'pending'",
+			"preview_attempts = 0",
+			"status = 'clean'",
+			"deleted_at IS NULL",
+		} {
+			if !strings.Contains(sql, fragment) {
+				t.Errorf("regeneration query missing %q:\n%s", fragment, sql)
+			}
+		}
+		if len(args) != 1 || args[0] != testAttachmentID {
+			t.Errorf("arguments = %v", args)
+		}
+		return valueRow{values: []any{true}}
+	}}
+	if err := storage.NewPGXAttachmentStore(pool).RegenerateDocumentPreview(context.Background(), testAttachmentID); err != nil {
+		t.Fatalf("RegenerateDocumentPreview: %v", err)
+	}
+
+	pool.queryRow = func(string, ...any) pgx.Row { return valueRow{values: []any{false}} }
+	if err := storage.NewPGXAttachmentStore(pool).RegenerateDocumentPreview(context.Background(), testAttachmentID); !errors.Is(err, domain.ErrPreviewUnavailable) {
+		t.Fatalf("invalid state error = %v", err)
+	}
+}
+
 func TestCreatePendingSetsExactlyOneDestinationColumn(t *testing.T) {
 	tests := []struct {
 		name              string

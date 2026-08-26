@@ -985,6 +985,41 @@ func previewStatusOf(stored pgtype.Text) domain.PreviewStatus {
 	return status
 }
 
+const regenerateDocumentPreviewQuery = `
+	WITH regenerated AS (
+		UPDATE files.attachments
+		SET preview_lifecycle_status = 'pending',
+		    preview_failure_reason = NULL,
+		    preview_next_attempt_at = now(),
+		    preview_attempts = 0,
+		    updated_at = now()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+		  AND status = 'clean'
+		  AND preview_lifecycle_status IN ('failed', 'expired')
+		RETURNING 1
+	)
+	SELECT EXISTS (SELECT 1 FROM regenerated)
+	    OR EXISTS (
+		SELECT 1 FROM files.attachments
+		WHERE id = $1 AND deleted_at IS NULL AND status = 'clean'
+		  AND preview_lifecycle_status = 'pending'
+	)`
+
+func (s *PGXAttachmentStore) RegenerateDocumentPreview(ctx context.Context, attachmentID string) error {
+	if s == nil || s.pool == nil {
+		return domain.ErrDependenciesUnavailable
+	}
+	var accepted bool
+	if err := s.pool.QueryRow(ctx, regenerateDocumentPreviewQuery, attachmentID).Scan(&accepted); err != nil {
+		return fmt.Errorf("regenerate document preview: %w", err)
+	}
+	if !accepted {
+		return domain.ErrPreviewUnavailable
+	}
+	return nil
+}
+
 // listableStatuses is the closed set the listing selects, derived from the
 // domain predicate so the SQL filter and Status.Listable can never disagree.
 func listableStatuses() []string {

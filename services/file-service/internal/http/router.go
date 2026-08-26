@@ -118,6 +118,7 @@ func registerAttachmentRoutes(
 	mux.Handle("GET "+RouteAttachmentPreview, authenticated(http.HandlerFunc(handler.GetPreview)))
 	mux.Handle("GET "+RouteDocumentPreview, authenticated(http.HandlerFunc(handler.GetDocumentPreviewManifest)))
 	mux.Handle("GET "+RouteDocumentPreviewPage, authenticated(http.HandlerFunc(handler.GetDocumentPreviewPage)))
+	mux.Handle("POST "+RouteDocumentPreviewRegenerate, authenticated(http.HandlerFunc(handler.RegenerateDocumentPreview)))
 }
 
 // registerLinkPreviewRoute wires RF-10.

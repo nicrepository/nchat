@@ -81,6 +81,7 @@ const claimDuePreviewsQuery = `
 		SELECT a.id
 		FROM files.attachments AS a
 		WHERE a.preview_status = 'pending'
+		  AND a.preview_lifecycle_status IN ('pending', 'generating')
 		  AND a.status = 'clean'
 		  AND a.deleted_at IS NULL
 		  AND a.wrapped_dek IS NOT NULL
@@ -91,7 +92,8 @@ const claimDuePreviewsQuery = `
 		FOR UPDATE SKIP LOCKED
 	)
 	UPDATE files.attachments AS a
-	   SET preview_attempts = LEAST(a.preview_attempts + 1, $3),
+	   SET preview_lifecycle_status = 'generating',
+	       preview_attempts = LEAST(a.preview_attempts + 1, $3),
 	       preview_next_attempt_at = now() + ($2 * interval '1 second'),
 	       updated_at = now()
 	  FROM due
@@ -266,6 +268,7 @@ const markPreviewReadyQuery = `
 		       updated_at = now()
 		 WHERE id = $1
 		   AND preview_status = 'pending'
+		   AND preview_lifecycle_status = 'generating'
 		   AND status = 'clean'
 		   AND deleted_at IS NULL
 		   AND preview_attempts = $8
@@ -380,10 +383,13 @@ func (s *PGXPreviewStore) MarkPreviewTerminal(
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE files.attachments
 		   SET preview_status = $2,
+		       preview_lifecycle_status = CASE $2 WHEN 'unsupported' THEN 'blocked' ELSE 'failed' END,
+		       preview_failure_reason = CASE $2 WHEN 'unsupported' THEN 'unsupported_format' ELSE 'render_failed' END,
 		       preview_next_attempt_at = NULL,
 		       updated_at = now()
 		 WHERE id = $1
 		   AND preview_status = 'pending'
+		   AND preview_lifecycle_status = 'generating'
 		   AND preview_attempts = $3`,
 		attachmentID, string(status), claimAttempt,
 	)

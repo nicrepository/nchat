@@ -106,11 +106,21 @@ func (s *ObjectCleanupService) ProcessDue(ctx context.Context) (int, error) {
 	if !s.Ready() {
 		return 0, domain.ErrDependenciesUnavailable
 	}
+	expired := 0
+	if reaper, ok := s.store.(interface {
+		ExpireDuePreviews(context.Context, int) (int, error)
+	}); ok {
+		var err error
+		expired, err = reaper.ExpireDuePreviews(ctx, 50)
+		if err != nil {
+			return 0, fmt.Errorf("expire due previews: %w", err)
+		}
+	}
 	jobs, err := s.store.ClaimDueCleanups(ctx, cleanupBatchSize, cleanupLease)
 	if err != nil {
 		return 0, fmt.Errorf("claim due cleanups: %w", err)
 	}
-	processed := 0
+	processed := expired
 	for _, job := range jobs {
 		if ctx.Err() != nil {
 			// The lease still holds, so untouched jobs simply become due again.

@@ -314,6 +314,10 @@ type AttachmentStore interface {
 	GetPreviewPage(ctx context.Context, attachmentID string, page int) (PreviewPage, error)
 }
 
+type documentPreviewRegenerationStore interface {
+	RegenerateDocumentPreview(ctx context.Context, attachmentID string) error
+}
+
 // DraftAttachmentStore owns the short-lived lifecycle used only by message
 // composer uploads. It is kept separate so legacy upload-store fakes remain
 // valid and a partially deployed database fails closed on draft operations.
@@ -925,6 +929,24 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		DestinationKind:    string(record.Kind),
 		CreatedAt:          record.CreatedAt,
 	}, nil
+}
+
+// RegenerateDocumentPreview reuses authorizedAttachment so DM, group and
+// channel visibility — including active-session checks and hidden 404s — are
+// identical to metadata, content and preview reads.
+func (s *AttachmentService) RegenerateDocumentPreview(ctx context.Context, input AttachmentAuthInput) error {
+	if !s.Ready() {
+		return domain.ErrDependenciesUnavailable
+	}
+	record, err := s.authorizedAttachment(ctx, input)
+	if err != nil {
+		return err
+	}
+	store, ok := s.store.(documentPreviewRegenerationStore)
+	if !ok {
+		return domain.ErrDependenciesUnavailable
+	}
+	return store.RegenerateDocumentPreview(ctx, record.ID)
 }
 
 // ListDestinationAttachments returns a destination's most recent attachments

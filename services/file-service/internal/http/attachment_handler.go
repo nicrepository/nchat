@@ -74,6 +74,31 @@ type AttachmentUseCases interface {
 	Ready() bool
 }
 
+type documentPreviewRegenerator interface {
+	RegenerateDocumentPreview(ctx context.Context, input service.AttachmentAuthInput) error
+}
+
+func (h *AttachmentHandler) RegenerateDocumentPreview(w http.ResponseWriter, r *http.Request) {
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	regenerator, ok := h.useCases.(documentPreviewRegenerator)
+	if !ok {
+		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
+		return
+	}
+	err := regenerator.RegenerateDocumentPreview(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"), UserID: principal.UserID, SessionID: principal.SessionID,
+	})
+	if err != nil {
+		writeAttachmentError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // CancelDraft handles DELETE /attachments/{attachmentID}. Authorization uses
 // the authenticated uploader and all disallowed outcomes stay non-enumerating.
 func (h *AttachmentHandler) CancelDraft(w http.ResponseWriter, r *http.Request) {
