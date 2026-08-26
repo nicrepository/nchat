@@ -214,6 +214,63 @@ func TestMarkPreviewReadyClearsAndReinsertsExtraPages(t *testing.T) {
 	}
 }
 
+// A sheet-kind preview must record its content type on the parent row and on
+// every extra page, not just default to image/jpeg by omission.
+func TestMarkPreviewReadyPersistsTheSheetContentType(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
+	}}
+	result := previewResult()
+	result.ContentType = domain.PreviewContentTypeSheet
+	result.PageCount = 1
+
+	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if err != nil || !recorded {
+		t.Fatalf("recorded = %v, err = %v", recorded, err)
+	}
+	if !strings.Contains(pool.lastSQL, "preview_content_type = $17") {
+		t.Fatalf("the update must set preview_content_type:\n%s", pool.lastSQL)
+	}
+	contentType, ok := pool.lastArgs[16].(string)
+	if !ok || contentType != domain.PreviewContentTypeSheet {
+		t.Fatalf("unexpected content type argument: %#v", pool.lastArgs[16])
+	}
+}
+
+// A caller that predates the content-type field (ContentType left at its zero
+// value) must still record a valid, closed-enum value — the true historical
+// one, image/jpeg — never an empty string the CHECK constraint would refuse.
+func TestMarkPreviewReadyDefaultsToJPEGWhenContentTypeIsUnset(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
+	}}
+	result := previewResult()
+	result.ContentType = ""
+
+	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if err != nil || !recorded {
+		t.Fatalf("recorded = %v, err = %v", recorded, err)
+	}
+	contentType, ok := pool.lastArgs[16].(string)
+	if !ok || contentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("unexpected content type argument: %#v", pool.lastArgs[16])
+	}
+}
+
+func TestMarkPreviewReadyRefusesAnUnknownContentType(t *testing.T) {
+	pool := &fakePool{}
+	result := previewResult()
+	result.ContentType = "application/octet-stream"
+
+	_, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want ErrInvalidInput", err)
+	}
+	if pool.lastSQL != "" {
+		t.Fatal("an unknown content type must not reach the database")
+	}
+}
+
 func TestMarkPreviewReadyReportsALostRaceWithoutFailing(t *testing.T) {
 	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
 		return valueRow{values: []any{0}}
