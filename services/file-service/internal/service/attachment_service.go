@@ -172,6 +172,12 @@ type StoredAttachment struct {
 	// the fields above it, and is 1 for every preview this service produced
 	// before multi-page rendering existed.
 	PreviewPageCount int
+	// PreviewContentType is what preview_object_id decodes to —
+	// domain.PreviewContentTypeJPEG for every preview produced before sheet
+	// previews existed, domain.PreviewContentTypeSheet for a spreadsheet/CSV
+	// preview. Meaningless unless PreviewStatus is ready, exactly like the
+	// fields above it.
+	PreviewContentType string
 }
 
 // ListDestinationAttachmentsQuery is a resolved, already-authorised listing
@@ -403,9 +409,16 @@ type AttachmentView struct {
 	// a second request. 1 for every attachment with a single-page preview,
 	// which is every image and every preview produced before multi-page
 	// rendering existed.
-	PreviewPageCount int       `json:"previewPageCount"`
-	DestinationKind  string    `json:"destinationKind"`
-	CreatedAt        time.Time `json:"createdAt"`
+	PreviewPageCount int `json:"previewPageCount"`
+	// PreviewContentType is not serialised to the client — it is what
+	// GetDocumentPreviewManifest reads to compute the manifest's own "kind"
+	// field ("pages" vs. "sheets"). The client learns the *kind*, never the
+	// raw content type: exposing this here would be metadata this
+	// projection's own contract deliberately keeps out of the general
+	// listing (see the struct's own doc comment).
+	PreviewContentType string    `json:"-"`
+	DestinationKind    string    `json:"destinationKind"`
+	CreatedAt          time.Time `json:"createdAt"`
 }
 
 // Download is an authorised, decrypted content stream. Closing Content closes
@@ -901,15 +914,16 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		return AttachmentView{}, err
 	}
 	return AttachmentView{
-		ID:               record.ID,
-		Filename:         record.Filename,
-		ContentType:      contentType(record),
-		Size:             record.Size,
-		Status:           string(record.Status),
-		PreviewStatus:    string(record.PreviewStatus),
-		PreviewPageCount: record.PreviewPageCount,
-		DestinationKind:  string(record.Kind),
-		CreatedAt:        record.CreatedAt,
+		ID:                 record.ID,
+		Filename:           record.Filename,
+		ContentType:        contentType(record),
+		Size:               record.Size,
+		Status:             string(record.Status),
+		PreviewStatus:      string(record.PreviewStatus),
+		PreviewPageCount:   record.PreviewPageCount,
+		PreviewContentType: record.PreviewContentType,
+		DestinationKind:    string(record.Kind),
+		CreatedAt:          record.CreatedAt,
 	}, nil
 }
 
@@ -1059,9 +1073,10 @@ func (s *AttachmentService) Preview(ctx context.Context, input AttachmentAuthInp
 	}
 	return Download{
 		Filename: record.Filename,
-		// Never the attachment's own type: the bytes are a raster this service
-		// produced, and saying so is what makes them safe to render inline.
-		ContentType: domain.PreviewContentType,
+		// Never the attachment's own type: the bytes are this service's own
+		// produced shape (a raster, or a bounded table document), and saying
+		// so is what makes them safe to render inline.
+		ContentType: record.PreviewContentType,
 		Size:        record.PreviewSize,
 		Content:     content,
 	}, nil
@@ -1108,7 +1123,7 @@ func (s *AttachmentService) DocumentPreviewPage(
 	}
 	return Download{
 		Filename:    record.Filename,
-		ContentType: domain.PreviewContentType,
+		ContentType: pageRecord.ContentType,
 		Size:        pageRecord.Size,
 		Content:     content,
 	}, nil

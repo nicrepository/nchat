@@ -169,6 +169,11 @@ type PreviewResult struct {
 	// one-page PDF, which is every preview this service produced before this
 	// field existed.
 	ExtraPages []PreviewPage
+	// ContentType is what every page in this result decodes to — the same
+	// value for page one and every extra page, since a render never mixes
+	// content types across its own pages. domain.PreviewContentTypeJPEG for
+	// every renderer that predates this field.
+	ContentType string
 }
 
 // PreviewPage is one page beyond the first, ready to be recorded in
@@ -183,6 +188,10 @@ type PreviewPage struct {
 	KEKKeyID        string
 	EnvelopeVersion int
 	KeyWrapVersion  int
+	// ContentType mirrors PreviewResult.ContentType — carried per page because
+	// GetPreviewPage reads a page in isolation, never alongside the result
+	// that produced it.
+	ContentType string
 }
 
 // PreviewStore is the persistence half of preview generation.
@@ -219,12 +228,14 @@ type FenceHandle interface {
 	Release(ctx context.Context)
 }
 
-// PreviewRenderer turns plaintext into the preview image, one JPEG per page.
-// It is an interface so the job can be tested without a decoder, and so the
-// decoders stay in a package that knows nothing about storage or the
-// database. Every non-PDF render is a length-1 slice; a PDF may return more.
+// PreviewRenderer turns plaintext into the preview pages plus the one content
+// type every one of those pages decodes to. It is an interface so the job can
+// be tested without a decoder, and so the decoders stay in a package that
+// knows nothing about storage or the database. Every non-PDF/sheet render is
+// a length-1 slice; a PDF may return more, all JPEG; a spreadsheet/CSV
+// returns exactly one page of bounded table JSON.
 type PreviewRenderer interface {
-	Render(ctx context.Context, detectedMIME string, src io.Reader) ([][]byte, error)
+	Render(ctx context.Context, detectedMIME string, src io.Reader) (pages [][]byte, contentType string, err error)
 }
 
 // PreviewObserver counts preview outcomes. It carries no labels beyond the
@@ -381,12 +392,12 @@ func (s *PreviewService) process(ctx context.Context, job PreviewJob) {
 		return
 	}
 
-	rendered, err := s.render(jobCtx, job)
+	rendered, contentType, err := s.render(jobCtx, job)
 	if err != nil {
 		s.finishFailed(ctx, job, err, started)
 		return
 	}
-	outcome, err := s.persist(jobCtx, job, rendered)
+	outcome, err := s.persist(jobCtx, job, rendered, contentType)
 	if err != nil {
 		s.finishFailed(ctx, job, err, started)
 		return
@@ -432,7 +443,7 @@ func (s *PreviewService) finalizeExhausted(ctx context.Context, job PreviewJob, 
 // The content is opened exactly the way a download opens it — same key ring,
 // same binding, same verifying reader — so a tampered or truncated object fails
 // here too rather than being rendered into a preview of something else.
-func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, error) {
+func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, string, error) {
 	content, err := openEncryptedObject(ctx, s.keys, s.objects, s.logger, encryptedObject{
 		objectID:        job.AttachmentID,
 		workspaceID:     job.WorkspaceID,
@@ -444,7 +455,7 @@ func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, 
 		keyWrapVersion:  job.KeyWrapVersion,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = content.Close() }()
 
@@ -473,11 +484,16 @@ type persistedPage struct {
 // at objects that are already durable, so no state is reachable in which a
 // preview is servable but some of its pages are absent.
 func (s *PreviewService) persist(
-	ctx context.Context, job PreviewJob, images [][]byte,
+	ctx context.Context, job PreviewJob, images [][]byte, contentType string,
 ) (previewPersistOutcome, error) {
 	workspaceID, err := uuid.Parse(job.WorkspaceID)
 	if err != nil {
 		return previewPersistSuperseded, fmt.Errorf("invalid stored workspace id")
+	}
+	if contentType == "" {
+		// Every renderer built before this field existed produces JPEG and
+		// nothing else.
+		contentType = domain.PreviewContentTypeJPEG
 	}
 
 	pages := make([]persistedPage, 0, len(images))
@@ -503,6 +519,7 @@ func (s *PreviewService) persist(
 			KEKKeyID:        page.kekKeyID,
 			EnvelopeVersion: crypto.EnvelopeVersion,
 			KeyWrapVersion:  crypto.KeyWrapVersion,
+			ContentType:     contentType,
 		})
 	}
 
@@ -517,6 +534,7 @@ func (s *PreviewService) persist(
 		KeyWrapVersion:  crypto.KeyWrapVersion,
 		PageCount:       len(pages),
 		ExtraPages:      extra,
+		ContentType:     contentType,
 	})
 	if err != nil {
 		s.discardPersistedPages(ctx, job, pages)

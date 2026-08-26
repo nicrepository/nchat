@@ -59,13 +59,30 @@ func (s PreviewStatus) Terminal() bool {
 	return s == PreviewStatusReady || s == PreviewStatusUnsupported || s == PreviewStatusFailed
 }
 
-// PreviewContentType is the single type every preview is encoded in.
-//
-// One output format, decided by the server, is what makes the response safe to
-// render inline: the bytes are always a re-encoded raster produced by this
-// service, never the uploaded file, so an HTML, SVG or script upload cannot
-// become a preview that a browser would execute.
-const PreviewContentType = "image/jpeg"
+// Preview content types. Every preview is one of these two, decided by the
+// server and recorded per attachment/page (preview_content_type / content_type,
+// migration 000016) — never inferred from the uploaded file's own declared or
+// detected type. That is what makes serving a preview inline safe: the bytes
+// are always either a re-encoded raster or this service's own bounded JSON
+// table shape, never the uploaded file, so an HTML, SVG or script upload
+// cannot become a preview a browser would execute.
+const (
+	// PreviewContentTypeJPEG is every raster preview: images, and every page
+	// of a rendered PDF.
+	PreviewContentTypeJPEG = "image/jpeg"
+	// PreviewContentTypeSheet is a spreadsheet/CSV preview: a single bounded
+	// JSON document (columns, rows, truncation flags — see
+	// internal/preview/csv.go and xlsx.go), never arbitrary JSON. A private,
+	// versioned type rather than a bare application/json, so a client
+	// dispatches on it without ambiguity about whose shape it is.
+	PreviewContentTypeSheet = "application/vnd.nchat.preview-sheet+json"
+)
+
+// PreviewContentTypeValid reports whether t is one of the two content types the
+// preview_content_type/content_type CHECK constraints allow.
+func PreviewContentTypeValid(t string) bool {
+	return t == PreviewContentTypeJPEG || t == PreviewContentTypeSheet
+}
 
 // Preview generation limits. They are constants rather than configuration: they
 // bound how much CPU and memory one hostile file may cost, and an operator who
@@ -100,6 +117,23 @@ const (
 	// document's length. A PDF longer than this is previewed up to the cap;
 	// the rest is reachable only through the full download.
 	MaxPreviewPDFPages = 20
+
+	// MaxPreviewSheetRows bounds how many data rows of a spreadsheet/CSV
+	// preview this service will ever render and store, the same cost-ceiling
+	// reasoning as MaxPreviewPDFPages applied to rows instead of pages. A row
+	// beyond this is reachable only through the full download.
+	MaxPreviewSheetRows = 500
+
+	// MaxPreviewSheetColumns bounds how many columns of each row are read. A
+	// hostile file with an enormous number of columns on one line is a
+	// memory-exhaustion vector distinct from row count, and is bounded
+	// independently of it.
+	MaxPreviewSheetColumns = 50
+
+	// MaxPreviewCellBytes bounds one cell's rendered length, so a single
+	// absurdly long field cannot make one row cost as much as the whole row
+	// limit.
+	MaxPreviewCellBytes = 2048
 )
 
 // previewableMIMEs is the allowlist of *detected* content types that have a
@@ -109,15 +143,19 @@ const (
 // image/webp is absent: the standard library has no webp decoder and this
 // change adds no dependency for one.
 //
-// DOCX/XLSX/PPTX/ODT/ODS/ODP/CSV are absent too, and deliberately: they need
-// an isolated conversion daemon this build does not yet have (task #494's
-// later phase), not a change here. Adding one of them to this map without
-// that daemon existing would schedule a render job with no renderer for it.
+// DOCX/PPTX/ODT/ODP/ODS/XLS are absent, and deliberately: DOCX/PPTX/ODT/ODP
+// need an isolated conversion daemon this build does not yet have (task #494's
+// later phase); ODS and legacy binary XLS have no renderer wired in yet either
+// (task #494's spreadsheet phase covers CSV and XLSX only — see
+// internal/preview/csv.go and xlsx.go). Adding any of them to this map without
+// a renderer for it would schedule a render job nothing can finish.
 var previewableMIMEs = map[string]struct{}{
 	"image/jpeg":      {},
 	"image/png":       {},
 	"image/gif":       {},
 	"application/pdf": {},
+	"text/csv":        {},
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
 }
 
 // NormalizeDetectedMIME reduces a stored detected type to the bare type for

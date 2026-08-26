@@ -345,7 +345,11 @@ type stubRenderer struct {
 	// every image and every one-page PDF; a longer one models a multi-page
 	// PDF.
 	pages [][]byte
-	err   error
+	// contentType is what Render reports alongside pages. Empty defaults to
+	// domain.PreviewContentTypeJPEG, exactly like persist()'s own fallback for
+	// a renderer that predates this field.
+	contentType string
+	err         error
 	// duringRender runs while the renderer is "working", so a test can change
 	// the world underneath a job exactly as a scan verdict would.
 	duringRender func()
@@ -355,7 +359,9 @@ type stubRenderer struct {
 	lastBytes []byte
 }
 
-func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Reader) ([][]byte, error) {
+func (r *stubRenderer) Render(
+	_ context.Context, detectedMIME string, src io.Reader,
+) ([][]byte, string, error) {
 	// Always drain: the real renderer reads the decrypting stream, so an
 	// integrity failure has to surface here exactly as it would in production.
 	read, readErr := io.ReadAll(src)
@@ -371,12 +377,12 @@ func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Rea
 	r.calls++
 	r.lastMIME, r.lastBytes = detectedMIME, read
 	if readErr != nil {
-		return nil, readErr
+		return nil, "", readErr
 	}
 	if r.err != nil {
-		return nil, r.err
+		return nil, "", r.err
 	}
-	return r.pages, nil
+	return r.pages, r.contentType, nil
 }
 
 func (r *stubRenderer) callCount() int {
@@ -1319,6 +1325,7 @@ func storedPreviewRecord(t *testing.T, f *fixture, image []byte) service.StoredA
 		PreviewKEKKeyID:        keyID,
 		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
 		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
+		PreviewContentType:     domain.PreviewContentTypeJPEG,
 	}
 }
 
@@ -1335,8 +1342,8 @@ func TestPreviewServesTheStoredPreviewOfAVisibleCleanAttachment(t *testing.T) {
 	}
 	defer func() { _ = preview.Content.Close() }()
 
-	if preview.ContentType != domain.PreviewContentType {
-		t.Fatalf("content type = %q, want %q", preview.ContentType, domain.PreviewContentType)
+	if preview.ContentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("content type = %q, want %q", preview.ContentType, domain.PreviewContentTypeJPEG)
 	}
 	if preview.Size != int64(len(image)) {
 		t.Fatalf("size = %d, want %d", preview.Size, len(image))
@@ -1382,6 +1389,7 @@ func TestDocumentPreviewPageServesAStoredExtraPage(t *testing.T) {
 		PageNumber: 2, ObjectID: pageID.String(), Size: int64(len(pageImage)),
 		WrappedDEK: wrapped, KEKKeyID: keyID,
 		EnvelopeVersion: crypto.EnvelopeVersion, KeyWrapVersion: crypto.KeyWrapVersion,
+		ContentType: domain.PreviewContentTypeJPEG,
 	})
 
 	page, err := f.service.DocumentPreviewPage(context.Background(), service.AttachmentAuthInput{
@@ -1392,8 +1400,8 @@ func TestDocumentPreviewPageServesAStoredExtraPage(t *testing.T) {
 	}
 	defer func() { _ = page.Content.Close() }()
 
-	if page.ContentType != domain.PreviewContentType {
-		t.Fatalf("content type = %q, want %q", page.ContentType, domain.PreviewContentType)
+	if page.ContentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("content type = %q, want %q", page.ContentType, domain.PreviewContentTypeJPEG)
 	}
 	served, err := io.ReadAll(page.Content)
 	if err != nil {

@@ -261,6 +261,7 @@ const markPreviewReadyQuery = `
 		       preview_envelope_version = $6,
 		       preview_dek_wrap_version = $7,
 		       preview_page_count = $9,
+		       preview_content_type = $17,
 		       preview_next_attempt_at = NULL,
 		       updated_at = now()
 		 WHERE id = $1
@@ -277,14 +278,14 @@ const markPreviewReadyQuery = `
 	inserted AS (
 		INSERT INTO files.attachment_preview_pages
 			(attachment_id, page_number, object_id, size_bytes,
-			 wrapped_dek, kek_key_id, envelope_version, dek_wrap_version)
+			 wrapped_dek, kek_key_id, envelope_version, dek_wrap_version, content_type)
 		SELECT u.id, p.page_number, p.object_id, p.size_bytes,
-		       p.wrapped_dek, p.kek_key_id, p.envelope_version, p.dek_wrap_version
+		       p.wrapped_dek, p.kek_key_id, p.envelope_version, p.dek_wrap_version, p.content_type
 		  FROM updated AS u
 		  CROSS JOIN unnest(
 		      $10::smallint[], $11::uuid[], $12::bigint[],
-		      $13::bytea[], $14::text[], $15::smallint[], $16::smallint[]
-		  ) AS p(page_number, object_id, size_bytes, wrapped_dek, kek_key_id, envelope_version, dek_wrap_version)
+		      $13::bytea[], $14::text[], $15::smallint[], $16::smallint[], $18::text[]
+		  ) AS p(page_number, object_id, size_bytes, wrapped_dek, kek_key_id, envelope_version, dek_wrap_version, content_type)
 	)
 	SELECT count(*) FROM updated`
 
@@ -308,6 +309,15 @@ func (s *PGXPreviewStore) MarkPreviewReady(
 		// zero value, and page one alone is what it always meant.
 		pageCount = 1
 	}
+	contentType := result.ContentType
+	if contentType == "" {
+		// Every caller before sheet previews existed leaves this at its zero
+		// value, and JPEG is what it always meant.
+		contentType = domain.PreviewContentTypeJPEG
+	}
+	if !domain.PreviewContentTypeValid(contentType) {
+		return false, fmt.Errorf("%w: unknown preview content type", domain.ErrInvalidInput)
+	}
 
 	pageNumbers := make([]int16, len(result.ExtraPages))
 	objectIDs := make([]string, len(result.ExtraPages))
@@ -316,6 +326,7 @@ func (s *PGXPreviewStore) MarkPreviewReady(
 	kekKeyIDs := make([]string, len(result.ExtraPages))
 	envelopeVersions := make([]int16, len(result.ExtraPages))
 	keyWrapVersions := make([]int16, len(result.ExtraPages))
+	contentTypes := make([]string, len(result.ExtraPages))
 	for i, page := range result.ExtraPages {
 		pageNumbers[i] = int16(page.PageNumber) //nolint:gosec // G115: bounded by MaxPreviewPDFPages.
 		objectIDs[i] = page.ObjectID
@@ -324,6 +335,11 @@ func (s *PGXPreviewStore) MarkPreviewReady(
 		kekKeyIDs[i] = page.KEKKeyID
 		envelopeVersions[i] = int16(page.EnvelopeVersion) //nolint:gosec // G115: pinned to small constants.
 		keyWrapVersions[i] = int16(page.KeyWrapVersion)   //nolint:gosec // G115: pinned to small constants.
+		pageContentType := page.ContentType
+		if pageContentType == "" {
+			pageContentType = domain.PreviewContentTypeJPEG
+		}
+		contentTypes[i] = pageContentType
 	}
 
 	var count int
@@ -333,6 +349,7 @@ func (s *PGXPreviewStore) MarkPreviewReady(
 		result.EnvelopeVersion, result.KeyWrapVersion,
 		result.ClaimAttempt, pageCount,
 		pageNumbers, objectIDs, sizes, wrappedDEKs, kekKeyIDs, envelopeVersions, keyWrapVersions,
+		contentType, contentTypes,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("mark preview ready: %w", err)

@@ -660,6 +660,11 @@ type documentPreviewManifest struct {
 // preview_page_count (task #494, Fase 1) — every attachment with a
 // single-page preview, which is every image and every preview produced
 // before multi-page rendering existed, still reports exactly one page.
+//
+// Kind is derived from preview_content_type, never stored redundantly: a
+// spreadsheet/CSV preview (task #494's sheet phase) always has PageCount 1 —
+// no sheet switching yet — but reports "sheets" so the client knows to fetch
+// and render a table instead of an image.
 func (h *AttachmentHandler) GetDocumentPreviewManifest(w http.ResponseWriter, r *http.Request) {
 	principal, ok := AuthenticatedPrincipal(r)
 	if !ok {
@@ -687,15 +692,21 @@ func (h *AttachmentHandler) GetDocumentPreviewManifest(w http.ResponseWriter, r 
 		// never allows it below that for a ready preview.
 		pageCount = 1
 	}
+	kind := "pages"
 	labels := make([]string, pageCount)
-	for i := range labels {
-		labels[i] = fmt.Sprintf("Página %d", i+1)
+	if view.PreviewContentType == domain.PreviewContentTypeSheet {
+		kind = "sheets"
+		labels = []string{"Planilha"}
+	} else {
+		for i := range labels {
+			labels[i] = fmt.Sprintf("Página %d", i+1)
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, no-store")
 	httputil.WriteJSON(w, http.StatusOK, documentPreviewManifest{
-		AttachmentID: view.ID, Kind: "pages", PageCount: pageCount, Labels: labels,
+		AttachmentID: view.ID, Kind: kind, PageCount: pageCount, Labels: labels,
 	})
 }
 

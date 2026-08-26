@@ -30,7 +30,7 @@ func previewRequest(path string) *http.Request {
 func servablePreview(useCases *fakeUseCases, body string) {
 	useCases.preview = service.Download{
 		Filename:    "diagram.png",
-		ContentType: domain.PreviewContentType,
+		ContentType: domain.PreviewContentTypeJPEG,
 		Size:        int64(len(body)),
 		Content:     seekableContent([]byte(body)),
 	}
@@ -53,8 +53,8 @@ func TestPreviewServesTheImageWithSafeHeaders(t *testing.T) {
 	}
 	// The type is the server's, never the attachment's: these bytes are a
 	// raster this service produced.
-	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentType {
-		t.Fatalf("Content-Type = %q, want %q", got, domain.PreviewContentType)
+	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentTypeJPEG {
+		t.Fatalf("Content-Type = %q, want %q", got, domain.PreviewContentTypeJPEG)
 	}
 	// Inline is what makes it usable as an image, and it is only safe because
 	// the payload cannot be the uploaded file. nosniff stops the declared type

@@ -126,7 +126,7 @@ func TestPreviewObjectKeyIsDerivedOnlyFromTheGeneratedID(t *testing.T) {
 }
 
 func TestPreviewContentTypeIsFixed(t *testing.T) {
-	if domain.PreviewContentType != "image/jpeg" {
-		t.Fatalf("preview content type = %q", domain.PreviewContentType)
+	if domain.PreviewContentTypeJPEG != "image/jpeg" {
+		t.Fatalf("preview content type = %q", domain.PreviewContentTypeJPEG)
 	}
 }

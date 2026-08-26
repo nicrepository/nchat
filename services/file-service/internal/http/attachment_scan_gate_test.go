@@ -144,6 +144,7 @@ func (s *gateStore) GetAuthorized(
 		PreviewEnvelopeVersion: s.preview.PreviewEnvelopeVersion,
 		PreviewKeyWrapVersion:  s.preview.PreviewKeyWrapVersion,
 		PreviewPageCount:       s.preview.PreviewPageCount,
+		PreviewContentType:     s.preview.PreviewContentType,
 	}, nil
 }
 
@@ -352,6 +353,7 @@ func (f *gateFixture) publishPreview(t *testing.T, content []byte) {
 		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
 		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
 		PreviewPageCount:       1,
+		PreviewContentType:     domain.PreviewContentTypeJPEG,
 	}
 }
 
@@ -395,6 +397,7 @@ func (f *gateFixture) publishExtraPage(t *testing.T, page int, content []byte) {
 		PageNumber: page, ObjectID: objectID.String(), Size: int64(len(content)),
 		WrappedDEK: wrapped, KEKKeyID: keyID,
 		EnvelopeVersion: crypto.EnvelopeVersion, KeyWrapVersion: crypto.KeyWrapVersion,
+		ContentType: domain.PreviewContentTypeJPEG,
 	}
 	if f.store.preview.PreviewPageCount < page {
 		f.store.preview.PreviewPageCount = page
@@ -562,7 +565,7 @@ func TestACleanAttachmentStillServesItsPreview(t *testing.T) {
 	if response.Body.String() != "jpeg-preview-bytes" {
 		t.Fatalf("preview served %q", response.Body.String())
 	}
-	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentType {
+	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentTypeJPEG {
 		t.Fatalf("preview content type = %q", got)
 	}
 }

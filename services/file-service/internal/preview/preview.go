@@ -1,11 +1,12 @@
-// Package preview turns an attachment's plaintext into the small raster the
-// client shows inline (RF-31).
+// Package preview turns an attachment's plaintext into the small preview the
+// client shows inline (RF-31): a raster for images and PDFs, a bounded JSON
+// table for spreadsheets and CSV.
 //
-// Everything in this package is a pure transformation: bytes in, JPEG out. It
-// has no database, no storage, no authorization and no knowledge of who is
-// asking — those belong to the caller, which has already decided that this
-// content may be rendered. That separation is what keeps the risky part of the
-// feature, the decoders, small and testable.
+// Everything in this package is a pure transformation: bytes in, a preview
+// out. It has no database, no storage, no authorization and no knowledge of
+// who is asking — those belong to the caller, which has already decided that
+// this content may be rendered. That separation is what keeps the risky part
+// of the feature, the decoders, small and testable.
 //
 // # Threat posture
 //
@@ -61,34 +62,56 @@ type Renderer struct{}
 // New returns the renderer used by the preview job.
 func New() *Renderer { return &Renderer{} }
 
-// Render reads src and returns one JPEG per page, each no larger than
-// domain.MaxPreviewDimension on its longest edge. Every non-PDF renderer
-// produces exactly one page; a PDF produces up to domain.MaxPreviewPDFPages,
-// bounded by the document's real page count.
+// Render reads src and returns every rendered page plus the one content type
+// they all share. A raster renderer (image or PDF) returns one JPEG per page,
+// each no larger than domain.MaxPreviewDimension on its longest edge — every
+// non-PDF raster is exactly one page, a PDF up to domain.MaxPreviewPDFPages,
+// bounded by the document's real page count. A spreadsheet/CSV renderer
+// returns exactly one page: a single bounded JSON table document.
 //
 // detectedMIME is the type detected from the content at upload — never a
 // declared type and never an extension. It selects the decoder; the decoder
 // then validates the bytes itself, so a mismatch fails rather than being
 // coerced.
-func (r *Renderer) Render(ctx context.Context, detectedMIME string, src io.Reader) ([][]byte, error) {
+func (r *Renderer) Render(
+	ctx context.Context, detectedMIME string, src io.Reader,
+) ([][]byte, string, error) {
 	if !domain.PreviewSupported(detectedMIME) {
-		return nil, fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
+		return nil, "", fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
 	}
 	data, err := readBounded(src, domain.MaxPreviewSourceBytes)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if domain.NormalizeDetectedMIME(detectedMIME) == "application/pdf" {
-		return renderPDFPages(ctx, data)
+	switch domain.NormalizeDetectedMIME(detectedMIME) {
+	case "application/pdf":
+		pages, err := renderPDFPages(ctx, data)
+		if err != nil {
+			return nil, "", err
+		}
+		return pages, domain.PreviewContentTypeJPEG, nil
+	case "text/csv":
+		page, err := renderCSV(data)
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
+	case xlsxSpreadsheetMIME:
+		page, err := renderXLSX(data)
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
+	default:
+		image, err := renderImage(data)
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{image}, domain.PreviewContentTypeJPEG, nil
 	}
-	image, err := renderImage(data)
-	if err != nil {
-		return nil, err
-	}
-	return [][]byte{image}, nil
 }
 
 // readBounded reads at most limit bytes and refuses anything longer.
