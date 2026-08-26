@@ -47,7 +47,7 @@ func InspectDocumentContainer(data []byte) (string, error) {
 		if total > maxDocumentExpandedBytes || (entry.CompressedSize64 > 0 && entry.UncompressedSize64/entry.CompressedSize64 > maxDocumentExpansionRate) {
 			return "", fmt.Errorf("%w: expansion limit", ErrUnsafeDocument)
 		}
-		if strings.HasSuffix(lower, "vbaproject.bin") || strings.Contains(lower, "/activex/") || strings.Contains(lower, "/embeddings/") || strings.Contains(lower, "/externallinks/") {
+		if strings.HasSuffix(lower, "vbaproject.bin") || strings.Contains(lower, "/activex/") || strings.Contains(lower, "/embeddings/") || strings.Contains(lower, "/externallinks/") || strings.HasPrefix(lower, "object ") || strings.HasPrefix(lower, "scripts/") || strings.HasPrefix(lower, "basic/") {
 			return "", fmt.Errorf("%w: active content", ErrUnsafeDocument)
 		}
 		names[lower] = struct{}{}
@@ -64,7 +64,7 @@ func InspectDocumentContainer(data []byte) (string, error) {
 				return "", readErr
 			}
 			folded := strings.ToLower(string(body))
-			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") {
+			if strings.Contains(folded, "<!doctype") || strings.Contains(folded, "<!entity") || strings.Contains(folded, `targetmode="external"`) || strings.Contains(folded, "targetmode='external'") || strings.Contains(folded, "<office:scripts") || strings.Contains(folded, "<script:") || strings.Contains(folded, "<draw:object") || strings.Contains(folded, "<draw:plugin") || hasExternalODFReference(folded) {
 				return "", fmt.Errorf("%w: active xml", ErrUnsafeDocument)
 			}
 		}
@@ -81,6 +81,17 @@ func InspectDocumentContainer(data []byte) (string, error) {
 	default:
 		return "", fmt.Errorf("%w: unsupported package", ErrUnsafeDocument)
 	}
+}
+
+func hasExternalODFReference(xml string) bool {
+	for _, quote := range []string{`xlink:href="`, "xlink:href='"} {
+		for _, scheme := range []string{"http:", "https:", "file:", "ftp:"} {
+			if strings.Contains(xml, quote+scheme) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasName(names map[string]struct{}, name string) bool { _, ok := names[name]; return ok }

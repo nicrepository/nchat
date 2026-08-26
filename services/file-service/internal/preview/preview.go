@@ -103,12 +103,19 @@ func (r *Renderer) Render(
 		}
 		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
 	case "application/zip":
-		// The only sniff net/http.DetectContentType ever produces for any
-		// zip-shaped upload — XLSX included, indistinguishable at this layer
-		// from DOCX/PPTX/ODT/ODP/ODS or an arbitrary .zip. renderXLSX's own
-		// InspectDocumentContainer call decides which of those this actually
-		// is, and refuses everything but XLSX.
-		page, err := renderXLSX(data)
+		detected, err := InspectDocumentContainer(data)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: %w", ErrUnsupported, err)
+		}
+		var page []byte
+		switch detected {
+		case xlsxSpreadsheetMIME:
+			page, err = renderXLSX(data)
+		case odsSpreadsheetMIME:
+			page, err = renderODS(data)
+		default:
+			return nil, "", fmt.Errorf("%w: no renderer for document container", ErrUnsupported)
+		}
 		if err != nil {
 			return nil, "", err
 		}

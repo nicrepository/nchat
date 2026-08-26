@@ -56,6 +56,11 @@ func TestInspectDocumentContainerRejectsTraversalAndMacros(t *testing.T) {
 		{"../escape": "x", "word/document.xml": "x"},
 		{"word/document.xml": "x", "word/vbaProject.bin": "macro"},
 		{"xl/workbook.xml": "x", "xl/externalLinks/externalLink1.xml": "external"},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<office:scripts/>`},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<draw:object xlink:href="Object 1"/>`},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<text:a xlink:href="https://example.test/secret"/>`},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<text:a xlink:href='file:///etc/passwd'/>`},
+		{"mimetype": "application/vnd.oasis.opendocument.spreadsheet", "content.xml": `<office/>`, "Object 1/content.xml": `<office/>`},
 	}
 	for _, files := range tests {
 		if _, err := InspectDocumentContainer(zipFixture(t, files)); err == nil {
