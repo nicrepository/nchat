@@ -56,6 +56,11 @@ import { emitCallTechnicalEvent } from "./callTelemetry";
 import FloatingCallWindow, { type FloatingActiveSpeaker } from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
 import IncomingCallPopup from "./IncomingCallPopup";
+import {
+  getIncomingCallRingtoneEnabled,
+  startIncomingCallRingtone,
+  stopIncomingCallRingtone,
+} from "./incomingCallRingtone";
 import OutgoingCallPopup from "./OutgoingCallPopup";
 
 type OwnerState = "none" | "local" | "remote";
@@ -1654,6 +1659,15 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     (!directory || calls.call.callee_id === directory.currentUserId)
       ? calls.call
       : null;
+  const incomingRingtoneCallId =
+    !dedicated && directIncoming && getIncomingCallRingtoneEnabled()
+      ? directIncoming.call_id
+      : null;
+  useEffect(() => {
+    if (!incomingRingtoneCallId) return;
+    startIncomingCallRingtone(incomingRingtoneCallId);
+    return stopIncomingCallRingtone;
+  }, [incomingRingtoneCallId]);
   // The CALLER's own surface for the exact same call.ringing (issue #615) —
   // authoritative only: gated on calls.call itself, never on calls.pending
   // (a start() preflight that never reaches the server, or one that fails
