@@ -5429,6 +5429,24 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
     expect(detailsToggle()).toHaveFocus();
   });
 
+  // Issue #467: below the wide-desktop threshold the panel covers the
+  // conversation, and a keyboard user has to be able to get back out of it.
+  // Wired once rather than by width, so the gesture is the same in both
+  // compositions.
+  it("closes on Escape and returns focus to the header control", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(detailsToggle()).toHaveFocus();
+  });
+
   it("is not offered in a DM, which has no channel details to show", async () => {
     mockFetchDMMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
     renderDMArea();

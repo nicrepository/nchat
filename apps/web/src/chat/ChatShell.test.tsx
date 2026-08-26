@@ -10,6 +10,7 @@ import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
+import { NAV_DRAWER_QUERY } from "./useNavDrawer";
 import { useCallMedia } from "./useCallMedia";
 
 vi.mock("./chatApi", async () => {
@@ -1144,7 +1145,15 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
         renameChannel: vi.fn(),
       }),
     }));
-    vi.doMock("./ChatSidebar", () => ({ default: () => null }));
+    // Partial: only the component is stubbed out. ChatSidebar also exports
+    // chatNavigationId, which the shell's navigation toggle points
+    // `aria-controls` at (issue #467) — replacing the whole module would take
+    // that named export with it and break rendering for a reason that has
+    // nothing to do with what this test is about.
+    vi.doMock("./ChatSidebar", async () => {
+      const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
+      return { ...actual, default: () => null };
+    });
 
     const { default: ChatShellFresh } = await import("./ChatShell");
 
@@ -1283,5 +1292,223 @@ describe("ChatShell — leaving the conversation on screen", () => {
 
     await waitFor(() => expect(screen.getByText("vazio")).toBeInTheDocument());
     expect(leaveConversation).toHaveBeenCalledWith("channel", readingId);
+  });
+});
+
+/**
+ * ISSUE #467 — the navigation is a column on wide viewports and a drawer below
+ * them. The composition itself is CSS; what is asserted here is the behaviour a
+ * stylesheet cannot carry: when the drawer is modal, what closes it, where focus
+ * goes, and that changing width is a change of composition and never a remount.
+ */
+describe("ChatShell — navegação responsiva", () => {
+  const readingId = "00000000-0000-4000-8000-0000000005b1";
+  const otherId = "00000000-0000-4000-8000-0000000005b2";
+
+  /**
+   * A MediaQueryList stand-in: jsdom does not implement matchMedia, so without
+   * this every query simply never matches — which is exactly the wide-viewport
+   * answer the tests that omit it rely on.
+   */
+  function stubViewport(startsAsDrawer: boolean) {
+    let drawer = startsAsDrawer;
+    const listeners = new Set<() => void>();
+    window.matchMedia = ((query: string) => ({
+      get matches() {
+        return query === NAV_DRAWER_QUERY && drawer;
+      },
+      media: query,
+      addEventListener: (_event: string, callback: () => void) => void listeners.add(callback),
+      removeEventListener: (_event: string, callback: () => void) =>
+        void listeners.delete(callback),
+    })) as unknown as typeof window.matchMedia;
+    return {
+      resizeTo(nextIsDrawer: boolean) {
+        drawer = nextIsDrawer;
+        act(() => listeners.forEach((callback) => callback()));
+      },
+    };
+  }
+
+  function renderShellAt(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route index element={<div>vazio</div>} />
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function sidebarWithTwoChannels() {
+    return {
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        { id: readingId, name: "Plataforma", type: "public" as const, canWrite: true },
+        { id: otherId, name: "Infra", type: "public" as const, canWrite: true },
+      ],
+      dms: [],
+      categories: [],
+    };
+  }
+
+  const toggle = () => screen.getByRole("button", { name: "Conversas" });
+  const main = () => screen.getByRole("main");
+
+  beforeEach(() => {
+    vi.mocked(fetchSidebarData).mockResolvedValue(sidebarWithTwoChannels());
+  });
+
+  afterEach(() => {
+    // @ts-expect-error -- jsdom does not define this by default; restore that.
+    delete window.matchMedia;
+  });
+
+  it("mantém a conversa interativa ao abrir a navegação em coluna", async () => {
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(toggle());
+
+    // The disclosure still reports itself open — the sidebar is simply always on
+    // screen at this width, so nothing about the conversation changes.
+    expect(screen.getByRole("button", { name: "Fechar conversas" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.queryByTestId("chat-nav-backdrop")).not.toBeInTheDocument();
+  });
+
+  it("abre a navegação como camada modal em larguras de drawer", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
+    expect(toggle()).toHaveAttribute("aria-controls", "chat-navigation");
+    expect(screen.getByTestId("chat-sidebar")).toHaveAttribute("id", "chat-navigation");
+    expect(main()).not.toHaveAttribute("inert");
+
+    await user.click(toggle());
+
+    expect(screen.getByTestId("chat-shell")).toHaveAttribute("data-nav-open", "true");
+    expect(main()).toHaveAttribute("inert");
+    expect(screen.getByTestId("chat-nav-backdrop")).toBeInTheDocument();
+  });
+
+  it("fecha com Escape e devolve o foco ao acionador", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(toggle());
+    await user.keyboard("{Escape}");
+
+    expect(screen.getByTestId("chat-shell")).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(toggle()).toHaveFocus();
+  });
+
+  // React bubbles a portal's events to its React parent, not its DOM one, so
+  // Escape inside a dialog opened from the drawer reaches the shell's handler.
+  // Dismissing that dialog must leave the drawer exactly as it was.
+  it("mantém a navegação aberta quando Escape fecha um diálogo aberto a partir dela", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(toggle());
+    await user.click(screen.getByRole("button", { name: "Mais opções para canal Infra" }));
+    await user.click(screen.getByRole("menuitem", { name: "Sair do canal" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-shell")).toHaveAttribute("data-nav-open", "true");
+  });
+
+  it("fecha ao tocar fora e devolve o foco ao acionador", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(toggle());
+    await user.click(screen.getByTestId("chat-nav-backdrop"));
+
+    expect(screen.getByTestId("chat-shell")).not.toHaveAttribute("data-nav-open");
+    expect(toggle()).toHaveFocus();
+  });
+
+  it("mostra a conversa escolhida e fecha a navegação, preservando a seleção", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(toggle());
+    await user.click(screen.getByRole("option", { name: /Infra/ }));
+
+    expect(screen.getByTestId("chat-shell")).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Infra/ })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("fecha a navegação ao abrir os detalhes de uma conversa pelo menu da linha", async () => {
+    stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Infra/ });
+
+    await user.click(toggle());
+    await user.click(screen.getByRole("button", { name: "Mais opções para canal Infra" }));
+    await user.click(screen.getByRole("menuitem", { name: "Detalhes do canal" }));
+
+    expect(screen.getByTestId("sidebar-details")).toHaveTextContent(`channel:${otherId}`);
+    expect(screen.getByTestId("chat-shell")).not.toHaveAttribute("data-nav-open");
+  });
+
+  it("redimensionar para coluna devolve a conversa sem recriar a conexão nem perder a seleção", async () => {
+    const viewport = stubViewport(true);
+    const user = userEvent.setup();
+    renderShellAt(`/chat/channel/${readingId}`);
+    await screen.findByRole("option", { name: /Plataforma/ });
+
+    await user.click(toggle());
+    expect(main()).toHaveAttribute("inert");
+    const socketsWhileDrawerOpen = FakeWebSocket.instances.length;
+    const sidebarFetches = vi.mocked(fetchSidebarData).mock.calls.length;
+
+    viewport.resizeTo(false);
+
+    // The drawer cannot stay modal over a sidebar that is a column again.
+    expect(screen.getByTestId("chat-shell")).not.toHaveAttribute("data-nav-open");
+    expect(main()).not.toHaveAttribute("inert");
+    // Composition changed; nothing else did.
+    expect(FakeWebSocket.instances).toHaveLength(socketsWhileDrawerOpen);
+    expect(vi.mocked(fetchSidebarData).mock.calls).toHaveLength(sidebarFetches);
+    expect(screen.getByText("mensagens")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Plataforma/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 });

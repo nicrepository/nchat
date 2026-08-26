@@ -38,7 +38,13 @@
  * message list, the composer or the WebSocket subscription.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 
 import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
@@ -950,6 +956,23 @@ export default function ConversationDetailsPanel({
   const details = state.details;
   const files = state.files;
 
+  // Escape closes the panel (issue #467). It matters most where the panel covers
+  // the conversation instead of sitting beside it, but the gesture is the same in
+  // both compositions, so it is wired once rather than being switched on by
+  // width.
+  //
+  // The containment check is not defensive noise: React bubbles a portal's
+  // events to its React parent rather than its DOM one, so without it the
+  // Escape that dismisses a dialog this panel opened — the member picker, the
+  // edit history — would close the panel out from under it, and the focus that
+  // dialog restores would land on an element that no longer exists.
+  function handleKeyDown(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key !== "Escape") return;
+    if (!event.currentTarget.contains(event.target as Node)) return;
+    event.stopPropagation();
+    onClose();
+  }
+
   return (
     <aside
       id={conversationDetailsPanelId}
@@ -957,6 +980,7 @@ export default function ConversationDetailsPanel({
       aria-labelledby={conversationDetailsTitleId}
       data-testid="chat-conversation-details"
       data-conversation-kind={kind}
+      onKeyDown={handleKeyDown}
     >
       <div className="chat-details__head">
         <h2 id={conversationDetailsTitleId} className="chat-details__title">
