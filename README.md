@@ -411,7 +411,7 @@ make k8s-status-dev
 make k8s-delete-dev
 ```
 
-Esses manifests nao sao de producao. Secrets reais nao sao versionados; `infra/k8s/base/secrets.example.yaml` e apenas modelo e nao entra no kustomization. O overlay `k3s-dev` assume Traefik disponivel no k3s e expoe `nchat.local` sem TLS real. O overlay `k3s-staging` adiciona Ingress TLS placeholder para `staging.nchat.local` com `VersionTLS13` via Traefik TLSOption quando os CRDs existem. Cert-manager, ArgoCD, Dockerfiles, build/push de imagens, producao real e data services em K8s entram em tarefas futuras.
+Os overlays `k3s-dev` e `k3s-staging` nao sao de producao; a estrutura de producao Blue/Green vive em `infra/k8s/overlays/k3s-prod` (issue #626) e esta descrita em `docs/runbooks/production-blue-green-deployment.md`. Estar versionada nao significa que exista um ambiente de producao provisionado ou liberado. Secrets reais nao sao versionados; `infra/k8s/base/secrets.example.yaml` e apenas modelo e nao entra no kustomization. O overlay `k3s-dev` assume Traefik disponivel no k3s e expoe `nchat.local` sem TLS real. O overlay `k3s-staging` adiciona Ingress TLS placeholder para `staging.nchat.local` com `VersionTLS13` via Traefik TLSOption quando os CRDs existem. Cert-manager, ArgoCD e data services em K8s entram em tarefas futuras.
 
 ## Services base structure
 

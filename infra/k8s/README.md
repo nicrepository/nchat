@@ -2,7 +2,9 @@
 
 ## Objetivo
 
-Esta pasta contem os manifests iniciais Kubernetes/k3s do NChat para ambientes dev/staging revisaveis. A entrega prepara o repositorio para uma futura adocao de GitOps, mas nao configura ArgoCD, Helm, cert-manager ou manifests de producao.
+Esta pasta contem os manifests Kubernetes/k3s do NChat para os ambientes dev/staging revisaveis e, desde a issue #626, o overlay de producao `overlays/k3s-prod` com a estrutura Blue/Green. A entrega prepara o repositorio para uma futura adocao de GitOps, mas nao configura ArgoCD, Helm nem cert-manager.
+
+Distincao importante: `overlays/k3s-prod` e **infraestrutura de producao versionada neste repositorio**. Ela nao implica que exista um cluster de producao provisionado, DNS resolvendo, certificado emitido ou ambiente liberado a usuarios. O procedimento operacional e os pre-requisitos externos estao em `docs/runbooks/production-blue-green-deployment.md`.
 
 ## Estrutura
 
@@ -157,9 +159,11 @@ out of scope for these manifests.
 
 ## Limitacoes
 
-- Nao e producao.
-- Sem TLS publico real.
-- Sem cert-manager.
+- Os overlays `k3s-dev` e `k3s-staging` nao sao producao. O overlay `k3s-prod` descreve producao,
+  mas nenhum ambiente de producao e provisionado por este repositorio.
+- Sem TLS publico real nos overlays dev/staging. `k3s-prod` declara um `Certificate` que pressupoe
+  um ClusterIssuer `letsencrypt-prod` existente no cluster.
+- Sem cert-manager instalado por esta base; `k3s-prod` apenas assume que ele exista no cluster alvo.
 - Sealed Secrets estruturado, mas sem controller aplicado por CI.
 - Sem ArgoCD.
 - Sem Helm.
