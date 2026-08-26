@@ -2277,7 +2277,7 @@ describe("CallSessionProvider", () => {
     );
   }
 
-  it("suppresses the resource FloatingCallWindow only once EVERY ingredient of resourcePresentationCall holds", async () => {
+  it("never suppresses the resource FloatingCallWindow even when resourcePresentationCall is fully ready (issue #657 regression fix)", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
@@ -2286,9 +2286,18 @@ describe("CallSessionProvider", () => {
     await waitFor(() =>
       expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
     );
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    // #657: FloatingCallWindow coexists with the bar, it is never suppressed.
+    // It must still provide the full surface controls (camera, screen share, open in new tab).
+    const panel = screen.getByTestId("resource-call-panel");
+    expect(panel).toBeInTheDocument();
+
+    // Prove it still offers camera, screen share, and "Expandir em nova aba"
+    const cameraBtn = within(panel).getByRole("button", { name: "Ativar câmera" });
+    const screenShareBtn = within(panel).getByRole("button", { name: "Compartilhar tela" });
+    expect(within(panel).getByRole("button", { name: "Expandir em nova aba" })).toBeInTheDocument();
+
+    expect(cameraBtn).toBeEnabled();
+    expect(screenShareBtn).toBeEnabled();
   });
 
   it("keeps the floating window when discovery still shows a DIFFERENT call_id for the same target (call.admitted/call.accepted have no ordering guarantee)", async () => {
@@ -2413,12 +2422,7 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.getByTestId("resource-presentation-call")).toHaveTextContent(callId),
-    );
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     // Media drops to reconnecting — the bar has no UI for this state.
     media.status = "reconnecting";
@@ -2463,23 +2467,19 @@ describe("CallSessionProvider", () => {
     expect(within(panel).getByRole("button", { name: "Tentar mídia novamente" })).toBeEnabled();
   });
 
-  it("restores the floating window when navigating away, suppresses it again on return, never duplicated", async () => {
+  it("keeps the floating window when navigating away and on return, never duplicated (issue #657)", async () => {
     renderProvider();
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: "Canal Y" }));
     expect(await screen.findByTestId("resource-call-panel")).toBeInTheDocument();
     expect(screen.getAllByTestId("resource-call-panel")).toHaveLength(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
     // Navigating A -> B -> A never reconnected media.
     expect(media.stop).not.toHaveBeenCalled();
   });
@@ -2489,9 +2489,7 @@ describe("CallSessionProvider", () => {
     fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
     fireEvent.click(screen.getByRole("button", { name: "Canal X" }));
     await makeResourcePresentationReady();
-    await waitFor(() =>
-      expect(screen.queryByTestId("resource-call-panel")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByTestId("resource-call-panel")).toBeInTheDocument());
 
     act(() => ownershipLost());
     await waitFor(() => expect(screen.getByTestId("owner")).toHaveTextContent("remote"));
