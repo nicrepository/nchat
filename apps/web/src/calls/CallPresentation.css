@@ -663,6 +663,80 @@
   min-height: min(60vh, 34rem);
   aspect-ratio: 16 / 9;
 }
+.dedicated-call__tile--screen .dedicated-call__media video {
+  object-fit: contain;
+}
+.dedicated-call__participant-status {
+  display: none;
+}
+.dedicated-call--screen-share {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+.dedicated-call__screen-share-layout {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) clamp(13rem, 22vw, 20rem);
+  gap: 0.75rem;
+  padding: 0.75rem;
+  overflow: hidden;
+}
+.dedicated-call__screen-stage {
+  min-width: 0;
+  min-height: 0;
+}
+.dedicated-call__screen-stage .dedicated-call__tile--screen {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  aspect-ratio: auto;
+}
+.dedicated-call__participant-sidebar {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.dedicated-call__participant-sidebar:focus-visible {
+  outline: 2px solid #f8fafc;
+  outline-offset: -2px;
+}
+.dedicated-call__participant-list {
+  display: grid;
+  gap: 0.6rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__participant {
+  min-height: 8rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__participant-status {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  z-index: 3;
+  display: flex;
+  gap: 0.3rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__name {
+  right: 6.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dedicated-call__participant-status > span {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  border-radius: 50%;
+  color: #f8fafc;
+  background: rgb(2 6 23 / 78%);
+}
+.dedicated-call__participant-status .material-symbols-outlined {
+  font-size: 1rem;
+}
 .dedicated-call__name {
   position: absolute;
   z-index: 3;
@@ -773,6 +847,22 @@
   }
   .floating-call__stage {
     min-height: 7rem;
+  }
+  .dedicated-call__screen-share-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .dedicated-call__participant-sidebar {
+    max-height: 8rem;
+  }
+  .dedicated-call__participant-list {
+    display: flex;
+    width: max-content;
+  }
+  .dedicated-call__participant-sidebar .dedicated-call__participant {
+    width: 10rem;
+    min-height: 7rem;
+    flex: 0 0 auto;
   }
 }
 
