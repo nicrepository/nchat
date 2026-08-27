@@ -76,6 +76,8 @@ export interface ChatComposerProps {
   channelId?: string;
   bodyFormat: CodecFormat;
   disabled?: boolean;
+  /** Conversation screens opt in; inline and isolated editors keep their focus policy. */
+  focusOnReady?: boolean;
   replyPreview?: ComposerReplyPreview | null;
   onCancelReply?: () => void;
   referencePreview?: PendingReferencePreview;
@@ -632,6 +634,7 @@ export default function ChatComposer({
   channelId,
   bodyFormat,
   disabled,
+  focusOnReady = false,
   replyPreview,
   onCancelReply,
   referencePreview = { status: "idle" },
@@ -710,6 +713,8 @@ export default function ChatComposer({
     disabled,
     channelId,
     bodyFormat,
+    focusOnReady,
+    restoreFocusOnSend: focusOnReady,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
     canSendEmpty: hasSendableAttachment(upload),
@@ -728,8 +733,11 @@ export default function ChatComposer({
   // composer during a recording is still neutralised rather than falling
   // through to the browser's own file-open navigation.
   const canAcceptAttachments = attachEnabled && !recording;
-  const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
   const activeEditor = editor ?? null;
+  const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, (files) => {
+    upload.selectFiles(files);
+    queueMicrotask(() => activeEditor?.view.dom.focus());
+  });
 
   const startRecording = () => {
     // A picker left open over a recording panel is the same noise a picker

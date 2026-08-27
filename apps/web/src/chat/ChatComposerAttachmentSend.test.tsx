@@ -112,6 +112,20 @@ afterEach(() => {
 });
 
 describe("composer attachment send", () => {
+  it("returns focus to the composer after selecting multiple documents", async () => {
+    const user = userEvent.setup();
+    renderComposer(makeOnSend());
+    const picker = screen.getByTestId("chat-composer-file-input");
+    picker.focus();
+
+    await user.upload(picker, [pdf("um.pdf"), pdf("dois.pdf")]);
+    await waitFor(() =>
+      expect(screen.getAllByTestId("chat-composer-pending-attachment")).toHaveLength(2),
+    );
+
+    await waitFor(() => expect(screen.getByTestId("chat-composer-input")).toHaveFocus());
+  });
+
   it("keeps the persisted attachment id after the upload", async () => {
     const user = userEvent.setup();
     renderComposer(makeOnSend());

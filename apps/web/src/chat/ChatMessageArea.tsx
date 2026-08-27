@@ -683,7 +683,8 @@ function MessageList({
 
   // Scroll management driven by lastMutation — explicit and race-condition-free.
   // "prepend"    → restore position via scrollHeight delta (older messages added above).
-  // "initial" | "append" → scroll to bottom unconditionally.
+  // "initial"    → set the exact bottom synchronously, before paint.
+  // "append"     → scroll to bottom smoothly after a local send.
   // "ws_append"  → scroll to bottom only when the user is already near the bottom;
   //                otherwise preserve position so reading history is not interrupted.
   // "none"       → no action (intermediate transition).
@@ -696,11 +697,17 @@ function MessageList({
   useLayoutEffect(() => {
     if (!listRef.current) return;
     const el = listRef.current;
+    let initialFrame: number | null = null;
 
     if (lastMutation === "prepend") {
       // Shift scrollTop by the amount the container grew so the user's view is stable.
       el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
-    } else if (lastMutation === "initial" || lastMutation === "append") {
+    } else if (lastMutation === "initial") {
+      el.scrollTop = el.scrollHeight;
+      initialFrame = window.requestAnimationFrame(() => {
+        if (listRef.current === el) el.scrollTop = el.scrollHeight;
+      });
+    } else if (lastMutation === "append") {
       scrollToBottom(bottomRef);
     } else if (lastMutation === "ws_append" && isNearBottomRef.current) {
       // Only auto-scroll on WS messages when user is already near the bottom.
@@ -712,6 +719,9 @@ function MessageList({
     if (lastMutation !== "none") {
       prevScrollHeightRef.current = el.scrollHeight;
     }
+    return () => {
+      if (initialFrame !== null) window.cancelAnimationFrame(initialFrame);
+    };
   }, [messages, lastMutation]);
 
   // IntersectionObserver: fire loadMore when the top sentinel enters the viewport.
@@ -1655,6 +1665,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
         <ChatComposer
           key={`${kind}:${targetId}`}
+          focusOnReady
           channelId={target.channelId}
           bodyFormat={target.isChannel ? "v3" : "v2"}
           placeholder={target.composerPlaceholder}

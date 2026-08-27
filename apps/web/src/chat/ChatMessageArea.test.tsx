@@ -368,6 +368,18 @@ function renderDMArea(dmId = "dm-juliane") {
   );
 }
 
+function ConversationNavigation({ ctx }: { ctx: ChatOutletContext }) {
+  const navigate = useNavigate();
+  return (
+    <>
+      <button type="button" onClick={() => navigate("/chat/channel/second")}>
+        Abrir segunda conversa
+      </button>
+      <Outlet context={ctx} />
+    </>
+  );
+}
+
 function renderChannelAreaForUser(currentUserId = "me-123") {
   return render(
     <MemoryRouter initialEntries={["/chat/channel/geral"]}>
@@ -4711,6 +4723,46 @@ describe("ChatMessageArea — storage safety", () => {
 
 // capturedIOCallback is scoped to this describe so that it is isolated from
 // tests that don't interact with IntersectionObserver.
+describe("ChatMessageArea — composer focus", () => {
+  it("focuses the composer after a conversation finishes loading", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "focus-1" })]));
+
+    renderChannelArea();
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(input).toHaveFocus());
+  });
+
+  it("focuses the newly mounted composer after route navigation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "focus-nav" })]));
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [
+        { id: "first", name: "Primeiro", type: "public", canWrite: true },
+        { id: "second", name: "Segundo", type: "public", canWrite: true },
+      ],
+      dms: [],
+    };
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/first"]}>
+        <Routes>
+          <Route path="/chat" element={<ConversationNavigation ctx={ctx} />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const firstInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(firstInput).toHaveFocus());
+
+    await userEvent.click(screen.getByRole("button", { name: "Abrir segunda conversa" }));
+
+    const secondInput = await screen.findByTestId("chat-composer-input");
+    expect(secondInput).not.toBe(firstInput);
+    await waitFor(() => expect(secondInput).toHaveFocus());
+  });
+});
+
 describe("ChatMessageArea — infinite scroll", () => {
   let capturedIOCallback: IntersectionObserverCallback | null = null;
 
@@ -5039,6 +5091,88 @@ describe("ChatMessageArea — infinite scroll", () => {
 
     // Append (sent) must scroll to bottom.
     expect(scrollMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("positions the initial timeline at the exact bottom without animation", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: Array.from({ length: 80 }, (_, index) =>
+        makeMessage({ id: `initial-${index}`, bodyText: `Message ${index}` }),
+      ),
+      nextCursor: "",
+    });
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+    const scrollHeight = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(4800);
+
+    renderChannelArea();
+    const list = await screen.findByRole("log");
+
+    await waitFor(() => expect(list.scrollTop).toBe(4800));
+    expect(scrollMock).not.toHaveBeenCalled();
+    scrollHeight.mockRestore();
+  });
+
+  it("corrects the initial bottom after late layout changes before the next frame", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "late-layout", bodyText: "Documento" })]),
+    );
+    let height = 900;
+    const scrollHeight = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockImplementation(() => height);
+    let frame: FrameRequestCallback | undefined;
+    const requestFrame = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        frame = callback;
+        return 1;
+      });
+
+    renderChannelArea();
+    const list = await screen.findByRole("log");
+    await waitFor(() => expect(list.scrollTop).toBe(900));
+    height = 1500;
+
+    act(() => frame?.(performance.now()));
+
+    expect(list.scrollTop).toBe(1500);
+    requestFrame.mockRestore();
+    scrollHeight.mockRestore();
+  });
+
+  it("does not inherit scrollTop when navigating to another conversation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "scroll-nav" })]));
+    const scrollHeight = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(2400);
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [
+        { id: "first", name: "Primeiro", type: "public", canWrite: true },
+        { id: "second", name: "Segundo", type: "public", canWrite: true },
+      ],
+      dms: [],
+    };
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/first"]}>
+        <Routes>
+          <Route path="/chat" element={<ConversationNavigation ctx={ctx} />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const firstList = await screen.findByRole("log");
+    await waitFor(() => expect(firstList.scrollTop).toBe(2400));
+    firstList.scrollTop = 275;
+
+    await userEvent.click(screen.getByRole("button", { name: "Abrir segunda conversa" }));
+
+    const secondList = await screen.findByRole("log");
+    await waitFor(() => expect(secondList.scrollTop).toBe(2400));
+    scrollHeight.mockRestore();
   });
 });
 

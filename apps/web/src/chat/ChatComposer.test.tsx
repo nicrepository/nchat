@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -47,6 +47,61 @@ function setup() {
   render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
   return onSend;
 }
+
+describe("ChatComposer focus policy", () => {
+  it("focuses when explicitly enabled and the loaded composer becomes editable", async () => {
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    const { rerender } = render(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        disabled
+        focusOnReady
+        onSend={onSend}
+      />,
+    );
+
+    rerender(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." focusOnReady onSend={onSend} />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(input).toHaveFocus());
+  });
+
+  it("does not steal focus while an aria-modal dialog is active", async () => {
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    document.body.append(modal);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." focusOnReady onSend={onSend} />);
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await act(async () => Promise.resolve());
+    expect(input).not.toHaveFocus();
+    modal.remove();
+  });
+
+  it("starts composing with a printable key pressed outside interactive controls", async () => {
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." focusOnReady onSend={onSend} />);
+    const input = await screen.findByTestId("chat-composer-input");
+    document.body.focus();
+
+    fireEvent.keyDown(document, { key: "o" });
+
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toHaveTextContent("o");
+  });
+});
 
 async function send(onSend: ReturnType<typeof setup>): Promise<string> {
   await userEvent.click(await screen.findByTestId("chat-send-btn"));

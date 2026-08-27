@@ -517,6 +517,46 @@ test.describe("layout responsivo", () => {
     await expectNoRootScroll(page, "histórico rolado");
   });
 
+  test("abre histórico longo no final com o composer focado", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const targetId = uniqueId(testInfo, "initial-focus-scroll");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: LONG_NAME,
+      messages: Array.from({ length: 60 }, (_, index) =>
+        makeMessage({
+          id: `${targetId}-m${index}`,
+          body_text: `Mensagem inicial ${index} desta conversa longa.`,
+        }),
+      ),
+    });
+    await installMessagingMocks(page, scenario);
+
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const input = composer(page);
+    await expect(input).toBeFocused();
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(async () =>
+        list.evaluate((element) =>
+          Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop),
+        ),
+      )
+      .toBeLessThanOrEqual(1);
+
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.type("d");
+    await expect(input).toHaveText("d");
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await page.keyboard.press("Backspace");
+    await fillComposer(page, "Mensagem enviada com foco preservado");
+    await input.press("Enter");
+    await expect(page.getByText("Mensagem enviada com foco preservado")).toBeVisible();
+    await expect(input).toBeFocused();
+  });
+
   /**
    * The lock is scoped to the shell, so leaving the chat has to give the
    * document its ordinary scrolling back — otherwise a taller route silently
