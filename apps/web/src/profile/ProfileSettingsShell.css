@@ -1,0 +1,60 @@
+/*
+ * ProfileSettingsShell — page chrome for /profile/*.
+ * Breakpoints mirror apps/web/src/chat/AppShell.css (wide >= 1280px, compact
+ * 1024-1279.98px, tablet/phone below 1024px) rather than inventing new ones.
+ */
+
+.profile-settings {
+  height: 100%;
+  overflow-y: auto;
+  background: var(--color-bg, #f7f5fb);
+}
+
+.profile-settings__header,
+.profile-tabs,
+.profile-settings__content {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding-left: 24px;
+  padding-right: 24px;
+}
+
+.profile-settings__header {
+  padding-top: 24px;
+}
+
+.profile-settings__title {
+  margin: 0 0 16px;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+}
+
+/* Sticky within the scrollable content region (.profile-settings), not the
+   page — the shell itself owns the scroll. */
+.profile-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--color-bg, #f7f5fb);
+}
+
+.profile-settings__content {
+  padding-top: 24px;
+  padding-bottom: 24px;
+}
+
+@media (max-width: 1279.98px) {
+  .profile-settings__header,
+  .profile-tabs,
+  .profile-settings__content {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .profile-settings__header {
+    padding-top: 16px;
+  }
+}

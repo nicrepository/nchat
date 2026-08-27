@@ -14,13 +14,17 @@ import ResetPasswordPage from "./auth/ResetPasswordPage";
 import AppShell from "./chat/AppShell";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
-import ProfilePage from "./profile/ProfilePage";
+import ProfileOverviewPage from "./profile/ProfileOverviewPage";
+import ProfileSettingsShell from "./profile/ProfileSettingsShell";
 
 const AdminAntiSpamPage = lazy(() => import("./admin/AdminAntiSpamPage"));
 const AdminUploadLimitPage = lazy(() => import("./admin/AdminUploadLimitPage"));
 const ChatMessageArea = lazy(() => import("./chat/ChatMessageArea"));
 const FavoritesPage = lazy(() => import("./chat/FavoritesPage"));
 const GlobalSearchPage = lazy(() => import("./search/GlobalSearchPage"));
+const NotificationsSettingsPage = lazy(() => import("./profile/NotificationsSettingsPage"));
+const SecuritySettingsPage = lazy(() => import("./profile/SecuritySettingsPage"));
+const SessionsSettingsPage = lazy(() => import("./profile/SessionsSettingsPage"));
 const LiveKitSpikePage = import.meta.env.DEV
   ? lazy(() => import("./mediaSpike/LiveKitSpikePage"))
   : null;
@@ -97,7 +101,33 @@ export default function App() {
             </Route>
 
             {/* ── Profile (authenticated) ─────────────────────────────── */}
-            <Route path="/profile" element={<ProfilePage />} />
+            <Route path="/profile" element={<ProfileSettingsShell />}>
+              <Route index element={<ProfileOverviewPage />} />
+              <Route
+                path="notifications"
+                element={
+                  <Suspense fallback={null}>
+                    <NotificationsSettingsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="security"
+                element={
+                  <Suspense fallback={null}>
+                    <SecuritySettingsPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="sessions"
+                element={
+                  <Suspense fallback={null}>
+                    <SessionsSettingsPage />
+                  </Suspense>
+                }
+              />
+            </Route>
           </Route>
 
           {/* ── Admin ─────────────────────────────────────────────────── */}
