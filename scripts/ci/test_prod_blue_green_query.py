@@ -243,6 +243,16 @@ spec:
             "        envFrom:\n        - configMapRef:\n            name: nchat-config\n", "")
         self.assertEqual(query.document_field(document(text), "configmap-envfrom"), "")
 
+    def test_app_env_is_inherited_when_no_container_override_exists(self):
+        self.assertEqual(query.document_field(document(self.ENVFROM), "app-env"), "")
+
+    def test_app_env_container_override_is_reported(self):
+        text = self.ENVFROM.replace(
+            "        - name: LIVEKIT_TOKEN_TTL_SECONDS",
+            "        - name: APP_ENV\n          value: blue\n        - name: LIVEKIT_TOKEN_TTL_SECONDS",
+        )
+        self.assertEqual(query.document_field(document(text), "app-env"), "blue")
+
 
 class LocalVolumeFieldTests(unittest.TestCase):
     def test_dotted_spec_path(self):
