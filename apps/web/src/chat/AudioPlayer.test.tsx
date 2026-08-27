@@ -93,4 +93,152 @@ describe("AudioPlayer", () => {
 
     expect(pauseX).toHaveBeenCalledTimes(1);
   });
+
+  // Regression tests for issue #693: short WebM voice messages (MediaRecorder
+  // output) can report `HTMLMediaElement.duration === Infinity` from
+  // `loadedmetadata`, and `ended` never syncs the visible progress to the end.
+  describe("issue #693: WebM voice message duration/progress", () => {
+    it("does not let an Infinity native duration overwrite a finite durationHint", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice"
+        />,
+      );
+
+      expect(screen.getByTestId("p-voice-time")).toHaveTextContent("0:00 / 0:04");
+      expect(screen.getByTestId("p-voice-seek")).toHaveAttribute("max", "4");
+
+      const audioEl = screen.getByTestId("p-voice-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: Infinity, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+
+      expect(screen.getByTestId("p-voice-time")).toHaveTextContent("0:00 / 0:04");
+      expect(screen.getByTestId("p-voice-seek")).toHaveAttribute("max", "4");
+    });
+
+    it("syncs the visible progress to the end when playback ends", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice2"
+        />,
+      );
+
+      const audioEl = screen.getByTestId("p-voice2-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: 4, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+
+      Object.defineProperty(audioEl, "currentTime", { value: 3.8, configurable: true });
+      fireEvent.timeUpdate(audioEl);
+      fireEvent.ended(audioEl);
+
+      expect(screen.getByTestId("p-voice2-seek")).toHaveValue("4");
+      expect(screen.getByTestId("p-voice2-time")).toHaveTextContent("0:04 / 0:04");
+    });
+
+    it("lets a finite native duration replace the hint", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice3"
+        />,
+      );
+
+      const audioEl = screen.getByTestId("p-voice3-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: 4.2, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+
+      expect(screen.getByTestId("p-voice3-seek")).toHaveAttribute("max", "4.2");
+      expect(screen.getByTestId("p-voice3-time")).toHaveTextContent("0:00 / 0:04");
+    });
+
+    it("ignores invalid native duration values and keeps the last valid duration", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice4"
+        />,
+      );
+
+      const audioEl = screen.getByTestId("p-voice4-audio-el") as HTMLAudioElement;
+      for (const invalid of [Infinity, NaN, 0, -1]) {
+        Object.defineProperty(audioEl, "duration", { value: invalid, configurable: true });
+        fireEvent.loadedMetadata(audioEl);
+        fireEvent.durationChange(audioEl);
+      }
+
+      expect(screen.getByTestId("p-voice4-seek")).toHaveAttribute("max", "4");
+      expect(screen.getByTestId("p-voice4-time")).toHaveTextContent("0:00 / 0:04");
+    });
+
+    it("picks up a duration that only becomes finite on a later durationchange", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice5"
+        />,
+      );
+
+      const audioEl = screen.getByTestId("p-voice5-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: Infinity, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+      expect(screen.getByTestId("p-voice5-seek")).toHaveAttribute("max", "4");
+
+      Object.defineProperty(audioEl, "duration", { value: 5.5, configurable: true });
+      fireEvent.durationChange(audioEl);
+
+      expect(screen.getByTestId("p-voice5-seek")).toHaveAttribute("max", "5.5");
+      expect(screen.getByTestId("p-voice5-time")).toHaveTextContent("0:00 / 0:05");
+    });
+
+    it("moves the seek bar proportionally on an intermediate timeupdate", () => {
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={4}
+          testIdPrefix="p-voice6"
+        />,
+      );
+
+      const audioEl = screen.getByTestId("p-voice6-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: 4, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+
+      Object.defineProperty(audioEl, "currentTime", { value: 2, configurable: true });
+      fireEvent.timeUpdate(audioEl);
+
+      expect(screen.getByTestId("p-voice6-seek")).toHaveValue("2");
+      expect(screen.getByTestId("p-voice6-time")).toHaveTextContent("0:02 / 0:04");
+    });
+  });
 });
