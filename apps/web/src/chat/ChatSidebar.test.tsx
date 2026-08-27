@@ -9,6 +9,7 @@ import { _resetSelfProfile, refreshSelfProfile } from "../profile/selfProfile";
 import type { SelfProfile } from "../profile/profileApi";
 import RequireAuth from "../auth/RequireAuth";
 import CallSessionProvider from "../calls/CallSessionProvider";
+import AppShell from "./AppShell";
 import ChatShell from "./ChatShell";
 import ChatSidebar from "./ChatSidebar";
 import type {
@@ -160,18 +161,19 @@ function renderChat(initialPath = "/chat", authenticated = true) {
       <Routes>
         <Route path="/login" element={<div>Login page</div>} />
         <Route
-          path="/chat"
           element={
             <RequireAuth>
               <CallSessionProvider>
-                <ChatShell />
+                <AppShell />
               </CallSessionProvider>
             </RequireAuth>
           }
         >
-          <Route index element={<div data-testid="chat-default">Selecione um canal</div>} />
-          <Route path="channel/:id" element={<div data-testid="chat-channel">channel</div>} />
-          <Route path="dm/:id" element={<div data-testid="chat-dm">dm</div>} />
+          <Route path="/chat" element={<ChatShell />}>
+            <Route index element={<div data-testid="chat-default">Selecione um canal</div>} />
+            <Route path="channel/:id" element={<div data-testid="chat-channel">channel</div>} />
+            <Route path="dm/:id" element={<div data-testid="chat-dm">dm</div>} />
+          </Route>
         </Route>
       </Routes>
     </MemoryRouter>,
@@ -1991,18 +1993,19 @@ describe("ChatSidebar — storage safety", () => {
         <Routes>
           <Route path="/login" element={<div>Login page</div>} />
           <Route
-            path="/chat"
             element={
               <RequireAuth>
                 <CallSessionProvider>
-                  <ChatShell />
+                  <AppShell />
                 </CallSessionProvider>
               </RequireAuth>
             }
           >
-            <Route index element={<div>default</div>} />
-            <Route path="channel/:id" element={<div>channel</div>} />
-            <Route path="dm/:id" element={<div>dm</div>} />
+            <Route path="/chat" element={<ChatShell />}>
+              <Route index element={<div>default</div>} />
+              <Route path="channel/:id" element={<div>channel</div>} />
+              <Route path="dm/:id" element={<div>dm</div>} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,

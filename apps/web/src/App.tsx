@@ -11,6 +11,7 @@ import RequireAuth from "./auth/RequireAuth";
 import CallSessionProvider from "./calls/CallSessionProvider";
 import DedicatedCallPage from "./calls/DedicatedCallPage";
 import ResetPasswordPage from "./auth/ResetPasswordPage";
+import AppShell from "./chat/AppShell";
 import ChatPlaceholder from "./chat/ChatPlaceholder";
 import ChatShell from "./chat/ChatShell";
 import ProfilePage from "./profile/ProfilePage";
@@ -53,45 +54,51 @@ export default function App() {
           }
         >
           <Route path="/call/:callId" element={<DedicatedCallPage />} />
-          {/* ── Chat shell (authenticated) ─────────────────────────────── */}
-          <Route path="/chat" element={<ChatShell />}>
-            <Route index element={<ChatPlaceholder />} />
-            <Route
-              path="channel/:id"
-              element={
-                <Suspense fallback={null}>
-                  <ChatMessageArea kind="channel" />
-                </Suspense>
-              }
-            />
-            <Route
-              path="dm/:id"
-              element={
-                <Suspense fallback={null}>
-                  <ChatMessageArea kind="dm" />
-                </Suspense>
-              }
-            />
-            <Route
-              path="favorites"
-              element={
-                <Suspense fallback={null}>
-                  <FavoritesPage />
-                </Suspense>
-              }
-            />
-            <Route
-              path="search"
-              element={
-                <Suspense fallback={null}>
-                  <GlobalSearchPage />
-                </Suspense>
-              }
-            />
-          </Route>
+          {/* ── Shared shell (authenticated): chat sidebar + drawer chrome,
+              common to both /chat/* and /profile/* so navigating between
+              them never tears down and rebuilds the sidebar's
+              WebSocket-backed data hook. ─────────────────────────────── */}
+          <Route element={<AppShell />}>
+            {/* ── Chat shell (authenticated) ───────────────────────────── */}
+            <Route path="/chat" element={<ChatShell />}>
+              <Route index element={<ChatPlaceholder />} />
+              <Route
+                path="channel/:id"
+                element={
+                  <Suspense fallback={null}>
+                    <ChatMessageArea kind="channel" />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="dm/:id"
+                element={
+                  <Suspense fallback={null}>
+                    <ChatMessageArea kind="dm" />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="favorites"
+                element={
+                  <Suspense fallback={null}>
+                    <FavoritesPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                path="search"
+                element={
+                  <Suspense fallback={null}>
+                    <GlobalSearchPage />
+                  </Suspense>
+                }
+              />
+            </Route>
 
-          {/* ── Profile (authenticated) ───────────────────────────────── */}
-          <Route path="/profile" element={<ProfilePage />} />
+            {/* ── Profile (authenticated) ─────────────────────────────── */}
+            <Route path="/profile" element={<ProfilePage />} />
+          </Route>
 
           {/* ── Admin ─────────────────────────────────────────────────── */}
           <Route path="/admin/users" element={<AdminUsersPage />} />

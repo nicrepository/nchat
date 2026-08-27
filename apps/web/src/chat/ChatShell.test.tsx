@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
 import { fetchSidebarData, leaveConversation } from "./chatApi";
-import ChatShell, { ROOT_LOCK_CLASS, type ChatOutletContext } from "./ChatShell";
+import AppShell, { ROOT_LOCK_CLASS } from "./AppShell";
+import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { _resetChatSocket } from "./chatSocket";
 import { requestMediaPermission, type MediaPermissionResult } from "./mediaPermission";
@@ -199,7 +200,11 @@ describe("ChatShell call identity bootstrap", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <CallSessionProvider>
-          <ChatShell />
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/chat" element={<ChatShell />} />
+            </Route>
+          </Routes>
         </CallSessionProvider>
       </MemoryRouter>,
     );
@@ -271,7 +276,11 @@ describe("ChatShell call identity bootstrap", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <CallSessionProvider>
-          <ChatShell />
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/chat" element={<ChatShell />} />
+            </Route>
+          </Routes>
         </CallSessionProvider>
       </MemoryRouter>,
     );
@@ -352,7 +361,11 @@ describe("ChatShell call identity bootstrap", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <CallSessionProvider>
-          <ChatShell />
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route path="/chat" element={<ChatShell />} />
+            </Route>
+          </Routes>
         </CallSessionProvider>
       </MemoryRouter>,
     );
@@ -482,15 +495,17 @@ async function renderWithJoinButtonReady() {
   render(
     <MemoryRouter initialEntries={["/chat"]}>
       <Routes>
-        <Route
-          path="/chat"
-          element={
-            <CallSessionProvider>
-              <ChatShell />
-            </CallSessionProvider>
-          }
-        >
-          <Route index element={<JoinChannelButton />} />
+        <Route element={<AppShell />}>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route index element={<JoinChannelButton />} />
+          </Route>
         </Route>
       </Routes>
     </MemoryRouter>,
@@ -1156,6 +1171,7 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
     });
 
     const { default: ChatShellFresh } = await import("./ChatShell");
+    const { default: AppShellFresh } = await import("./AppShell");
 
     function LeaveProbe() {
       const ctx = useOutletContext<ChatOutletContext>();
@@ -1169,8 +1185,10 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <Routes>
-          <Route path="/chat" element={<ChatShellFresh />}>
-            <Route index element={<LeaveProbe />} />
+          <Route element={<AppShellFresh />}>
+            <Route path="/chat" element={<ChatShellFresh />}>
+              <Route index element={<LeaveProbe />} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,
@@ -1263,11 +1281,14 @@ describe("ChatShell — #673 directCallSession derivation", () => {
 
   async function renderWithDirectSessionProbe() {
     const { default: ChatShellFresh } = await import("./ChatShell");
+    const { default: AppShellFresh } = await import("./AppShell");
     return render(
       <MemoryRouter initialEntries={["/chat"]}>
         <Routes>
-          <Route path="/chat" element={<ChatShellFresh />}>
-            <Route index element={<DirectSessionProbe />} />
+          <Route element={<AppShellFresh />}>
+            <Route path="/chat" element={<ChatShellFresh />}>
+              <Route index element={<DirectSessionProbe />} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,
@@ -1379,16 +1400,18 @@ describe("ChatShell — leaving the conversation on screen", () => {
     return render(
       <MemoryRouter initialEntries={[path]}>
         <Routes>
-          <Route
-            path="/chat"
-            element={
-              <CallSessionProvider>
-                <ChatShell />
-              </CallSessionProvider>
-            }
-          >
-            <Route index element={<div>vazio</div>} />
-            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route index element={<div>vazio</div>} />
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,
@@ -1484,15 +1507,17 @@ describe("ChatShell — trava de rolagem do documento", () => {
     return render(
       <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
         <Routes>
-          <Route
-            path="/chat"
-            element={
-              <CallSessionProvider>
-                <ChatShell />
-              </CallSessionProvider>
-            }
-          >
-            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,
@@ -1571,16 +1596,18 @@ describe("ChatShell — navegação responsiva", () => {
     return render(
       <MemoryRouter initialEntries={[path]}>
         <Routes>
-          <Route
-            path="/chat"
-            element={
-              <CallSessionProvider>
-                <ChatShell />
-              </CallSessionProvider>
-            }
-          >
-            <Route index element={<div>vazio</div>} />
-            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route index element={<div>vazio</div>} />
+              <Route path="channel/:channelId" element={<div>mensagens</div>} />
+            </Route>
           </Route>
         </Routes>
       </MemoryRouter>,
