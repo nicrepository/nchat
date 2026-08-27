@@ -29,6 +29,7 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
   } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [failed, setFailed] = useState(false);
+  const [downloadState, setDownloadState] = useState<"idle" | "loading" | "failed">("idle");
 
   useEffect(() => closeRef.current?.focus(), []);
   useEffect(() => {
@@ -103,14 +104,25 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
     }
   }
 
+  // Same idle/loading/failed shape as MessageAttachments' own
+  // AttachmentDownloadButton — a failed fetch here used to be a silent
+  // unhandled rejection; it now degrades to a short inline note instead of
+  // leaving the button looking clicked-and-forgotten.
   async function download() {
-    const blob = await fetchAttachmentContent(attachment.id);
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = attachment.filename || "arquivo";
-    anchor.click();
-    URL.revokeObjectURL(url);
+    if (downloadState === "loading") return;
+    setDownloadState("loading");
+    try {
+      const blob = await fetchAttachmentContent(attachment.id);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = attachment.filename || "arquivo";
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setDownloadState("idle");
+    } catch {
+      setDownloadState("failed");
+    }
   }
 
   const titleId = `document-preview-title-${attachment.id}`;
@@ -128,53 +140,87 @@ export default function DocumentPreviewViewer({ attachment, onClose }: Props) {
         <header className="document-preview__header">
           <h2 id={titleId}>{attachment.filename}</h2>
           <div className="document-preview__actions">
-            <button type="button" onClick={() => void download()}>
-              Baixar
+            <button
+              type="button"
+              className="document-preview__action-button"
+              aria-label={`Baixar ${attachment.filename}`}
+              disabled={downloadState === "loading"}
+              onClick={() => void download()}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                download
+              </span>
+              {downloadState === "loading" ? "Baixando…" : "Baixar"}
             </button>
-            <button ref={closeRef} type="button" aria-label="Fechar visualização" onClick={onClose}>
-              Fechar
+            <button
+              ref={closeRef}
+              type="button"
+              className="document-preview__icon-button document-preview__close"
+              aria-label="Fechar visualização"
+              onClick={onClose}
+            >
+              <span className="material-symbols-outlined" aria-hidden="true">
+                close
+              </span>
             </button>
           </div>
         </header>
+        {downloadState === "failed" && (
+          <p className="document-preview__download-error" role="alert">
+            Não foi possível baixar o arquivo.
+          </p>
+        )}
         <div className="document-preview__toolbar">
           {!isSheet && (
             <>
               <button
                 type="button"
+                className="document-preview__icon-button"
                 aria-label="Página anterior"
                 disabled={page <= 1}
                 onClick={() => setPage((value) => value - 1)}
               >
-                ‹
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  chevron_left
+                </span>
               </button>
               <span>{manifest ? `Página ${page} de ${manifest.pageCount}` : "Carregando…"}</span>
               <button
                 type="button"
+                className="document-preview__icon-button"
                 aria-label="Próxima página"
                 disabled={!manifest || page >= manifest.pageCount}
                 onClick={() => setPage((value) => value + 1)}
               >
-                ›
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  chevron_right
+                </span>
               </button>
             </>
           )}
           {isSheet && <span>{manifest ? "Planilha" : "Carregando…"}</span>}
           <button
             type="button"
+            className="document-preview__icon-button"
             aria-label="Reduzir zoom"
             disabled={zoom <= 0.5}
             onClick={() => setZoom((value) => value - 0.25)}
           >
-            −
+            <span className="material-symbols-outlined" aria-hidden="true">
+              zoom_out
+            </span>
           </button>
           <span>{Math.round(zoom * 100)}%</span>
           <button
             type="button"
+            className="document-preview__icon-button"
             aria-label="Aumentar zoom"
             disabled={zoom >= 2}
             onClick={() => setZoom((value) => value + 0.25)}
           >
-            +
+            <span className="material-symbols-outlined" aria-hidden="true">
+              zoom_in
+            </span>
           </button>
         </div>
         <div className="document-preview__canvas">

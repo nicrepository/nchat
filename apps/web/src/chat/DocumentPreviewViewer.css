@@ -43,6 +43,88 @@
   padding: 0.5rem 1rem;
   border-block: 1px solid rgb(0 0 0 / 10%);
 }
+
+/* Icon-only controls (close, pagination, zoom) — a round, borderless button
+   with the same hover/disabled/focus language as AttachmentLightbox's own
+   close button, adapted to this viewer's light theme instead of the
+   lightbox's dark one. */
+.document-preview__icon-button {
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text, #211a29);
+  cursor: pointer;
+}
+
+.document-preview__icon-button .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.document-preview__icon-button:hover:not(:disabled) {
+  background: rgb(0 0 0 / 6%);
+}
+
+.document-preview__icon-button:disabled {
+  color: var(--color-text-muted, #6b6580);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.document-preview__close {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.document-preview__close .material-symbols-outlined {
+  font-size: 22px;
+}
+
+/* Baixar keeps its label — the same icon+text pill MessageAttachments' own
+   Baixar/Visualizar actions use, so the action reads the same wherever it
+   appears in the app. */
+.document-preview__action-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.document-preview__action-button:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.document-preview__action-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.document-preview__action-button .material-symbols-outlined {
+  font-size: 16px;
+}
+
+.document-preview button:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.document-preview__download-error {
+  margin: 0;
+  padding: 0.35rem 1rem 0;
+  color: var(--color-danger-strong, #b91c1c);
+  font-size: 0.8rem;
+}
 .document-preview__canvas {
   flex: 1;
   overflow: auto;
