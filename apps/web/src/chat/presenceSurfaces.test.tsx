@@ -23,6 +23,7 @@ import ChatSidebar from "./ChatSidebar";
 import { _resetChatSocket } from "./chatSocket";
 import type { Channel, ChannelDetails, DMConversation, Message } from "./chatTypes";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import MessageBubble from "./MessageBubble";
 import { _resetPresenceStore } from "./presence";
 import type { ConversationDetailsState } from "./useConversationDetails";
@@ -454,7 +455,9 @@ describe("message bubbles", () => {
           onEditMessage={() => Promise.resolve(message)}
           onEditForbidden={() => {}}
           onDeleteMessage={() => Promise.resolve()}
-          allowedReactionEmojis={[]}
+          emojiUsage={emptyEmojiUsage}
+          onEmojiToneChange={() => {}}
+          currentUserId="me"
           recentReactionEmojis={[]}
           reactionMenuVisible={false}
           onReactionMenuVisibleChange={() => {}}

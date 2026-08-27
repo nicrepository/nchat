@@ -382,6 +382,47 @@ export interface MessageReaction {
   emoji: string;
   count: number;
   reactedByMe: boolean;
+  /**
+   * A bounded prefix of the people behind `count` (issue #496) — enough to name
+   * the two the tooltip spells out, whoever the reader is. The rest are
+   * summarised from `count`, so this is never the whole set.
+   */
+  users: ReactionUser[];
+}
+
+/** The only identity a reaction carries: who, and what to call them. */
+export interface ReactionUser {
+  userId: string;
+  displayName: string;
+}
+
+/**
+ * The named reactors of one aggregate (issue #496), from either transport.
+ *
+ * Defensive because it renders straight into a tooltip other people read: an
+ * entry without both an id and a name is dropped rather than shown as an empty
+ * label, and a server that sends no users at all yields an empty list, which the
+ * formatter reads as "count only".
+ */
+export function parseReactionUsers(value: unknown): ReactionUser[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isReactionUserResponse).map((user) => ({
+    userId: user.user_id,
+    displayName: user.display_name,
+  }));
+}
+
+function isReactionUserResponse(
+  value: unknown,
+): value is { user_id: string; display_name: string } {
+  if (typeof value !== "object" || value === null) return false;
+  const user = value as Record<string, unknown>;
+  return (
+    typeof user.user_id === "string" &&
+    user.user_id !== "" &&
+    typeof user.display_name === "string" &&
+    user.display_name !== ""
+  );
 }
 
 export interface QuotedMessage {

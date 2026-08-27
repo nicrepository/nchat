@@ -130,13 +130,35 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 			       min(created_at) AS first_created_at
 			FROM final_reactions
 			GROUP BY emoji
+		),
+		-- The same prefix of names the list endpoint attaches, computed from the
+		-- post-toggle state so the event that announces a reaction already carries
+		-- who is behind it. A reactor without a display name is counted and left
+		-- unnamed rather than labelled with an id or an address.
+		named AS (
+			SELECT f.emoji, f.user_id, u.display_name,
+			       row_number() OVER (PARTITION BY f.emoji
+			                          ORDER BY f.created_at, f.user_id) AS seq
+			FROM final_reactions f
+			JOIN auth.users u ON u.id = f.user_id
+			WHERE u.display_name <> ''
+		),
+		authors AS (
+			SELECT emoji,
+			       array_agg(user_id::text ORDER BY seq) AS user_ids,
+			       array_agg(display_name ORDER BY seq) AS display_names
+			FROM named
+			WHERE seq <= $5
+			GROUP BY emoji
 		)
 		SELECT a.channel_id, a.dm_id, EXISTS (SELECT 1 FROM inserted),
-		       COALESCE(g.emoji, ''), COALESCE(g.count, 0), COALESCE(g.reacted_by_me, false)
+		       COALESCE(g.emoji, ''), COALESCE(g.count, 0), COALESCE(g.reacted_by_me, false),
+		       COALESCE(au.user_ids, '{}'), COALESCE(au.display_names, '{}')
 		FROM authorized a
 		LEFT JOIN aggregated g ON true
+		LEFT JOIN authors au ON au.emoji = g.emoji
 		ORDER BY g.first_created_at NULLS LAST, g.emoji`,
-		input.WorkspaceID, input.UserID, input.MessageID, input.Emoji)
+		input.WorkspaceID, input.UserID, input.MessageID, input.Emoji, reactionAuthorLimit)
 	if err != nil {
 		return result, fmt.Errorf("toggle authorized reaction: %w", err)
 	}
@@ -145,13 +167,15 @@ func toggleAuthorizedReaction(ctx context.Context, tx pgx.Tx, input ToggleReacti
 	for rows.Next() {
 		found = true
 		var reaction domain.MessageReaction
+		var userIDs, displayNames []string
 		if err := rows.Scan(
 			&result.ChannelID, &result.DMID, &result.Added,
-			&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe,
+			&reaction.Emoji, &reaction.Count, &reaction.ReactedByMe, &userIDs, &displayNames,
 		); err != nil {
 			return ToggleReactionResult{}, fmt.Errorf("scan reaction toggle: %w", err)
 		}
 		if reaction.Emoji != "" {
+			reaction.Users = zipReactionUsers(userIDs, displayNames)
 			result.Reactions = append(result.Reactions, reaction)
 		}
 	}

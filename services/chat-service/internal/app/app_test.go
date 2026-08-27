@@ -873,7 +873,10 @@ func TestReactionHandlerAdapterMapsChannelAndDMUpdates(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &reactionStoreStub{result: tt.result}
-			store.result.Reactions = []domain.MessageReaction{{Emoji: "👍", Count: 2}}
+			store.result.Reactions = []domain.MessageReaction{{
+				Emoji: "👍", Count: 2,
+				Users: []domain.ReactionUser{{UserID: "user-1", DisplayName: "Álvaro Neto"}},
+			}}
 			adapter := reactionHandlerAdapter{service: service.NewReactionService(store)}
 
 			got, err := adapter.ToggleReaction(t.Context(), "workspace-1", "user-1", "message-1", "👍")
@@ -885,6 +888,12 @@ func TestReactionHandlerAdapterMapsChannelAndDMUpdates(t *testing.T) {
 			}
 			if len(got.Reactions) != 1 || got.Reactions[0].Emoji != "👍" || got.Reactions[0].Count != 2 {
 				t.Fatalf("unexpected reactions: %+v", got.Reactions)
+			}
+			// The tooltip's names travel with the event, so no subscriber has to
+			// ask who reacted (issue #496).
+			users := got.Reactions[0].Users
+			if len(users) != 1 || users[0].DisplayName != "Álvaro Neto" || users[0].UserID != "user-1" {
+				t.Fatalf("unexpected reaction authors: %+v", users)
 			}
 			if store.input.WorkspaceID != "workspace-1" || store.input.UserID != "user-1" {
 				t.Fatalf("server identity not forwarded: %+v", store.input)

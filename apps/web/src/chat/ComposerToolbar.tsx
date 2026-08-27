@@ -2,15 +2,30 @@
  * ComposerToolbar — formatting toolbar for the TipTap-based message composer.
  *
  * All format buttons call TipTap editor chain commands; no string insertion.
- * Emoji picker inserts content via editor.chain().insertContent().
- * ponytail: emoji picker has no search (add when requested); GIF/upload are RF-12+.
+ *
+ * The emoji button opens the same picker the reactions use (issue #496). It
+ * used to open a hard-coded panel of twenty emoji, which meant one product with
+ * two different emoji experiences — a searchable Unicode catalog beside a
+ * message, and a fixed grid inside the composer. There is one picker now; only
+ * what happens after a choice differs, and that belongs to the caller.
  *
  * RF-11: all formatting commands are direct Material Symbols buttons.
  *        link/attach/mic: removed — add back when the backing RF lands.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { Editor } from "@tiptap/core";
+
+import { useAnchoredPicker } from "./emoji/useAnchoredPicker";
+import { emptyEmojiUsage, type EmojiUsage } from "./emoji/emojiUsage";
+
+/**
+ * The picker and its catalog stay in the chunk the reactions already load, so
+ * opening it from the composer downloads nothing the conversation has not
+ * needed, and never a second copy.
+ */
+const EmojiPicker = lazy(() => import("./emoji/EmojiPicker"));
 
 // ── Toolbar item descriptors ──────────────────────────────────────────────────
 
@@ -67,33 +82,10 @@ const FORMAT_ITEMS: ToolbarItem[] = [
   },
 ];
 
-// ── Emoji list ─────────────────────────────────────────────────────────────────
-
-// ponytail: 20 frequent emojis; expand to full picker when users request search
-const EMOJIS = [
-  "😀",
-  "😂",
-  "🙏",
-  "👍",
-  "👎",
-  "❤️",
-  "🔥",
-  "✅",
-  "⚠️",
-  "🎉",
-  "💡",
-  "📝",
-  "🚀",
-  "🐛",
-  "💬",
-  "📌",
-  "🔒",
-  "⚡",
-  "🎯",
-  "🌟",
-];
-
 // ── Icons ─────────────────────────────────────────────────────────────────────
+
+/** Stable id so the button's aria-controls can point at the panel. */
+const composerPickerId = "composer-emoji-picker";
 
 const IconEmoji = () => (
   <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 20 }}>
@@ -103,46 +95,94 @@ const IconEmoji = () => (
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
+/**
+ * What the surrounding surface lends the picker: the reader's shared emoji
+ * history, and where a use is recorded. Optional because the inline message
+ * editor has no conversation state to lend — its picker still works, it simply
+ * has no personalised "Recentes".
+ */
+export interface ComposerEmojiOptions {
+  usage: EmojiUsage;
+  onToneChange: (tone: number) => void;
+  /** Records a use, so an emoji typed here reaches the same "Recentes". */
+  onUsed: (emoji: string) => void;
+}
+
 export interface ComposerToolbarProps {
   editor: Editor | null;
   disabled?: boolean;
+  emoji?: ComposerEmojiOptions;
+  /** Controlled open state. Omitted, the toolbar manages its own. */
+  pickerOpen?: boolean;
+  onPickerOpenChange?: (open: boolean) => void;
 }
 
-export default function ComposerToolbar({ editor, disabled = false }: ComposerToolbarProps) {
-  const [emojiOpen, setEmojiOpen] = useState(false);
+const noEmojiUse = () => undefined;
+
+/**
+ * The picker's open state and the usage it reads, whether the caller supplies
+ * them or not.
+ *
+ * The composer controls the state because it has to close the picker on send;
+ * the inline editor has nothing to say about it and gets local state instead.
+ */
+function useComposerEmoji(props: ComposerToolbarProps) {
+  const [localOpen, setLocalOpen] = useState(false);
+  const { pickerOpen, onPickerOpenChange, emoji } = props;
+  return {
+    open: pickerOpen ?? localOpen,
+    setOpen: onPickerOpenChange ?? setLocalOpen,
+    usage: emoji?.usage ?? emptyEmojiUsage,
+    onToneChange: emoji?.onToneChange ?? noEmojiUse,
+    onUsed: emoji?.onUsed ?? noEmojiUse,
+  };
+}
+
+export default function ComposerToolbar(props: ComposerToolbarProps) {
+  const { editor, disabled = false } = props;
+  const { open, setOpen, usage, onToneChange, onUsed } = useComposerEmoji(props);
   const containerRef = useRef<HTMLDivElement>(null);
   const emojiBtnRef = useRef<HTMLButtonElement>(null);
-  const firstEmojiRef = useRef<HTMLButtonElement>(null);
 
-  // Close panels on outside click.
-  useEffect(() => {
-    const onDown = (ev: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(ev.target as Node)) {
-        setEmojiOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, []);
+  /**
+   * Escape and the button itself hand focus back to the editor, so the reader
+   * carries on typing where they left off (issue #493). A click elsewhere does
+   * not: focus belongs wherever that click put it.
+   */
+  const closeEmoji = useCallback(
+    (restoreFocus: boolean) => {
+      setOpen(false);
+      if (restoreFocus) editor?.chain().focus().run();
+    },
+    [editor, setOpen],
+  );
 
-  useLayoutEffect(() => {
-    if (emojiOpen) firstEmojiRef.current?.focus();
-  }, [emojiOpen]);
+  const pickerRef = useAnchoredPicker({
+    open,
+    anchorRef: emojiBtnRef,
+    onDismiss: closeEmoji,
+    containerRef,
+    align: "start",
+  });
 
   function handleFormat(item: ToolbarItem) {
     if (editor) item.run(editor);
-    setEmojiOpen(false);
+    setOpen(false);
   }
 
+  /**
+   * Inserts the emoji where the cursor is, and leaves the picker open.
+   *
+   * TipTap keeps its own selection while the DOM focus is on the picker, so
+   * insertContent lands at the caret — replacing a selection exactly as typing
+   * would — without this having to save and restore anything. Focus is
+   * deliberately not pulled back to the editor: the reader is in the picker, and
+   * a messenger lets them pick 😂❤️🚀 without reopening it three times.
+   */
   function handleEmoji(emoji: string) {
-    editor?.chain().focus().insertContent(emoji).run();
-    setEmojiOpen(false);
+    editor?.chain().insertContent(emoji).run();
+    onUsed(emoji);
   }
-
-  const closeEmoji = () => {
-    setEmojiOpen(false);
-    emojiBtnRef.current?.focus();
-  };
 
   return (
     <div className="composer-toolbar" ref={containerRef}>
@@ -174,40 +214,41 @@ export default function ComposerToolbar({ editor, disabled = false }: ComposerTo
           className="composer-toolbar__btn"
           aria-label="Inserir emoji"
           aria-haspopup="dialog"
-          aria-expanded={emojiOpen}
+          aria-expanded={open}
+          aria-controls={open ? composerPickerId : undefined}
           disabled={disabled}
           data-testid="toolbar-emoji-btn"
-          onClick={() => {
-            setEmojiOpen((o) => !o);
-          }}
+          onClick={() => (open ? closeEmoji(true) : setOpen(true))}
         >
           <IconEmoji />
         </button>
 
-        {emojiOpen && (
-          <div
-            role="dialog"
-            aria-label="Seletor de emoji"
-            className="composer-toolbar__emoji-picker"
-            data-testid="toolbar-emoji-picker"
-            onKeyDown={(ev) => {
-              if (ev.key === "Escape") closeEmoji();
-            }}
-          >
-            {EMOJIS.map((emoji, i) => (
-              <button
-                key={emoji}
-                ref={i === 0 ? firstEmojiRef : undefined}
-                type="button"
-                className="composer-toolbar__emoji-btn"
-                aria-label={emoji}
-                onClick={() => handleEmoji(emoji)}
+        {open &&
+          createPortal(
+            <div
+              ref={pickerRef}
+              id={composerPickerId}
+              // Portalled out of the composer so the picker is never clipped by
+              // it, and carrying the chat scope with it — see the reaction
+              // picker's own container for why the theme class travels.
+              className="chat-theme chat-emoji-surface"
+              role="dialog"
+              aria-label="Inserir emoji"
+              data-testid="toolbar-emoji-picker"
+              style={{ visibility: "hidden" }}
+            >
+              <Suspense
+                fallback={
+                  <p className="chat-emoji-picker__status" role="status">
+                    Carregando emojis…
+                  </p>
+                }
               >
-                {emoji}
-              </button>
-            ))}
-          </div>
-        )}
+                <EmojiPicker usage={usage} onToneChange={onToneChange} onSelect={handleEmoji} />
+              </Suspense>
+            </div>,
+            document.body,
+          )}
       </div>
     </div>
   );

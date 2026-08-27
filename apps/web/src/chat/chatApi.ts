@@ -18,6 +18,7 @@ import {
   normalizeLinkSafety,
   parseDMConversationType,
   parseMessageAttachments,
+  parseReactionUsers,
   type AddMembersResult,
   type Channel,
   type ChannelCategory,
@@ -857,7 +858,13 @@ interface MessageResponse {
   edited_at?: string | null;
   edit_count?: number;
   is_edited?: boolean;
-  reactions?: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
+  reactions?: Array<{
+    emoji: string;
+    count: number;
+    reacted_by_me: boolean;
+    /** Absent on a pre-#496 server; the tooltip then names only the reader. */
+    users?: Array<{ user_id?: unknown; display_name?: unknown }>;
+  }>;
   is_favorited?: boolean;
   /** Current servers always send this; optionality accepts pre-RF-08 responses. */
   is_forwarded?: unknown;
@@ -1041,49 +1048,93 @@ function mapConversationEvent(r: MessageResponse): {
   };
 }
 
-function mapMessage(r: MessageResponse): Message {
-  const isRemoved = r.is_removed === true || r.status === "deleted" || Boolean(r.deleted_at);
+/**
+ * RF-21: a message the backend is withholding pending a link scan reports itself
+ * as such, so the composer can say it is being checked instead of pretending it
+ * was delivered. Any other value collapses to "active", so an unknown status can
+ * never be rendered as a state this client invented.
+ */
+function messageStatus(status: unknown, isRemoved: boolean): Message["status"] {
+  if (isRemoved) return "deleted";
+  return status === "pending_link_scan" ? "pending_link_scan" : "active";
+}
+
+/** Who wrote a message, as the list endpoints report them. */
+function mapMessageAuthor(
+  r: MessageResponse,
+): Pick<Message, "senderId" | "senderDisplayName" | "senderEmail" | "senderAvatarUrl"> {
   return {
-    id: r.id,
     senderId: r.sender_id,
     senderDisplayName: r.sender_display_name ?? "",
     senderEmail: r.sender_email ?? "",
     senderAvatarUrl: safeAvatarUrl(r.sender_avatar_url),
-    kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
-    ...mapConversationEvent(r),
-    bodyText: isRemoved ? "" : (r.body_text ?? ""),
-    bodyFormat: normalizeBodyFormat(r.body_format),
-    isRemoved,
-    // RF-21: a message the backend is withholding pending a link scan reports
-    // itself as such, so the composer can say it is being checked instead of
-    // pretending it was delivered. Any other value collapses to "active", so an
-    // unknown status can never be rendered as a state this client invented.
-    status: isRemoved
-      ? "deleted"
-      : r.status === "pending_link_scan"
-        ? "pending_link_scan"
-        : "active",
-    // RF-21 link safety (issue #135), a separate axis from `status`: an active
-    // message may carry links the provider could not produce a verdict for. A
-    // removed message reports nothing, exactly as its body and quote do not.
-    linkSafetyState: isRemoved ? "" : normalizeLinkSafety(r.link_safety_state),
-    deletedAt: r.deleted_at ?? null,
+  };
+}
+
+/** Timestamps and the edit counters derived from them. */
+function mapMessageTimestamps(
+  r: MessageResponse,
+): Pick<Message, "createdAt" | "updatedAt" | "deletedAt" | "isEdited" | "editCount" | "editedAt"> {
+  const editCount = r.edit_count ?? 0;
+  return {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
-    isEdited: r.is_edited ?? (r.edit_count ?? 0) > 0,
-    editCount: r.edit_count ?? 0,
+    deletedAt: r.deleted_at ?? null,
+    isEdited: r.is_edited ?? editCount > 0,
+    editCount,
     editedAt: r.edited_at ?? undefined,
-    reactions: (r.reactions ?? []).map((reaction) => ({
-      emoji: reaction.emoji,
-      count: reaction.count,
-      reactedByMe: reaction.reacted_by_me,
-    })),
+  };
+}
+
+/**
+ * The body and the two axes that decide what may be shown of it.
+ *
+ * RF-21 link safety (issue #135) is a separate axis from `status`: an active
+ * message may carry links the provider could not produce a verdict for. A
+ * removed message reports neither — it has no body, no verdict, no quote.
+ */
+function mapMessageBody(
+  r: MessageResponse,
+  isRemoved: boolean,
+): Pick<Message, "bodyText" | "bodyFormat" | "status" | "linkSafetyState"> {
+  return {
+    bodyText: isRemoved ? "" : (r.body_text ?? ""),
+    bodyFormat: normalizeBodyFormat(r.body_format),
+    status: messageStatus(r.status, isRemoved),
+    linkSafetyState: isRemoved ? "" : normalizeLinkSafety(r.link_safety_state),
+  };
+}
+
+/**
+ * Everything a removed message deliberately does not describe: its quote, its
+ * cross-target reference and its attachments.
+ */
+function mapMessageContext(
+  r: MessageResponse,
+  isRemoved: boolean,
+): Pick<Message, "quoted" | "reference" | "attachments"> {
+  if (isRemoved) return { quoted: undefined, reference: undefined, attachments: undefined };
+  return {
+    quoted: r.quoted ? mapQuote(r.quoted) : undefined,
+    reference: r.reference ? mapReference(r.reference) : undefined,
+    attachments: parseMessageAttachments(r.attachments),
+  };
+}
+
+function mapMessage(r: MessageResponse): Message {
+  const isRemoved = r.is_removed === true || r.status === "deleted" || Boolean(r.deleted_at);
+  return {
+    id: r.id,
+    kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
+    ...mapMessageAuthor(r),
+    ...mapConversationEvent(r),
+    ...mapMessageBody(r, isRemoved),
+    ...mapMessageTimestamps(r),
+    ...mapMessageContext(r, isRemoved),
+    isRemoved,
+    reactions: mapReactions(r.reactions),
     isFavorited: r.is_favorited ?? false,
     isForwarded: r.is_forwarded === true,
-    quoted: !isRemoved && r.quoted ? mapQuote(r.quoted) : undefined,
-    reference: !isRemoved && r.reference ? mapReference(r.reference) : undefined,
-    // A removed message describes nothing, exactly as its body and quote do not.
-    attachments: isRemoved ? undefined : parseMessageAttachments(r.attachments),
   };
 }
 
@@ -1104,6 +1155,19 @@ function mapMessageEditError(error: unknown): never {
     if (reason) throw new MessageEditError(error.status, reason, error.message);
   }
   throw error;
+}
+
+/**
+ * One aggregate per emoji, with the bounded prefix of names the tooltip renders
+ * (issue #496). A server that sends no reactions at all yields an empty list.
+ */
+function mapReactions(reactions: MessageResponse["reactions"]): Message["reactions"] {
+  return (reactions ?? []).map((reaction) => ({
+    emoji: reaction.emoji,
+    count: reaction.count,
+    reactedByMe: reaction.reacted_by_me,
+    users: parseReactionUsers(reaction.users),
+  }));
 }
 
 function mapQuote(r: QuoteResponse): Message["quoted"] {
