@@ -31,6 +31,24 @@ func TestLiveKitConfigurationValidWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestLiveKitConfigurationValidatesEnvironment(t *testing.T) {
+	for _, environment := range []string{"", " ", ":", "prod:evil", "PROD", strings.Repeat("a", 33)} {
+		cfg := validLiveKitConfig()
+		cfg.Env = environment
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected APP_ENV %q to fail", environment)
+		}
+	}
+}
+
+func TestLoadTrimsLiveKitEnvironment(t *testing.T) {
+	t.Setenv("APP_ENV", " production \n")
+	cfg := Load()
+	if cfg.Env != "production" {
+		t.Fatalf("expected trimmed APP_ENV, got %q", cfg.Env)
+	}
+}
+
 func TestLiveKitConfigurationAcceptsSecureWebSocketURL(t *testing.T) {
 	cfg := validLiveKitConfig()
 	cfg.LiveKitAPIURL = "wss://livekit-dev.nic-labs.com"

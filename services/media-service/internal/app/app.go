@@ -11,6 +11,7 @@ import (
 	platformlog "github.com/nicrepository/nchat/libs/go/platform/log"
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/media-service/internal/config"
+	"github.com/nicrepository/nchat/services/media-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/media-service/internal/http"
 	"github.com/nicrepository/nchat/services/media-service/internal/service"
 	"github.com/nicrepository/nchat/services/media-service/internal/storage"
@@ -62,7 +63,12 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 			return nil, err
 		}
 		clock := time.Now
-		signer, err := service.NewLiveKitTokenSigner(cfg.LiveKitAPIKey, cfg.LiveKitAPISecret, clock)
+		environment, err := domain.ParseEnvironment(cfg.Env)
+		if err != nil {
+			_ = shutdownTracing(shutdown)
+			return nil, err
+		}
+		signer, err := service.NewLiveKitTokenSigner(environment, cfg.LiveKitAPIKey, cfg.LiveKitAPISecret, clock)
 		if err != nil {
 			_ = shutdownTracing(shutdown)
 			return nil, err
@@ -84,6 +90,7 @@ func newApp(cfg config.Config, deps appDependencies) (*App, error) {
 			TokenIssuer: service.NewTokenService(
 				storage.NewPGXResourceAuthorizer(pool),
 				signer,
+				environment,
 				time.Duration(cfg.LiveKitTokenTTLSeconds)*time.Second,
 				clock,
 			),
