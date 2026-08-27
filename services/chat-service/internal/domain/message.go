@@ -214,7 +214,12 @@ type Message struct {
 	// Populated by list queries that JOIN auth.users; empty for create results.
 	SenderDisplayName string
 	SenderEmail       string
-	Reactions         []MessageReaction
+	// SenderAvatarURL is the sender's auth.users.avatar_url, projected through
+	// the same JOIN as SenderDisplayName/SenderEmail. Empty when unset — never
+	// defaulted or fetched from elsewhere, so a message says nothing about an
+	// avatar the sender never configured.
+	SenderAvatarURL string
+	Reactions       []MessageReaction
 
 	// IsFavorited reports whether the requesting user favorited this message.
 	// Always scoped to the caller — never exposes other users' favorites.
@@ -366,4 +371,18 @@ type MessageReaction struct {
 	Emoji       string
 	Count       int
 	ReactedByMe bool
+	// Users names the first few people behind Count, so a client can say who
+	// reacted without asking again per badge or per hover (issue #496). It is
+	// deliberately a prefix, not the whole set: the tooltip shows two names and
+	// summarises the rest from Count, so carrying more would be payload nobody
+	// renders.
+	Users []ReactionUser
+}
+
+// ReactionUser is the minimum identity a reaction tooltip needs: who it is, and
+// what to call them. No email, no username, no profile — a viewer already
+// authorized to read the message learns a name they can already see on it.
+type ReactionUser struct {
+	UserID      string
+	DisplayName string
 }

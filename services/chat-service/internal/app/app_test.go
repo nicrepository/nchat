@@ -538,6 +538,25 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	}
 }
 
+// TestDomainMessageToWSPayloadCarriesSenderAvatarURL guards the issue #495
+// fix: message.created must carry the same sender avatar the HTTP history
+// endpoint does, so a subscriber's timeline and a fresh page load never
+// disagree about whether a sender has one.
+func TestDomainMessageToWSPayloadCarriesSenderAvatarURL(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		SenderID: "user-1", SenderAvatarURL: "/avatars/user-1.png",
+	})
+	if got.SenderAvatarURL != "/avatars/user-1.png" {
+		t.Fatalf("sender avatar url not mapped: %+v", got)
+	}
+
+	withoutAvatar := domainMessageToWSPayload(domain.Message{ID: "message-2", SenderID: "user-2"})
+	if withoutAvatar.SenderAvatarURL != "" {
+		t.Fatalf("sender without an avatar must not get one invented: %+v", withoutAvatar)
+	}
+}
+
 func TestDomainMessageToWSUpdatedPayloadWithholdsDeletedBody(t *testing.T) {
 	now := time.Now().UTC()
 	got := domainMessageToWSUpdatedPayload(domain.Message{
@@ -854,7 +873,10 @@ func TestReactionHandlerAdapterMapsChannelAndDMUpdates(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &reactionStoreStub{result: tt.result}
-			store.result.Reactions = []domain.MessageReaction{{Emoji: "👍", Count: 2}}
+			store.result.Reactions = []domain.MessageReaction{{
+				Emoji: "👍", Count: 2,
+				Users: []domain.ReactionUser{{UserID: "user-1", DisplayName: "Álvaro Neto"}},
+			}}
 			adapter := reactionHandlerAdapter{service: service.NewReactionService(store)}
 
 			got, err := adapter.ToggleReaction(t.Context(), "workspace-1", "user-1", "message-1", "👍")
@@ -866,6 +888,12 @@ func TestReactionHandlerAdapterMapsChannelAndDMUpdates(t *testing.T) {
 			}
 			if len(got.Reactions) != 1 || got.Reactions[0].Emoji != "👍" || got.Reactions[0].Count != 2 {
 				t.Fatalf("unexpected reactions: %+v", got.Reactions)
+			}
+			// The tooltip's names travel with the event, so no subscriber has to
+			// ask who reacted (issue #496).
+			users := got.Reactions[0].Users
+			if len(users) != 1 || users[0].DisplayName != "Álvaro Neto" || users[0].UserID != "user-1" {
+				t.Fatalf("unexpected reaction authors: %+v", users)
 			}
 			if store.input.WorkspaceID != "workspace-1" || store.input.UserID != "user-1" {
 				t.Fatalf("server identity not forwarded: %+v", store.input)

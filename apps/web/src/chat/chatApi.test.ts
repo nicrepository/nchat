@@ -1407,6 +1407,31 @@ describe("fetchChannelMessages", () => {
     });
   });
 
+  // Issue #495: the same auth.users JOIN that already resolves display name
+  // and email now also resolves an avatar, and it must reach the mapped
+  // Message under the same same-origin policy as every other avatarUrl.
+  it("maps a same-origin sender avatar URL", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "/media/avatars/user-abc.png" })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBe("/media/avatars/user-abc.png");
+  });
+
+  it("drops a sender avatar URL that is not a safe same-origin target", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "https://evil.test/tracker.png" })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
+  it("leaves senderAvatarUrl undefined when the field is absent (pre-#495 server)", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
   it("maps the server-derived forwarding marker", async () => {
     mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ is_forwarded: true })]));
     const page = await fetchChannelMessages("geral");
@@ -1427,12 +1452,60 @@ describe("fetchChannelMessages", () => {
     if (_case === "missing") expect(page.messages[0].bodyText).toBe("");
   });
 
-  it("maps reaction aggregates", async () => {
+  it("maps reaction aggregates with their named authors", async () => {
     mockAuthFetch.mockResolvedValue(
-      msgListEnvelope([msgRaw({ reactions: [{ emoji: "👍", count: 2, reacted_by_me: true }] })]),
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            {
+              emoji: "👍",
+              count: 2,
+              reacted_by_me: true,
+              users: [{ user_id: "u-1", display_name: "Álvaro Neto" }],
+            },
+          ],
+        }),
+      ]),
     );
     const page = await fetchChannelMessages("geral");
-    expect(page.messages[0].reactions).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+    expect(page.messages[0].reactions).toEqual([
+      {
+        emoji: "👍",
+        count: 2,
+        reactedByMe: true,
+        users: [{ userId: "u-1", displayName: "Álvaro Neto" }],
+      },
+    ]);
+  });
+
+  // A pre-#496 server sends no authors at all, and a malformed entry must not
+  // reach a tooltip as an empty name.
+  it("tolerates missing or malformed reaction authors", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            { emoji: "👍", count: 1, reacted_by_me: false },
+            {
+              emoji: "🎉",
+              count: 3,
+              reacted_by_me: false,
+              users: [
+                { user_id: "u-1", display_name: "" },
+                { user_id: 7, display_name: "Caio" },
+                "nope",
+                { user_id: "u-2", display_name: "Caio Almeida" },
+              ],
+            },
+          ],
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions[0].users).toEqual([]);
+    expect(page.messages[0].reactions[1].users).toEqual([
+      { userId: "u-2", displayName: "Caio Almeida" },
+    ]);
   });
 
   it("maps inline quoted message previews", async () => {
@@ -1850,6 +1923,32 @@ describe("fetchDMMessages", () => {
     const page = await fetchDMMessages("dm-juliane");
     expect(page.messages).toEqual([]);
     expect(page.nextCursor).toBe("");
+  });
+
+  // Issue #495: group DMs and 1:1 DMs both list through fetchDMMessages —
+  // there is no per-conversation-type mapping to duplicate this for, so one
+  // set of tests covers both, mirroring the fetchChannelMessages coverage
+  // above (mapMessage/safeAvatarUrl are shared, not reimplemented here).
+  it("maps a same-origin sender avatar URL", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "/media/avatars/user-abc.png" })]),
+    );
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBe("/media/avatars/user-abc.png");
+  });
+
+  it("leaves senderAvatarUrl undefined when the field is absent (pre-#495 server)", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
+  it("drops a sender avatar URL that is not a safe same-origin target", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "https://evil.test/tracker.png" })]),
+    );
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
   });
 });
 

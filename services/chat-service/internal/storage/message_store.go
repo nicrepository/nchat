@@ -568,6 +568,7 @@ func listMessageColumns(alias, userParam string) string {
 	return messageColumns(alias) + `,
 	COALESCE(u.display_name, ''),
 	COALESCE(u.email::text, ''),
+	COALESCE(u.avatar_url, ''),
 	EXISTS (
 		SELECT 1 FROM chat.message_favorites mf
 		WHERE mf.message_id = ` + alias + `.id AND mf.user_id = ` + userParam + `::uuid
@@ -623,7 +624,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&msg.CreatedAt, &msg.UpdatedAt,
 		(*string)(&msg.LinkSafety),
 		&msg.EventType, &eventPayload,
-		&msg.SenderDisplayName, &msg.SenderEmail,
+		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
 		&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
@@ -1968,6 +1969,15 @@ func (s *PGXMessageStore) ListDMMessages(ctx context.Context, input ListDMMessag
 	return result, nil
 }
 
+// reactionAuthorLimit is how many names travel with each reaction aggregate.
+//
+// The tooltip renders at most two entries and summarises the rest from the
+// count, and one of those two may be "Você" — so three is the smallest prefix
+// that always fills the tooltip whoever the viewer is. Sending the whole set
+// would be payload nobody renders, and would grow without bound on a popular
+// message.
+const reactionAuthorLimit = 3
+
 func (s *PGXMessageStore) loadReactionBatch(ctx context.Context, messages []domain.Message, userID string) error {
 	if len(messages) == 0 {
 		return nil
@@ -1979,21 +1989,15 @@ func (s *PGXMessageStore) loadReactionBatch(ctx context.Context, messages []doma
 		byID[messages[i].ID] = i
 		messages[i].Reactions = []domain.MessageReaction{}
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT message_id::text, emoji, count(*)::int, bool_or(user_id = $2)
-		FROM chat.message_reactions
-		WHERE message_id = ANY($1::uuid[])
-		GROUP BY message_id, emoji
-		ORDER BY message_id, min(created_at), emoji`, ids, userID)
+	rows, err := s.pool.Query(ctx, reactionBatchQuery, ids, userID, reactionAuthorLimit)
 	if err != nil {
 		return fmt.Errorf("load message reactions: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var messageID string
-		var reaction domain.MessageReaction
-		if err := rows.Scan(&messageID, &reaction.Emoji, &reaction.Count, &reaction.ReactedByMe); err != nil {
-			return fmt.Errorf("scan message reaction: %w", err)
+		messageID, reaction, err := scanMessageReaction(rows)
+		if err != nil {
+			return err
 		}
 		if i, ok := byID[messageID]; ok {
 			messages[i].Reactions = append(messages[i].Reactions, reaction)
@@ -2003,6 +2007,77 @@ func (s *PGXMessageStore) loadReactionBatch(ctx context.Context, messages []doma
 		return fmt.Errorf("iterate message reactions: %w", err)
 	}
 	return nil
+}
+
+// reactionBatchQuery aggregates a whole page of messages in one statement
+// (never one per message, and never one per reacting user): counts, whether the
+// reader is among them, and the first few display names behind each emoji.
+//
+// Authorization is the caller's: this runs only over message IDs the outer list
+// query already resolved for this reader, so it can add no reach of its own. A
+// user with no display name is left out of the names but still counted, which
+// is what keeps "e mais N" arithmetic honest without inventing a label.
+const reactionBatchQuery = `
+	WITH scoped AS (
+		SELECT message_id, emoji, user_id, created_at
+		FROM chat.message_reactions
+		WHERE message_id = ANY($1::uuid[])
+	),
+	totals AS (
+		SELECT message_id, emoji, count(*)::int AS count,
+		       bool_or(user_id = $2) AS reacted_by_me, min(created_at) AS first_created_at
+		FROM scoped
+		GROUP BY message_id, emoji
+	),
+	named AS (
+		SELECT s.message_id, s.emoji, s.user_id, u.display_name,
+		       row_number() OVER (PARTITION BY s.message_id, s.emoji
+		                          ORDER BY s.created_at, s.user_id) AS seq
+		FROM scoped s
+		JOIN auth.users u ON u.id = s.user_id
+		WHERE u.display_name <> ''
+	),
+	authors AS (
+		SELECT message_id, emoji,
+		       array_agg(user_id::text ORDER BY seq) AS user_ids,
+		       array_agg(display_name ORDER BY seq) AS display_names
+		FROM named
+		WHERE seq <= $3
+		GROUP BY message_id, emoji
+	)
+	SELECT t.message_id::text, t.emoji, t.count, t.reacted_by_me,
+	       COALESCE(a.user_ids, '{}'), COALESCE(a.display_names, '{}')
+	FROM totals t
+	LEFT JOIN authors a ON a.message_id = t.message_id AND a.emoji = t.emoji
+	ORDER BY t.message_id, t.first_created_at, t.emoji`
+
+func scanMessageReaction(rows pgx.Rows) (string, domain.MessageReaction, error) {
+	var messageID string
+	var reaction domain.MessageReaction
+	var userIDs, displayNames []string
+	if err := rows.Scan(
+		&messageID, &reaction.Emoji, &reaction.Count, &reaction.ReactedByMe, &userIDs, &displayNames,
+	); err != nil {
+		return "", domain.MessageReaction{}, fmt.Errorf("scan message reaction: %w", err)
+	}
+	reaction.Users = zipReactionUsers(userIDs, displayNames)
+	return messageID, reaction, nil
+}
+
+// zipReactionUsers pairs the two parallel arrays the aggregate returns. They are
+// produced by one array_agg pass each over the same ordered rows, so a length
+// mismatch is impossible in practice; the shorter bound is taken anyway so a
+// surprise truncates instead of panicking mid-page.
+func zipReactionUsers(userIDs, displayNames []string) []domain.ReactionUser {
+	size := min(len(userIDs), len(displayNames))
+	if size == 0 {
+		return nil
+	}
+	users := make([]domain.ReactionUser, size)
+	for i := range size {
+		users[i] = domain.ReactionUser{UserID: userIDs[i], DisplayName: displayNames[i]}
+	}
+	return users
 }
 
 // loadAttachmentBatch fills Attachments for a whole page in one query (RF-32).
@@ -2126,7 +2201,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.EventType, &eventPayload,
 		}
 		if withSender {
-			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
+			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL, &msg.IsFavorited)
 			dest = append(dest,
 				&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
 				&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),

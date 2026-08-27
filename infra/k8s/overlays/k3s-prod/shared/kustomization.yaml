@@ -10,10 +10,12 @@ kind: Kustomization
 # "Blue and Green differ only by image" true by construction rather than by
 # discipline.
 #
-# The stateful layer — PostgreSQL, Valkey, SeaweedFS, Keycloak, LiveKit and
-# coturn — is a prerequisite of this namespace, not a resource of it. Blue and
-# Green share one of each; see docs/runbooks/production-blue-green-deployment.md
-# for what must exist before the first apply.
+# The stateful layer — PostgreSQL, Valkey, SeaweedFS and Keycloak — is a
+# prerequisite of this namespace, not a resource of it. Blue and Green share one
+# of each; see docs/runbooks/production-blue-green-deployment.md for what must
+# exist before the first apply. The media plane is NOT in that list and not in
+# this cluster: LiveKit runs as one shared AWS deployment that nchat-dev already
+# uses, reached over 443 by media-service and dialled directly by the browser.
 namespace: nchat-prod
 components:
   # The same least-privilege posture nchat-dev runs, not a second set written
@@ -130,6 +132,32 @@ patches:
       - op: add
         path: /spec/selector/nchat.io~1release-slot
         value: blue
+  # The avatar claim's backing volume, named explicitly.
+  #
+  # base leaves storageClassName unset, which in this cluster means the default
+  # class: local-path, on the root disk, with reclaimPolicy Delete. That is the
+  # right default for a scratch environment and the wrong one for production —
+  # deleting the claim would delete every user's avatar, and the root disk is
+  # not where this deployment's data lives.
+  #
+  # Naming the volume binds it to nchat-prod-auth-avatars from
+  # ../stateful/storage.yaml: the same retained HDD as PostgreSQL, SeaweedFS and
+  # Valkey. It is still one claim shared by both slots — the slot build deletes
+  # its copy precisely so that an avatar uploaded on Blue survives the cutover.
+  #
+  # This is the one place the shared half depends on the stateful half having
+  # been applied first. Without the PersistentVolume the claim stays Pending and
+  # auth-service does not start, which is a loud failure and the intended one.
+  - target:
+      kind: PersistentVolumeClaim
+      name: auth-service-avatars
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: local-hdd-geral
+      - op: add
+        path: /spec/volumeName
+        value: nchat-prod-auth-avatars
   - path: configmap-patch.yaml
   - path: quota-patch.yaml
   - target:
@@ -294,6 +322,21 @@ replacements:
           name: nchat-config
         fieldPaths:
           - data.AUTH_PUBLIC_WEB_BASE_URL
+  # The external media plane's address, taken whole from topology rather than
+  # assembled from the application host: LiveKit is NOT behind this deployment's
+  # gateway, so nothing about its URL can be derived from NCHAT_PROD_HOST. It is
+  # the AWS deployment nchat-dev already uses, and media-service both dials it
+  # and hands it to the browser unchanged.
+  - source:
+      kind: ConfigMap
+      name: nchat-prod-topology
+      fieldPath: data.NCHAT_PROD_LIVEKIT_URL
+    targets:
+      - select:
+          kind: ConfigMap
+          name: nchat-config
+        fieldPaths:
+          - data.LIVEKIT_API_URL
   - source:
       kind: ConfigMap
       name: nchat-prod-topology

@@ -1,0 +1,87 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The stateful layer nchat-prod is built on: PostgreSQL, Valkey and SeaweedFS.
+#
+# ## What is NOT here: the media plane
+#
+# The media plane is not production infrastructure. One LiveKit deployment runs
+# on AWS, outside this cluster, and nchat-dev already uses it; nchat-prod uses
+# the same one. Nothing about it is provisioned, scheduled or port-mapped by
+# this repository -- media-service reaches it over 443 with the credentials in
+# nchat-secrets, and the browser dials it directly. See
+# docs/runbooks/production-blue-green-deployment.md#3b for the operator-side
+# prerequisites, and scripts/ci/prod-stateful-check.sh, which fails if a media
+# workload is ever added to this layer. coturn is named in that gate's
+# forbidden list too: production must not grow a local TURN server either,
+# whatever the AWS deployment turns out to run.
+#
+# ## Why this is not a resource of ../kustomization.yaml
+#
+# Production is applied in pieces because the pieces have different lifetimes.
+# ../shared changes when the platform does, ../slots/<slot> and ../migrations
+# change on every release — and this one should change almost never. Wiring it
+# into the composed picture would put a `kubectl apply` over the database in the
+# blast radius of an ordinary platform change, and that is the one operation
+# nobody should be able to perform by accident.
+#
+# So it is applied by its own command, scripts/deploy/nchat-prod/stateful.sh,
+# which validates before it writes and never deletes a volume. The operational
+# order is:
+#
+#   stateful  ->  shared  ->  migrations  ->  blue
+#
+# bootstrap.sh checks the Services this layer publishes and refuses to run
+# without them, so the ordering is enforced by the tooling, not only documented.
+#
+# ## What must exist first
+#
+# The four host directories the PersistentVolumes point at, and these Secrets,
+# none of which this repository contains or creates:
+#
+#   nchat-secrets            VALKEY_PASSWORD
+#   nchat-postgres-admin     the superuser postgres-bootstrap connects as
+#   nchat-postgres-runtime   POSTGRES_APP_PASSWORD, for the nchat_app role
+#   nchat-postgres-migrator  POSTGRES_MIGRATOR_PASSWORD, for the nchat_migrator role
+#
+# ## What is deliberately absent
+#
+# NetworkPolicies. ../shared already applies
+# components/least-privilege-network-policies, whose rules select on
+# app.kubernetes.io/component — postgres, valkey, seaweedfs — and policies are
+# namespace-scoped and match pods, not the Kustomization that created them. The
+# workloads below carry exactly those component labels, so they inherit the same
+# least-privilege posture nchat-dev runs, and a second copy written here could
+# only ever drift from it.
+namespace: nchat-prod
+resources:
+  - storage.yaml
+  - data.yaml
+  - postgres-bootstrap-job.yaml
+configMapGenerator:
+  - name: postgres-bootstrap
+    files:
+      - postgres-bootstrap.sh
+generatorOptions:
+  disableNameSuffixHash: true
+# Digest-pinned, and the same digests nchat-dev runs. A tag alone would let the
+# database's binary change under a `kubectl rollout restart`; these three are the
+# processes that own the data, so "the same bytes as last time" is the property
+# that matters most about them.
+images:
+  - name: postgres
+    newTag: 16.10-alpine
+    digest: sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+  - name: valkey/valkey
+    newTag: 8.1.3-alpine
+    digest: sha256:d827e7f7552cdee40cc7482dbae9da020f42bc47669af6f71182a4ef76a22773
+  - name: chrislusf/seaweedfs
+    newTag: "4.29"
+    digest: sha256:d47c7ee99fcb951351d7194915f4e3a5ea604a8e8871183d713907dec4fb9bf5
+# includeSelectors stays false: adding a label to a StatefulSet's selector after
+# it exists is rejected by the API server, and these workloads are meant to
+# outlive many releases.
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-prod

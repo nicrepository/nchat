@@ -12,11 +12,16 @@ import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
 
-import type { ActiveResourceCallSession, ChatOutletContext } from "./ChatShell";
+import type {
+  ActiveDirectCallSession,
+  ActiveResourceCallSession,
+  ChatOutletContext,
+} from "./ChatShell";
 import type { Call } from "./callState";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
+import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage } from "./chatTypes";
@@ -440,6 +445,25 @@ function renderPendingReferenceState(state: unknown) {
       </Routes>
     </MemoryRouter>,
   );
+}
+
+/**
+ * A DOMRect for the geometry tests: jsdom reports every box as zero-sized, so a
+ * placement test has to say what the browser would have measured.
+ */
+function domRect(rect: Partial<DOMRect>): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: 0,
+    height: 0,
+    ...rect,
+    toJSON: () => ({}),
+  } as DOMRect;
 }
 
 async function openFullReactionPicker(messageIndex = 0) {
@@ -1803,6 +1827,441 @@ describe("ChatMessageArea — #642 active resource call bar", () => {
   });
 });
 
+// ── #673: icon call controls (channel/group + DM) ───────────────────────────
+
+describe("ChatMessageArea — #673 icon call controls", () => {
+  it("channel header: no visible 'Chamada' text, an accessible icon button preserves the join callback", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const onCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  getResourceCall: () => null,
+                  isParticipatingIn: () => false,
+                  joinResourceCall: () => onCall(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).queryByText("Chamada")).not.toBeInTheDocument();
+    const button = within(header).getByRole("button", { name: "Iniciar chamada" });
+    expect(button.tagName).toBe("BUTTON");
+    fireEvent.click(button);
+    expect(onCall).toHaveBeenCalledOnce();
+  });
+
+  it("DM header: no visible 'Áudio'/'Vídeo' text, two separate icon buttons each fire only their own call type", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const startCall = vi.fn(() => true);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "dm-1",
+                      type: "1:1",
+                      name: "Juliane",
+                      participants: [],
+                      counterpart: { userId: "user-jl", displayName: "Juliane" },
+                    },
+                  ],
+                  startCall,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByTestId("chat-msg-header");
+    expect(within(header).queryByText("Áudio")).not.toBeInTheDocument();
+    expect(within(header).queryByText("Vídeo")).not.toBeInTheDocument();
+
+    const audioBtn = within(header).getByRole("button", { name: "Iniciar chamada de áudio" });
+    const videoBtn = within(header).getByRole("button", { name: "Iniciar chamada de vídeo" });
+    expect(audioBtn.tagName).toBe("BUTTON");
+    expect(videoBtn.tagName).toBe("BUTTON");
+
+    fireEvent.click(audioBtn);
+    expect(startCall).toHaveBeenNthCalledWith(1, "user-jl", "audio");
+    fireEvent.click(videoBtn);
+    expect(startCall).toHaveBeenNthCalledWith(2, "user-jl", "video");
+    expect(startCall).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── #673: active direct 1:1 call bar ────────────────────────────────────────
+
+function directCallSession(overrides: Partial<ActiveDirectCallSession> = {}) {
+  const session: ActiveDirectCallSession = {
+    callId: "direct-call-1",
+    startedAt: "2024-01-01T12:00:00.000Z",
+    callType: "audio",
+    peerUserId: "user-jl",
+    microphoneEnabled: true,
+    microphonePending: false,
+    onToggleMicrophone: vi.fn(),
+    onLeave: vi.fn(),
+    onOpenFullCall: vi.fn(),
+    ...overrides,
+  };
+  return session;
+}
+
+const directDM = {
+  id: "dm-1",
+  type: "1:1" as const,
+  name: "Juliane",
+  participants: [],
+  counterpart: { userId: "user-jl", displayName: "Juliane Lino", avatarUrl: "/avatar.png" },
+};
+
+describe("ChatMessageArea — #673 active direct call bar", () => {
+  it("shows the bar for an active direct call matching this DM's own counterpart", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    expect(bar).toHaveTextContent("Chamada de voz — Juliane Lino");
+
+    // The header suppresses its own call actions once the bar takes over.
+    const header = screen.getByTestId("chat-msg-header");
+    expect(
+      within(header).queryByRole("button", { name: /Iniciar chamada/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows "Chamada de vídeo" for a video call type', async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ callType: "video" }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    expect(bar).toHaveTextContent("Chamada de vídeo — Juliane Lino");
+  });
+
+  it("never shows the bar for a DIFFERENT open DM, even when a direct call session is present", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-other"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [
+                    directDM,
+                    {
+                      id: "dm-other",
+                      type: "1:1" as const,
+                      name: "Outra Pessoa",
+                      participants: [],
+                      counterpart: { userId: "user-other", displayName: "Outra Pessoa" },
+                    },
+                  ],
+                  // The session's peerUserId ("user-jl") does not match this
+                  // DM's own counterpart ("user-other") — a call belonging
+                  // to a different 1:1 must never render here.
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("never shows the bar for a group DM, even if a directCallSession is somehow present", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-grp"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra", participants: [] }],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("never shows the bar for a channel, even if a directCallSession is somehow present", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("shows no bar when directCallSession is absent (e.g. only ringing — IncomingCallPopup owns that surface)", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: undefined,
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("chat-msg-header");
+    expect(screen.queryByTestId("active-direct-call-bar")).not.toBeInTheDocument();
+  });
+
+  it("wires the bar's leave button to ctx.directCallSession.onLeave", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onLeave = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ onLeave }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: /Sair/ }));
+    expect(onLeave).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's mute button to ctx.directCallSession.onToggleMicrophone and reflects the real mic state", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onToggleMicrophone = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({
+                    onToggleMicrophone,
+                    microphoneEnabled: false,
+                  }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    const muteButton = within(bar).getByRole("button", { name: "Ativar microfone" });
+    fireEvent.click(muteButton);
+    expect(onToggleMicrophone).toHaveBeenCalledOnce();
+  });
+
+  it("wires the bar's main area to ctx.directCallSession.onOpenFullCall", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const onOpenFullCall = vi.fn();
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession({ onOpenFullCall }),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const bar = await screen.findByTestId("active-direct-call-bar");
+    fireEvent.click(within(bar).getByRole("button", { name: /Abrir chamada/ }));
+    expect(onOpenFullCall).toHaveBeenCalledOnce();
+  });
+
+  it("re-render/navigation away and back reuses the same bar — never duplicated", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("active-direct-call-bar");
+
+    rerender(
+      <MemoryRouter initialEntries={["/chat/dm/dm-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "user-an",
+                  channels: [],
+                  dms: [directDM],
+                  directCallSession: directCallSession(),
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByTestId("active-direct-call-bar")).toHaveLength(1);
+  });
+});
+
 // ── Loading state ─────────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — loading state", () => {
@@ -2030,16 +2489,60 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
 
-  it("filters stored recent emojis against the server allowlist", async () => {
-    localStorage.setItem("nchat_recent_reactions:me-123", JSON.stringify(["🛑", "🚀", "👍"]));
+  it("puts the reader's own recent emoji first in the quick row", async () => {
+    localStorage.setItem(
+      "nchat_emoji_usage:me-123",
+      JSON.stringify({
+        v: 1,
+        tone: 0,
+        entries: [{ emoji: "🛑", count: 3, usedAt: 20 }],
+      }),
+    );
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelAreaForUser();
     const bubble = await screen.findByTestId("chat-msg-bubble");
 
     fireEvent.mouseEnter(bubble);
 
-    expect(screen.queryByRole("button", { name: "Reagir rapidamente com 🛑" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Reagir rapidamente com 🚀" })).toBeVisible();
+    const quick = screen
+      .getAllByRole("button", { name: /^Reagir rapidamente com/ })
+      .map((button) => button.getAttribute("aria-label"));
+    // The reader's own history leads; the server's shortlist fills the rest.
+    expect(quick[0]).toBe("Reagir rapidamente com 🛑");
+    expect(quick).toHaveLength(3);
+  });
+
+  // One history, two surfaces: what the reader reacts with and what they type
+  // into a message feed the same "Recentes" (issue #496).
+  it("lends the same emoji history to the composer's picker", async () => {
+    localStorage.setItem(
+      "nchat_emoji_usage:me-123",
+      JSON.stringify({ v: 1, tone: 0, entries: [{ emoji: "🛑", count: 3, usedAt: 20 }] }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelAreaForUser();
+
+    await userEvent.click(await screen.findByTestId("toolbar-emoji-btn"));
+    const picker = await screen.findByTestId("toolbar-emoji-picker");
+    await within(picker).findByRole("searchbox", { name: "Buscar emoji" });
+
+    // The history tab is offered at all, and it opens on the emoji the reader
+    // reacted with — which only this conversation's own usage could supply.
+    expect(within(picker).getByRole("tab", { name: "Recentes" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(picker).getAllByRole("button", { name: "sinal de pare" })).not.toHaveLength(0);
+  });
+
+  it("ignores a corrupted local emoji preference instead of losing the quick row", async () => {
+    localStorage.setItem("nchat_emoji_usage:me-123", "{not json");
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelAreaForUser();
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+
+    fireEvent.mouseEnter(bubble);
+
     expect(screen.getByRole("button", { name: "Reagir rapidamente com 👍" })).toBeVisible();
   });
 
@@ -2059,10 +2562,15 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
 
+  // A use is what the reader chose *here* and the server confirmed, so the
+  // reaction has to start as a local toggle: an event with no intent behind it
+  // came from somewhere else and does not shape this client's history (#496).
   it("stores a confirmed own reaction as the most recent allowed emoji", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
     renderChannelAreaForUser();
-    await screen.findByTestId("chat-msg-bubble");
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 😂" }));
 
     act(() =>
       wsMockState.capturedReactionUpdated?.({
@@ -2073,17 +2581,17 @@ describe("ChatMessageArea — message list", () => {
         reaction: {
           message_id: "m1",
           actor_user_id: "me-123",
-          emoji: "🚀",
+          emoji: "😂",
           added: true,
-          reactions: [{ emoji: "🚀", count: 1 }],
+          reactions: [{ emoji: "😂", count: 1 }],
         },
       }),
     );
 
     await waitFor(() =>
-      expect(JSON.parse(localStorage.getItem("nchat_recent_reactions:me-123") ?? "[]")[0]).toBe(
-        "🚀",
-      ),
+      expect(
+        JSON.parse(localStorage.getItem("nchat_emoji_usage:me-123") ?? "null").entries[0].emoji,
+      ).toBe("😂"),
     );
   });
 
@@ -2093,7 +2601,9 @@ describe("ChatMessageArea — message list", () => {
       throw new DOMException("quota", "QuotaExceededError");
     });
     renderChannelAreaForUser();
-    await screen.findByTestId("chat-msg-bubble");
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
 
     act(() =>
       wsMockState.capturedReactionUpdated?.({
@@ -2115,19 +2625,31 @@ describe("ChatMessageArea — message list", () => {
     setItem.mockRestore();
   });
 
-  it("renders reaction counts, uses the server allowlist and closes after selection", async () => {
+  it("renders reaction counts and reacts with an emoji chosen from the full picker", async () => {
     mockFetchChannelMessages.mockResolvedValue(
       messagePage([
-        makeMessage({ id: "m1", reactions: [{ emoji: "🎉", count: 3, reactedByMe: true }] }),
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🎉", count: 3, reactedByMe: true, users: [] }],
+        }),
       ]),
     );
     renderChannelArea();
 
     expect(await screen.findByRole("button", { name: "Remover reação 🎉" })).toHaveTextContent("3");
     await openFullReactionPicker();
-    await userEvent.click(screen.getByRole("button", { name: "Reagir com 👍" }));
+    await userEvent.type(await screen.findByRole("searchbox", { name: "Buscar emoji" }), "polegar");
+    // 👍 has skin tones, so choosing it asks which one — against the emoji
+    // itself, not a control in the header.
+    await userEvent.click(await screen.findByRole("button", { name: "polegar para cima" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "polegar para cima — Padrão" }),
+    );
+
     expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+    // The picker is served by the bundled catalog: choosing from it costs no
+    // request beyond the one configuration call the conversation already made.
     expect(mockFetchAllowedReactionEmojis).toHaveBeenCalledTimes(1);
   });
 
@@ -2154,6 +2676,132 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
   });
 
+  // Escape is a keyboard gesture, so it has to leave the keyboard somewhere
+  // usable: the button the reader opened the picker from.
+  it("returns focus to the opener when the picker is closed with Escape", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    await screen.findByRole("searchbox", { name: "Buscar emoji" });
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.getByRole("button", { name: "Mais reações" })).toHaveFocus();
+  });
+
+  it("returns focus to the opener after an emoji is chosen", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    await userEvent.type(await screen.findByRole("searchbox", { name: "Buscar emoji" }), "foguete");
+    await userEvent.click(await screen.findByRole("button", { name: "foguete" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "🚀");
+    expect(screen.getByRole("button", { name: "Mais reações" })).toHaveFocus();
+  });
+
+  it("names who reacted on the badge, and keeps that name current in realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [
+            {
+              emoji: "🎉",
+              count: 1,
+              reactedByMe: false,
+              users: [{ userId: "u-2", displayName: "Caio Almeida" }],
+            },
+          ],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const badge = await screen.findByRole("button", { name: "Adicionar reação 🎉" });
+    expect(badge).toHaveAccessibleDescription("🎉: Caio Almeida");
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "me-123",
+          emoji: "🎉",
+          added: true,
+          reactions: [
+            {
+              emoji: "🎉",
+              count: 2,
+              users: [
+                { user_id: "u-2", display_name: "Caio Almeida" },
+                { user_id: "me-123", display_name: "Álvaro Neto" },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+
+    // No reload, no refetch and no request per hover: the event carried the
+    // names, and the reader is named "Você" rather than by their own name.
+    const updated = await screen.findByRole("button", { name: "Remover reação 🎉" });
+    expect(updated).toHaveAccessibleDescription("🎉: Você e Caio Almeida");
+    expect(updated).toHaveTextContent("2");
+    expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops an author from the badge when their reaction is removed in realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [
+            {
+              emoji: "🎉",
+              count: 2,
+              reactedByMe: false,
+              users: [
+                { userId: "u-2", displayName: "Caio Almeida" },
+                { userId: "u-3", displayName: "Bruna Dias" },
+              ],
+            },
+          ],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByRole("button", { name: "Adicionar reação 🎉" });
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "u-3",
+          emoji: "🎉",
+          added: false,
+          reactions: [
+            { emoji: "🎉", count: 1, users: [{ user_id: "u-2", display_name: "Caio Almeida" }] },
+          ],
+        },
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Adicionar reação 🎉" }),
+      ).toHaveAccessibleDescription("🎉: Caio Almeida"),
+    );
+  });
+
   it.each([
     ["middle", 400, 426, 243],
     ["viewport footer", 730, 756, 573],
@@ -2177,7 +2825,7 @@ describe("ChatMessageArea — message list", () => {
               toJSON: () => ({}),
             };
           }
-          if (this.classList.contains("chat-msg-area__reaction-grid")) {
+          if (this.classList.contains("chat-emoji-surface")) {
             return {
               x: 0,
               y: 0,
@@ -2212,6 +2860,93 @@ describe("ChatMessageArea — message list", () => {
       rectSpy.mockRestore();
     },
   );
+
+  // The picker opens at the size of its Suspense fallback and grows when the
+  // lazily-imported catalog lands. Without a second placement it would keep the
+  // position computed for the small box and hang off the viewport.
+  it("re-places the picker when its lazily-loaded content changes size", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    let pickerHeight = 40;
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.getAttribute("aria-label") === "Mais reações") {
+          return domRect({ left: 450, right: 480, top: 100, bottom: 130, width: 30, height: 30 });
+        }
+        if (this.classList.contains("chat-emoji-surface")) {
+          return domRect({ right: 188, bottom: pickerHeight, width: 188, height: pickerHeight });
+        }
+        return domRect({});
+      });
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    const dialog = screen.getByRole("dialog", { name: "Escolher reação" });
+    // 100 (anchor top) - 40 (fallback height) - 7 (gap): it fits above.
+    expect(dialog).toHaveStyle({ top: "53px" });
+
+    pickerHeight = 400;
+    act(() => flushResizeObservers());
+
+    // Too tall to fit above now, so it flips below the anchor — and stays whole
+    // inside the viewport instead of keeping the stale placement.
+    expect(dialog).toHaveStyle({ top: "137px" });
+    expect(137 + pickerHeight).toBeLessThanOrEqual(window.innerHeight);
+    rectSpy.mockRestore();
+  });
+
+  // The finding this covers: removing the last reaction used to make the badge
+  // vanish between two frames. It now leaves, and is unmounted by its own
+  // animation rather than by a timer.
+  it("plays the badge out before removing it, end to end", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🎉", count: 1, reactedByMe: true, users: [] }],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+    const badge = await screen.findByRole("button", { name: "Remover reação 🎉" });
+    const slot = badge.closest(".chat-msg-area__reaction-slot") as HTMLElement;
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "me-123",
+          emoji: "🎉",
+          added: false,
+          reactions: [],
+        },
+      }),
+    );
+
+    await waitFor(() => expect(slot).toHaveAttribute("data-exiting", "true"));
+    expect(screen.queryByRole("button", { name: /reação 🎉/ })).toBeNull();
+
+    fireEvent.animationEnd(slot);
+
+    await waitFor(() => expect(document.querySelector(".chat-msg-area__reaction-slot")).toBeNull());
+  });
+
+  it("stops observing the picker once it is closed", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    renderChannelArea();
+
+    await openFullReactionPicker();
+    expect(observedElements()).toHaveLength(1);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
+    expect(observedElements()).toHaveLength(0);
+  });
 
   it("closes the reaction picker when its anchor leaves the viewport", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
@@ -2279,7 +3014,7 @@ describe("ChatMessageArea — message list", () => {
 
   it("renders the reaction pill after the authoritative WS update", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
-    renderChannelArea();
+    renderChannelAreaForUser();
 
     const bubble = await screen.findByTestId("chat-msg-bubble");
     fireEvent.mouseEnter(bubble);
@@ -2294,7 +3029,7 @@ describe("ChatMessageArea — message list", () => {
         message_id: "m1",
         reaction: {
           message_id: "m1",
-          actor_user_id: "other-user",
+          actor_user_id: "me-123",
           emoji: "👍",
           added: true,
           reactions: [{ emoji: "👍", count: 1 }],
@@ -2302,9 +3037,40 @@ describe("ChatMessageArea — message list", () => {
       }),
     );
 
-    expect(await screen.findByRole("button", { name: "Adicionar reação 👍" })).toHaveTextContent(
-      "1",
+    expect(await screen.findByRole("button", { name: "Remover reação 👍" })).toHaveTextContent("1");
+  });
+
+  // Somebody else reacting with the same emoji moves the confirmed count, but it
+  // is not this reader's confirmation: their own toggle stays on top of it.
+  it("stacks the reader's pending reaction on another reader's confirmed one", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+
+    act(() =>
+      wsMockState.capturedReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m1",
+        reaction: {
+          message_id: "m1",
+          actor_user_id: "other-user",
+          emoji: "👍",
+          added: true,
+          reactions: [
+            { emoji: "👍", count: 1, users: [{ user_id: "other-user", display_name: "Bruna" }] },
+          ],
+        },
+      }),
     );
+
+    const badge = await screen.findByRole("button", { name: "Remover reação 👍" });
+    expect(badge).toHaveTextContent("2");
+    expect(badge).toHaveAccessibleDescription("👍: Você e Bruna");
   });
 
   it("rejects a reaction whose bytes do not match the server allowlist", async () => {
@@ -2312,7 +3078,7 @@ describe("ChatMessageArea — message list", () => {
       messagePage([
         makeMessage({
           id: "m1",
-          reactions: [{ emoji: "❤", count: 1, reactedByMe: false }],
+          reactions: [{ emoji: "❤", count: 1, reactedByMe: false, users: [] }],
         }),
       ]),
     );
@@ -2330,8 +3096,8 @@ describe("ChatMessageArea — message list", () => {
         makeMessage({
           id: "m1",
           reactions: [
-            { emoji: "👍", count: 2, reactedByMe: false },
-            { emoji: "🎉", count: 4, reactedByMe: true },
+            { emoji: "👍", count: 2, reactedByMe: false, users: [] },
+            { emoji: "🎉", count: 4, reactedByMe: true, users: [] },
           ],
         }),
       ]),
@@ -2350,7 +3116,7 @@ describe("ChatMessageArea — message list", () => {
       messagePage([
         makeMessage({
           id: "m1",
-          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false, users: [] }],
         }),
       ]),
     );
@@ -2372,7 +3138,7 @@ describe("ChatMessageArea — message list", () => {
       messagePage([
         makeMessage({
           id: "m1",
-          reactions: [{ emoji: "👍", count: 1, reactedByMe: false }],
+          reactions: [{ emoji: "👍", count: 1, reactedByMe: false, users: [] }],
         }),
       ]),
     );

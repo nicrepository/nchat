@@ -198,3 +198,102 @@ describe("ChatComposer mentions", () => {
     await waitFor(() => expect(screen.queryByRole("option", { name: /anuncios/ })).toBeNull());
   });
 });
+
+/**
+ * The composer's emoji button (issue #496).
+ *
+ * These go through the real TipTap editor rather than a mock, because what is
+ * under test is *where* the emoji lands — at the caret, over a selection —
+ * which only the real editor's selection can answer.
+ */
+describe("ChatComposer emoji picker", () => {
+  async function openPicker() {
+    await userEvent.click(await screen.findByTestId("toolbar-emoji-btn"));
+    const search = await screen.findByRole("searchbox", { name: "Buscar emoji" });
+    await waitFor(() => expect(search).toHaveFocus());
+  }
+
+  /**
+   * Puts the caret inside the paragraph the reader has typed.
+   *
+   * jsdom has no caret of its own — ArrowLeft moves nothing in a contenteditable
+   * — so the selection is set through the DOM Selection API and ProseMirror
+   * picks it up from there, exactly as it does from a real browser.
+   */
+  function select(input: HTMLElement, from: number, to = from) {
+    const text = input.querySelector("p")?.firstChild;
+    if (!text) throw new Error("composer has no typed text to select in");
+    const range = document.createRange();
+    range.setStart(text, from);
+    range.setEnd(text, to);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+  }
+
+  /**
+   * The editor, focused, ready to be typed into.
+   *
+   * Focused rather than clicked: ProseMirror answers a mousedown by asking the
+   * document what is at those coordinates, and jsdom has no layout to answer
+   * with. A real click is covered by the end-to-end spec, in a real browser.
+   */
+  async function focusedInput() {
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    return input;
+  }
+
+  async function pick(label: string) {
+    await userEvent.click(screen.getByRole("button", { name: label }));
+  }
+
+  it("inserts at the caret, in the middle of what is already typed", async () => {
+    const onSend = setup();
+    const input = await focusedInput();
+    await userEvent.keyboard("bomdia");
+    select(input, 3);
+
+    await openPicker();
+    await pick("rosto risonho");
+
+    expect(await send(onSend)).toBe("bom😀dia");
+  });
+
+  it("replaces the selection, exactly as typing a character would", async () => {
+    const onSend = setup();
+    const input = await focusedInput();
+    await userEvent.keyboard("bom dia");
+    select(input, 4, 7);
+
+    await openPicker();
+    await pick("rosto risonho");
+
+    expect(await send(onSend)).toBe("bom 😀");
+  });
+
+  it("takes several emoji without being reopened", async () => {
+    const onSend = setup();
+    await focusedInput();
+
+    await openPicker();
+    await pick("rosto risonho");
+    await pick("rosto chorando de rir");
+
+    expect(await send(onSend)).toBe("😀😂");
+  });
+
+  // A picker left hanging over a message that has already gone is noise.
+  it("closes once the message is on its way", async () => {
+    const onSend = setup();
+    await focusedInput();
+    await openPicker();
+    await pick("rosto risonho");
+    expect(screen.getByTestId("toolbar-emoji-picker")).toBeInTheDocument();
+
+    await send(onSend);
+
+    await waitFor(() => expect(screen.queryByTestId("toolbar-emoji-picker")).toBeNull());
+  });
+});

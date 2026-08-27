@@ -195,11 +195,18 @@ type messageJSON struct {
 	SenderID          string `json:"sender_id"`
 	SenderDisplayName string `json:"sender_display_name,omitempty"`
 	SenderEmail       string `json:"sender_email,omitempty"`
-	Kind              string `json:"kind"`
-	BodyText          string `json:"body_text,omitempty"`
-	BodyFormat        string `json:"body_format"`
-	IsRemoved         bool   `json:"is_removed,omitempty"`
-	Status            string `json:"status"`
+	// SenderAvatarURL is the sender's auth.users.avatar_url, straight from the
+	// same JOIN as SenderDisplayName/SenderEmail (issue #495). Omitted when the
+	// sender has none set. Same-origin/scheme safety is a render-time client
+	// concern, exactly like every other avatar_url this API already returns
+	// (sidebar counterpart, channel members, group participants, direct
+	// profile) — this handler forwards the stored value unmodified.
+	SenderAvatarURL string `json:"sender_avatar_url,omitempty"`
+	Kind            string `json:"kind"`
+	BodyText        string `json:"body_text,omitempty"`
+	BodyFormat      string `json:"body_format"`
+	IsRemoved       bool   `json:"is_removed,omitempty"`
+	Status          string `json:"status"`
 	// LinkSafetyState is the link-safety axis and is independent of Status
 	// (issue #135): a published message whose links could not all be verified is
 	// `active` and carries "inconclusive" here. It is what the client draws the
@@ -271,9 +278,26 @@ type referenceJSON struct {
 }
 
 type reactionJSON struct {
-	Emoji       string `json:"emoji"`
-	Count       int    `json:"count"`
-	ReactedByMe bool   `json:"reacted_by_me"`
+	Emoji       string             `json:"emoji"`
+	Count       int                `json:"count"`
+	ReactedByMe bool               `json:"reacted_by_me"`
+	Users       []reactionUserJSON `json:"users"`
+}
+
+// reactionUserJSON is the identity a reaction tooltip needs and nothing more
+// (issue #496): who, and what to call them. The reader is already authorized to
+// read this message, and so already sees names in it.
+type reactionUserJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+}
+
+func reactionUsersJSON(users []domain.ReactionUser) []reactionUserJSON {
+	out := make([]reactionUserJSON, len(users))
+	for i, user := range users {
+		out[i] = reactionUserJSON{UserID: user.UserID, DisplayName: user.DisplayName}
+	}
+	return out
 }
 
 // listMessagesResponseData is the data envelope for list endpoints.
@@ -509,6 +533,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		SenderID:          m.SenderID,
 		SenderDisplayName: m.SenderDisplayName,
 		SenderEmail:       m.SenderEmail,
+		SenderAvatarURL:   m.SenderAvatarURL,
 		Kind:              string(m.Kind),
 		BodyFormat:        string(m.BodyFormat),
 		Status:            string(m.Status),
@@ -525,6 +550,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
 			Emoji: reaction.Emoji, Count: reaction.Count, ReactedByMe: reaction.ReactedByMe,
+			Users: reactionUsersJSON(reaction.Users),
 		}
 	}
 	if m.Status == domain.MessageStatusDeleted || !m.DeletedAt.IsZero() {
@@ -612,14 +638,34 @@ func mapQuoteJSON(q *domain.QuotedMessage) *quoteJSON {
 }
 
 type allowedReactionEmojisResponseData struct {
+	// Emojis is the quick-reaction row, unchanged in name and meaning from
+	// before issue #496 so a client built against the old contract keeps working.
 	Emojis []string `json:"emojis"`
+	// Version names the Unicode emoji catalog this server validates against.
+	// The full catalog is not shipped here: it is a fixed, versioned Unicode
+	// projection that the client already carries, so repeating thousands of
+	// sequences on every chat open would be payload for nothing.
+	Version string `json:"version"`
 }
 
-// ListAllowedReactionEmojis returns the immutable server-side reaction
-// allowlist. Authentication and active-session checks are applied by NewRouter.
-func (h *MessageHandler) ListAllowedReactionEmojis(w http.ResponseWriter, _ *http.Request) {
+// ListAllowedReactionEmojis returns the quick-reaction row and the catalog
+// version. Authentication and active-session checks are applied by NewRouter.
+//
+// The answer changes only when the deployment adopts a new Unicode version, so
+// it carries a validator derived from exactly that: a client that already holds
+// this version is told so instead of being sent the body again.
+func (h *MessageHandler) ListAllowedReactionEmojis(w http.ResponseWriter, r *http.Request) {
+	version := service.EmojiCatalogVersion()
+	etag := `"emoji-catalog-` + version + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	httputil.WriteJSON(w, http.StatusOK, allowedReactionEmojisResponseData{
-		Emojis: service.AllowedReactionEmojis(),
+		Emojis:  service.QuickReactionEmojis(),
+		Version: version,
 	})
 }
 

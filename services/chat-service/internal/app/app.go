@@ -788,12 +788,22 @@ func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID
 	}
 	reactions := make([]ws.ReactionPayload, len(result.Reactions))
 	for i, reaction := range result.Reactions {
-		reactions[i] = ws.ReactionPayload{Emoji: reaction.Emoji, Count: reaction.Count}
+		reactions[i] = ws.ReactionPayload{
+			Emoji: reaction.Emoji, Count: reaction.Count, Users: reactionUserPayloads(reaction.Users),
+		}
 	}
 	return ws.ReactionUpdate{
 		MessageID: result.MessageID, TargetType: targetType, TargetID: targetID,
 		Added: result.Added, Reactions: reactions,
 	}, nil
+}
+
+func reactionUserPayloads(users []domain.ReactionUser) []ws.ReactionUserPayload {
+	payloads := make([]ws.ReactionUserPayload, len(users))
+	for i, user := range users {
+		payloads[i] = ws.ReactionUserPayload{UserID: user.UserID, DisplayName: user.DisplayName}
+	}
+	return payloads
 }
 
 // PublishMessageBlocked forwards the RF-21 refusal to its author.
@@ -895,6 +905,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		DMConversationID:  msg.DMConversationID,
 		SenderID:          msg.SenderID,
 		SenderDisplayName: msg.SenderDisplayName,
+		SenderAvatarURL:   msg.SenderAvatarURL,
 		Kind:              string(msg.Kind),
 		BodyText:          body,
 		BodyFormat:        string(msg.BodyFormat),

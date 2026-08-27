@@ -183,6 +183,104 @@ class SecretRefTests(unittest.TestCase):
         self.assertEqual(query._secret_refs([document(MIDDLEWARE)]), [])
 
 
+# A production stateful PersistentVolume, whose three safety properties -- the
+# path it points at, that it is retained rather than collected, and the single
+# node it may bind on -- are the ones prod-stateful-check reads back.
+LOCAL_VOLUME = """apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nchat-prod-postgres
+spec:
+  capacity:
+    storage: 30Gi
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-hdd-geral
+  local:
+    path: /mnt/hdd-geral/k3s/nchat-prod/postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - srv-apps-01
+"""
+
+
+# kustomize emits a rule's keys alphabetically, so `backend` precedes `path`.
+# A reader that took the nearest preceding path would shift every backend onto
+# the previous rule's path, which is exactly the mistake this fixture pins.
+class ConfigMapEnvFromTests(unittest.TestCase):
+    ENVFROM = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media-service-blue
+spec:
+  template:
+    spec:
+      containers:
+      - name: media-service
+        envFrom:
+        - configMapRef:
+            name: nchat-config
+        - secretRef:
+            name: nchat-secrets
+        env:
+        - name: LIVEKIT_TOKEN_TTL_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: nchat-config
+              key: LIVEKIT_TTL_SECONDS
+"""
+
+    def test_reports_the_whole_config_map_the_workload_inherits(self):
+        self.assertEqual(
+            query.document_field(document(self.ENVFROM), "configmap-envfrom"), "nchat-config")
+
+    def test_a_single_key_reference_is_not_an_envfrom(self):
+        text = self.ENVFROM.replace(
+            "        envFrom:\n        - configMapRef:\n            name: nchat-config\n", "")
+        self.assertEqual(query.document_field(document(text), "configmap-envfrom"), "")
+
+    def test_app_env_is_inherited_when_no_container_override_exists(self):
+        self.assertEqual(query.document_field(document(self.ENVFROM), "app-env"), "")
+
+    def test_app_env_container_override_is_reported(self):
+        text = self.ENVFROM.replace(
+            "        - name: LIVEKIT_TOKEN_TTL_SECONDS",
+            "        - name: APP_ENV\n          value: blue\n        - name: LIVEKIT_TOKEN_TTL_SECONDS",
+        )
+        self.assertEqual(query.document_field(document(text), "app-env"), "blue")
+
+
+class LocalVolumeFieldTests(unittest.TestCase):
+    def test_dotted_spec_path(self):
+        self.assertEqual(
+            query.document_field(document(LOCAL_VOLUME), "spec.persistentVolumeReclaimPolicy"),
+            "Retain",
+        )
+
+    def test_dotted_spec_path_reaches_a_nested_mapping(self):
+        self.assertEqual(
+            query.document_field(document(LOCAL_VOLUME), "spec.local.path"),
+            "/mnt/hdd-geral/k3s/nchat-prod/postgres",
+        )
+
+    def test_absent_spec_path_is_empty(self):
+        self.assertEqual(query.document_field(document(LOCAL_VOLUME), "spec.nope"), "")
+
+    def test_node_hosts(self):
+        self.assertEqual(query.document_field(document(LOCAL_VOLUME), "node-hosts"), "srv-apps-01")
+
+    def test_node_hosts_collects_every_value(self):
+        text = LOCAL_VOLUME.replace("          - srv-apps-01\n", "          - srv-apps-01\n          - other\n")
+        self.assertEqual(query.document_field(document(text), "node-hosts"), "srv-apps-01 other")
+
+    def test_a_document_with_no_affinity_reports_no_host(self):
+        self.assertEqual(query.document_field(document(DEPLOYMENT), "node-hosts"), "")
+
+
 class FieldQueryTests(unittest.TestCase):
     def test_release_sha(self):
         self.assertEqual(query.document_field(document(DEPLOYMENT), "release-sha"), "abc123")

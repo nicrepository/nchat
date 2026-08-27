@@ -101,8 +101,8 @@ func TestNewEnabledAppIssuesOfficialLiveKitToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify LiveKit token: %v", err)
 	}
-	if grants.Identity != appTestUserID || grants.Video == nil ||
-		!grants.Video.RoomJoin || grants.Video.Room != "call:"+appTestResource {
+	if grants.Identity != "production:"+appTestUserID || grants.Video == nil ||
+		!grants.Video.RoomJoin || grants.Video.Room != "production:call:"+appTestResource {
 		t.Fatalf("unexpected LiveKit grants: %+v", grants)
 	}
 	if grants.Name != "App Test User" {
@@ -163,7 +163,7 @@ func TestAppShutdownIsNilSafeIdempotentAndPropagatesTracingError(t *testing.T) {
 
 func validAppConfig() config.Config {
 	return config.Config{
-		ServiceName: "media-service", Env: "test", Port: 8087,
+		ServiceName: "media-service", Env: "production", Port: 8087,
 		ReadHeaderTimeoutSeconds: 5, ReadTimeoutSeconds: 10, WriteTimeoutSeconds: 10,
 		DatabaseURL: "postgres://database/nchat", DBConnectTimeoutSeconds: 1,
 		AuthJWTHMACSecret: repeatedAppTestValue('j', 32), AuthJWTIssuer: "nchat-auth", AuthJWTAudience: "nchat-api",

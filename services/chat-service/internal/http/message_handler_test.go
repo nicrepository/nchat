@@ -276,7 +276,13 @@ func testMessage() domain.Message {
 		Status:      domain.MessageStatusActive,
 		CreatedAt:   testNow(),
 		UpdatedAt:   testNow(),
-		Reactions:   []domain.MessageReaction{{Emoji: "👍", Count: 2, ReactedByMe: true}},
+		Reactions: []domain.MessageReaction{{
+			Emoji: "👍", Count: 2, ReactedByMe: true,
+			Users: []domain.ReactionUser{
+				{UserID: msgTestUserID, DisplayName: "Álvaro Neto"},
+				{UserID: "22222222-2222-4222-8222-222222222222", DisplayName: "Caio Almeida"},
+			},
+		}},
 	}
 }
 
@@ -751,9 +757,50 @@ func TestMessageHandler_ListAllowedReactionEmojis(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := decodeBody(t, rec)
-	emojis, ok := body["data"].(map[string]any)["emojis"].([]any)
+	data := body["data"].(map[string]any)
+	emojis, ok := data["emojis"].([]any)
 	if !ok || len(emojis) < 16 || len(emojis) > 20 {
-		t.Fatalf("unexpected allowlist response: %#v", body)
+		t.Fatalf("unexpected quick reaction response: %#v", body)
+	}
+	if data["version"] != service.EmojiCatalogVersion() {
+		t.Fatalf("expected the catalog version in the payload, got %#v", data["version"])
+	}
+	// The full catalog is not shipped here: it is a versioned Unicode projection
+	// the client already carries, and repeating it per chat open would be payload
+	// for nothing.
+	if len(emojis) >= service.EmojiCatalogSize() {
+		t.Fatal("the configuration route must not serve the whole catalog")
+	}
+}
+
+// The answer changes only when the deployment adopts a new Unicode version, so a
+// client holding that version is told so rather than sent the body again.
+func TestMessageHandler_AllowedReactionEmojisRevalidatesByCatalogVersion(t *testing.T) {
+	h := httpapi.NewMessageHandler(nil, nil, nil)
+	first := httptest.NewRecorder()
+	h.ListAllowedReactionEmojis(first, httptest.NewRequest(http.MethodGet, httpapi.RouteAllowedReactionEmojis, nil))
+	etag := first.Header().Get("ETag")
+	if etag == "" || !strings.Contains(etag, service.EmojiCatalogVersion()) {
+		t.Fatalf("expected a version-derived ETag, got %q", etag)
+	}
+	if cache := first.Header().Get("Cache-Control"); !strings.Contains(cache, "private") {
+		t.Fatalf("the per-user configuration route must not be shared-cacheable, got %q", cache)
+	}
+
+	revalidation := httptest.NewRequest(http.MethodGet, httpapi.RouteAllowedReactionEmojis, nil)
+	revalidation.Header.Set("If-None-Match", etag)
+	second := httptest.NewRecorder()
+	h.ListAllowedReactionEmojis(second, revalidation)
+	if second.Code != http.StatusNotModified || second.Body.Len() != 0 {
+		t.Fatalf("expected an empty 304, got %d with %d bytes", second.Code, second.Body.Len())
+	}
+
+	stale := httptest.NewRequest(http.MethodGet, httpapi.RouteAllowedReactionEmojis, nil)
+	stale.Header.Set("If-None-Match", `"emoji-catalog-0.0"`)
+	third := httptest.NewRecorder()
+	h.ListAllowedReactionEmojis(third, stale)
+	if third.Code != http.StatusOK {
+		t.Fatalf("a client on another catalog version must be served the body, got %d", third.Code)
 	}
 }
 
@@ -831,8 +878,60 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	if !ok || len(reactions) != 1 || reactions[0].(map[string]any)["reacted_by_me"] != true {
 		t.Fatalf("expected reaction aggregate, got %#v", msgsArr[0].(map[string]any)["reactions"])
 	}
+	assertReactionUsersAreMinimalIdentities(t, reactions[0].(map[string]any))
 	if forwarded, present := msgsArr[0].(map[string]any)["is_forwarded"]; !present || forwarded != false {
 		t.Fatalf("normal list item must contain is_forwarded=false, got %#v", msgsArr[0])
+	}
+}
+
+// TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL guards the
+// issue #495 fix: the sender's avatar (projected by the same auth.users JOIN
+// as display name and email) must reach the HTTP history response, and stay
+// absent when the sender has none set — never a fabricated or defaulted URL.
+func TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL(t *testing.T) {
+	withAvatar := testMessage()
+	withAvatar.SenderAvatarURL = "/avatars/user-1.png"
+	withoutAvatar := testMessage()
+	withoutAvatar.ID = "77777777-7777-7777-7777-777777777777"
+
+	provider := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{
+		Messages: []domain.Message{withAvatar, withoutAvatar},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	msgsArr := decodeBody(t, rec)["data"].(map[string]any)["messages"].([]any)
+	if got := msgsArr[0].(map[string]any)["sender_avatar_url"]; got != "/avatars/user-1.png" {
+		t.Fatalf("expected sender_avatar_url to be preserved, got %#v", got)
+	}
+	if _, present := msgsArr[1].(map[string]any)["sender_avatar_url"]; present {
+		t.Fatalf("expected sender_avatar_url omitted for a sender with none set, got %#v", msgsArr[1])
+	}
+}
+
+// The tooltip needs a name and a way to recognise the reader among the
+// reactors, and nothing else: an address or a profile field here would be read
+// by every member of the conversation (issue #496).
+func assertReactionUsersAreMinimalIdentities(t *testing.T, reaction map[string]any) {
+	t.Helper()
+	users, ok := reaction["users"].([]any)
+	if !ok || len(users) != 2 {
+		t.Fatalf("expected the reaction to name its authors, got %#v", reaction["users"])
+	}
+	first := users[0].(map[string]any)
+	if first["display_name"] != "Álvaro Neto" || first["user_id"] != msgTestUserID {
+		t.Fatalf("expected the first author's display identity, got %#v", first)
+	}
+	for _, user := range users {
+		fields := user.(map[string]any)
+		if len(fields) != 2 {
+			t.Fatalf("reaction author must carry only user_id and display_name, got %#v", fields)
+		}
 	}
 }
 
@@ -1660,6 +1759,41 @@ func TestMessageHandler_ListDMMessages_Success(t *testing.T) {
 	msgsArr, ok := body["data"].(map[string]any)["messages"].([]any)
 	if !ok || len(msgsArr) != 1 {
 		t.Fatalf("expected 1 dm message, got %v", body["data"].(map[string]any)["messages"])
+	}
+}
+
+// TestMessageHandler_ListDMMessages_IncludesSenderAvatarURL mirrors
+// TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL for the DM
+// path (issue #495): a group DM and a 1:1 DM both list through ListDMMessages,
+// so this one test covers both — there is no per-conversation-type branch to
+// duplicate it for.
+func TestMessageHandler_ListDMMessages_IncludesSenderAvatarURL(t *testing.T) {
+	withAvatar := testMessage()
+	withAvatar.ChannelID = ""
+	withAvatar.DMConversationID = testConversationID
+	withAvatar.SenderAvatarURL = "/avatars/user-1.png"
+	withoutAvatar := testMessage()
+	withoutAvatar.ID = "77777777-7777-7777-7777-777777777777"
+	withoutAvatar.ChannelID = ""
+	withoutAvatar.DMConversationID = testConversationID
+
+	provider := &fakeMessageProvider{dmOut: service.ListDMMessagesOutput{
+		Messages: []domain.Message{withAvatar, withoutAvatar},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	msgsArr := decodeBody(t, rec)["data"].(map[string]any)["messages"].([]any)
+	if got := msgsArr[0].(map[string]any)["sender_avatar_url"]; got != "/avatars/user-1.png" {
+		t.Fatalf("expected sender_avatar_url to be preserved, got %#v", got)
+	}
+	if _, present := msgsArr[1].(map[string]any)["sender_avatar_url"]; present {
+		t.Fatalf("expected sender_avatar_url omitted for a sender with none set, got %#v", msgsArr[1])
 	}
 }
 

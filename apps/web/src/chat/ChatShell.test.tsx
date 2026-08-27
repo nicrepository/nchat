@@ -1187,6 +1187,182 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
   });
 });
 
+// ── issue #673: directCallSession is derived from directPresentationCall,
+// mirroring resourceCallSession's own derivation exactly. useCallSession is
+// mocked ONLY for these tests (vi.doMock, not the hoisted vi.mock every
+// other test in this file relies on the real CallSessionProvider for) so the
+// rest of the suite is untouched. ──
+
+describe("ChatShell — #673 directCallSession derivation", () => {
+  afterEach(() => {
+    vi.doUnmock("../calls/CallSessionProvider");
+    vi.doUnmock("./useChatSidebar");
+    vi.doUnmock("./ChatSidebar");
+    vi.resetModules();
+  });
+
+  function mockUseCallSession(overrides: Record<string, unknown> = {}) {
+    vi.doMock("../calls/CallSessionProvider", () => ({
+      useCallSession: () => ({
+        calls: { call: null, start: vi.fn(), end: vi.fn() },
+        resource: { active: null, callId: null, status: "idle", error: null },
+        joinResourceParticipation: vi.fn(),
+        registerDirectory: vi.fn(),
+        registerIdentity: vi.fn(),
+        getResourceCall: vi.fn(() => null),
+        media: {
+          participants: [],
+          activeSpeakerId: null,
+          microphoneEnabled: true,
+          pendingControl: null,
+          toggleMicrophone: vi.fn(),
+        },
+        expand: vi.fn(),
+        leaveResourceParticipation: vi.fn(),
+        localIdentity: { name: "Você", initials: "V" },
+        resourcePresentationCall: null,
+        directPresentationCall: null,
+        ...overrides,
+      }),
+    }));
+    vi.doMock("./useChatSidebar", () => ({
+      useChatSidebar: () => ({
+        state: { status: "ready", currentUserId, channels: [], dms: [] },
+        retry: vi.fn(),
+        setPinned: vi.fn(),
+        markRead: vi.fn(),
+        renameChannel: vi.fn(),
+      }),
+    }));
+    vi.doMock("./ChatSidebar", async () => {
+      const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
+      return { ...actual, default: () => null };
+    });
+  }
+
+  function DirectSessionProbe() {
+    const ctx = useOutletContext<ChatOutletContext>();
+    if (!ctx.directCallSession) return <span>ausente</span>;
+    return (
+      <>
+        <span data-testid="direct-call-id">{ctx.directCallSession.callId}</span>
+        <span data-testid="direct-call-type">{ctx.directCallSession.callType}</span>
+        <span data-testid="direct-peer-id">{ctx.directCallSession.peerUserId}</span>
+        <span data-testid="direct-mic-enabled">
+          {String(ctx.directCallSession.microphoneEnabled)}
+        </span>
+        <button type="button" onClick={() => ctx.directCallSession?.onLeave()}>
+          Sair da chamada
+        </button>
+        <button type="button" onClick={() => ctx.directCallSession?.onOpenFullCall()}>
+          Abrir chamada
+        </button>
+      </>
+    );
+  }
+
+  async function renderWithDirectSessionProbe() {
+    const { default: ChatShellFresh } = await import("./ChatShell");
+    return render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Routes>
+          <Route path="/chat" element={<ChatShellFresh />}>
+            <Route index element={<DirectSessionProbe />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("exposes no directCallSession when directPresentationCall is null (e.g. only ringing)", async () => {
+    vi.resetModules();
+    mockUseCallSession({ directPresentationCall: null });
+
+    await renderWithDirectSessionProbe();
+
+    expect(await screen.findByText("ausente")).toBeInTheDocument();
+  });
+
+  it("derives directCallSession from directPresentationCall, resolving peerUserId as the OTHER party", async () => {
+    vi.resetModules();
+    const directPresentationCall = {
+      call_id: "call-direct-1",
+      request_id: "req-1",
+      caller_id: currentUserId,
+      callee_id: "user-jl",
+      target_type: "user" as const,
+      call_type: "video" as const,
+      status: "active" as const,
+      version: 1,
+      created_at: "2024-01-01T12:00:00.000Z",
+      occurred_at: "2024-01-01T12:00:00.000Z",
+      expires_at: "2024-01-01T13:00:00.000Z",
+    };
+    mockUseCallSession({ directPresentationCall });
+
+    await renderWithDirectSessionProbe();
+
+    expect(await screen.findByTestId("direct-call-id")).toHaveTextContent("call-direct-1");
+    expect(screen.getByTestId("direct-call-type")).toHaveTextContent("video");
+    // The local user (currentUserId) is the caller — the peer is the callee.
+    expect(screen.getByTestId("direct-peer-id")).toHaveTextContent("user-jl");
+    expect(screen.getByTestId("direct-mic-enabled")).toHaveTextContent("true");
+  });
+
+  it("resolves peerUserId as the caller when the local user is the callee", async () => {
+    vi.resetModules();
+    mockUseCallSession({
+      directPresentationCall: {
+        call_id: "call-direct-2",
+        request_id: "req-2",
+        caller_id: "user-jl",
+        callee_id: currentUserId,
+        target_type: "user" as const,
+        call_type: "audio" as const,
+        status: "active" as const,
+        version: 1,
+        created_at: "2024-01-01T12:00:00.000Z",
+        occurred_at: "2024-01-01T12:00:00.000Z",
+        expires_at: "2024-01-01T13:00:00.000Z",
+      },
+    });
+
+    await renderWithDirectSessionProbe();
+
+    expect(await screen.findByTestId("direct-peer-id")).toHaveTextContent("user-jl");
+  });
+
+  it("wires onLeave to calls.end() and onOpenFullCall to expand() — the same authoritative actions FloatingCallWindow uses", async () => {
+    vi.resetModules();
+    const end = vi.fn();
+    const expand = vi.fn();
+    mockUseCallSession({
+      calls: { call: null, start: vi.fn(), end },
+      expand,
+      directPresentationCall: {
+        call_id: "call-direct-3",
+        request_id: "req-3",
+        caller_id: currentUserId,
+        callee_id: "user-jl",
+        target_type: "user" as const,
+        call_type: "audio" as const,
+        status: "active" as const,
+        version: 1,
+        created_at: "2024-01-01T12:00:00.000Z",
+        occurred_at: "2024-01-01T12:00:00.000Z",
+        expires_at: "2024-01-01T13:00:00.000Z",
+      },
+    });
+
+    await renderWithDirectSessionProbe();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Sair da chamada" }));
+    expect(end).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Abrir chamada" }));
+    expect(expand).toHaveBeenCalledOnce();
+  });
+});
+
 /**
  * ISSUE #527 (code review) — leaving the conversation that is on screen.
  *

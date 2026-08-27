@@ -276,6 +276,9 @@ function Probe() {
       <span data-testid="resource-presentation-call">
         {session.resourcePresentationCall?.call_id ?? "none"}
       </span>
+      <span data-testid="direct-presentation-call">
+        {session.directPresentationCall?.call_id ?? "none"}
+      </span>
       <button type="button" onClick={() => navigate("/profile")}>
         Perfil
       </button>
@@ -638,6 +641,86 @@ describe("CallSessionProvider", () => {
       renderProvider();
       fireEvent.click(screen.getByRole("button", { name: "Diretório" }));
       expect(mockStartRingtone).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── issue #673: directPresentationCall — the direct-call counterpart of
+  // resourcePresentationCall. Drives ownership through the real
+  // ownedMedia.connect bridge (captured from the mocked useResourceCallSession
+  // call args, exactly like the resource-side "claims media once..." test
+  // above) so ownerState genuinely becomes "local", never just asserted. ──
+
+  describe("directPresentationCall (issue #673)", () => {
+    it("stays null while the call is merely ringing — IncomingCallPopup owns that surface", () => {
+      calls.call = { ...activeDirect(), status: "ringing" };
+      renderProvider();
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent("none");
+    });
+
+    it("stays null once active but not yet locally connected (connecting)", () => {
+      calls.call = activeDirect();
+      renderProvider();
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent("none");
+    });
+
+    it("becomes non-null only once active, media-connected, AND locally owned", async () => {
+      calls.call = activeDirect();
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+
+      expect(screen.getByTestId("owner")).toHaveTextContent("local");
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent(callId);
+    });
+
+    it("clears once ownership moves to another tab, even though the call itself is still active", async () => {
+      calls.call = activeDirect();
+      const view = renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent(callId);
+
+      act(() => ownershipLost());
+      view.rerender(providerTree());
+
+      expect(screen.getByTestId("owner")).toHaveTextContent("remote");
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent("none");
+    });
+
+    it("never confuses a resource call for a direct one, or vice versa", async () => {
+      resource.active = { kind: "channel", id: channelId, name: "Produto" };
+      resource.callId = callId;
+      resource.status = "active";
+      media.status = "connected";
+      renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() =>
+        owned.connect(
+          { call_id: callId, call_type: "audio" } as never,
+          "token",
+          "wss://livekit",
+          "fresh",
+        ),
+      );
+
+      // ownerState is local for the RESOURCE call — calls.call is still null,
+      // so directActive (and therefore directPresentationCall) must stay null.
+      expect(screen.getByTestId("owner")).toHaveTextContent("local");
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent("none");
+    });
+
+    it("never goes stale after the call ends — clears the instant status leaves active", async () => {
+      calls.call = activeDirect();
+      const view = renderProvider();
+      const owned = vi.mocked(useResourceCallSession).mock.calls[0]![0];
+      await act(() => owned.connect(activeDirect() as never, "token", "wss://livekit", "fresh"));
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent(callId);
+
+      calls.call = { ...activeDirect(), status: "ended" };
+      view.rerender(providerTree());
+
+      expect(screen.getByTestId("direct-presentation-call")).toHaveTextContent("none");
     });
   });
 

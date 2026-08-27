@@ -26,33 +26,42 @@ import {
   useMemo,
   useRef,
   useState,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { useLocation, useNavigate, useOutletContext, useParams } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
 import "./ChatMessageArea.css";
-import ActiveResourceCallBar, {
-  type ActiveResourceCallBarProps,
-} from "../calls/ActiveResourceCallBar";
+import ActiveDirectCallBar, { type ActiveDirectCallBarProps } from "../calls/ActiveDirectCallBar";
+import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
-import { normalizeChatTargetId } from "./chatTargetId";
-import type { DMCounterpart, Message, PinnedItem } from "./chatTypes";
-import { fetchAllowedReactionEmojis, fetchChannelMessage, fetchDMMessage } from "./chatApi";
-import { useMessages, type LastMutation, type SendResult } from "./useMessages";
+import type { Channel, DMConversation, DMCounterpart, Message, PinnedItem } from "./chatTypes";
+import { fetchAllowedReactionEmojis } from "./chatApi";
+import { usePendingReference } from "./usePendingReference";
+import { useConversationTarget } from "./useConversationTarget";
+import { isCatalogedEmoji } from "./emoji/emojiCatalog";
+import { recentEmojis, type EmojiUsage } from "./emoji/emojiUsage";
+import { useEmojiUsage } from "./emoji/useEmojiUsage";
+import { useMessages, type LastMutation, type MessagesState, type SendResult } from "./useMessages";
 import { useTypingIndicator } from "./useTypingIndicator";
 import type { WSTypingUpdatedEvent } from "./useChatWebSocket";
 import { usePins } from "./usePins";
 import { selectLatestPin } from "./selectLatestPin";
-import { useConversationDetails } from "./useConversationDetails";
+import {
+  useConversationDetailsPanel,
+  type ConversationDetailsKind,
+  type ConversationDetailsPanelState,
+} from "./useConversationDetailsPanel";
+import { useResourceCallBar } from "./useResourceCallBar";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import ConversationSystemMessage from "./ConversationSystemMessage.tsx";
 import { systemScopeFor, type SystemMessageScope } from "./conversationSystemMessage";
 import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
-import ChatComposer, { type PendingReferencePreview } from "./ChatComposer";
+import ChatComposer from "./ChatComposer";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
 import PresenceDot from "./PresenceDot";
-import { presenceLabel, presenceTargetKey, usePresence } from "./presence";
+import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import {
   avatarColorFor,
   formatDayLabel,
@@ -63,13 +72,10 @@ import {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const defaultRecentReactions = ["👍", "❤️", "😂"];
 const quoteHighlightMs = 1_200;
 const reactionMenuLeaveDelayMs = 150;
-
-function recentReactionsKey(userID: string): string {
-  return `nchat_recent_reactions:${userID}`;
-}
+/** How many emoji the row above a message offers before "Mais reações". */
+const quickReactionCount = 3;
 
 /**
  * "Fulano está digitando…" for one or two people, an aggregate count beyond
@@ -87,64 +93,30 @@ function typingIndicatorText(
   return `${userIds.length} pessoas estão digitando…`;
 }
 
-function allowedRecentReactions(
-  userID: string,
-  allowed: string[],
-  sessionRecent: string[] = [],
-): string[] {
-  let stored: unknown = [];
-  try {
-    stored = JSON.parse(localStorage.getItem(recentReactionsKey(userID)) ?? "[]");
-  } catch {
-    // Ignore malformed local preferences.
-  }
-  const candidates = [
-    ...sessionRecent,
-    ...(Array.isArray(stored)
-      ? stored.filter((emoji): emoji is string => typeof emoji === "string")
-      : []),
-    ...defaultRecentReactions,
-    ...allowed,
-  ];
-  return [...new Set(candidates)].filter((emoji) => allowed.includes(emoji)).slice(0, 3);
+/**
+ * The quick-reaction row: what this person actually reaches for, backfilled
+ * from the server's curated shortlist so a brand-new account still has one
+ * (issue #496).
+ *
+ * The shortlist is the only server-provided part, and it is a suggestion: what
+ * a reaction may be is the catalog's decision, made again on the server for
+ * every toggle.
+ */
+/**
+ * Whether this UI ever offered the emoji: the server's quick row, or the
+ * catalog the picker is built from.
+ *
+ * A local echo of the server's answer, not a second policy — the same catalog
+ * decides again on the server for every toggle. It exists so a value this UI
+ * never showed is refused before it reaches the socket.
+ */
+function isOfferedReactionEmoji(emoji: string, quickRow: string[]): boolean {
+  return quickRow.includes(emoji) || isCatalogedEmoji(emoji);
 }
 
-function safeDecodeURIComponent(s: string): string {
-  try {
-    return decodeURIComponent(s);
-  } catch {
-    return s;
-  }
-}
-
-interface PendingReferenceLocation {
-  messageId: string;
-  targetKind: "channel" | "dm";
-  targetId: string;
-}
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const NIL_UUID = "00000000-0000-0000-0000-000000000000";
-
-function isValidUUID(value: unknown): value is string {
-  return typeof value === "string" && UUID_PATTERN.test(value) && value.toLowerCase() !== NIL_UUID;
-}
-
-function readPendingReference(state: unknown): PendingReferenceLocation | null {
-  if (typeof state !== "object" || state === null) return null;
-  const value = state as Record<string, unknown>;
-  if (
-    !isValidUUID(value.referencedMessageId) ||
-    !isValidUUID(value.referenceTargetId) ||
-    (value.referenceTargetKind !== "channel" && value.referenceTargetKind !== "dm")
-  ) {
-    return null;
-  }
-  return {
-    messageId: value.referencedMessageId,
-    targetKind: value.referenceTargetKind,
-    targetId: value.referenceTargetId,
-  };
+function quickReactionEmojis(usage: EmojiUsage, serverShortlist: string[]): string[] {
+  const candidates = [...recentEmojis(usage, quickReactionCount), ...serverShortlist];
+  return [...new Set(candidates)].slice(0, quickReactionCount);
 }
 
 function quoteAuthorLabel(
@@ -270,15 +242,33 @@ interface DirectCallActionsProps {
   onVideo: () => void;
 }
 
-/** RF-23 direct 1:1 call entry: audio and video remain distinct call types. */
+/**
+ * RF-23 direct 1:1 call entry: audio and video remain distinct call types,
+ * each its own icon button (issue #673) — never consolidated into one
+ * control or an intermediate type-picker menu.
+ */
 function DirectCallActions({ onAudio, onVideo }: DirectCallActionsProps) {
   return (
-    <div className="chat-msg-area__call-actions" aria-label="Iniciar chamada">
-      <button type="button" aria-label="Iniciar chamada de áudio" onClick={onAudio}>
-        Áudio
+    <div className="chat-msg-area__call-actions">
+      <button
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Iniciar chamada de áudio"
+        onClick={onAudio}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          call
+        </span>
       </button>
-      <button type="button" aria-label="Iniciar chamada de vídeo" onClick={onVideo}>
-        Vídeo
+      <button
+        type="button"
+        className="chat-msg-area__header-btn"
+        aria-label="Iniciar chamada de vídeo"
+        onClick={onVideo}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          videocam
+        </span>
       </button>
     </div>
   );
@@ -299,18 +289,23 @@ export type ResourceCallHeaderState = { onCall: () => void; disabled?: boolean }
 /**
  * RF-24 channel/group entry (issue #540 follow-up). A resource room is one
  * multiparty call, never separate "audio" and "video" rooms, so there is a
- * single action instead of RF-23's two.
+ * single action instead of RF-23's two. An icon button (issue #673) rather
+ * than the previous "Chamada" text label — the accessible name, disabled
+ * state, and onCall action are unchanged.
  */
 function ResourceCallAction({ state }: { state: ResourceCallHeaderState }) {
   return (
-    <div className="chat-msg-area__call-actions" aria-label="Chamada">
+    <div className="chat-msg-area__call-actions">
       <button
         type="button"
+        className="chat-msg-area__header-btn"
         aria-label="Iniciar chamada"
         onClick={state.onCall}
         disabled={Boolean(state.disabled)}
       >
-        Chamada
+        <span className="material-symbols-outlined" aria-hidden="true">
+          call
+        </span>
       </button>
     </div>
   );
@@ -353,6 +348,58 @@ interface HeaderDMProps {
   presenceTarget?: string;
 }
 
+/**
+ * The counterpart's avatar: their picture when it loads, their initials when it
+ * does not.
+ *
+ * A load failure is scoped to the URL that was current when it happened, so a
+ * change of src must clear it — otherwise navigating A → B → A would never retry
+ * A. This uses React's "adjust state when a prop changes" pattern (reset during
+ * render, guarded so it runs ONLY when src actually changes, never every
+ * render); an effect would trip react-hooks/set-state-in-effect. An unchanged
+ * src that keeps failing stays on the initials fallback.
+ */
+function HeaderAvatar({
+  name,
+  counterpart,
+  presence,
+}: {
+  name: string;
+  counterpart: DMCounterpart | undefined;
+  presence: PresenceState;
+}) {
+  const src = counterpart?.avatarUrl;
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const [trackedSrc, setTrackedSrc] = useState(src);
+  if (src !== trackedSrc) {
+    setTrackedSrc(src);
+    setFailedSrc(null);
+  }
+  // Same deterministic colour the sidebar uses for this person, so the initials
+  // fallback matches across both surfaces. Keyed on the counterpart user id
+  // (stable per person); legacy DMs without a counterpart fall back to the name.
+  const color = avatarColorFor(counterpart?.userId ?? name);
+  return (
+    <div
+      className={`chat-msg-area__header-avatar chat-msg-area__header-avatar--${color}`}
+      aria-hidden="true"
+    >
+      {Boolean(src) && failedSrc !== src ? (
+        <img
+          className="chat-msg-area__header-avatar-img"
+          src={src}
+          alt=""
+          referrerPolicy="no-referrer"
+          onError={() => setFailedSrc(src ?? null)}
+        />
+      ) : (
+        initialsFrom(counterpart?.displayName ?? name)
+      )}
+      <PresenceDot state={presence} size="md" />
+    </div>
+  );
+}
+
 export function HeaderDM({
   name,
   counterpart,
@@ -361,45 +408,11 @@ export function HeaderDM({
   detailsToggle,
   presenceTarget,
 }: HeaderDMProps) {
-  const src = counterpart?.avatarUrl;
-  // A load failure is scoped to the URL that was current when it happened, so a
-  // change of src must clear it — otherwise navigating A → B → A would never
-  // retry A. This uses React's "adjust state when a prop changes" pattern (reset
-  // during render, guarded so it runs ONLY when src actually changes, never every
-  // render); an effect would trip react-hooks/set-state-in-effect. An unchanged
-  // src that keeps failing stays on the initials fallback.
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  const [trackedSrc, setTrackedSrc] = useState(src);
-  if (src !== trackedSrc) {
-    setTrackedSrc(src);
-    setFailedSrc(null);
-  }
-  const showImage = Boolean(src) && failedSrc !== src;
-  // Same deterministic colour the sidebar uses for this person, so the initials
-  // fallback matches across both surfaces. Keyed on the counterpart user id
-  // (stable per person); legacy DMs without a counterpart fall back to the name.
-  const color = avatarColorFor(counterpart?.userId ?? name);
   const presence = usePresence(counterpart?.userId, presenceTarget);
 
   return (
     <header className="chat-msg-area__header" data-testid="chat-msg-header">
-      <div
-        className={`chat-msg-area__header-avatar chat-msg-area__header-avatar--${color}`}
-        aria-hidden="true"
-      >
-        {showImage ? (
-          <img
-            className="chat-msg-area__header-avatar-img"
-            src={src}
-            alt=""
-            referrerPolicy="no-referrer"
-            onError={() => setFailedSrc(src ?? null)}
-          />
-        ) : (
-          initialsFrom(counterpart?.displayName ?? name)
-        )}
-        <PresenceDot state={presence} size="md" />
-      </div>
+      <HeaderAvatar name={name} counterpart={counterpart} presence={presence} />
       <h1 className="chat-msg-area__header-title">{name}</h1>
       {/* The header states the status in words as well: this is the surface a
           reader is looking at while writing to this person, so "Ausente" being
@@ -490,6 +503,18 @@ function EmptyState({ kind, name }: EmptyStateProps) {
   );
 }
 
+/**
+ * Scrolls the timeline to its newest message.
+ *
+ * The capability check is for jsdom, which implements no layout and therefore no
+ * scrollIntoView; a test asserting on message order must not fail on it.
+ */
+function scrollToBottom(bottomRef: RefObject<HTMLDivElement | null>): void {
+  if (typeof bottomRef.current?.scrollIntoView === "function") {
+    bottomRef.current.scrollIntoView({ behavior: "smooth" });
+  }
+}
+
 interface MessageListProps {
   messages: Message[];
   currentUserId: string;
@@ -522,8 +547,10 @@ interface MessageListProps {
   onTogglePin?: (messageId: string, pin: boolean) => void;
   /** RF-05: set of currently-pinned message IDs in this target. */
   pinnedIds?: Set<string>;
-  allowedReactionEmojis: string[];
   recentReactionEmojis: string[];
+  /** Local emoji history and skin tone, owned by this conversation (issue #496). */
+  emojiUsage: EmojiUsage;
+  onEmojiToneChange: (tone: number) => void;
   focusMessageId?: string;
 }
 
@@ -550,8 +577,9 @@ function MessageList({
   presenceTarget,
   onTogglePin,
   pinnedIds,
-  allowedReactionEmojis,
   recentReactionEmojis,
+  emojiUsage,
+  onEmojiToneChange,
   focusMessageId,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
@@ -673,14 +701,10 @@ function MessageList({
       // Shift scrollTop by the amount the container grew so the user's view is stable.
       el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
     } else if (lastMutation === "initial" || lastMutation === "append") {
-      if (typeof bottomRef.current?.scrollIntoView === "function") {
-        bottomRef.current.scrollIntoView({ behavior: "smooth" });
-      }
+      scrollToBottom(bottomRef);
     } else if (lastMutation === "ws_append" && isNearBottomRef.current) {
       // Only auto-scroll on WS messages when user is already near the bottom.
-      if (typeof bottomRef.current?.scrollIntoView === "function") {
-        bottomRef.current.scrollIntoView({ behavior: "smooth" });
-      }
+      scrollToBottom(bottomRef);
     }
 
     // Only snapshot scrollHeight in a stable state — not during "none" transitions
@@ -791,8 +815,10 @@ function MessageList({
             presenceTarget={presenceTarget}
             onTogglePin={onTogglePin}
             isPinned={pinnedIds?.has(item.message.id) ?? false}
-            allowedReactionEmojis={allowedReactionEmojis}
             recentReactionEmojis={recentReactionEmojis}
+            emojiUsage={emojiUsage}
+            onEmojiToneChange={onEmojiToneChange}
+            currentUserId={currentUserId}
             reactionMenuVisible={hoveredMessageId === item.message.id}
             onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
             pickerOpen={openPickerMessageId === item.message.id}
@@ -947,95 +973,326 @@ function PinnedBar({ pin, onUnpin }: PinnedBarProps) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
+interface ConversationHeaderProps {
+  kind: "channel" | "dm";
+  name: string;
+  counterpart: DMCounterpart | undefined;
+  presenceTarget: string | undefined;
+  onStartCall: ChatOutletContext["startCall"];
+  resourceCall: ResourceCallHeaderState | undefined;
+  details: ConversationDetailsPanelState;
+  detailsToggleRef: RefObject<HTMLButtonElement | null>;
+}
+
+/** The channel or DM header, and the details control both of them offer. */
+function ConversationHeader({
+  kind,
+  name,
+  counterpart,
+  presenceTarget,
+  onStartCall,
+  resourceCall,
+  details,
+  detailsToggleRef,
+}: ConversationHeaderProps) {
+  const detailsToggle = details.supportsDetails ? (
+    <DetailsToggle
+      ref={detailsToggleRef}
+      open={details.showDetails}
+      label={details.toggleLabel}
+      onToggle={details.toggle}
+    />
+  ) : undefined;
+  if (kind === "channel") {
+    return <HeaderChannel name={name} resourceCall={resourceCall} detailsToggle={detailsToggle} />;
+  }
+  return (
+    <HeaderDM
+      name={name}
+      counterpart={counterpart}
+      presenceTarget={presenceTarget}
+      onStartCall={onStartCall}
+      resourceCall={resourceCall}
+      detailsToggle={detailsToggle}
+    />
+  );
+}
+
+/** Every callback the timeline hands down to a message. */
+interface TimelineActions {
+  onLoadMore: () => void;
+  onToggleReaction: (messageId: string, emoji: string) => void;
+  onReplyMessage: (message: Message) => void;
+  onReferenceMessage: (message: Message) => void;
+  onForwardMessage: (message: Message) => void;
+  onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
+  onToggleFavorite: MessageBubbleProps["onToggleFavorite"];
+  onReconcileLinkSafety: MessageBubbleProps["onReconcileLinkSafety"];
+  onEditMessage: MessageBubbleProps["onEditMessage"];
+  onEditForbidden: MessageBubbleProps["onEditForbidden"];
+  onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
+  onTogglePin: (messageId: string, pin: boolean) => void;
+  onRetry: () => void;
+}
+
+interface ConversationTimelineProps {
+  kind: "channel" | "dm";
+  targetId: string;
+  name: string;
+  detailsKind: ConversationDetailsKind | null;
+  state: MessagesState;
+  currentUserId: string;
+  actions: TimelineActions;
+  editDisabledIds: Set<string>;
+  pinnedIds: Set<string>;
+  recentReactionEmojis: string[];
+  emojiUsage: EmojiUsage;
+  onEmojiToneChange: (tone: number) => void;
+  focusMessageId: string;
+}
+
+/**
+ * Which of the conversation's four states is on screen: still loading, failed,
+ * empty, or a list of messages.
+ *
+ * The channel-only props are resolved here rather than by the caller, because
+ * "does a DM have a channel id" is a question about this timeline and not about
+ * the page around it.
+ */
+function ConversationTimeline({
+  kind,
+  targetId,
+  name,
+  detailsKind,
+  state,
+  currentUserId,
+  actions,
+  editDisabledIds,
+  pinnedIds,
+  recentReactionEmojis,
+  emojiUsage,
+  onEmojiToneChange,
+  focusMessageId,
+}: ConversationTimelineProps) {
+  if (state.status === "loading") return <LoadingSkeleton />;
+  if (state.status === "error") return <ErrorState onRetry={actions.onRetry} />;
+  if (state.status !== "ready") return null;
+  if (state.messages.length === 0) return <EmptyState kind={kind} name={name} />;
+  const channelId = kind === "channel" ? targetId : undefined;
+  return (
+    <MessageList
+      messages={state.messages}
+      currentUserId={currentUserId}
+      // "canal" / "grupo" / "conversa" for this timeline's system messages
+      // (issue #527).
+      systemScope={systemScopeFor(detailsKind, kind)}
+      hasMore={state.nextCursor !== ""}
+      loadingMore={state.loadingMore}
+      lastMutation={state.lastMutation}
+      onLoadMore={actions.onLoadMore}
+      onToggleReaction={actions.onToggleReaction}
+      onReplyMessage={actions.onReplyMessage}
+      onReferenceMessage={actions.onReferenceMessage}
+      onForwardMessage={channelId ? actions.onForwardMessage : undefined}
+      onReferenceJump={actions.onReferenceJump}
+      onToggleFavorite={actions.onToggleFavorite}
+      onReconcileLinkSafety={actions.onReconcileLinkSafety}
+      onEditMessage={actions.onEditMessage}
+      onEditForbidden={actions.onEditForbidden}
+      onDeleteMessage={actions.onDeleteMessage}
+      editDisabledIds={editDisabledIds}
+      channelId={channelId}
+      presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
+      onTogglePin={actions.onTogglePin}
+      pinnedIds={pinnedIds}
+      recentReactionEmojis={recentReactionEmojis}
+      emojiUsage={emojiUsage}
+      onEmojiToneChange={onEmojiToneChange}
+      focusMessageId={focusMessageId}
+    />
+  );
+}
+
+/**
+ * The strip between the timeline and the composer: a failed send, an unstable
+ * connection, a refused action, and who is typing.
+ *
+ * The three errors share one line because only one of them can usefully be read
+ * at a time, and the order is the order they matter in.
+ */
+function ConversationNotices({
+  sendError,
+  realtimeError,
+  reactionError,
+  actionError,
+  pinError,
+  typingLabel,
+}: {
+  sendError: string | null;
+  realtimeError: string | null;
+  reactionError: string | null;
+  actionError: string | null;
+  pinError: string | null;
+  typingLabel: string | null;
+}) {
+  const refusal = reactionError ?? actionError ?? pinError;
+  return (
+    <>
+      {sendError && (
+        <div className="chat-msg-area__send-error" role="alert" data-testid="chat-send-error">
+          <IconWarning />
+          {sendError}
+        </div>
+      )}
+      {realtimeError && (
+        <div
+          className="chat-msg-area__realtime-error"
+          role="status"
+          data-testid="chat-realtime-error"
+        >
+          <IconWarning />
+          Conexão em tempo real instável. Tentando reconectar...
+        </div>
+      )}
+      {refusal && (
+        <div className="chat-msg-area__reaction-error" role="alert">
+          <IconWarning />
+          {refusal}
+        </div>
+      )}
+      {typingLabel && (
+        <div
+          className="chat-msg-area__typing-indicator"
+          role="status"
+          data-testid="chat-typing-indicator"
+        >
+          <span className="chat-msg-area__typing-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
+          {typingLabel}
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * The two message dialogs. Both render through a portal, so their position in
+ * the tree costs the conversation column no layout.
+ */
+function ConversationDialogs({
+  kind,
+  targetId,
+  channels,
+  dms,
+  referenceSource,
+  forwardSource,
+  onCloseReference,
+  onSelectReferenceDestination,
+  onCloseForward,
+}: {
+  kind: "channel" | "dm";
+  targetId: string;
+  channels: Channel[];
+  dms: DMConversation[];
+  referenceSource: Message | null;
+  forwardSource: ForwardSourceContext | null;
+  onCloseReference: () => void;
+  onSelectReferenceDestination: (target: { kind: "channel" | "dm"; id: string }) => void;
+  onCloseForward: () => void;
+}) {
+  return (
+    <>
+      {referenceSource && (
+        <ReferenceDestinationDialog
+          current={{ kind, id: targetId }}
+          channels={channels}
+          dms={dms}
+          onClose={onCloseReference}
+          onSelect={onSelectReferenceDestination}
+        />
+      )}
+      {forwardSource && kind === "channel" && (
+        <ForwardMessageDialog
+          source={forwardSource}
+          channels={channels}
+          onClose={onCloseForward}
+          onSuccess={onCloseForward}
+        />
+      )}
+    </>
+  );
+}
+
 interface ChatMessageAreaProps {
   kind: "channel" | "dm";
 }
 
+/**
+ * The direct 1:1 call bar for this view, or nothing (#673).
+ *
+ * Derived from ChatShell's own directCallSession — itself populated only once
+ * CallSessionProvider's directPresentationCall authority is non-null (genuinely
+ * active, media-connected, locally owned; never merely ringing — IncomingCallPopup
+ * keeps owning that surface). Matched against THIS view's own server-resolved
+ * counterpart (never the route or a display name) so the bar only ever appears in
+ * the exact DM the call belongs to — navigating to a different conversation, or a
+ * call belonging to a different DM, never shows it here.
+ *
+ * A module-level function rather than inline in ChatMessageArea, which the
+ * resource call bar already left for the same reason: the component states what
+ * it renders, and each bar decides for itself whether it applies.
+ */
+function directCallBar(
+  kind: "channel" | "dm",
+  session: ChatOutletContext["directCallSession"],
+  counterpart: DMCounterpart | undefined,
+): ActiveDirectCallBarProps | null {
+  if (kind !== "dm" || !session || !counterpart || counterpart.userId !== session.peerUserId) {
+    return null;
+  }
+  return {
+    title: `${session.callType === "video" ? "Chamada de vídeo" : "Chamada de voz"} — ${counterpart.displayName}`,
+    startedAt: session.startedAt,
+    peerUserId: session.peerUserId,
+    peerName: counterpart.displayName,
+    peerAvatarUrl: counterpart.avatarUrl,
+    microphoneEnabled: session.microphoneEnabled,
+    microphonePending: session.microphonePending,
+    onToggleMicrophone: session.onToggleMicrophone,
+    onLeave: session.onLeave,
+    onOpenFullCall: session.onOpenFullCall,
+  };
+}
+
 export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
-  const params = useParams<{ id: string }>();
-  const rawId = params.id ?? "";
-  const targetId = normalizeChatTargetId(safeDecodeURIComponent(rawId));
   const location = useLocation();
   const navigate = useNavigate();
-  const focusMessageId = new URLSearchParams(location.search).get("message") ?? "";
+  const target = useConversationTarget(kind);
+  const { ctx, targetId, focusMessageId, activeDM, resolvedName } = target;
   const [referenceSource, setReferenceSource] = useState<Message | null>(null);
   const [forwardSource, setForwardSource] = useState<ForwardSourceContext | null>(null);
-  const pendingReference = useMemo(() => readPendingReference(location.state), [location.state]);
-  const pendingReferenceId = pendingReference?.messageId ?? "";
-  const pendingReferenceKey = pendingReference
-    ? `${pendingReference.targetKind}:${pendingReference.targetId}:${pendingReference.messageId}`
-    : "";
-  const [referenceResolution, setReferenceResolution] = useState<{
-    key: string;
-    preview: Extract<PendingReferencePreview, { status: "available" | "unavailable" }>;
-  } | null>(null);
-  const referencePreview = useMemo<PendingReferencePreview>(() => {
-    if (!pendingReference) return { status: "idle" };
-    return referenceResolution?.key === pendingReferenceKey
-      ? referenceResolution.preview
-      : { status: "loading", messageId: pendingReference.messageId };
-  }, [pendingReference, pendingReferenceKey, referenceResolution]);
-
-  const ctx = useOutletContext<ChatOutletContext>() ?? { currentUserId: "", channels: [], dms: [] };
-
-  // The sidebar payload already carries the counterpart identity, so the header
-  // reads it from the outlet context instead of issuing a per-DM request.
-  const activeDM = kind === "dm" ? ctx.dms.find((dm) => dm.id === targetId) : undefined;
-  const resolvedName =
-    kind === "channel"
-      ? (ctx.channels.find((ch) => ch.id === targetId)?.name ?? targetId)
-      : (activeDM?.name ?? targetId);
-  const referenceTargetLabel = useMemo(() => {
-    if (pendingReference?.targetKind === "channel") {
-      const name = ctx.channels.find((channel) => channel.id === pendingReference.targetId)?.name;
-      return name ? `#${name}` : "Canal";
-    }
-    if (pendingReference?.targetKind === "dm") {
-      return ctx.dms.find((dm) => dm.id === pendingReference.targetId)?.name ?? "Conversa";
-    }
-    return "Conversa";
-  }, [ctx.channels, ctx.dms, pendingReference]);
-
-  const [allowedReactionEmojiState, setAllowedReactionEmojis] = useState<string[]>([]);
-  const [sessionRecentReactions, setSessionRecentReactions] = useState<{
-    userID: string;
-    emojis: string[];
-  }>({ userID: "", emojis: [] });
+  const pendingReference = usePendingReference(location.state, ctx.channels, ctx.dms);
+  const [allowedReactionEmojis, setAllowedReactionEmojis] = useState<string[]>([]);
+  const {
+    usage: emojiUsage,
+    remember: rememberReaction,
+    changeTone: changeEmojiTone,
+  } = useEmojiUsage(ctx.currentUserId);
   const [reactionInputError, setReactionInputError] = useState<string | null>(null);
   const [editDisabledIds, setEditDisabledIds] = useState<Set<string>>(new Set());
   const lastReactionToggleRef = useRef({ key: "", at: 0 });
-  const allowedReactionEmojis = useMemo(
-    () => allowedReactionEmojiState,
-    [allowedReactionEmojiState],
-  );
   const recentReactionEmojis = useMemo(
-    () =>
-      allowedRecentReactions(
-        ctx.currentUserId,
-        allowedReactionEmojis,
-        sessionRecentReactions.userID === ctx.currentUserId ? sessionRecentReactions.emojis : [],
-      ),
-    [allowedReactionEmojis, ctx.currentUserId, sessionRecentReactions],
+    () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
+    [allowedReactionEmojis, emojiUsage],
   );
-
-  const rememberReaction = useCallback(
-    (emoji: string) => {
-      if (!ctx.currentUserId || !allowedReactionEmojis.includes(emoji)) return;
-      setSessionRecentReactions((current) => {
-        const existing =
-          current.userID === ctx.currentUserId
-            ? current.emojis
-            : allowedRecentReactions(ctx.currentUserId, allowedReactionEmojis);
-        const next = [emoji, ...existing.filter((item) => item !== emoji)].slice(0, 3);
-        try {
-          localStorage.setItem(recentReactionsKey(ctx.currentUserId), JSON.stringify(next));
-        } catch {
-          // Local preferences are best-effort and must never block reaction updates.
-        }
-        return { userID: ctx.currentUserId, emojis: next };
-      });
-    },
-    [allowedReactionEmojis, ctx.currentUserId],
+  // One object, so the composer's toolbar is not re-rendered by the identity of
+  // its own props changing every frame.
+  const composerEmoji = useMemo(
+    () => ({ usage: emojiUsage, onToneChange: changeEmojiTone, onUsed: rememberReaction }),
+    [changeEmojiTone, emojiUsage, rememberReaction],
   );
 
   const pinTarget = useMemo(() => (targetId ? { kind, id: targetId } : null), [kind, targetId]);
@@ -1046,99 +1303,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   // once and neither can show a message the other does not.
   const latestPin = useMemo(() => selectLatestPin(pins), [pins]);
 
-  // Panel state lives here, in the component that owns the conversation, and
-  // not in the message list or a global store. This component is not remounted
-  // when messages change or when the route parameter changes, so toggling the
-  // panel cannot restart useMessages, the WebSocket subscription, the composer
-  // or the scroll position — and the panel stays open across a channel switch.
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsToggleRef = useRef<HTMLButtonElement>(null);
-  // Which aggregate the panel would describe, from the domain discriminant:
-  // chat.channels for a channel, and a chat.dm_conversations row of type
-  // 'group' or 'direct' for a conversation. Only an unknown target resolves to
-  // null.
-  //
-  // activeDM.type is the server's own `direct`/`group` value carried by the
-  // sidebar payload, never the participant count or the conversation's name: a
-  // group that happens to have two people is still a group, and a 1:1 DM whose
-  // title looks like a group's is still a 1:1.
-  //
-  // The same discriminant decides whether the panel offers "Adicionar membros"
-  // (issue #398): a channel and a group do, a 1:1 does not — adding a third
-  // person would convert a direct conversation into a group, which that issue
-  // deliberately does not do.
-  const detailsKind: "channel" | "group" | "direct" | null =
-    targetId === ""
-      ? null
-      : kind === "channel"
-        ? "channel"
-        : activeDM === undefined
-          ? null
-          : activeDM.type === "group"
-            ? "group"
-            : "direct";
-  const supportsDetails = detailsKind !== null;
-  const detailsTarget = useMemo(
-    () => (detailsKind && detailsOpen ? { kind: detailsKind, id: targetId } : null),
-    [detailsKind, detailsOpen, targetId],
-  );
-  const detailsState = useConversationDetails(detailsTarget);
-
-  // members.added names nobody, so the only correct response is to refetch the
-  // open panel (issue #398) — and it is the same call the local add makes, so
-  // the HTTP response and the event converge on one view of the roster instead
-  // of two. A closed panel has no target and so refetches nothing.
-  const reloadOpenDetails = detailsState.reload;
-
-  // A rename lands in the sidebar payload first — through this actor's own
-  // refetch or through channel.updated for everybody else — and the header above
-  // reads its name straight from there. The open details panel does not: it
-  // holds its own display_name from GET /details, so without this it would keep
-  // showing the old one until the panel was closed and reopened (issue #527).
-  //
-  // Watching the rendered name rather than subscribing to a second WebSocket
-  // callback is deliberate: every source of a name change — the local rename,
-  // the realtime event, a reconciling refetch — arrives through this one value,
-  // so one effect covers all three and the panel refetches from the authority
-  // instead of patching a field.
-  //
-  // The name is watched *together with the target's identity*, and that pairing
-  // is the whole point. Switching conversations also changes `resolvedName`, but
-  // there useConversationDetails is already loading the new target from its own
-  // kind/id effect — reloading here as well would abort that request and issue a
-  // second one for the same panel. So a changed identity is left alone, and only
-  // a name that moved *under the same conversation* triggers a refetch. A closed
-  // panel has no target and refetches nothing either way.
-  const openDetailsKey = `${kind}:${targetId}`;
-  const lastDetailsRef = useRef({ key: openDetailsKey, name: resolvedName });
-  useEffect(() => {
-    const previous = lastDetailsRef.current;
-    lastDetailsRef.current = { key: openDetailsKey, name: resolvedName };
-    // Navigation: useConversationDetails owns the load for the new target.
-    if (previous.key !== openDetailsKey) return;
-    if (previous.name === resolvedName) return;
-    if (detailsOpen) reloadOpenDetails();
-  }, [openDetailsKey, resolvedName, detailsOpen, reloadOpenDetails]);
-
-  // Focus returns to the control that opened the panel — but after the render
-  // that closes it, never during the click that asked for it. Below the
-  // wide-desktop threshold (issue #467) the panel covers the conversation and
-  // the header is hidden underneath it, and an element inside a hidden subtree
-  // cannot take focus; by the time this effect runs the header is on screen
-  // again. Guarded by the flag so only a real close restores focus, and by the
-  // ref so a control that is no longer mounted — after a channel switch to a DM
-  // it is not — never drops focus to <body>.
-  const restoreDetailsFocusRef = useRef(false);
-  const closeDetails = useCallback(() => {
-    restoreDetailsFocusRef.current = true;
-    setDetailsOpen(false);
-  }, []);
-  useEffect(() => {
-    if (detailsOpen || !restoreDetailsFocusRef.current) return;
-    restoreDetailsFocusRef.current = false;
-    detailsToggleRef.current?.focus();
-  }, [detailsOpen]);
-  const toggleDetails = useCallback(() => setDetailsOpen((open) => !open), []);
+  const details = useConversationDetailsPanel({
+    kind,
+    targetId,
+    activeDM,
+    resolvedName,
+    toggleRef: detailsToggleRef,
+  });
+  const detailsKind = details.detailsKind;
+  const reloadOpenDetails = details.reload;
 
   // Typing indicator: useTypingIndicator needs sendTyping, which useMessages
   // only produces once called, but useMessages needs an onTypingUpdated
@@ -1254,38 +1428,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, [typing.typingUserIds, typing.typingDisplayNameByUserId, typingNameByUserId]);
 
   useEffect(() => {
-    if (!pendingReference) return;
-    const { messageId, targetKind, targetId: sourceTargetId } = pendingReference;
-
-    const controller = new AbortController();
-    const request =
-      targetKind === "channel"
-        ? fetchChannelMessage(sourceTargetId, messageId, controller.signal)
-        : fetchDMMessage(sourceTargetId, messageId, controller.signal);
-    request.then(
-      (message) => {
-        if (controller.signal.aborted) return;
-        setReferenceResolution({
-          key: pendingReferenceKey,
-          preview:
-            message.id === messageId && !message.isRemoved
-              ? { status: "available", messageId, message }
-              : { status: "unavailable", messageId },
-        });
-      },
-      () => {
-        if (!controller.signal.aborted) {
-          setReferenceResolution({
-            key: pendingReferenceKey,
-            preview: { status: "unavailable", messageId },
-          });
-        }
-      },
-    );
-    return () => controller.abort();
-  }, [pendingReference, pendingReferenceKey]);
-
-  useEffect(() => {
     let active = true;
     fetchAllowedReactionEmojis().then(
       (emojis) => {
@@ -1302,7 +1444,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   const handleSend = useCallback(
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
-      const result = await sendMessage(body, pendingReferenceId || undefined, attachmentIds);
+      const result = await sendMessage(
+        body,
+        pendingReference.messageId || undefined,
+        attachmentIds,
+      );
       if (result.status === "sent") {
         // Sending is itself the clearest possible "stopped typing" signal —
         // do not wait for the composer-cleared activity event or the
@@ -1312,7 +1458,14 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       }
       return result;
     },
-    [location.pathname, location.search, navigate, pendingReferenceId, sendMessage, typingStop],
+    [
+      location.pathname,
+      location.search,
+      navigate,
+      pendingReference.messageId,
+      sendMessage,
+      typingStop,
+    ],
   );
 
   const selectReferenceDestination = useCallback(
@@ -1356,7 +1509,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
   const handleToggleReaction = useCallback(
     (messageId: string, emoji: string) => {
-      if (!allowedReactionEmojis.includes(emoji)) {
+      if (!isOfferedReactionEmoji(emoji, allowedReactionEmojis)) {
         setReactionInputError("Emoji não permitido para reações.");
         return;
       }
@@ -1392,117 +1545,43 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [kind, targetId],
   );
 
-  const showDetails = supportsDetails && detailsOpen;
+  const resourceCall = useResourceCallBar({
+    kind,
+    targetId,
+    resolvedName,
+    detailsKind,
+    ctx,
+  });
 
-  // A group's control names the panel; a 1:1's names the person it is about,
-  // because "Detalhes da conversa" would be an odd thing to hear announced for
-  // a panel that shows one profile. The name comes from the sidebar payload the
-  // header already renders, so the label never waits on a request; when the
-  // counterpart could not be resolved it degrades to the conversation itself
-  // rather than to a blank or an ID.
-  const detailsToggleLabel =
-    detailsKind === "direct"
-      ? activeDM?.counterpart?.displayName
-        ? `Abrir perfil de ${activeDM.counterpart.displayName}`
-        : "Abrir perfil da conversa"
-      : "Detalhes do grupo";
+  const closeReferenceDialog = useCallback(() => setReferenceSource(null), []);
+  const clearPendingReference = useCallback(
+    () => navigate(`${location.pathname}${location.search}`, { replace: true, state: null }),
+    [location.pathname, location.search, navigate],
+  );
 
-  // RF-24/#622 round 2: a resource call room applies only to a channel or a
-  // group DM — a 1:1 (detailsKind === "direct") keeps using RF-23's
-  // onStartCall above and never touches discovery at all. Discovery
-  // (getResourceCall) and participation (isParticipatingIn) are independent
-  // of whether the join action is currently available: ctx.joinResourceCall
-  // is undefined exactly while RF-23/RF-24's shared Room is busy elsewhere
-  // (ChatShell's own gate, unchanged since before this issue), so "can I
-  // click this" is read directly off its presence — discovery itself must
-  // never be hidden just because that's the case.
-  const resourceCallKind: "channel" | "dm" | null =
-    kind === "channel" ? "channel" : detailsKind === "group" ? "dm" : null;
-  const discoveredResourceCall =
-    resourceCallKind && targetId
-      ? (ctx.getResourceCall?.(resourceCallKind, targetId) ?? null)
-      : null;
-  const resourceCallExists = discoveredResourceCall?.status === "active";
-  const participatingHere =
-    resourceCallKind && targetId
-      ? (ctx.isParticipatingIn?.(resourceCallKind, targetId) ?? false)
-      : false;
+  // One object rather than a dozen props: the timeline hands every one of these
+  // straight down to a message, and none of them means anything on its own here.
+  const timelineActions: TimelineActions = {
+    onLoadMore: loadMore,
+    onToggleReaction: handleToggleReaction,
+    onReplyMessage: selectReply,
+    onReferenceMessage: setReferenceSource,
+    onForwardMessage: selectForwardSource,
+    onReferenceJump: jumpToReference,
+    onToggleFavorite: toggleFavorite,
+    onReconcileLinkSafety: reconcileLinkSafety,
+    onEditMessage: editMessageLocal,
+    onEditForbidden: handleEditForbidden,
+    onDeleteMessage: deleteMessageLocal,
+    onTogglePin: togglePin,
+    onRetry: retry,
+  };
 
-  // #657: Deduplicate the header. If there's an active call (or if we are
-  // participating), the header actions are completely suppressed (undefined)
-  // because the ActiveResourceCallBar takes over. The "Chamada" start button
-  // is preserved only when no call exists and we are not in one.
-  const resourceCallHeaderState: ResourceCallHeaderState | undefined =
-    !resourceCallKind || !targetId || resourceCallExists || participatingHere
-      ? undefined
-      : {
-          disabled: !ctx.joinResourceCall,
-          onCall: () =>
-            ctx.joinResourceCall?.({
-              kind: resourceCallKind,
-              id: targetId,
-              name: resolvedName,
-            }),
-        };
-
-  // #642: channel keeps the "#" prefix already used everywhere else in this
-  // header; a group DM has no channel-style handle, so it uses the bare
-  // name (issue explicitly forbids inventing a "#" for it). Resource calls
-  // are always call_type "audio" by construction (RF-24: one multiparty
-  // room, never RF-23's separate audio/video split — see
-  // useResourceCallSession.join()'s own hardcoded "audio"), so "Chamada de
-  // voz" is a real invariant here, not a hardcoded guess.
-  const activeResourceCallBarTitle =
-    detailsKind === "group"
-      ? `Chamada de voz — ${resolvedName}`
-      : `Chamada de voz — #${resolvedName}`;
-
-  let activeResourceCallBarProps: ActiveResourceCallBarProps | null = null;
-  if (resourceCallExists) {
-    if (participatingHere && ctx.resourceCallSession) {
-      activeResourceCallBarProps = {
-        mode: "participating-local",
-        title: activeResourceCallBarTitle,
-        startedAt: discoveredResourceCall.created_at,
-        participants: ctx.resourceCallSession.participants,
-        localId: ctx.resourceCallSession.localId,
-        localName: ctx.resourceCallSession.localName,
-        localInitials: ctx.resourceCallSession.localInitials,
-        localAvatarUrl: ctx.resourceCallSession.localAvatarUrl,
-        activeSpeakerId: ctx.resourceCallSession.activeSpeakerId,
-        microphoneEnabled: ctx.resourceCallSession.microphoneEnabled,
-        microphonePending: ctx.resourceCallSession.microphonePending,
-        onToggleMicrophone: ctx.resourceCallSession.onToggleMicrophone,
-        onLeave: ctx.resourceCallSession.onLeave,
-        onOpenFullCall: ctx.resourceCallSession.onOpenFullCall,
-      };
-    } else if (participatingHere) {
-      activeResourceCallBarProps = {
-        mode: "participating-info",
-        title: activeResourceCallBarTitle,
-        startedAt: discoveredResourceCall.created_at,
-      };
-    } else {
-      // Not participating, but discovery shows an active call.
-      activeResourceCallBarProps = {
-        mode: "available",
-        title: activeResourceCallBarTitle,
-        startedAt: discoveredResourceCall.created_at,
-        joinDisabled: !ctx.joinResourceCall,
-        onJoin: () =>
-          ctx.joinResourceCall?.({
-            kind: resourceCallKind!,
-            id: targetId,
-            name: resolvedName,
-            callId: discoveredResourceCall.call_id,
-          }),
-      };
-    }
-  }
+  const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);
 
   return (
     <div
-      className={`chat-msg-area${showDetails ? " chat-msg-area--with-details" : ""}`}
+      className={`chat-msg-area${details.showDetails ? " chat-msg-area--with-details" : ""}`}
       data-testid="chat-message-area"
     >
       {/*
@@ -1512,128 +1591,57 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         place rather than remounted.
       */}
       <div className="chat-msg-area__conversation">
-        {kind === "channel" ? (
-          <HeaderChannel
-            name={resolvedName}
-            resourceCall={resourceCallHeaderState}
-            detailsToggle={
-              supportsDetails ? (
-                <DetailsToggle
-                  ref={detailsToggleRef}
-                  open={detailsOpen}
-                  label="Detalhes do canal"
-                  onToggle={toggleDetails}
-                />
-              ) : undefined
-            }
-          />
-        ) : (
-          <HeaderDM
-            name={resolvedName}
-            counterpart={activeDM?.counterpart}
-            presenceTarget={targetId ? presenceTargetKey("dm", targetId) : undefined}
-            onStartCall={ctx.startCall}
-            resourceCall={resourceCallHeaderState}
-            detailsToggle={
-              supportsDetails ? (
-                <DetailsToggle
-                  ref={detailsToggleRef}
-                  open={detailsOpen}
-                  label={detailsToggleLabel}
-                  onToggle={toggleDetails}
-                />
-              ) : undefined
-            }
-          />
-        )}
+        <ConversationHeader
+          kind={kind}
+          name={resolvedName}
+          counterpart={activeDM?.counterpart}
+          presenceTarget={target.presenceTarget}
+          // #673: once the direct call bar takes over presentation for this DM,
+          // the header suppresses its own call actions — the same pattern #657
+          // established for the resource call header action.
+          onStartCall={directCallBarProps ? undefined : ctx.startCall}
+          resourceCall={resourceCall.headerState}
+          details={details}
+          detailsToggleRef={detailsToggleRef}
+        />
 
         {/*
           #657: The bar is shown based on discovery (available) or participation
           (participating-local or participating-info).
         */}
-        {activeResourceCallBarProps && <ActiveResourceCallBar {...activeResourceCallBarProps} />}
+        {resourceCall.barProps && <ActiveResourceCallBar {...resourceCall.barProps} />}
+
+        {/* #673: the direct 1:1 counterpart of the bar above — mutually
+            exclusive with it by construction (resourceCallKind is null for a
+            1:1 DM, so activeResourceCallBarProps is never set here). */}
+        {directCallBarProps && <ActiveDirectCallBar {...directCallBarProps} />}
 
         <PinnedBar pin={latestPin} onUnpin={togglePin} />
 
-        {state.status === "loading" && <LoadingSkeleton />}
+        <ConversationTimeline
+          kind={kind}
+          targetId={targetId}
+          name={resolvedName}
+          detailsKind={detailsKind}
+          state={state}
+          currentUserId={ctx.currentUserId}
+          actions={timelineActions}
+          editDisabledIds={editDisabledIds}
+          pinnedIds={pinnedIds}
+          recentReactionEmojis={recentReactionEmojis}
+          emojiUsage={emojiUsage}
+          onEmojiToneChange={changeEmojiTone}
+          focusMessageId={focusMessageId}
+        />
 
-        {state.status === "error" && <ErrorState onRetry={retry} />}
-
-        {state.status === "ready" && state.messages.length === 0 && (
-          <EmptyState kind={kind} name={resolvedName} />
-        )}
-
-        {state.status === "ready" && state.messages.length > 0 && (
-          <MessageList
-            messages={state.messages}
-            currentUserId={ctx.currentUserId}
-            // "canal" / "grupo" / "conversa" for this timeline's system
-            // messages (issue #527).
-            systemScope={systemScopeFor(detailsKind, kind)}
-            hasMore={state.nextCursor !== ""}
-            loadingMore={state.loadingMore}
-            lastMutation={state.lastMutation}
-            onLoadMore={loadMore}
-            onToggleReaction={handleToggleReaction}
-            onReplyMessage={selectReply}
-            onReferenceMessage={setReferenceSource}
-            onForwardMessage={kind === "channel" ? selectForwardSource : undefined}
-            onReferenceJump={jumpToReference}
-            onToggleFavorite={toggleFavorite}
-            onReconcileLinkSafety={reconcileLinkSafety}
-            onEditMessage={editMessageLocal}
-            onEditForbidden={handleEditForbidden}
-            onDeleteMessage={deleteMessageLocal}
-            editDisabledIds={editDisabledIds}
-            channelId={kind === "channel" ? targetId : undefined}
-            presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
-            onTogglePin={togglePin}
-            pinnedIds={pinnedIds}
-            allowedReactionEmojis={allowedReactionEmojis}
-            recentReactionEmojis={recentReactionEmojis}
-            focusMessageId={focusMessageId}
-          />
-        )}
-
-        {state.sendError && (
-          <div className="chat-msg-area__send-error" role="alert" data-testid="chat-send-error">
-            <IconWarning />
-            {state.sendError}
-          </div>
-        )}
-
-        {state.realtimeError && (
-          <div
-            className="chat-msg-area__realtime-error"
-            role="status"
-            data-testid="chat-realtime-error"
-          >
-            <IconWarning />
-            Conexão em tempo real instável. Tentando reconectar...
-          </div>
-        )}
-
-        {(reactionInputError || state.actionError || pinError) && (
-          <div className="chat-msg-area__reaction-error" role="alert">
-            <IconWarning />
-            {reactionInputError || state.actionError || pinError}
-          </div>
-        )}
-
-        {typingIndicatorLabel && (
-          <div
-            className="chat-msg-area__typing-indicator"
-            role="status"
-            data-testid="chat-typing-indicator"
-          >
-            <span className="chat-msg-area__typing-dots" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </span>
-            {typingIndicatorLabel}
-          </div>
-        )}
+        <ConversationNotices
+          sendError={state.sendError}
+          realtimeError={state.realtimeError}
+          reactionError={reactionInputError}
+          actionError={state.actionError}
+          pinError={pinError}
+          typingLabel={typingIndicatorLabel}
+        />
 
         {/*
         The composer is keyed by the conversation identity so switching targets
@@ -1647,62 +1655,51 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
         <ChatComposer
           key={`${kind}:${targetId}`}
-          channelId={kind === "channel" ? targetId : undefined}
-          bodyFormat={kind === "channel" ? "v3" : "v2"}
-          placeholder={
-            kind === "channel"
-              ? `Mensagem para #${resolvedName}…`
-              : `Mensagem para ${resolvedName}…`
-          }
+          channelId={target.channelId}
+          bodyFormat={target.isChannel ? "v3" : "v2"}
+          placeholder={target.composerPlaceholder}
           disabled={state.status !== "ready"}
           replyPreview={replyPreview}
           onCancelReply={cancelReply}
-          referencePreview={referencePreview}
-          referenceTargetLabel={referenceTargetLabel}
-          onCancelReference={() =>
-            navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
-          }
+          referencePreview={pendingReference.preview}
+          referenceTargetLabel={pendingReference.originLabel}
+          onCancelReference={clearPendingReference}
           onSend={handleSend}
           onActivity={handleComposerActivity}
+          // The composer's emoji button opens the same picker the reactions use,
+          // over the same history — one emoji experience in one product (#496).
+          emoji={composerEmoji}
           // RF-32 (issue #458): the same composer serves channels and DMs, so
           // one target prop covers both. It is the route's own kind and id —
           // the very pair the composer is keyed by — so an attachment can never
           // be posted to the destination the user just navigated away from.
-          uploadTarget={targetId ? { kind, id: targetId } : null}
+          uploadTarget={target.uploadTarget}
           attachmentLimits={ctx.attachmentLimits}
           // An upload adds a file to the destination without creating a message
           // — the message comes later, when the user presses Enviar (RF-32) —
           // so the details panel's file list still has to reconcile here.
           onAttachmentUploaded={reloadOpenDetails}
         />
-        {referenceSource && (
-          <ReferenceDestinationDialog
-            current={{ kind, id: targetId }}
-            channels={ctx.channels}
-            dms={ctx.dms}
-            onClose={() => setReferenceSource(null)}
-            onSelect={selectReferenceDestination}
-          />
-        )}
-        {/* Both dialogs render through a portal, so their position here costs the
-          conversation column no layout. */}
-        {forwardSource && kind === "channel" && (
-          <ForwardMessageDialog
-            source={forwardSource}
-            channels={ctx.channels}
-            onClose={closeForwardDialog}
-            onSuccess={closeForwardDialog}
-          />
-        )}
+        <ConversationDialogs
+          kind={kind}
+          targetId={targetId}
+          channels={ctx.channels}
+          dms={ctx.dms}
+          referenceSource={referenceSource}
+          forwardSource={forwardSource}
+          onCloseReference={closeReferenceDialog}
+          onSelectReferenceDestination={selectReferenceDestination}
+          onCloseForward={closeForwardDialog}
+        />
       </div>
 
-      {showDetails && (
+      {details.showDetails && (
         <ConversationDetailsPanel
           kind={detailsKind ?? "channel"}
-          state={detailsState}
+          state={details.detailsState}
           currentUserId={ctx.currentUserId}
           latestPin={latestPin}
-          onClose={closeDetails}
+          onClose={details.close}
         />
       )}
     </div>

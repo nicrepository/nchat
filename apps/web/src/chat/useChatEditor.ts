@@ -61,7 +61,7 @@ const MentionChannelContext = Extension.create({
 
 export interface UseChatEditorOptions {
   placeholder: string;
-  disabled: boolean;
+  disabled?: boolean;
   channelId?: string;
   bodyFormat: CodecFormat;
   initialContent?: TTNode;

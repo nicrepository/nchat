@@ -130,6 +130,16 @@ export interface CallSessionContextValue {
    */
   resourcePresentationCall: Call | null;
   /**
+   * The direct-call counterpart of resourcePresentationCall (issue #673) —
+   * null in every state except a genuinely active, media-connected,
+   * locally-owned 1:1 call. Non-null carries the exact, proven Call
+   * (useCallSignaling's own calls.call) this tab is participating in, so a
+   * view-scoped consumer (ChatShell's directCallSession, mirroring
+   * resourceCallSession) derives callId/callType/peer identity/startedAt
+   * from the SAME validated source rather than re-deriving its own guess.
+   */
+  directPresentationCall: Call | null;
+  /**
    * Registers a fresh resource-call participation for callId — the causal
    * counterpart to leaveDedicated/endResourceParticipation (issue #570
    * follow-up). Must be called once, right after resource.join() itself
@@ -1039,6 +1049,19 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
     ownerState === "local"
       ? resourceDiscoveredForTarget
       : null;
+  // #673 — the direct-call counterpart of resourcePresentationCall: the
+  // single derived authority for "this 1:1 call is stable enough to present
+  // the compact persistent bar in the DM view". Unlike a resource call,
+  // there is no separate discovery/participation duality to reconcile here —
+  // calls.call (useCallSignaling) already only ever holds a direct/"user"
+  // call this tab itself is caller or callee of, so directActive alone
+  // (status "active", never merely "ringing") plus the same media-connected/
+  // local-ownership gate resourcePresentationCall uses is the whole
+  // predicate. Null while ringing (IncomingCallPopup/OutgoingCallPopup keep
+  // owning that state), connecting, reconnecting, erroring, or while
+  // ownership is remote (another tab/FloatingCallWindow owns the surface).
+  const directPresentationCall =
+    directActive && media.status === "connected" && ownerState === "local" ? directActive : null;
 
   // Ownership fence for screen-share START only (issue #611) — requirements
   // traceability that only the CURRENT owner of THIS specific call may begin
@@ -1620,6 +1643,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       localIdentity,
       leaveResourceParticipation,
       resourcePresentationCall,
+      directPresentationCall,
       beginResourceParticipation,
       joinResourceParticipation,
       activateResourceParticipation,
@@ -1633,6 +1657,7 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
       beginResourceParticipation,
       calls,
       dedicatedRecoveryFailed,
+      directPresentationCall,
       enableMedia,
       expand,
       getResourceCall,

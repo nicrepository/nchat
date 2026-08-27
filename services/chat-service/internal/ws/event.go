@@ -273,10 +273,16 @@ type MessagePayload struct {
 	DMConversationID  string `json:"dm_conversation_id,omitempty"`
 	SenderID          string `json:"sender_id"`
 	SenderDisplayName string `json:"sender_display_name"`
-	Kind              string `json:"kind"`
-	BodyText          string `json:"body_text"`
-	BodyFormat        string `json:"body_format"`
-	Status            string `json:"status"`
+	// SenderAvatarURL mirrors the HTTP message contract's field of the same
+	// name (issue #495): the client renders a subscriber's own avatar image
+	// instead of initials when this is present, using the exact same
+	// same-origin validation the sidebar/profile avatars already apply.
+	// Omitted for the overwhelming majority of senders, who have none set.
+	SenderAvatarURL string `json:"sender_avatar_url,omitempty"`
+	Kind            string `json:"kind"`
+	BodyText        string `json:"body_text"`
+	BodyFormat      string `json:"body_format"`
+	Status          string `json:"status"`
 	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
 	// A subscriber uses it to decide whether to draw the "could not verify this
 	// link" notice on a message it is inserting. It authorises nothing — see
@@ -346,6 +352,19 @@ type QuotePayload struct {
 type ReactionPayload struct {
 	Emoji string `json:"emoji"`
 	Count int    `json:"count"`
+	// Users names the first few reactors behind Count (issue #496), so a
+	// subscriber can update a reaction tooltip from the event instead of asking
+	// who reacted every time a badge is hovered. It is the same bounded prefix
+	// the REST aggregate carries, and it identifies nobody the subscriber is not
+	// already reading messages beside.
+	Users []ReactionUserPayload `json:"users,omitempty"`
+}
+
+// ReactionUserPayload is one named reactor: an id, so a client can recognise
+// itself, and a display name. Nothing else about the person travels.
+type ReactionUserPayload struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
 }
 
 // PinEventPayload carries a pin change (RF-05). It is route-plus-flag
