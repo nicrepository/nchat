@@ -316,6 +316,13 @@ export interface Message {
   senderId: string;
   senderDisplayName: string;
   senderEmail: string;
+  /**
+   * The sender's avatar (issue #495). Absent when unset or when the stored
+   * URL is not a safe same-origin target — same policy as every other
+   * avatarUrl in this module (sidebar counterpart, channel members, group
+   * participants, direct profile), applied by the same safeAvatarUrl.
+   */
+  senderAvatarUrl?: string;
   kind: MessageKind;
   /**
    * Set only on `kind: "system"` (issue #527). The database enforces that

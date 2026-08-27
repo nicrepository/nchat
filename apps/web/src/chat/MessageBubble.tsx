@@ -15,6 +15,7 @@ import InlineMessageEditor from "./InlineMessageEditor";
 import MessageAttachments from "./MessageAttachments";
 import MessageEditHistory from "./MessageEditHistory";
 import { formatTime, senderLabel } from "./messageDisplay";
+import { PersonAvatarImage } from "./PersonAvatarImage";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import PresenceDot from "./PresenceDot";
 import RichTextRenderer from "./RichTextRenderer";
@@ -750,7 +751,11 @@ export default function MessageBubble({
     >
       {!isMine && (
         <div className="chat-msg-area__msg-avatar" aria-hidden="true">
-          {senderInitials(message)}
+          <PersonAvatarImage
+            src={message.senderAvatarUrl}
+            initials={senderInitials(message)}
+            imgClassName="chat-msg-area__msg-avatar-img"
+          />
           {/* Decoration only, like the avatar it sits on: the sender's name is
               already in the message meta above, and repeating "Ausente" once
               per message would make a conversation unbearable to listen to. */}

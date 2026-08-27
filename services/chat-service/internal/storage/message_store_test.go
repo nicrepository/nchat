@@ -95,7 +95,7 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 // listMessageCols returns columns matching listMessageColumns("") scan order
 // (base message columns + sender display info from auth.users).
 func listMessageCols() []string {
-	return append(messageCols(), "sender_display_name", "sender_email", "is_favorited")
+	return append(messageCols(), "sender_display_name", "sender_email", "sender_avatar_url", "is_favorited")
 }
 
 func listMessageWithQuoteCols() []string {
@@ -111,7 +111,7 @@ func forwardMessageCols() []string {
 }
 
 func listMessageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
-	return append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", false)
+	return append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", "", false)
 }
 
 func listMessageWithQuoteRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
@@ -127,7 +127,7 @@ func quoteRow(id, authorID, body, format, status string, deletedAt *time.Time, c
 }
 
 func listMessageRowWithQuote(id, workspaceID, channelID, dmID string, now time.Time, quote []any) []any {
-	row := append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", false)
+	row := append(messageRow(id, workspaceID, channelID, dmID, now), "Test User", "test@example.com", "", false)
 	return append(row, quote...)
 }
 
@@ -807,7 +807,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
-		"Test User", "test@example.com", false,
+		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)
 	expectCreate(mock, pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
@@ -930,6 +930,34 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 	}
 	if len(msg.Reactions) != 1 || !msg.Reactions[0].ReactedByMe {
 		t.Fatalf("expected personalized reactions, got %+v", msg.Reactions)
+	}
+	checkExpectations(t, mock)
+}
+
+// TestPGXMessageStore_GetMessageByIDInWorkspace_ScansSenderAvatarURL guards the
+// issue #495 fix: the avatar_url column added to listMessageColumns must land
+// in SenderAvatarURL and not shift any later column (is_favorited, quote).
+func TestPGXMessageStore_GetMessageByIDInWorkspace_ScansSenderAvatarURL(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	row := append(messageRow("msg-1", "ws-1", "ch-1", "", now),
+		"Test User", "test@example.com", "/avatars/user-1.png", true)
+	row = append(row, emptyQuoteRow()...)
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("msg-1", "ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).AddRow(row...))
+	expectReactionBatch(mock, emptyReactionRows())
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	msg, err := storage.NewPGXMessageStore(mock).GetMessageByIDInWorkspace(context.Background(), "ws-1", "msg-1", "user-1")
+	if err != nil {
+		t.Fatalf("GetMessageByIDInWorkspace: %v", err)
+	}
+	if msg.SenderAvatarURL != "/avatars/user-1.png" {
+		t.Fatalf("expected sender_avatar_url '/avatars/user-1.png', got %q", msg.SenderAvatarURL)
+	}
+	if !msg.IsFavorited {
+		t.Fatalf("adding the avatar column must not shift is_favorited: %+v", msg)
 	}
 	checkExpectations(t, mock)
 }
@@ -1334,7 +1362,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
-		"Test User", "test@example.com", false,
+		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)
 	mock.ExpectQuery(`SELECT`).

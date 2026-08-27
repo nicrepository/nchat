@@ -538,6 +538,25 @@ func TestDomainMessageToWSPayloadMapsRemovalTimestamps(t *testing.T) {
 	}
 }
 
+// TestDomainMessageToWSPayloadCarriesSenderAvatarURL guards the issue #495
+// fix: message.created must carry the same sender avatar the HTTP history
+// endpoint does, so a subscriber's timeline and a fresh page load never
+// disagree about whether a sender has one.
+func TestDomainMessageToWSPayloadCarriesSenderAvatarURL(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		SenderID: "user-1", SenderAvatarURL: "/avatars/user-1.png",
+	})
+	if got.SenderAvatarURL != "/avatars/user-1.png" {
+		t.Fatalf("sender avatar url not mapped: %+v", got)
+	}
+
+	withoutAvatar := domainMessageToWSPayload(domain.Message{ID: "message-2", SenderID: "user-2"})
+	if withoutAvatar.SenderAvatarURL != "" {
+		t.Fatalf("sender without an avatar must not get one invented: %+v", withoutAvatar)
+	}
+}
+
 func TestDomainMessageToWSUpdatedPayloadWithholdsDeletedBody(t *testing.T) {
 	now := time.Now().UTC()
 	got := domainMessageToWSUpdatedPayload(domain.Message{

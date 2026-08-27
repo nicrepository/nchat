@@ -195,11 +195,18 @@ type messageJSON struct {
 	SenderID          string `json:"sender_id"`
 	SenderDisplayName string `json:"sender_display_name,omitempty"`
 	SenderEmail       string `json:"sender_email,omitempty"`
-	Kind              string `json:"kind"`
-	BodyText          string `json:"body_text,omitempty"`
-	BodyFormat        string `json:"body_format"`
-	IsRemoved         bool   `json:"is_removed,omitempty"`
-	Status            string `json:"status"`
+	// SenderAvatarURL is the sender's auth.users.avatar_url, straight from the
+	// same JOIN as SenderDisplayName/SenderEmail (issue #495). Omitted when the
+	// sender has none set. Same-origin/scheme safety is a render-time client
+	// concern, exactly like every other avatar_url this API already returns
+	// (sidebar counterpart, channel members, group participants, direct
+	// profile) — this handler forwards the stored value unmodified.
+	SenderAvatarURL string `json:"sender_avatar_url,omitempty"`
+	Kind            string `json:"kind"`
+	BodyText        string `json:"body_text,omitempty"`
+	BodyFormat      string `json:"body_format"`
+	IsRemoved       bool   `json:"is_removed,omitempty"`
+	Status          string `json:"status"`
 	// LinkSafetyState is the link-safety axis and is independent of Status
 	// (issue #135): a published message whose links could not all be verified is
 	// `active` and carries "inconclusive" here. It is what the client draws the
@@ -509,6 +516,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		SenderID:          m.SenderID,
 		SenderDisplayName: m.SenderDisplayName,
 		SenderEmail:       m.SenderEmail,
+		SenderAvatarURL:   m.SenderAvatarURL,
 		Kind:              string(m.Kind),
 		BodyFormat:        string(m.BodyFormat),
 		Status:            string(m.Status),

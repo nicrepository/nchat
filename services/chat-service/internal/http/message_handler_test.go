@@ -836,6 +836,36 @@ func TestMessageHandler_ListChannelMessages_SuccessReturnsMessages(t *testing.T)
 	}
 }
 
+// TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL guards the
+// issue #495 fix: the sender's avatar (projected by the same auth.users JOIN
+// as display name and email) must reach the HTTP history response, and stay
+// absent when the sender has none set — never a fabricated or defaulted URL.
+func TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL(t *testing.T) {
+	withAvatar := testMessage()
+	withAvatar.SenderAvatarURL = "/avatars/user-1.png"
+	withoutAvatar := testMessage()
+	withoutAvatar.ID = "77777777-7777-7777-7777-777777777777"
+
+	provider := &fakeMessageProvider{channelOut: service.ListChannelMessagesOutput{
+		Messages: []domain.Message{withAvatar, withoutAvatar},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages", nil)
+	r.SetPathValue("channelID", testChannelID)
+	h.ListChannelMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	msgsArr := decodeBody(t, rec)["data"].(map[string]any)["messages"].([]any)
+	if got := msgsArr[0].(map[string]any)["sender_avatar_url"]; got != "/avatars/user-1.png" {
+		t.Fatalf("expected sender_avatar_url to be preserved, got %#v", got)
+	}
+	if _, present := msgsArr[1].(map[string]any)["sender_avatar_url"]; present {
+		t.Fatalf("expected sender_avatar_url omitted for a sender with none set, got %#v", msgsArr[1])
+	}
+}
+
 func TestMessageHandler_ListChannelMessages_ReferenceDTOFailsClosed(t *testing.T) {
 	msg := testMessage()
 	msg.ReferencedMessageID = "66666666-6666-6666-6666-666666666666"
@@ -1660,6 +1690,41 @@ func TestMessageHandler_ListDMMessages_Success(t *testing.T) {
 	msgsArr, ok := body["data"].(map[string]any)["messages"].([]any)
 	if !ok || len(msgsArr) != 1 {
 		t.Fatalf("expected 1 dm message, got %v", body["data"].(map[string]any)["messages"])
+	}
+}
+
+// TestMessageHandler_ListDMMessages_IncludesSenderAvatarURL mirrors
+// TestMessageHandler_ListChannelMessages_IncludesSenderAvatarURL for the DM
+// path (issue #495): a group DM and a 1:1 DM both list through ListDMMessages,
+// so this one test covers both — there is no per-conversation-type branch to
+// duplicate it for.
+func TestMessageHandler_ListDMMessages_IncludesSenderAvatarURL(t *testing.T) {
+	withAvatar := testMessage()
+	withAvatar.ChannelID = ""
+	withAvatar.DMConversationID = testConversationID
+	withAvatar.SenderAvatarURL = "/avatars/user-1.png"
+	withoutAvatar := testMessage()
+	withoutAvatar.ID = "77777777-7777-7777-7777-777777777777"
+	withoutAvatar.ChannelID = ""
+	withoutAvatar.DMConversationID = testConversationID
+
+	provider := &fakeMessageProvider{dmOut: service.ListDMMessagesOutput{
+		Messages: []domain.Message{withAvatar, withoutAvatar},
+	}}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, provider)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/"+testConversationID+"/messages", nil)
+	r.SetPathValue("conversationID", testConversationID)
+	h.ListDMMessages(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+	}
+	msgsArr := decodeBody(t, rec)["data"].(map[string]any)["messages"].([]any)
+	if got := msgsArr[0].(map[string]any)["sender_avatar_url"]; got != "/avatars/user-1.png" {
+		t.Fatalf("expected sender_avatar_url to be preserved, got %#v", got)
+	}
+	if _, present := msgsArr[1].(map[string]any)["sender_avatar_url"]; present {
+		t.Fatalf("expected sender_avatar_url omitted for a sender with none set, got %#v", msgsArr[1])
 	}
 }
 

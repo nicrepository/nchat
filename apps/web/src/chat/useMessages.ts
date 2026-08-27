@@ -39,6 +39,7 @@ import {
   postDMMessage,
   resolveChannelMessageReferences,
   resolveDMMessageReferences,
+  safeAvatarUrl,
   unfavoriteMessage,
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
@@ -1605,6 +1606,7 @@ export function useMessages({
           senderId: p.sender_id,
           senderDisplayName: p.sender_display_name,
           senderEmail: p.sender_email ?? "",
+          senderAvatarUrl: safeAvatarUrl(p.sender_avatar_url),
           kind: p.kind as Message["kind"],
           bodyText: removed ? "" : p.body_text,
           bodyFormat: normalizeBodyFormat(p.body_format),

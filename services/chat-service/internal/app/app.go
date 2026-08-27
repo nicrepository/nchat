@@ -895,6 +895,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		DMConversationID:  msg.DMConversationID,
 		SenderID:          msg.SenderID,
 		SenderDisplayName: msg.SenderDisplayName,
+		SenderAvatarURL:   msg.SenderAvatarURL,
 		Kind:              string(msg.Kind),
 		BodyText:          body,
 		BodyFormat:        string(msg.BodyFormat),

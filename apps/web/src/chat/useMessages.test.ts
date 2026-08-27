@@ -154,7 +154,11 @@ const {
     >(),
 }));
 
-vi.mock("./chatApi", () => ({
+vi.mock("./chatApi", async (importOriginal) => ({
+  // safeAvatarUrl is real: it's the pure, already-tested same-origin policy
+  // (chatApi.test.ts), and these WS tests need the genuine behavior rather
+  // than a second hand-rolled copy of it.
+  safeAvatarUrl: (await importOriginal<typeof import("./chatApi")>()).safeAvatarUrl,
   fetchChannelMessages: (id: string, cursor?: string, signal?: AbortSignal) =>
     mockFetchChannelMessages(id, cursor, signal),
   fetchChannelMessage: (id: string, msgId: string, signal?: AbortSignal) =>
@@ -1157,6 +1161,53 @@ describe("useMessages — WS message.created integration", () => {
         senderEmail: "",
       }),
     );
+  });
+
+  // Issue #495: message.created must carry the sender's avatar so the
+  // timeline never has to fetch a profile per message to render one.
+  it("renders realtime payload's sender avatar", async () => {
+    const payload = makePayload({
+      id: "msg-avatar",
+      sender_avatar_url: "/avatars/user-sender.png",
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-avatar", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventWithPayload("channel", "ch-avatar", payload);
+    });
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].senderAvatarUrl).toBe("/avatars/user-sender.png");
+  });
+
+  // The same same-origin policy every other avatar in the app already
+  // applies (chatApi's safeAvatarUrl) must reject a cross-origin URL here too
+  // — a message payload is not a second, weaker place to trust one.
+  it("drops a realtime sender avatar that is not a safe same-origin URL", async () => {
+    const payload = makePayload({
+      id: "msg-unsafe-avatar",
+      sender_avatar_url: "https://evil.test/tracker.png",
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-unsafe-avatar", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsEventWithPayload("channel", "ch-unsafe-avatar", payload);
+    });
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0].senderAvatarUrl).toBeUndefined();
   });
 
   it("inserts DM message directly from payload without fetch", async () => {
