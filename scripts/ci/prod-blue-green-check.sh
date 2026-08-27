@@ -460,6 +460,21 @@ check_livekit_client_contract() {
   ok "both slots hand the browser one external LiveKit, and the CSP allows exactly that host"
 }
 
+check_livekit_environment_namespace() {
+  local environment slot direct
+  environment="$(query 'ConfigMap|nchat-config|data.APP_ENV')"
+  [[ "$environment" == production ]] ||
+    fail "production APP_ENV is '${environment:-unset}', expected 'production'"
+  for slot in "${SLOTS[@]}"; do
+    [[ "$(query "Deployment|media-service-$slot|configmap-envfrom")" == *nchat-config* ]] ||
+      fail "media-service-$slot does not inherit APP_ENV from nchat-config"
+    direct="$(query "Deployment|media-service-$slot|app-env")"
+    [[ -z "$direct" ]] ||
+      fail "media-service-$slot overrides APP_ENV with '$direct'; both slots must inherit 'production'"
+  done
+  ok "Blue and Green inherit the production LiveKit namespace"
+}
+
 # A ConfigMap key naming a Service the overlay does not render is an address
 # that resolves to nothing. It costs nothing at runtime and everything later,
 # when someone reads it as a statement that the dependency exists.
@@ -498,6 +513,7 @@ check_configuration() {
   check_scanner
   check_livekit
   check_livekit_client_contract
+  check_livekit_environment_namespace
   check_no_dangling_service_endpoints
 }
 
