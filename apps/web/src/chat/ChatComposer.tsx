@@ -20,6 +20,8 @@ import {
 } from "react";
 import type { UploadProgress } from "../lib/api";
 import { useAttachmentUpload, type AttachmentUploadTarget } from "./useAttachmentUpload";
+import { useVoiceRecorder } from "./useVoiceRecorder";
+import VoiceRecorderPanel from "./VoiceRecorderPanel";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar from "./ComposerToolbar";
@@ -192,6 +194,25 @@ export default function ChatComposer({
   const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
   const attachEnabled = uploadTarget !== null && !disabled;
   const uploading = upload.busy;
+  // Whether any attachment — queued, uploading, ready or even failed-but-not-
+  // dismissed — is currently sitting in the composer. `upload.items` is the
+  // single source of truth useAttachmentUpload already keeps for exactly
+  // this; a voice recording does not merge with it (issue #670 code review),
+  // so recording must not even start while it is non-empty.
+  const hasComposerAttachments = upload.items.length > 0;
+  // A voice recording is sent through the same onSend as any other message:
+  // an empty body plus the one attachment that upload just produced. See
+  // handleComposerSend below for why an attachment-only send is already the
+  // composer's normal shape.
+  const recorder = useVoiceRecorder({
+    target: uploadTarget,
+    maxUploadBytes: attachmentLimits.maxUploadBytes,
+    onUploaded: async (attachmentId) => {
+      const result = await onSend("", [attachmentId]);
+      return result.status === "sent";
+    },
+  });
+  const recording = recorder.phase !== "idle";
   const pendingAttachments = upload.items
     .map((item) => item.attachment)
     .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
@@ -231,10 +252,19 @@ export default function ChatComposer({
     onActivity,
   });
 
+  // Whether a new attachment may be taken at all right now. A voice
+  // recording is deliberately never combined with an attachment (issue
+  // #670): the picker and the attach button already disappear while
+  // `recording` (the whole toolbar row is hidden), and this is the same
+  // rule extended to the one entry point that stays reachable regardless —
+  // the composer box's own drag-and-drop surface, bound below whether or
+  // not a recording is in progress.
+  const canAcceptAttachments = attachEnabled && !recording;
+
   // Both entry points funnel here, so there is exactly one place that decides
   // whether a file may be taken and exactly one validation path behind it.
   const acceptFiles = (files: Iterable<File> | undefined) => {
-    if (!attachEnabled || !files) return;
+    if (!canAcceptAttachments || !files) return;
     upload.selectFiles(files);
   };
 
@@ -252,7 +282,13 @@ export default function ChatComposer({
 
   const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
     if (!attachEnabled || !dragHasFiles(event)) return;
+    // Prevented whenever this composer could in principle handle the drag —
+    // recording or not — so the browser never takes over navigation to the
+    // dragged file. Only the *visual* affordance below is conditional on
+    // recording: a user must never be shown a drop target that a recording
+    // is about to make ignore the drop.
     event.preventDefault();
+    if (!canAcceptAttachments) return;
     setDragActive(true);
   };
 
@@ -269,10 +305,14 @@ export default function ChatComposer({
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     if (!attachEnabled || !dragHasFiles(event)) return;
-    // Prevented only for a drop this composer handles, so the browser never
-    // navigates away to the dropped file.
+    // Prevented whenever this composer could in principle handle the drop —
+    // recording or not — so the browser never navigates away to the dropped
+    // file. `setDragActive(false)` is unconditional for the same reason:
+    // nothing must be left signalling an accepted drop that a recording
+    // silently ignored.
     event.preventDefault();
     setDragActive(false);
+    if (!canAcceptAttachments) return;
     acceptFiles(event.dataTransfer.files ?? undefined);
   };
 
@@ -332,7 +372,11 @@ export default function ChatComposer({
           targetLabel={referenceTargetLabel}
           onCancel={onCancelReference}
         />
-        <div className="chat-msg-area__composer-editor-wrap">
+        {recording && <VoiceRecorderPanel recorder={recorder} />}
+        <div
+          className="chat-msg-area__composer-editor-wrap"
+          hidden={recording}
+        >
           {editor?.isEmpty && !editor.isActive("listItem") && (
             <div className="chat-msg-area__composer-placeholder" aria-hidden="true">
               {placeholder}
@@ -340,7 +384,7 @@ export default function ChatComposer({
           )}
           <EditorContent editor={editor} />
         </div>
-        {uploadTarget && (upload.items.length > 0 || dragActive || upload.notice) && (
+        {!recording && uploadTarget && (upload.items.length > 0 || dragActive || upload.notice) && (
           <div
             className="chat-msg-area__composer-upload"
             data-testid="chat-composer-upload-status"
@@ -448,52 +492,81 @@ export default function ChatComposer({
             )}
           </div>
         )}
-        <div className="chat-msg-area__composer-bar">
-          <ComposerToolbar editor={editor ?? null} disabled={disabled || sending} />
-          {uploadTarget && (
-            <>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="chat-msg-area__composer-file-input"
-                data-testid="chat-composer-file-input"
-                aria-label="Escolher arquivo para anexar"
-                hidden
-                onChange={handlePickerChange}
-              />
+        {!recording && (
+          <div className="chat-msg-area__composer-bar">
+            <ComposerToolbar editor={editor ?? null} disabled={disabled || sending} />
+            {uploadTarget && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  className="chat-msg-area__composer-file-input"
+                  data-testid="chat-composer-file-input"
+                  aria-label="Escolher arquivo para anexar"
+                  hidden
+                  onChange={handlePickerChange}
+                />
+                <button
+                  type="button"
+                  className="composer-toolbar__btn"
+                  aria-label="Anexar arquivo"
+                  disabled={!attachEnabled || upload.items.length >= 10}
+                  data-testid="chat-composer-attach-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <span
+                    className="material-symbols-outlined"
+                    aria-hidden="true"
+                    style={{ fontSize: 18 }}
+                  >
+                    attach_file
+                  </span>
+                </button>
+              </>
+            )}
+            {uploadTarget && recorder.supported && (
               <button
                 type="button"
                 className="composer-toolbar__btn"
-                aria-label="Anexar arquivo"
-                disabled={!attachEnabled || upload.items.length >= 10}
-                data-testid="chat-composer-attach-btn"
-                onClick={() => fileInputRef.current?.click()}
+                aria-label="Gravar mensagem de voz"
+                // A voice recording is never merged with pending attachments
+                // (issue #670 code review) — recording must not even start
+                // while one exists, so this only ever disables, never
+                // silently drops or combines the two.
+                title={
+                  hasComposerAttachments
+                    ? "Remova os anexos para gravar uma mensagem de voz."
+                    : undefined
+                }
+                disabled={!attachEnabled || uploading || hasComposerAttachments}
+                data-testid="chat-composer-record-btn"
+                onClick={recorder.start}
               >
                 <span
                   className="material-symbols-outlined"
                   aria-hidden="true"
                   style={{ fontSize: 18 }}
                 >
-                  attach_file
+                  mic
                 </span>
               </button>
-            </>
-          )}
-          <button
-            type="button"
-            className="chat-msg-area__send-btn"
-            // Unavailable while a file is going up, whatever else the composer
-            // holds: the attachment is part of the message being written, and
-            // sending now would post a message without it.
-            disabled={!canSend || uploading}
-            aria-label="Enviar mensagem"
-            onClick={() => void handleSend()}
-            data-testid="chat-send-btn"
-          >
-            <IconSend />
-          </button>
-        </div>
+            )}
+            <button
+              type="button"
+              className="chat-msg-area__send-btn"
+              // Unavailable while a file is going up, whatever else the composer
+              // holds: the attachment is part of the message being written, and
+              // sending now would post a message without it.
+              disabled={!canSend || uploading}
+              aria-label="Enviar mensagem"
+              onClick={() => void handleSend()}
+              data-testid="chat-send-btn"
+            >
+              <IconSend />
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

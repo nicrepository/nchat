@@ -31,11 +31,13 @@
 
 import { useState } from "react";
 
+import AttachmentAudio from "./AttachmentAudio";
 import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
 import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
 import { isImageAttachment } from "./attachmentImageRules";
+import { isVoiceMessage } from "./attachmentAudioRules";
 import { fetchAttachmentContent } from "./filesApi";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import type { ChannelAttachment } from "./chatTypes";
@@ -115,7 +117,44 @@ interface MessageAttachmentProps {
   onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
 }
 
+/**
+ * A voice message's compact presentation (issue #670): a player and its scan
+ * status, and deliberately nothing else — no filename, so a recording never
+ * shows as "recording-1699999999.webm" the way an ordinary attachment shows
+ * its name. AttachmentAudio already draws nothing for a rejected recording
+ * and a note for one still being scanned, so the status line below only adds
+ * the words those two silent states are missing; a clean, playable one needs
+ * no second confirmation once the player itself is on screen.
+ */
+function VoiceMessageAttachment({ attachment }: { attachment: ChannelAttachment }) {
+  return (
+    <li
+      className="chat-msg-area__attachment chat-msg-area__attachment--voice"
+      data-testid={`chat-message-attachment-${attachment.id}`}
+    >
+      <span className="chat-msg-area__attachment-icon" aria-hidden="true">
+        <span className="material-symbols-outlined">mic</span>
+      </span>
+      <div className="chat-msg-area__voice-body">
+        <AttachmentAudio attachment={attachment} />
+        {attachment.status !== "clean" && (
+          <span
+            className={`chat-msg-area__attachment-status chat-msg-area__attachment-status--${attachment.status}`}
+            data-testid={`chat-message-attachment-status-${attachment.id}`}
+          >
+            {attachment.status === "pending_scan" && "Verificando mensagem de voz…"}
+            {attachment.status === "rejected" && "Bloqueado pela verificação de segurança"}
+          </span>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) {
+  if (isVoiceMessage(attachment)) {
+    return <VoiceMessageAttachment attachment={attachment} />;
+  }
   const icon = (
     <span className="chat-msg-area__attachment-icon" aria-hidden="true">
       <span className="material-symbols-outlined">{fileIconFor(attachment.contentType)}</span>
@@ -180,6 +219,9 @@ function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) 
       {/* Draws a player only for a clean, playable video, and nothing at all
           otherwise — including for a file still being scanned. */}
       <AttachmentVideo attachment={attachment} />
+      {/* Same contract for an ordinary audio file (issue #670) — never for a
+          voice message, which VoiceMessageAttachment already handled above. */}
+      <AttachmentAudio attachment={attachment} />
     </li>
   );
 }
