@@ -2171,23 +2171,23 @@ describe("ChatSidebar — footer", () => {
     mockFetchMyProfile.mockResolvedValue({ id: "user-a", displayName: longName });
     renderFooter();
 
-    // The name is one clipped element (CSS ellipsis), and the settings control
-    // remains a sibling of the profile link rather than being pushed out of it.
+    // The name is one clipped element (CSS ellipsis), and the account menu
+    // trigger remains a sibling of the profile link rather than being pushed
+    // out of it.
     const name = await screen.findByText(longName);
     expect(name).toHaveClass("chat-sidebar__user-name");
     expect(avatarText()).toBe("MA");
-    expect(screen.getByRole("link", { name: "Configurações" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /menu da conta/i })).toBeInTheDocument();
   });
 
-  it("keeps the settings action, its target and its accessible name", async () => {
+  it("keeps the account menu trigger as a sibling of the profile link", async () => {
     renderFooter();
 
-    const settings = await screen.findByRole("link", { name: "Configurações" });
-    expect(settings).toHaveAttribute("href", "/admin/users");
-    expect(settings).toHaveAttribute("title", "Configurações");
-    // Interactive elements must not nest: settings is a sibling of the profile
-    // link, never inside it.
-    expect(userLink().contains(settings)).toBe(false);
+    const trigger = await screen.findByRole("button", { name: /menu da conta/i });
+    expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    // Interactive elements must not nest: the trigger is a sibling of the
+    // profile link, never inside it.
+    expect(userLink().contains(trigger)).toBe(false);
   });
 
   it("links to the global search page (RF-15)", () => {
@@ -2204,16 +2204,16 @@ describe("ChatSidebar — footer", () => {
     expect(userLink()).toHaveAttribute("href", "/profile");
   });
 
-  it("reaches the profile and settings links by keyboard", async () => {
+  it("reaches the profile link and account menu trigger by keyboard", async () => {
     const user = userEvent.setup();
     renderFooter();
 
     await screen.findByText("Ana Souza");
-    const settings = screen.getByRole("link", { name: "Configurações" });
+    const trigger = screen.getByRole("button", { name: /menu da conta/i });
     userLink().focus();
     expect(userLink()).toHaveFocus();
     await user.tab();
-    expect(settings).toHaveFocus();
+    expect(trigger).toHaveFocus();
   });
 
   it("does not invent an identity when the profile fails to load", async () => {

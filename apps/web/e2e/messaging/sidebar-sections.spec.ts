@@ -584,16 +584,18 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     await expect(userLink(page).locator("img")).toHaveAttribute("src", "/assets/nic-labs-icon.png");
   });
 
-  test("mantém Configurações acionável por mouse e por teclado", async ({ page }, testInfo) => {
+  test("mantém o menu da conta acionável por mouse e por teclado", async ({ page }, testInfo) => {
     await openChatWithAllThreeCategories(page, testInfo);
 
-    const settings = page.getByRole("link", { name: "Configurações" });
-    await expect(settings).toHaveAttribute("href", "/admin/users");
+    const trigger = page.getByRole("button", { name: /menu da conta/i });
 
     await userLink(page).focus();
     await page.keyboard.press("Tab");
-    await expect(settings).toBeFocused();
+    await expect(trigger).toBeFocused();
     await page.keyboard.press("Enter");
+    const admin = page.getByRole("menuitem", { name: "Administração" });
+    await expect(admin).toHaveAttribute("href", "/admin/users");
+    await admin.click();
     await expect(page).toHaveURL(/\/admin\/users/);
   });
 
@@ -605,7 +607,7 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     await page.setViewportSize({ width: 360, height: 720 });
     await page.getByTestId("chat-nav-toggle").click();
 
-    const settings = page.getByRole("link", { name: "Configurações" });
+    const settings = page.getByRole("button", { name: /menu da conta/i });
     await expect(settings).toBeVisible();
     // The drawer slides in over 180ms, and its `visibility` flips on the very
     // first frame — so the link is "visible" while the panel is still moving.
