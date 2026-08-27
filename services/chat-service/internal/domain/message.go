@@ -214,7 +214,12 @@ type Message struct {
 	// Populated by list queries that JOIN auth.users; empty for create results.
 	SenderDisplayName string
 	SenderEmail       string
-	Reactions         []MessageReaction
+	// SenderAvatarURL is the sender's auth.users.avatar_url, projected through
+	// the same JOIN as SenderDisplayName/SenderEmail. Empty when unset — never
+	// defaulted or fetched from elsewhere, so a message says nothing about an
+	// avatar the sender never configured.
+	SenderAvatarURL string
+	Reactions       []MessageReaction
 
 	// IsFavorited reports whether the requesting user favorited this message.
 	// Always scoped to the caller — never exposes other users' favorites.

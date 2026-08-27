@@ -48,6 +48,12 @@ export interface WSMessagePayload {
   sender_id: string;
   sender_display_name: string;
   sender_email?: string;
+  /**
+   * RF-495 sender avatar. Absent on a pre-#495 server and on a sender with
+   * none set; the value is narrowed by the client that reads it, same as
+   * every other avatar_url this app already validates.
+   */
+  sender_avatar_url?: unknown;
   kind: string;
   body_text: string;
   /** Missing means legacy v1 during rolling deploys. */

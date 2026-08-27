@@ -253,7 +253,7 @@ const maxAvatarUrlLength = 512;
  * rule at persistence time (root-relative only), because it cannot know the
  * browser origin — the two checks guard different things and are not duplicates.
  */
-function safeAvatarUrl(raw: unknown): string | undefined {
+export function safeAvatarUrl(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
   const value = raw.trim();
   if (value === "" || value.length > maxAvatarUrlLength) return undefined;
@@ -839,6 +839,8 @@ interface MessageResponse {
   sender_id: string;
   sender_display_name?: string;
   sender_email?: string;
+  /** RF-495. Absent on a pre-#495 server and on a sender with none set. */
+  sender_avatar_url?: unknown;
   kind: string;
   /** Structured conversation event, on system messages only (issue #527). */
   event_type?: unknown;
@@ -1046,6 +1048,7 @@ function mapMessage(r: MessageResponse): Message {
     senderId: r.sender_id,
     senderDisplayName: r.sender_display_name ?? "",
     senderEmail: r.sender_email ?? "",
+    senderAvatarUrl: safeAvatarUrl(r.sender_avatar_url),
     kind: (r.kind === "system" ? "system" : "user") as Message["kind"],
     ...mapConversationEvent(r),
     bodyText: isRemoved ? "" : (r.body_text ?? ""),

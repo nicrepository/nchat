@@ -29,7 +29,9 @@ const { mockFetchChannelMessages, mockPostChannelMessage, mockPostDMMessage } = 
   mockPostDMMessage: vi.fn(),
 }));
 
-vi.mock("./chatApi", () => ({
+vi.mock("./chatApi", async (importOriginal) => ({
+  // Real implementation: pure and already covered by chatApi.test.ts.
+  safeAvatarUrl: (await importOriginal<typeof import("./chatApi")>()).safeAvatarUrl,
   fetchChannelMessages: (...args: unknown[]) => mockFetchChannelMessages(...args),
   fetchChannelMessage: vi.fn(),
   fetchDMMessages: vi.fn().mockResolvedValue({ messages: [], nextCursor: "" }),

@@ -315,6 +315,14 @@
   position: relative;
 }
 
+.chat-msg-area__msg-avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
 .chat-msg-area__msg-body {
   display: flex;
   flex-direction: column;

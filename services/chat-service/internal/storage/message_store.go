@@ -568,6 +568,7 @@ func listMessageColumns(alias, userParam string) string {
 	return messageColumns(alias) + `,
 	COALESCE(u.display_name, ''),
 	COALESCE(u.email::text, ''),
+	COALESCE(u.avatar_url, ''),
 	EXISTS (
 		SELECT 1 FROM chat.message_favorites mf
 		WHERE mf.message_id = ` + alias + `.id AND mf.user_id = ` + userParam + `::uuid
@@ -623,7 +624,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&msg.CreatedAt, &msg.UpdatedAt,
 		(*string)(&msg.LinkSafety),
 		&msg.EventType, &eventPayload,
-		&msg.SenderDisplayName, &msg.SenderEmail,
+		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
 		&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
@@ -2126,7 +2127,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.EventType, &eventPayload,
 		}
 		if withSender {
-			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.IsFavorited)
+			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL, &msg.IsFavorited)
 			dest = append(dest,
 				&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
 				&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
