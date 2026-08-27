@@ -49,6 +49,7 @@ import {
   normalizeBodyFormat,
   normalizeLinkSafety,
   parseMessageAttachments,
+  parseReactionUsers,
   type LinkSafetyRecheck,
   type ChannelAttachment,
   type Message,
@@ -112,7 +113,15 @@ export interface MessagesState {
   /** Feedback for rejected/unsent message actions (reactions, favorites). */
   actionError: string | null;
   /** Reactions snapshot to restore per messageId if the in-flight optimistic toggle is rejected or times out. */
-  pendingReactions: Map<string, Message["reactions"]>;
+  /**
+   * Reactions this reader has toggled but the server has not confirmed yet,
+   * per message (issue #496).
+   *
+   * `confirmed` is the last list the server stated; `intents` is what this
+   * reader has asked for since, one entry per emoji. What is rendered is always
+   * `confirmed` with `intents` applied on top — see applyPendingReactions.
+   */
+  pendingReactions: Map<string, PendingReactions>;
   /** RF-07: message currently selected as the parent quote for the composer. */
   replyTo: Message | null;
   /** Versioned corrections that arrived before their message.created payload. */
@@ -194,7 +203,7 @@ type Action =
   | { type: "favorite_set"; messageId: string; isFavorited: boolean }
   | { type: "favorite_error"; error: string }
   | { type: "reaction_optimistic"; messageId: string; emoji: string }
-  | { type: "reaction_revert"; messageId: string; error: string }
+  | { type: "reaction_revert"; messageId: string; emoji: string; error: string }
   | { type: "ws_fetch_error"; error: string }
   | { type: "attachment_status"; attachmentId: string; status: ChannelAttachment["status"] }
   | { type: "ws_subscription_ready" };
@@ -206,7 +215,9 @@ function toggleOptimisticReaction(
 ): Message["reactions"] {
   const index = reactions.findIndex((item) => item.emoji === emoji);
   if (index < 0) {
-    return [...reactions, { emoji, count: 1, reactedByMe: true }];
+    // No named author yet: the tooltip says "Você" from reactedByMe, and the
+    // server's own list replaces this the moment the toggle is confirmed.
+    return [...reactions, { emoji, count: 1, reactedByMe: true, users: [] }];
   }
   const current = reactions[index];
   if (!current.reactedByMe) {
@@ -220,6 +231,194 @@ function toggleOptimisticReaction(
   return reactions.map((item, i) =>
     i === index ? { ...item, count: item.count - 1, reactedByMe: false } : item,
   );
+}
+
+/**
+ * One reaction this reader has asked for and is still waiting on: the state
+ * they want that `(message, emoji)` to end up in.
+ *
+ * The pair is the identity of the intent, so it is the key rather than a field —
+ * nothing here has to build, parse or escape a composite string.
+ */
+type ReactionIntent = "added" | "removed";
+
+interface PendingReactions {
+  /** The last list the server stated for this message. */
+  confirmed: Message["reactions"];
+  /** Still awaiting confirmation, by emoji. */
+  intents: Map<string, ReactionIntent>;
+}
+
+/**
+ * Forces one emoji to the state an intent asks for.
+ *
+ * Idempotent on purpose: replaying an intent over a list that already agrees
+ * with it changes nothing, which is what lets the same intents be applied again
+ * over every new confirmed list without the count drifting.
+ */
+function applyReactionIntent(
+  reactions: Message["reactions"],
+  emoji: string,
+  desired: ReactionIntent,
+): Message["reactions"] {
+  const reacted = reactions.find((item) => item.emoji === emoji)?.reactedByMe ?? false;
+  if (reacted === (desired === "added")) return reactions;
+  return toggleOptimisticReaction(reactions, emoji);
+}
+
+/** Confirmed server state + this reader's outstanding intents = what is drawn. */
+function applyPendingReactions(pending: PendingReactions): Message["reactions"] {
+  let reactions = pending.confirmed;
+  for (const [emoji, desired] of pending.intents) {
+    reactions = applyReactionIntent(reactions, emoji, desired);
+  }
+  return reactions;
+}
+
+/** The pending entry for a message, or an empty one anchored on what is drawn. */
+function pendingFor(
+  state: MessagesState,
+  messageId: string,
+  rendered: Message["reactions"],
+): PendingReactions {
+  return state.pendingReactions.get(messageId) ?? { confirmed: rendered, intents: new Map() };
+}
+
+/**
+ * Writes a message's pending entry back, dropping it once nothing is in flight
+ * so the map holds only messages that actually have something outstanding.
+ */
+function withPending(
+  state: MessagesState,
+  messageId: string,
+  pending: PendingReactions | null,
+): Map<string, PendingReactions> {
+  const next = new Map(state.pendingReactions);
+  if (pending === null || pending.intents.size === 0) next.delete(messageId);
+  else next.set(messageId, pending);
+  return next;
+}
+
+/**
+ * What an incoming event settled, if anything.
+ *
+ * Carries the intent it settled so the caller does not have to work out again
+ * whether it was an addition — that question decides the emoji history, and it
+ * must have exactly one answer.
+ */
+interface ReactionConfirmation {
+  confirmed: boolean;
+  intent?: ReactionIntent;
+}
+
+const unconfirmed: ReactionConfirmation = { confirmed: false };
+
+/**
+ * Whether an event is the confirmation of what *this reader* asked for.
+ *
+ * Observing an event is not the same as having your own toggle confirmed. The
+ * server fans one event out to every subscriber, so a reaction the reader is
+ * still waiting on and an identical reaction from somebody else look alike on
+ * the wire; and the reader's own events can arrive after they have already
+ * changed their mind. Only an event that says back the state the outstanding
+ * intent asked for settles it — which is what makes it safe to stop that
+ * intent's rollback timer and to count the emoji as used.
+ *
+ * The three cases this exists to refuse:
+ *
+ *  - another reader toggling the same emoji. It moves the confirmed count, and
+ *    this reader's own toggle stays pending on top of it;
+ *  - a stale `added` reaching a reader who has since asked to remove the same
+ *    emoji, and the mirror case. The newer intent survives and is re-applied,
+ *    so the event cannot resurrect what the reader has already taken back;
+ *  - a redelivery. The first copy settled the intent, so by the second there is
+ *    nothing outstanding and nothing to settle.
+ *
+ * Two tabs of the same reader are indistinguishable here: the protocol carries
+ * an actor, not an origin. When the other tab's action happens to be the state
+ * this tab is waiting for, the server already satisfies the intent and treating
+ * that as convergence is correct.
+ */
+function confirmReactionIntent(
+  pending: Map<string, PendingReactions>,
+  reaction: NonNullable<WSReactionUpdatedEvent["reaction"]>,
+  actorIsMe: boolean,
+): ReactionConfirmation {
+  if (!actorIsMe) return unconfirmed;
+  const intent = pending.get(reaction.message_id)?.intents.get(reaction.emoji);
+  if (intent === undefined || intent !== (reaction.added ? "added" : "removed")) {
+    return unconfirmed;
+  }
+  return { confirmed: true, intent };
+}
+
+/** The intents left once an event has settled the one it confirms, if any. */
+function remainingIntents(
+  pending: PendingReactions,
+  emoji: string,
+  confirmation: ReactionConfirmation,
+): Map<string, ReactionIntent> {
+  if (!confirmation.confirmed) return pending.intents;
+  const next = new Map(pending.intents);
+  next.delete(emoji);
+  return next;
+}
+
+/**
+ * Applies a reaction.updated event to the message it names (issue #496).
+ *
+ * The event carries absolute values — a count and a bounded list of names, never
+ * an increment — so replaying one is a no-op: nothing accumulates, and no author
+ * is listed twice. Each event's list replaces the previous one wholesale, and
+ * events for a target arrive in publication order over a single connection, so
+ * the last one delivered is the current state; a reconnect is reconciled by
+ * refetching the message, not by ordering rules here.
+ *
+ * What the event does *not* carry is `reacted_by_me`: one event is fanned out to
+ * every subscriber, so the reader's own state is derived here instead.
+ *
+ * That derivation reconciles against the pre-optimistic baseline, not the
+ * current — possibly still unconfirmed — optimistic guess, so an update from
+ * another actor cannot inherit this reader's own pending toggle as ground truth.
+ */
+function applyReactionEvent(
+  state: MessagesState,
+  event: WSReactionUpdatedEvent,
+  actorIsMe: boolean,
+): MessagesState {
+  const { reaction } = event;
+  if (!reaction) return state;
+  const index = state.messages.findIndex((message) => message.id === reaction.message_id);
+  if (index < 0) return state;
+  const message = state.messages[index];
+  const previous = pendingFor(state, reaction.message_id, message.reactions);
+  const wasReacted = new Map(previous.confirmed.map((item) => [item.emoji, item.reactedByMe]));
+  const confirmed = reaction.reactions.map((item) => ({
+    emoji: item.emoji,
+    count: item.count,
+    // The names travel with the event, so a tooltip is correct the instant the
+    // count changes — no refetch, and no request when it is hovered.
+    users: parseReactionUsers(item.users),
+    reactedByMe:
+      actorIsMe && item.emoji === reaction.emoji
+        ? reaction.added
+        : (wasReacted.get(item.emoji) ?? false),
+  }));
+  const confirmation = confirmReactionIntent(state.pendingReactions, reaction, actorIsMe);
+  const pending = {
+    confirmed,
+    intents: remainingIntents(previous, reaction.emoji, confirmation),
+  };
+  const messages = [...state.messages];
+  messages[index] = { ...message, reactions: applyPendingReactions(pending) };
+  return {
+    ...state,
+    messages,
+    pendingReactions: withPending(state, reaction.message_id, pending),
+    lastMutation: "none",
+    realtimeError: null,
+    actionError: null,
+  };
 }
 
 function insertMessageChronologically(
@@ -387,7 +586,873 @@ function applyLinkSafetyCorrections(
   return next;
 }
 
-function reducer(state: MessagesState, action: Action): MessagesState {
+/** The action of one specific type, narrowed out of the union. */
+type ActionOf<T extends Action["type"]> = Extract<Action, { type: T }>;
+
+function applyLoaded(state: MessagesState, action: ActionOf<"loaded">): MessagesState {
+  return {
+    status: "ready",
+    messages: action.page.messages.map((message) =>
+      applyLinkSafetyCorrections(message, state.linkSafetyCorrections),
+    ),
+    nextCursor: action.page.nextCursor,
+    sendError: null,
+    sending: false,
+    loadingMore: false,
+    lastMutation: "initial",
+    realtimeError: null,
+    actionError: null,
+    pendingReactions: new Map(),
+    replyTo: null,
+    linkSafetyCorrections: state.linkSafetyCorrections,
+  };
+}
+
+function applySent(state: MessagesState, action: ActionOf<"sent">): MessagesState {
+  // Deduplicate: a realtime event or a prior send might have already added this message.
+  const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
+  const message = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  linkSafetyCorrections.delete(action.message.id);
+  return {
+    ...state,
+    messages: alreadyPresent ? state.messages : [...state.messages, message],
+    sending: false,
+    sendError: null,
+    lastMutation: alreadyPresent ? "none" : "append",
+    realtimeError: null,
+    replyTo: null,
+    linkSafetyCorrections,
+  };
+}
+
+function applyMessageBlocked(
+  state: MessagesState,
+  action: ActionOf<"message_blocked">,
+): MessagesState {
+  // Only a message this client is still showing as pending is affected. A
+  // late event for something already resolved, or for a message this view
+  // never held, is a no-op.
+  const blocked = state.messages.find(
+    (m) => m.id === action.messageId && m.status === "pending_link_scan",
+  );
+  if (!blocked) return state;
+  return {
+    ...state,
+    messages: state.messages.filter((m) => m.id !== action.messageId),
+    sending: false,
+    // "unavailable" is the one explicit sentinel for "the message itself is
+    // gone" (reconciliation found no blocked verdict behind it). Every other
+    // reason — a recognised one, or one this client does not know yet — is a
+    // link refusal, and defaults to the malicious wording rather than the
+    // "gone" one: downgrading an unrecognised-but-real refusal to "message
+    // unavailable" would discard a verdict already established.
+    sendError:
+      action.reason === "unavailable"
+        ? pendingMessageUnavailable
+        : action.reason === "link_check_inconclusive"
+          ? sendErrorMessages.link_check_inconclusive
+          : sendErrorMessages.malicious_url,
+    lastMutation: "none",
+  };
+}
+
+type LinkSafetyChange = { state: Message["linkSafetyState"]; updatedAt: string };
+
+/**
+ * Whether a link-safety correction is already reflected, or is older than what
+ * is drawn.
+ *
+ * A quote or a cross-target reference can be the only visible copy of the
+ * source, and its version is authoritative too: accepting an older correction
+ * here would let a later stale snapshot re-apply it. At-least-once delivery of
+ * this event is free precisely because this says "nothing to do" for a repeat.
+ */
+function linkSafetyChangeIsStale(
+  state: MessagesState,
+  action: ActionOf<"link_safety_changed">,
+): boolean {
+  const previous = state.linkSafetyCorrections.get(action.messageId);
+  if (previous?.state === action.state && previous?.updatedAt === action.updatedAt) return true;
+  if (previous && isOlderSecurityVersion(action.updatedAt, previous.updatedAt)) return true;
+  if (
+    state.replyTo?.id === action.messageId &&
+    isOlderSecurityVersion(action.updatedAt, state.replyTo.updatedAt)
+  ) {
+    return true;
+  }
+  return state.messages.some((message) => holdsNewerVersionOf(message, action));
+}
+
+/** True when this message, its quote or its reference is newer than the change. */
+function holdsNewerVersionOf(message: Message, action: ActionOf<"link_safety_changed">): boolean {
+  const quoted = message.quoted;
+  const reference = message.reference;
+  if (message.id === action.messageId) {
+    return isOlderSecurityVersion(action.updatedAt, message.updatedAt);
+  }
+  if (quoted?.id === action.messageId) {
+    return isOlderSecurityVersion(action.updatedAt, quoted.updatedAt ?? quoted.createdAt);
+  }
+  if (reference?.available && reference.messageId === action.messageId) {
+    return isOlderSecurityVersion(action.updatedAt, reference.updatedAt ?? reference.createdAt);
+  }
+  return false;
+}
+
+/** The message body's own correction: nothing when it is already applied. */
+function correctMessageBody(
+  message: Message,
+  action: ActionOf<"link_safety_changed">,
+  malicious: boolean,
+): Message {
+  const unchanged =
+    (message.linkSafetyState ?? "") === (action.state ?? "") &&
+    !(malicious && message.bodyText !== "");
+  if (message.id !== action.messageId || unchanged) return message;
+  if (isOlderSecurityVersion(action.updatedAt, message.updatedAt)) return message;
+  return {
+    ...message,
+    linkSafetyState: action.state,
+    bodyText: malicious ? "" : message.bodyText,
+    updatedAt: action.updatedAt,
+  };
+}
+
+/** The same correction applied to the quote preview this message carries. */
+function correctQuotedPreview(
+  message: Message,
+  action: ActionOf<"link_safety_changed">,
+  malicious: boolean,
+): Message {
+  const quoted = message.quoted;
+  if (!quoted || quoted.id !== action.messageId) return message;
+  const unchanged =
+    quoted.linkSafetyState === action.state && !(malicious && quoted.bodyText !== "");
+  if (unchanged) return message;
+  if (isOlderSecurityVersion(action.updatedAt, quoted.updatedAt ?? quoted.createdAt))
+    return message;
+  return {
+    ...message,
+    quoted: {
+      ...quoted,
+      linkSafetyState: action.state ?? "",
+      bodyText: malicious ? "" : quoted.bodyText,
+      updatedAt: action.updatedAt,
+    },
+  };
+}
+
+/** Narrows a reference to the available branch and to one source message. */
+function referenceIsAbout(
+  reference: Message["reference"],
+  messageId: string,
+): reference is Extract<NonNullable<Message["reference"]>, { available: true }> {
+  return reference?.available === true && reference.messageId === messageId;
+}
+
+/** The same correction applied to the cross-target reference preview. */
+function correctReferencePreview(
+  message: Message,
+  action: ActionOf<"link_safety_changed">,
+  malicious: boolean,
+): Message {
+  const reference = message.reference;
+  if (!referenceIsAbout(reference, action.messageId)) return message;
+  const unchanged =
+    reference.linkSafetyState === action.state && !(malicious && reference.bodyText !== "");
+  if (unchanged) return message;
+  if (isOlderSecurityVersion(action.updatedAt, reference.updatedAt ?? reference.createdAt)) {
+    return message;
+  }
+  return {
+    ...message,
+    reference: {
+      ...reference,
+      linkSafetyState: action.state ?? "",
+      bodyText: malicious ? "" : reference.bodyText,
+      updatedAt: action.updatedAt,
+    },
+  };
+}
+
+/**
+ * RF-21 (issue #135): what is known about a published message's links changed.
+ *
+ * Nothing here inserts a message and nothing changes `status`: if the message
+ * has not arrived yet, only a versioned correction is retained for its eventual
+ * create event. Nothing here fetches a URL either — see MessageContent, where
+ * this state is rendered and never acted on.
+ *
+ * lastMutation stays "none": nothing was added or removed, so the list must not
+ * scroll. A notice appearing above a message the reader is looking at should not
+ * move the conversation under them.
+ */
+function applyLinkSafetyChanged(
+  state: MessagesState,
+  action: ActionOf<"link_safety_changed">,
+): MessagesState {
+  if (linkSafetyChangeIsStale(state, action)) return state;
+  const change: LinkSafetyChange = { state: action.state, updatedAt: action.updatedAt };
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  linkSafetyCorrections.set(action.messageId, change);
+  const malicious = action.state === "malicious";
+  const messages = state.messages.map((message) =>
+    correctReferencePreview(
+      correctQuotedPreview(correctMessageBody(message, action, malicious), action, malicious),
+      action,
+      malicious,
+    ),
+  );
+  const replyTo =
+    state.replyTo?.id === action.messageId
+      ? applyLinkSafetyCorrection(state.replyTo, change)
+      : state.replyTo;
+  return { ...state, messages, replyTo, linkSafetyCorrections, lastMutation: "none" };
+}
+
+type AvailableSnapshot = Extract<MessageSecuritySnapshot, { available: true }>;
+type LinkSafetyCorrections = Map<string, LinkSafetyChange>;
+
+/**
+ * Which version of a message's security state wins: a local correction the
+ * snapshot has not caught up with, the snapshot itself, or what is already
+ * drawn. A correction that lost is dropped, because the snapshot now carries it.
+ */
+function resolveSnapshotVersion(
+  message: Message,
+  snapshot: AvailableSnapshot,
+  corrections: LinkSafetyCorrections,
+): { state: Message["linkSafetyState"]; updatedAt: string; status: Message["status"] } {
+  const correction = corrections.get(message.id);
+  const correctionWins = Boolean(
+    correction && isNotNewerSecurityVersion(snapshot.updatedAt, correction.updatedAt),
+  );
+  if (!correctionWins) corrections.delete(message.id);
+  const snapshotWins = !isOlderSecurityVersion(snapshot.updatedAt, message.updatedAt);
+  const status = snapshotWins ? snapshot.status : message.status;
+  if (correction && correctionWins) {
+    return { state: correction.state, updatedAt: correction.updatedAt, status };
+  }
+  if (snapshotWins) {
+    return { state: snapshot.linkSafetyState, updatedAt: snapshot.updatedAt, status };
+  }
+  return { state: message.linkSafetyState, updatedAt: message.updatedAt, status };
+}
+
+type QuoteLinkSafety = NonNullable<Message["quoted"]>["linkSafetyState"];
+
+/**
+ * Which version of a quote preview's security state wins.
+ *
+ * A quote can be the only visible copy of its source, so its own version is
+ * compared too — a correction only wins while it is newer than both the snapshot
+ * and what is drawn.
+ */
+function resolveQuoteVersion(
+  quoted: NonNullable<Message["quoted"]>,
+  snapshotQuote: NonNullable<AvailableSnapshot["quoted"]>,
+  corrections: LinkSafetyCorrections,
+): { state: QuoteLinkSafety; updatedAt: string; removed: boolean } {
+  const current = quoted.updatedAt ?? quoted.createdAt;
+  const correction = corrections.get(quoted.id);
+  const correctionWins = Boolean(
+    correction &&
+    isNotNewerSecurityVersion(snapshotQuote.updatedAt, correction.updatedAt) &&
+    !isOlderSecurityVersion(correction.updatedAt, current),
+  );
+  if (!correctionWins) corrections.delete(quoted.id);
+  const snapshotWins = !isOlderSecurityVersion(snapshotQuote.updatedAt, current);
+  const removed = snapshotWins ? snapshotQuote.status === "deleted" : quoted.isRemoved;
+  if (correction && correctionWins) {
+    return { state: correction.state ?? "unknown", updatedAt: correction.updatedAt, removed };
+  }
+  if (snapshotWins) {
+    return {
+      state: snapshotQuote.linkSafetyState,
+      updatedAt: snapshotQuote.updatedAt,
+      removed,
+    };
+  }
+  return { state: quoted.linkSafetyState, updatedAt: current, removed };
+}
+
+/** The resolved quote version, written back onto the message that carries it. */
+function applySnapshotToQuote(
+  next: Message,
+  quoted: NonNullable<Message["quoted"]>,
+  snapshotQuote: NonNullable<AvailableSnapshot["quoted"]>,
+  corrections: LinkSafetyCorrections,
+): Message {
+  const { state, updatedAt, removed } = resolveQuoteVersion(quoted, snapshotQuote, corrections);
+  return {
+    ...next,
+    quoted: {
+      ...quoted,
+      linkSafetyState: state,
+      updatedAt,
+      isRemoved: removed,
+      bodyText: removed || state === "malicious" ? "" : quoted.bodyText,
+    },
+  };
+}
+
+/** A message the server says is gone: it keeps its place and nothing else. */
+function withdrawMessage(message: Message): Message {
+  return {
+    ...message,
+    bodyText: "",
+    quoted: undefined,
+    reference: undefined,
+    reactions: [],
+    status: "deleted" as const,
+    isRemoved: true,
+  };
+}
+
+function applySnapshotToMessage(
+  message: Message,
+  snapshot: MessageSecuritySnapshot,
+  corrections: LinkSafetyCorrections,
+): Message {
+  if (!snapshot.available) {
+    corrections.delete(message.id);
+    return withdrawMessage(message);
+  }
+  const resolved = resolveSnapshotVersion(message, snapshot, corrections);
+  const removed = resolved.status === "deleted";
+  const malicious = resolved.state === "malicious";
+  const next: Message = {
+    ...message,
+    status: resolved.status,
+    linkSafetyState: resolved.state,
+    bodyText: removed || malicious ? "" : message.bodyText,
+    isRemoved: removed,
+    updatedAt: resolved.updatedAt,
+    ...(removed ? { quoted: undefined, reactions: [] } : {}),
+  };
+  const quoted = message.quoted;
+  if (removed || !quoted || snapshot.quoted?.messageId !== quoted.id) return next;
+  return applySnapshotToQuote(next, quoted, snapshot.quoted, corrections);
+}
+
+/**
+ * RF-21 reconciliation: the authoritative security state of a page of messages,
+ * read back from the server and merged with any correction still in flight.
+ */
+function applySecuritySnapshotsRefreshed(
+  state: MessagesState,
+  action: ActionOf<"security_snapshots_refreshed">,
+): MessagesState {
+  const snapshots = new Map(action.snapshots.map((snapshot) => [snapshot.messageId, snapshot]));
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  let changed = false;
+  const messages = state.messages.map((message) => {
+    const snapshot = snapshots.get(message.id);
+    if (!snapshot) return message;
+    changed = true;
+    return applySnapshotToMessage(message, snapshot, linkSafetyCorrections);
+  });
+  if (!changed) return state;
+  const replySnapshot = state.replyTo ? snapshots.get(state.replyTo.id) : undefined;
+  const replyTo =
+    replySnapshot && (!replySnapshot.available || replySnapshot.status === "deleted")
+      ? null
+      : state.replyTo;
+  return { ...state, messages, replyTo, linkSafetyCorrections, lastMutation: "none" };
+}
+
+function applyPrepended(state: MessagesState, action: ActionOf<"prepended">): MessagesState {
+  // Prepend older messages; deduplicate by ID to guard against cursor overlaps.
+  const existingIds = new Set(state.messages.map((m) => m.id));
+  const fresh = action.page.messages
+    .filter((m) => !existingIds.has(m.id))
+    .map((message) => applyLinkSafetyCorrections(message, state.linkSafetyCorrections));
+  // If every message in this page was already present, no DOM change occurs:
+  // skip the scroll delta calculation by keeping lastMutation as "none".
+  return {
+    ...state,
+    messages: fresh.length > 0 ? [...fresh, ...state.messages] : state.messages,
+    nextCursor: action.page.nextCursor,
+    loadingMore: false,
+    lastMutation: fresh.length > 0 ? "prepend" : "none",
+  };
+}
+
+function applyWsReceived(state: MessagesState, action: ActionOf<"ws_received">): MessagesState {
+  const received = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  linkSafetyCorrections.delete(action.message.id);
+  // Dedup: if the message is already present (e.g. our own POST response
+  // arrived before the WS event), this is normally a pure no-op.
+  const existingIndex = state.messages.findIndex((m) => m.id === received.id);
+  if (existingIndex >= 0) {
+    const existing = state.messages[existingIndex];
+    // RF-21: the one case where "already present" is not a no-op.
+    //
+    // A message whose links were still being scanned was returned to its
+    // own sender as pending_link_scan and shown to nobody else. When the
+    // scan clears, the backend promotes it and broadcasts message.created
+    // with the same id — so discarding the event by id, as this branch used
+    // to do unconditionally, left the sender looking at "checking links…"
+    // forever while everyone else saw the message.
+    //
+    // The event carries the authoritative published row, so it replaces the
+    // local one in place: same position, no duplicate, no re-sort. Only this
+    // transition is special-cased; every other repeat delivery stays the
+    // no-op it was, which is what keeps at-least-once outbox delivery safe.
+    if (existing.status === "pending_link_scan" && received.status !== "pending_link_scan") {
+      const messages = [...state.messages];
+      messages[existingIndex] = received;
+      return { ...state, messages, linkSafetyCorrections, realtimeError: null };
+    }
+    return { ...state, linkSafetyCorrections, realtimeError: null };
+  }
+
+  // Insert in stable (createdAt, id) order to handle out-of-order delivery.
+  // Most WS messages are newer than all existing ones, so a quick tail-check
+  // avoids a full sort in the common case.
+  const insertion = insertMessageChronologically(state.messages, received);
+
+  return {
+    ...state,
+    messages: insertion.messages,
+    // ws_append: MessageList scrolls to bottom only if the user is already
+    // near the bottom, preserving position when reading history.
+    // If the message was inserted mid-list (out-of-order), no auto-scroll.
+    lastMutation: insertion.isNewer ? "ws_append" : "none",
+    realtimeError: null,
+    linkSafetyCorrections,
+  };
+}
+
+function applyEditOptimistic(
+  state: MessagesState,
+  action: ActionOf<"edit_optimistic">,
+): MessagesState {
+  const messages = state.messages.map((message) =>
+    message.id === action.messageId
+      ? {
+          ...message,
+          bodyText: action.body,
+          bodyFormat: action.bodyFormat,
+          isEdited: true,
+          editCount: message.editCount + 1,
+          editedAt: action.editedAt,
+          // The new body has not yet received the server's verdict. Keeping the
+          // old body's clearance here would briefly authorize different links.
+          linkSafetyState: "unknown" as const,
+        }
+      : message,
+  );
+  return { ...state, messages, lastMutation: "none" };
+}
+
+function applyEditConfirmed(
+  state: MessagesState,
+  action: ActionOf<"edit_confirmed">,
+): MessagesState {
+  const correction = state.linkSafetyCorrections.get(action.message.id);
+  const correctionWins =
+    correction && isNotNewerSecurityVersion(action.message.updatedAt, correction.updatedAt);
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  if (!correctionWins) linkSafetyCorrections.delete(action.message.id);
+  return {
+    ...state,
+    messages: state.messages.map((message) =>
+      message.id === action.message.id &&
+      !message.isRemoved &&
+      action.message.editCount >= message.editCount
+        ? correctionWins
+          ? applyLinkSafetyCorrection(message, correction)
+          : {
+              ...message,
+              bodyText: action.message.bodyText,
+              bodyFormat: action.message.bodyFormat,
+              editedAt: action.message.editedAt,
+              updatedAt: action.message.updatedAt,
+              editCount: action.message.editCount,
+              isEdited: action.message.isEdited,
+              linkSafetyState: action.message.linkSafetyState,
+            }
+        : message,
+    ),
+    linkSafetyCorrections,
+    lastMutation: "none",
+  };
+}
+
+function applyEditRevert(state: MessagesState, action: ActionOf<"edit_revert">): MessagesState {
+  return {
+    ...state,
+    messages: state.messages.map((message) =>
+      message.id === action.message.id &&
+      !message.isRemoved &&
+      message.editedAt === action.optimisticEditedAt
+        ? applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections)
+        : message,
+    ),
+    lastMutation: "none",
+  };
+}
+
+type MessageUpdate = NonNullable<WSMessageUpdatedEvent["message_update"]>;
+
+/** The removal an update announces, written onto the message it names. */
+function withdrawUpdatedMessage(
+  message: Message,
+  update: MessageUpdate,
+  deletedAt: string | null,
+): Message {
+  return {
+    ...message,
+    bodyText: "",
+    quoted: undefined,
+    reactions: [],
+    status: "deleted" as const,
+    isRemoved: true,
+    deletedAt,
+    updatedAt: update.updated_at ?? deletedAt ?? message.updatedAt,
+  };
+}
+
+/** The edit an update announces, unless this client already holds a later one. */
+function applyUpdatedBody(message: Message, update: MessageUpdate): Message {
+  if (update.edit_count < message.editCount) return message;
+  const linkSafetyState =
+    update.link_safety_state === undefined
+      ? message.linkSafetyState
+      : normalizeLinkSafety(update.link_safety_state);
+  return {
+    ...message,
+    bodyText: linkSafetyState === "malicious" ? "" : update.body,
+    bodyFormat: normalizeBodyFormat(update.body_format),
+    editedAt: update.edited_at,
+    updatedAt: update.updated_at ?? update.edited_at,
+    editCount: update.edit_count,
+    isEdited: update.is_edited,
+    linkSafetyState,
+  };
+}
+
+interface MessageUpdateContext {
+  update: MessageUpdate;
+  removed: boolean;
+  deletedAt: string | null;
+  /** A local correction that is still newer than this update, if any. */
+  correction: LinkSafetyChange | undefined;
+  correctionWins: boolean;
+}
+
+function applyUpdateToMessage(message: Message, context: MessageUpdateContext): Message {
+  const { update, removed, deletedAt } = context;
+  if (message.id !== update.message_id) {
+    if (!removed || message.quoted?.id !== update.message_id) return message;
+    return {
+      ...message,
+      quoted: { ...message.quoted, bodyText: "", isRemoved: true, deletedAt },
+    };
+  }
+  if (context.correctionWins) return message;
+  if (removed) return withdrawUpdatedMessage(message, update, deletedAt);
+  if (message.isRemoved) return message;
+  return applyUpdatedBody(message, update);
+}
+
+/**
+ * Everything one update decides before it is applied, including whether a local
+ * correction outranks it. A correction that lost is dropped here.
+ */
+function messageUpdateContext(
+  update: MessageUpdate,
+  corrections: LinkSafetyCorrections,
+): MessageUpdateContext {
+  const correction = corrections.get(update.message_id);
+  const updateVersion = update.updated_at ?? update.edited_at;
+  const correctionWins = Boolean(
+    correction && isNotNewerSecurityVersion(updateVersion, correction.updatedAt),
+  );
+  if (!correctionWins) corrections.delete(update.message_id);
+  return {
+    update,
+    removed: update.is_removed === true || update.status === "deleted",
+    deletedAt: update.deleted_at ?? update.updated_at ?? null,
+    correction,
+    correctionWins,
+  };
+}
+
+/**
+ * A message.updated event: an edit or a deletion someone else performed.
+ *
+ * A local link-safety correction newer than the update wins over it, so a
+ * verdict that arrived first is not undone by an edit event that predates it.
+ */
+function applyMessageUpdated(
+  state: MessagesState,
+  action: ActionOf<"message_updated">,
+): MessagesState {
+  const update = action.event.message_update;
+  if (!update) return state;
+  const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
+  const context = messageUpdateContext(update, linkSafetyCorrections);
+  const stillTargeted = state.replyTo?.id === update.message_id;
+  return {
+    ...state,
+    messages: state.messages.map((message) => applyUpdateToMessage(message, context)),
+    replyTo: context.removed && stillTargeted ? null : state.replyTo,
+    lastMutation: "none",
+    realtimeError: null,
+    linkSafetyCorrections,
+  };
+}
+
+/**
+ * A copy of the corrections with the one this version supersedes removed. A
+ * correction newer than the version being applied is kept: it is still the most
+ * recent thing known about that message's links.
+ */
+function dropSupersededCorrection(
+  corrections: LinkSafetyCorrections,
+  messageId: string,
+  version: string,
+): LinkSafetyCorrections {
+  const next = new Map(corrections);
+  const correction = next.get(messageId);
+  if (!correction || !isNotNewerSecurityVersion(version, correction.updatedAt)) {
+    next.delete(messageId);
+  }
+  return next;
+}
+
+/** The snapshot written onto the message it replaces, or onto a quote of it. */
+function applySnapshotToTimeline(message: Message, snapshot: Message, removed: boolean): Message {
+  if (message.id === snapshot.id) {
+    return message.isRemoved && !removed ? message : snapshot;
+  }
+  if (!removed || message.quoted?.id !== snapshot.id) return message;
+  return {
+    ...message,
+    quoted: {
+      ...message.quoted,
+      bodyText: "",
+      isRemoved: true,
+      deletedAt: snapshot.deletedAt ?? snapshot.updatedAt,
+    },
+  };
+}
+
+/**
+ * An authoritative single-message read, applied to the timeline.
+ *
+ * This is the resync path: after a reconnect, or after a realtime event this
+ * client could not trust, the server's own copy replaces what is drawn.
+ */
+function applyMessageSnapshot(
+  state: MessagesState,
+  action: ActionOf<"message_snapshot">,
+): MessagesState {
+  const removed = action.message.isRemoved || action.message.status === "deleted";
+  const rawSnapshot = removed
+    ? { ...action.message, bodyText: "", quoted: undefined, reactions: [] }
+    : action.message;
+  const snapshot = applyLinkSafetyCorrections(rawSnapshot, state.linkSafetyCorrections);
+  const linkSafetyCorrections = dropSupersededCorrection(
+    state.linkSafetyCorrections,
+    rawSnapshot.id,
+    rawSnapshot.updatedAt,
+  );
+  const alreadyPresent = state.messages.some((message) => message.id === snapshot.id);
+  const rewritten = state.messages.map((message) =>
+    applySnapshotToTimeline(message, snapshot, removed),
+  );
+  const insertion =
+    !alreadyPresent && action.insertIfMissing
+      ? insertMessageChronologically(rewritten, snapshot)
+      : { messages: rewritten, isNewer: false };
+  return {
+    ...state,
+    messages: insertion.messages,
+    replyTo: removed && state.replyTo?.id === snapshot.id ? null : state.replyTo,
+    lastMutation: insertion.isNewer ? "ws_append" : "none",
+    realtimeError: null,
+    linkSafetyCorrections,
+  };
+}
+
+/**
+ * Whether a refetched reference preview is older than the one already drawn.
+ *
+ * The second clause is the one that matters for RF-21: a preview this client
+ * already knows was condemned must not be replaced by an unversioned answer that
+ * says otherwise, because the correction that condemned it may simply not have
+ * reached the endpoint that produced this one yet.
+ */
+function refreshedReferenceIsStale(
+  current: NonNullable<Message["reference"]>,
+  refreshed: NonNullable<Message["reference"]>,
+): boolean {
+  if (!current.available || !refreshed.available) return false;
+  if (
+    current.updatedAt &&
+    refreshed.updatedAt &&
+    isOlderSecurityVersion(refreshed.updatedAt, current.updatedAt)
+  ) {
+    return true;
+  }
+  return (
+    current.linkSafetyState === "malicious" &&
+    !refreshed.updatedAt &&
+    refreshed.linkSafetyState !== "malicious"
+  );
+}
+
+function applyReferencesRefreshed(
+  state: MessagesState,
+  action: ActionOf<"references_refreshed">,
+): MessagesState {
+  return {
+    ...state,
+    messages: state.messages.map((message) => {
+      const reference = action.references[message.id];
+      if (!reference || !message.reference) return message;
+      return refreshedReferenceIsStale(message.reference, reference)
+        ? message
+        : { ...message, reference };
+    }),
+  };
+}
+
+function applyAttachmentStatus(
+  state: MessagesState,
+  action: ActionOf<"attachment_status">,
+): MessagesState {
+  // RF-22 verdict for an attachment shown inside a message (RF-32).
+  //
+  // Patched in place rather than refetched: the event already carries the
+  // authoritative new status, and the status is the only thing that changed
+  // — nothing here decides what may be downloaded. That gate is
+  // file-service's, applied to every content and preview request, so a
+  // client that got this wrong would still be refused the bytes.
+  //
+  // Messages that carry no matching attachment are returned unchanged by
+  // identity, so an event for another conversation's file — or one this
+  // timeline has never seen — allocates nothing and rerenders nothing.
+  let changed = false;
+  const messages = state.messages.map((message) => {
+    if (!message.attachments?.some((item) => item.id === action.attachmentId)) {
+      return message;
+    }
+    changed = true;
+    return {
+      ...message,
+      attachments: message.attachments.map((item) =>
+        item.id === action.attachmentId ? { ...item, status: action.status } : item,
+      ),
+    };
+  });
+  return changed ? { ...state, messages, lastMutation: "none" } : state;
+}
+
+function applyReactionError(
+  state: MessagesState,
+  action: ActionOf<"reaction_error">,
+): MessagesState {
+  // Server-level errors (rate limit, feature unavailable) aren't scoped to a
+  // single message, so every optimistic toggle still in flight is reverted.
+  if (state.pendingReactions.size === 0) {
+    return { ...state, actionError: action.error };
+  }
+  const messages = state.messages.map((message) => {
+    const pending = state.pendingReactions.get(message.id);
+    return pending ? { ...message, reactions: pending.confirmed } : message;
+  });
+  return { ...state, messages, actionError: action.error, pendingReactions: new Map() };
+}
+
+function applyFavoriteSet(state: MessagesState, action: ActionOf<"favorite_set">): MessagesState {
+  const index = state.messages.findIndex((message) => message.id === action.messageId);
+  if (index < 0) return state;
+  const messages = [...state.messages];
+  messages[index] = { ...messages[index], isFavorited: action.isFavorited };
+  return { ...state, messages };
+}
+
+function applyReactionOptimistic(
+  state: MessagesState,
+  action: ActionOf<"reaction_optimistic">,
+): MessagesState {
+  const index = state.messages.findIndex((message) => message.id === action.messageId);
+  if (index < 0) return state;
+  const message = state.messages[index];
+  const previous = pendingFor(state, action.messageId, message.reactions);
+  // The toggle is read off what the reader is looking at, so a second toggle of
+  // the same emoji supersedes the first rather than stacking with it.
+  const reacted =
+    message.reactions.find((item) => item.emoji === action.emoji)?.reactedByMe ?? false;
+  const intents = new Map(previous.intents).set(action.emoji, reacted ? "removed" : "added");
+  const pending = { confirmed: previous.confirmed, intents };
+  const messages = [...state.messages];
+  messages[index] = { ...message, reactions: applyPendingReactions(pending) };
+  return {
+    ...state,
+    messages,
+    pendingReactions: withPending(state, action.messageId, pending),
+    actionError: null,
+  };
+}
+
+/** Undoes one intent — a refused send, or a confirmation that never came. */
+function applyReactionRevert(
+  state: MessagesState,
+  action: ActionOf<"reaction_revert">,
+): MessagesState {
+  const previous = state.pendingReactions.get(action.messageId);
+  if (!previous?.intents.has(action.emoji)) return { ...state, actionError: action.error };
+  const intents = new Map(previous.intents);
+  intents.delete(action.emoji);
+  const pending = { confirmed: previous.confirmed, intents };
+  const index = state.messages.findIndex((message) => message.id === action.messageId);
+  const reactions = applyPendingReactions(pending);
+  const messages =
+    index < 0
+      ? state.messages
+      : state.messages.map((message, i) => (i === index ? { ...message, reactions } : message));
+  return {
+    ...state,
+    messages,
+    pendingReactions: withPending(state, action.messageId, pending),
+    actionError: action.error,
+  };
+}
+
+/**
+ * A refetched message replaces what the server had said, and the intents still
+ * in flight are re-applied on top of it — a resync must not swallow a toggle the
+ * reader is still waiting on.
+ */
+function applyReactionSnapshot(
+  state: MessagesState,
+  action: ActionOf<"reaction_snapshot">,
+): MessagesState {
+  const index = state.messages.findIndex((message) => message.id === action.messageId);
+  if (index < 0) return state;
+  const previous = state.pendingReactions.get(action.messageId);
+  const pending = { confirmed: action.reactions, intents: previous?.intents ?? new Map() };
+  const messages = [...state.messages];
+  messages[index] = { ...messages[index], reactions: applyPendingReactions(pending) };
+  return {
+    ...state,
+    messages,
+    pendingReactions: withPending(state, action.messageId, pending),
+    lastMutation: "none",
+    realtimeError: null,
+    actionError: null,
+  };
+}
+
+/** Loading a conversation and paging through it. */
+function reduceHistory(state: MessagesState, action: Action): MessagesState | undefined {
   switch (action.type) {
     case "loading":
       // Reset cursor and loadingMore so stale pagination state does not carry over.
@@ -405,686 +1470,144 @@ function reducer(state: MessagesState, action: Action): MessagesState {
         replyTo: null,
       };
     case "loaded":
-      return {
-        status: "ready",
-        messages: action.page.messages.map((message) =>
-          applyLinkSafetyCorrections(message, state.linkSafetyCorrections),
-        ),
-        nextCursor: action.page.nextCursor,
-        sendError: null,
-        sending: false,
-        loadingMore: false,
-        lastMutation: "initial",
-        realtimeError: null,
-        actionError: null,
-        pendingReactions: new Map(),
-        replyTo: null,
-        linkSafetyCorrections: state.linkSafetyCorrections,
-      };
+      return applyLoaded(state, action);
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
-    case "sending":
-      return { ...state, sending: true, sendError: null };
-    case "sent": {
-      // Deduplicate: a realtime event or a prior send might have already added this message.
-      const alreadyPresent = state.messages.some((m) => m.id === action.message.id);
-      const message = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      linkSafetyCorrections.delete(action.message.id);
-      return {
-        ...state,
-        messages: alreadyPresent ? state.messages : [...state.messages, message],
-        sending: false,
-        sendError: null,
-        lastMutation: alreadyPresent ? "none" : "append",
-        realtimeError: null,
-        replyTo: null,
-        linkSafetyCorrections,
-      };
-    }
-    case "message_blocked": {
-      // Only a message this client is still showing as pending is affected. A
-      // late event for something already resolved, or for a message this view
-      // never held, is a no-op.
-      const blocked = state.messages.find(
-        (m) => m.id === action.messageId && m.status === "pending_link_scan",
-      );
-      if (!blocked) return state;
-      return {
-        ...state,
-        messages: state.messages.filter((m) => m.id !== action.messageId),
-        sending: false,
-        // "unavailable" is the one explicit sentinel for "the message itself is
-        // gone" (reconciliation found no blocked verdict behind it). Every other
-        // reason — a recognised one, or one this client does not know yet — is a
-        // link refusal, and defaults to the malicious wording rather than the
-        // "gone" one: downgrading an unrecognised-but-real refusal to "message
-        // unavailable" would discard a verdict already established.
-        sendError:
-          action.reason === "unavailable"
-            ? pendingMessageUnavailable
-            : action.reason === "link_check_inconclusive"
-              ? sendErrorMessages.link_check_inconclusive
-              : sendErrorMessages.malicious_url,
-        lastMutation: "none",
-      };
-    }
-    case "link_safety_changed": {
-      // Only a message already on screen, and only a real change. A correction
-      // for something this view never held is a no-op, and so is one that agrees
-      // with what is already drawn — which is what makes at-least-once delivery
-      // of this event free.
-      //
-      // Nothing here inserts a message and nothing changes `status`: if the
-      // message has not arrived yet, only a versioned correction is retained for
-      // its eventual create event. Nothing here fetches a URL either — see
-      // MessageBubble, where this state is rendered and never acted on.
-      const previousCorrection = state.linkSafetyCorrections.get(action.messageId);
-      if (
-        previousCorrection?.state === action.state &&
-        previousCorrection?.updatedAt === action.updatedAt
-      ) {
-        return state;
-      }
-      if (
-        previousCorrection &&
-        isOlderSecurityVersion(action.updatedAt, previousCorrection.updatedAt)
-      ) {
-        return state;
-      }
-      // A quote/reference can be the only visible copy of the source. Its
-      // version is still authoritative: retaining an older correction here
-      // would let a later stale snapshot re-apply it.
-      const hasNewerVisibleVersion = state.messages.some(
-        (message) =>
-          (message.id === action.messageId &&
-            isOlderSecurityVersion(action.updatedAt, message.updatedAt)) ||
-          (message.quoted?.id === action.messageId &&
-            isOlderSecurityVersion(
-              action.updatedAt,
-              message.quoted.updatedAt ?? message.quoted.createdAt,
-            )) ||
-          (message.reference?.available &&
-            message.reference.messageId === action.messageId &&
-            isOlderSecurityVersion(
-              action.updatedAt,
-              message.reference.updatedAt ?? message.reference.createdAt,
-            )),
-      );
-      if (
-        hasNewerVisibleVersion ||
-        (state.replyTo?.id === action.messageId &&
-          isOlderSecurityVersion(action.updatedAt, state.replyTo.updatedAt))
-      ) {
-        return state;
-      }
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      linkSafetyCorrections.set(action.messageId, {
-        state: action.state,
-        updatedAt: action.updatedAt,
-      });
-      const malicious = action.state === "malicious";
-      const messages = state.messages.map((message) => {
-        let next = message;
-        if (
-          message.id === action.messageId &&
-          !isOlderSecurityVersion(action.updatedAt, message.updatedAt) &&
-          ((message.linkSafetyState ?? "") !== (action.state ?? "") ||
-            (malicious && message.bodyText !== ""))
-        ) {
-          next = {
-            ...next,
-            linkSafetyState: action.state,
-            bodyText: malicious ? "" : next.bodyText,
-            updatedAt: action.updatedAt,
-          };
-        }
-        if (
-          message.quoted?.id === action.messageId &&
-          !isOlderSecurityVersion(
-            action.updatedAt,
-            message.quoted.updatedAt ?? message.quoted.createdAt,
-          ) &&
-          (message.quoted.linkSafetyState !== action.state ||
-            (malicious && message.quoted.bodyText !== ""))
-        ) {
-          next = {
-            ...next,
-            quoted: {
-              ...message.quoted,
-              linkSafetyState: action.state ?? "",
-              bodyText: malicious ? "" : message.quoted.bodyText,
-              updatedAt: action.updatedAt,
-            },
-          };
-        }
-        if (
-          message.reference?.available &&
-          message.reference.messageId === action.messageId &&
-          !isOlderSecurityVersion(
-            action.updatedAt,
-            message.reference.updatedAt ?? message.reference.createdAt,
-          ) &&
-          (message.reference.linkSafetyState !== action.state ||
-            (malicious && message.reference.bodyText !== ""))
-        ) {
-          next = {
-            ...next,
-            reference: {
-              ...message.reference,
-              linkSafetyState: action.state ?? "",
-              bodyText: malicious ? "" : message.reference.bodyText,
-              updatedAt: action.updatedAt,
-            },
-          };
-        }
-        return next;
-      });
-      const replyTo =
-        state.replyTo?.id === action.messageId &&
-        !isOlderSecurityVersion(action.updatedAt, state.replyTo.updatedAt)
-          ? applyLinkSafetyCorrection(state.replyTo, {
-              state: action.state,
-              updatedAt: action.updatedAt,
-            })
-          : state.replyTo;
-      // lastMutation stays "none": nothing was added or removed, so the list must
-      // not scroll. A notice appearing above a message the reader is looking at
-      // should not move the conversation under them.
-      return {
-        ...state,
-        messages,
-        replyTo,
-        linkSafetyCorrections,
-        lastMutation: "none",
-      };
-    }
-    case "security_snapshots_refreshed": {
-      const snapshots = new Map(action.snapshots.map((snapshot) => [snapshot.messageId, snapshot]));
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      let changed = false;
-      const messages = state.messages.map((message) => {
-        const snapshot = snapshots.get(message.id);
-        if (!snapshot) return message;
-        if (!snapshot.available) {
-          linkSafetyCorrections.delete(message.id);
-          changed = true;
-          return {
-            ...message,
-            bodyText: "",
-            quoted: undefined,
-            reference: undefined,
-            reactions: [],
-            status: "deleted" as const,
-            isRemoved: true,
-          };
-        }
-        const correction = linkSafetyCorrections.get(message.id);
-        const correctionWins =
-          correction && isNotNewerSecurityVersion(snapshot.updatedAt, correction.updatedAt);
-        if (!correctionWins) linkSafetyCorrections.delete(message.id);
-        const snapshotWins = !isOlderSecurityVersion(snapshot.updatedAt, message.updatedAt);
-        const effectiveState = correctionWins
-          ? correction.state
-          : snapshotWins
-            ? snapshot.linkSafetyState
-            : message.linkSafetyState;
-        const effectiveUpdatedAt = correctionWins
-          ? correction.updatedAt
-          : snapshotWins
-            ? snapshot.updatedAt
-            : message.updatedAt;
-        const effectiveStatus = snapshotWins ? snapshot.status : message.status;
-        const removed = effectiveStatus === "deleted";
-        const malicious = effectiveState === "malicious";
-        let next: Message = {
-          ...message,
-          status: effectiveStatus,
-          linkSafetyState: effectiveState,
-          bodyText: removed || malicious ? "" : message.bodyText,
-          isRemoved: removed,
-          updatedAt: effectiveUpdatedAt,
-          ...(removed ? { quoted: undefined, reactions: [] } : {}),
-        };
-        if (!removed && message.quoted && snapshot.quoted?.messageId === message.quoted.id) {
-          const quoteCurrentVersion = message.quoted.updatedAt ?? message.quoted.createdAt;
-          const quoteCorrection = linkSafetyCorrections.get(message.quoted.id);
-          const quoteCorrectionWins =
-            quoteCorrection &&
-            isNotNewerSecurityVersion(snapshot.quoted.updatedAt, quoteCorrection.updatedAt) &&
-            !isOlderSecurityVersion(quoteCorrection.updatedAt, quoteCurrentVersion);
-          if (!quoteCorrectionWins) linkSafetyCorrections.delete(message.quoted.id);
-          const quoteSnapshotWins = !isOlderSecurityVersion(
-            snapshot.quoted.updatedAt,
-            quoteCurrentVersion,
-          );
-          const quoteState = quoteCorrectionWins
-            ? (quoteCorrection.state ?? "unknown")
-            : quoteSnapshotWins
-              ? snapshot.quoted.linkSafetyState
-              : message.quoted.linkSafetyState;
-          const quoteUpdatedAt = quoteCorrectionWins
-            ? quoteCorrection.updatedAt
-            : quoteSnapshotWins
-              ? snapshot.quoted.updatedAt
-              : quoteCurrentVersion;
-          const quoteRemoved = quoteSnapshotWins
-            ? snapshot.quoted.status === "deleted"
-            : message.quoted.isRemoved;
-          next = {
-            ...next,
-            quoted: {
-              ...message.quoted,
-              linkSafetyState: quoteState,
-              updatedAt: quoteUpdatedAt,
-              isRemoved: quoteRemoved,
-              bodyText: quoteRemoved || quoteState === "malicious" ? "" : message.quoted.bodyText,
-            },
-          };
-        }
-        changed = true;
-        return next;
-      });
-      if (!changed) return state;
-      const replySnapshot = state.replyTo ? snapshots.get(state.replyTo.id) : undefined;
-      const replyTo =
-        replySnapshot && (!replySnapshot.available || replySnapshot.status === "deleted")
-          ? null
-          : state.replyTo;
-      return { ...state, messages, replyTo, linkSafetyCorrections, lastMutation: "none" };
-    }
-    case "send_error":
-      return { ...state, sending: false, sendError: action.error };
     case "prepending":
       return { ...state, loadingMore: true, lastMutation: "none" };
-    case "prepended": {
-      // Prepend older messages; deduplicate by ID to guard against cursor overlaps.
-      const existingIds = new Set(state.messages.map((m) => m.id));
-      const fresh = action.page.messages
-        .filter((m) => !existingIds.has(m.id))
-        .map((message) => applyLinkSafetyCorrections(message, state.linkSafetyCorrections));
-      // If every message in this page was already present, no DOM change occurs:
-      // skip the scroll delta calculation by keeping lastMutation as "none".
-      return {
-        ...state,
-        messages: fresh.length > 0 ? [...fresh, ...state.messages] : state.messages,
-        nextCursor: action.page.nextCursor,
-        loadingMore: false,
-        lastMutation: fresh.length > 0 ? "prepend" : "none",
-      };
-    }
+    case "prepended":
+      return applyPrepended(state, action);
     case "prepend_error":
       return { ...state, loadingMore: false, lastMutation: "none" };
-    case "ws_received": {
-      const received = applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections);
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      linkSafetyCorrections.delete(action.message.id);
-      // Dedup: if the message is already present (e.g. our own POST response
-      // arrived before the WS event), this is normally a pure no-op.
-      const existingIndex = state.messages.findIndex((m) => m.id === received.id);
-      if (existingIndex >= 0) {
-        const existing = state.messages[existingIndex];
-        // RF-21: the one case where "already present" is not a no-op.
-        //
-        // A message whose links were still being scanned was returned to its
-        // own sender as pending_link_scan and shown to nobody else. When the
-        // scan clears, the backend promotes it and broadcasts message.created
-        // with the same id — so discarding the event by id, as this branch used
-        // to do unconditionally, left the sender looking at "checking links…"
-        // forever while everyone else saw the message.
-        //
-        // The event carries the authoritative published row, so it replaces the
-        // local one in place: same position, no duplicate, no re-sort. Only this
-        // transition is special-cased; every other repeat delivery stays the
-        // no-op it was, which is what keeps at-least-once outbox delivery safe.
-        if (existing.status === "pending_link_scan" && received.status !== "pending_link_scan") {
-          const messages = [...state.messages];
-          messages[existingIndex] = received;
-          return { ...state, messages, linkSafetyCorrections, realtimeError: null };
-        }
-        return { ...state, linkSafetyCorrections, realtimeError: null };
-      }
+    default:
+      return undefined;
+  }
+}
 
-      // Insert in stable (createdAt, id) order to handle out-of-order delivery.
-      // Most WS messages are newer than all existing ones, so a quick tail-check
-      // avoids a full sort in the common case.
-      const insertion = insertMessageChronologically(state.messages, received);
+/** Sending, and what the server refused. */
+function reduceComposer(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
+    case "sending":
+      return { ...state, sending: true, sendError: null };
+    case "sent":
+      return applySent(state, action);
+    case "send_error":
+      return { ...state, sending: false, sendError: action.error };
+    case "message_blocked":
+      return applyMessageBlocked(state, action);
+    default:
+      return undefined;
+  }
+}
 
-      return {
-        ...state,
-        messages: insertion.messages,
-        // ws_append: MessageList scrolls to bottom only if the user is already
-        // near the bottom, preserving position when reading history.
-        // If the message was inserted mid-list (out-of-order), no auto-scroll.
-        lastMutation: insertion.isNewer ? "ws_append" : "none",
-        realtimeError: null,
-        linkSafetyCorrections,
-      };
-    }
-    case "edit_optimistic": {
-      const messages = state.messages.map((message) =>
-        message.id === action.messageId
-          ? {
-              ...message,
-              bodyText: action.body,
-              bodyFormat: action.bodyFormat,
-              isEdited: true,
-              editCount: message.editCount + 1,
-              editedAt: action.editedAt,
-              // The new body has not yet received the server's verdict. Keeping the
-              // old body's clearance here would briefly authorize different links.
-              linkSafetyState: "unknown" as const,
-            }
-          : message,
-      );
-      return { ...state, messages, lastMutation: "none" };
-    }
-    case "edit_confirmed": {
-      const correction = state.linkSafetyCorrections.get(action.message.id);
-      const correctionWins =
-        correction && isNotNewerSecurityVersion(action.message.updatedAt, correction.updatedAt);
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      if (!correctionWins) linkSafetyCorrections.delete(action.message.id);
-      return {
-        ...state,
-        messages: state.messages.map((message) =>
-          message.id === action.message.id &&
-          !message.isRemoved &&
-          action.message.editCount >= message.editCount
-            ? correctionWins
-              ? applyLinkSafetyCorrection(message, correction)
-              : {
-                  ...message,
-                  bodyText: action.message.bodyText,
-                  bodyFormat: action.message.bodyFormat,
-                  editedAt: action.message.editedAt,
-                  updatedAt: action.message.updatedAt,
-                  editCount: action.message.editCount,
-                  isEdited: action.message.isEdited,
-                  linkSafetyState: action.message.linkSafetyState,
-                }
-            : message,
-        ),
-        linkSafetyCorrections,
-        lastMutation: "none",
-      };
-    }
-    case "edit_revert":
-      return {
-        ...state,
-        messages: state.messages.map((message) =>
-          message.id === action.message.id &&
-          !message.isRemoved &&
-          message.editedAt === action.optimisticEditedAt
-            ? applyLinkSafetyCorrections(action.message, state.linkSafetyCorrections)
-            : message,
-        ),
-        lastMutation: "none",
-      };
-    case "message_updated": {
-      const update = action.event.message_update;
-      if (!update) return state;
-      const removed = update.is_removed === true || update.status === "deleted";
-      const deletedAt = update.deleted_at ?? update.updated_at ?? null;
-      const updateVersion = update.updated_at ?? update.edited_at;
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      const correction = linkSafetyCorrections.get(update.message_id);
-      if (!correction || !isNotNewerSecurityVersion(updateVersion, correction.updatedAt)) {
-        linkSafetyCorrections.delete(update.message_id);
-      }
-      return {
-        ...state,
-        messages: state.messages.map((message) => {
-          if (message.id === update.message_id) {
-            if (correction && isNotNewerSecurityVersion(updateVersion, correction.updatedAt)) {
-              return message;
-            }
-            if (message.isRemoved || removed) {
-              return removed
-                ? {
-                    ...message,
-                    bodyText: "",
-                    quoted: undefined,
-                    reactions: [],
-                    status: "deleted" as const,
-                    isRemoved: true,
-                    deletedAt,
-                    updatedAt: update.updated_at ?? deletedAt ?? message.updatedAt,
-                  }
-                : message;
-            }
-            const linkSafetyState =
-              update.link_safety_state === undefined
-                ? message.linkSafetyState
-                : normalizeLinkSafety(update.link_safety_state);
-            return update.edit_count < message.editCount
-              ? message
-              : {
-                  ...message,
-                  bodyText: linkSafetyState === "malicious" ? "" : update.body,
-                  bodyFormat: normalizeBodyFormat(update.body_format),
-                  editedAt: update.edited_at,
-                  updatedAt: update.updated_at ?? update.edited_at,
-                  editCount: update.edit_count,
-                  isEdited: update.is_edited,
-                  linkSafetyState,
-                };
-          }
-          if (removed && message.quoted?.id === update.message_id) {
-            return {
-              ...message,
-              quoted: { ...message.quoted, bodyText: "", isRemoved: true, deletedAt },
-            };
-          }
-          return message;
-        }),
-        replyTo: removed && state.replyTo?.id === update.message_id ? null : state.replyTo,
-        lastMutation: "none",
-        realtimeError: null,
-        linkSafetyCorrections,
-      };
-    }
-    case "message_snapshot": {
-      const removed = action.message.isRemoved || action.message.status === "deleted";
-      const rawSnapshot = removed
-        ? { ...action.message, bodyText: "", quoted: undefined, reactions: [] }
-        : action.message;
-      const correction = state.linkSafetyCorrections.get(rawSnapshot.id);
-      const snapshot = applyLinkSafetyCorrections(rawSnapshot, state.linkSafetyCorrections);
-      const linkSafetyCorrections = new Map(state.linkSafetyCorrections);
-      if (!correction || !isNotNewerSecurityVersion(rawSnapshot.updatedAt, correction.updatedAt)) {
-        linkSafetyCorrections.delete(rawSnapshot.id);
-      }
-      const alreadyPresent = state.messages.some((message) => message.id === snapshot.id);
-      let insertedAsNewer = false;
-      let messages = state.messages.map((message) => {
-        if (message.id === snapshot.id) return message.isRemoved && !removed ? message : snapshot;
-        if (removed && message.quoted?.id === snapshot.id) {
-          return {
-            ...message,
-            quoted: {
-              ...message.quoted,
-              bodyText: "",
-              isRemoved: true,
-              deletedAt: snapshot.deletedAt ?? snapshot.updatedAt,
-            },
-          };
-        }
-        return message;
-      });
-      if (!alreadyPresent && action.insertIfMissing) {
-        const insertion = insertMessageChronologically(messages, snapshot);
-        messages = insertion.messages;
-        insertedAsNewer = insertion.isNewer;
-      }
-      return {
-        ...state,
-        messages,
-        replyTo: removed && state.replyTo?.id === snapshot.id ? null : state.replyTo,
-        lastMutation: insertedAsNewer ? "ws_append" : "none",
-        realtimeError: null,
-        linkSafetyCorrections,
-      };
-    }
+/** RF-21 verdicts about links, and the snapshots that carry them. */
+function reduceLinkSafety(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
+    case "link_safety_changed":
+      return applyLinkSafetyChanged(state, action);
+    case "security_snapshots_refreshed":
+      return applySecuritySnapshotsRefreshed(state, action);
     case "references_refreshed":
-      return {
-        ...state,
-        messages: state.messages.map((message) => {
-          const reference = action.references[message.id];
-          if (!reference || !message.reference) return message;
-          if (
-            message.reference.available &&
-            reference.available &&
-            ((message.reference.updatedAt &&
-              reference.updatedAt &&
-              isOlderSecurityVersion(reference.updatedAt, message.reference.updatedAt)) ||
-              (message.reference.linkSafetyState === "malicious" &&
-                !reference.updatedAt &&
-                reference.linkSafetyState !== "malicious"))
-          ) {
-            return message;
-          }
-          return { ...message, reference };
-        }),
-      };
-    case "delete_error":
-      return { ...state, actionError: action.error };
+      return applyReferencesRefreshed(state, action);
+    default:
+      return undefined;
+  }
+}
+
+/** What the socket delivered about messages in this conversation. */
+function reduceRealtime(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
+    case "ws_received":
+      return applyWsReceived(state, action);
+    case "message_updated":
+      return applyMessageUpdated(state, action);
+    case "message_snapshot":
+      return applyMessageSnapshot(state, action);
+    case "attachment_status":
+      return applyAttachmentStatus(state, action);
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "ws_subscription_ready":
       return { ...state, realtimeError: null };
-    case "attachment_status": {
-      // RF-22 verdict for an attachment shown inside a message (RF-32).
-      //
-      // Patched in place rather than refetched: the event already carries the
-      // authoritative new status, and the status is the only thing that changed
-      // — nothing here decides what may be downloaded. That gate is
-      // file-service's, applied to every content and preview request, so a
-      // client that got this wrong would still be refused the bytes.
-      //
-      // Messages that carry no matching attachment are returned unchanged by
-      // identity, so an event for another conversation's file — or one this
-      // timeline has never seen — allocates nothing and rerenders nothing.
-      let changed = false;
-      const messages = state.messages.map((message) => {
-        if (!message.attachments?.some((item) => item.id === action.attachmentId)) {
-          return message;
-        }
-        changed = true;
-        return {
-          ...message,
-          attachments: message.attachments.map((item) =>
-            item.id === action.attachmentId ? { ...item, status: action.status } : item,
-          ),
-        };
-      });
-      return changed ? { ...state, messages, lastMutation: "none" } : state;
-    }
-    case "reaction_error": {
-      // Server-level errors (rate limit, feature unavailable) aren't scoped to a
-      // single message, so every optimistic toggle still in flight is reverted.
-      if (state.pendingReactions.size === 0) {
-        return { ...state, actionError: action.error };
-      }
-      const messages = state.messages.map((message) => {
-        const snapshot = state.pendingReactions.get(message.id);
-        return snapshot ? { ...message, reactions: snapshot } : message;
-      });
-      return { ...state, messages, actionError: action.error, pendingReactions: new Map() };
-    }
+    default:
+      return undefined;
+  }
+}
+
+/** Editing and deleting a message this reader wrote. */
+function reduceEditing(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
+    case "edit_optimistic":
+      return applyEditOptimistic(state, action);
+    case "edit_confirmed":
+      return applyEditConfirmed(state, action);
+    case "edit_revert":
+      return applyEditRevert(state, action);
+    case "delete_error":
+      return { ...state, actionError: action.error };
+    default:
+      return undefined;
+  }
+}
+
+/** Reactions: optimistic toggles, their confirmations and their refusals. */
+function reduceReactions(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
+    case "reaction_optimistic":
+      return applyReactionOptimistic(state, action);
+    case "reaction_revert":
+      return applyReactionRevert(state, action);
+    case "reaction_updated":
+      return applyReactionEvent(state, action.event, action.actorIsMe);
+    case "reaction_snapshot":
+      return applyReactionSnapshot(state, action);
+    case "reaction_error":
+      return applyReactionError(state, action);
     case "reaction_error_clear":
       return { ...state, actionError: null };
+    default:
+      return undefined;
+  }
+}
+
+/** Reply target and favourites — per-reader state beside the list. */
+function reduceConversation(state: MessagesState, action: Action): MessagesState | undefined {
+  switch (action.type) {
     case "reply_set":
       return { ...state, replyTo: action.message };
     case "reply_clear":
       return { ...state, replyTo: null };
-    case "favorite_set": {
-      const index = state.messages.findIndex((message) => message.id === action.messageId);
-      if (index < 0) return state;
-      const messages = [...state.messages];
-      messages[index] = { ...messages[index], isFavorited: action.isFavorited };
-      return { ...state, messages };
-    }
+    case "favorite_set":
+      return applyFavoriteSet(state, action);
     case "favorite_error":
       // Reuses the transient banner without touching reaction snapshots.
       return { ...state, actionError: action.error };
-    case "reaction_optimistic": {
-      const index = state.messages.findIndex((message) => message.id === action.messageId);
-      if (index < 0) return state;
-      const message = state.messages[index];
-      const pendingReactions = new Map(state.pendingReactions);
-      if (!pendingReactions.has(action.messageId)) {
-        pendingReactions.set(action.messageId, message.reactions);
-      }
-      const messages = [...state.messages];
-      messages[index] = {
-        ...message,
-        reactions: toggleOptimisticReaction(message.reactions, action.emoji),
-      };
-      return { ...state, messages, pendingReactions, actionError: null };
-    }
-    case "reaction_revert": {
-      const snapshot = state.pendingReactions.get(action.messageId);
-      if (!snapshot) return { ...state, actionError: action.error };
-      const index = state.messages.findIndex((message) => message.id === action.messageId);
-      const messages =
-        index < 0
-          ? state.messages
-          : state.messages.map((message, i) =>
-              i === index ? { ...message, reactions: snapshot } : message,
-            );
-      const pendingReactions = new Map(state.pendingReactions);
-      pendingReactions.delete(action.messageId);
-      return { ...state, messages, pendingReactions, actionError: action.error };
-    }
-    case "reaction_updated": {
-      const { reaction } = action.event;
-      if (!reaction) return state;
-      const index = state.messages.findIndex((message) => message.id === reaction.message_id);
-      if (index < 0) return state;
-      const message = state.messages[index];
-      // Reconcile against the pre-optimistic baseline (not the current, possibly
-      // still-unconfirmed optimistic guess) so an update from another actor doesn't
-      // inherit our own not-yet-confirmed toggle as ground truth.
-      const baseline = state.pendingReactions.get(reaction.message_id) ?? message.reactions;
-      const previous = new Map(baseline.map((item) => [item.emoji, item.reactedByMe]));
-      const reactions = reaction.reactions.map((item) => ({
-        ...item,
-        reactedByMe:
-          action.actorIsMe && item.emoji === reaction.emoji
-            ? reaction.added
-            : (previous.get(item.emoji) ?? false),
-      }));
-      const messages = [...state.messages];
-      messages[index] = { ...message, reactions };
-      const pendingReactions = new Map(state.pendingReactions);
-      pendingReactions.delete(reaction.message_id);
-      return {
-        ...state,
-        messages,
-        pendingReactions,
-        lastMutation: "none",
-        realtimeError: null,
-        actionError: null,
-      };
-    }
-    case "reaction_snapshot": {
-      const index = state.messages.findIndex((message) => message.id === action.messageId);
-      if (index < 0) return state;
-      const messages = [...state.messages];
-      messages[index] = { ...messages[index], reactions: action.reactions };
-      const pendingReactions = new Map(state.pendingReactions);
-      pendingReactions.delete(action.messageId);
-      return {
-        ...state,
-        messages,
-        pendingReactions,
-        lastMutation: "none",
-        realtimeError: null,
-        actionError: null,
-      };
-    }
+    default:
+      return undefined;
   }
+}
+
+/**
+ * The conversation's state machine.
+ *
+ * Every action belongs to exactly one subject — history, composing, link
+ * safety, realtime delivery, editing, reactions, or the reader's own selection —
+ * so the reducer asks each in turn and the first one that recognises the action
+ * answers. A sub-reducer returns undefined for an action that is not its
+ * business, which is what keeps the groups disjoint and this function a
+ * dispatcher rather than a second copy of the switch.
+ */
+function reducer(state: MessagesState, action: Action): MessagesState {
+  return (
+    reduceHistory(state, action) ??
+    reduceComposer(state, action) ??
+    reduceLinkSafety(state, action) ??
+    reduceRealtime(state, action) ??
+    reduceEditing(state, action) ??
+    reduceReactions(state, action) ??
+    reduceConversation(state, action) ??
+    state
+  );
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
@@ -1203,24 +1726,43 @@ export function useMessages({
     stateRef.current.messages = state.messages;
     stateRef.current.replyTo = state.replyTo;
   });
+  useLayoutEffect(() => {
+    pendingReactionsRef.current = state.pendingReactions;
+  }, [state.pendingReactions]);
 
   const abortRef = useRef<AbortController | null>(null);
   const loadMoreAbortRef = useRef<AbortController | null>(null);
   const wsFallbackAbortRefs = useRef<Map<string, AbortController>>(new Map());
   const deletedMessageTombstonesRef = useRef<Map<string, string | null>>(new Map());
   const deletedMessageTombstoneTargetRef = useRef(`${kind}:${targetId}`);
-  const pendingReactionTimersRef = useRef<Map<string, number>>(new Map());
+  // Nested by message and then by emoji, so one confirmation clears one timer.
+  // A message can carry several toggles at once and each waits on its own.
+  const pendingReactionTimersRef = useRef<Map<string, Map<string, number>>>(new Map());
+  /**
+   * A read-only mirror of the reducer's pending intents, for the one decision
+   * that has to be made before dispatching: whether an incoming event confirms
+   * an addition this client asked for, and so counts as a use.
+   */
+  const pendingReactionsRef = useRef(initialState.pendingReactions);
   const pendingSendIdentityRef = useRef<{ signature: string; key: string } | null>(null);
   const onMessageRemovedRef = useRef(onMessageRemoved);
   useLayoutEffect(() => {
     onMessageRemovedRef.current = onMessageRemoved;
   }, [onMessageRemoved]);
-  const clearReactionTimer = useCallback((messageId: string) => {
-    const timer = pendingReactionTimersRef.current.get(messageId);
-    if (timer !== undefined) {
-      window.clearTimeout(timer);
+  /** Stops waiting on one toggle, or on every toggle of a message when no emoji is named. */
+  const clearReactionTimer = useCallback((messageId: string, emoji?: string) => {
+    const timers = pendingReactionTimersRef.current.get(messageId);
+    if (!timers) return;
+    if (emoji === undefined) {
+      for (const timer of timers.values()) window.clearTimeout(timer);
       pendingReactionTimersRef.current.delete(messageId);
+      return;
     }
+    const timer = timers.get(emoji);
+    if (timer === undefined) return;
+    window.clearTimeout(timer);
+    timers.delete(emoji);
+    if (timers.size === 0) pendingReactionTimersRef.current.delete(messageId);
   }, []);
 
   const abortWsFallbacks = useCallback(() => {
@@ -1341,7 +1883,9 @@ export function useMessages({
         ctrl.abort();
         loadMoreAbortRef.current?.abort();
         abortWsFallbacks();
-        for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
+        for (const timers of pendingReactionTimersRef.current.values()) {
+          for (const timer of timers.values()) window.clearTimeout(timer);
+        }
         pendingReactionTimersRef.current.clear();
       };
     },
@@ -1724,14 +2268,23 @@ export function useMessages({
         fetchReactionSnapshot(event.message_id);
         return;
       }
-      const actorIsMe = event.reaction.actor_user_id === currentUserId;
-      if (actorIsMe) onOwnReactionConfirmed?.(event.reaction.emoji);
-      clearReactionTimer(event.message_id);
-      dispatch({
-        type: "reaction_updated",
-        event,
-        actorIsMe,
-      });
+      const { reaction } = event;
+      const actorIsMe = reaction.actor_user_id === currentUserId;
+      // Asked once, of the same predicate the reducer uses, against a mirror of
+      // the reducer's own intents. An event that settles nothing leaves the
+      // rollback timer running and the emoji history untouched — it has only
+      // moved this client's view of what the server holds.
+      //
+      // The dispatch below settles whatever this answer says was settled, so a
+      // redelivered copy finds nothing outstanding: each WS frame is a separate
+      // task, and React has committed the mirror by the time the next arrives.
+      const confirmation = confirmReactionIntent(pendingReactionsRef.current, reaction, actorIsMe);
+      if (confirmation.confirmed) {
+        clearReactionTimer(reaction.message_id, reaction.emoji);
+        // A removal is not a use; only reaching for an emoji is.
+        if (confirmation.intent === "added") onOwnReactionConfirmed?.(reaction.emoji);
+      }
+      dispatch({ type: "reaction_updated", event, actorIsMe });
     },
     [
       clearReactionTimer,
@@ -1816,7 +2369,10 @@ export function useMessages({
       rate_limited: "Muitas reações em sequência. Aguarde um minuto e tente novamente.",
       temporarily_unavailable: "Reações temporariamente indisponíveis.",
     };
-    for (const timer of pendingReactionTimersRef.current.values()) window.clearTimeout(timer);
+    // A server-level refusal is not scoped to one toggle, so every wait ends.
+    for (const timers of pendingReactionTimersRef.current.values()) {
+      for (const timer of timers.values()) window.clearTimeout(timer);
+    }
     pendingReactionTimersRef.current.clear();
     dispatch({
       type: "reaction_error",
@@ -2107,20 +2663,27 @@ export function useMessages({
         dispatch({
           type: "reaction_revert",
           messageId,
+          emoji,
           error: "Conexão em tempo real indisponível. Tente novamente.",
         });
         return;
       }
-      clearReactionTimer(messageId);
+      // One window per (message, emoji): re-toggling the same emoji restarts its
+      // own wait, and a toggle of a different emoji on the same message starts a
+      // second one beside it.
+      clearReactionTimer(messageId, emoji);
       const timer = window.setTimeout(() => {
-        pendingReactionTimersRef.current.delete(messageId);
+        pendingReactionTimersRef.current.get(messageId)?.delete(emoji);
         dispatch({
           type: "reaction_revert",
           messageId,
+          emoji,
           error: "Não foi possível confirmar a reação. Tente novamente.",
         });
       }, reactionConfirmTimeoutMs);
-      pendingReactionTimersRef.current.set(messageId, timer);
+      const timers = pendingReactionTimersRef.current.get(messageId) ?? new Map<string, number>();
+      timers.set(emoji, timer);
+      pendingReactionTimersRef.current.set(messageId, timers);
     },
     [clearReactionTimer, sendReactionToggle],
   );

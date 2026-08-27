@@ -1452,12 +1452,60 @@ describe("fetchChannelMessages", () => {
     if (_case === "missing") expect(page.messages[0].bodyText).toBe("");
   });
 
-  it("maps reaction aggregates", async () => {
+  it("maps reaction aggregates with their named authors", async () => {
     mockAuthFetch.mockResolvedValue(
-      msgListEnvelope([msgRaw({ reactions: [{ emoji: "👍", count: 2, reacted_by_me: true }] })]),
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            {
+              emoji: "👍",
+              count: 2,
+              reacted_by_me: true,
+              users: [{ user_id: "u-1", display_name: "Álvaro Neto" }],
+            },
+          ],
+        }),
+      ]),
     );
     const page = await fetchChannelMessages("geral");
-    expect(page.messages[0].reactions).toEqual([{ emoji: "👍", count: 2, reactedByMe: true }]);
+    expect(page.messages[0].reactions).toEqual([
+      {
+        emoji: "👍",
+        count: 2,
+        reactedByMe: true,
+        users: [{ userId: "u-1", displayName: "Álvaro Neto" }],
+      },
+    ]);
+  });
+
+  // A pre-#496 server sends no authors at all, and a malformed entry must not
+  // reach a tooltip as an empty name.
+  it("tolerates missing or malformed reaction authors", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            { emoji: "👍", count: 1, reacted_by_me: false },
+            {
+              emoji: "🎉",
+              count: 3,
+              reacted_by_me: false,
+              users: [
+                { user_id: "u-1", display_name: "" },
+                { user_id: 7, display_name: "Caio" },
+                "nope",
+                { user_id: "u-2", display_name: "Caio Almeida" },
+              ],
+            },
+          ],
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions[0].users).toEqual([]);
+    expect(page.messages[0].reactions[1].users).toEqual([
+      { userId: "u-2", displayName: "Caio Almeida" },
+    ]);
   });
 
   it("maps inline quoted message previews", async () => {

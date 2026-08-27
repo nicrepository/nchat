@@ -5,12 +5,13 @@
  * toolbar → TipTap JSON → storage codec → rendered message flow.
  */
 
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Editor } from "@tiptap/core";
 import type { Editor as EditorType } from "@tiptap/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import ComposerToolbar from "./ComposerToolbar";
+import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import RichTextRenderer from "./RichTextRenderer";
 import { tiptapDocToMarkdown } from "./tiptapSerializer";
 import { createChatEditorExtensions } from "./useChatEditor";
@@ -62,6 +63,27 @@ function createMockEditor(activeFormat?: string): { editor: EditorType; chain: M
 
 function renderToolbar(editor: EditorType | null, disabled = false) {
   render(<ComposerToolbar editor={editor} disabled={disabled} />);
+}
+
+/**
+ * Opens the picker and waits for it to be usable.
+ *
+ * The picker and its catalog arrive through a dynamic import, so the panel is a
+ * Suspense fallback for a tick after the click. Waiting on the search field
+ * rather than on a timer is what makes these tests deterministic — and waiting
+ * on its *focus* specifically, because the picker moves focus there on mount
+ * and a test that focuses something else first would lose it a tick later.
+ */
+async function openPicker(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByTestId("toolbar-emoji-btn"));
+  const search = await screen.findByRole("searchbox", { name: "Buscar emoji" });
+  await waitFor(() => expect(search).toHaveFocus());
+  return search;
+}
+
+/** Picks an emoji by the name a screen reader would announce for its cell. */
+async function pickEmoji(user: ReturnType<typeof userEvent.setup>, label: string) {
+  await user.click(screen.getByRole("button", { name: label }));
 }
 
 // ── Direct format buttons ─────────────────────────────────────────────────────
@@ -202,31 +224,171 @@ describe("ComposerToolbar — keyboard accessibility", () => {
   });
 });
 
-// ── Emoji insertion ───────────────────────────────────────────────────────────
+// ── Emoji insertion (issue #496) ─────────────────────────────────────────────
 
 describe("ComposerToolbar — emoji insertion", () => {
-  it("inserts emoji via editor.chain().insertContent()", async () => {
+  it("opens the full picker, not a fixed list", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+
+    await openPicker(user);
+
+    // The three things the old twenty-emoji panel could not do.
+    expect(screen.getByRole("searchbox", { name: "Buscar emoji" })).toBeInTheDocument();
+    expect(screen.getByRole("tablist", { name: "Categorias de emoji" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /rosto/i }).length).toBeGreaterThan(20);
+  });
+
+  it("inserts the chosen emoji through the editor's own command", async () => {
     const user = userEvent.setup();
     const { editor, chain } = createMockEditor();
     renderToolbar(editor);
 
-    await user.click(screen.getByTestId("toolbar-emoji-btn"));
-    await user.click(screen.getByText("😀"));
+    await openPicker(user);
+    await pickEmoji(user, "rosto risonho");
 
     expect(chain.insertContent).toHaveBeenCalledWith("😀");
     expect(chain.run).toHaveBeenCalled();
   });
 
-  it("closes emoji picker after inserting", async () => {
+  // A messenger lets you pick three emoji in a row. Closing after each one
+  // would mean three round trips through the button for one "😀😂🎉".
+  it("stays open across selections", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
+
+    await openPicker(user);
+    await pickEmoji(user, "rosto risonho");
+    await pickEmoji(user, "rosto chorando de rir");
+
+    expect(chain.insertContent).toHaveBeenNthCalledWith(1, "😀");
+    expect(chain.insertContent).toHaveBeenNthCalledWith(2, "😂");
+    expect(screen.getByTestId("toolbar-emoji-picker")).toBeInTheDocument();
+  });
+
+  it("records what was inserted, so it reaches the shared Recentes", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    const onUsed = vi.fn();
+    render(
+      <ComposerToolbar
+        editor={editor}
+        emoji={{ usage: emptyEmojiUsage, onToneChange: vi.fn(), onUsed }}
+      />,
+    );
+
+    await openPicker(user);
+    await pickEmoji(user, "rosto risonho");
+
+    expect(onUsed).toHaveBeenCalledWith("😀");
+  });
+
+  // The tone palette belongs to the picker, so it works here for free — this
+  // test exists to prove the composer did not lose it by portalling the picker
+  // somewhere the palette's outside-click test would fire on.
+  it("inserts the skin tone the reader picks", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    const onToneChange = vi.fn();
+    render(
+      <ComposerToolbar
+        editor={editor}
+        emoji={{ usage: emptyEmojiUsage, onToneChange, onUsed: vi.fn() }}
+      />,
+    );
+
+    await openPicker(user);
+    // Pasted, not typed: one input event, one re-filter of the whole catalog.
+    await user.paste("polegar para cima");
+    await pickEmoji(user, "polegar para cima");
+    await pickEmoji(user, "polegar para cima — Morena escura");
+
+    expect(chain.insertContent).toHaveBeenCalledWith("👍🏾");
+    expect(onToneChange).toHaveBeenCalledWith(4);
+    expect(screen.getByTestId("toolbar-emoji-picker")).toBeInTheDocument();
+  });
+
+  it("closes on Escape and gives the editor its focus back", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    renderToolbar(editor);
+
+    await openPicker(user);
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("toolbar-emoji-picker")).not.toBeInTheDocument();
+    // Issue #493: the caret goes back where the reader left it.
+    expect(chain.focus).toHaveBeenCalled();
+  });
+
+  it("closes on a click outside, leaving focus where the click put it", async () => {
+    const user = userEvent.setup();
+    const { editor, chain } = createMockEditor();
+    render(
+      <div>
+        <ComposerToolbar editor={editor} />
+        <button type="button">Fora</button>
+      </div>,
+    );
+
+    await openPicker(user);
+    chain.focus.mockClear();
+    await user.click(screen.getByRole("button", { name: "Fora" }));
+
+    expect(screen.queryByTestId("toolbar-emoji-picker")).not.toBeInTheDocument();
+    expect(chain.focus).not.toHaveBeenCalled();
+  });
+
+  it("toggles shut when the button is pressed again", async () => {
     const user = userEvent.setup();
     const { editor } = createMockEditor();
     renderToolbar(editor);
 
+    await openPicker(user);
     await user.click(screen.getByTestId("toolbar-emoji-btn"));
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
 
-    await user.click(screen.getByText("😀"));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("toolbar-emoji-picker")).not.toBeInTheDocument();
+  });
+
+  it("lets its owner close it — a send, or a change of conversation", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    const onPickerOpenChange = vi.fn();
+    const { rerender } = render(
+      <ComposerToolbar editor={editor} pickerOpen onPickerOpenChange={onPickerOpenChange} />,
+    );
+    expect(await screen.findByRole("searchbox", { name: "Buscar emoji" })).toBeInTheDocument();
+
+    rerender(
+      <ComposerToolbar
+        editor={editor}
+        pickerOpen={false}
+        onPickerOpenChange={onPickerOpenChange}
+      />,
+    );
+
+    expect(screen.queryByTestId("toolbar-emoji-picker")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("toolbar-emoji-btn"));
+    expect(onPickerOpenChange).toHaveBeenCalledWith(true);
+  });
+
+  it("announces the panel it controls", async () => {
+    const user = userEvent.setup();
+    const { editor } = createMockEditor();
+    renderToolbar(editor);
+    const button = screen.getByTestId("toolbar-emoji-btn");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+
+    await openPicker(user);
+
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    const panel = screen.getByTestId("toolbar-emoji-picker");
+    expect(button).toHaveAttribute("aria-controls", panel.id);
+    // The composer inserts text; nothing here may claim a reaction is happening.
+    expect(panel).toHaveAccessibleName("Inserir emoji");
+    expect(panel.textContent).not.toMatch(/reação/i);
   });
 });
 
@@ -266,8 +428,8 @@ describe("ComposerToolbar — null editor", () => {
     const user = userEvent.setup();
     renderToolbar(null);
 
-    await user.click(screen.getByTestId("toolbar-emoji-btn"));
-    await expect(user.click(screen.getByText("😀"))).resolves.toBeUndefined();
+    await openPicker(user);
+    await expect(pickEmoji(user, "rosto risonho")).resolves.toBeUndefined();
   });
 
   it("does not throw when editor is null and code is clicked", async () => {

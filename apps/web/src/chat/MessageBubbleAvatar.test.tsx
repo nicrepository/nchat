@@ -12,6 +12,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import MessageBubble from "./MessageBubble";
 import type { MessageBubbleProps } from "./MessageBubble";
 import type { Message } from "./chatTypes";
@@ -51,8 +52,11 @@ function renderBubble(overrides: Partial<MessageBubbleProps> = {}) {
     onEditMessage: vi.fn(),
     onEditForbidden: vi.fn(),
     onDeleteMessage: vi.fn(),
-    allowedReactionEmojis: [],
     recentReactionEmojis: [],
+    // The reaction row's own state, owned by the conversation (issue #496).
+    emojiUsage: emptyEmojiUsage,
+    onEmojiToneChange: vi.fn(),
+    currentUserId: "me",
     reactionMenuVisible: false,
     onReactionMenuVisibleChange: vi.fn(),
     pickerOpen: false,
@@ -108,8 +112,10 @@ describe("MessageBubble avatar", () => {
       onEditMessage: vi.fn(),
       onEditForbidden: vi.fn(),
       onDeleteMessage: vi.fn(),
-      allowedReactionEmojis: [],
       recentReactionEmojis: [],
+      emojiUsage: emptyEmojiUsage,
+      onEmojiToneChange: vi.fn(),
+      currentUserId: "me",
       reactionMenuVisible: false,
       onReactionMenuVisibleChange: vi.fn(),
       pickerOpen: false,

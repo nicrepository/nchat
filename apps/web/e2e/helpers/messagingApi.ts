@@ -88,7 +88,13 @@ interface RawMessage {
   edit_count: number;
   is_edited: boolean;
   deleted_at?: string | null;
-  reactions: Array<{ emoji: string; count: number; reacted_by_me: boolean }>;
+  reactions: Array<{
+    emoji: string;
+    count: number;
+    reacted_by_me: boolean;
+    /** The named prefix the badge tooltip renders (issue #496). */
+    users: Array<{ user_id: string; display_name: string }>;
+  }>;
   is_favorited: boolean;
   is_forwarded: boolean;
   /** Issue #527: structured conversation event, on system messages only. */
@@ -1081,8 +1087,11 @@ async function installWebSocketMock(
       const index = reactions.findIndex((reaction) => reaction.emoji === emoji);
       let updated: RawMessage["reactions"];
       let added: boolean;
+      const me = { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME };
+      const withoutMe = (users: Array<{ user_id: string; display_name: string }>) =>
+        users.filter((user) => user.user_id !== CURRENT_USER_ID);
       if (index === -1) {
-        updated = [...reactions, { emoji, count: 1, reacted_by_me: true }];
+        updated = [...reactions, { emoji, count: 1, reacted_by_me: true, users: [me] }];
         added = true;
       } else if (reactions[index].reacted_by_me) {
         added = false;
@@ -1091,13 +1100,25 @@ async function installWebSocketMock(
             ? reactions.filter((_, i) => i !== index)
             : reactions.map((reaction, i) =>
                 i === index
-                  ? { ...reaction, count: reaction.count - 1, reacted_by_me: false }
+                  ? {
+                      ...reaction,
+                      count: reaction.count - 1,
+                      reacted_by_me: false,
+                      users: withoutMe(reaction.users),
+                    }
                   : reaction,
               );
       } else {
         added = true;
         updated = reactions.map((reaction, i) =>
-          i === index ? { ...reaction, count: reaction.count + 1, reacted_by_me: true } : reaction,
+          i === index
+            ? {
+                ...reaction,
+                count: reaction.count + 1,
+                reacted_by_me: true,
+                users: [...withoutMe(reaction.users), me],
+              }
+            : reaction,
         );
       }
       location.messages[location.index] = { ...location.message, reactions: updated };
@@ -1295,7 +1316,15 @@ async function installWebSocketMock(
                 messageId: string,
                 emoji: string,
               ) => Promise<
-                { added: boolean; reactions: Array<{ emoji: string; count: number }> } | undefined
+                | {
+                    added: boolean;
+                    reactions: Array<{
+                      emoji: string;
+                      count: number;
+                      users: Array<{ user_id: string; display_name: string }>;
+                    }>;
+                  }
+                | undefined
               >;
             }
           )
@@ -1718,7 +1747,7 @@ async function installInteractionMocks(
     route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ data: { emojis: ["👍", "🎉"] } }),
+      body: JSON.stringify({ data: { emojis: ["👍", "🎉"], version: "16.0" } }),
     }),
   );
 

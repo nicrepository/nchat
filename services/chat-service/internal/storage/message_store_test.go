@@ -179,12 +179,23 @@ func checkExpectations(t *testing.T, mock pgxmock.PgxPoolIface) {
 
 func expectReactionBatch(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 	mock.ExpectQuery(`(?s)FROM chat\.message_reactions.*message_id = ANY`).
-		WithArgs(pgxmock.AnyArg(), "user-1").
+		WithArgs(pgxmock.AnyArg(), "user-1", reactionAuthorPrefix).
 		WillReturnRows(rows)
 }
 
 func emptyReactionRows() *pgxmock.Rows {
-	return pgxmock.NewRows([]string{"message_id", "emoji", "count", "reacted_by_me"})
+	return pgxmock.NewRows(reactionBatchColumns)
+}
+
+// reactionAuthorPrefix is how many names the aggregate is asked for. It mirrors
+// storage.reactionAuthorLimit, which is unexported: a change on either side must
+// be made on both, and the mock's argument match is what catches it.
+const reactionAuthorPrefix = 3
+
+// reactionBatchColumns mirrors the aggregate's projection: counts first, then
+// the two parallel author arrays.
+var reactionBatchColumns = []string{
+	"message_id", "emoji", "count", "reacted_by_me", "user_ids", "display_names",
 }
 
 // expectAttachmentBatch registers the RF-32 per-page attachment read. It runs
@@ -911,7 +922,7 @@ func TestPGXMessageStore_GetMessageByIDInWorkspace_Found(t *testing.T) {
 		WithArgs("msg-1", "ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
-	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 1, true))
+	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 1, true, []string{"user-1"}, []string{"Ana"}))
 	expectAttachmentBatch(mock, emptyAttachmentRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -1279,7 +1290,7 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...).
 			AddRow(listMessageWithQuoteRow("msg-2", "ws-1", "ch-1", "", now)...))
-	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 2, true))
+	expectReactionBatch(mock, emptyReactionRows().AddRow("msg-1", "👍", 2, true, []string{"user-1", "user-2"}, []string{"Ana", "Bruno"}))
 	expectAttachmentBatch(mock, emptyAttachmentRows())
 
 	store := storage.NewPGXMessageStore(mock)
@@ -1297,6 +1308,65 @@ func TestPGXMessageStore_ListChannelMessages_ReturnsMessages(t *testing.T) {
 	}
 	if len(result.Messages[1].Reactions) != 1 || result.Messages[1].Reactions[0].Emoji != "👍" {
 		t.Fatalf("expected batched reaction aggregate, got %+v", result.Messages[1].Reactions)
+	}
+	// One statement for the whole page carries the names too, so nothing has to
+	// resolve a profile per reaction or per hover (issue #496).
+	users := result.Messages[1].Reactions[0].Users
+	if len(users) != 2 || users[0].DisplayName != "Ana" || users[0].UserID != "user-1" || users[1].DisplayName != "Bruno" {
+		t.Fatalf("expected the reaction's named authors in order, got %+v", users)
+	}
+	checkExpectations(t, mock)
+}
+
+// A reactor the aggregate could not name — no display name of their own — is
+// still counted. The tooltip summarises them as part of "e mais N" rather than
+// falling back to an id or an address.
+func TestPGXMessageStore_ListChannelMessages_CountsUnnamedReactorsWithoutNamingThem(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows().
+		AddRow("msg-1", "🎉", 4, false, []string{"user-2"}, []string{"Bruno"}))
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	reaction := result.Messages[0].Reactions[0]
+	if reaction.Count != 4 || len(reaction.Users) != 1 || reaction.Users[0].DisplayName != "Bruno" {
+		t.Fatalf("expected 4 counted with 1 named, got %+v", reaction)
+	}
+	checkExpectations(t, mock)
+}
+
+// The aggregate returns no author arrays at all when nobody reacting has a name.
+func TestPGXMessageStore_ListChannelMessages_HandlesReactionsWithNoNamedAuthors(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows().
+		AddRow("msg-1", "🚀", 1, true, []string{}, []string{}))
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	store := storage.NewPGXMessageStore(mock)
+	result, err := store.ListChannelMessages(context.Background(), storage.ListChannelMessagesInput{
+		WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+	})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	if reaction := result.Messages[0].Reactions[0]; reaction.Count != 1 || len(reaction.Users) != 0 {
+		t.Fatalf("expected an unnamed single reaction, got %+v", reaction)
 	}
 	checkExpectations(t, mock)
 }

@@ -371,4 +371,18 @@ type MessageReaction struct {
 	Emoji       string
 	Count       int
 	ReactedByMe bool
+	// Users names the first few people behind Count, so a client can say who
+	// reacted without asking again per badge or per hover (issue #496). It is
+	// deliberately a prefix, not the whole set: the tooltip shows two names and
+	// summarises the rest from Count, so carrying more would be payload nobody
+	// renders.
+	Users []ReactionUser
+}
+
+// ReactionUser is the minimum identity a reaction tooltip needs: who it is, and
+// what to call them. No email, no username, no profile — a viewer already
+// authorized to read the message learns a name they can already see on it.
+type ReactionUser struct {
+	UserID      string
+	DisplayName string
 }

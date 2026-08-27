@@ -42,7 +42,17 @@ body.chat-root-locked {
 }
 
 /* ── Scoped tokens ──────────────────────────────────────────────────────────── */
-.chat-app {
+/*
+ * The chat surface's own palette, radius scale and shadows.
+ *
+ * Declared on `.chat-theme` as well as on the shell so that an overlay portalled
+ * to <body> — the emoji picker, its skin-tone palette — can opt into the same
+ * tokens without inheriting the shell's grid, its 100dvh height or its overflow
+ * rule. A portal that took the whole `.chat-app` class would be laid out as a
+ * full-screen grid.
+ */
+.chat-app,
+.chat-theme {
   /* Prototype purple accent */
   --color-primary: #6d28d9;
   --color-primary-strong: #5b21b6;
@@ -80,7 +90,9 @@ body.chat-root-locked {
   /* Column widths, so the tracks and the elements in them cannot disagree. */
   --chat-nav-w: 240px;
   --chat-details-w: 320px;
+}
 
+.chat-app {
   display: grid;
   /*
    * The trailing `auto` track is the details column. It collapses to zero when
