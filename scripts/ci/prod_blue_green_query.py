@@ -36,8 +36,8 @@ class Document:
     def __init__(self, text: str) -> None:
         self.lines = text.split("\n")
         self.kind = self._top("kind") or ""
-        self.name = self._nested("metadata", "name") or ""
-        self.namespace = self._nested("metadata", "namespace") or ""
+        self.name = self.nested("metadata", "name") or ""
+        self.namespace = self.nested("metadata", "namespace") or ""
 
     def _top(self, key: str) -> str | None:
         for line in self.lines:
@@ -56,7 +56,7 @@ class Document:
             depth += 2
         return lines
 
-    def _nested(self, *path: str) -> str | None:
+    def nested(self, *path: str) -> str | None:
         *parents, key = path
         for line in self.block(*parents):
             if line.strip().startswith(f"{key}: "):
@@ -176,6 +176,46 @@ def _field_source_range(document: Document) -> str:
     return " ".join(value.lstrip("- ").strip() for value in values)
 
 
+def _field_node_hosts(document: Document) -> str:
+    """Every hostname a node affinity admits, space separated.
+
+    Written for the production stateful layer's local PersistentVolumes, whose
+    whole safety property is that they can only bind on the node their directory
+    is actually on. The values live under nodeSelectorTerms as bare list items,
+    so they are collected positionally -- from the `values:` key to the end of
+    its sequence -- rather than by a key path, which cannot address a list.
+    """
+    hosts, collecting = [], False
+    for line in document.lines:
+        stripped = line.strip()
+        if stripped == "values:":
+            collecting = True
+        elif collecting and stripped.startswith("- "):
+            hosts.append(stripped[2:].strip().strip("'\""))
+        else:
+            collecting = False
+    return " ".join(hosts)
+
+
+def _field_configmap_envfrom(document: Document) -> str:
+    """Every ConfigMap this workload takes its whole environment from.
+
+    `configMapRef` is envFrom -- the whole ConfigMap becomes environment. It is
+    a different key from `configMapKeyRef`, which names one entry, so matching
+    the line exactly keeps the two apart.
+    """
+    names = []
+    for position, line in enumerate(document.lines):
+        # A list item under envFrom ("- configMapRef:") or, less usually, a bare
+        # key. Never configMapKeyRef, which is a different word entirely.
+        if line.strip().lstrip("- ") != "configMapRef:":
+            continue
+        name = _first_name_after(document.lines, position + 1, 3)
+        if name:
+            names.append(name)
+    return " ".join(names)
+
+
 FIELD_QUERIES = {
     "selector-slot": _field_selector_slot,
     "middlewares": _field_middlewares,
@@ -183,6 +223,8 @@ FIELD_QUERIES = {
     "release-sha": _field_release_sha,
     "probes": _field_probes,
     "livekit-env": _field_livekit_env,
+    "node-hosts": _field_node_hosts,
+    "configmap-envfrom": _field_configmap_envfrom,
 }
 
 
@@ -310,6 +352,11 @@ def document_field(document: Document, field: str) -> str:
         return document.mapping("data").get(field[len("data.") :], "")
     if field.startswith("hard."):
         return document.mapping("spec", "hard").get(field[len("hard.") :], "")
+    # A dotted path under spec, for the flat scalars a PersistentVolume keeps
+    # there: persistentVolumeReclaimPolicy, storageClassName, local.path. Only
+    # mappings are addressable this way; a sequence needs a handler above.
+    if field.startswith("spec."):
+        return document.nested("spec", *field[len("spec.") :].split(".")) or ""
     handler = FIELD_QUERIES.get(field)
     return handler(document) if handler else ""
 

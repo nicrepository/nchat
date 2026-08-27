@@ -62,6 +62,88 @@ QUERY_FIXTURE=$(printf 'Ingress|backends\tnchat-prod-admin|admin-service')
 expect "the stable admin host keeps its stable backends" accept check_stable_ingress_routing
 
 echo
+echo "--- private backends ---"
+
+QUERY_FIXTURE="$good_ingress_backends"
+expect "an edge that publishes only release workloads is accepted" accept check_private_backends_are_not_published
+
+QUERY_FIXTURE=$(printf 'Ingress|backends\tnchat-prod|postgres')
+expect "publishing PostgreSQL through an Ingress is rejected" reject check_private_backends_are_not_published
+
+QUERY_FIXTURE=$(printf 'Ingress|backends\tnchat-prod|seaweedfs-filer')
+expect "publishing the SeaweedFS filer through an Ingress is rejected" reject check_private_backends_are_not_published
+
+# The media plane is external AWS infrastructure. An Ingress naming it means a
+# local LiveKit was provisioned to point at, and WebRTC signalling was put
+# behind this deployment's gateway.
+QUERY_FIXTURE=$(printf 'Ingress|backends\tnchat-prod-livekit|livekit')
+expect "publishing a local LiveKit through an Ingress is rejected" reject check_private_backends_are_not_published
+
+QUERY_FIXTURE=$(printf 'Ingress|backends\tnchat-prod-turn|coturn')
+expect "publishing a local coturn through an Ingress is rejected" reject check_private_backends_are_not_published
+
+echo "--- livekit client contract ---"
+
+# The application is on nchat.nic-labs.com; LiveKit is somewhere else entirely,
+# which is the whole property under test. The host below stands in for the AWS
+# media plane -- the gate asserts the relationship between the values, never a
+# particular hostname, because the real one is operator topology.
+good_client_contract=$(printf 'ConfigMap|nchat-config|data.AUTH_PUBLIC_WEB_BASE_URL\thttps://nchat.nic-labs.com
+ConfigMap|nchat-config|data.LIVEKIT_API_URL\twss://livekit.example.net
+ConfigMap|nchat-config|data.NCHAT_WEB_LIVEKIT_CONNECT_SRC\twss://livekit.example.net https://livekit.example.net
+Deployment|media-service-blue|configmap-envfrom\tnchat-config
+Deployment|media-service-green|configmap-envfrom\tnchat-config')
+
+QUERY_FIXTURE="$good_client_contract"
+expect "an external media plane, reaching both slots, is accepted" accept check_livekit_client_contract
+
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net/http:\/\/livekit:7890}"
+expect "an in-cluster address the browser cannot dial is rejected" reject check_livekit_client_contract
+
+# The correction this gate was rewritten for: media must not be proxied through
+# the application's own gateway.
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net/wss:\/\/nchat.nic-labs.com}"
+expect "LiveKit on the application's own host is rejected" reject check_livekit_client_contract
+
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net/wss:\/\/nchat.nic-labs.com\/livekit}"
+expect "LiveKit behind a path on the application's host is rejected" reject check_livekit_client_contract
+
+# The SDK appends its own paths, and media-service refuses a URL carrying one.
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net/wss:\/\/livekit.example.net\/livekit}"
+expect "a path on the external host is rejected" reject check_livekit_client_contract
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.AUTH_PUBLIC_WEB_BASE_URL\thttps://nchat.nic-labs.com
+ConfigMap|nchat-config|data.LIVEKIT_API_URL\twss://livekit.example.net
+ConfigMap|nchat-config|data.NCHAT_WEB_LIVEKIT_CONNECT_SRC\twss://other.example.net https://other.example.net
+Deployment|media-service-blue|configmap-envfrom\tnchat-config
+Deployment|media-service-green|configmap-envfrom\tnchat-config')
+expect "a CSP allowing a host the SDK never dials is rejected" reject check_livekit_client_contract
+
+# The SDK dials wss:// and fetches over https:// against the same host, so a CSP
+# carrying only one of them fails as a call that never connects.
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net https:\/\/livekit.example.net/wss:\/\/livekit.example.net}"
+expect "a CSP without the https origin is rejected" reject check_livekit_client_contract
+
+QUERY_FIXTURE="${good_client_contract//wss:\/\/livekit.example.net https:\/\/livekit.example.net/https:\/\/livekit.example.net}"
+expect "a CSP without the wss origin is rejected" reject check_livekit_client_contract
+
+QUERY_FIXTURE="${good_client_contract//$'\nDeployment|media-service-green|configmap-envfrom\tnchat-config'/}"
+expect "a slot whose media-service cannot read nchat-config is rejected" reject check_livekit_client_contract
+
+echo "--- dangling service endpoints ---"
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SEAWEEDFS_FILER_URL\thttp://seaweedfs-filer:8888
+Service|name\tclamav')
+expect "an endpoint naming a stateful Service is accepted" accept check_no_dangling_service_endpoints
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SEAWEEDFS_S3_ENDPOINT\thttp://seaweedfs-s3:8333
+Service|name\tclamav')
+expect "the inherited S3 endpoint, which names nothing, is rejected" reject check_no_dangling_service_endpoints
+
+QUERY_FIXTURE=$(printf 'Service|name\tclamav')
+expect "an absent S3 endpoint is accepted" accept check_no_dangling_service_endpoints
+
+echo
 echo "--- preview routing ---"
 
 QUERY_FIXTURE="$good_ingress_backends"

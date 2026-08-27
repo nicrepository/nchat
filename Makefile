@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old migrations-up migrations-down migrations-status migrations-reset migrations-smoke dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
+.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
 
 help:
 	@echo "NChat development commands"
@@ -59,8 +59,13 @@ help:
 	@echo "  make migrations-status       Show migration status (requires DB)"
 	@echo "  make migrations-reset        Roll back all migrations interactively (requires DB)"
 	@echo "  make migrations-smoke        Run migration smoke test (requires Docker Compose)"
+	@echo "  make db-restore-test         Prove backup/restore keeps role ownership (requires Docker)"
 	@echo "  make migrations-blue-green-test Run Blue/Green migration gate fixtures (CI-safe)"
 	@echo "  make prod-blue-green-check   Validate the production Blue/Green overlay (CI-safe)"
+	@echo "  make prod-stateful-check     Validate the production stateful overlay (CI-safe)"
+	@echo "  make prod-stateful-check-test Run stateful gate negative tests (CI-safe)"
+	@echo "  make prod-stateful-preflight-test Run stateful preflight negative tests (CI-safe)"
+	@echo "  make prod-stateful-apply     Apply the production stateful layer (requires cluster)"
 	@echo "  make prod-blue-green-check-test Run manifest gate negative tests (CI-safe)"
 	@echo "  make prod-blue-green-test    Run production Blue/Green script tests (CI-safe)"
 	@echo "  make prod-blue-green-query-test Run manifest reader unit tests (CI-safe)"
@@ -300,11 +305,32 @@ migrations-reset:
 migrations-smoke:
 	pnpm migrations:smoke
 
+# Proves the production backup/restore procedure preserves the least-privilege
+# role model. Starts its own PostgreSQL, so it needs Docker but no compose stack
+# and no cluster. Out of `pnpm ci` for the same reason migrations-smoke is.
+db-restore-test:
+	pnpm db:restore-test
+
 migrations-blue-green-test:
 	pnpm migrations:blue-green:test
 
 prod-blue-green-check:
 	pnpm prod:blue-green:check
+
+prod-stateful-check:
+	pnpm prod:stateful:check
+
+prod-stateful-check-test:
+	pnpm prod:stateful:check-test
+
+prod-stateful-preflight-test:
+	pnpm prod:stateful:preflight-test
+
+# Applies the shared stateful layer to a real cluster. Separate from the release
+# targets on purpose: it writes over production storage and is run once, before
+# prod-blue-green-bootstrap.
+prod-stateful-apply:
+	pnpm prod:stateful:apply
 
 prod-blue-green-check-test:
 	pnpm prod:blue-green:check-test

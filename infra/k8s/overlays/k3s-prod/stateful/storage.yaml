@@ -1,0 +1,138 @@
+# The production storage claims' backing volumes.
+#
+# Local PersistentVolumes, the same shape nchat-dev has been running from
+# infra/k8s/overlays/nchat-dev-server/server/persistent-volumes.yaml, with three
+# differences that are the whole point of this file: their own names, their own
+# paths under /mnt/hdd-geral/k3s/nchat-prod, and nothing shared with the
+# development namespace.
+#
+# `local` rather than `hostPath`: that is the pattern the deployment already
+# uses, and it is the one that carries node affinity, so a claim can never bind
+# on a node where the directory does not exist. On this single-node cluster the
+# affinity is srv-apps-01, matching where the disk is.
+#
+# persistentVolumeReclaimPolicy is Retain on all four. A PVC deleted by accident
+# — or a namespace deleted entirely — leaves the volume Released with the data
+# still on disk, to be reclaimed deliberately by an operator. Delete would hand
+# the database to the garbage collector, and there is no undo for that.
+#
+# The directories themselves are NOT created here. Kubernetes does not create
+# the target of a local PV, and the manifest that pretended to would only fail
+# later with a confusing mount error. See the runbook for the exact mkdir/chown.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nchat-prod-postgres
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/instance: nchat-prod
+    app.kubernetes.io/component: postgres
+spec:
+  capacity:
+    storage: 30Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-hdd-geral
+  local:
+    path: /mnt/hdd-geral/k3s/nchat-prod/postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - srv-apps-01
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nchat-prod-valkey
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/instance: nchat-prod
+    app.kubernetes.io/component: valkey
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-hdd-geral
+  local:
+    path: /mnt/hdd-geral/k3s/nchat-prod/valkey
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - srv-apps-01
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nchat-prod-seaweedfs
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/instance: nchat-prod
+    app.kubernetes.io/component: seaweedfs
+spec:
+  capacity:
+    storage: 60Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-hdd-geral
+  local:
+    path: /mnt/hdd-geral/k3s/nchat-prod/seaweedfs
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - srv-apps-01
+---
+# The avatar volume, which base declares as a claim with no storageClassName at
+# all — so in production it would bind whatever the cluster's default class is:
+# local-path, on the root disk, with reclaimPolicy Delete. Deleting the claim
+# would delete every user's avatar, and the root disk is explicitly not where
+# this deployment's data belongs.
+#
+# Naming a volume here, and binding the claim to it from ../shared, moves the
+# avatars onto the same retained HDD as everything else. 1Gi is base's own
+# request: avatars are a few KiB each and the claim is ReadWriteOnce because a
+# single auth-service replica owns writes — see base/services/auth-service.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nchat-prod-auth-avatars
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/instance: nchat-prod
+    app.kubernetes.io/component: auth
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-hdd-geral
+  local:
+    path: /mnt/hdd-geral/k3s/nchat-prod/auth-avatars
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - srv-apps-01
