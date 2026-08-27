@@ -1114,6 +1114,15 @@ validate_link_safety() {
   fi
 }
 
+validate_app_environment() {
+  local name="$1" rendered="$2" expected="$3" config
+  config="$(yaml_document "$rendered" ConfigMap nchat-config)"
+  if [[ "$(grep -Fxc "  APP_ENV: $expected" <<<"$config")" -ne 1 ]]; then
+    echo "error: APP_ENV must be '$expected' in nchat-config for $name" >&2
+    return 1
+  fi
+}
+
 load_nchat_dev_topology "$NCHAT_DEV_TOPOLOGY_FILE"
 sh -n "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data/postgres-bootstrap.sh"
 if grep -q '|' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server/data/postgres-bootstrap.sh"; then
@@ -1128,6 +1137,18 @@ for overlay in "${overlays[@]}"; do
 done
 
 if [[ -z "${K8S_OVERLAY:-}" ]]; then
+  validate_app_environment \
+    infra/k8s/base \
+    "${rendered_by_overlay[infra/k8s/base]}" \
+    development
+  validate_app_environment \
+    infra/k8s/overlays/k3s-dev \
+    "${rendered_by_overlay[infra/k8s/overlays/k3s-dev]}" \
+    development
+  validate_app_environment \
+    infra/k8s/overlays/k3s-prod/shared \
+    "${rendered_by_overlay[infra/k8s/overlays/k3s-prod/shared]}" \
+    production
   validate_nchat_dev \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server/data]}" \

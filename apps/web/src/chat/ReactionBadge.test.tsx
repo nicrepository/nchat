@@ -107,6 +107,183 @@ describe("ReactionBadge", () => {
 });
 
 /**
+ * When the names of the reactors are on screen (issue #496 overflow fix).
+ *
+ * The pointer and the keyboard are two independent ways of asking for them, so
+ * they are two independent states: whichever one is still asking keeps the
+ * tooltip open. A single flag let either channel close what the other had
+ * opened — moving the mouse away from a badge the keyboard was still on hid the
+ * names mid-read.
+ *
+ * The tooltip itself is portalled to the body, so these look for it there
+ * rather than inside the badge: that is what keeps it out of the message list's
+ * scrollable width.
+ */
+describe("reaction authors tooltip", () => {
+  const withAuthors = {
+    count: 3,
+    reactedByMe: true,
+    users: [
+      { userId: me, displayName: "Eu" },
+      { userId: "u2", displayName: "Caio Almeida" },
+    ],
+  };
+
+  const tooltip = () => document.body.querySelector(":scope > [data-testid='reaction-authors']");
+  const badge = () => screen.getByRole("button", { name: "Remover reação 👍" });
+  const slot = () => badge().closest(".chat-msg-area__reaction-slot") as HTMLElement;
+
+  it("shows the names on hover and takes them away when the pointer leaves", () => {
+    renderBadge(withAuthors);
+    expect(tooltip()).toBeNull();
+
+    fireEvent.mouseEnter(slot());
+    expect(tooltip()).toHaveTextContent("👍: Você, Caio Almeida e mais 1");
+
+    fireEvent.mouseLeave(slot());
+    expect(tooltip()).toBeNull();
+  });
+
+  it("shows the names on keyboard focus and takes them away on blur", () => {
+    renderBadge(withAuthors);
+
+    fireEvent.focus(badge());
+    expect(tooltip()).toHaveTextContent("👍: Você, Caio Almeida e mais 1");
+
+    fireEvent.blur(badge());
+    expect(tooltip()).toBeNull();
+  });
+
+  // The finding: the pointer leaving must not close what the keyboard is on.
+  it("keeps the names while the badge is still focused after the pointer leaves", () => {
+    renderBadge(withAuthors);
+
+    fireEvent.mouseEnter(slot());
+    fireEvent.focus(badge());
+    fireEvent.mouseLeave(slot());
+
+    expect(tooltip()).not.toBeNull();
+
+    fireEvent.blur(badge());
+    expect(tooltip()).toBeNull();
+  });
+
+  // And the mirror: focus leaving must not close what the pointer is on.
+  it("keeps the names while the pointer is still over the badge after blur", () => {
+    renderBadge(withAuthors);
+
+    fireEvent.focus(badge());
+    fireEvent.mouseEnter(slot());
+    fireEvent.blur(badge());
+
+    expect(tooltip()).not.toBeNull();
+
+    fireEvent.mouseLeave(slot());
+    expect(tooltip()).toBeNull();
+  });
+
+  // A reaction that no longer exists must not still be naming its reactors.
+  it("takes the names away when the reaction starts leaving", () => {
+    const { rerender } = render(
+      <ReactionBadge
+        messageId="m1"
+        reaction={reaction(withAuthors)}
+        currentUserId={me}
+        onToggle={vi.fn()}
+      />,
+    );
+    fireEvent.mouseEnter(slot());
+    expect(tooltip()).not.toBeNull();
+
+    rerender(
+      <ReactionBadge
+        messageId="m1"
+        reaction={reaction(withAuthors)}
+        currentUserId={me}
+        onToggle={vi.fn()}
+        exiting
+        onExited={vi.fn()}
+      />,
+    );
+
+    expect(tooltip()).toBeNull();
+  });
+
+  // The tooltip is fixed, so it has to be told when its badge moves. Those
+  // listeners must live exactly as long as the tooltip does.
+  it("listens for scroll and resize only while it is open", () => {
+    const add = vi.spyOn(window, "addEventListener");
+    const remove = vi.spyOn(window, "removeEventListener");
+    const kinds = (spy: typeof add) =>
+      spy.mock.calls.map(([type]) => type).filter((type) => type === "scroll" || type === "resize");
+    renderBadge(withAuthors);
+    expect(kinds(add)).toEqual([]);
+
+    fireEvent.mouseEnter(slot());
+    expect(kinds(add)).toEqual(["scroll", "resize"]);
+    expect(kinds(remove)).toEqual([]);
+
+    fireEvent.mouseLeave(slot());
+    expect(kinds(remove)).toEqual(["scroll", "resize"]);
+    // Registered on the way down, so one listener sees the message list scroll
+    // without this having to find every scroll parent.
+    expect(add.mock.calls.find(([type]) => type === "scroll")?.[2]).toBe(true);
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  /**
+   * jsdom lays nothing out, so every box is 0×0 and the tooltip would always
+   * read as pointing at nothing. Handing the badge a box is what lets these two
+   * drive the decision at all; where the tooltip actually lands is measured in a
+   * real browser by the responsive-layout spec.
+   */
+  function giveBadgeABox(box: { top: number; bottom: number }) {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      ...box,
+      left: 100,
+      right: 160,
+      width: 60,
+      height: box.bottom - box.top,
+      x: 100,
+      y: box.top,
+      toJSON: () => ({}),
+    } as DOMRect);
+  }
+
+  it("re-places itself when the conversation scrolls under it", () => {
+    giveBadgeABox({ top: 300, bottom: 330 });
+    renderBadge(withAuthors);
+    fireEvent.mouseEnter(slot());
+    const placed = tooltip() as HTMLElement;
+    expect(placed.style.visibility).toBe("visible");
+
+    placed.style.top = "-999px";
+    fireEvent.scroll(document, {});
+    expect(placed.style.top).not.toBe("-999px");
+  });
+
+  // The finding: a badge scrolled out of sight is not something to point at.
+  it("hides itself when the badge scrolls out of the visible area", () => {
+    giveBadgeABox({ top: 300, bottom: 330 });
+    renderBadge(withAuthors);
+    fireEvent.mouseEnter(slot());
+    const placed = tooltip() as HTMLElement;
+    expect(placed.style.visibility).toBe("visible");
+
+    // The badge is now entirely above the band it is painted in.
+    giveBadgeABox({ top: -80, bottom: -20 });
+    fireEvent.scroll(document, {});
+    expect(placed.style.visibility).toBe("hidden");
+
+    // And back again, without the reader touching anything.
+    giveBadgeABox({ top: 300, bottom: 330 });
+    fireEvent.scroll(document, {});
+    expect(placed.style.visibility).toBe("visible");
+  });
+});
+
+/**
  * A reaction that is removed has to be seen leaving. Before this, the last badge
  * vanished between two frames, which reads as a glitch rather than as an action.
  *

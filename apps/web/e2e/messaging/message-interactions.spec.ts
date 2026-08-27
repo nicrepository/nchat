@@ -372,24 +372,27 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
     const badge = messageBubble(page, original.id).getByRole("button", {
       name: "Adicionar reação 🎉",
     });
-    const authors = messageBubble(page, original.id).getByTestId("reaction-authors");
+    // O tooltip visível vive fora da conversa — portalizado, para que não possa
+    // alargar a lista de mensagens (regressão de scroll horizontal).
+    const authors = page.locator("body > [data-testid=reaction-authors]");
 
     // A informação é acessível sempre — a descrição do próprio botão — e não
     // depende do tooltip visual.
     await expect(badge).toHaveAccessibleDescription(
       `🎉: ${OTHER_USER_NAME}, Terceira Pessoa e mais 1`,
     );
-    await expect(authors).toHaveCSS("opacity", "0");
+    await expect(authors).toHaveCount(0);
 
     await badge.hover();
-    await expect(authors).toHaveCSS("opacity", "1");
+    await expect(authors).toBeVisible();
+    await expect(authors).toHaveText(`🎉: ${OTHER_USER_NAME}, Terceira Pessoa e mais 1`);
 
     await page.mouse.move(0, 0);
-    await expect(authors).toHaveCSS("opacity", "0");
+    await expect(authors).toHaveCount(0);
 
     // O mesmo conteúdo aparece por foco de teclado, sem mouse.
     await badge.focus();
-    await expect(authors).toHaveCSS("opacity", "1");
+    await expect(authors).toBeVisible();
 
     // Reagir junto passa a nomear o leitor como "Você", sem reload.
     await badge.click();

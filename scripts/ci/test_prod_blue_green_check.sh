@@ -130,6 +130,26 @@ expect "a CSP without the wss origin is rejected" reject check_livekit_client_co
 QUERY_FIXTURE="${good_client_contract//$'\nDeployment|media-service-green|configmap-envfrom\tnchat-config'/}"
 expect "a slot whose media-service cannot read nchat-config is rejected" reject check_livekit_client_contract
 
+echo "--- livekit environment namespace ---"
+
+good_environment_contract=$(printf 'ConfigMap|nchat-config|data.APP_ENV\tproduction
+Deployment|media-service-blue|configmap-envfrom\tnchat-config
+Deployment|media-service-blue|app-env\t
+Deployment|media-service-green|configmap-envfrom\tnchat-config
+Deployment|media-service-green|app-env\t')
+
+QUERY_FIXTURE="$good_environment_contract"
+expect "both slots inherit the production namespace" accept check_livekit_environment_namespace
+
+QUERY_FIXTURE="${good_environment_contract/production/development}"
+expect "production cannot use the development namespace" reject check_livekit_environment_namespace
+
+QUERY_FIXTURE="${good_environment_contract/Deployment|media-service-blue|app-env$'\t'/Deployment|media-service-blue|app-env$'\t'blue}"
+expect "Blue cannot override APP_ENV with its slot name" reject check_livekit_environment_namespace
+
+QUERY_FIXTURE="${good_environment_contract/Deployment|media-service-green|app-env$'\t'/Deployment|media-service-green|app-env$'\t'green}"
+expect "Green cannot override APP_ENV with its slot name" reject check_livekit_environment_namespace
+
 echo "--- dangling service endpoints ---"
 
 QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SEAWEEDFS_FILER_URL\thttp://seaweedfs-filer:8888

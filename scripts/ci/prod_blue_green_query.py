@@ -216,6 +216,22 @@ def _field_configmap_envfrom(document: Document) -> str:
     return " ".join(names)
 
 
+def _field_app_env(document: Document) -> str:
+    """Return a container-level APP_ENV override, if present."""
+    for position, line in enumerate(document.lines):
+        if line.strip() != "- name: APP_ENV":
+            continue
+        for candidate in document.lines[position + 1 :]:
+            stripped = candidate.strip()
+            if stripped.startswith("- name:"):
+                break
+            if stripped.startswith("value:"):
+                return stripped.split(":", 1)[1].strip().strip("'\"")
+            if stripped == "valueFrom:":
+                return "valueFrom"
+    return ""
+
+
 FIELD_QUERIES = {
     "selector-slot": _field_selector_slot,
     "middlewares": _field_middlewares,
@@ -225,6 +241,7 @@ FIELD_QUERIES = {
     "livekit-env": _field_livekit_env,
     "node-hosts": _field_node_hosts,
     "configmap-envfrom": _field_configmap_envfrom,
+    "app-env": _field_app_env,
 }
 
 
