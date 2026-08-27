@@ -58,6 +58,39 @@ func TestReactionService_RejectsInvalidEmojiBeforeStorage(t *testing.T) {
 	}
 }
 
+// A composed sequence must reach storage whole: the picker offers them, and
+// truncating one to its first code point would store a different reaction.
+func TestReactionService_AcceptsComposedSequencesVerbatim(t *testing.T) {
+	for _, emoji := range []string{"👨‍👩‍👧‍👦", "👍🏿", "🏳️‍🌈"} {
+		store := &fakeReactionStore{result: storage.ToggleReactionResult{MessageID: "msg-1", Added: true}}
+		svc := service.NewReactionService(store)
+		if _, err := svc.ToggleReaction(context.Background(), service.ToggleReactionInput{
+			WorkspaceID: "ws-1", UserID: "user-1", MessageID: "msg-1", Emoji: emoji,
+		}); err != nil {
+			t.Fatalf("ToggleReaction(%q): %v", emoji, err)
+		}
+		if store.input.Emoji != emoji {
+			t.Fatalf("expected %q to reach storage unchanged, got %q", emoji, store.input.Emoji)
+		}
+	}
+}
+
+func TestReactionService_RejectsUncataloguedValuesBeforeStorage(t *testing.T) {
+	for _, emoji := range []string{"👍 boa", "👍👍", ":+1:", "🏻", "❤"} {
+		store := &fakeReactionStore{err: errors.New("must not be called")}
+		svc := service.NewReactionService(store)
+		_, err := svc.ToggleReaction(context.Background(), service.ToggleReactionInput{
+			WorkspaceID: "ws-1", UserID: "user-1", MessageID: "msg-1", Emoji: emoji,
+		})
+		if !errors.Is(err, domain.ErrInvalidInput) {
+			t.Fatalf("expected %q to be refused, got %v", emoji, err)
+		}
+		if store.input.MessageID != "" {
+			t.Fatalf("uncatalogued %q reached storage", emoji)
+		}
+	}
+}
+
 func TestReactionService_RejectsMissingIdentityOrMessage(t *testing.T) {
 	store := &fakeReactionStore{}
 	svc := service.NewReactionService(store)
@@ -88,14 +121,14 @@ func TestReactionService_SequentialDoubleToggleLeavesReactionRemoved(t *testing.
 	}
 }
 
-func TestAllowedReactionEmojis_IsCuratedAndFitsDatabaseConstraint(t *testing.T) {
-	emojis := service.AllowedReactionEmojis()
+func TestQuickReactionEmojis_IsCuratedAndCatalogued(t *testing.T) {
+	emojis := service.QuickReactionEmojis()
 	if len(emojis) < 16 || len(emojis) > 20 {
 		t.Fatalf("expected 16-20 emojis, got %d", len(emojis))
 	}
 	for _, emoji := range emojis {
-		if n := len([]rune(emoji)); n < 1 || n > 8 {
-			t.Fatalf("emoji %q has %d code points; database permits 1-8", emoji, n)
+		if !service.IsAllowedReactionEmoji(emoji) {
+			t.Fatalf("quick reaction %q is not in the emoji catalog", emoji)
 		}
 	}
 }

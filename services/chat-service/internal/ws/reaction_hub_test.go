@@ -189,3 +189,89 @@ func decodeEvent(raw []byte) (Event, error) {
 	err := json.Unmarshal(raw, &evt)
 	return evt, err
 }
+
+// Every subscriber gets the same named prefix, the actor included, so a client
+// can render who reacted without asking — and can tell whether it is itself by
+// the id it already knows (issue #496).
+func TestHub_ReactionEventCarriesTheAuthorsOfEachAggregate(t *testing.T) {
+	handler := &fakeReactionHandler{result: ReactionUpdate{
+		MessageID: testReactionMessageID, TargetType: TargetTypeChannel, TargetID: "ch-1", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 2, Users: []ReactionUserPayload{
+			{UserID: "user-auth", DisplayName: "Álvaro Neto"},
+			{UserID: "user-other", DisplayName: "Caio Almeida"},
+		}}},
+	}}
+	authorizer := &fakeAuthorizer{}
+	authorizer.setAccess("user-other", "ws-auth", TargetTypeChannel, "ch-1", true)
+	hub := NewHub(authorizer, newTestLogger(), NopBus{}, "test-reaction-authors",
+		WithReactionHandler(handler), WithReactionLimiter(fakeReactionLimiter{allowed: true}))
+	t.Cleanup(hub.Shutdown)
+	actor := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+	observer := newClient("client-2", "user-other", "ws-auth", &fakeSender{})
+	if !hub.Register(actor) || !hub.Register(observer) {
+		t.Fatal("register")
+	}
+	if err := hub.Subscribe(context.Background(), observer, TargetTypeChannel, "ch-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := hub.handleClientMessage(context.Background(), actor, ClientMessage{
+		Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
+	}); err != nil {
+		t.Fatalf("reaction toggle: %v", err)
+	}
+
+	select {
+	case raw := <-observer.outbox:
+		evt, err := decodeEvent(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		users := evt.Reaction.Reactions[0].Users
+		if len(users) != 2 || users[0].DisplayName != "Álvaro Neto" || users[0].UserID != "user-auth" {
+			t.Fatalf("expected the actor to be named to other subscribers, got %+v", users)
+		}
+		if users[1].DisplayName != "Caio Almeida" {
+			t.Fatalf("expected a stable author order, got %+v", users)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reaction event not broadcast")
+	}
+}
+
+// A subscriber with no access to the target is not told that the reaction
+// happened, and therefore never learns who is behind it.
+func TestHub_ReactionEventIsNotDeliveredToUnauthorizedSubscribers(t *testing.T) {
+	handler := &fakeReactionHandler{result: ReactionUpdate{
+		MessageID: testReactionMessageID, TargetType: TargetTypeChannel, TargetID: "ch-1", Added: true,
+		Reactions: []ReactionPayload{{Emoji: "👍", Count: 1, Users: []ReactionUserPayload{
+			{UserID: "user-auth", DisplayName: "Álvaro Neto"},
+		}}},
+	}}
+	authorizer := &fakeAuthorizer{}
+	authorizer.setAccess("user-revoked", "ws-auth", TargetTypeChannel, "ch-1", true)
+	hub := NewHub(authorizer, newTestLogger(), NopBus{}, "test-reaction-authz",
+		WithReactionHandler(handler), WithReactionLimiter(fakeReactionLimiter{allowed: true}))
+	t.Cleanup(hub.Shutdown)
+	actor := newClient("client-1", "user-auth", "ws-auth", &fakeSender{})
+	revoked := newClient("client-2", "user-revoked", "ws-auth", &fakeSender{})
+	if !hub.Register(actor) || !hub.Register(revoked) {
+		t.Fatal("register")
+	}
+	if err := hub.Subscribe(context.Background(), revoked, TargetTypeChannel, "ch-1"); err != nil {
+		t.Fatal(err)
+	}
+	authorizer.setAccess("user-revoked", "ws-auth", TargetTypeChannel, "ch-1", false)
+
+	if err := hub.handleClientMessage(context.Background(), actor, ClientMessage{
+		Type: ClientMessageTypeReactionToggle, MessageID: testReactionMessageID, Emoji: "👍",
+	}); err != nil {
+		t.Fatalf("reaction toggle: %v", err)
+	}
+
+	select {
+	case raw := <-revoked.outbox:
+		t.Fatalf("a revoked subscriber received reaction data: %s", raw)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
