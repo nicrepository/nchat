@@ -1,0 +1,101 @@
+# The roles the application and the migrations connect as.
+#
+# PostgreSQL starts owning one superuser, from nchat-postgres-admin. This Job
+# creates the other two and is the only place their grants are stated:
+#
+#   nchat_migrator  CONNECT + CREATE on the database, USAGE + CREATE on the
+#                   schema, and ownership of auth and chat. It is what
+#                   base/migrations/job.yaml runs as.
+#   nchat_app       CONNECT and USAGE only. Every service runs as this role, and
+#                   it cannot alter the schema even by mistake.
+#
+# That separation is what makes "application rollback is not database rollback"
+# enforceable rather than a convention: a released service physically cannot
+# migrate anything. Re-running the Job is safe — every statement is idempotent —
+# but stateful.sh deletes the previous one first, because a completed Job's pod
+# template is immutable and a second apply would otherwise be rejected.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-bootstrap
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: postgres-bootstrap
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/component: postgres-bootstrap
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: srv-apps-01
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres-bootstrap
+          image: postgres
+          command:
+            - /bootstrap/postgres-bootstrap.sh
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGDATABASE
+              value: nchat
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-admin
+                  key: POSTGRES_ADMIN_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-admin
+                  key: POSTGRES_ADMIN_PASSWORD
+            - name: POSTGRES_MIGRATOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-migrator
+                  key: POSTGRES_MIGRATOR_PASSWORD
+            - name: POSTGRES_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: POSTGRES_APP_PASSWORD
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: postgres-bootstrap
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}

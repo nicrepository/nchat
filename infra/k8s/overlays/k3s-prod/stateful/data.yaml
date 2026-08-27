@@ -1,0 +1,384 @@
+# The single PostgreSQL, Valkey and SeaweedFS that Blue and Green share.
+#
+# One of each, deliberately: Blue and Green are release slots, not environments.
+# A second database per slot would make a cutover a data migration, and an
+# attachment uploaded while Blue serves traffic has to be readable the instant
+# Green takes over. Nothing in this file carries a nchat.io/release-slot label,
+# and nothing may ever grow one.
+#
+# The shape is nchat-dev's, from
+# infra/k8s/overlays/nchat-dev-server/data/resources.yaml, because that is the
+# configuration this deployment has actually run — production is not the place
+# to try a different one. What differs is the volumeName of each claim (its own
+# retained PV, never dev's) and the seaweedfs-filer Service below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  # Not an availability decision so much as a correctness one: two Postgres
+  # pods would both try to open the same ReadWriteOnce volume. High
+  # availability needs replication, which is a different design and not this
+  # change.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/component: postgres
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: srv-apps-01
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # The superuser, and only the superuser, comes from
+          # nchat-postgres-admin. The runtime role (nchat_app) and the migration
+          # role (nchat_migrator) are created by postgres-bootstrap-job.yaml
+          # with separate passwords from separate Secrets, and nchat_app is
+          # never granted CREATE on the schema — the separation the release
+          # depends on is enforced in the database, not by which URL a service
+          # happens to read.
+          env:
+            - name: POSTGRES_DB
+              value: nchat
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-admin
+                  key: POSTGRES_ADMIN_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-admin
+                  key: POSTGRES_ADMIN_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-hdd-geral
+        volumeName: nchat-prod-postgres
+        resources:
+          requests:
+            storage: 30Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+spec:
+  selector:
+    app.kubernetes.io/component: valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey
+spec:
+  serviceName: valkey
+  # One instance, shared. chat-service's WebSocket bus, presence and the
+  # attachment status events all cross it, and both slots' replicas subscribe to
+  # it at once during a release: a message published by a pod in the outgoing
+  # slot must reach a subscriber in the incoming one. Two Valkeys would split
+  # exactly that traffic in half at the worst possible moment.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: valkey
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/component: valkey
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: srv-apps-01
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: valkey/valkey
+          command:
+            - sh
+            - -ec
+          args:
+            - exec valkey-server --appendonly yes --requirepass "$VALKEY_PASSWORD"
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: VALKEY_PASSWORD
+          ports:
+            - name: valkey
+              containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: valkey
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: valkey
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-hdd-geral
+        volumeName: nchat-prod-valkey
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+spec:
+  selector:
+    app.kubernetes.io/component: seaweedfs
+  ports:
+    - name: master
+      port: 9333
+      targetPort: master
+    # The filer does not keep chunks: it asks the master where to write and is
+    # handed back seaweedfs:8080, the address `-ip=seaweedfs` makes the volume
+    # server announce. Without this port the Service has no endpoint there and
+    # every upload fails with `connection refused` (failure_code=storage_write).
+    # This is also why the Service must keep this exact name.
+    - name: volume
+      port: 8080
+      targetPort: volume
+    - name: filer
+      port: 8888
+      targetPort: filer
+---
+# The filer under the name production's configuration already uses.
+#
+# base/configmap.yaml sets SEAWEEDFS_FILER_URL to http://seaweedfs-filer:8888
+# and bootstrap.sh checks for a Service by that name. nchat-dev overrides the
+# URL to point at its single `seaweedfs` Service; production does not, so the
+# name has to exist. It is a second address for the same pod rather than a
+# second workload, and it publishes only the filer port — the master and the
+# volume server stay reachable exclusively under the internal `seaweedfs` name,
+# which is what keeps `nchat-allow-file-data-egress` (filer, 8888, and nothing
+# else) an accurate description of what file-service can reach.
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-filer
+spec:
+  selector:
+    app.kubernetes.io/component: seaweedfs
+  ports:
+    - name: filer
+      port: 8888
+      targetPort: filer
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: seaweedfs
+spec:
+  serviceName: seaweedfs
+  # One object store, shared. An attachment uploaded on Blue must be readable on
+  # Green the moment the selector moves; a per-slot store would make a cutover
+  # lose every file uploaded since the candidate was deployed.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: seaweedfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/component: seaweedfs
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: srv-apps-01
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs
+          args:
+            - server
+            - -dir=/data
+            - -ip=seaweedfs
+            - -ip.bind=0.0.0.0
+            # `weed server` starts the master and the volume server; the filer
+            # is opt-in and defaults to off. Without this flag port 8888 is
+            # declared by the Services above and nothing listens on it, which is
+            # exactly what was found in nchat-dev: `connection refused`.
+            # file-service cannot work without it — SeaweedFSStore.Ping does
+            # GET {filer}/ and that check gates /readyz once uploads are on.
+            - -filer=true
+          ports:
+            - name: master
+              containerPort: 9333
+            - name: volume
+              containerPort: 8080
+            - name: filer
+              containerPort: 8888
+          # The master has to be up before the filer can serve, so it is the
+          # startup gate; readiness is then the filer, because that is the only
+          # endpoint file-service actually consumes. Probing the master for
+          # readiness is what let a missing filer stay invisible in nchat-dev.
+          startupProbe:
+            httpGet:
+              path: /cluster/status
+              port: master
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /
+              port: filer
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: master
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-hdd-geral
+        volumeName: nchat-prod-seaweedfs
+        resources:
+          requests:
+            storage: 60Gi

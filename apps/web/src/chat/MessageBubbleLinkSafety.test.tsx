@@ -20,6 +20,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import MessageBubble from "./MessageBubble";
 import type { MessageBubbleProps } from "./MessageBubble";
 import { linkSafetyAllowsAnchors, normalizeLinkSafety } from "./chatTypes";
@@ -65,7 +66,9 @@ function renderBubble(overrides: Partial<MessageBubbleProps> = {}) {
     onEditMessage: vi.fn(),
     onEditForbidden: vi.fn(),
     onDeleteMessage: vi.fn(),
-    allowedReactionEmojis: [],
+    emojiUsage: emptyEmojiUsage,
+    onEmojiToneChange: vi.fn(),
+    currentUserId: "me",
     recentReactionEmojis: [],
     reactionMenuVisible: false,
     onReactionMenuVisibleChange: vi.fn(),
@@ -350,7 +353,9 @@ describe("anchors", () => {
         onEditMessage={vi.fn()}
         onEditForbidden={vi.fn()}
         onDeleteMessage={vi.fn()}
-        allowedReactionEmojis={[]}
+        emojiUsage={emptyEmojiUsage}
+        onEmojiToneChange={vi.fn()}
+        currentUserId="me"
         recentReactionEmojis={[]}
         reactionMenuVisible={false}
         onReactionMenuVisibleChange={vi.fn()}
@@ -381,7 +386,9 @@ describe("anchors", () => {
         onEditMessage={vi.fn()}
         onEditForbidden={vi.fn()}
         onDeleteMessage={vi.fn()}
-        allowedReactionEmojis={[]}
+        emojiUsage={emptyEmojiUsage}
+        onEmojiToneChange={vi.fn()}
+        currentUserId="me"
         recentReactionEmojis={[]}
         reactionMenuVisible={false}
         onReactionMenuVisibleChange={vi.fn()}
@@ -530,7 +537,9 @@ describe("clickability is an allowlist", () => {
         onEditMessage={vi.fn()}
         onEditForbidden={vi.fn()}
         onDeleteMessage={vi.fn()}
-        allowedReactionEmojis={[]}
+        emojiUsage={emptyEmojiUsage}
+        onEmojiToneChange={vi.fn()}
+        currentUserId="me"
         recentReactionEmojis={[]}
         reactionMenuVisible={false}
         onReactionMenuVisibleChange={vi.fn()}

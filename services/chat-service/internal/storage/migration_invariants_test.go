@@ -496,6 +496,32 @@ func TestChatMigration_AddsMessageReactionLookupIndex(t *testing.T) {
 	}
 }
 
+// Issue #496 widened the stored sequence bound so a complete Unicode emoji
+// fits. The widening is added NOT VALID and validated separately: an ADD that
+// scans chat.message_reactions holds ACCESS EXCLUSIVE for the whole scan, and
+// that table grows with every reaction ever made.
+func TestChatMigration_WidensReactionEmojiSequenceBound(t *testing.T) {
+	widen := readChatMigration(t, "000040_message_reactions_emoji_sequence_length.up.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT message_reactions_emoji_check",
+		"CHECK (char_length(emoji) BETWEEN 1 AND 32)",
+		"NOT VALID",
+	} {
+		if !strings.Contains(widen, expected) {
+			t.Fatalf("reaction emoji length migration missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000040_message_reactions_emoji_sequence_length.down.sql")
+	if !strings.Contains(down, "CHECK (char_length(emoji) BETWEEN 1 AND 8)") {
+		t.Fatal("reaction emoji length rollback must restore the original bound")
+	}
+
+	validate := readChatMigration(t, "000041_validate_message_reactions_emoji_check.up.sql")
+	if !strings.Contains(validate, "VALIDATE CONSTRAINT message_reactions_emoji_check") {
+		t.Fatal("the widened reaction emoji constraint must be validated in its own migration")
+	}
+}
+
 func TestChatMigration_AddsMessageFavoritesWithRollback(t *testing.T) {
 	migration := readChatMigration(t, "000010_message_favorites.up.sql")
 	for _, expected := range []string{

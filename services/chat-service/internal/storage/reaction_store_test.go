@@ -12,6 +12,12 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
+// toggleReactionColumns mirrors the toggle aggregate's projection, author
+// arrays included.
+var toggleReactionColumns = []string{
+	"channel_id", "dm_id", "added", "emoji", "count", "reacted_by_me", "user_ids", "display_names",
+}
+
 const toggleReactionSQL = `(?s)WITH base AS MATERIALIZED.*final_reactions AS MATERIALIZED.*GROUP BY emoji`
 
 func reactionInput() storage.ToggleReactionInput {
@@ -30,9 +36,9 @@ func TestPGXReactionStore_ToggleAddsReactionAndReturnsAggregate(t *testing.T) {
 	input := reactionInput()
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(reactionAdvisoryKey(input)).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍").
-		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "dm_id", "added", "emoji", "count", "reacted_by_me"}).
-			AddRow("ch-1", "", true, "👍", 2, true))
+	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍", reactionAuthorPrefix).
+		WillReturnRows(pgxmock.NewRows(toggleReactionColumns).
+			AddRow("ch-1", "", true, "👍", 2, true, []string{"user-1", "user-2"}, []string{"Ana", "Bruno"}))
 	mock.ExpectCommit()
 
 	got, err := storage.NewPGXReactionStore(mock).ToggleReaction(context.Background(), input)
@@ -51,9 +57,9 @@ func TestPGXReactionStore_ToggleRemovesExistingReaction(t *testing.T) {
 	input := reactionInput()
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(reactionAdvisoryKey(input)).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍").
-		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "dm_id", "added", "emoji", "count", "reacted_by_me"}).
-			AddRow("", "dm-1", false, "", 0, false))
+	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍", reactionAuthorPrefix).
+		WillReturnRows(pgxmock.NewRows(toggleReactionColumns).
+			AddRow("", "dm-1", false, "", 0, false, []string{}, []string{}))
 	mock.ExpectCommit()
 
 	got, err := storage.NewPGXReactionStore(mock).ToggleReaction(context.Background(), input)
@@ -72,8 +78,8 @@ func TestPGXReactionStore_InvisibleMissingOrDeletedMessageIsNotFound(t *testing.
 	input := reactionInput()
 	mock.ExpectExec(`SELECT pg_advisory_xact_lock`).WithArgs(reactionAdvisoryKey(input)).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍").
-		WillReturnRows(pgxmock.NewRows([]string{"channel_id", "dm_id", "added", "emoji", "count", "reacted_by_me"}))
+	mock.ExpectQuery(toggleReactionSQL).WithArgs("ws-1", "user-1", "msg-1", "👍", reactionAuthorPrefix).
+		WillReturnRows(pgxmock.NewRows(toggleReactionColumns))
 	mock.ExpectRollback()
 
 	_, err := storage.NewPGXReactionStore(mock).ToggleReaction(context.Background(), input)

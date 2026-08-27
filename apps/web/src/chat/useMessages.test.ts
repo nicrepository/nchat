@@ -618,7 +618,7 @@ describe("useMessages — WS message.created integration", () => {
       id: "destination-message",
       bodyText: "edited body",
       editedAt: "2026-07-21T13:00:00Z",
-      reactions: [{ emoji: "👍", count: 4, reactedByMe: true }],
+      reactions: [{ emoji: "👍", count: 4, reactedByMe: true, users: [] }],
       isFavorited: true,
       reference: { available: false },
     });
@@ -635,7 +635,7 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0]).toMatchObject({
       bodyText: "edited body",
       editedAt: "2026-07-21T13:00:00Z",
-      reactions: [{ emoji: "👍", count: 4, reactedByMe: true }],
+      reactions: [{ emoji: "👍", count: 4, reactedByMe: true, users: [] }],
       isFavorited: true,
       reference: { available: false },
     });
@@ -672,7 +672,7 @@ describe("useMessages — WS message.created integration", () => {
     );
 
     expect(result.current.state.messages[0].reactions).toEqual([
-      { emoji: "👍", count: 2, reactedByMe: true },
+      { emoji: "👍", count: 2, reactedByMe: true, users: [] },
     ]);
     act(() => result.current.toggleReaction("msg-1", "👍"));
     expect(mockToggleReaction).toHaveBeenCalledWith("msg-1", "👍");
@@ -792,7 +792,7 @@ describe("useMessages — WS message.created integration", () => {
   });
 
   it("reverts pending optimistic reactions when the server reports a reaction error", async () => {
-    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false, users: [] }];
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
       nextCursor: "",
@@ -804,7 +804,7 @@ describe("useMessages — WS message.created integration", () => {
 
     act(() => result.current.toggleReaction("msg-1", "👍"));
     expect(result.current.state.messages[0].reactions).toEqual([
-      { emoji: "👍", count: 2, reactedByMe: true },
+      { emoji: "👍", count: 2, reactedByMe: true, users: [] },
     ]);
 
     act(() => capturedOnReactionError?.({ type: "error", code: "temporarily_unavailable" }));
@@ -814,7 +814,7 @@ describe("useMessages — WS message.created integration", () => {
   });
 
   it("reverts an optimistic reaction when confirmation times out", async () => {
-    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false }];
+    const originalReactions = [{ emoji: "👍", count: 1, reactedByMe: false, users: [] }];
     mockFetchChannelMessages.mockResolvedValue({
       messages: [makeMessage({ id: "msg-1", reactions: originalReactions })],
       nextCursor: "",
@@ -854,7 +854,10 @@ describe("useMessages — WS message.created integration", () => {
       nextCursor: "",
     });
     mockFetchChannelMessage.mockResolvedValue(
-      makeMessage({ id: "msg-remote", reactions: [{ emoji: "🔥", count: 4, reactedByMe: true }] }),
+      makeMessage({
+        id: "msg-remote",
+        reactions: [{ emoji: "🔥", count: 4, reactedByMe: true, users: [] }],
+      }),
     );
     const { result } = renderHook(() =>
       useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
@@ -910,7 +913,7 @@ describe("useMessages — WS message.created integration", () => {
     mockFetchDMMessage.mockResolvedValue(
       makeMessage({
         id: "msg-dm-remote",
-        reactions: [{ emoji: "🔥", count: 2, reactedByMe: false }],
+        reactions: [{ emoji: "🔥", count: 2, reactedByMe: false, users: [] }],
       }),
     );
     const { result } = renderHook(() =>
@@ -968,8 +971,142 @@ describe("useMessages — WS message.created integration", () => {
     );
 
     expect(result.current.state.messages[0].reactions).toEqual([
-      { emoji: "👍", count: 1, reactedByMe: false },
+      { emoji: "👍", count: 1, reactedByMe: false, users: [] },
     ]);
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+
+  // A re-delivered event must not inflate the count or list a reactor twice, and
+  // the event that follows it must still be able to take a reactor away.
+  it("converges on duplicate and superseded reaction events", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-dup",
+          reactions: [
+            {
+              emoji: "🎉",
+              count: 1,
+              reactedByMe: false,
+              users: [{ userId: "user-two", displayName: "Bruna" }],
+            },
+          ],
+        }),
+      ],
+      nextCursor: "",
+    });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const added = {
+      type: "reaction.updated" as const,
+      target_type: "channel" as const,
+      target_id: "ch-1",
+      message_id: "msg-dup",
+      reaction: {
+        message_id: "msg-dup",
+        actor_user_id: "user-three",
+        emoji: "🎉",
+        added: true,
+        reactions: [
+          {
+            emoji: "🎉",
+            count: 2,
+            users: [
+              { user_id: "user-two", display_name: "Bruna" },
+              { user_id: "user-three", display_name: "Caio" },
+            ],
+          },
+        ],
+      },
+    };
+
+    act(() => capturedOnReactionUpdated?.(added));
+    act(() => capturedOnReactionUpdated?.(added));
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      {
+        emoji: "🎉",
+        count: 2,
+        reactedByMe: false,
+        users: [
+          { userId: "user-two", displayName: "Bruna" },
+          { userId: "user-three", displayName: "Caio" },
+        ],
+      },
+    ]);
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        ...added,
+        reaction: {
+          ...added.reaction,
+          added: false,
+          reactions: [
+            { emoji: "🎉", count: 1, users: [{ user_id: "user-two", display_name: "Bruna" }] },
+          ],
+        },
+      }),
+    );
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      {
+        emoji: "🎉",
+        count: 1,
+        reactedByMe: false,
+        users: [{ userId: "user-two", displayName: "Bruna" }],
+      },
+    ]);
+  });
+
+  // The reader's own state is derived, never carried by the event: a duplicate
+  // confirmation of their own toggle must not flip it back.
+  it("keeps the reader's own state stable across a duplicated own-toggle event", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "msg-own", reactions: [] })],
+      nextCursor: "",
+    });
+    const onOwnReactionConfirmed = vi.fn();
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const own = {
+      type: "reaction.updated" as const,
+      target_type: "channel" as const,
+      target_id: "ch-1",
+      message_id: "msg-own",
+      reaction: {
+        message_id: "msg-own",
+        actor_user_id: "user-me",
+        emoji: "👍",
+        added: true,
+        reactions: [{ emoji: "👍", count: 1, users: [{ user_id: "user-me", display_name: "Eu" }] }],
+      },
+    };
+
+    act(() => capturedOnReactionUpdated?.(own));
+    act(() => capturedOnReactionUpdated?.(own));
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      {
+        emoji: "👍",
+        count: 1,
+        reactedByMe: true,
+        users: [{ userId: "user-me", displayName: "Eu" }],
+      },
+    ]);
+    // Nor may a duplicate reach the emoji history — and this reader never
+    // toggled here, so the reaction came from another session and counts for
+    // nothing on this client either way.
     expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
   });
 
@@ -1499,6 +1636,629 @@ describe("useMessages — WS message.created integration", () => {
 
 // ── Quote reply state (RF-07) ─────────────────────────────────────────────────
 
+/**
+ * Reaction reconciliation (issue #496, CQ round 4).
+ *
+ * The rule these all check is one sentence: what the reader sees is the state
+ * the server has confirmed, with every local intent still awaiting confirmation
+ * applied on top of it. An intent is one `(message, emoji)` pair — never a whole
+ * message — so confirming, failing or timing out one of them leaves the others
+ * exactly where they were.
+ */
+describe("useMessages — concurrent reaction intents", () => {
+  const messageId = "msg-r";
+
+  function ownEvent(
+    emoji: string,
+    added: boolean,
+    reactions: { emoji: string; count: number }[],
+    actor = "user-me",
+  ): WSReactionUpdatedEvent {
+    return {
+      type: "reaction.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: messageId,
+      reaction: { message_id: messageId, actor_user_id: actor, emoji, added, reactions },
+    };
+  }
+
+  function setup(reactions: Message["reactions"] = [], onOwnReactionConfirmed = vi.fn()) {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: messageId, reactions })],
+      nextCursor: "",
+    });
+    const hook = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    return { ...hook, onOwnReactionConfirmed };
+  }
+
+  function emojis(result: { current: { state: { messages: Message[] } } }): string[] {
+    return result.current.state.messages[0].reactions.map((item) => item.emoji);
+  }
+
+  const mine = (emoji: string, count = 1) => ({ emoji, count, reactedByMe: true, users: [] });
+
+  it("keeps a second pending reaction alive when the first is confirmed", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+    expect(emojis(result)).toEqual(["🎉", "🚀"]);
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🎉", true, [{ emoji: "🎉", count: 1 }])));
+    // 🎉 is confirmed; 🚀 is still an intent, so it is still drawn.
+    expect(emojis(result)).toEqual(["🎉", "🚀"]);
+
+    act(() =>
+      capturedOnReactionUpdated?.(
+        ownEvent("🚀", true, [
+          { emoji: "🎉", count: 1 },
+          { emoji: "🚀", count: 1 },
+        ]),
+      ),
+    );
+    expect(result.current.state.messages[0].reactions).toEqual([mine("🎉"), mine("🚀")]);
+    expect(onOwnReactionConfirmed.mock.calls).toEqual([["🎉"], ["🚀"]]);
+  });
+
+  it("converges when the confirmations arrive in the opposite order", async () => {
+    const { result } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🚀", true, [{ emoji: "🚀", count: 1 }])));
+    expect(emojis(result)).toEqual(["🚀", "🎉"]);
+
+    act(() =>
+      capturedOnReactionUpdated?.(
+        ownEvent("🎉", true, [
+          { emoji: "🚀", count: 1 },
+          { emoji: "🎉", count: 1 },
+        ]),
+      ),
+    );
+    expect(result.current.state.messages[0].reactions).toEqual([mine("🚀"), mine("🎉")]);
+  });
+
+  it("reverts only the reaction whose confirmation timed out", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🎉"));
+      act(() => vi.advanceTimersByTime(3_000));
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      // Only 🎉's own 8s window elapses; 🚀 was started 3s later.
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(emojis(result)).toEqual(["🚀"]);
+      expect(result.current.state.actionError).toMatch(/confirmar a reação/i);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🚀", true, [{ emoji: "🚀", count: 1 }])));
+    expect(result.current.state.messages[0].reactions).toEqual([mine("🚀")]);
+    expect(onOwnReactionConfirmed.mock.calls).toEqual([["🚀"]]);
+  });
+
+  it("keeps the surviving intent when the socket refuses the other toggle", async () => {
+    const { result } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    mockToggleReaction.mockReturnValueOnce(false);
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+
+    // 🚀 never left the client; 🎉 is untouched and still pending.
+    expect(emojis(result)).toEqual(["🎉"]);
+    expect(result.current.state.actionError).toMatch(/tempo real/i);
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🎉", true, [{ emoji: "🎉", count: 1 }])));
+    expect(result.current.state.messages[0].reactions).toEqual([mine("🎉")]);
+  });
+
+  it("reconciles a removal and an addition of different emoji", async () => {
+    const { result, onOwnReactionConfirmed } = setup([
+      { emoji: "🎉", count: 1, reactedByMe: true, users: [] },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+    expect(emojis(result)).toEqual(["🚀"]);
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🎉", false, [])));
+    // The removal is confirmed; the addition is still only an intent.
+    expect(emojis(result)).toEqual(["🚀"]);
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🚀", true, [{ emoji: "🚀", count: 1 }])));
+    expect(result.current.state.messages[0].reactions).toEqual([mine("🚀")]);
+    // A removal is not a use; only the addition counts.
+    expect(onOwnReactionConfirmed.mock.calls).toEqual([["🚀"]]);
+  });
+
+  it("lets the newest intent win when the same emoji is toggled twice", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    expect(emojis(result)).toEqual([]);
+
+    // The add lands first. It must not resurrect 🎉 against the newer intent.
+    act(() => capturedOnReactionUpdated?.(ownEvent("🎉", true, [{ emoji: "🎉", count: 1 }])));
+    expect(emojis(result)).toEqual([]);
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("🎉", false, [])));
+    expect(emojis(result)).toEqual([]);
+    // The add was never the reader's settled choice, so it is not a use.
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+
+  it("re-applies pending intents over a refetched snapshot", async () => {
+    const { result } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: messageId,
+        reactions: [{ emoji: "🎉", count: 1, reactedByMe: false, users: [] }],
+      }),
+    );
+
+    // A reaction event with no payload is the reconnect path: refetch, then
+    // reconcile against what is still in flight.
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: messageId,
+      }),
+    );
+
+    await waitFor(() => expect(emojis(result)).toEqual(["🎉", "🚀"]));
+  });
+
+  it("re-applies a pending removal over a refetched snapshot", async () => {
+    const { result } = setup([
+      { emoji: "🎉", count: 1, reactedByMe: true, users: [] },
+      { emoji: "🚀", count: 1, reactedByMe: false, users: [] },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🎉"));
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({
+        id: messageId,
+        reactions: [
+          { emoji: "🎉", count: 1, reactedByMe: true, users: [] },
+          { emoji: "🚀", count: 1, reactedByMe: false, users: [] },
+        ],
+      }),
+    );
+
+    act(() =>
+      capturedOnReactionUpdated?.({
+        type: "reaction.updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: messageId,
+      }),
+    );
+
+    await waitFor(() => expect(emojis(result)).toEqual(["🚀"]));
+  });
+});
+
+/**
+ * Seeing an event is not the same as having your own toggle confirmed
+ * (issue #496, CQ round 5).
+ *
+ * Every valid event updates what this client believes the server holds. Only an
+ * event that says back what *this reader* asked for settles their intent — and
+ * only then may the rollback timer stop and the emoji history learn anything.
+ * An event from somebody else, or a stale one of the reader's own that the
+ * newest local intent has already superseded, does neither.
+ */
+describe("useMessages — events that do not confirm the local intent", () => {
+  const messageId = "msg-c";
+
+  function event(
+    emoji: string,
+    added: boolean,
+    reactions: {
+      emoji: string;
+      count: number;
+      users?: { user_id: string; display_name: string }[];
+    }[],
+    actor: string,
+  ): WSReactionUpdatedEvent {
+    return {
+      type: "reaction.updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: messageId,
+      reaction: { message_id: messageId, actor_user_id: actor, emoji, added, reactions },
+    };
+  }
+
+  function setup(reactions: Message["reactions"] = []) {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: messageId, reactions })],
+      nextCursor: "",
+    });
+    const onOwnReactionConfirmed = vi.fn();
+    const hook = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    return { ...hook, onOwnReactionConfirmed };
+  }
+
+  const drawn = (result: { current: { state: { messages: Message[] } } }) =>
+    result.current.state.messages[0].reactions;
+
+  const other = [{ user_id: "user-two", display_name: "Bruna" }];
+
+  it("does not let another reader's addition confirm this reader's own", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      expect(drawn(result)).toEqual([{ emoji: "🚀", count: 1, reactedByMe: true, users: [] }]);
+
+      // Somebody else reacts with the same emoji while this reader waits.
+      act(() =>
+        capturedOnReactionUpdated?.(
+          event("🚀", true, [{ emoji: "🚀", count: 1, users: other }], "user-two"),
+        ),
+      );
+
+      // Server has one reactor; this reader's own toggle is still on top of it.
+      expect(drawn(result)).toEqual([
+        {
+          emoji: "🚀",
+          count: 2,
+          reactedByMe: true,
+          users: [{ userId: "user-two", displayName: "Bruna" }],
+        },
+      ]);
+      expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+
+      // The timer was never this event's to cancel, so the rollback still runs.
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Only this reader's contribution goes; the other reactor stays.
+    expect(drawn(result)).toEqual([
+      {
+        emoji: "🚀",
+        count: 1,
+        reactedByMe: false,
+        users: [{ userId: "user-two", displayName: "Bruna" }],
+      },
+    ]);
+    expect(result.current.state.actionError).toMatch(/confirmar a reação/i);
+  });
+
+  it("does not cancel a pending remove when a delayed own add arrives", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🎉"));
+      act(() => result.current.toggleReaction(messageId, "🎉"));
+      expect(drawn(result)).toEqual([]);
+
+      // The first toggle's confirmation lands late. The reader has since asked
+      // for the opposite, so this settles the server's view and nothing else.
+      act(() =>
+        capturedOnReactionUpdated?.(
+          event(
+            "🎉",
+            true,
+            [{ emoji: "🎉", count: 1, users: [{ user_id: "user-me", display_name: "Eu" }] }],
+            "user-me",
+          ),
+        ),
+      );
+
+      expect(drawn(result)).toEqual([]);
+      expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+
+      // The removal was never confirmed, so its own window still expires.
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Rolling back the removal leaves what the server actually holds.
+    expect(drawn(result)).toEqual([
+      {
+        emoji: "🎉",
+        count: 1,
+        reactedByMe: true,
+        users: [{ userId: "user-me", displayName: "Eu" }],
+      },
+    ]);
+    expect(result.current.state.actionError).toMatch(/confirmar a reação/i);
+  });
+
+  it("does not cancel a pending add when a delayed own remove arrives", async () => {
+    const { result, onOwnReactionConfirmed } = setup([
+      {
+        emoji: "🎉",
+        count: 1,
+        reactedByMe: true,
+        users: [{ userId: "user-me", displayName: "Eu" }],
+      },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🎉"));
+      act(() => result.current.toggleReaction(messageId, "🎉"));
+      expect(drawn(result)).toEqual([
+        {
+          emoji: "🎉",
+          count: 1,
+          reactedByMe: true,
+          users: [{ userId: "user-me", displayName: "Eu" }],
+        },
+      ]);
+
+      act(() => capturedOnReactionUpdated?.(event("🎉", false, [], "user-me")));
+
+      // Server says gone; the newest intent says added, and it is still drawn.
+      expect(drawn(result)).toEqual([{ emoji: "🎉", count: 1, reactedByMe: true, users: [] }]);
+      expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(drawn(result)).toEqual([]);
+  });
+
+  it("does not let another reader's removal confirm this reader's own", async () => {
+    const { result, onOwnReactionConfirmed } = setup([
+      {
+        emoji: "🚀",
+        count: 2,
+        reactedByMe: true,
+        users: [
+          { userId: "user-me", displayName: "Eu" },
+          { userId: "user-two", displayName: "Bruna" },
+        ],
+      },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      expect(drawn(result)).toEqual([
+        {
+          emoji: "🚀",
+          count: 1,
+          reactedByMe: false,
+          users: [
+            { userId: "user-me", displayName: "Eu" },
+            { userId: "user-two", displayName: "Bruna" },
+          ],
+        },
+      ]);
+
+      act(() =>
+        capturedOnReactionUpdated?.(
+          event(
+            "🚀",
+            false,
+            [{ emoji: "🚀", count: 1, users: [{ user_id: "user-me", display_name: "Eu" }] }],
+            "user-two",
+          ),
+        ),
+      );
+      expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The reader's removal was never confirmed, so it rolls back to the server's
+    // list — which no longer has the other reactor.
+    expect(drawn(result)).toEqual([
+      {
+        emoji: "🚀",
+        count: 1,
+        reactedByMe: true,
+        users: [{ userId: "user-me", displayName: "Eu" }],
+      },
+    ]);
+  });
+
+  // The other side of the rule: an event that *does* say back what was asked
+  // ends the wait, and the rollback must not fire afterwards.
+  it("stops the rollback once the matching confirmation arrives", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      act(() =>
+        capturedOnReactionUpdated?.(
+          event(
+            "🚀",
+            true,
+            [{ emoji: "🚀", count: 1, users: [{ user_id: "user-me", display_name: "Eu" }] }],
+            "user-me",
+          ),
+        ),
+      );
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(drawn(result)).toEqual([
+      {
+        emoji: "🚀",
+        count: 1,
+        reactedByMe: true,
+        users: [{ userId: "user-me", displayName: "Eu" }],
+      },
+    ]);
+    expect(result.current.state.actionError).toBeNull();
+    expect(onOwnReactionConfirmed).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops the rollback once a matching removal is confirmed, without a use", async () => {
+    const { result, onOwnReactionConfirmed } = setup([
+      { emoji: "🚀", count: 1, reactedByMe: true, users: [] },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      act(() => capturedOnReactionUpdated?.(event("🚀", false, [], "user-me")));
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(drawn(result)).toEqual([]);
+    expect(result.current.state.actionError).toBeNull();
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * What counts as a use for "Mais usados" (issue #496, CQ round 4).
+ *
+ * Only a local addition the server confirmed. Not a removal, not a redelivery of
+ * an event already acted on, not a failed attempt, and not something this reader
+ * did in another tab — the picker's history is this client's own record of what
+ * the reader reached for here.
+ */
+describe("useMessages — own reaction usage", () => {
+  const messageId = "msg-u";
+
+  function ownEvent(emoji: string, added: boolean, reactions: { emoji: string; count: number }[]) {
+    return {
+      type: "reaction.updated" as const,
+      target_type: "channel" as const,
+      target_id: "ch-1",
+      message_id: messageId,
+      reaction: {
+        message_id: messageId,
+        actor_user_id: "user-me",
+        emoji,
+        added,
+        reactions,
+      },
+    };
+  }
+
+  function setup(reactions: Message["reactions"] = []) {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [makeMessage({ id: messageId, reactions })],
+      nextCursor: "",
+    });
+    const onOwnReactionConfirmed = vi.fn();
+    const hook = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-1",
+        currentUserId: "user-me",
+        onOwnReactionConfirmed,
+      }),
+    );
+    return { ...hook, onOwnReactionConfirmed };
+  }
+
+  it("records a confirmed addition exactly once, however often it is redelivered", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+    const added = ownEvent("🚀", true, [{ emoji: "🚀", count: 1 }]);
+    act(() => capturedOnReactionUpdated?.(added));
+    act(() => capturedOnReactionUpdated?.(added));
+    act(() => capturedOnReactionUpdated?.(added));
+
+    expect(onOwnReactionConfirmed).toHaveBeenCalledTimes(1);
+    expect(onOwnReactionConfirmed).toHaveBeenCalledWith("🚀");
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "🚀", count: 1, reactedByMe: true, users: [] },
+    ]);
+  });
+
+  it("never records a removal, redelivered or not", async () => {
+    const { result, onOwnReactionConfirmed } = setup([
+      { emoji: "🚀", count: 1, reactedByMe: true, users: [] },
+    ]);
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => result.current.toggleReaction(messageId, "🚀"));
+    const removed = ownEvent("🚀", false, []);
+    act(() => capturedOnReactionUpdated?.(removed));
+    act(() => capturedOnReactionUpdated?.(removed));
+
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+    expect(result.current.state.messages[0].reactions).toEqual([]);
+  });
+
+  it("does not record an addition that never got confirmed", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    vi.useFakeTimers();
+    try {
+      act(() => result.current.toggleReaction(messageId, "🚀"));
+      act(() => vi.advanceTimersByTime(8_000));
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(result.current.state.messages[0].reactions).toEqual([]);
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+
+  // The same person, another tab. The reaction is theirs and the badge must show
+  // it, but this client's own history is a record of what was reached for *here*.
+  it("does not record a reaction this client never initiated", async () => {
+    const { result, onOwnReactionConfirmed } = setup();
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => capturedOnReactionUpdated?.(ownEvent("👍", true, [{ emoji: "👍", count: 1 }])));
+
+    expect(result.current.state.messages[0].reactions).toEqual([
+      { emoji: "👍", count: 1, reactedByMe: true, users: [] },
+    ]);
+    expect(onOwnReactionConfirmed).not.toHaveBeenCalled();
+  });
+});
+
 describe("useMessages — reply state", () => {
   it("selectReply exposes the selected message as replyTo", async () => {
     const msg = makeMessage({ id: "msg-reply-parent" });
@@ -1618,7 +2378,7 @@ describe("useMessages — message editing", () => {
   it("confirms server edit fields without clearing reactions or favorite state", async () => {
     const initial = makeMessage({
       id: "msg-edit",
-      reactions: [{ emoji: "👍", count: 2, reactedByMe: true }],
+      reactions: [{ emoji: "👍", count: 2, reactedByMe: true, users: [] }],
       isFavorited: true,
       linkSafetyState: "safe",
     });
@@ -1992,7 +2752,7 @@ describe("useMessages — message deletion", () => {
       id: "msg-delete",
       bodyText: "segredo",
       createdAt,
-      reactions: [{ emoji: "👍", count: 1, reactedByMe: true }],
+      reactions: [{ emoji: "👍", count: 1, reactedByMe: true, users: [] }],
     });
     const reply = makeMessage({
       id: "msg-reply",

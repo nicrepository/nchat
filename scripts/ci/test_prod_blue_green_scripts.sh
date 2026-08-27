@@ -658,6 +658,7 @@ cat >"$TOPOLOGY" <<TOPO
 NCHAT_PROD_HOST=nchat.example.com
 NCHAT_PROD_PUBLIC_URL=https://nchat.example.com
 NCHAT_PROD_PREVIEW_ALLOW_CIDR=198.51.100.0/24
+NCHAT_PROD_LIVEKIT_URL=wss://livekit.example.com
 NCHAT_PROD_LIVEKIT_CONNECT_SRC=wss://livekit.example.com https://livekit.example.com
 TOPO
 

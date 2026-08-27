@@ -915,8 +915,17 @@
   margin-top: 5px;
 }
 
-.chat-msg-area__reaction,
-.chat-msg-area__reaction-grid button {
+/* The badge and its tooltip share one positioned box, so the tooltip can be
+   placed against the badge without either of them affecting the message's
+   layout (issue #496). */
+.chat-msg-area__reaction-slot {
+  position: relative;
+  display: inline-flex;
+}
+
+/* The picker inside .chat-emoji-surface styles its own buttons; this is the
+   reaction badge under a message and nothing else. */
+.chat-msg-area__reaction {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -928,18 +937,118 @@
   font-weight: 500;
   cursor: pointer;
   color: var(--color-ink-2);
+  transition:
+    transform 140ms ease-out,
+    background-color 140ms ease-out,
+    border-color 140ms ease-out;
 }
 
+/* Scale only: the badge grows within its own box and never nudges the badge
+   beside it, so hovering a reaction cannot reflow the row. */
 .chat-msg-area__reaction:hover,
 .chat-msg-area__reaction:focus-visible {
   border-color: var(--color-primary-tint-strong);
   background: var(--color-primary-tint);
+  transform: scale(1.08);
 }
 
+/* Active state is a filled background *and* a heavier outline, never colour
+   alone. */
 .chat-msg-area__reaction--mine {
-  border-color: var(--color-primary-tint-strong);
+  border-color: var(--color-primary-strong);
+  border-width: 2px;
+  padding: 1px 7px;
   background: var(--color-primary-tint);
   color: var(--color-primary-strong);
+}
+
+/* Replayed by React remounting this span whenever the count changes — a
+   reaction landing, from anyone — and by nothing else. */
+.chat-msg-area__reaction-emoji {
+  display: inline-block;
+  animation: chat-reaction-pop 200ms ease-out;
+}
+
+/* A badge that has just appeared grows into place; one that is leaving shrinks
+   and fades, and is unmounted by its own animationend rather than by a timer. */
+.chat-msg-area__reaction-slot {
+  animation: chat-reaction-enter 180ms ease-out;
+}
+
+.chat-msg-area__reaction-slot--exiting {
+  animation: chat-reaction-exit 180ms ease-in forwards;
+  pointer-events: none;
+}
+
+@keyframes chat-reaction-pop {
+  0% {
+    transform: scale(1);
+  }
+  55% {
+    transform: scale(1.2);
+  }
+  80% {
+    transform: scale(0.96);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes chat-reaction-enter {
+  from {
+    transform: scale(0.82);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes chat-reaction-exit {
+  from {
+    transform: scale(1);
+    opacity: 1;
+  }
+  to {
+    transform: scale(0.84);
+    opacity: 0;
+  }
+}
+
+@keyframes chat-reaction-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+/* Who reacted. Always in the DOM as the badge's accessible description, and
+   revealed on hover or keyboard focus by this rule alone — no state, no
+   listener, and no re-render of the conversation to open it. */
+.chat-msg-area__reaction-authors {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  z-index: var(--z-overlay-emoji);
+  transform: translateX(-50%);
+  max-width: 220px;
+  width: max-content;
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  background: var(--color-ink);
+  color: var(--color-surface);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease-out;
+}
+
+.chat-msg-area__reaction-slot:hover .chat-msg-area__reaction-authors,
+.chat-msg-area__reaction-slot:focus-within .chat-msg-area__reaction-authors {
+  opacity: 1;
 }
 
 .chat-msg-area__reaction:disabled {
@@ -1131,12 +1240,14 @@
   cursor: pointer;
 }
 
-.chat-msg-area__reaction-grid {
+/*
+ * The floating shell every emoji surface is drawn in: the "Mais reações"
+ * picker over a message, and the composer's picker. Both are portalled and
+ * placed by useAnchoredPicker, so both are `fixed` and want the same frame.
+ */
+.chat-emoji-surface {
   position: fixed;
   z-index: var(--z-overlay-emoji);
-  display: grid;
-  grid-template-columns: repeat(5, 32px);
-  gap: 3px;
   padding: 7px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -1144,18 +1255,321 @@
   box-shadow: var(--shadow-md);
 }
 
-.chat-msg-area__reaction-grid button {
-  justify-content: center;
-  border: 0;
-  min-width: 30px;
-  min-height: 30px;
-  padding: 2px;
-  font-size: 17px;
+/* ── Emoji picker (issue #496) ───────────────────────────────────────────────── */
+
+/*
+ * Proportions validated in Figma against NChat's own tokens: 336px wide, an
+ * eight-column grid of 38px cells with a 22px glyph, and a single row of ten
+ * category glyphs. A nine-column grid at 34px was tried and read as cramped.
+ */
+.chat-emoji-picker {
+  display: flex;
+  flex-direction: column;
+  width: min(21rem, calc(100vw - 24px));
+  max-height: min(24rem, calc(100vh - 96px));
+  animation: chat-emoji-picker-in 150ms ease-out;
 }
 
-.chat-msg-area__reaction-grid button:hover,
-.chat-msg-area__reaction-grid button:focus-visible {
+.chat-emoji-picker__search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  transition: border-color 140ms ease-out;
+}
+
+.chat-emoji-picker__search:focus-within {
+  border-color: var(--color-primary);
+}
+
+.chat-emoji-picker__search-icon {
+  font-size: 17px;
+  color: var(--color-muted);
+}
+
+.chat-emoji-picker__search input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font-size: 13px;
+}
+
+.chat-emoji-picker__search input:focus {
+  outline: none;
+}
+
+/* Ten glyphs, one row, no scrollbar: the bar fits every width the picker is
+   offered, which is what the text pills it replaced could not do. */
+.chat-emoji-picker__tabs {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 0;
+  margin: 6px 0 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.chat-emoji-picker__tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 30px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: transparent;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease-out,
+    transform 140ms ease-out;
+}
+
+.chat-emoji-picker__tab:hover,
+.chat-emoji-picker__tab:focus-visible {
   background: var(--color-primary-tint);
+}
+
+/* The active category is marked by a filled ground *and* an underline, so it
+   survives a colour-blind reader and a high-contrast theme. */
+.chat-emoji-picker__tab[aria-selected="true"] {
+  background: var(--color-primary-tint);
+  border-bottom-color: var(--color-primary-strong);
+}
+
+.chat-emoji-picker__sections {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-top: 6px;
+}
+
+.chat-emoji-picker__section-title {
+  margin: 6px 0 2px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-muted);
+}
+
+/* Eight columns, matching gridColumns in EmojiPicker.tsx: the arrow keys move
+   by exactly one row. */
+.chat-emoji-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 0;
+}
+
+/*
+ * A grid item's automatic minimum size is its content, so a wide emoji glyph —
+ * and how wide one is depends on the reader's own font — pushes its column past
+ * the 1fr it was given, and eight of them push the last column off the picker.
+ * On a 390px viewport that clipped the eighth emoji of every row. `1fr` only
+ * caps a column once its item is allowed to be narrower than its content.
+ */
+.chat-emoji-picker__grid > .chat-emoji-picker__emoji {
+  /*
+   * The column decides the cell, not the glyph.
+   *
+   * A grid item's automatic minimum size is its content, and how wide an emoji
+   * glyph is depends on the reader's own font; sizing the cell by `aspect-ratio`
+   * alone let a taller line box make it wider than the 1fr column it sits in,
+   * and on a 390px viewport the eighth emoji of every row was clipped. Taking
+   * the width from the column and the height from the width instead keeps the
+   * cell square at whatever width eight columns work out to.
+   */
+  min-width: 0;
+  width: 100%;
+  aspect-ratio: 1;
+}
+
+.chat-emoji-tone__option {
+  width: 38px;
+  aspect-ratio: 1;
+}
+
+.chat-emoji-picker__emoji,
+.chat-emoji-tone__option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  /* The UA gives a button 6px of side padding, which on a mobile viewport made
+     the cell wider than the column it sits in. The glyph is centred by flex, so
+     there is nothing for the padding to do. */
+  padding: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 140ms ease-out,
+    background-color 140ms ease-out;
+}
+
+.chat-emoji-picker__emoji:hover,
+.chat-emoji-picker__emoji:focus-visible,
+.chat-emoji-tone__option:hover,
+.chat-emoji-tone__option:focus-visible {
+  background: var(--color-primary-tint);
+  transform: scale(1.12);
+}
+
+/* The pop on a deliberate choice. Applied by the parent for one animation
+   frame, so it plays when an emoji is picked and never on a re-render. */
+.chat-emoji-picker__emoji:active {
+  animation: chat-emoji-pop 200ms ease-out;
+}
+
+.chat-emoji-picker__status {
+  margin: 10px 4px;
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
+
+.chat-emoji-picker__retry {
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 140ms ease-out;
+}
+
+.chat-emoji-picker__retry:hover,
+.chat-emoji-picker__retry:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+/* ── Contextual skin-tone palette (issue #496) ───────────────────────────────── */
+
+.chat-emoji-tone {
+  position: fixed;
+  z-index: var(--z-overlay-mention);
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+  animation: chat-emoji-tone-in 130ms ease-out;
+}
+
+.chat-emoji-tone__option {
+  min-height: 34px;
+  font-size: 20px;
+}
+
+/* The tone in use is marked with a ring rather than only a tint, so "current"
+   is legible without colour. */
+.chat-emoji-tone__option[aria-current="true"] {
+  background: var(--color-primary-tint);
+  outline: 2px solid var(--color-primary-strong);
+  outline-offset: -2px;
+}
+
+@keyframes chat-emoji-picker-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes chat-emoji-tone-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes chat-emoji-pop {
+  0% {
+    transform: scale(1);
+  }
+  55% {
+    transform: scale(1.22);
+  }
+  80% {
+    transform: scale(0.97);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* A coarse pointer has no hover to aim with, so the target grows instead. */
+@media (pointer: coarse) {
+  .chat-emoji-picker__emoji,
+  .chat-emoji-tone__option {
+    min-height: 44px;
+  }
+
+  .chat-emoji-picker__tab {
+    height: 38px;
+  }
+}
+
+/* Movement is decoration here: every state it expresses is also expressed by
+   colour, weight, outline and the accessible name, so removing it costs a
+   reader nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__reaction,
+  .chat-msg-area__reaction-authors,
+  .chat-emoji-picker__emoji,
+  .chat-emoji-picker__retry,
+  .chat-emoji-picker__search,
+  .chat-emoji-picker__tab,
+  .chat-emoji-tone__option {
+    transition-duration: 1ms;
+  }
+
+  .chat-msg-area__reaction:hover,
+  .chat-msg-area__reaction:focus-visible,
+  .chat-emoji-picker__emoji:hover,
+  .chat-emoji-picker__emoji:focus-visible,
+  .chat-emoji-tone__option:hover,
+  .chat-emoji-tone__option:focus-visible {
+    transform: none;
+  }
+
+  /* Movement goes; the states these animations expressed are still expressed by
+     colour, weight, outline and the accessible name. The exit keeps only its
+     fade, because the badge still has to finish leaving before it is unmounted
+     — animationend is what removes it. */
+  .chat-msg-area__reaction-emoji,
+  .chat-emoji-picker__emoji:active,
+  .chat-emoji-picker,
+  .chat-emoji-tone {
+    animation: none;
+  }
+
+  .chat-msg-area__reaction-slot--exiting {
+    animation: chat-reaction-fade-out 1ms linear forwards;
+  }
 }
 
 /* ── Message grouping (same sender, same minute) ─────────────────────────────── */
@@ -1864,41 +2278,6 @@
 .composer-toolbar__btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
-}
-
-/* Emoji picker */
-.composer-toolbar__emoji-picker {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
-  background: var(--color-surface, #fff);
-  border: 1px solid var(--color-border, #e8e3f0);
-  border-radius: var(--radius-lg, 14px);
-  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
-  padding: 8px;
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 2px;
-  width: 184px;
-  z-index: var(--z-overlay-emoji, 200);
-}
-
-.composer-toolbar__emoji-btn {
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-sm, 6px);
-  width: 32px;
-  height: 32px;
-  font-size: 17px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: background 0.12s;
-}
-
-.composer-toolbar__emoji-btn:hover {
-  background: var(--color-surface-2, #faf8fd);
 }
 
 /* ── Message editing and history (RF-13) ─────────────────────────────────── */

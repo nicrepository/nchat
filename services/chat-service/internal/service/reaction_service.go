@@ -9,23 +9,19 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-var allowedReactionEmojiList = []string{
+// quickReactionEmojiList is the small, product-curated row offered above a
+// message before anyone opens the full picker (issue #496). It is a shortcut,
+// not a policy: what a reaction may be is decided by the embedded Unicode
+// catalog, and this list is a subset of it.
+var quickReactionEmojiList = []string{
 	"👍", "❤️", "😂", "🎉", "😮", "😢", "👎", "🔥", "🙌", "👏",
 	"✅", "👀", "🚀", "💯", "😍", "🤔", "🙏", "💪", "🤝", "😄",
 }
 
-var allowedReactionEmojis = func() map[string]struct{} {
-	allowed := make(map[string]struct{}, len(allowedReactionEmojiList))
-	for _, emoji := range allowedReactionEmojiList {
-		allowed[emoji] = struct{}{}
-	}
-	return allowed
-}()
-
-// AllowedReactionEmojis returns a copy so callers cannot mutate validation
-// policy shared by the WebSocket handler and the frontend configuration route.
-func AllowedReactionEmojis() []string {
-	return append([]string(nil), allowedReactionEmojiList...)
+// QuickReactionEmojis returns a copy so callers cannot mutate the row shared by
+// the frontend configuration route.
+func QuickReactionEmojis() []string {
+	return append([]string(nil), quickReactionEmojiList...)
 }
 
 type ToggleReactionInput struct {
@@ -48,7 +44,7 @@ func (s *ReactionService) ToggleReaction(ctx context.Context, input ToggleReacti
 	if input.WorkspaceID == "" || input.UserID == "" || input.MessageID == "" {
 		return storage.ToggleReactionResult{}, fmt.Errorf("%w: workspace, user and message are required", domain.ErrInvalidInput)
 	}
-	if _, ok := allowedReactionEmojis[input.Emoji]; !ok {
+	if !IsAllowedReactionEmoji(input.Emoji) {
 		return storage.ToggleReactionResult{}, fmt.Errorf("%w: unsupported emoji", domain.ErrInvalidInput)
 	}
 	return s.reactions.ToggleReaction(ctx, storage.ToggleReactionInput{

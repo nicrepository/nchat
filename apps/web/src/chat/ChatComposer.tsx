@@ -10,6 +10,7 @@
  */
 
 import { EditorContent } from "@tiptap/react";
+import type { Editor } from "@tiptap/core";
 import {
   useEffect,
   useRef,
@@ -17,14 +18,20 @@ import {
   type ChangeEvent,
   type DragEvent,
   type KeyboardEvent,
+  type RefObject,
 } from "react";
 import type { UploadProgress } from "../lib/api";
-import { useAttachmentUpload, type AttachmentUploadTarget } from "./useAttachmentUpload";
+import {
+  useAttachmentUpload,
+  type AttachmentUploadItem,
+  type AttachmentUploadState,
+  type AttachmentUploadTarget,
+} from "./useAttachmentUpload";
 import { useVoiceRecorder } from "./useVoiceRecorder";
 import VoiceRecorderPanel from "./VoiceRecorderPanel";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
-import ComposerToolbar from "./ComposerToolbar";
+import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
 import type { CodecFormat } from "./tiptapSerializer";
 import type { Message, MessageBodyFormat } from "./chatTypes";
@@ -101,6 +108,11 @@ export interface ChatComposerProps {
    * typing.start, nothing at all).
    */
   onActivity?: (hasContent: boolean) => void;
+  /**
+   * The reader's shared emoji history, lent to the toolbar's picker (#496).
+   * Absent, the picker still opens — it simply offers no "Recentes".
+   */
+  emoji?: ComposerEmojiOptions;
 }
 
 export interface ComposerReplyPreview {
@@ -118,11 +130,11 @@ export type PendingReferencePreview =
 
 function ComposerReference({
   preview,
-  targetLabel,
+  targetLabel = "Conversa",
   onCancel,
 }: {
   preview: PendingReferencePreview;
-  targetLabel: string;
+  targetLabel?: string;
   onCancel?: () => void;
 }) {
   if (preview.status === "idle") return null;
@@ -168,31 +180,480 @@ function ComposerReference({
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
+/** The upload panel's cap on how many files one message may carry. */
+const maxComposerFiles = 10;
+
+/**
+ * The message being replied to, above the editor. Extracted from ChatComposer
+ * with the upload panel and the attach button: the composer's own logic is the
+ * editor, the send and the drop zone, and it was carrying three unrelated
+ * presentational trees that made it unreadable and pushed it far past the
+ * complexity gate.
+ */
+function ComposerReplyQuote({
+  preview,
+  onCancel,
+}: {
+  preview: ComposerReplyPreview | null | undefined;
+  onCancel?: () => void;
+}) {
+  if (!preview) return null;
+  return (
+    <div className="chat-msg-area__composer-quote" data-testid="chat-composer-quote">
+      <div className="chat-msg-area__composer-quote-body">
+        <div className="chat-msg-area__quote-author">{preview.authorLabel}</div>
+        <div className="chat-msg-area__quote-excerpt">
+          {preview.isRemoved ? (
+            "Mensagem original indisponível."
+          ) : (
+            <RichTextRenderer text={preview.bodyText} bodyFormat={preview.bodyFormat} />
+          )}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="chat-msg-area__composer-quote-close"
+        aria-label="Cancelar resposta"
+        onClick={onCancel}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          close
+        </span>
+      </button>
+    </div>
+  );
+}
+
+/** What one queued file is doing, in the reader's words. */
+function uploadStateLabel(item: AttachmentUploadItem): string {
+  if (item.status === "queued") return "Aguardando envio";
+  if (item.status === "uploading") {
+    return `Enviando arquivo…${item.progress ? ` ${uploadPercent(item.progress)}%` : ""}`;
+  }
+  if (item.status === "success") return "Pronto para enviar";
+  return item.error ?? "";
+}
+
+function ComposerUploadItem({
+  item,
+  upload,
+  alone,
+}: {
+  item: AttachmentUploadItem;
+  upload: AttachmentUploadState;
+  /** The only file in the panel; its labels then need no file name to tell it apart. */
+  alone: boolean;
+}) {
+  return (
+    <div
+      className="chat-msg-area__composer-upload-item"
+      data-testid={item.status === "success" ? "chat-composer-pending-attachment" : undefined}
+    >
+      <span className="chat-msg-area__composer-upload-icon" aria-hidden="true">
+        <span className="material-symbols-outlined">draft</span>
+      </span>
+      <div className="chat-msg-area__composer-upload-body">
+        <span className="chat-msg-area__composer-upload-name" title={item.file.name}>
+          {item.file.name}
+        </span>
+        <span
+          className={`chat-msg-area__composer-upload-state chat-msg-area__composer-upload-state--${item.status}`}
+        >
+          {uploadStateLabel(item)}
+        </span>
+        <span className="chat-msg-area__composer-upload-size">
+          {formatFileSize(item.file.size)}
+        </span>
+        {item.status === "uploading" && item.progress && (
+          <progress
+            className="chat-msg-area__composer-progress"
+            data-testid="chat-composer-upload-progress"
+            aria-label={alone ? "Progresso do envio" : `Progresso do envio de ${item.file.name}`}
+            value={item.progress.loaded}
+            max={item.progress.total}
+          />
+        )}
+        {item.status === "failed" && (
+          <button
+            type="button"
+            className="chat-msg-area__composer-upload-retry"
+            onClick={() => upload.retry(item.localId)}
+          >
+            Tentar novamente
+          </button>
+        )}
+      </div>
+      <button
+        type="button"
+        className="chat-msg-area__composer-quote-close"
+        aria-label={alone ? "Remover anexo" : `Remover anexo ${item.file.name}`}
+        data-testid="chat-composer-remove-attachment"
+        onClick={() => upload.remove(item.localId)}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          close
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function ComposerUploadHeader({
+  count,
+  total,
+}: {
+  count: number;
+  /** Aggregate progress, shown only when there is more than one file to total. */
+  total: UploadProgress | null;
+}) {
+  return (
+    <div className="chat-msg-area__composer-upload-header">
+      <span className="material-symbols-outlined" aria-hidden="true">
+        attach_file
+      </span>
+      <strong>{count === 1 ? "1 arquivo anexado" : `${count} arquivos anexados`}</strong>
+      {total && count > 1 && (
+        <span className="chat-msg-area__composer-upload-total">
+          {uploadPercent(total)}% no total
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ComposerUploadPanel({
+  upload,
+  dragActive,
+}: {
+  upload: AttachmentUploadState;
+  dragActive: boolean;
+}) {
+  // Nothing chosen, nothing being dragged, nothing to say: no panel at all.
+  if (upload.items.length === 0 && !dragActive && !upload.notice) return null;
+  const alone = upload.items.length === 1;
+  const total = upload.aggregateProgress;
+  return (
+    <div
+      className="chat-msg-area__composer-upload"
+      data-testid="chat-composer-upload-status"
+      role={upload.status === "failed" ? "alert" : "status"}
+    >
+      <ComposerUploadHeader count={upload.items.length} total={total} />
+      {dragActive && upload.status === "idle" && (
+        <span className="chat-msg-area__composer-upload-notice">Solte os arquivos aqui.</span>
+      )}
+      {upload.notice && (
+        <span className="chat-msg-area__composer-upload-notice" role="status">
+          {upload.notice}
+        </span>
+      )}
+      <div className="chat-msg-area__composer-upload-list">
+        {upload.items.map((item) => (
+          <ComposerUploadItem key={item.localId} item={item} upload={upload} alone={alone} />
+        ))}
+      </div>
+      {total && !alone && (
+        <progress
+          className="chat-msg-area__composer-progress chat-msg-area__composer-progress--total"
+          aria-label="Progresso total dos anexos"
+          value={total.loaded}
+          max={total.total}
+        />
+      )}
+    </div>
+  );
+}
+
+function ComposerAttachButton({
+  inputRef,
+  enabled,
+  onPick,
+}: {
+  inputRef: RefObject<HTMLInputElement | null>;
+  enabled: boolean;
+  onPick: (event: ChangeEvent<HTMLInputElement>) => void;
+}) {
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        className="chat-msg-area__composer-file-input"
+        data-testid="chat-composer-file-input"
+        aria-label="Escolher arquivo para anexar"
+        hidden
+        onChange={onPick}
+      />
+      <button
+        type="button"
+        className="composer-toolbar__btn"
+        aria-label="Anexar arquivo"
+        disabled={!enabled}
+        data-testid="chat-composer-attach-btn"
+        onClick={() => inputRef.current?.click()}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+          attach_file
+        </span>
+      </button>
+    </>
+  );
+}
+
+/**
+ * Taking files into the composer — from the file picker, and from a drag.
+ *
+ * One place decides whether a file may be taken at all, so the picker and the
+ * drop zone can never disagree, and ChatComposer is left with the editor and
+ * the send rather than with four drag handlers.
+ *
+ * `interceptEnabled` and `acceptEnabled` are deliberately separate (issue
+ * #670 code review): a voice recording must not accept a dropped file, but a
+ * drag over the composer still has to be prevented from turning into the
+ * browser's own file-open navigation. So while recording, a drag is still
+ * intercepted — `preventDefault()` still runs — but never shown as an active
+ * drop target and never handed to `selectFiles`. Outside of a recording the
+ * two always agree, which is what keeps every other caller of this hook
+ * unaffected.
+ */
+function useComposerDropZone(
+  interceptEnabled: boolean,
+  acceptEnabled: boolean,
+  selectFiles: (files: Iterable<File>) => void,
+) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [active, setActive] = useState(false);
+
+  const accept = (files: Iterable<File> | undefined) => {
+    if (acceptEnabled && files) selectFiles(files);
+  };
+
+  // Only a drag that actually carries files is intercepted. A text drag, or a
+  // drag from inside the editor, keeps its default browser behaviour.
+  const hasFiles = (event: DragEvent<HTMLDivElement>) =>
+    interceptEnabled && Array.from(event.dataTransfer?.types ?? []).includes("Files");
+
+  return {
+    inputRef,
+    active,
+    onPick: (event: ChangeEvent<HTMLInputElement>) => {
+      accept(event.target.files ?? undefined);
+      // Clearing the value is what lets the same file be chosen again after a
+      // failure: without it the input reports no change and fires nothing.
+      event.target.value = "";
+    },
+    onDragOver: (event: DragEvent<HTMLDivElement>) => {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      // Only the *visual* affordance is conditional on acceptance: a user must
+      // never be shown a drop target that a recording is about to ignore.
+      if (!acceptEnabled) return;
+      setActive(true);
+    },
+    // A dragleave also fires every time the pointer crosses from the box into
+    // one of its children — the quote, the editor, the toolbar. Ending the drag
+    // state there would flicker the outline on each internal boundary, so only
+    // a leave that really exits the composer counts. A null relatedTarget
+    // (leaving the window, or a drop) is outside by definition.
+    onDragLeave: (event: DragEvent<HTMLDivElement>) => {
+      const next = event.relatedTarget;
+      if (next instanceof Node && event.currentTarget.contains(next)) return;
+      setActive(false);
+    },
+    onDrop: (event: DragEvent<HTMLDivElement>) => {
+      if (!hasFiles(event)) return;
+      // Prevented whenever this composer could in principle handle the drop —
+      // recording or not — so the browser never navigates away to the dropped
+      // file. `setActive(false)` is unconditional for the same reason:
+      // nothing must be left signalling an accepted drop that a recording
+      // silently ignored.
+      event.preventDefault();
+      setActive(false);
+      accept(event.dataTransfer.files ?? undefined);
+    },
+  };
+}
+
+/**
+ * The editor and the placeholder drawn behind it.
+ *
+ * TipTap's own placeholder extension is not used: an empty list item is still
+ * an empty document to it, and the hint would sit on top of the bullet the
+ * reader just created.
+ */
+function ComposerEditor({ editor, placeholder }: { editor: Editor | null; placeholder: string }) {
+  const empty = editor?.isEmpty && !editor.isActive("listItem");
+  return (
+    <div className="chat-msg-area__composer-editor-wrap">
+      {empty && (
+        <div className="chat-msg-area__composer-placeholder" aria-hidden="true">
+          {placeholder}
+        </div>
+      )}
+      <EditorContent editor={editor} />
+    </div>
+  );
+}
+
+interface ComposerAttachOptions {
+  inputRef: RefObject<HTMLInputElement | null>;
+  enabled: boolean;
+  onPick: (event: ChangeEvent<HTMLInputElement>) => void;
+}
+
+/**
+ * The voice-record affordance (issue #670). `disabled` already folds in
+ * every reason recording may not start right now — no destination, the
+ * composer disabled, an upload in flight, or an attachment already sitting
+ * in the composer — so ComposerBar itself never has to know any of those
+ * rules.
+ */
+interface ComposerVoiceOptions {
+  disabled: boolean;
+  /** Explains a disabled state beyond the button's own label, e.g. "remove the attachment first". */
+  title?: string;
+  onStart: () => void;
+}
+
+/** The row under the editor: formatting, emoji, attachment, voice, send. */
+function ComposerBar({
+  editor,
+  disabled,
+  emoji,
+  pickerOpen,
+  onPickerOpenChange,
+  attach,
+  voice,
+  canSend,
+  onSend,
+}: {
+  editor: Editor | null;
+  disabled: boolean;
+  emoji?: ComposerEmojiOptions;
+  pickerOpen: boolean;
+  onPickerOpenChange: (open: boolean) => void;
+  /** Absent when this composer has nowhere to put a file. */
+  attach: ComposerAttachOptions | null;
+  /** Absent when this composer has no destination, or the browser cannot record. */
+  voice: ComposerVoiceOptions | null;
+  canSend: boolean;
+  onSend: () => Promise<unknown>;
+}) {
+  return (
+    <div className="chat-msg-area__composer-bar">
+      <ComposerToolbar
+        editor={editor}
+        disabled={disabled}
+        emoji={emoji}
+        pickerOpen={pickerOpen}
+        onPickerOpenChange={onPickerOpenChange}
+      />
+      {attach && <ComposerAttachButton {...attach} />}
+      {voice && (
+        <button
+          type="button"
+          className="composer-toolbar__btn"
+          aria-label="Gravar mensagem de voz"
+          title={voice.title}
+          disabled={voice.disabled}
+          data-testid="chat-composer-record-btn"
+          onClick={voice.onStart}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+            mic
+          </span>
+        </button>
+      )}
+      <button
+        type="button"
+        className="chat-msg-area__send-btn"
+        disabled={!canSend}
+        aria-label="Enviar mensagem"
+        onClick={() => void onSend()}
+        data-testid="chat-send-btn"
+      >
+        <IconSend />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * An attachment is content, so a composer holding one may send an empty
+ * document — but not while its own upload is still running.
+ */
+function hasSendableAttachment(upload: AttachmentUploadState): boolean {
+  return !upload.busy && upload.items.some((item) => item.attachment !== null);
+}
+
+/** The attach affordance, or nothing when this composer has nowhere to put a file. */
+function attachOptions(
+  enabled: boolean,
+  upload: AttachmentUploadState,
+  drop: { inputRef: RefObject<HTMLInputElement | null>; onPick: ComposerAttachOptions["onPick"] },
+): ComposerAttachOptions | null {
+  if (!enabled) return null;
+  return {
+    inputRef: drop.inputRef,
+    onPick: drop.onPick,
+    enabled: upload.items.length < maxComposerFiles,
+  };
+}
+
+/**
+ * The voice-record affordance, or nothing when this composer has no
+ * destination or the browser offers no MediaRecorder format the backend
+ * accepts (issue #670).
+ *
+ * A pending/ready attachment disables it rather than hiding it: the reader
+ * should see *why* recording is unavailable (the button's own `title`) and
+ * not wonder where it went, and it must never be combined implicitly with
+ * what is already in the composer.
+ */
+function voiceOptions(
+  hasDestination: boolean,
+  supported: boolean,
+  attachEnabled: boolean,
+  uploading: boolean,
+  hasComposerAttachments: boolean,
+  onStart: () => void,
+): ComposerVoiceOptions | null {
+  if (!hasDestination || !supported) return null;
+  return {
+    disabled: !attachEnabled || uploading || hasComposerAttachments,
+    title: hasComposerAttachments
+      ? "Remova os anexos para gravar uma mensagem de voz."
+      : undefined,
+    onStart,
+  };
+}
+
 export default function ChatComposer({
   placeholder,
   channelId,
   bodyFormat,
-  disabled = false,
-  replyPreview = null,
+  disabled,
+  replyPreview,
   onCancelReply,
   referencePreview = { status: "idle" },
-  referenceTargetLabel = "Conversa",
+  referenceTargetLabel,
   onCancelReference,
   onSend,
-  uploadTarget = null,
-  attachmentLimits = {
-    maxUploadBytes: null,
-    maxFiles: 1,
-    maxBytes: Number.MAX_SAFE_INTEGER,
-  },
+  uploadTarget,
+  attachmentLimits,
   onAttachmentUploaded,
   onActivity,
+  emoji,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const [dragActive, setDragActive] = useState(false);
+  // A picker left hanging over a sent message is noise. Closing on a confirmed
+  // send is the only case the toolbar cannot see for itself; a change of
+  // conversation needs no code at all, because ChatMessageArea keys this
+  // composer by target and the whole subtree — picker included — is remounted.
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
-  const attachEnabled = uploadTarget !== null && !disabled;
+  const attachEnabled = Boolean(uploadTarget) && !disabled;
   const uploading = upload.busy;
   // Whether any attachment — queued, uploading, ready or even failed-but-not-
   // dismissed — is currently sitting in the composer. `upload.items` is the
@@ -205,8 +666,11 @@ export default function ChatComposer({
   // handleComposerSend below for why an attachment-only send is already the
   // composer's normal shape.
   const recorder = useVoiceRecorder({
-    target: uploadTarget,
-    maxUploadBytes: attachmentLimits.maxUploadBytes,
+    // Both props are optional on ChatComposerProps and neither is defaulted
+    // in the destructuring above (issue #682 removed the old defaults), so
+    // nullish coalescing here is load-bearing, not defensive style.
+    target: uploadTarget ?? null,
+    maxUploadBytes: attachmentLimits?.maxUploadBytes ?? null,
     onUploaded: async (attachmentId) => {
       const result = await onSend("", [attachmentId]);
       return result.status === "sent";
@@ -236,7 +700,10 @@ export default function ChatComposer({
       body,
       pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
     );
-    if (result.status === "sent") upload.resetAfterPublish();
+    if (result.status === "sent") {
+      upload.resetAfterPublish();
+      setEmojiPickerOpen(false);
+    }
     return result;
   };
 
@@ -247,7 +714,7 @@ export default function ChatComposer({
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
-    canSendEmpty: pendingAttachments.length > 0 && !uploading,
+    canSendEmpty: hasSendableAttachment(upload),
     onSend: handleComposerSend,
     onActivity,
   });
@@ -255,65 +722,23 @@ export default function ChatComposer({
   // Whether a new attachment may be taken at all right now. A voice
   // recording is deliberately never combined with an attachment (issue
   // #670): the picker and the attach button already disappear while
-  // `recording` (the whole toolbar row is hidden), and this is the same
-  // rule extended to the one entry point that stays reachable regardless —
-  // the composer box's own drag-and-drop surface, bound below whether or
-  // not a recording is in progress.
+  // `recording` (the whole bar is hidden — see the render below), and this
+  // is the same rule extended to the one entry point that stays reachable
+  // regardless of that: the composer box's own drag-and-drop surface, bound
+  // below whether or not a recording is in progress. `interceptEnabled`
+  // (passed as `attachEnabled` below) stays unconditional so a drag over the
+  // composer during a recording is still neutralised rather than falling
+  // through to the browser's own file-open navigation.
   const canAcceptAttachments = attachEnabled && !recording;
+  const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
+  const activeEditor = editor ?? null;
 
-  // Both entry points funnel here, so there is exactly one place that decides
-  // whether a file may be taken and exactly one validation path behind it.
-  const acceptFiles = (files: Iterable<File> | undefined) => {
-    if (!canAcceptAttachments || !files) return;
-    upload.selectFiles(files);
-  };
-
-  const handlePickerChange = (event: ChangeEvent<HTMLInputElement>) => {
-    acceptFiles(event.target.files ?? undefined);
-    // Clearing the value is what lets the same file be chosen again after a
-    // failure: without it the input reports no change and fires nothing.
-    event.target.value = "";
-  };
-
-  // Only a drag that actually carries files is intercepted. A text drag, or a
-  // drag from inside the editor, keeps its default browser behaviour.
-  const dragHasFiles = (event: DragEvent<HTMLDivElement>) =>
-    Array.from(event.dataTransfer?.types ?? []).includes("Files");
-
-  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
-    if (!attachEnabled || !dragHasFiles(event)) return;
-    // Prevented whenever this composer could in principle handle the drag —
-    // recording or not — so the browser never takes over navigation to the
-    // dragged file. Only the *visual* affordance below is conditional on
-    // recording: a user must never be shown a drop target that a recording
-    // is about to make ignore the drop.
-    event.preventDefault();
-    if (!canAcceptAttachments) return;
-    setDragActive(true);
-  };
-
-  // A dragleave also fires every time the pointer crosses from the box into one
-  // of its children — the quote, the editor, the toolbar. Ending the drag state
-  // there would flicker the outline on each internal boundary, so only a leave
-  // that really exits the composer counts. A null relatedTarget (leaving the
-  // window, or a drop) is outside by definition.
-  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
-    const next = event.relatedTarget;
-    if (next instanceof Node && event.currentTarget.contains(next)) return;
-    setDragActive(false);
-  };
-
-  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
-    if (!attachEnabled || !dragHasFiles(event)) return;
-    // Prevented whenever this composer could in principle handle the drop —
-    // recording or not — so the browser never navigates away to the dropped
-    // file. `setDragActive(false)` is unconditional for the same reason:
-    // nothing must be left signalling an accepted drop that a recording
-    // silently ignored.
-    event.preventDefault();
-    setDragActive(false);
-    if (!canAcceptAttachments) return;
-    acceptFiles(event.dataTransfer.files ?? undefined);
+  const startRecording = () => {
+    // A picker left open over a recording panel is the same noise a picker
+    // left open over a sent message would be, and recording replaces the bar
+    // the picker lives in regardless.
+    setEmojiPickerOpen(false);
+    recorder.start();
   };
 
   useEffect(() => {
@@ -333,239 +758,48 @@ export default function ChatComposer({
   return (
     <div className="chat-msg-area__composer">
       <div
-        className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}${dragActive ? " chat-msg-area__composer-box--drag" : ""}`}
+        className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}${drop.active ? " chat-msg-area__composer-box--drag" : ""}`}
         onKeyDownCapture={handleKeyDownCapture}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
+        onDragOver={drop.onDragOver}
+        onDragLeave={drop.onDragLeave}
+        onDrop={drop.onDrop}
         data-testid="chat-composer-box"
       >
-        {replyPreview && (
-          <div className="chat-msg-area__composer-quote" data-testid="chat-composer-quote">
-            <div className="chat-msg-area__composer-quote-body">
-              <div className="chat-msg-area__quote-author">{replyPreview.authorLabel}</div>
-              <div className="chat-msg-area__quote-excerpt">
-                {replyPreview.isRemoved ? (
-                  "Mensagem original indisponível."
-                ) : (
-                  <RichTextRenderer
-                    text={replyPreview.bodyText}
-                    bodyFormat={replyPreview.bodyFormat}
-                  />
-                )}
-              </div>
-            </div>
-            <button
-              type="button"
-              className="chat-msg-area__composer-quote-close"
-              aria-label="Cancelar resposta"
-              onClick={onCancelReply}
-            >
-              <span className="material-symbols-outlined" aria-hidden="true">
-                close
-              </span>
-            </button>
-          </div>
-        )}
+        <ComposerReplyQuote preview={replyPreview} onCancel={onCancelReply} />
         <ComposerReference
           preview={referencePreview}
           targetLabel={referenceTargetLabel}
           onCancel={onCancelReference}
         />
-        {recording && <VoiceRecorderPanel recorder={recorder} />}
-        <div
-          className="chat-msg-area__composer-editor-wrap"
-          hidden={recording}
-        >
-          {editor?.isEmpty && !editor.isActive("listItem") && (
-            <div className="chat-msg-area__composer-placeholder" aria-hidden="true">
-              {placeholder}
-            </div>
-          )}
-          <EditorContent editor={editor} />
-        </div>
-        {!recording && uploadTarget && (upload.items.length > 0 || dragActive || upload.notice) && (
-          <div
-            className="chat-msg-area__composer-upload"
-            data-testid="chat-composer-upload-status"
-            role={upload.status === "failed" ? "alert" : "status"}
-          >
-            <div className="chat-msg-area__composer-upload-header">
-              <span className="material-symbols-outlined" aria-hidden="true">
-                attach_file
-              </span>
-              <strong>
-                {upload.items.length === 1
-                  ? "1 arquivo anexado"
-                  : `${upload.items.length} arquivos anexados`}
-              </strong>
-              {upload.aggregateProgress && upload.items.length > 1 && (
-                <span className="chat-msg-area__composer-upload-total">
-                  {uploadPercent(upload.aggregateProgress)}% no total
-                </span>
+        {recording ? (
+          <VoiceRecorderPanel recorder={recorder} />
+        ) : (
+          <>
+            <ComposerEditor editor={activeEditor} placeholder={placeholder} />
+            {/* No target, no items and no drag to report: the panel draws nothing. */}
+            <ComposerUploadPanel upload={upload} dragActive={drop.active} />
+            <ComposerBar
+              editor={activeEditor}
+              disabled={disabled || sending}
+              emoji={emoji}
+              pickerOpen={emojiPickerOpen}
+              onPickerOpenChange={setEmojiPickerOpen}
+              attach={attachOptions(attachEnabled, upload, drop)}
+              voice={voiceOptions(
+                Boolean(uploadTarget),
+                recorder.supported,
+                attachEnabled,
+                uploading,
+                hasComposerAttachments,
+                startRecording,
               )}
-            </div>
-            {dragActive && upload.status === "idle" && (
-              <span className="chat-msg-area__composer-upload-notice">Solte os arquivos aqui.</span>
-            )}
-            {upload.notice && (
-              <span className="chat-msg-area__composer-upload-notice" role="status">
-                {upload.notice}
-              </span>
-            )}
-            <div className="chat-msg-area__composer-upload-list">
-              {upload.items.map((item) => (
-                <div
-                  key={item.localId}
-                  className="chat-msg-area__composer-upload-item"
-                  data-testid={
-                    item.status === "success" ? "chat-composer-pending-attachment" : undefined
-                  }
-                >
-                  <span className="chat-msg-area__composer-upload-icon" aria-hidden="true">
-                    <span className="material-symbols-outlined">draft</span>
-                  </span>
-                  <div className="chat-msg-area__composer-upload-body">
-                    <span className="chat-msg-area__composer-upload-name" title={item.file.name}>
-                      {item.file.name}
-                    </span>
-                    <span
-                      className={`chat-msg-area__composer-upload-state chat-msg-area__composer-upload-state--${item.status}`}
-                    >
-                      {item.status === "queued" && "Aguardando envio"}
-                      {item.status === "uploading" &&
-                        `Enviando arquivo…${item.progress ? ` ${uploadPercent(item.progress)}%` : ""}`}
-                      {item.status === "success" && "Pronto para enviar"}
-                      {item.status === "failed" && item.error}
-                    </span>
-                    <span className="chat-msg-area__composer-upload-size">
-                      {formatFileSize(item.file.size)}
-                    </span>
-                    {item.status === "uploading" && item.progress && (
-                      <progress
-                        className="chat-msg-area__composer-progress"
-                        data-testid="chat-composer-upload-progress"
-                        aria-label={
-                          upload.items.length === 1
-                            ? "Progresso do envio"
-                            : `Progresso do envio de ${item.file.name}`
-                        }
-                        value={item.progress.loaded}
-                        max={item.progress.total}
-                      />
-                    )}
-                    {item.status === "failed" && (
-                      <button
-                        type="button"
-                        className="chat-msg-area__composer-upload-retry"
-                        onClick={() => upload.retry(item.localId)}
-                      >
-                        Tentar novamente
-                      </button>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    className="chat-msg-area__composer-quote-close"
-                    aria-label={
-                      upload.items.length === 1
-                        ? "Remover anexo"
-                        : `Remover anexo ${item.file.name}`
-                    }
-                    data-testid="chat-composer-remove-attachment"
-                    onClick={() => upload.remove(item.localId)}
-                  >
-                    <span className="material-symbols-outlined" aria-hidden="true">
-                      close
-                    </span>
-                  </button>
-                </div>
-              ))}
-            </div>
-            {upload.aggregateProgress && upload.items.length > 1 && (
-              <progress
-                className="chat-msg-area__composer-progress chat-msg-area__composer-progress--total"
-                aria-label="Progresso total dos anexos"
-                value={upload.aggregateProgress.loaded}
-                max={upload.aggregateProgress.total}
-              />
-            )}
-          </div>
-        )}
-        {!recording && (
-          <div className="chat-msg-area__composer-bar">
-            <ComposerToolbar editor={editor ?? null} disabled={disabled || sending} />
-            {uploadTarget && (
-              <>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="chat-msg-area__composer-file-input"
-                  data-testid="chat-composer-file-input"
-                  aria-label="Escolher arquivo para anexar"
-                  hidden
-                  onChange={handlePickerChange}
-                />
-                <button
-                  type="button"
-                  className="composer-toolbar__btn"
-                  aria-label="Anexar arquivo"
-                  disabled={!attachEnabled || upload.items.length >= 10}
-                  data-testid="chat-composer-attach-btn"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  <span
-                    className="material-symbols-outlined"
-                    aria-hidden="true"
-                    style={{ fontSize: 18 }}
-                  >
-                    attach_file
-                  </span>
-                </button>
-              </>
-            )}
-            {uploadTarget && recorder.supported && (
-              <button
-                type="button"
-                className="composer-toolbar__btn"
-                aria-label="Gravar mensagem de voz"
-                // A voice recording is never merged with pending attachments
-                // (issue #670 code review) — recording must not even start
-                // while one exists, so this only ever disables, never
-                // silently drops or combines the two.
-                title={
-                  hasComposerAttachments
-                    ? "Remova os anexos para gravar uma mensagem de voz."
-                    : undefined
-                }
-                disabled={!attachEnabled || uploading || hasComposerAttachments}
-                data-testid="chat-composer-record-btn"
-                onClick={recorder.start}
-              >
-                <span
-                  className="material-symbols-outlined"
-                  aria-hidden="true"
-                  style={{ fontSize: 18 }}
-                >
-                  mic
-                </span>
-              </button>
-            )}
-            <button
-              type="button"
-              className="chat-msg-area__send-btn"
               // Unavailable while a file is going up, whatever else the composer
               // holds: the attachment is part of the message being written, and
               // sending now would post a message without it.
-              disabled={!canSend || uploading}
-              aria-label="Enviar mensagem"
-              onClick={() => void handleSend()}
-              data-testid="chat-send-btn"
-            >
-              <IconSend />
-            </button>
-          </div>
+              canSend={canSend && !uploading}
+              onSend={handleSend}
+            />
+          </>
         )}
       </div>
     </div>

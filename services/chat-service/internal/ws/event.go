@@ -357,6 +357,19 @@ type QuotePayload struct {
 type ReactionPayload struct {
 	Emoji string `json:"emoji"`
 	Count int    `json:"count"`
+	// Users names the first few reactors behind Count (issue #496), so a
+	// subscriber can update a reaction tooltip from the event instead of asking
+	// who reacted every time a badge is hovered. It is the same bounded prefix
+	// the REST aggregate carries, and it identifies nobody the subscriber is not
+	// already reading messages beside.
+	Users []ReactionUserPayload `json:"users,omitempty"`
+}
+
+// ReactionUserPayload is one named reactor: an id, so a client can recognise
+// itself, and a display name. Nothing else about the person travels.
+type ReactionUserPayload struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
 }
 
 // PinEventPayload carries a pin change (RF-05). It is route-plus-flag
