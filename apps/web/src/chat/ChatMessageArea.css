@@ -915,9 +915,10 @@
   margin-top: 5px;
 }
 
-/* The badge and its tooltip share one positioned box, so the tooltip can be
-   placed against the badge without either of them affecting the message's
-   layout (issue #496). */
+/* Positioned so the badge's accessible description — visually hidden, 1×1 and
+   clipped — is anchored to the badge rather than to a distant ancestor. The
+   visible tooltip is not here: it is portalled, so that nothing drawn against a
+   badge can widen the conversation. */
 .chat-msg-area__reaction-slot {
   position: relative;
   display: inline-flex;
@@ -1023,15 +1024,27 @@
   }
 }
 
-/* Who reacted. Always in the DOM as the badge's accessible description, and
-   revealed on hover or keyboard focus by this rule alone — no state, no
-   listener, and no re-render of the conversation to open it. */
+/*
+ * Who reacted, floating above the badge.
+ *
+ * Fixed, and portalled out of the conversation, because a tooltip must not be
+ * able to make the conversation scroll.
+ *
+ * It used to be absolutely positioned inside the badge and centred on it. An
+ * absolutely positioned box still counts towards the scrollable overflow of its
+ * scroll container, and the message list is one — `overflow-y: auto` makes the
+ * computed `overflow-x` `auto` as well — so half a tooltip hanging past a
+ * right-aligned own message was enough to give the whole conversation a
+ * horizontal scrollbar. Fixed and portalled, its containing block is the
+ * viewport: it cannot grow anything.
+ *
+ * Placement is the emoji picker's, so it is clamped inside the viewport by the
+ * same rules and stays whole against either edge instead of being centred off
+ * the side of the screen.
+ */
 .chat-msg-area__reaction-authors {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
+  position: fixed;
   z-index: var(--z-overlay-emoji);
-  transform: translateX(-50%);
   max-width: 220px;
   width: max-content;
   padding: 4px 8px;
@@ -1041,14 +1054,17 @@
   font-size: 12px;
   line-height: 1.35;
   text-align: center;
-  opacity: 0;
   pointer-events: none;
-  transition: opacity 120ms ease-out;
+  animation: chat-reaction-tooltip-in 120ms ease-out;
 }
 
-.chat-msg-area__reaction-slot:hover .chat-msg-area__reaction-authors,
-.chat-msg-area__reaction-slot:focus-within .chat-msg-area__reaction-authors {
-  opacity: 1;
+@keyframes chat-reaction-tooltip-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .chat-msg-area__reaction:disabled {
@@ -1538,7 +1554,6 @@
    reader nothing. */
 @media (prefers-reduced-motion: reduce) {
   .chat-msg-area__reaction,
-  .chat-msg-area__reaction-authors,
   .chat-emoji-picker__emoji,
   .chat-emoji-picker__retry,
   .chat-emoji-picker__search,
@@ -1561,6 +1576,7 @@
      fade, because the badge still has to finish leaving before it is unmounted
      — animationend is what removes it. */
   .chat-msg-area__reaction-emoji,
+  .chat-msg-area__reaction-authors,
   .chat-emoji-picker__emoji:active,
   .chat-emoji-picker,
   .chat-emoji-tone {

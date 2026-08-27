@@ -39,6 +39,33 @@ export function placeAgainstAnchor(
   element.style.visibility = "visible";
 }
 
+/** The band of screen an anchor is actually painted in. */
+export interface VisibleBounds {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+}
+
+/**
+ * Whether any part of an anchor is inside the band it can be painted in.
+ *
+ * A floating surface may only be drawn against an anchor the reader can see. The
+ * band is not always the viewport: an anchor inside a scroll container is
+ * clipped by it too, so the caller passes the intersection it knows about.
+ *
+ * Partly visible counts as visible — an anchor half past an edge is still one
+ * the reader is looking at.
+ */
+export function anchorIsVisible(anchor: DOMRect, bounds: VisibleBounds): boolean {
+  return (
+    anchor.bottom > bounds.top &&
+    anchor.top < bounds.bottom &&
+    anchor.right > bounds.left &&
+    anchor.left < bounds.right
+  );
+}
+
 export interface AnchoredPickerOptions {
   open: boolean;
   /** The control the picker belongs to; also where focus returns on Escape. */

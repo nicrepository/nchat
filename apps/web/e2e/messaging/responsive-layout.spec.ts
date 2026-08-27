@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import {
   CURRENT_USER_ID,
@@ -148,6 +148,32 @@ async function expectNoHorizontalScroll(page: Page) {
     );
   });
   expect(overflow).toBeLessThanOrEqual(1);
+}
+
+/**
+ * The conversation column, and the message list inside it, must not scroll
+ * sideways either (issue #496 regression).
+ *
+ * The document-level check above is not enough on its own, and that is exactly
+ * how this regression shipped: the list has `overflow-y: auto`, which makes its
+ * computed `overflow-x` `auto` too, so it can grow its own horizontal scrollbar
+ * while the page around it stays exactly the right width.
+ */
+async function expectNoConversationScroll(page: Page, moment: string) {
+  const overflow = await page.evaluate(() => {
+    const measure = (selector: string) => {
+      const element = document.querySelector(selector);
+      return element ? element.scrollWidth - element.clientWidth : 0;
+    };
+    return {
+      conversation: measure(".chat-msg-area__conversation"),
+      list: measure(".chat-msg-area__list"),
+    };
+  });
+  expect(overflow, `rolagem horizontal na conversa (${moment})`).toEqual({
+    conversation: 0,
+    list: 0,
+  });
 }
 
 /**
@@ -513,6 +539,303 @@ test.describe("layout responsivo", () => {
     expect(unlocked).toEqual({ html: false, body: false, overflowY: "visible" });
   });
 
+  /**
+   * The regression this file exists to catch, in the shape it actually shipped
+   * (issue #496).
+   *
+   * A reaction on an own message sits against the right edge of the
+   * conversation, and the tooltip naming who reacted used to be drawn inside the
+   * badge and centred on it — so half of it hung past the message. An absolutely
+   * positioned box still counts towards the scrollable overflow of its scroll
+   * container, and the message list is one, so the conversation grew a
+   * horizontal scrollbar while the page around it stayed exactly the right
+   * width. That is why it has to be measured on the list, and in a real browser:
+   * nothing in jsdom has a width.
+   */
+  /** An own message — right-aligned, so its reactions hug the right edge. */
+  function messageWithReactions(targetId: string) {
+    return makeMessage({
+      id: `${targetId}-mine`,
+      sender_id: CURRENT_USER_ID,
+      sender_display_name: CURRENT_USER_NAME,
+      body_text: "reações na borda direita",
+      reactions: ["👍", "❤️", "😂", "🎉", "🚀", "🔥"].map((emoji) => ({
+        emoji,
+        count: 3,
+        reacted_by_me: true,
+        users: [
+          { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME },
+          { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME },
+        ],
+      })),
+    });
+  }
+
+  async function openReactedMessage(page: Page, testInfo: Parameters<typeof uniqueId>[0]) {
+    const targetId = uniqueId(testInfo, "reaction-overflow");
+    const mine = messageWithReactions(targetId);
+    // History on both sides of it, so the list has somewhere to scroll in either
+    // direction: a badge pinned to the end of the conversation can only ever be
+    // scrolled out of sight, which would prove nothing about following it.
+    const filler = (prefix: string, hour: number) =>
+      Array.from({ length: 14 }, (_, index) =>
+        makeMessage({
+          id: `${targetId}-${prefix}${index}`,
+          body_text: `histórico ${prefix}${index}`,
+          created_at: new Date(Date.UTC(2026, 0, 1, hour, index)).toISOString(),
+        }),
+      );
+    await installMessagingMocks(
+      page,
+      createScenario({
+        kind: "channel",
+        targetId,
+        targetName: OTHER_CHANNEL_NAME,
+        messages: [...filler("a", 8), mine, ...filler("b", 10)],
+      }),
+    );
+    await page.goto(`/chat/channel/${targetId}`);
+    const bubble = page.locator(`[data-message-id="${mine.id}"]`);
+    await expect(bubble).toBeAttached();
+    // The list opens on the newest message, so bring the reacted one into view.
+    await bubble.scrollIntoViewIfNeeded();
+    await expect(bubble).toBeVisible();
+    return bubble;
+  }
+
+  /** The tooltip lives on the body, which is the whole point of the fix. */
+  const authorsTooltip = (page: Page) => page.locator("body > [data-testid=reaction-authors]");
+
+  /**
+   * The tooltip's own gap is 6px; this leaves room for the sub-pixel rounding of
+   * a re-measured box without tolerating a tooltip that stayed behind.
+   */
+  const maxAuthorsGap = 16;
+
+  /**
+   * Where the tooltip sits relative to its badge.
+   *
+   * Reported as an offset rather than as absolute coordinates because that is
+   * the thing that must not change when the badge moves: the tooltip is clamped
+   * inside the viewport, so a badge near an edge legitimately has its tooltip
+   * off-centre, and only the badge's own position may change it.
+   */
+  async function anchorOffset(badge: Locator, tooltip: Locator) {
+    const anchor = (await badge.boundingBox())!;
+    const box = (await tooltip.boundingBox())!;
+    return {
+      dx: Math.round(box.x + box.width / 2 - (anchor.x + anchor.width / 2)),
+      // Positive: the tooltip's bottom sits above the badge's top.
+      gap: Math.round(anchor.y - (box.y + box.height)),
+    };
+  }
+
+  for (const viewport of [
+    { width: 1280, height: 900 },
+    { width: 1920, height: 1080 },
+    { width: 390, height: 780 },
+    { width: 640, height: 450 },
+    { width: 320, height: 700 },
+  ]) {
+    test(`${viewport.width}x${viewport.height}: reações e tooltip de autores não rolam a conversa`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      const bubble = await openReactedMessage(page, testInfo);
+      await expectNoHorizontalScroll(page);
+      await expectNoConversationScroll(page, "reações renderizadas");
+
+      // The floating toolbar appears on hover; it must not widen anything.
+      await page.mouse.move(0, 0);
+      await bubble.hover();
+      await expect(page.getByRole("button", { name: "Mais reações" })).toBeVisible();
+      await expectNoHorizontalScroll(page);
+      await expectNoConversationScroll(page, "toolbar visível");
+
+      // Every badge's tooltip, one at a time: shown, whole inside the viewport,
+      // and never the reason the conversation scrolls.
+      const badges = bubble.locator(".chat-msg-area__reaction-slot");
+      const tooltip = authorsTooltip(page);
+      const count = await badges.count();
+      expect(count).toBe(6);
+      for (let index = 0; index < count; index += 1) {
+        await page.mouse.move(0, 0);
+        await badges.nth(index).hover();
+        await expect(tooltip).toBeVisible();
+        const inside = await tooltip.evaluate((element) => {
+          const box = element.getBoundingClientRect();
+          return box.left >= 0 && box.right <= document.documentElement.clientWidth;
+        });
+        expect(inside, `tooltip ${index} inteiro na viewport`).toBe(true);
+        await expectNoHorizontalScroll(page);
+        await expectNoConversationScroll(page, `tooltip do badge ${index}`);
+      }
+    });
+  }
+
+  /**
+   * The tooltip is `position: fixed`, so it does not travel with its badge on
+   * its own. These drive the two ways the badge can move under an open tooltip.
+   */
+  test("o tooltip acompanha o badge quando a conversa rola", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const bubble = await openReactedMessage(page, testInfo);
+    const badge = bubble.locator(".chat-msg-area__reaction-slot").last();
+    const tooltip = authorsTooltip(page);
+
+    // Focus rather than hover: the pointer would follow the page, the caret does
+    // not, so this is the case where the tooltip really can be left behind.
+    await badge.getByRole("button").focus();
+    await expect(tooltip).toBeVisible();
+    // Settled just above the badge. Polled rather than read once: the list
+    // scrolls itself to the newest message on open, and the tooltip is placed
+    // against wherever the badge has come to rest.
+    await expect
+      .poll(async () => {
+        const now = await anchorOffset(badge, tooltip);
+        return now.gap >= 0 && now.gap <= maxAuthorsGap;
+      })
+      .toBe(true);
+    const placed = await anchorOffset(badge, tooltip);
+    const before = (await badge.boundingBox())!.y;
+
+    // A nudge, not a jump: the badge has to move while staying on screen, which
+    // is the only state in which following it means anything.
+    await page.locator(".chat-msg-area__list").evaluate((list) => {
+      list.scrollTop += 60;
+    });
+    // Wait for the badge to have actually moved rather than for a duration.
+    await expect.poll(async () => (await badge.boundingBox())!.y).not.toBe(before);
+
+    // Still just above the badge, and still the same distance from its centre:
+    // it followed. Before the listener existed the tooltip stayed where the
+    // badge used to be, which this measures as a gap of roughly the scroll.
+    await expect
+      .poll(async () => {
+        const now = await anchorOffset(badge, tooltip);
+        return { dx: now.dx, follows: now.gap >= 0 && now.gap <= maxAuthorsGap };
+      })
+      .toEqual({ dx: placed.dx, follows: true });
+    await expect(tooltip).toBeVisible();
+    await expectNoConversationScroll(page, "após rolar a lista");
+  });
+
+  test("o tooltip volta para dentro da viewport quando ela encolhe", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const bubble = await openReactedMessage(page, testInfo);
+    const badge = bubble.locator(".chat-msg-area__reaction-slot").last();
+    const tooltip = authorsTooltip(page);
+
+    await badge.getByRole("button").focus();
+    await expect(tooltip).toBeVisible();
+
+    // The same page, resized: this is what exercises the resize listener.
+    await page.setViewportSize({ width: 420, height: 700 });
+    // A narrower shell reflows the conversation, which can carry the badge out
+    // of the list's visible band — and a tooltip with nothing to point at is
+    // correctly hidden. Bring it back so what is under test is the clamp.
+    await badge.scrollIntoViewIfNeeded();
+
+    await expect
+      .poll(async () => {
+        const box = await tooltip.boundingBox();
+        return box !== null && box.x >= 0 && box.x + box.width <= 420;
+      })
+      .toBe(true);
+    await expect(tooltip).toBeVisible();
+    await expectNoHorizontalScroll(page);
+    await expectNoConversationScroll(page, "após encolher a viewport");
+  });
+
+  /**
+   * A tooltip may only be drawn against a badge the reader can actually see.
+   *
+   * The badge lives inside `.chat-msg-area__list`, which clips vertically, so
+   * "visible" is the list's own band and not the window: a badge scrolled past
+   * the list's edge is hidden even though the window still has room for it. The
+   * tooltip is `position: fixed` and followed its badge anywhere, so a focused
+   * badge scrolled out of the list left its names floating over the page, or off
+   * it entirely.
+   */
+  test("o tooltip some quando o badge sai da área visível da lista e volta com ele", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const bubble = await openReactedMessage(page, testInfo);
+    const badge = bubble.locator(".chat-msg-area__reaction-slot").last();
+    const tooltip = authorsTooltip(page);
+    const list = page.locator(".chat-msg-area__list");
+
+    await badge.getByRole("button").focus();
+    await expect(tooltip).toBeVisible();
+
+    // Reads whether any part of the badge is inside the band the list actually
+    // paints — the intersection of the list's box and the window.
+    const badgeIsOnScreen = () =>
+      badge.evaluate((slot) => {
+        const clip = slot.closest(".chat-msg-area__list")!.getBoundingClientRect();
+        const rect = slot.getBoundingClientRect();
+        return (
+          rect.bottom > Math.max(0, clip.top) &&
+          rect.top < Math.min(window.innerHeight, clip.bottom) &&
+          rect.right > Math.max(0, clip.left) &&
+          rect.left < Math.min(window.innerWidth, clip.right)
+        );
+      });
+
+    expect(await badgeIsOnScreen()).toBe(true);
+    const scrolledDown = await list.evaluate((element) => element.scrollTop);
+
+    // All the way up: the reacted message is far below now, out of the band.
+    await list.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await expect.poll(badgeIsOnScreen).toBe(false);
+
+    // The badge is gone from view, so its names are too — without the reader
+    // having touched the keyboard or the mouse.
+    await expect(tooltip).toBeHidden();
+    await expectNoConversationScroll(page, "âncora fora da lista");
+    await expectNoHorizontalScroll(page);
+
+    // Scrolling back brings it straight back, still against its badge.
+    await list.evaluate((element, top) => {
+      element.scrollTop = top;
+    }, scrolledDown);
+    await expect.poll(badgeIsOnScreen).toBe(true);
+
+    await expect(tooltip).toBeVisible();
+    await expect
+      .poll(async () => {
+        const now = await anchorOffset(badge, tooltip);
+        return now.gap >= 0 && now.gap <= maxAuthorsGap;
+      })
+      .toBe(true);
+    await expectNoConversationScroll(page, "âncora de volta");
+  });
+
+  // One real combination, to prove in a browser what the unit tests prove in
+  // isolation: whichever channel is still asking keeps the names on screen.
+  test("o tooltip permanece enquanto o badge segue focado e o ponteiro sai", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const bubble = await openReactedMessage(page, testInfo);
+    const badge = bubble.locator(".chat-msg-area__reaction-slot").last();
+    const tooltip = authorsTooltip(page);
+
+    await badge.hover();
+    await expect(tooltip).toBeVisible();
+    await badge.getByRole("button").focus();
+
+    // The pointer leaves; the keyboard has not.
+    await page.mouse.move(0, 0);
+    await expect(tooltip).toBeVisible();
+
+    await badge.getByRole("button").blur();
+    await expect(tooltip).toHaveCount(0);
+  });
+
   for (const viewport of VIEWPORT_MATRIX) {
     test(`${viewport.width}x${viewport.height}: sem rolagem horizontal com conteúdo longo, detalhes abertos e fechados`, async ({
       page,
@@ -524,16 +847,19 @@ test.describe("layout responsivo", () => {
       await expect(page.getByTestId("chat-msg-header")).toBeVisible();
       await expect(composer(page)).toBeVisible();
       await expectNoHorizontalScroll(page);
+      await expectNoConversationScroll(page, "inicial");
       await expectNoRootScroll(page, "inicial");
 
       await detailsToggle(page).click();
       await expect(page.getByTestId("chat-conversation-details")).toBeVisible();
       await expectNoHorizontalScroll(page);
+      await expectNoConversationScroll(page, "detalhes abertos");
       await expectNoRootScroll(page, "detalhes abertos");
 
       await page.getByRole("button", { name: "Fechar detalhes do canal" }).click();
       await expect(page.getByTestId("chat-conversation-details")).toBeHidden();
       await expectNoHorizontalScroll(page);
+      await expectNoConversationScroll(page, "detalhes fechados");
       await expectNoRootScroll(page, "detalhes fechados");
     });
   }
