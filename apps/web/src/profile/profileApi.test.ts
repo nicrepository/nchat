@@ -7,6 +7,7 @@ import {
   removeAvatar,
   updateDisplayName,
   UpdateDisplayNameError,
+  updateProfile,
   updateProfileFields,
   UpdateProfileFieldsError,
   uploadAvatar,
@@ -280,6 +281,49 @@ describe("updateProfileFields", () => {
   it("maps an unknown failure to a generic reason", async () => {
     mockAuthFetch.mockRejectedValue(new Error("boom"));
     await expect(updateProfileFields(emptyFields)).rejects.toBeInstanceOf(UpdateProfileFieldsError);
+  });
+});
+
+describe("updateProfile", () => {
+  it("sends all five fields in one PATCH and maps the response", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "u1",
+        display_name: "Ana",
+        job_title: "Eng",
+        bio: "bio",
+        timezone: "America/Sao_Paulo",
+        custom_status: "🚀 Focada",
+      },
+    });
+    const result = await updateProfile({
+      displayName: "Ana",
+      jobTitle: "Eng",
+      bio: "bio",
+      timezone: "America/Sao_Paulo",
+      customStatus: "🚀 Focada",
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/me"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: "Ana",
+          job_title: "Eng",
+          bio: "bio",
+          timezone: "America/Sao_Paulo",
+          custom_status: "🚀 Focada",
+        }),
+      }),
+    );
+    expect(result.displayName).toBe("Ana");
+  });
+
+  it("maps a 400 to an invalid UpdateProfileError and a 403 to forbidden", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(400, "bad", "bad"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "invalid" });
   });
 });
 

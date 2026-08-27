@@ -281,3 +281,62 @@ function mapUpdateProfileFieldsError(error: unknown): UpdateProfileFieldsError {
   }
   return new UpdateProfileFieldsError("unknown", "Não foi possível atualizar o perfil.");
 }
+
+export interface UpdateProfileInput {
+  displayName: string;
+  jobTitle: string;
+  bio: string;
+  timezone: string;
+  customStatus: string;
+}
+
+export type UpdateProfileErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateProfileError extends Error {
+  readonly reason: UpdateProfileErrorReason;
+  constructor(reason: UpdateProfileErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateProfileError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Saves display_name, job_title, bio, timezone and custom_status in one PATCH,
+ * replacing ProfilePage's former two-form/two-request flow now that a single
+ * edit dialog owns all five fields together.
+ */
+export async function updateProfile(
+  fields: UpdateProfileInput,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        display_name: fields.displayName,
+        job_title: fields.jobTitle,
+        bio: fields.bio,
+        timezone: fields.timezone,
+        custom_status: fields.customStatus,
+      }),
+      signal,
+    });
+    return selfProfileFromResponse(res);
+  } catch (error) {
+    throw mapUpdateProfileError(error);
+  }
+}
+
+function mapUpdateProfileError(error: unknown): UpdateProfileError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateProfileError("invalid", "Dados inválidos.");
+      case 403:
+        return new UpdateProfileError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateProfileError("unknown", "Não foi possível atualizar o perfil.");
+}
