@@ -60,6 +60,13 @@ function nextRate(rate: PlaybackRate): PlaybackRate {
   return RATE_CYCLE[(index + 1) % RATE_CYCLE.length];
 }
 
+// WebM/MediaRecorder can report Infinity (or later revise to NaN/0) from
+// `loadedmetadata`/`durationchange`; only a finite, positive value is usable
+// as the effective duration for the seek bar and the time label.
+function isValidDuration(value: number | undefined): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
 export interface AudioPlayerProps {
   /** aria-label stem, e.g. "Áudio: reunião.mp3" or "Mensagem de voz". */
   label: string;
@@ -90,7 +97,7 @@ export default function AudioPlayer({
   const wantsPlayRef = useRef(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(durationHint ?? 0);
+  const [duration, setDuration] = useState(isValidDuration(durationHint) ? durationHint : 0);
   const [buffering, setBuffering] = useState(false);
   const [decodeError, setDecodeError] = useState(false);
   const [rate, setRate] = useState<PlaybackRate>(loadStoredRate);
@@ -157,6 +164,13 @@ export default function AudioPlayer({
     setCurrentTime(value);
   }, []);
 
+  // WebM can report duration on `loadedmetadata` and revise it again on a
+  // later `durationchange`; both go through the same validity guard so an
+  // invalid revision (Infinity/NaN/0/negative) never overwrites a good one.
+  const handleDurationCandidate = useCallback((value: number) => {
+    if (isValidDuration(value)) setDuration(value);
+  }, []);
+
   const showError = failed || decodeError;
   const showLoading = loading && !showError;
 
@@ -174,8 +188,14 @@ export default function AudioPlayer({
             setPlaying(true);
           }}
           onPause={() => setPlaying(false)}
-          onEnded={() => setPlaying(false)}
-          onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+          onEnded={() => {
+            setPlaying(false);
+            // The last timeupdate before "ended" may have been throttled
+            // away, so force the visual progress to the end explicitly.
+            setCurrentTime((prev) => (isValidDuration(duration) ? duration : prev));
+          }}
+          onLoadedMetadata={(e) => handleDurationCandidate(e.currentTarget.duration)}
+          onDurationChange={(e) => handleDurationCandidate(e.currentTarget.duration)}
           onTimeUpdate={(e) => {
             const now = e.currentTarget.currentTime;
             if (Math.abs(now - lastTickRef.current) < 0.25 && now !== 0) return;
