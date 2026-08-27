@@ -6,25 +6,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/livekit/protocol/auth"
 	"github.com/nicrepository/nchat/services/media-service/internal/domain"
 )
 
 type LiveKitTokenSigner struct {
-	apiKey    string
-	apiSecret string
-	now       func() time.Time
-	encode    liveKitTokenEncoder
+	environment domain.Environment
+	apiKey      string
+	apiSecret   string
+	now         func() time.Time
+	encode      liveKitTokenEncoder
 }
 
 type liveKitTokenEncoder func(apiKey, apiSecret, identity, displayName, room string, ttl time.Duration) (SignedToken, error)
 
-func NewLiveKitTokenSigner(apiKey, apiSecret string, now func() time.Time) (*LiveKitTokenSigner, error) {
-	return newLiveKitTokenSigner(apiKey, apiSecret, now, encodeLiveKitToken)
+// NewLiveKitTokenSigner binds a signer to one validated environment.
+func NewLiveKitTokenSigner(environment domain.Environment, apiKey, apiSecret string, now func() time.Time) (*LiveKitTokenSigner, error) {
+	return newLiveKitTokenSigner(environment, apiKey, apiSecret, now, encodeLiveKitToken)
 }
 
-func newLiveKitTokenSigner(apiKey, apiSecret string, now func() time.Time, encoder liveKitTokenEncoder) (*LiveKitTokenSigner, error) {
+func newLiveKitTokenSigner(environment domain.Environment, apiKey, apiSecret string, now func() time.Time, encoder liveKitTokenEncoder) (*LiveKitTokenSigner, error) {
+	environment, err := domain.ParseEnvironment(environment.String())
+	if err != nil {
+		return nil, fmt.Errorf("LiveKit environment is invalid: %w", err)
+	}
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, fmt.Errorf("LiveKit API key is required")
 	}
@@ -38,7 +43,8 @@ func newLiveKitTokenSigner(apiKey, apiSecret string, now func() time.Time, encod
 		return nil, fmt.Errorf("LiveKit token encoder is required")
 	}
 	return &LiveKitTokenSigner{
-		apiKey: strings.TrimSpace(apiKey), apiSecret: apiSecret,
+		environment: environment,
+		apiKey:      strings.TrimSpace(apiKey), apiSecret: apiSecret,
 		now: now, encode: encoder,
 	}, nil
 }
@@ -47,17 +53,10 @@ func (s *LiveKitTokenSigner) Sign(ctx context.Context, input SignInput) (SignedT
 	if err := ctx.Err(); err != nil {
 		return SignedToken{}, err
 	}
-	identity, err := uuid.Parse(input.Identity)
-	if err != nil || identity.String() != input.Identity {
+	if _, err := domain.ParseParticipantIdentity(s.environment, input.Identity); err != nil {
 		return SignedToken{}, fmt.Errorf("invalid LiveKit identity")
 	}
-	separator := strings.IndexByte(input.Room, ':')
-	if separator <= 0 {
-		return SignedToken{}, fmt.Errorf("invalid LiveKit room")
-	}
-	kind := domain.ResourceKind(input.Room[:separator])
-	wantRoom, err := domain.RoomName(kind, input.Room[separator+1:])
-	if err != nil || wantRoom != input.Room {
+	if _, _, err := domain.ParseRoomName(s.environment, input.Room); err != nil {
 		return SignedToken{}, fmt.Errorf("invalid LiveKit room")
 	}
 	now := s.now().UTC()
@@ -66,7 +65,7 @@ func (s *LiveKitTokenSigner) Sign(ctx context.Context, input SignInput) (SignedT
 		return SignedToken{}, fmt.Errorf("invalid LiveKit token expiry")
 	}
 
-	signed, err := s.encode(s.apiKey, s.apiSecret, identity.String(), input.DisplayName, input.Room, deadline.Sub(now))
+	signed, err := s.encode(s.apiKey, s.apiSecret, input.Identity, input.DisplayName, input.Room, deadline.Sub(now))
 	if err != nil {
 		return SignedToken{}, fmt.Errorf("issue LiveKit token")
 	}

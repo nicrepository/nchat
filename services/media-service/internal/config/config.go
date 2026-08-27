@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+	"github.com/nicrepository/nchat/services/media-service/internal/domain"
 )
 
 const (
@@ -47,7 +48,7 @@ func Load() Config {
 	liveKitEnabled, liveKitEnabledInvalid := configuredBool("LIVEKIT_ENABLED", false)
 	return Config{
 		ServiceName:              serviceName,
-		Env:                      platformconfig.GetString("APP_ENV", "development"),
+		Env:                      strings.TrimSpace(platformconfig.GetString("APP_ENV", "development")),
 		Port:                     platformconfig.GetInt("PORT", defaultPort),
 		ReadHeaderTimeoutSeconds: platformconfig.GetInt("READ_HEADER_TIMEOUT_SECONDS", 5),
 		ReadTimeoutSeconds:       positiveInt("READ_TIMEOUT_SECONDS", 10),
@@ -71,6 +72,9 @@ func (c Config) Validate() error {
 		return errors.New("LIVEKIT_ENABLED must be a valid boolean")
 	}
 	if c.LiveKitEnabled {
+		if _, err := domain.ParseEnvironment(c.Env); err != nil {
+			return fmt.Errorf("APP_ENV is not a valid LiveKit namespace: %w", err)
+		}
 		if !validLiveKitAPIURL(c.LiveKitAPIURL) {
 			return errors.New("LiveKit API URL must be a valid HTTP, HTTPS, or WSS URL")
 		}

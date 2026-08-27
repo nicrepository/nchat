@@ -8,17 +8,24 @@ import (
 	"time"
 
 	"github.com/livekit/protocol/auth"
+	"github.com/nicrepository/nchat/services/media-service/internal/domain"
 )
 
 const liveKitSignerTestSecret = "livekit-test-secret-with-sufficient-length"
+
+const (
+	signerTestEnv      domain.Environment = "production"
+	signerTestOtherEnv domain.Environment = "development"
+	signerTestIdentity                    = "production:" + serviceTestUserID
+)
 
 func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.T) {
 	result, err := encodeLiveKitToken(
 		"livekit-test-key",
 		liveKitSignerTestSecret,
-		serviceTestUserID,
+		signerTestIdentity,
 		"",
-		"channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		"production:channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		5*time.Minute,
 	)
 	if err != nil {
@@ -33,11 +40,11 @@ func TestLiveKitTokenEncoderUsesOfficialSDKWithRoomBoundMinimalGrant(t *testing.
 	if err != nil {
 		t.Fatalf("verify official LiveKit token: %v", err)
 	}
-	if grants.Identity != serviceTestUserID || grants.Name != "" || grants.Metadata != "" {
+	if grants.Identity != signerTestIdentity || grants.Name != "" || grants.Metadata != "" {
 		t.Fatalf("unexpected participant claims: %+v", grants)
 	}
 	video := grants.Video
-	if video == nil || !video.RoomJoin || video.Room != "channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
+	if video == nil || !video.RoomJoin || video.Room != "production:channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" {
 		t.Fatalf("token is not room-bound: %+v", video)
 	}
 	if !video.GetCanPublish() || !video.GetCanSubscribe() {
@@ -73,9 +80,9 @@ func TestLiveKitTokenEncoderSetsParticipantNameFromDisplayNameNeverIdentity(t *t
 	result, err := encodeLiveKitToken(
 		"livekit-test-key",
 		liveKitSignerTestSecret,
-		serviceTestUserID,
+		signerTestIdentity,
 		"Ana Lima",
-		"channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		"production:channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		5*time.Minute,
 	)
 	if err != nil {
@@ -90,7 +97,7 @@ func TestLiveKitTokenEncoderSetsParticipantNameFromDisplayNameNeverIdentity(t *t
 	if err != nil {
 		t.Fatalf("verify official LiveKit token: %v", err)
 	}
-	if grants.Identity != serviceTestUserID {
+	if grants.Identity != signerTestIdentity {
 		t.Fatalf("identity must stay the canonical UUID, got %q", grants.Identity)
 	}
 	if grants.Name != "Ana Lima" {
@@ -108,9 +115,9 @@ func TestLiveKitTokenSignerPassesDisplayNameThroughToTheEncoder(t *testing.T) {
 	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
 
 	if _, err := signer.Sign(context.Background(), SignInput{
-		Identity:    serviceTestUserID,
+		Identity:    signerTestIdentity,
 		DisplayName: "Pedro Almeida",
-		Room:        "dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Room:        "production:dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		ExpiresAt:   now.Add(time.Minute),
 	}); err != nil {
 		t.Fatalf("sign: %v", err)
@@ -143,8 +150,8 @@ func TestLiveKitTokenSignerUsesDeterministicAbsoluteDeadlineAcrossSecondBoundary
 			signer := mustTestLiveKitSigner(t, func() time.Time { return tt.now }, encoder)
 
 			result, err := signer.Sign(context.Background(), SignInput{
-				Identity:  serviceTestUserID,
-				Room:      "dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+				Identity:  signerTestIdentity,
+				Room:      "production:dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 				ExpiresAt: deadline,
 			})
 			if err != nil {
@@ -169,8 +176,8 @@ func TestLiveKitTokenSignerRejectsExpiryBeyondAbsoluteDeadline(t *testing.T) {
 	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
 
 	result, err := signer.Sign(context.Background(), SignInput{
-		Identity:  serviceTestUserID,
-		Room:      "channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Identity:  signerTestIdentity,
+		Room:      "production:channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		ExpiresAt: deadline,
 	})
 	if err == nil || result.Token != "" {
@@ -182,19 +189,19 @@ func TestLiveKitTokenSignerRejectsInvalidConfigurationAndInput(t *testing.T) {
 	fixedNow := func() time.Time {
 		return time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	}
-	if _, err := NewLiveKitTokenSigner("", liveKitSignerTestSecret, fixedNow); err == nil {
+	if _, err := NewLiveKitTokenSigner(signerTestEnv, "", liveKitSignerTestSecret, fixedNow); err == nil {
 		t.Fatal("expected missing API key to fail")
 	}
-	if _, err := NewLiveKitTokenSigner("key", "", fixedNow); err == nil {
+	if _, err := NewLiveKitTokenSigner(signerTestEnv, "key", "", fixedNow); err == nil {
 		t.Fatal("expected missing API secret to fail")
 	}
 	signer := mustTestLiveKitSigner(t, fixedNow, func(_ string, _ string, _ string, _ string, _ string, _ time.Duration) (SignedToken, error) {
 		return SignedToken{Token: "unused"}, nil
 	})
 	for _, input := range []SignInput{
-		{Identity: "not-a-uuid", Room: "channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", ExpiresAt: fixedNow().Add(time.Minute)},
+		{Identity: "production:not-a-uuid", Room: "production:channel:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", ExpiresAt: fixedNow().Add(time.Minute)},
 		{Identity: serviceTestUserID, Room: "client-room", ExpiresAt: fixedNow().Add(time.Minute)},
-		{Identity: serviceTestUserID, Room: "dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		{Identity: signerTestIdentity, Room: "production:dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
 	} {
 		if result, err := signer.Sign(context.Background(), input); err == nil || result.Token != "" {
 			t.Fatalf("expected invalid sign input to fail without token: input=%+v result=%+v err=%v", input, result, err)
@@ -211,8 +218,8 @@ func TestLiveKitTokenSignerPropagatesCanceledContextWithoutToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	result, err := signer.Sign(ctx, SignInput{
-		Identity:  serviceTestUserID,
-		Room:      "dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Identity:  signerTestIdentity,
+		Room:      "production:dm:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 		ExpiresAt: now.Add(time.Minute),
 	})
 	if !errors.Is(err, context.Canceled) || result.Token != "" {
@@ -222,9 +229,78 @@ func TestLiveKitTokenSignerPropagatesCanceledContextWithoutToken(t *testing.T) {
 
 func mustTestLiveKitSigner(t *testing.T, now func() time.Time, encoder liveKitTokenEncoder) *LiveKitTokenSigner {
 	t.Helper()
-	signer, err := newLiveKitTokenSigner("key", liveKitSignerTestSecret, now, encoder)
+	signer, err := newLiveKitTokenSigner(signerTestEnv, "key", liveKitSignerTestSecret, now, encoder)
 	if err != nil {
 		t.Fatalf("new signer: %v", err)
 	}
 	return signer
+}
+
+// The signer is the last structural gate before a JWT exists. It holds its own
+// environment, so a TokenService bug cannot talk it into minting a token into
+// another deployment's namespace.
+func TestLiveKitTokenSignerRefusesValuesFromAnotherEnvironment(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	encoder := func(_, _, _, _, _ string, _ time.Duration) (SignedToken, error) {
+		return SignedToken{Token: "token", ExpiresAt: now.Add(time.Minute)}, nil
+	}
+	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
+
+	const validRoom = "production:call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	for _, tt := range []struct {
+		name     string
+		identity string
+		room     string
+	}{
+		{"room from another environment", signerTestIdentity, "development:call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		{"identity from another environment", "development:" + serviceTestUserID, validRoom},
+		{"pre-namespace room", signerTestIdentity, "call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		{"pre-namespace identity", serviceTestUserID, validRoom},
+		{"unknown kind", signerTestIdentity, "production:group:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+		{"invalid room uuid", signerTestIdentity, "production:call:not-a-uuid"},
+		{"invalid identity uuid", "production:not-a-uuid", validRoom},
+		{"administrative-looking room", signerTestIdentity, "production:admin"},
+		{"extra room segment", signerTestIdentity, validRoom + ":extra"},
+		{"non-canonical room uuid", signerTestIdentity, "production:call:AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := signer.Sign(context.Background(), SignInput{
+				Identity: tt.identity, Room: tt.room, ExpiresAt: now.Add(time.Minute),
+			}); err == nil {
+				t.Fatalf("signer accepted identity %q room %q", tt.identity, tt.room)
+			}
+		})
+	}
+}
+
+func TestLiveKitTokenSignerAcceptsItsOwnEnvironment(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	var gotIdentity, gotRoom string
+	encoder := func(_, _, identity, _, room string, _ time.Duration) (SignedToken, error) {
+		gotIdentity, gotRoom = identity, room
+		return SignedToken{Token: "token", ExpiresAt: now.Add(time.Minute)}, nil
+	}
+	signer := mustTestLiveKitSigner(t, func() time.Time { return now }, encoder)
+
+	const room = "production:call:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	if _, err := signer.Sign(context.Background(), SignInput{
+		Identity: signerTestIdentity, Room: room, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if gotIdentity != signerTestIdentity || gotRoom != room {
+		t.Fatalf("encoder received identity %q room %q", gotIdentity, gotRoom)
+	}
+}
+
+func TestNewLiveKitTokenSignerRefusesAnInvalidEnvironment(t *testing.T) {
+	fixedNow := func() time.Time { return time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC) }
+	for _, environment := range []domain.Environment{"", ":", "prod:evil", "PROD", " "} {
+		if _, err := NewLiveKitTokenSigner(environment, "key", liveKitSignerTestSecret, fixedNow); err == nil {
+			t.Fatalf("signer constructed with environment %q", environment)
+		}
+	}
+	if _, err := NewLiveKitTokenSigner(signerTestOtherEnv, "key", liveKitSignerTestSecret, fixedNow); err != nil {
+		t.Fatalf("a valid environment must construct: %v", err)
+	}
 }

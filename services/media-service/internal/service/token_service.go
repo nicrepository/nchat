@@ -70,21 +70,35 @@ type IssuedToken struct {
 }
 
 type TokenService struct {
-	authorizer ResourceAuthorizer
-	signer     TokenSigner
-	ttl        time.Duration
-	now        func() time.Time
+	authorizer  ResourceAuthorizer
+	signer      TokenSigner
+	environment domain.Environment
+	ttl         time.Duration
+	now         func() time.Time
 }
 
-func NewTokenService(authorizer ResourceAuthorizer, signer TokenSigner, ttl time.Duration, now func() time.Time) *TokenService {
+func NewTokenService(
+	authorizer ResourceAuthorizer,
+	signer TokenSigner,
+	environment domain.Environment,
+	ttl time.Duration,
+	now func() time.Time,
+) *TokenService {
 	if now == nil {
 		now = time.Now
 	}
-	return &TokenService{authorizer: authorizer, signer: signer, ttl: ttl, now: now}
+	return &TokenService{
+		authorizer: authorizer, signer: signer,
+		environment: environment, ttl: ttl, now: now,
+	}
 }
 
 func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (IssuedToken, error) {
 	if s == nil || s.authorizer == nil || s.signer == nil || s.ttl <= 0 {
+		return IssuedToken{}, domain.ErrUnavailable
+	}
+	environment, err := domain.ParseEnvironment(s.environment.String())
+	if err != nil {
 		return IssuedToken{}, domain.ErrUnavailable
 	}
 	userID, err := uuid.Parse(input.UserID)
@@ -121,9 +135,13 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 		}
 		return IssuedToken{}, fmt.Errorf("authorize media resource: %w", err)
 	}
-	room, err := domain.RoomName(input.Kind, authorized.ID)
+	room, err := domain.RoomName(environment, input.Kind, authorized.ID)
 	if err != nil {
 		return IssuedToken{}, fmt.Errorf("derive media room: %w", err)
+	}
+	identity, err := domain.ParticipantIdentity(environment, userID.String())
+	if err != nil {
+		return IssuedToken{}, fmt.Errorf("derive media identity: %w", err)
 	}
 
 	now := s.now().UTC()
@@ -140,7 +158,7 @@ func (s *TokenService) Issue(ctx context.Context, input IssueTokenInput) (Issued
 	}
 
 	signed, err := s.signer.Sign(ctx, SignInput{
-		Identity:    userID.String(),
+		Identity:    identity,
 		DisplayName: authorized.DisplayName,
 		Room:        room,
 		ExpiresAt:   deadline,
