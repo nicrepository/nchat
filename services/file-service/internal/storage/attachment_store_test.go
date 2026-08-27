@@ -404,6 +404,8 @@ func authorizedAttachmentRow(status domain.Status) []any {
 		text(testKEKKeyID),
 		pgtype.Int2{Int16: 2, Valid: true},
 		timestamp(time.Now()),
+		pgtype.Text{},
+		pgtype.Int4{},
 		text(string(domain.PreviewStatusReady)),
 		text(testPreviewObject),
 		pgtype.Int8{Int64: 4096, Valid: true},
@@ -424,7 +426,7 @@ func TestGetAuthorizedReadsAnAbsentPreviewStateAsUnsupported(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			row := authorizedAttachmentRow(domain.StatusClean)
-			row[15] = stored
+			row[17] = stored
 			pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
 				return valueRow{values: row}
 			}}

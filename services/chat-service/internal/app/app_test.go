@@ -925,6 +925,28 @@ func TestDomainMessageToWSPayloadCarriesAttachmentMetadata(t *testing.T) {
 	}
 }
 
+// The WebSocket payload carries the same RF-670 voice fields as the HTTP one
+// (issue #670), so a client never needs a follow-up GET to tell a voice
+// message from an ordinary attachment delivered over the socket.
+func TestDomainMessageToWSPayloadCarriesVoiceMessageFields(t *testing.T) {
+	attachment := domain.MessageAttachment{
+		ID: "attachment-1", Filename: "voice-message.ogg", ContentType: "audio/ogg",
+		SizeBytes: 4096, Status: "clean", PreviewStatus: "unsupported",
+		AudioKind: "voice", DurationMs: 4200,
+	}
+	payload := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+		SenderID: "user-1", Attachments: []domain.MessageAttachment{attachment},
+	})
+	if len(payload.Attachments) != 1 {
+		t.Fatalf("attachment payload not mapped: %+v", payload.Attachments)
+	}
+	got := payload.Attachments[0]
+	if got.AudioKind != "voice" || got.DurationMs != 4200 {
+		t.Fatalf("voice fields not carried through: %+v", got)
+	}
+}
+
 func TestDomainMessageToWSPayloadWithholdsAttachmentsOnRemovedMessage(t *testing.T) {
 	payload := domainMessageToWSPayload(domain.Message{
 		ID: "message-1", Status: domain.MessageStatusDeleted, DeletedAt: time.Now().UTC(),

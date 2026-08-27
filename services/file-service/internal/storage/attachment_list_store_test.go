@@ -34,6 +34,7 @@ func attachmentRowValues(id, status, filename, mime string, size int64, createdA
 	return []any{
 		id, status, text(string(domain.PreviewStatusReady)), filename, mime, size,
 		pgtype.Timestamptz{Time: createdAt, Valid: true},
+		"", int32(0),
 	}
 }
 
