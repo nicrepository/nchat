@@ -92,7 +92,11 @@ beforeEach(() => {
     configurable: true,
   });
   vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
-  vi.stubGlobal("URL", { ...URL, createObjectURL: vi.fn(() => "blob:voice-1"), revokeObjectURL: vi.fn() });
+  vi.stubGlobal("URL", {
+    ...URL,
+    createObjectURL: vi.fn(() => "blob:voice-1"),
+    revokeObjectURL: vi.fn(),
+  });
 });
 
 afterEach(() => {

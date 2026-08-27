@@ -226,12 +226,20 @@ export default function AudioPlayer({
         {rate}x
       </button>
       {buffering && !showError && (
-        <span className="chat-msg-area__audio-note" role="status" data-testid={`${testIdPrefix}-buffering`}>
+        <span
+          className="chat-msg-area__audio-note"
+          role="status"
+          data-testid={`${testIdPrefix}-buffering`}
+        >
           Carregando…
         </span>
       )}
       {showError && (
-        <span className="chat-msg-area__audio-note" role="alert" data-testid={`${testIdPrefix}-error`}>
+        <span
+          className="chat-msg-area__audio-note"
+          role="alert"
+          data-testid={`${testIdPrefix}-error`}
+        >
           Não foi possível reproduzir o áudio.
         </span>
       )}

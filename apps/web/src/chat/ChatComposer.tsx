@@ -622,9 +622,7 @@ function voiceOptions(
   if (!hasDestination || !supported) return null;
   return {
     disabled: !attachEnabled || uploading || hasComposerAttachments,
-    title: hasComposerAttachments
-      ? "Remova os anexos para gravar uma mensagem de voz."
-      : undefined,
+    title: hasComposerAttachments ? "Remova os anexos para gravar uma mensagem de voz." : undefined,
     onStart,
   };
 }

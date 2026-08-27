@@ -128,7 +128,8 @@ export default function VoiceRecorderPanel({ recorder }: { recorder: VoiceRecord
       {phase === "uploading" && (
         <p className="chat-msg-area__voice-status" role="status">
           Enviando mensagem de voz…
-          {uploadProgress && ` ${Math.floor((uploadProgress.loaded / uploadProgress.total) * 100)}%`}
+          {uploadProgress &&
+            ` ${Math.floor((uploadProgress.loaded / uploadProgress.total) * 100)}%`}
         </p>
       )}
 

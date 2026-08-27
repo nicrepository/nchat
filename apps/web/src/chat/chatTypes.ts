@@ -822,7 +822,9 @@ function parseMessageAttachment(raw: unknown): ChannelAttachment | undefined {
     previewStatus: parseAttachmentPreviewStatus(item.preview_status),
     createdAt: "",
     ...(audioKind ? { audioKind } : {}),
-    ...(typeof item.duration_ms === "number" && Number.isFinite(item.duration_ms) && item.duration_ms > 0
+    ...(typeof item.duration_ms === "number" &&
+    Number.isFinite(item.duration_ms) &&
+    item.duration_ms > 0
       ? { durationMs: item.duration_ms }
       : {}),
   };

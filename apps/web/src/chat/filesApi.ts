@@ -57,7 +57,9 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
     previewStatus: parseAttachmentPreviewStatus(item.previewStatus),
     createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
     ...(audioKind ? { audioKind } : {}),
-    ...(typeof item.durationMs === "number" && Number.isFinite(item.durationMs) && item.durationMs > 0
+    ...(typeof item.durationMs === "number" &&
+    Number.isFinite(item.durationMs) &&
+    item.durationMs > 0
       ? { durationMs: item.durationMs }
       : {}),
   };

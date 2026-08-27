@@ -211,8 +211,7 @@ export function useVoiceRecorder({
   const handleStop = useCallback(() => {
     clearTimer();
     stopTracks();
-    const finalElapsed =
-      accumulatedMsRef.current + (performance.now() - segmentStartRef.current);
+    const finalElapsed = accumulatedMsRef.current + (performance.now() - segmentStartRef.current);
     if (discardingRef.current) {
       discardingRef.current = false;
       setState(initialState);

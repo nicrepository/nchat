@@ -92,7 +92,9 @@ describe("AttachmentAudio", () => {
 
     fireEvent.click(screen.getByTestId("chat-audio-a-1-playpause"));
 
-    await waitFor(() => expect(mockFetchAttachmentContent).toHaveBeenCalledWith("a-1", expect.any(AbortSignal)));
+    await waitFor(() =>
+      expect(mockFetchAttachmentContent).toHaveBeenCalledWith("a-1", expect.any(AbortSignal)),
+    );
     const el = await screen.findByTestId("chat-audio-a-1-audio-el");
     const src = el.getAttribute("src") ?? "";
     expect(src).toBe("blob:audio-1");
