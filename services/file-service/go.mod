@@ -8,7 +8,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/klippa-app/go-pdfium v1.19.6
 	github.com/nicrepository/nchat/libs/go/platform v0.0.0
-	github.com/prometheus/client_golang v1.22.0
+	github.com/prometheus/client_golang v1.24.1
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/valkey-io/valkey-go v1.0.75
 	github.com/xuri/excelize/v2 v2.11.0
@@ -27,9 +27,9 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jolestar/go-commons-pool/v2 v2.1.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/prometheus/client_model v0.6.1 // indirect
-	github.com/prometheus/common v0.62.0 // indirect
-	github.com/prometheus/procfs v0.15.1 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
+	github.com/prometheus/common v0.70.1 // indirect
+	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/richardlehane/mscfb v1.0.7 // indirect
 	github.com/richardlehane/msoleps v1.0.6 // indirect
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect
