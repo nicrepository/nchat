@@ -32,6 +32,7 @@ NCHAT_PROD_STABLE_SERVICES=(
   auth-service
   chat-service
   file-service
+  document-converter
   notification-service
   admin-service
   search-service
@@ -423,7 +424,7 @@ image_for_service() {
   case "$1" in
     nchat-web) printf 'web' ;;
     nchat-admin-web) printf 'admin-web' ;;
-    auth-service|chat-service|file-service|notification-service|admin-service|search-service|media-service)
+    auth-service|chat-service|file-service|document-converter|notification-service|admin-service|search-service|media-service)
       printf '%s' "$1" ;;
     *) return 1 ;;
   esac

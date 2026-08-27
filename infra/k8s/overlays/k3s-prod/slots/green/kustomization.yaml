@@ -47,6 +47,8 @@ images:
     newTag: sha-placeholder
   - name: ghcr.io/nicrepository/nchat/file-service
     newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/document-converter
+    newTag: sha-placeholder
   - name: ghcr.io/nicrepository/nchat/notification-service
     newTag: sha-placeholder
   - name: ghcr.io/nicrepository/nchat/admin-service

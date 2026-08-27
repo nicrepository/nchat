@@ -10,7 +10,7 @@
 
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentPreview } from "./filesApi";
-import type { ChannelAttachment } from "./chatTypes";
+import { isPreviewAvailable, isPreviewPending, type ChannelAttachment } from "./chatTypes";
 
 /**
  * Decides whether an attachment may show a preview at all.
@@ -22,7 +22,7 @@ import type { ChannelAttachment } from "./chatTypes";
  * request to be told what the metadata already said.
  */
 export function canShowPreview(attachment: ChannelAttachment): boolean {
-  return attachment.status === "clean" && attachment.previewStatus === "ready";
+  return attachment.status === "clean" && isPreviewAvailable(attachment.previewStatus);
 }
 
 /**
@@ -55,7 +55,7 @@ export function canShowPreview(attachment: ChannelAttachment): boolean {
  * "could this still change", never "keep asking forever".
  */
 export function isPreviewWorkPending(attachment: ChannelAttachment): boolean {
-  if (attachment.previewStatus !== "pending") {
+  if (!isPreviewPending(attachment.previewStatus)) {
     return false;
   }
   return attachment.status === "pending_scan" || attachment.status === "clean";

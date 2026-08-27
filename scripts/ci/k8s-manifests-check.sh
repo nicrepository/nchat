@@ -770,6 +770,7 @@ validate_nchat_dev() {
   grep -q 'name: nchat-default-deny-ingress' "$application"
 
   [[ "$(network_policy_names_by_type "$application" Egress)" == "$(printf '%s\n' \
+    document-converter-isolation \
     nchat-allow-admin-postgres-egress \
     nchat-allow-auth-keycloak-egress \
     nchat-allow-auth-postgres-egress \
@@ -777,6 +778,7 @@ validate_nchat_dev() {
     nchat-allow-dns-egress \
     nchat-allow-file-clamav-egress \
     nchat-allow-file-data-egress \
+    nchat-allow-file-document-converter-egress \
     nchat-allow-link-safety-egress \
     nchat-allow-livekit-api-egress \
     nchat-allow-media-postgres-egress \

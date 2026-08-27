@@ -33,6 +33,7 @@ func claimedPreviewRow() []any {
 		testAttachmentID,
 		testWorkspaceID,
 		"image/png",
+		"photo.png",
 		int64(4096),
 		testStorageObject,
 		pgtype.Int2{Int16: 1, Valid: true},
@@ -127,8 +128,8 @@ func TestClaimDuePreviewsWrapsDatabaseFailures(t *testing.T) {
 }
 
 func TestMarkPreviewReadyWritesTheWholeBindingAtOnce(t *testing.T) {
-	pool := &fakePool{exec: func(string, ...any) (pgconn.CommandTag, error) {
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
 	}}
 	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(
 		context.Background(), previewResult())
@@ -143,6 +144,7 @@ func TestMarkPreviewReadyWritesTheWholeBindingAtOnce(t *testing.T) {
 		"preview_kek_key_id = $5",
 		"preview_envelope_version = $6",
 		"preview_dek_wrap_version = $7",
+		"preview_page_count = $9",
 		"preview_next_attempt_at = NULL",
 	} {
 		if !strings.Contains(pool.lastSQL, column) {
@@ -160,8 +162,8 @@ func TestMarkPreviewReadyWritesTheWholeBindingAtOnce(t *testing.T) {
 // time and a verdict can land inside that window. Without it, a preview of a
 // file the scanner condemned mid-render would be published as ready.
 func TestMarkPreviewReadyRevalidatesTheScanVerdictBeforePublishing(t *testing.T) {
-	pool := &fakePool{exec: func(string, ...any) (pgconn.CommandTag, error) {
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
 	}}
 	if _, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(
 		context.Background(), previewResult()); err != nil {
@@ -178,9 +180,101 @@ func TestMarkPreviewReadyRevalidatesTheScanVerdictBeforePublishing(t *testing.T)
 	}
 }
 
+// The extra pages ride on the same statement, and the pages a previous attempt
+// might have left behind are cleared unconditionally rather than merged with
+// the new set: cleared and inserted are data-modifying CTEs, which PostgreSQL
+// always runs to completion even though the final SELECT reads only updated.
+func TestMarkPreviewReadyClearsAndReinsertsExtraPages(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
+	}}
+	result := previewResult()
+	result.PageCount = 3
+	result.ExtraPages = []service.PreviewPage{
+		{PageNumber: 2, ObjectID: testPreviewObject, Size: 512,
+			WrappedDEK: []byte{1}, KEKKeyID: testKEKKeyID, EnvelopeVersion: 1, KeyWrapVersion: 2},
+		{PageNumber: 3, ObjectID: testPreviewObject, Size: 512,
+			WrappedDEK: []byte{2}, KEKKeyID: testKEKKeyID, EnvelopeVersion: 1, KeyWrapVersion: 2},
+	}
+	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if err != nil || !recorded {
+		t.Fatalf("recorded = %v, err = %v", recorded, err)
+	}
+	for _, fragment := range []string{
+		"DELETE FROM files.attachment_preview_pages",
+		"INSERT INTO files.attachment_preview_pages",
+		"unnest(",
+	} {
+		if !strings.Contains(pool.lastSQL, fragment) {
+			t.Fatalf("the statement must %q:\n%s", fragment, pool.lastSQL)
+		}
+	}
+	pageNumbers, ok := pool.lastArgs[9].([]int16)
+	if !ok || len(pageNumbers) != 2 || pageNumbers[0] != 2 || pageNumbers[1] != 3 {
+		t.Fatalf("unexpected page numbers argument: %#v", pool.lastArgs[9])
+	}
+}
+
+// A sheet-kind preview must record its content type on the parent row and on
+// every extra page, not just default to image/jpeg by omission.
+func TestMarkPreviewReadyPersistsTheSheetContentType(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
+	}}
+	result := previewResult()
+	result.ContentType = domain.PreviewContentTypeSheet
+	result.PageCount = 1
+
+	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if err != nil || !recorded {
+		t.Fatalf("recorded = %v, err = %v", recorded, err)
+	}
+	if !strings.Contains(pool.lastSQL, "preview_content_type = $17") {
+		t.Fatalf("the update must set preview_content_type:\n%s", pool.lastSQL)
+	}
+	contentType, ok := pool.lastArgs[16].(string)
+	if !ok || contentType != domain.PreviewContentTypeSheet {
+		t.Fatalf("unexpected content type argument: %#v", pool.lastArgs[16])
+	}
+}
+
+// A caller that predates the content-type field (ContentType left at its zero
+// value) must still record a valid, closed-enum value — the true historical
+// one, image/jpeg — never an empty string the CHECK constraint would refuse.
+func TestMarkPreviewReadyDefaultsToJPEGWhenContentTypeIsUnset(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{1}}
+	}}
+	result := previewResult()
+	result.ContentType = ""
+
+	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if err != nil || !recorded {
+		t.Fatalf("recorded = %v, err = %v", recorded, err)
+	}
+	contentType, ok := pool.lastArgs[16].(string)
+	if !ok || contentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("unexpected content type argument: %#v", pool.lastArgs[16])
+	}
+}
+
+func TestMarkPreviewReadyRefusesAnUnknownContentType(t *testing.T) {
+	pool := &fakePool{}
+	result := previewResult()
+	result.ContentType = "application/octet-stream"
+
+	_, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(context.Background(), result)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want ErrInvalidInput", err)
+	}
+	if pool.lastSQL != "" {
+		t.Fatal("an unknown content type must not reach the database")
+	}
+}
+
 func TestMarkPreviewReadyReportsALostRaceWithoutFailing(t *testing.T) {
-	pool := &fakePool{exec: func(string, ...any) (pgconn.CommandTag, error) {
-		return pgconn.NewCommandTag("UPDATE 0"), nil
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row {
+		return valueRow{values: []any{0}}
 	}}
 	recorded, err := storage.NewPGXPreviewStore(pool).MarkPreviewReady(
 		context.Background(), previewResult())

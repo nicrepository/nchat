@@ -299,3 +299,19 @@ func TestObjectCleanupWorkerStopsWhenCancelled(t *testing.T) {
 		t.Fatal("the cleanup worker did not return after cancellation")
 	}
 }
+
+func TestEveryWorkerConstructorFallsBackToTheDefaultLoggerWhenNoneIsGiven(t *testing.T) {
+	processor := newCountingProcessor()
+	if worker.NewPreview(processor, nil) == nil {
+		t.Fatal("NewPreview returned nil")
+	}
+	if worker.NewLinkScan(processor, nil) == nil {
+		t.Fatal("NewLinkScan returned nil")
+	}
+	if worker.NewMalwareScan(processor, nil) == nil {
+		t.Fatal("NewMalwareScan returned nil")
+	}
+	if worker.NewObjectCleanup(processor, nil) == nil {
+		t.Fatal("NewObjectCleanup returned nil")
+	}
+}

@@ -85,12 +85,22 @@ type fakeUseCases struct {
 	previewErr  error
 	previewCall service.AttachmentAuthInput
 
+	documentPage     service.Download
+	documentPageErr  error
+	documentPageCall struct {
+		input service.AttachmentAuthInput
+		page  int
+	}
+
 	listViews []service.AttachmentView
 	listErr   error
 	listInput service.ListDestinationAttachmentsInput
 
 	cancelErr   error
 	cancelInput service.CancelDraftInput
+
+	regenerateErr   error
+	regenerateInput service.AttachmentAuthInput
 }
 
 // AuthorizeUpload stands in for the destination lookup the handler now performs
@@ -192,6 +202,25 @@ func (f *fakeUseCases) Preview(_ context.Context, input service.AttachmentAuthIn
 		return service.Download{}, f.previewErr
 	}
 	return f.preview, nil
+}
+
+func (f *fakeUseCases) DocumentPreviewPage(
+	_ context.Context, input service.AttachmentAuthInput, page int,
+) (service.Download, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.documentPageCall.input, f.documentPageCall.page = input, page
+	if f.documentPageErr != nil {
+		return service.Download{}, f.documentPageErr
+	}
+	return f.documentPage, nil
+}
+
+func (f *fakeUseCases) RegenerateDocumentPreview(_ context.Context, input service.AttachmentAuthInput) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.regenerateInput = input
+	return f.regenerateErr
 }
 
 func (f *fakeUseCases) Ready() bool {
@@ -563,6 +592,9 @@ func TestUploadResponseExposesOnlyTheClientProjection(t *testing.T) {
 		// The preview state is a client concern and carries nothing internal:
 		// it is one of four words, never an object id, a key or a URL.
 		"previewStatus": true,
+		// The page count is bounded navigation metadata, not an identifier: a
+		// small integer, never an object id, a key or a URL.
+		"previewPageCount": true,
 	}
 	for field := range envelope.Data {
 		if !allowed[field] {
@@ -1566,6 +1598,55 @@ func TestDownloadPublishesTheAuthenticatedLengthOnSuccess(t *testing.T) {
 	}
 	if response.Body.String() != string(payload) {
 		t.Fatalf("unexpected body %q", response.Body.String())
+	}
+}
+
+// --- document preview regeneration --------------------------------------
+
+func regenerateRequest(t *testing.T, id string) *http.Request {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/attachments/"+id+"/document-preview/regenerate", nil)
+	request.Header.Set("Authorization", "Bearer "+testToken)
+	return request
+}
+
+func TestRegenerateDocumentPreviewSucceeds(t *testing.T) {
+	id := uuid.NewString()
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, regenerateRequest(t, id))
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", response.Code, response.Body.String())
+	}
+	if useCases.regenerateInput.AttachmentID != id {
+		t.Fatalf("attachment id = %q, want %q", useCases.regenerateInput.AttachmentID, id)
+	}
+}
+
+func TestRegenerateDocumentPreviewRequiresAuthentication(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	request := httptest.NewRequest(http.MethodPost, "/attachments/"+uuid.NewString()+"/document-preview/regenerate", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
+func TestRegenerateDocumentPreviewHidesInvisibleAttachments(t *testing.T) {
+	useCases := readyUseCases()
+	useCases.regenerateErr = domain.ErrNotFound
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, regenerateRequest(t, uuid.NewString()))
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", response.Code)
 	}
 }
 

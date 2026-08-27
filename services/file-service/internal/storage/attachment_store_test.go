@@ -30,6 +30,87 @@ func newAttachment(kind domain.DestinationKind, destinationID string) service.Ne
 	}
 }
 
+func TestRegenerateDocumentPreviewUsesAnIdempotentFailedOrExpiredCAS(t *testing.T) {
+	pool := &fakePool{queryRow: func(sql string, args ...any) pgx.Row {
+		for _, fragment := range []string{
+			"preview_lifecycle_status IN ('failed', 'expired')",
+			"preview_lifecycle_status = 'pending'",
+			"preview_attempts = 0",
+			"status = 'clean'",
+			"deleted_at IS NULL",
+		} {
+			if !strings.Contains(sql, fragment) {
+				t.Errorf("regeneration query missing %q:\n%s", fragment, sql)
+			}
+		}
+		if len(args) != 1 || args[0] != testAttachmentID {
+			t.Errorf("arguments = %v", args)
+		}
+		return valueRow{values: []any{true}}
+	}}
+	if err := storage.NewPGXAttachmentStore(pool).RegenerateDocumentPreview(context.Background(), testAttachmentID); err != nil {
+		t.Fatalf("RegenerateDocumentPreview: %v", err)
+	}
+
+	pool.queryRow = func(string, ...any) pgx.Row { return valueRow{values: []any{false}} }
+	if err := storage.NewPGXAttachmentStore(pool).RegenerateDocumentPreview(context.Background(), testAttachmentID); !errors.Is(err, domain.ErrPreviewUnavailable) {
+		t.Fatalf("invalid state error = %v", err)
+	}
+}
+
+func TestGetPreviewPageReturnsTheStoredPage(t *testing.T) {
+	pool := &fakePool{queryRow: func(sql string, args ...any) pgx.Row {
+		if !strings.Contains(sql, "FROM files.attachment_preview_pages") {
+			t.Errorf("query does not read the per-page table:\n%s", sql)
+		}
+		if len(args) != 2 || args[0] != testAttachmentID || args[1] != 2 {
+			t.Errorf("arguments = %v", args)
+		}
+		return valueRow{values: []any{
+			pgtype.Text{String: "object-2", Valid: true},
+			pgtype.Int8{Int64: 4096, Valid: true},
+			[]byte("wrapped-dek"),
+			pgtype.Text{String: "kek-1", Valid: true},
+			pgtype.Int2{Int16: 1, Valid: true},
+			pgtype.Int2{Int16: 2, Valid: true},
+			pgtype.Text{String: "image/jpeg", Valid: true},
+		}}
+	}}
+	page, err := storage.NewPGXAttachmentStore(pool).GetPreviewPage(context.Background(), testAttachmentID, 2)
+	if err != nil {
+		t.Fatalf("GetPreviewPage: %v", err)
+	}
+	if page.PageNumber != 2 || page.ObjectID != "object-2" || page.Size != 4096 ||
+		page.KEKKeyID != "kek-1" || page.ContentType != "image/jpeg" ||
+		page.EnvelopeVersion != 1 || page.KeyWrapVersion != 2 {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+}
+
+func TestGetPreviewPageIsNonEnumeratingForAMissingPage(t *testing.T) {
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row { return errRow{err: pgx.ErrNoRows} }}
+	_, err := storage.NewPGXAttachmentStore(pool).GetPreviewPage(context.Background(), testAttachmentID, 99)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetPreviewPageWrapsDatabaseFailures(t *testing.T) {
+	dbErr := errors.New("connection reset")
+	pool := &fakePool{queryRow: func(string, ...any) pgx.Row { return errRow{err: dbErr} }}
+	_, err := storage.NewPGXAttachmentStore(pool).GetPreviewPage(context.Background(), testAttachmentID, 2)
+	if err == nil || errors.Is(err, domain.ErrNotFound) || !strings.Contains(err.Error(), "read preview page") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestGetPreviewPageRequiresAPool(t *testing.T) {
+	var store *storage.PGXAttachmentStore
+	if _, err := store.GetPreviewPage(context.Background(), testAttachmentID, 1); !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("error = %v, want ErrDependenciesUnavailable", err)
+	}
+}
+
 func TestCreatePendingSetsExactlyOneDestinationColumn(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -413,6 +494,8 @@ func authorizedAttachmentRow(status domain.Status) []any {
 		text(testKEKKeyID),
 		pgtype.Int2{Int16: 1, Valid: true},
 		pgtype.Int2{Int16: 2, Valid: true},
+		pgtype.Int2{Int16: 1, Valid: true},
+		text(domain.PreviewContentTypeJPEG),
 	}
 }
 

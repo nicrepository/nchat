@@ -24,6 +24,29 @@ func TestPreviewStatusSetIsClosed(t *testing.T) {
 	}
 }
 
+func TestPreviewLifecycleAllowsOnlyDefinedTransitions(t *testing.T) {
+	allowed := [][2]domain.PreviewLifecycleStatus{
+		{domain.PreviewLifecyclePending, domain.PreviewLifecycleScanning},
+		{domain.PreviewLifecycleScanning, domain.PreviewLifecyclePending},
+		{domain.PreviewLifecyclePending, domain.PreviewLifecycleGenerating},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleAvailable},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleFailed},
+		{domain.PreviewLifecycleGenerating, domain.PreviewLifecycleBlocked},
+		{domain.PreviewLifecycleAvailable, domain.PreviewLifecycleExpired},
+		{domain.PreviewLifecycleFailed, domain.PreviewLifecyclePending},
+		{domain.PreviewLifecycleExpired, domain.PreviewLifecyclePending},
+	}
+	for _, transition := range allowed {
+		if !transition[0].CanTransitionTo(transition[1]) {
+			t.Errorf("transition %s -> %s rejected", transition[0], transition[1])
+		}
+	}
+	if domain.PreviewLifecycleAvailable.CanTransitionTo(domain.PreviewLifecycleGenerating) ||
+		domain.PreviewLifecycleBlocked.CanTransitionTo(domain.PreviewLifecyclePending) {
+		t.Fatal("invalid lifecycle transition accepted")
+	}
+}
+
 // Only one state may be served, and the check is positive: an unrecognised
 // value must never be treated as a preview that exists.
 func TestOnlyAReadyPreviewIsServable(t *testing.T) {
@@ -58,6 +81,11 @@ func TestOnlyPendingIsNonTerminal(t *testing.T) {
 func TestPreviewSupportedNamesExactlyTheRenderableTypes(t *testing.T) {
 	for _, supported := range []string{
 		"image/jpeg", "image/png", "image/gif", "application/pdf",
+		// text/plain and application/zip are the coarse sniffs
+		// net/http.DetectContentType actually produces for CSV and XLSX —
+		// never the specific strings, which that sniffer cannot name. See
+		// previewableMIMEs' own comment.
+		"text/plain", "application/zip",
 		"IMAGE/PNG", " image/jpeg ", "image/jpeg; charset=binary",
 	} {
 		if !domain.PreviewSupported(supported) {
@@ -65,7 +93,7 @@ func TestPreviewSupportedNamesExactlyTheRenderableTypes(t *testing.T) {
 		}
 	}
 	for _, unsupported := range []string{
-		"", "image/webp", "image/svg+xml", "text/html", "application/zip",
+		"", "image/webp", "image/svg+xml", "text/html",
 		"video/mp4", "application/octet-stream", "application/pdf-something",
 	} {
 		if domain.PreviewSupported(unsupported) {
@@ -92,7 +120,7 @@ func TestInitialPreviewStatusQueuesOnlyWhatCanBeRendered(t *testing.T) {
 	}{
 		"image":            {detected: "image/png", size: 4096, want: domain.PreviewStatusPending},
 		"pdf":              {detected: "application/pdf", size: 4096, want: domain.PreviewStatusPending},
-		"unknown type":     {detected: "application/zip", size: 4096, want: domain.PreviewStatusUnsupported},
+		"unknown type":     {detected: "video/mp4", size: 4096, want: domain.PreviewStatusUnsupported},
 		"empty":            {detected: "image/png", size: 0, want: domain.PreviewStatusUnsupported},
 		"at the limit":     {detected: "image/png", size: domain.MaxPreviewSourceBytes, want: domain.PreviewStatusPending},
 		"beyond the limit": {detected: "image/png", size: domain.MaxPreviewSourceBytes + 1, want: domain.PreviewStatusUnsupported},
@@ -126,7 +154,70 @@ func TestPreviewObjectKeyIsDerivedOnlyFromTheGeneratedID(t *testing.T) {
 }
 
 func TestPreviewContentTypeIsFixed(t *testing.T) {
-	if domain.PreviewContentType != "image/jpeg" {
-		t.Fatalf("preview content type = %q", domain.PreviewContentType)
+	if domain.PreviewContentTypeJPEG != "image/jpeg" {
+		t.Fatalf("preview content type = %q", domain.PreviewContentTypeJPEG)
+	}
+}
+
+func TestPreviewLifecycleStatusSetIsClosed(t *testing.T) {
+	for _, status := range []domain.PreviewLifecycleStatus{
+		domain.PreviewLifecyclePending, domain.PreviewLifecycleScanning,
+		domain.PreviewLifecycleGenerating, domain.PreviewLifecycleAvailable,
+		domain.PreviewLifecycleFailed, domain.PreviewLifecycleBlocked,
+		domain.PreviewLifecycleExpired,
+	} {
+		if !status.Valid() {
+			t.Fatalf("%q must be a valid preview lifecycle status", status)
+		}
+	}
+	for _, status := range []domain.PreviewLifecycleStatus{"", "READY", "processing", "clean"} {
+		if status.Valid() {
+			t.Fatalf("%q must not be a valid preview lifecycle status", status)
+		}
+	}
+}
+
+func TestPreviewContentTypeValidAcceptsOnlyTheTwoStoredShapes(t *testing.T) {
+	for _, valid := range []string{domain.PreviewContentTypeJPEG, domain.PreviewContentTypeSheet} {
+		if !domain.PreviewContentTypeValid(valid) {
+			t.Fatalf("%q must be a valid preview content type", valid)
+		}
+	}
+	for _, invalid := range []string{"", "application/json", "image/png"} {
+		if domain.PreviewContentTypeValid(invalid) {
+			t.Fatalf("%q must not be a valid preview content type", invalid)
+		}
+	}
+}
+
+func TestInitialDocumentPreviewStatusAdmitsALegacyPPTByExtension(t *testing.T) {
+	// A legacy .ppt sniffs to the generic application/octet-stream — there is
+	// no signature for it — so the extension is what makes it a candidate at
+	// all; the worker still re-validates the CFB signature before rendering.
+	status := domain.InitialDocumentPreviewStatus("application/octet-stream", "slides.ppt", 2048)
+	if status != domain.PreviewStatusPending {
+		t.Fatalf("status = %q, want pending", status)
+	}
+}
+
+func TestInitialDocumentPreviewStatusRejectsAnOversizedLegacyPPT(t *testing.T) {
+	status := domain.InitialDocumentPreviewStatus(
+		"application/octet-stream", "slides.ppt", domain.MaxPreviewSourceBytes+1,
+	)
+	if status != domain.PreviewStatusUnsupported {
+		t.Fatalf("status = %q, want unsupported", status)
+	}
+}
+
+func TestInitialDocumentPreviewStatusFallsBackToTheGenericRulesForEverythingElse(t *testing.T) {
+	// A .bin with the same octet-stream sniff but no .ppt extension is not a
+	// document-preview candidate at all, and falls through to InitialPreviewStatus.
+	status := domain.InitialDocumentPreviewStatus("application/octet-stream", "archive.bin", 2048)
+	if status != domain.PreviewStatusUnsupported {
+		t.Fatalf("status = %q, want unsupported", status)
+	}
+	status = domain.InitialDocumentPreviewStatus("application/pdf", "report.pdf", 2048)
+	if status != domain.PreviewStatusPending {
+		t.Fatalf("status = %q, want pending", status)
 	}
 }

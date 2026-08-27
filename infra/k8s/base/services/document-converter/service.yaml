@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: document-converter
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: document-converter
+spec:
+  selector:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/component: document-converter
+  ports:
+    - name: http
+      port: 8089
+      targetPort: http

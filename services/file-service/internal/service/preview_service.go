@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -91,6 +94,7 @@ type PreviewJob struct {
 	AttachmentID     string
 	WorkspaceID      string
 	DetectedMIME     string
+	OriginalFilename string
 	Size             int64
 	StorageObjectKey string
 	EnvelopeVersion  int
@@ -142,6 +146,10 @@ const (
 // PreviewResult is a produced preview, ready to be recorded against its
 // attachment. Like UploadedAttachment, the length and the key material travel
 // together because the wrapped key authenticates the length.
+//
+// The fields above PageCount describe page one exactly as they always have —
+// that object stays the one files.attachments.preview_object_id points at, so
+// every existing reader of this struct is unaffected by pages beyond it.
 type PreviewResult struct {
 	AttachmentID string
 	// ClaimAttempt is the fencing token of the claim that produced this
@@ -154,6 +162,40 @@ type PreviewResult struct {
 	KEKKeyID        string
 	EnvelopeVersion int
 	KeyWrapVersion  int
+
+	// PageCount is the total number of pages actually rendered and stored,
+	// page one included. It is the count achieved inside the job's budget,
+	// never the document's true page count if the two differ (see
+	// preview.renderPDFPages) — a preview always describes exactly what was
+	// published, never what was attempted.
+	PageCount int
+	// ExtraPages holds pages 2..PageCount. Empty for every image and every
+	// one-page PDF, which is every preview this service produced before this
+	// field existed.
+	ExtraPages []PreviewPage
+	// ContentType is what every page in this result decodes to — the same
+	// value for page one and every extra page, since a render never mixes
+	// content types across its own pages. domain.PreviewContentTypeJPEG for
+	// every renderer that predates this field.
+	ContentType string
+}
+
+// PreviewPage is one page beyond the first, ready to be recorded in
+// files.attachment_preview_pages. It carries the same binding shape as page
+// one because it is stored exactly the same way: its own object, its own data
+// key, the same envelope.
+type PreviewPage struct {
+	PageNumber      int
+	ObjectID        string
+	Size            int64
+	WrappedDEK      []byte
+	KEKKeyID        string
+	EnvelopeVersion int
+	KeyWrapVersion  int
+	// ContentType mirrors PreviewResult.ContentType — carried per page because
+	// GetPreviewPage reads a page in isolation, never alongside the result
+	// that produced it.
+	ContentType string
 }
 
 // PreviewStore is the persistence half of preview generation.
@@ -190,11 +232,18 @@ type FenceHandle interface {
 	Release(ctx context.Context)
 }
 
-// PreviewRenderer turns plaintext into the preview image. It is an interface so
-// the job can be tested without a decoder, and so the decoders stay in a
-// package that knows nothing about storage or the database.
+// PreviewRenderer turns plaintext into the preview pages plus the one content
+// type every one of those pages decodes to. It is an interface so the job can
+// be tested without a decoder, and so the decoders stay in a package that
+// knows nothing about storage or the database. Every non-PDF/sheet render is
+// a length-1 slice; a PDF may return more, all JPEG; a spreadsheet/CSV
+// returns exactly one page of bounded table JSON.
 type PreviewRenderer interface {
-	Render(ctx context.Context, detectedMIME string, src io.Reader) ([]byte, error)
+	Render(ctx context.Context, detectedMIME string, src io.Reader) (pages [][]byte, contentType string, err error)
+}
+
+type documentPreviewRenderer interface {
+	RenderDocument(ctx context.Context, detectedMIME, originalFilename string, src io.Reader) (pages [][]byte, contentType string, err error)
 }
 
 // PreviewObserver counts preview outcomes. It carries no labels beyond the
@@ -351,12 +400,12 @@ func (s *PreviewService) process(ctx context.Context, job PreviewJob) {
 		return
 	}
 
-	rendered, err := s.render(jobCtx, job)
+	rendered, contentType, err := s.render(jobCtx, job)
 	if err != nil {
 		s.finishFailed(ctx, job, err, started)
 		return
 	}
-	outcome, err := s.persist(jobCtx, job, rendered)
+	outcome, err := s.persist(jobCtx, job, rendered, contentType)
 	if err != nil {
 		s.finishFailed(ctx, job, err, started)
 		return
@@ -396,12 +445,13 @@ func (s *PreviewService) finalizeExhausted(ctx context.Context, job PreviewJob, 
 	s.logPreview(ctx, slog.LevelWarn, job, previewResultFailed, started)
 }
 
-// render reads the attachment back and produces the preview image.
+// render reads the attachment back and produces the preview image, one JPEG
+// per page.
 //
 // The content is opened exactly the way a download opens it — same key ring,
 // same binding, same verifying reader — so a tampered or truncated object fails
 // here too rather than being rendered into a preview of something else.
-func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([]byte, error) {
+func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, string, error) {
 	content, err := openEncryptedObject(ctx, s.keys, s.objects, s.logger, encryptedObject{
 		objectID:        job.AttachmentID,
 		workspaceID:     job.WorkspaceID,
@@ -413,95 +463,176 @@ func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([]byte, er
 		keyWrapVersion:  job.KeyWrapVersion,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = content.Close() }()
 
+	if renderer, ok := s.renderer.(documentPreviewRenderer); ok {
+		return renderer.RenderDocument(ctx, job.DetectedMIME, job.OriginalFilename, content)
+	}
 	return s.renderer.Render(ctx, job.DetectedMIME, content)
 }
 
-// persist encrypts the rendered image, stores it and records it.
+// persistedPage is one encrypted-and-stored page, kept around only long
+// enough to either land in the published PreviewResult or be discarded.
+type persistedPage struct {
+	objectID   uuid.UUID
+	objectKey  string
+	size       int64
+	wrappedDEK []byte
+	kekKeyID   string
+}
+
+// persist encrypts every rendered page, stores each as its own object and
+// records the whole set in one write.
 //
-// The preview is a first-class encrypted object: its own random identity, its
+// Every page is a first-class encrypted object: its own random identity, its
 // own data key, the same envelope and the same key ring as the attachment it
-// belongs to. Nothing about it is weaker for being derived — a thumbnail of a
-// document is still that document's content.
+// belongs to. Nothing about any of them is weaker for being derived — a
+// thumbnail of a document is still that document's content.
 //
 // The ordering mirrors the upload path for the same reason: the row only points
-// at an object that is already durable, so no state is reachable in which a
-// preview is servable but absent.
+// at objects that are already durable, so no state is reachable in which a
+// preview is servable but some of its pages are absent.
 func (s *PreviewService) persist(
-	ctx context.Context, job PreviewJob, image []byte,
+	ctx context.Context, job PreviewJob, images [][]byte, contentType string,
 ) (previewPersistOutcome, error) {
-	previewID := uuid.New()
 	workspaceID, err := uuid.Parse(job.WorkspaceID)
 	if err != nil {
 		return previewPersistSuperseded, fmt.Errorf("invalid stored workspace id")
 	}
-	dataKey, err := crypto.NewDataKey()
-	if err != nil {
-		return previewPersistSuperseded, fmt.Errorf("prepare preview key: %w", err)
-	}
-	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(image), dataKey, previewID)
-	if err != nil {
-		return previewPersistSuperseded, fmt.Errorf("prepare preview envelope: %w", err)
+	if contentType == "" {
+		// Every renderer built before this field existed produces JPEG and
+		// nothing else.
+		contentType = domain.PreviewContentTypeJPEG
 	}
 
-	objectKey := domain.PreviewObjectKey(previewID)
+	pages := make([]persistedPage, 0, len(images))
+	for _, image := range images {
+		page, err := s.persistPage(ctx, workspaceID, image)
+		if err != nil {
+			// page may itself name an object that reached storage before the
+			// failure, so it joins the pages already persisted for cleanup.
+			s.discardPersistedPages(ctx, job, append(pages, page))
+			return previewPersistSuperseded, err
+		}
+		pages = append(pages, page)
+	}
+
+	first := pages[0]
+	extra := make([]PreviewPage, 0, len(pages)-1)
+	for i, page := range pages[1:] {
+		extra = append(extra, PreviewPage{
+			PageNumber:      i + 2,
+			ObjectID:        page.objectID.String(),
+			Size:            page.size,
+			WrappedDEK:      page.wrappedDEK,
+			KEKKeyID:        page.kekKeyID,
+			EnvelopeVersion: crypto.EnvelopeVersion,
+			KeyWrapVersion:  crypto.KeyWrapVersion,
+			ContentType:     contentType,
+		})
+	}
+
+	recorded, err := s.store.MarkPreviewReady(ctx, PreviewResult{
+		AttachmentID:    job.AttachmentID,
+		ClaimAttempt:    job.Attempts,
+		PreviewObjectID: first.objectID.String(),
+		Size:            first.size,
+		WrappedDEK:      first.wrappedDEK,
+		KEKKeyID:        first.kekKeyID,
+		EnvelopeVersion: crypto.EnvelopeVersion,
+		KeyWrapVersion:  crypto.KeyWrapVersion,
+		PageCount:       len(pages),
+		ExtraPages:      extra,
+		ContentType:     contentType,
+	})
+	if err != nil {
+		s.discardPersistedPages(ctx, job, pages)
+		return previewPersistSuperseded, fmt.Errorf("record preview: %w", err)
+	}
+	if !recorded {
+		// This attempt no longer owns the job: another claim superseded it, the
+		// scan condemned the attachment, or it was removed. Every object here
+		// is this attempt's own — nothing else ever writes to these keys — so
+		// discarding all of them cannot affect whatever won, and keeping any
+		// would leave an object nothing points at.
+		//
+		// The outcome goes back to the caller rather than being logged here, so
+		// there is one record of it, with the job's real duration, on the same
+		// path every other outcome is reported from.
+		s.discardPersistedPages(ctx, job, pages)
+		return previewPersistSuperseded, nil
+	}
+	return previewPersistPublished, nil
+}
+
+// persistPage encrypts and stores one rendered page. It does not record
+// anything against the attachment — that happens once, for every page
+// together, in persist.
+func (s *PreviewService) persistPage(
+	ctx context.Context, workspaceID uuid.UUID, image []byte,
+) (persistedPage, error) {
+	objectID := uuid.New()
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		return persistedPage{}, fmt.Errorf("prepare preview key: %w", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(image), dataKey, objectID)
+	if err != nil {
+		return persistedPage{}, fmt.Errorf("prepare preview envelope: %w", err)
+	}
+
+	objectKey := domain.PreviewObjectKey(objectID)
 	ciphertextSize, err := s.objects.Put(ctx, objectKey, encrypted)
 	if err != nil {
 		// A failed write may still have left a partial object behind, so it is
-		// treated as stored and cleaned up.
-		s.discardPreviewObject(ctx, job, objectKey)
-		return previewPersistSuperseded, fmt.Errorf("store preview object: %w", err)
+		// treated as stored and left for the caller to discard.
+		return persistedPage{objectID: objectID, objectKey: objectKey},
+			fmt.Errorf("store preview object: %w", err)
 	}
 	size := int64(len(image))
 	if want := crypto.CiphertextSize(size); ciphertextSize != want {
-		s.discardPreviewObject(ctx, job, objectKey)
-		return previewPersistSuperseded, fmt.Errorf(
+		// A failed write may still have left a partial object behind, so it is
+		// treated as stored and left for the caller to discard.
+		return persistedPage{objectID: objectID, objectKey: objectKey}, fmt.Errorf(
 			"stored preview envelope is %d bytes, expected %d", ciphertextSize, want)
 	}
 
 	wrappedDEK, keyID, err := s.keys.Wrap(dataKey, crypto.Binding{
-		AttachmentID:           previewID,
+		AttachmentID:           objectID,
 		WorkspaceID:            workspaceID,
 		PlaintextSize:          size,
 		KeyWrapVersion:         crypto.KeyWrapVersion,
 		ContentEnvelopeVersion: crypto.EnvelopeVersion,
 	})
 	if err != nil {
-		s.discardPreviewObject(ctx, job, objectKey)
-		return previewPersistSuperseded, fmt.Errorf("wrap preview key: %w", err)
+		return persistedPage{objectID: objectID, objectKey: objectKey}, fmt.Errorf(
+			"wrap preview key: %w", err)
 	}
+	return persistedPage{
+		objectID: objectID, objectKey: objectKey, size: size,
+		wrappedDEK: wrappedDEK, kekKeyID: keyID,
+	}, nil
+}
 
-	recorded, err := s.store.MarkPreviewReady(ctx, PreviewResult{
-		AttachmentID:    job.AttachmentID,
-		ClaimAttempt:    job.Attempts,
-		PreviewObjectID: previewID.String(),
-		Size:            size,
-		WrappedDEK:      wrappedDEK,
-		KEKKeyID:        keyID,
-		EnvelopeVersion: crypto.EnvelopeVersion,
-		KeyWrapVersion:  crypto.KeyWrapVersion,
-	})
-	if err != nil {
-		s.discardPreviewObject(ctx, job, objectKey)
-		return previewPersistSuperseded, fmt.Errorf("record preview: %w", err)
+// discardPersistedPages discards every page in pages that reached storage.
+//
+// It is the multi-page answer to what a single-page job always guaranteed:
+// nothing servable is left half-written, and nothing storable is left
+// unaccounted-for. A render that produces N pages but fails to publish must
+// not leak N-1 of them just because only the last one hit an error — every
+// object this attempt put into storage is this attempt's own, and all of them
+// are discarded together, in one pass, on every failure path in persist.
+func (s *PreviewService) discardPersistedPages(ctx context.Context, job PreviewJob, pages []persistedPage) {
+	for _, page := range pages {
+		if page.objectKey == "" {
+			// Nothing reached storage for this page — a key-prep failure
+			// before the first Put — so there is nothing to discard.
+			continue
+		}
+		s.discardPreviewObject(ctx, job, page.objectKey)
 	}
-	if !recorded {
-		// This attempt no longer owns the job: another claim superseded it, the
-		// scan condemned the attachment, or it was removed. Its object is a
-		// different one — every attempt writes to its own key — so discarding
-		// this one cannot affect whatever won, and keeping it would leave an
-		// object nothing points at.
-		//
-		// The outcome goes back to the caller rather than being logged here, so
-		// there is one record of it, with the job's real duration, on the same
-		// path every other outcome is reported from.
-		s.discardPreviewObject(ctx, job, objectKey)
-		return previewPersistSuperseded, nil
-	}
-	return previewPersistPublished, nil
 }
 
 // discardPreviewObject removes a preview object that must not survive: a failed
@@ -639,10 +770,57 @@ func (s *PreviewService) logPreview(
 func (s *PreviewService) logPreviewOutcome(
 	ctx context.Context, level slog.Level, job PreviewJob, result string, duration time.Duration,
 ) {
+	format := previewFormat(job)
+	reason := previewReason(result)
+	workerName, _ := os.Hostname()
 	s.logger.LogAttrs(ctx, level, "attachment preview completed",
 		slog.String("attachment_id", job.AttachmentID),
+		slog.String("format", format),
+		slog.Int64("size_bytes", job.Size),
 		slog.String("result", result),
+		slog.String("reason", reason),
+		slog.String("worker", workerName),
 		slog.Int("attempt", job.Attempts),
 		slog.Int64("duration_ms", duration.Milliseconds()),
 	)
+	if observer, ok := s.observer.(interface {
+		ObserveDocumentPreview(string, string, string, time.Duration)
+	}); ok {
+		observer.ObserveDocumentPreview(format, result, reason, duration)
+	}
+}
+
+func previewFormat(job PreviewJob) string {
+	mime := domain.NormalizeDetectedMIME(job.DetectedMIME)
+	switch {
+	case mime == "application/pdf":
+		return "pdf"
+	case mime == "text/plain":
+		return "csv"
+	case mime == "application/zip":
+		return "office_zip"
+	case mime == "application/octet-stream" && strings.EqualFold(filepath.Ext(job.OriginalFilename), ".ppt"):
+		return "ppt"
+	case strings.HasPrefix(mime, "image/"):
+		return "image"
+	default:
+		return "unknown"
+	}
+}
+
+func previewReason(result string) string {
+	switch result {
+	case previewResultReady:
+		return "none"
+	case previewResultUnsupported:
+		return "unsupported_format"
+	case previewResultFailed:
+		return "render_failed"
+	case previewResultRetry:
+		return "transient"
+	case previewResultSuperseded:
+		return "superseded"
+	default:
+		return "state_write_failed"
+	}
 }

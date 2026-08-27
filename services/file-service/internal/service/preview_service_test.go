@@ -341,8 +341,15 @@ func (q *fakeCleanupQueue) queued() []string {
 type stubRenderer struct {
 	mu sync.Mutex
 
-	image []byte
-	err   error
+	// pages is what Render returns on success. A single-element slice models
+	// every image and every one-page PDF; a longer one models a multi-page
+	// PDF.
+	pages [][]byte
+	// contentType is what Render reports alongside pages. Empty defaults to
+	// domain.PreviewContentTypeJPEG, exactly like persist()'s own fallback for
+	// a renderer that predates this field.
+	contentType string
+	err         error
 	// duringRender runs while the renderer is "working", so a test can change
 	// the world underneath a job exactly as a scan verdict would.
 	duringRender func()
@@ -352,7 +359,9 @@ type stubRenderer struct {
 	lastBytes []byte
 }
 
-func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Reader) ([]byte, error) {
+func (r *stubRenderer) Render(
+	_ context.Context, detectedMIME string, src io.Reader,
+) ([][]byte, string, error) {
 	// Always drain: the real renderer reads the decrypting stream, so an
 	// integrity failure has to surface here exactly as it would in production.
 	read, readErr := io.ReadAll(src)
@@ -368,12 +377,12 @@ func (r *stubRenderer) Render(_ context.Context, detectedMIME string, src io.Rea
 	r.calls++
 	r.lastMIME, r.lastBytes = detectedMIME, read
 	if readErr != nil {
-		return nil, readErr
+		return nil, "", readErr
 	}
 	if r.err != nil {
-		return nil, r.err
+		return nil, "", r.err
 	}
-	return r.image, nil
+	return r.pages, r.contentType, nil
 }
 
 func (r *stubRenderer) callCount() int {
@@ -448,7 +457,7 @@ func newPreviewFixture(t *testing.T) *previewFixture {
 	f := &previewFixture{
 		store:    newFakePreviewStore(),
 		objects:  newFakeObjects(),
-		renderer: &stubRenderer{image: []byte("a rendered jpeg, near enough")},
+		renderer: &stubRenderer{pages: [][]byte{[]byte("a rendered jpeg, near enough")}},
 		fence:    newFakeFence(),
 		cleanup:  &fakeCleanupQueue{},
 		observer: &previewObserver{},
@@ -570,11 +579,83 @@ func TestProcessDueStoresAnEncryptedPreviewAndRecordsIt(t *testing.T) {
 	if result.PreviewObjectID == job.AttachmentID {
 		t.Fatal("the preview must have its own identity, not the attachment's")
 	}
-	if decrypted := string(f.openRecordedPreview(t, result)); decrypted != string(f.renderer.image) {
+	if decrypted := string(f.openRecordedPreview(t, result)); decrypted != string(f.renderer.pages[0]) {
 		t.Fatalf("stored preview decrypts to %q", decrypted)
 	}
 	if results := f.observer.observed(); len(results) != 1 || results[0] != "ready" {
 		t.Fatalf("observed %v, want one ready", results)
+	}
+}
+
+// A multi-page render (a PDF, in production) must persist every page as its
+// own object and record the whole set — page one on the result itself, the
+// rest in ExtraPages — in the one write that publishes the preview.
+func TestProcessDuePersistsEveryRenderedPageAndRecordsThePageCount(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.pages = [][]byte{
+		[]byte("page one bytes"), []byte("page two bytes"), []byte("page three bytes"),
+	}
+	job := f.storeAttachment(t, []byte("a three page pdf, near enough"), "application/pdf")
+	f.store.enqueue(job)
+
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	ready, _ := f.store.recorded()
+	if len(ready) != 1 {
+		t.Fatalf("recorded %d ready results, want 1", len(ready))
+	}
+	result := ready[0]
+	if result.PageCount != 3 {
+		t.Fatalf("page count = %d, want 3", result.PageCount)
+	}
+	if len(result.ExtraPages) != 2 {
+		t.Fatalf("extra pages = %d, want 2", len(result.ExtraPages))
+	}
+	for i, page := range result.ExtraPages {
+		if want := i + 2; page.PageNumber != want {
+			t.Fatalf("extra page %d has number %d, want %d", i, page.PageNumber, want)
+		}
+		if page.ObjectID == result.PreviewObjectID {
+			t.Fatal("an extra page must not share page one's object identity")
+		}
+	}
+	if a, b := result.ExtraPages[0].ObjectID, result.ExtraPages[1].ObjectID; a == b {
+		t.Fatal("the two extra pages must not share an object identity")
+	}
+	// The attachment's own object, plus one stored object per rendered page.
+	if got := f.objects.count(); got != 4 {
+		t.Fatalf("stored objects = %d, want 4 (1 attachment + 3 pages)", got)
+	}
+}
+
+// A publish that loses the race — the row was claimed by a newer attempt, or
+// the scan condemned the attachment mid-render — must discard every page this
+// attempt produced, not only the first. A partial discard would leak every
+// object beyond page one.
+func TestProcessDueDiscardsEveryPageWhenThePreviewIsSuperseded(t *testing.T) {
+	f := newPreviewFixture(t)
+	f.renderer.pages = [][]byte{[]byte("page one"), []byte("page two"), []byte("page three")}
+	f.store.readyLost = true
+	job := f.storeAttachment(t, []byte("a three page pdf, near enough"), "application/pdf")
+	f.store.enqueue(job)
+
+	if _, err := f.service.ProcessDue(context.Background()); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	ready, terminal := f.store.recorded()
+	if len(ready) != 0 || len(terminal) != 0 {
+		t.Fatalf("a lost race must record nothing: ready=%v terminal=%v", ready, terminal)
+	}
+	// Only the attachment's own object survives; every page this attempt wrote
+	// must have been deleted, not just the first.
+	if got := f.objects.count(); got != 1 {
+		t.Fatalf("stored objects = %d, want 1 (the attachment only)", got)
+	}
+	if got := len(f.objects.deletedKeys()); got != 3 {
+		t.Fatalf("deleted objects = %d, want 3 (one per rendered page)", got)
 	}
 }
 
@@ -1244,6 +1325,7 @@ func storedPreviewRecord(t *testing.T, f *fixture, image []byte) service.StoredA
 		PreviewKEKKeyID:        keyID,
 		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
 		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
+		PreviewContentType:     domain.PreviewContentTypeJPEG,
 	}
 }
 
@@ -1260,8 +1342,8 @@ func TestPreviewServesTheStoredPreviewOfAVisibleCleanAttachment(t *testing.T) {
 	}
 	defer func() { _ = preview.Content.Close() }()
 
-	if preview.ContentType != domain.PreviewContentType {
-		t.Fatalf("content type = %q, want %q", preview.ContentType, domain.PreviewContentType)
+	if preview.ContentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("content type = %q, want %q", preview.ContentType, domain.PreviewContentTypeJPEG)
 	}
 	if preview.Size != int64(len(image)) {
 		t.Fatalf("size = %d, want %d", preview.Size, len(image))
@@ -1272,6 +1354,85 @@ func TestPreviewServesTheStoredPreviewOfAVisibleCleanAttachment(t *testing.T) {
 	}
 	if string(served) != string(image) {
 		t.Fatalf("served %q, want %q", served, image)
+	}
+}
+
+// DocumentPreviewPage serves page two exactly the way Preview serves page
+// one: same decrypting stream, same content type, its own object identity.
+func TestDocumentPreviewPageServesAStoredExtraPage(t *testing.T) {
+	f := newFixture(t)
+	record := storedPreviewRecord(t, f, []byte("page one bytes"))
+	record.PreviewPageCount = 2
+	f.store.authorized = record
+
+	pageID, workspaceID := uuid.New(), uuid.MustParse(testWorkspaceID)
+	pageImage := []byte("page two bytes")
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		t.Fatalf("data key: %v", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(pageImage), dataKey, pageID)
+	if err != nil {
+		t.Fatalf("encrypting reader: %v", err)
+	}
+	if _, err := f.objects.Put(context.Background(), domain.PreviewObjectKey(pageID), encrypted); err != nil {
+		t.Fatalf("store page: %v", err)
+	}
+	wrapped, keyID, err := f.keys.Wrap(dataKey, crypto.Binding{
+		AttachmentID: pageID, WorkspaceID: workspaceID, PlaintextSize: int64(len(pageImage)),
+		KeyWrapVersion: crypto.KeyWrapVersion, ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+	f.store.publishPreviewPage(service.PreviewPage{
+		PageNumber: 2, ObjectID: pageID.String(), Size: int64(len(pageImage)),
+		WrappedDEK: wrapped, KEKKeyID: keyID,
+		EnvelopeVersion: crypto.EnvelopeVersion, KeyWrapVersion: crypto.KeyWrapVersion,
+		ContentType: domain.PreviewContentTypeJPEG,
+	})
+
+	page, err := f.service.DocumentPreviewPage(context.Background(), service.AttachmentAuthInput{
+		AttachmentID: record.ID, UserID: testUserID, SessionID: testSessionID,
+	}, 2)
+	if err != nil {
+		t.Fatalf("document preview page: %v", err)
+	}
+	defer func() { _ = page.Content.Close() }()
+
+	if page.ContentType != domain.PreviewContentTypeJPEG {
+		t.Fatalf("content type = %q, want %q", page.ContentType, domain.PreviewContentTypeJPEG)
+	}
+	served, err := io.ReadAll(page.Content)
+	if err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if string(served) != string(pageImage) {
+		t.Fatalf("served %q, want %q", served, pageImage)
+	}
+}
+
+// A page number outside [2, PreviewPageCount] is refused before the store is
+// ever asked for it — the bound is checked against the attachment's own
+// record, not discovered from a missing row.
+func TestDocumentPreviewPageRefusesPagesOutsideTheRecordedCount(t *testing.T) {
+	f := newFixture(t)
+	record := storedPreviewRecord(t, f, []byte("page one bytes"))
+	record.PreviewPageCount = 2
+	f.store.authorized = record
+
+	for _, page := range []int{1, 0, -1, 3} {
+		t.Run(fmt.Sprintf("page_%d", page), func(t *testing.T) {
+			_, err := f.service.DocumentPreviewPage(context.Background(), service.AttachmentAuthInput{
+				AttachmentID: record.ID, UserID: testUserID, SessionID: testSessionID,
+			}, page)
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("error = %v, want ErrNotFound", err)
+			}
+		})
+	}
+	if f.store.previewPageCall.page != 0 {
+		t.Fatal("an out-of-range page must never reach the store")
 	}
 }
 
@@ -1400,9 +1561,16 @@ func TestUploadSchedulesAPreviewWithoutWaitingForOne(t *testing.T) {
 		content []byte
 		want    domain.PreviewStatus
 	}{
-		"png":   {content: pngBytes(), want: domain.PreviewStatusPending},
-		"pdf":   {content: []byte("%PDF-1.4 a document"), want: domain.PreviewStatusPending},
-		"other": {content: []byte("PK\x03\x04 an archive"), want: domain.PreviewStatusUnsupported},
+		"png": {content: pngBytes(), want: domain.PreviewStatusPending},
+		"pdf": {content: []byte("%PDF-1.4 a document"), want: domain.PreviewStatusPending},
+		// A zip-shaped upload is scheduled too now — CSV and XLSX both sniff
+		// as coarse types (text/plain, application/zip respectively; see
+		// domain.previewableMIMEs' own comment), so an office document is no
+		// longer distinguishable from "not previewable at all" until the
+		// renderer itself inspects the container. What stays genuinely
+		// outside the allowlist is a type net/http.DetectContentType names
+		// specifically and this service has no renderer for.
+		"other": {content: []byte("ID3\x03\x00\x00\x00\x00\x00\x00an mp3"), want: domain.PreviewStatusUnsupported},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)

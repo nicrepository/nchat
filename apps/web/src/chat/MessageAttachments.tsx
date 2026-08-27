@@ -32,15 +32,17 @@
 import { useState } from "react";
 
 import AttachmentAudio from "./AttachmentAudio";
+import AttachmentDocumentPreview from "./AttachmentDocumentPreview";
 import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
 import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
+import DocumentPreviewViewer from "./DocumentPreviewViewer";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
 import { fetchAttachmentContent } from "./filesApi";
 import { formatFileSize } from "./conversationDetailsDisplay";
-import type { ChannelAttachment } from "./chatTypes";
+import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
 
 /** Same mapping the details panel uses, kept local so neither owns the other. */
 function fileIconFor(contentType: string): string {
@@ -50,6 +52,36 @@ function fileIconFor(contentType: string): string {
   if (contentType === "application/pdf") return "picture_as_pdf";
   if (contentType.startsWith("text/")) return "description";
   return "draft";
+}
+
+/**
+ * Whether this attachment might carry a document preview (PDF today; CSV/
+ * XLSX as of task #494's sheet phase).
+ *
+ * `contentType` here is file-service's *detected* type — net/http.
+ * DetectContentType's own sniff, never the filename or what the browser
+ * declared — and that detector has no signature for CSV or for any OOXML
+ * subtype. It can only ever report `text/plain` for delimited text and
+ * `application/zip` for any zip-shaped file (XLSX included, indistinguishable
+ * from DOCX/PPTX/ODT/ODP or an arbitrary .zip at this layer). Matching
+ * `text/csv`, `officedocument`, `msword`, `ms-excel`, `ms-powerpoint` or
+ * `opendocument` — what a real upload's contentType can never be — silently
+ * routed every CSV/XLSX attachment through the generic thumbnail branch
+ * instead of the document one. See file-service's
+ * domain.previewableMIMEs for the server-side half of this same fact.
+ *
+ * A `text/plain` or `application/zip` attachment is not guaranteed to have a
+ * usable preview — the server may still answer "unsupported" for a DOCX, a
+ * plain log file, or a generic zip — but it is always routed here so the
+ * Visualizar action becomes reachable the moment previewStatus says ready.
+ */
+function isDocumentAttachment(attachment: ChannelAttachment): boolean {
+  // The detected type can carry a parameter (e.g. "text/plain;
+  // charset=utf-8" is what a real CSV upload's contentType looks like) —
+  // stripped here the same way file-service's own NormalizeDetectedMIME
+  // does server-side, so the two never disagree about what a bare type is.
+  const type = attachment.contentType.split(";")[0].trim().toLowerCase();
+  return type === "application/pdf" || type === "text/plain" || type === "application/zip";
 }
 
 /**
@@ -115,6 +147,7 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
 interface MessageAttachmentProps {
   attachment: ChannelAttachment;
   onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
+  onOpenDocument: (attachment: ChannelAttachment, trigger: HTMLButtonElement) => void;
 }
 
 /**
@@ -151,7 +184,7 @@ function VoiceMessageAttachment({ attachment }: { attachment: ChannelAttachment 
   );
 }
 
-function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) {
+function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageAttachmentProps) {
   if (isVoiceMessage(attachment)) {
     return <VoiceMessageAttachment attachment={attachment} />;
   }
@@ -204,14 +237,56 @@ function MessageAttachment({ attachment, onOpenImage }: MessageAttachmentProps) 
     );
   }
 
+  // Documents (PDF today; other office formats once a later phase renders
+  // them) get the large WhatsApp-style card: a big first-page preview above
+  // the row, an explicit Visualizar action beside Baixar. A file still being
+  // scanned or rejected keeps the plain icon row below unchanged — the same
+  // split AttachmentImagePreview draws for raster types, applied to
+  // documents instead of replacing that branch.
+  if (isDocumentAttachment(attachment)) {
+    return (
+      <li
+        className="chat-msg-area__attachment"
+        data-testid={`chat-message-attachment-${attachment.id}`}
+      >
+        {attachment.status === "clean" && (
+          <AttachmentDocumentPreview
+            attachment={attachment}
+            onOpen={(trigger) => onOpenDocument(attachment, trigger)}
+          />
+        )}
+        <div className="chat-msg-area__attachment-row">
+          {icon}
+          {meta}
+        </div>
+        {attachment.status === "clean" && (
+          <div className="chat-msg-area__attachment-actions">
+            {isPreviewAvailable(attachment.previewStatus) && (
+              <button
+                type="button"
+                className="chat-msg-area__attachment-action"
+                aria-label={`Visualizar ${attachment.filename}`}
+                onClick={(event) => onOpenDocument(attachment, event.currentTarget)}
+              >
+                <span className="material-symbols-outlined" aria-hidden="true">
+                  visibility
+                </span>
+                Visualizar
+              </button>
+            )}
+            <AttachmentDownloadButton attachment={attachment} />
+          </div>
+        )}
+      </li>
+    );
+  }
+
   return (
     <li
       className="chat-msg-area__attachment"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
       <div className="chat-msg-area__attachment-row">
-        {/* The thumbnail draws itself only for an approved file with a ready
-            preview; everything else falls back to the type icon. */}
         <AttachmentThumbnail attachment={attachment} fallback={icon} />
         {meta}
         {download}
@@ -239,6 +314,10 @@ export default function MessageAttachments({
   attachments: ChannelAttachment[] | undefined;
 }) {
   const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
+  const [documentViewer, setDocumentViewer] = useState<{
+    attachment: ChannelAttachment;
+    trigger: HTMLButtonElement;
+  } | null>(null);
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
   if (!attachments || attachments.length === 0) return null;
@@ -283,6 +362,7 @@ export default function MessageAttachments({
                 key={segment.attachment.id}
                 attachment={segment.attachment}
                 onOpenImage={openImage}
+                onOpenDocument={(attachment, trigger) => setDocumentViewer({ attachment, trigger })}
               />
             );
           }
@@ -302,6 +382,9 @@ export default function MessageAttachments({
                     key={attachment.id}
                     attachment={attachment}
                     onOpenImage={openImage}
+                    onOpenDocument={(attachment, trigger) =>
+                      setDocumentViewer({ attachment, trigger })
+                    }
                   />
                 ))}
               </ul>
@@ -331,6 +414,15 @@ export default function MessageAttachments({
           inlineUrl={lightbox.url}
           inlineIsOriginal={lightbox.isOriginal}
           onClose={closeLightbox}
+        />
+      )}
+      {documentViewer && (
+        <DocumentPreviewViewer
+          attachment={documentViewer.attachment}
+          onClose={() => {
+            documentViewer.trigger.focus();
+            setDocumentViewer(null);
+          }}
         />
       )}
     </>

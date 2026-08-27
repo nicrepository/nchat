@@ -90,12 +90,14 @@ const (
 )
 
 type Config struct {
-	ServiceName              string
-	Env                      string
-	Port                     int
-	ReadHeaderTimeoutSeconds int
-	ReadTimeoutSeconds       int
-	WriteTimeoutSeconds      int
+	ServiceName                     string
+	Env                             string
+	Port                            int
+	ReadHeaderTimeoutSeconds        int
+	ReadTimeoutSeconds              int
+	WriteTimeoutSeconds             int
+	DocumentConverterURL            string
+	DocumentConverterTimeoutSeconds int
 
 	// UploadsEnabled gates every attachment route and every dependency they
 	// need. While false the service is health-only, exactly as before RF-30.
@@ -273,33 +275,35 @@ func Load() Config {
 		// deployment that simply forgot to set the variable, which is the
 		// opposite of failing closed. Every overlay and every .env example sets
 		// it explicitly, so the empty case only ever means "not configured".
-		Env:                        strings.TrimSpace(platformconfig.GetString("APP_ENV", "")),
-		Port:                       platformconfig.GetInt("PORT", defaultPort),
-		ReadHeaderTimeoutSeconds:   positiveInt("READ_HEADER_TIMEOUT_SECONDS", 5),
-		ReadTimeoutSeconds:         positiveInt("READ_TIMEOUT_SECONDS", defaultReadTimeoutSeconds),
-		WriteTimeoutSeconds:        positiveInt("WRITE_TIMEOUT_SECONDS", defaultWriteTimeoutSeconds),
-		UploadsEnabled:             uploadsEnabled,
-		DatabaseURL:                strings.TrimSpace(platformconfig.GetString("DATABASE_URL", "")),
-		DBConnectTimeoutSeconds:    positiveInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
-		DBMaxConnections:           platformconfig.GetInt("FILE_DB_MAX_CONNECTIONS", defaultDBMaxConnections),
-		UploadMaxConcurrent:        platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT", defaultUploadMaxConcurrent),
-		UploadMaxConcurrentPerUser: platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT_PER_USER", defaultUploadMaxConcurrentPerUser),
-		UploadRetryAfterSeconds:    positiveInt("FILE_UPLOAD_RETRY_AFTER_SECONDS", defaultUploadRetryAfterSeconds),
-		AuthJWTHMACSecret:          platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
-		AuthJWTIssuer:              strings.TrimSpace(platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer)),
-		AuthJWTAudience:            strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
-		MaxUploadBytes:             maxUploadBytes,
-		EncryptionMasterKey:        platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY", ""),
-		EncryptionMasterKeyID:      platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY_ID", ""),
-		EncryptionPreviousKeys:     platformconfig.GetString("FILE_ENCRYPTION_PREVIOUS_KEYS", ""),
-		MalwareScanRequired:        scanRequired,
-		MalwareScannerAddress:      strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
-		MalwareScanTimeoutSeconds:  positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
-		ValkeyURL:                  strings.TrimSpace(platformconfig.GetString("VALKEY_URL", "")),
-		WSInstanceID:               sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
-		SeaweedFSFilerURL:          strings.TrimSpace(platformconfig.GetString("SEAWEEDFS_FILER_URL", "")),
-		SeaweedFSTimeoutSeconds:    positiveInt("SEAWEEDFS_TIMEOUT_SECONDS", defaultSeaweedFSTimeoutSeconds),
-		LinkPreviewEnabled:         linkPreviewEnabled,
+		Env:                             strings.TrimSpace(platformconfig.GetString("APP_ENV", "")),
+		Port:                            platformconfig.GetInt("PORT", defaultPort),
+		ReadHeaderTimeoutSeconds:        positiveInt("READ_HEADER_TIMEOUT_SECONDS", 5),
+		ReadTimeoutSeconds:              positiveInt("READ_TIMEOUT_SECONDS", defaultReadTimeoutSeconds),
+		WriteTimeoutSeconds:             positiveInt("WRITE_TIMEOUT_SECONDS", defaultWriteTimeoutSeconds),
+		DocumentConverterURL:            strings.TrimSpace(platformconfig.GetString("DOCUMENT_CONVERTER_URL", "http://127.0.0.1:8089")),
+		DocumentConverterTimeoutSeconds: positiveInt("DOCUMENT_CONVERTER_TIMEOUT_SECONDS", 35),
+		UploadsEnabled:                  uploadsEnabled,
+		DatabaseURL:                     strings.TrimSpace(platformconfig.GetString("DATABASE_URL", "")),
+		DBConnectTimeoutSeconds:         positiveInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
+		DBMaxConnections:                platformconfig.GetInt("FILE_DB_MAX_CONNECTIONS", defaultDBMaxConnections),
+		UploadMaxConcurrent:             platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT", defaultUploadMaxConcurrent),
+		UploadMaxConcurrentPerUser:      platformconfig.GetInt("FILE_UPLOAD_MAX_CONCURRENT_PER_USER", defaultUploadMaxConcurrentPerUser),
+		UploadRetryAfterSeconds:         positiveInt("FILE_UPLOAD_RETRY_AFTER_SECONDS", defaultUploadRetryAfterSeconds),
+		AuthJWTHMACSecret:               platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:                   strings.TrimSpace(platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer)),
+		AuthJWTAudience:                 strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
+		MaxUploadBytes:                  maxUploadBytes,
+		EncryptionMasterKey:             platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY", ""),
+		EncryptionMasterKeyID:           platformconfig.GetString("FILE_ENCRYPTION_MASTER_KEY_ID", ""),
+		EncryptionPreviousKeys:          platformconfig.GetString("FILE_ENCRYPTION_PREVIOUS_KEYS", ""),
+		MalwareScanRequired:             scanRequired,
+		MalwareScannerAddress:           strings.TrimSpace(platformconfig.GetString("FILE_MALWARE_SCANNER_ADDRESS", "")),
+		MalwareScanTimeoutSeconds:       positiveInt("FILE_MALWARE_SCAN_TIMEOUT_SECONDS", defaultMalwareScanTimeoutSeconds),
+		ValkeyURL:                       strings.TrimSpace(platformconfig.GetString("VALKEY_URL", "")),
+		WSInstanceID:                    sanitizeInstanceID(platformconfig.GetString("WS_INSTANCE_ID", "")),
+		SeaweedFSFilerURL:               strings.TrimSpace(platformconfig.GetString("SEAWEEDFS_FILER_URL", "")),
+		SeaweedFSTimeoutSeconds:         positiveInt("SEAWEEDFS_TIMEOUT_SECONDS", defaultSeaweedFSTimeoutSeconds),
+		LinkPreviewEnabled:              linkPreviewEnabled,
 		LinkPreviewTimeoutSeconds: positiveInt(
 			"FILE_LINK_PREVIEW_TIMEOUT_SECONDS", defaultLinkPreviewTimeoutSeconds,
 		),

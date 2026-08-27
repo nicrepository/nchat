@@ -1,0 +1,184 @@
+.document-preview__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgb(15 12 22 / 78%);
+}
+
+.document-preview {
+  display: flex;
+  flex-direction: column;
+  width: min(70rem, 100%);
+  height: min(52rem, 92vh);
+  overflow: hidden;
+  border-radius: 0.75rem;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #211a29);
+}
+
+.document-preview__header,
+.document-preview__toolbar,
+.document-preview__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.document-preview__header {
+  justify-content: space-between;
+  padding: 1rem;
+}
+
+.document-preview__header h2 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.document-preview__toolbar {
+  justify-content: center;
+  padding: 0.5rem 1rem;
+  border-block: 1px solid rgb(0 0 0 / 10%);
+}
+
+/* Icon-only controls (close, pagination, zoom) — a round, borderless button
+   with the same hover/disabled/focus language as AttachmentLightbox's own
+   close button, adapted to this viewer's light theme instead of the
+   lightbox's dark one. */
+.document-preview__icon-button {
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text, #211a29);
+  cursor: pointer;
+}
+
+.document-preview__icon-button .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.document-preview__icon-button:hover:not(:disabled) {
+  background: rgb(0 0 0 / 6%);
+}
+
+.document-preview__icon-button:disabled {
+  color: var(--color-text-muted, #6b6580);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.document-preview__close {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.document-preview__close .material-symbols-outlined {
+  font-size: 22px;
+}
+
+/* Baixar keeps its label — the same icon+text pill MessageAttachments' own
+   Baixar/Visualizar actions use, so the action reads the same wherever it
+   appears in the app. */
+.document-preview__action-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.document-preview__action-button:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.document-preview__action-button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.document-preview__action-button .material-symbols-outlined {
+  font-size: 16px;
+}
+
+.document-preview button:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.document-preview__download-error {
+  margin: 0;
+  padding: 0.35rem 1rem 0;
+  color: var(--color-danger-strong, #b91c1c);
+  font-size: 0.8rem;
+}
+.document-preview__canvas {
+  flex: 1;
+  overflow: auto;
+  padding: 1rem;
+  text-align: center;
+  background: #e9e7ec;
+}
+.document-preview__canvas img {
+  max-width: none;
+  height: auto;
+  box-shadow: 0 2px 12px rgb(0 0 0 / 18%);
+}
+
+/* Spreadsheet/CSV preview (task #494's sheet phase): a scrollable table, not
+   a rasterised image — the canvas already scrolls, so the table just has to
+   stay wide enough to read without wrapping every cell. */
+.document-preview__sheet {
+  display: inline-block;
+  min-width: 100%;
+  text-align: left;
+}
+.document-preview__sheet-note {
+  margin: 0 0 0.5rem;
+  color: var(--color-text-muted, #6b6580);
+  font-size: 0.85rem;
+}
+.document-preview__sheet-table {
+  border-collapse: collapse;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 2px 12px rgb(0 0 0 / 18%);
+}
+.document-preview__sheet-table th,
+.document-preview__sheet-table td {
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--color-border, #e8e3f0);
+  white-space: nowrap;
+}
+.document-preview__sheet-table th {
+  position: sticky;
+  top: 0;
+  background: var(--color-surface-2, #faf8fd);
+  font-weight: 600;
+}
+
+@media (max-width: 40rem) {
+  .document-preview__backdrop {
+    padding: 0;
+  }
+  .document-preview {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+  }
+  .document-preview__header {
+    align-items: flex-start;
+  }
+}

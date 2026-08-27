@@ -11,6 +11,7 @@ resources:
   - admin-web
   - services/auth-service
   - services/chat-service
+  - services/document-converter
   - services/file-service
   - services/upload-guard
   - services/notification-service
