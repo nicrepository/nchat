@@ -61,9 +61,16 @@ const explicitlyUnsupportedFile = (file: File) => {
 const failureMessage = (cause: unknown) =>
   cause instanceof AttachmentUploadError ? cause.message : "Não foi possível enviar o arquivo.";
 
+/** What a workspace allows when it has not said otherwise. */
+const defaultLimits: WorkspaceAttachmentLimits = {
+  maxUploadBytes: null,
+  maxFiles: 1,
+  maxBytes: Number.MAX_SAFE_INTEGER,
+};
+
 export function useAttachmentUpload(
-  target: AttachmentUploadTarget | null,
-  limits: WorkspaceAttachmentLimits,
+  target: AttachmentUploadTarget | null | undefined,
+  limits: WorkspaceAttachmentLimits = defaultLimits,
   onUploaded?: () => void,
 ): AttachmentUploadState {
   const [items, setItems] = useState<AttachmentUploadItem[]>([]);

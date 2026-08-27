@@ -118,7 +118,16 @@ export interface WSReactionUpdatedEvent {
     actor_user_id: string;
     emoji: string;
     added: boolean;
-    reactions: Array<{ emoji: string; count: number }>;
+    reactions: Array<{
+      emoji: string;
+      count: number;
+      /**
+       * The named prefix behind each count (issue #496). Absent on a pre-#496
+       * server and on the cross-instance relay, which strips reaction payloads
+       * and makes the client refetch instead.
+       */
+      users?: Array<{ user_id?: unknown; display_name?: unknown }>;
+    }>;
   };
 }
 
