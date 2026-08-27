@@ -335,6 +335,11 @@ type MessageAttachmentPayload struct {
 	Size          int64  `json:"size"`
 	Status        string `json:"status"`
 	PreviewStatus string `json:"preview_status"`
+	// AudioKind and DurationMs mirror the HTTP payload's own RF-670 fields, so
+	// a message delivered over the socket needs no follow-up GET to tell a
+	// voice message from an ordinary attachment.
+	AudioKind  string `json:"audio_kind,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
 type QuotePayload struct {

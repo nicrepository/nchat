@@ -76,20 +76,31 @@ func (s *PGXAttachmentStore) CreatePending(ctx context.Context, attachment servi
 		return fmt.Errorf("%w: invalid destination kind", domain.ErrInvalidInput)
 	}
 
+	var audioKind any
+	if attachment.AudioKind != "" {
+		audioKind = string(attachment.AudioKind)
+	}
+	var declaredDurationMs any
+	if attachment.DeclaredDurationMs > 0 {
+		declaredDurationMs = attachment.DeclaredDurationMs
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO files.attachments (
 			id, workspace_id, uploader_id, destination_kind,
 			channel_id, conversation_id,
 			original_filename, declared_mime,
 			storage_provider, storage_object_key,
-			envelope_version, dek_wrap_version, status, draft_expires_at
+			envelope_version, dek_wrap_version,
+			audio_kind, declared_duration_ms,
+			status, draft_expires_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 		attachment.ID, attachment.WorkspaceID, attachment.UploaderID,
 		string(attachment.Destination.Kind), channelID, conversationID,
 		attachment.Filename, attachment.DeclaredMIME,
 		attachment.StorageProvider, attachment.StorageObjectKey,
 		attachment.EnvelopeVersion, attachment.KeyWrapVersion,
+		audioKind, declaredDurationMs,
 		string(domain.StatusPendingUpload),
 		attachment.DraftExpiresAt,
 	)
@@ -700,6 +711,8 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		kekKeyID         pgtype.Text
 		keyWrapVersion   pgtype.Int2
 		createdAt        pgtype.Timestamptz
+		audioKind        pgtype.Text
+		declaredDuration pgtype.Int4
 
 		previewStatus          pgtype.Text
 		previewObjectID        pgtype.Text
@@ -715,6 +728,7 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		&sessionExpiresAt, &id, &workspaceID, &destinationKind, &status,
 		&filename, &declaredMIME, &detectedMIME, &size, &objectKey,
 		&envelopeVersion, &wrappedDEK, &kekKeyID, &keyWrapVersion, &createdAt,
+		&audioKind, &declaredDuration,
 		&previewStatus, &previewObjectID, &previewSize, &previewWrappedDEK,
 		&previewKEKKeyID, &previewEnvelopeVersion, &previewKeyWrapVersion,
 	)
@@ -755,6 +769,10 @@ func (s *PGXAttachmentStore) GetAuthorized(
 		KeyWrapVersion:   int(keyWrapVersion.Int16),
 		CreatedAt:        createdAt.Time.UTC(),
 		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
+		// pgtype.Int4's zero value is already {Int32: 0, Valid: false}, so an
+		// absent column reads as 0 with no branch needed.
+		AudioKind:          domain.AudioKind(audioKind.String),
+		DeclaredDurationMs: declaredDuration.Int32,
 
 		// The preview columns are NULL until one exists, which the CHECK ties
 		// to preview_status: an unknown or absent status therefore reads as
@@ -799,7 +817,8 @@ func (s *PGXAttachmentStore) GetAuthorized(
 const (
 	listChannelAttachmentsQuery = `
 		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
-		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
+		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at,
+		       COALESCE(a.audio_kind, ''), COALESCE(a.declared_duration_ms, 0)
 		FROM files.attachments AS a
 		WHERE a.destination_kind = 'channel'
 		  AND a.deleted_at IS NULL
@@ -817,7 +836,8 @@ const (
 
 	listDMAttachmentsQuery = `
 		SELECT a.id::text, a.status, a.preview_status, a.original_filename,
-		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at
+		       COALESCE(a.detected_mime, ''), a.size_bytes, a.created_at,
+		       COALESCE(a.audio_kind, ''), COALESCE(a.declared_duration_ms, 0)
 		FROM files.attachments AS a
 		WHERE a.destination_kind = 'dm'
 		  AND a.deleted_at IS NULL
@@ -890,13 +910,18 @@ func (s *PGXAttachmentStore) ListDestinationAttachments(
 			status        string
 			previewStatus pgtype.Text
 			createdAt     pgtype.Timestamptz
+			audioKind     string
+			durationMs    int32
 		)
 		if err := rows.Scan(
 			&record.ID, &status, &previewStatus, &record.Filename,
 			&record.DetectedMIME, &record.Size, &createdAt,
+			&audioKind, &durationMs,
 		); err != nil {
 			return nil, fmt.Errorf("scan destination attachment: %w", err)
 		}
+		record.AudioKind = domain.AudioKind(audioKind)
+		record.DeclaredDurationMs = durationMs
 		attachmentStatus := domain.Status(status)
 		if !attachmentStatus.Valid() {
 			// A row outside the CHECK's closed set is a data-integrity problem,
@@ -953,6 +978,7 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		       a.original_filename, a.declared_mime, a.detected_mime,
 		       a.size_bytes, a.storage_object_key, a.envelope_version,
 		       a.wrapped_dek, a.kek_key_id, a.dek_wrap_version, a.created_at,
+		       a.audio_kind, a.declared_duration_ms,
 		       a.preview_status, a.preview_object_id, a.preview_size_bytes,
 		       a.preview_wrapped_dek, a.preview_kek_key_id,
 		       a.preview_envelope_version, a.preview_dek_wrap_version
@@ -1017,6 +1043,8 @@ const authorizedAttachmentQuery = authsession.ActiveSessionCTE + `,
 		authorized.kek_key_id,
 		authorized.dek_wrap_version,
 		authorized.created_at,
+		authorized.audio_kind,
+		authorized.declared_duration_ms,
 		authorized.preview_status,
 		authorized.preview_object_id::text,
 		authorized.preview_size_bytes,

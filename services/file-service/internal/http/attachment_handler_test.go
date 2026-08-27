@@ -366,6 +366,130 @@ func TestUploadAcceptsServerRecognizedMessageDraftPurpose(t *testing.T) {
 	}
 }
 
+// --- leading form fields: purpose and duration_ms (issue #670) ----------
+
+func durationPart(value string) filePart {
+	return filePart{field: "duration_ms", content: []byte(value)}
+}
+
+func purposePart(value string) filePart {
+	return filePart{field: "purpose", content: []byte(value)}
+}
+
+func TestUploadAcceptsDurationMsBeforeTheFile(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(
+		t, channelUploadPath(testChannelID), durationPart("4200"), fileOf("hello world"),
+	))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+	}
+	if got := useCases.call().DurationMs; got != "4200" {
+		t.Fatalf("expected duration_ms to reach the service unchanged, got %q", got)
+	}
+}
+
+// purpose and duration_ms are read by field name, not by position: either may
+// come first, and each must reach the service whichever order the client
+// happened to send them in.
+func TestUploadAcceptsPurposeAndDurationMsInEitherOrder(t *testing.T) {
+	for name, parts := range map[string][]filePart{
+		"purpose then duration_ms": {
+			purposePart(service.UploadPurposeVoiceMessage), durationPart("4200"),
+		},
+		"duration_ms then purpose": {
+			durationPart("4200"), purposePart(service.UploadPurposeVoiceMessage),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			useCases := readyUseCases()
+			router := newTestRouter(t, useCases, enabledConfig())
+			response := httptest.NewRecorder()
+
+			router.ServeHTTP(response, uploadRequest(
+				t, channelUploadPath(testChannelID), append(parts, fileOf("hello world"))...,
+			))
+
+			if response.Code != http.StatusCreated {
+				t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+			}
+			call := useCases.call()
+			if call.Purpose != service.UploadPurposeVoiceMessage {
+				t.Fatalf("expected voice_message purpose, got %q", call.Purpose)
+			}
+			if call.DurationMs != "4200" {
+				t.Fatalf("expected duration_ms 4200, got %q", call.DurationMs)
+			}
+		})
+	}
+}
+
+// A field name this route does not recognise, arriving before the file, is
+// refused rather than silently ignored or treated as the file part.
+func TestUploadRejectsAnUnknownLeadingFormField(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		filePart{field: "workspaceId", content: []byte("another-workspace")},
+		fileOf("hello world"),
+	))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
+	}
+	if errorCode(t, response) != httputil.ErrCodeBadRequest {
+		t.Fatalf("unexpected error code %q", errorCode(t, response))
+	}
+}
+
+// Exactly maxLeadingFormFields (4) recognised fields ahead of the file part is
+// the documented ceiling and must still succeed — the bound exists to stop an
+// unbounded scan, not to make the two legitimate fields fragile.
+func TestUploadAcceptsExactlyTheMaximumNumberOfLeadingFormFields(t *testing.T) {
+	useCases := readyUseCases()
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		durationPart("100"), durationPart("200"), durationPart("300"), durationPart("400"),
+		fileOf("hello world"),
+	))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", response.Code, response.Body.String())
+	}
+	// The last one seen wins — there is nothing here that merges repeats, and
+	// this is simply what four writes to the same local variable do.
+	if got := useCases.call().DurationMs; got != "400" {
+		t.Fatalf("expected the last duration_ms value, got %q", got)
+	}
+}
+
+// One field past the ceiling, still ahead of the file, must fail closed
+// rather than keep scanning indefinitely for a file part that may never come.
+func TestUploadRejectsMoreLeadingFormFieldsThanTheBoundAllows(t *testing.T) {
+	router := newTestRouter(t, readyUseCases(), enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, uploadRequest(t, channelUploadPath(testChannelID),
+		durationPart("100"), durationPart("200"), durationPart("300"),
+		durationPart("400"), durationPart("500"),
+		fileOf("hello world"),
+	))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.Code, response.Body.String())
+	}
+	if errorCode(t, response) != httputil.ErrCodeBadRequest {
+		t.Fatalf("unexpected error code %q", errorCode(t, response))
+	}
+}
+
 func TestDeleteAttachmentDraftIsRegistered(t *testing.T) {
 	useCases := readyUseCases()
 	router := newTestRouter(t, useCases, enabledConfig())

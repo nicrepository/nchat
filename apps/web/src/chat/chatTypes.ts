@@ -715,6 +715,27 @@ export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
  */
 export type AttachmentPreviewStatus = "pending" | "ready" | "unsupported" | "failed";
 
+/**
+ * The explicit, server-authoritative semantic role of an attachment's audio
+ * (issue #670). `"voice"` is a composer recording; absent is every other
+ * attachment, including an ordinary audio file picked from disk. It is never
+ * derived from `filename` or `contentType` anywhere in this codebase — both
+ * of those stay exactly what they always were, a rendering hint and nothing
+ * more. See parseAudioKind.
+ */
+export type AudioKind = "voice";
+
+/**
+ * Narrows a server value to the one AudioKind this build knows. Anything
+ * else — absent, or a value a newer server might one day send — becomes
+ * `undefined`, which renders as an ordinary attachment. Under-recognising is
+ * the safe direction here: this field only ever selects a presentation, never
+ * a permission, so the worst a missed tag costs is a plainer row.
+ */
+export function parseAudioKind(raw: unknown): AudioKind | undefined {
+  return raw === "voice" ? "voice" : undefined;
+}
+
 export interface ChannelAttachment {
   id: string;
   filename: string;
@@ -729,6 +750,15 @@ export interface ChannelAttachment {
    * repeat the timestamp. Every reader already treats "" as "no date to show".
    */
   createdAt: string;
+  /** Present only for a composer recording (issue #670). See AudioKind. */
+  audioKind?: AudioKind;
+  /**
+   * Client-declared recording length in milliseconds, present only alongside
+   * `audioKind`. Display only: it is never verified against the decoded
+   * audio and must never be used to decide anything beyond what a player
+   * shows before the real duration is known from playback.
+   */
+  durationMs?: number;
 }
 
 /**
@@ -763,6 +793,8 @@ interface MessageAttachmentResponse {
   size?: unknown;
   status?: unknown;
   preview_status?: unknown;
+  audio_kind?: unknown;
+  duration_ms?: unknown;
 }
 
 /**
@@ -780,6 +812,7 @@ function parseMessageAttachment(raw: unknown): ChannelAttachment | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const item = raw as MessageAttachmentResponse;
   if (typeof item.id !== "string" || item.id === "") return undefined;
+  const audioKind = parseAudioKind(item.audio_kind);
   return {
     id: item.id,
     filename: typeof item.filename === "string" ? item.filename : "",
@@ -788,6 +821,12 @@ function parseMessageAttachment(raw: unknown): ChannelAttachment | undefined {
     status: parseAttachmentStatus(item.status),
     previewStatus: parseAttachmentPreviewStatus(item.preview_status),
     createdAt: "",
+    ...(audioKind ? { audioKind } : {}),
+    ...(typeof item.duration_ms === "number" &&
+    Number.isFinite(item.duration_ms) &&
+    item.duration_ms > 0
+      ? { durationMs: item.duration_ms }
+      : {}),
   };
 }
 

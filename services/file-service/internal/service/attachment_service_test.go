@@ -121,6 +121,87 @@ func TestMessageDraftUploadGetsAServerControlledExpiry(t *testing.T) {
 	}
 }
 
+// --- voice messages (issue #670) -----------------------------------------
+
+func TestVoiceMessageUploadTagsAudioKindAndCarriesDeclaredDuration(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		UserID:      testUserID, SessionID: testSessionID,
+	})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	view, err := f.service.Upload(context.Background(), service.UploadInput{
+		Target: target, Filename: "voice-message.ogg", DeclaredMIME: "audio/ogg",
+		Purpose: service.UploadPurposeVoiceMessage, DurationMs: "4200",
+		Content: strings.NewReader("OggS\x00" + strings.Repeat("x", 40)),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if view.AudioKind != string(domain.AudioKindVoice) {
+		t.Fatalf("expected audio kind voice, got %q", view.AudioKind)
+	}
+	if view.DurationMs != 4200 {
+		t.Fatalf("expected declared duration 4200, got %d", view.DurationMs)
+	}
+	created, _, _ := f.store.snapshot()
+	if created[0].AudioKind != domain.AudioKindVoice || created[0].DeclaredDurationMs != 4200 {
+		t.Fatalf("unexpected persisted voice fields: %+v", created[0])
+	}
+	if created[0].DraftExpiresAt == nil {
+		t.Fatal("a voice message is a draft until a message binds it")
+	}
+}
+
+// A garbage or absent duration must never fail the upload: it is a display
+// hint, not a requirement.
+func TestVoiceMessageUploadToleratesAMissingOrGarbageDuration(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		UserID:      testUserID, SessionID: testSessionID,
+	})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	view, err := f.service.Upload(context.Background(), service.UploadInput{
+		Target: target, Filename: "voice-message.ogg", DeclaredMIME: "audio/ogg",
+		Purpose: service.UploadPurposeVoiceMessage, DurationMs: "not-a-number",
+		Content: strings.NewReader("OggS\x00" + strings.Repeat("x", 40)),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if view.DurationMs != 0 {
+		t.Fatalf("expected no declared duration, got %d", view.DurationMs)
+	}
+}
+
+// A request tagged voice_message whose real bytes cannot plausibly be a
+// browser recording is refused before anything is persisted — it must never
+// become a voice bubble with nothing playable inside.
+func TestVoiceMessageUploadRejectsContentThatCannotBeARecording(t *testing.T) {
+	f := newFixture(t)
+	target, err := f.service.AuthorizeUpload(context.Background(), service.AuthorizeUploadInput{
+		Destination: domain.Destination{Kind: domain.DestinationKindChannel, ID: testChannelID},
+		UserID:      testUserID, SessionID: testSessionID,
+	})
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	_, err = f.service.Upload(context.Background(), service.UploadInput{
+		Target: target, Filename: "not-audio.pdf", DeclaredMIME: "application/pdf",
+		Purpose: service.UploadPurposeVoiceMessage,
+		Content: strings.NewReader("%PDF-1.7 not actually a recording"),
+	})
+	if !errors.Is(err, domain.ErrUnsupportedMedia) {
+		t.Fatalf("expected ErrUnsupportedMedia, got %v", err)
+	}
+	assertNothingPersisted(t, f)
+}
+
 // The client's declared type is recorded but never trusted: the served type
 // comes from the real bytes.
 func TestUploadRejectsActiveContentDisguisedAsAnImage(t *testing.T) {

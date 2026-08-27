@@ -274,6 +274,14 @@ type MessageAttachment struct {
 	SizeBytes     int64
 	Status        string
 	PreviewStatus string
+	// AudioKind is "voice" for a composer recording, empty otherwise (issue
+	// #670). It is files.attachments' own explicit tag, read through
+	// unchanged — never derived here from ContentType or Filename.
+	AudioKind string
+	// DurationMs is the client-declared recording length in milliseconds, 0
+	// when absent. Display only, exactly like ContentType being a hint: it
+	// grants nothing and is never used to authorize or bound anything.
+	DurationMs int64
 }
 
 // MessageEditHistory is a previous persisted version of a message body.

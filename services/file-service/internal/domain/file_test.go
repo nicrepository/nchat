@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -228,4 +229,71 @@ func isValidUTF8(value string) bool {
 		}
 	}
 	return true
+}
+
+// --- voice messages (issue #670) -----------------------------------------
+
+func TestAudioKindValid(t *testing.T) {
+	if !domain.AudioKind("").Valid() || !domain.AudioKindVoice.Valid() {
+		t.Fatal("unset and voice must both be valid")
+	}
+	for _, kind := range []domain.AudioKind{"Voice", "music", "voice "} {
+		if kind.Valid() {
+			t.Fatalf("kind %q must be invalid", kind)
+		}
+	}
+}
+
+func TestNormalizeDeclaredDurationMs(t *testing.T) {
+	if _, ok := domain.NormalizeDeclaredDurationMs(""); ok {
+		t.Fatal("an absent value must not be declared")
+	}
+	if _, ok := domain.NormalizeDeclaredDurationMs("not-a-number"); ok {
+		t.Fatal("garbage must not be declared")
+	}
+	if _, ok := domain.NormalizeDeclaredDurationMs("0"); ok {
+		t.Fatal("zero must not be declared")
+	}
+	if _, ok := domain.NormalizeDeclaredDurationMs("-5"); ok {
+		t.Fatal("a negative value must not be declared")
+	}
+	if _, ok := domain.NormalizeDeclaredDurationMs("99999999999"); ok {
+		t.Fatal("an absurd value must not be declared")
+	}
+	value, ok := domain.NormalizeDeclaredDurationMs("4200")
+	if !ok || value != 4200 {
+		t.Fatalf("expected 4200, got %d (ok=%v)", value, ok)
+	}
+	value, ok = domain.NormalizeDeclaredDurationMs(" 4200 ")
+	if !ok || value != 4200 {
+		t.Fatalf("surrounding whitespace must be tolerated, got %d (ok=%v)", value, ok)
+	}
+	ceiling := domain.MaxDeclaredDurationMs
+	if value, ok := domain.NormalizeDeclaredDurationMs(fmt.Sprint(ceiling)); !ok || int64(value) != int64(ceiling) {
+		t.Fatalf("the ceiling itself must be accepted, got %d (ok=%v)", value, ok)
+	}
+	if _, ok := domain.NormalizeDeclaredDurationMs(fmt.Sprint(ceiling + 1)); ok {
+		t.Fatal("one past the ceiling must not be declared")
+	}
+}
+
+func TestVoiceCompatibleContent(t *testing.T) {
+	for _, mime := range []string{
+		"audio/mpeg", "audio/ogg", "audio/wav", "audio/wave", "audio/x-wav",
+		"application/ogg", "video/webm", "video/mp4",
+		// A codecs parameter must not change the answer: only the bare type
+		// is ever compared.
+		"video/webm; codecs=opus",
+	} {
+		if !domain.VoiceCompatibleContent(mime) {
+			t.Fatalf("%q must be voice-compatible", mime)
+		}
+	}
+	for _, mime := range []string{
+		"application/pdf", "image/png", "text/plain", "video/quicktime", "",
+	} {
+		if domain.VoiceCompatibleContent(mime) {
+			t.Fatalf("%q must not be voice-compatible", mime)
+		}
+	}
 }

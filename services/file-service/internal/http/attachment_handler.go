@@ -24,6 +24,14 @@ const multipartOverhead = 8 << 10
 const (
 	uploadFormField    = "file"
 	uploadPurposeField = "purpose"
+	// uploadDurationMsField is the optional RF-670 client-declared recording
+	// length, in milliseconds. Display only — see domain.NormalizeDeclaredDurationMs.
+	uploadDurationMsField = "duration_ms"
+	// maxLeadingFormFields bounds how many non-file text parts the upload
+	// route reads before it must see the file part. There are only two
+	// legitimate ones today (purpose, duration_ms); the margin exists so
+	// neither one becoming optional-in-either-order costs a rewrite here.
+	maxLeadingFormFields = 4
 )
 
 const (
@@ -227,16 +235,47 @@ func (h *AttachmentHandler) upload(
 		h.failUpload(w, r, startedAt, kind, fmt.Errorf("%w: missing file part", domain.ErrInvalidInput))
 		return
 	}
-	purpose := ""
-	if part.FormName() == uploadPurposeField && part.FileName() == "" {
-		purposeBytes, readErr := io.ReadAll(io.LimitReader(part, 65))
-		_ = part.Close()
-		if readErr != nil || len(purposeBytes) > 64 || string(purposeBytes) != service.UploadPurposeMessageDraft {
+	// Leading text fields, read before the file part: "purpose" and (issue
+	// #670) "duration_ms". Both are optional and either order is accepted,
+	// but the loop is bounded — a client cannot force it to read an unbounded
+	// number of tiny parts before ever reaching a file.
+	purpose, durationMs := "", ""
+	for range [maxLeadingFormFields]struct{}{} {
+		if part.FormName() == uploadFormField && part.FileName() != "" {
+			break
+		}
+		if part.FileName() != "" {
 			h.failUpload(w, r, startedAt, kind,
-				fmt.Errorf("%w: invalid upload purpose", domain.ErrInvalidInput))
+				fmt.Errorf("%w: expected a single %q file field", domain.ErrInvalidInput, uploadFormField))
 			return
 		}
-		purpose = string(purposeBytes)
+		switch part.FormName() {
+		case uploadPurposeField:
+			value, readErr := io.ReadAll(io.LimitReader(part, 65))
+			_ = part.Close()
+			if readErr != nil || len(value) > 64 ||
+				(string(value) != service.UploadPurposeMessageDraft &&
+					string(value) != service.UploadPurposeVoiceMessage) {
+				h.failUpload(w, r, startedAt, kind,
+					fmt.Errorf("%w: invalid upload purpose", domain.ErrInvalidInput))
+				return
+			}
+			purpose = string(value)
+		case uploadDurationMsField:
+			value, readErr := io.ReadAll(io.LimitReader(part, 21))
+			_ = part.Close()
+			if readErr != nil || len(value) > 20 {
+				h.failUpload(w, r, startedAt, kind,
+					fmt.Errorf("%w: invalid duration", domain.ErrInvalidInput))
+				return
+			}
+			durationMs = string(value)
+		default:
+			_ = part.Close()
+			h.failUpload(w, r, startedAt, kind,
+				fmt.Errorf("%w: unexpected form field %q", domain.ErrInvalidInput, part.FormName()))
+			return
+		}
 		part, err = reader.NextPart()
 		if err != nil {
 			h.failUpload(w, r, startedAt, kind,
@@ -253,6 +292,7 @@ func (h *AttachmentHandler) upload(
 
 	view, err := h.useCases.Upload(r.Context(), service.UploadInput{
 		Target:       target,
+		DurationMs:   durationMs,
 		Filename:     part.FileName(),
 		DeclaredMIME: part.Header.Get("Content-Type"),
 		Purpose:      purpose,

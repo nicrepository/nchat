@@ -150,6 +150,49 @@ func TestMessageHandler_MessageJSON_ExposesOnlySafeAttachmentMetadata(t *testing
 	}
 }
 
+// A voice message (issue #670) adds exactly two fields to the payload, and an
+// ordinary attachment must keep looking exactly as it did before this existed
+// — see TestMessageHandler_MessageJSON_ExposesOnlySafeAttachmentMetadata for
+// that half of the contract.
+func TestMessageHandler_MessageJSON_ExposesVoiceMessageFields(t *testing.T) {
+	voice := testMessage()
+	voice.Attachments = []domain.MessageAttachment{{
+		ID: handlerAttachmentID, Filename: "voice-message.ogg", ContentType: "audio/ogg",
+		SizeBytes: 4096, Status: "clean", PreviewStatus: "unsupported",
+		AudioKind: "voice", DurationMs: 4200,
+	}}
+	msgs := &fakeMessageProvider{createdMsg: voice}
+	h := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, msgs)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodPost, "/api/chat/channels/"+testChannelID+"/messages",
+		strings.NewReader(`{"body_text":"","attachment_ids":["`+handlerAttachmentID+`"]}`))
+	r.SetPathValue("channelID", testChannelID)
+
+	h.CreateChannelMessage(rec, r)
+
+	var payload struct {
+		Data struct {
+			Attachments []map[string]any `json:"attachments"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Data.Attachments) != 1 {
+		t.Fatalf("expected one attachment, got %s", rec.Body.String())
+	}
+	attachment := payload.Data.Attachments[0]
+	if attachment["audio_kind"] != "voice" {
+		t.Fatalf("expected audio_kind = voice, got %v", attachment["audio_kind"])
+	}
+	if attachment["duration_ms"] != float64(4200) {
+		t.Fatalf("expected duration_ms = 4200, got %v", attachment["duration_ms"])
+	}
+	if len(attachment) != 8 {
+		t.Fatalf("a voice attachment must expose exactly the eight safe fields: %+v", attachment)
+	}
+}
+
 // A removed message says only that it was removed.
 func TestMessageHandler_MessageJSON_WithholdsAttachmentsOnRemovedMessage(t *testing.T) {
 	removed := messageWithAttachment()

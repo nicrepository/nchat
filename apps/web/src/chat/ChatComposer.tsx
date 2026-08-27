@@ -27,6 +27,8 @@ import {
   type AttachmentUploadState,
   type AttachmentUploadTarget,
 } from "./useAttachmentUpload";
+import { useVoiceRecorder } from "./useVoiceRecorder";
+import VoiceRecorderPanel from "./VoiceRecorderPanel";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
@@ -405,19 +407,32 @@ function ComposerAttachButton({
  * One place decides whether a file may be taken at all, so the picker and the
  * drop zone can never disagree, and ChatComposer is left with the editor and
  * the send rather than with four drag handlers.
+ *
+ * `interceptEnabled` and `acceptEnabled` are deliberately separate (issue
+ * #670 code review): a voice recording must not accept a dropped file, but a
+ * drag over the composer still has to be prevented from turning into the
+ * browser's own file-open navigation. So while recording, a drag is still
+ * intercepted — `preventDefault()` still runs — but never shown as an active
+ * drop target and never handed to `selectFiles`. Outside of a recording the
+ * two always agree, which is what keeps every other caller of this hook
+ * unaffected.
  */
-function useComposerDropZone(enabled: boolean, selectFiles: (files: Iterable<File>) => void) {
+function useComposerDropZone(
+  interceptEnabled: boolean,
+  acceptEnabled: boolean,
+  selectFiles: (files: Iterable<File>) => void,
+) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [active, setActive] = useState(false);
 
   const accept = (files: Iterable<File> | undefined) => {
-    if (enabled && files) selectFiles(files);
+    if (acceptEnabled && files) selectFiles(files);
   };
 
   // Only a drag that actually carries files is intercepted. A text drag, or a
   // drag from inside the editor, keeps its default browser behaviour.
   const hasFiles = (event: DragEvent<HTMLDivElement>) =>
-    enabled && Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    interceptEnabled && Array.from(event.dataTransfer?.types ?? []).includes("Files");
 
   return {
     inputRef,
@@ -431,6 +446,9 @@ function useComposerDropZone(enabled: boolean, selectFiles: (files: Iterable<Fil
     onDragOver: (event: DragEvent<HTMLDivElement>) => {
       if (!hasFiles(event)) return;
       event.preventDefault();
+      // Only the *visual* affordance is conditional on acceptance: a user must
+      // never be shown a drop target that a recording is about to ignore.
+      if (!acceptEnabled) return;
       setActive(true);
     },
     // A dragleave also fires every time the pointer crosses from the box into
@@ -445,8 +463,11 @@ function useComposerDropZone(enabled: boolean, selectFiles: (files: Iterable<Fil
     },
     onDrop: (event: DragEvent<HTMLDivElement>) => {
       if (!hasFiles(event)) return;
-      // Prevented only for a drop this composer handles, so the browser never
-      // navigates away to the dropped file.
+      // Prevented whenever this composer could in principle handle the drop —
+      // recording or not — so the browser never navigates away to the dropped
+      // file. `setActive(false)` is unconditional for the same reason:
+      // nothing must be left signalling an accepted drop that a recording
+      // silently ignored.
       event.preventDefault();
       setActive(false);
       accept(event.dataTransfer.files ?? undefined);
@@ -481,7 +502,21 @@ interface ComposerAttachOptions {
   onPick: (event: ChangeEvent<HTMLInputElement>) => void;
 }
 
-/** The row under the editor: formatting, emoji, attachment, send. */
+/**
+ * The voice-record affordance (issue #670). `disabled` already folds in
+ * every reason recording may not start right now — no destination, the
+ * composer disabled, an upload in flight, or an attachment already sitting
+ * in the composer — so ComposerBar itself never has to know any of those
+ * rules.
+ */
+interface ComposerVoiceOptions {
+  disabled: boolean;
+  /** Explains a disabled state beyond the button's own label, e.g. "remove the attachment first". */
+  title?: string;
+  onStart: () => void;
+}
+
+/** The row under the editor: formatting, emoji, attachment, voice, send. */
 function ComposerBar({
   editor,
   disabled,
@@ -489,6 +524,7 @@ function ComposerBar({
   pickerOpen,
   onPickerOpenChange,
   attach,
+  voice,
   canSend,
   onSend,
 }: {
@@ -499,6 +535,8 @@ function ComposerBar({
   onPickerOpenChange: (open: boolean) => void;
   /** Absent when this composer has nowhere to put a file. */
   attach: ComposerAttachOptions | null;
+  /** Absent when this composer has no destination, or the browser cannot record. */
+  voice: ComposerVoiceOptions | null;
   canSend: boolean;
   onSend: () => Promise<unknown>;
 }) {
@@ -512,6 +550,21 @@ function ComposerBar({
         onPickerOpenChange={onPickerOpenChange}
       />
       {attach && <ComposerAttachButton {...attach} />}
+      {voice && (
+        <button
+          type="button"
+          className="composer-toolbar__btn"
+          aria-label="Gravar mensagem de voz"
+          title={voice.title}
+          disabled={voice.disabled}
+          data-testid="chat-composer-record-btn"
+          onClick={voice.onStart}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+            mic
+          </span>
+        </button>
+      )}
       <button
         type="button"
         className="chat-msg-area__send-btn"
@@ -548,6 +601,32 @@ function attachOptions(
   };
 }
 
+/**
+ * The voice-record affordance, or nothing when this composer has no
+ * destination or the browser offers no MediaRecorder format the backend
+ * accepts (issue #670).
+ *
+ * A pending/ready attachment disables it rather than hiding it: the reader
+ * should see *why* recording is unavailable (the button's own `title`) and
+ * not wonder where it went, and it must never be combined implicitly with
+ * what is already in the composer.
+ */
+function voiceOptions(
+  hasDestination: boolean,
+  supported: boolean,
+  attachEnabled: boolean,
+  uploading: boolean,
+  hasComposerAttachments: boolean,
+  onStart: () => void,
+): ComposerVoiceOptions | null {
+  if (!hasDestination || !supported) return null;
+  return {
+    disabled: !attachEnabled || uploading || hasComposerAttachments,
+    title: hasComposerAttachments ? "Remova os anexos para gravar uma mensagem de voz." : undefined,
+    onStart,
+  };
+}
+
 export default function ChatComposer({
   placeholder,
   channelId,
@@ -574,6 +653,28 @@ export default function ChatComposer({
   const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
   const attachEnabled = Boolean(uploadTarget) && !disabled;
   const uploading = upload.busy;
+  // Whether any attachment — queued, uploading, ready or even failed-but-not-
+  // dismissed — is currently sitting in the composer. `upload.items` is the
+  // single source of truth useAttachmentUpload already keeps for exactly
+  // this; a voice recording does not merge with it (issue #670 code review),
+  // so recording must not even start while it is non-empty.
+  const hasComposerAttachments = upload.items.length > 0;
+  // A voice recording is sent through the same onSend as any other message:
+  // an empty body plus the one attachment that upload just produced. See
+  // handleComposerSend below for why an attachment-only send is already the
+  // composer's normal shape.
+  const recorder = useVoiceRecorder({
+    // Both props are optional on ChatComposerProps and neither is defaulted
+    // in the destructuring above (issue #682 removed the old defaults), so
+    // nullish coalescing here is load-bearing, not defensive style.
+    target: uploadTarget ?? null,
+    maxUploadBytes: attachmentLimits?.maxUploadBytes ?? null,
+    onUploaded: async (attachmentId) => {
+      const result = await onSend("", [attachmentId]);
+      return result.status === "sent";
+    },
+  });
+  const recording = recorder.phase !== "idle";
   const pendingAttachments = upload.items
     .map((item) => item.attachment)
     .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
@@ -616,8 +717,27 @@ export default function ChatComposer({
     onActivity,
   });
 
-  const drop = useComposerDropZone(attachEnabled, upload.selectFiles);
+  // Whether a new attachment may be taken at all right now. A voice
+  // recording is deliberately never combined with an attachment (issue
+  // #670): the picker and the attach button already disappear while
+  // `recording` (the whole bar is hidden — see the render below), and this
+  // is the same rule extended to the one entry point that stays reachable
+  // regardless of that: the composer box's own drag-and-drop surface, bound
+  // below whether or not a recording is in progress. `interceptEnabled`
+  // (passed as `attachEnabled` below) stays unconditional so a drag over the
+  // composer during a recording is still neutralised rather than falling
+  // through to the browser's own file-open navigation.
+  const canAcceptAttachments = attachEnabled && !recording;
+  const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
   const activeEditor = editor ?? null;
+
+  const startRecording = () => {
+    // A picker left open over a recording panel is the same noise a picker
+    // left open over a sent message would be, and recording replaces the bar
+    // the picker lives in regardless.
+    setEmojiPickerOpen(false);
+    recorder.start();
+  };
 
   useEffect(() => {
     const hasContext = Boolean(replyPreview) || referencePreview.status !== "idle";
@@ -649,22 +769,36 @@ export default function ChatComposer({
           targetLabel={referenceTargetLabel}
           onCancel={onCancelReference}
         />
-        <ComposerEditor editor={activeEditor} placeholder={placeholder} />
-        {/* No target, no items and no drag to report: the panel draws nothing. */}
-        <ComposerUploadPanel upload={upload} dragActive={drop.active} />
-        <ComposerBar
-          editor={activeEditor}
-          disabled={disabled || sending}
-          emoji={emoji}
-          pickerOpen={emojiPickerOpen}
-          onPickerOpenChange={setEmojiPickerOpen}
-          attach={attachOptions(attachEnabled, upload, drop)}
-          // Unavailable while a file is going up, whatever else the composer
-          // holds: the attachment is part of the message being written, and
-          // sending now would post a message without it.
-          canSend={canSend && !uploading}
-          onSend={handleSend}
-        />
+        {recording ? (
+          <VoiceRecorderPanel recorder={recorder} />
+        ) : (
+          <>
+            <ComposerEditor editor={activeEditor} placeholder={placeholder} />
+            {/* No target, no items and no drag to report: the panel draws nothing. */}
+            <ComposerUploadPanel upload={upload} dragActive={drop.active} />
+            <ComposerBar
+              editor={activeEditor}
+              disabled={disabled || sending}
+              emoji={emoji}
+              pickerOpen={emojiPickerOpen}
+              onPickerOpenChange={setEmojiPickerOpen}
+              attach={attachOptions(attachEnabled, upload, drop)}
+              voice={voiceOptions(
+                Boolean(uploadTarget),
+                recorder.supported,
+                attachEnabled,
+                uploading,
+                hasComposerAttachments,
+                startRecording,
+              )}
+              // Unavailable while a file is going up, whatever else the composer
+              // holds: the attachment is part of the message being written, and
+              // sending now would post a message without it.
+              canSend={canSend && !uploading}
+              onSend={handleSend}
+            />
+          </>
+        )}
       </div>
     </div>
   );

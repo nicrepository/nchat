@@ -2106,7 +2106,8 @@ func (s *PGXMessageStore) loadAttachmentBatch(ctx context.Context, messages []do
 	rows, err := s.pool.Query(ctx, `
 		SELECT ma.message_id::text, a.id::text, a.original_filename,
 		       COALESCE(NULLIF(a.detected_mime, ''), a.declared_mime),
-		       a.size_bytes, a.status, a.preview_status
+		       a.size_bytes, a.status, a.preview_status,
+		       COALESCE(a.audio_kind, ''), COALESCE(a.declared_duration_ms, 0)
 		FROM chat.message_attachments ma
 		JOIN files.attachments a ON a.id = ma.attachment_id
 		WHERE ma.message_id = ANY($1::uuid[])
@@ -2122,6 +2123,7 @@ func (s *PGXMessageStore) loadAttachmentBatch(ctx context.Context, messages []do
 		if err := rows.Scan(
 			&messageID, &attachment.ID, &attachment.Filename, &attachment.ContentType,
 			&attachment.SizeBytes, &attachment.Status, &attachment.PreviewStatus,
+			&attachment.AudioKind, &attachment.DurationMs,
 		); err != nil {
 			return fmt.Errorf("scan message attachment: %w", err)
 		}

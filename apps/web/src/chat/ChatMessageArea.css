@@ -2790,6 +2790,182 @@
   }
 }
 
+/* ── Inline audio player (issue #670) ─────────────────────────────────────────
+   Shared by an ordinary audio file's row (AttachmentAudio) and the voice
+   bubble below it — one look for "there is audio here you can play". */
+.chat-msg-area__audio-player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-muted, #f5f2fa);
+}
+
+.chat-msg-area__audio-playbtn,
+.chat-msg-area__audio-rate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-msg-area__audio-rate {
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  border: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-msg-area__audio-playbtn:disabled,
+.chat-msg-area__audio-rate:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chat-msg-area__audio-playbtn:focus-visible,
+.chat-msg-area__audio-rate:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__audio-seek {
+  flex: 1 1 120px;
+  min-width: 80px;
+  accent-color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__audio-time {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary, #6b6478);
+  white-space: nowrap;
+}
+
+.chat-msg-area__audio-note {
+  font-size: 11px;
+  color: var(--color-text-secondary, #6b6478);
+  flex-basis: 100%;
+}
+
+.chat-msg-area__audio-note[role="alert"] {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+/* ── Voice message compact presentation (issue #670) ──────────────────────────
+   No filename, no size: a recording is identified by playing it, not by a
+   name like "recording-1699999999.webm". */
+.chat-msg-area__attachment--voice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.chat-msg-area__voice-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── Voice recorder panel (issue #670) ─────────────────────────────────────── */
+.chat-msg-area__voice-recorder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 4px;
+  min-height: 40px;
+}
+
+.chat-msg-area__voice-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-danger, #dc2626);
+  flex: 0 0 auto;
+}
+
+.chat-msg-area__voice-dot--live {
+  animation: chat-voice-dot-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes chat-voice-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__voice-dot--live {
+    animation: none;
+  }
+}
+
+.chat-msg-area__voice-elapsed {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text, #1f1a2e);
+  min-width: 3ch;
+}
+
+.chat-msg-area__voice-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 50%;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #1f1a2e);
+  cursor: pointer;
+}
+
+.chat-msg-area__voice-btn--primary {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+}
+
+.chat-msg-area__voice-btn:hover:not(:disabled) {
+  background: var(--color-surface-2, #f5f2fa);
+}
+
+.chat-msg-area__voice-btn--primary:hover:not(:disabled) {
+  background: var(--color-primary-strong, #4c1d95);
+}
+
+.chat-msg-area__voice-btn:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__voice-status {
+  font-size: 13px;
+  color: var(--color-text-secondary, #6b6478);
+  flex: 1 1 auto;
+}
+
+.chat-msg-area__voice-status[role="alert"] {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
 /* ── Phone density (issue #467) ──────────────────────────────────────────────
    Only spacing and one redundant label; every control stays where it was and
    stays reachable. The thresholds are the ones documented in ChatShell.css. */

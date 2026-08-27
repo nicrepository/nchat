@@ -4,6 +4,7 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -185,6 +186,79 @@ func (s Status) Listable() bool {
 	default:
 		return false
 	}
+}
+
+// AudioKind is the explicit, client-declared semantic role of an attachment's
+// audio (issue #670). It is never inferred from filename, extension or
+// content type — those stay authorization- and rendering-neutral, exactly as
+// they were before this existed. The empty value means "an ordinary
+// attachment, nothing declared", which is what every pre-existing row and
+// every non-audio upload has.
+type AudioKind string
+
+const (
+	// AudioKindVoice marks a recording made by the in-app composer, as
+	// opposed to an audio file the user picked from disk. It is requested by
+	// the client via the upload "purpose" field and only ever grants a
+	// presentation choice (a compact player instead of a filename row) — it
+	// is not a security or capacity input anywhere in this service.
+	AudioKindVoice AudioKind = "voice"
+)
+
+// Valid reports whether the value is one the CHECK allows: unset, or "voice".
+func (k AudioKind) Valid() bool {
+	return k == "" || k == AudioKindVoice
+}
+
+// MaxDeclaredDurationMs bounds the client-declared recording length kept for
+// display. It is generous on purpose — nothing here enforces a recording
+// limit — and exists only to keep an obviously-corrupt value out of the
+// column; the number is never used to authorize or reject anything.
+const MaxDeclaredDurationMs = 6 * 60 * 60 * 1000 // 6 hours
+
+// NormalizeDeclaredDurationMs parses the client's optional recording length.
+// Like NormalizeDeclaredMIME it never fails the upload: an empty, malformed,
+// zero, negative or absurd value simply means "nothing to display", exactly
+// as if the field had been omitted. It carries no authority — nothing here
+// checks it against an actual decoded duration — so it must never be read as
+// anything more than a display hint.
+func NormalizeDeclaredDurationMs(raw string) (int32, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 || value > MaxDeclaredDurationMs {
+		return 0, false
+	}
+	return int32(value), true
+}
+
+// voiceCompatibleContent is the small set of detected containers a voice
+// recording can plausibly be. It exists only to catch an obviously wrong
+// purpose=voice_message request (a PDF marked as a recording, say) before it
+// reaches the client as a voice bubble with nothing playable inside — it is
+// not a stronger security gate than the ordinary upload allowlist already is,
+// and every value here is already accepted by allowedUploadContent.
+//
+// video/webm and video/mp4 are included deliberately: MediaRecorder's
+// audio-only output is still wrapped in a WebM or MP4 container, and
+// net/http.DetectContentType — which does not parse tracks — reports the
+// container's usual type, not "audio/*". See the recorder's MIME selection on
+// the client for the matching list of formats it actually offers.
+var voiceCompatibleContent = map[string]struct{}{
+	"audio/mpeg": {}, "audio/ogg": {}, "audio/wav": {}, "audio/wave": {},
+	"audio/x-wav": {}, "application/ogg": {},
+	"video/webm": {}, "video/mp4": {},
+}
+
+// VoiceCompatibleContent reports whether a detected content type could
+// plausibly hold the audio recorded by a browser's MediaRecorder. It is
+// checked against the *detected* type, once sniffing has run — never the
+// client-declared one.
+func VoiceCompatibleContent(detectedMIME string) bool {
+	_, ok := voiceCompatibleContent[NormalizeDetectedMIME(detectedMIME)]
+	return ok
 }
 
 // DefaultContentType is served whenever no type could be detected. It is inert.
