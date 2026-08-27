@@ -1166,7 +1166,10 @@ describe("useMessages — WS message.created integration", () => {
   // Issue #495: message.created must carry the sender's avatar so the
   // timeline never has to fetch a profile per message to render one.
   it("renders realtime payload's sender avatar", async () => {
-    const payload = makePayload({ id: "msg-avatar", sender_avatar_url: "/avatars/user-sender.png" });
+    const payload = makePayload({
+      id: "msg-avatar",
+      sender_avatar_url: "/avatars/user-sender.png",
+    });
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
     const { result } = renderHook(() =>
