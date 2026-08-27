@@ -1048,7 +1048,7 @@ if require_pinned_kustomize; then
   done
   validate_rendered_overlay "$migrations" "$TEMP_DIR/migrations.yaml"
   validate_rendered_overlay "$application" "$TEMP_DIR/application.yaml"
-  [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/application.yaml")" -eq 9 ]] || fail "application images are not digest-pinned"
+  [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/application.yaml")" -eq 10 ]] || fail "application images are not digest-pinned"
   [[ "$(grep -Fc "@$DIGEST" "$TEMP_DIR/migrations.yaml")" -eq 1 ]] || fail "migration image is not digest-pinned"
 
   fixture_host='nchat-dev.example.invalid'

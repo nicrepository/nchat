@@ -1245,6 +1245,86 @@ func attachmentServiceWithStore(store service.AttachmentStore) *service.Attachme
 	return service.NewAttachmentService(nil, store, nil, nil, 0, false, nil, nil)
 }
 
+type regenerationStoreStub struct {
+	*fakeStore
+	regenerateAttachmentID string
+	regenerateErr          error
+}
+
+func newRegenerationStoreStub() *regenerationStoreStub {
+	return &regenerationStoreStub{fakeStore: newFakeStore()}
+}
+
+func (s *regenerationStoreStub) RegenerateDocumentPreview(_ context.Context, attachmentID string) error {
+	s.regenerateAttachmentID = attachmentID
+	return s.regenerateErr
+}
+
+// readyAttachmentServiceWithStore is attachmentServiceWithStore but with every
+// dependency Ready() checks actually populated, for the handful of methods
+// (RegenerateDocumentPreview among them) that refuse to run at all otherwise.
+func readyAttachmentServiceWithStore(t *testing.T, store service.AttachmentStore) *service.AttachmentService {
+	t.Helper()
+	return service.NewAttachmentService(
+		&fakeAuthorizer{result: service.AuthorizedDestination{
+			ID: testChannelID, WorkspaceID: testWorkspaceID, SessionExpiresAt: time.Now().Add(time.Hour),
+		}},
+		store, newFakeObjects(), testKeyring(t),
+		domain.DefaultMaxUploadBytes, true, &countingOrphans{}, discardLogger(),
+	)
+}
+
+func TestRegenerateDocumentPreviewDelegatesToTheStore(t *testing.T) {
+	id := uuid.NewString()
+	store := newRegenerationStoreStub()
+	store.authorized = service.StoredAttachment{ID: id}
+	svc := readyAttachmentServiceWithStore(t, store)
+
+	err := svc.RegenerateDocumentPreview(context.Background(), downloadInput(id))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.regenerateAttachmentID != id {
+		t.Fatalf("regenerate called with %q, want %q", store.regenerateAttachmentID, id)
+	}
+}
+
+func TestRegenerateDocumentPreviewPropagatesTheStoresError(t *testing.T) {
+	id := uuid.NewString()
+	store := newRegenerationStoreStub()
+	store.authorized = service.StoredAttachment{ID: id}
+	store.regenerateErr = domain.ErrNotFound
+	svc := readyAttachmentServiceWithStore(t, store)
+
+	err := svc.RegenerateDocumentPreview(context.Background(), downloadInput(id))
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestRegenerateDocumentPreviewPropagatesAuthorizationFailures(t *testing.T) {
+	store := newRegenerationStoreStub()
+	store.authorizedErr = domain.ErrNotFound
+	svc := readyAttachmentServiceWithStore(t, store)
+
+	err := svc.RegenerateDocumentPreview(context.Background(), downloadInput(uuid.NewString()))
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestRegenerateDocumentPreviewRequiresARegenerationCapableStore(t *testing.T) {
+	id := uuid.NewString()
+	store := newFakeStore()
+	store.authorized = service.StoredAttachment{ID: id}
+	svc := readyAttachmentServiceWithStore(t, store)
+
+	err := svc.RegenerateDocumentPreview(context.Background(), downloadInput(id))
+	if !errors.Is(err, domain.ErrDependenciesUnavailable) {
+		t.Fatalf("expected ErrDependenciesUnavailable, got %v", err)
+	}
+}
+
 func TestCancelDraftValidatesIdentifiersBeforeCallingTheStore(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

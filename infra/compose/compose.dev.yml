@@ -1,6 +1,26 @@
 name: ${COMPOSE_PROJECT_NAME:-nchat-dev}
 
 services:
+  document-converter:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.document-converter
+    image: nchat/document-converter:dev
+    container_name: nchat-document-converter
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DOCUMENT_CONVERTER_HOST_PORT:-8089}:8089"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /work:size=128m,mode=0700,uid=65532,gid=65532
+    networks:
+      - nchat-dev
+
   postgres:
     image: ${POSTGRES_IMAGE}
     env_file:

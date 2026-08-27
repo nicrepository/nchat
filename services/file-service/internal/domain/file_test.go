@@ -297,3 +297,36 @@ func TestVoiceCompatibleContent(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeAttachmentListLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{"zero means unspecified", 0, domain.DefaultAttachmentListLimit},
+		{"negative means unspecified", -5, domain.DefaultAttachmentListLimit},
+		{"within range passes through", 10, 10},
+		{"over the ceiling is clamped", domain.MaxAttachmentListLimit + 1, domain.MaxAttachmentListLimit},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := domain.NormalizeAttachmentListLimit(test.limit); got != test.want {
+				t.Fatalf("NormalizeAttachmentListLimit(%d) = %d, want %d", test.limit, got, test.want)
+			}
+		})
+	}
+}
+
+func TestStatusListable(t *testing.T) {
+	for _, status := range []domain.Status{domain.StatusPendingScan, domain.StatusClean, domain.StatusRejected} {
+		if !status.Listable() {
+			t.Fatalf("%q must be listable", status)
+		}
+	}
+	for _, status := range []domain.Status{domain.StatusPendingUpload, domain.StatusFailed, domain.StatusDeleted} {
+		if status.Listable() {
+			t.Fatalf("%q must not be listable", status)
+		}
+	}
+}

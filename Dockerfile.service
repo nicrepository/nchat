@@ -9,6 +9,7 @@ COPY go.work go.work.sum ./
 COPY services/admin-service/go.mod services/admin-service/go.sum ./services/admin-service/
 COPY services/auth-service/go.mod services/auth-service/go.sum ./services/auth-service/
 COPY services/chat-service/go.mod services/chat-service/go.sum ./services/chat-service/
+COPY services/document-converter/go.mod services/document-converter/go.sum ./services/document-converter/
 COPY services/file-service/go.mod services/file-service/go.sum ./services/file-service/
 COPY services/media-service/go.mod services/media-service/go.sum ./services/media-service/
 COPY services/notification-service/go.mod services/notification-service/go.sum ./services/notification-service/

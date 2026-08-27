@@ -713,7 +713,26 @@ export type AttachmentStatus = "pending_scan" | "clean" | "rejected";
  * The fallback for the last three is identical and is the whole contract: the
  * file icon and the download action, which never depended on a preview.
  */
-export type AttachmentPreviewStatus = "pending" | "ready" | "unsupported" | "failed";
+export type AttachmentPreviewStatus =
+  | "pending"
+  | "scanning"
+  | "generating"
+  | "available"
+  | "failed"
+  | "blocked"
+  | "expired"
+  // Transitional aliases accepted in in-memory objects created by an older
+  // chat payload during a blue-green rollout. API parsers normalize them.
+  | "ready"
+  | "unsupported";
+
+export function isPreviewAvailable(status: AttachmentPreviewStatus): boolean {
+  return status === "available" || status === "ready";
+}
+
+export function isPreviewPending(status: AttachmentPreviewStatus): boolean {
+  return status === "pending" || status === "scanning" || status === "generating";
+}
 
 /**
  * The explicit, server-authoritative semantic role of an attachment's audio
@@ -783,7 +802,22 @@ export function parseAttachmentStatus(raw: unknown): AttachmentStatus {
  * not exist.
  */
 export function parseAttachmentPreviewStatus(raw: unknown): AttachmentPreviewStatus {
-  return raw === "pending" || raw === "ready" || raw === "failed" ? raw : "unsupported";
+  switch (raw) {
+    case "pending":
+    case "scanning":
+    case "generating":
+    case "available":
+    case "failed":
+    case "blocked":
+    case "expired":
+      return raw;
+    case "ready":
+      return "available";
+    case "unsupported":
+      return "blocked";
+    default:
+      return "blocked";
+  }
 }
 
 interface MessageAttachmentResponse {

@@ -83,6 +83,8 @@ type gateStore struct {
 	// one. The database CHECK keeps these columns empty unless previewStatus is
 	// ready, and this fake keeps them together for the same reason.
 	preview service.StoredAttachment
+	// pages models files.attachment_preview_pages, keyed by page number.
+	pages map[int]service.PreviewPage
 }
 
 func (s *gateStore) CreatePending(_ context.Context, attachment service.NewAttachment) error {
@@ -141,7 +143,21 @@ func (s *gateStore) GetAuthorized(
 		PreviewKEKKeyID:        s.preview.PreviewKEKKeyID,
 		PreviewEnvelopeVersion: s.preview.PreviewEnvelopeVersion,
 		PreviewKeyWrapVersion:  s.preview.PreviewKeyWrapVersion,
+		PreviewPageCount:       s.preview.PreviewPageCount,
+		PreviewContentType:     s.preview.PreviewContentType,
 	}, nil
+}
+
+func (s *gateStore) GetPreviewPage(
+	_ context.Context, _ string, page int,
+) (service.PreviewPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.pages[page]
+	if !ok {
+		return service.PreviewPage{}, domain.ErrNotFound
+	}
+	return record, nil
 }
 
 func (s *gateStore) setStatus(status domain.Status) {
@@ -336,6 +352,102 @@ func (f *gateFixture) publishPreview(t *testing.T, content []byte) {
 		PreviewKEKKeyID:        keyID,
 		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
 		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
+		PreviewPageCount:       1,
+		PreviewContentType:     domain.PreviewContentTypeJPEG,
+	}
+}
+
+// publishSheetPreview is publishPreview's sheet-kind twin: same authorized
+// encrypted object, same single page, but content carries the bounded JSON
+// table shape and is recorded as such — the fixture's way of putting a
+// finished CSV/XLSX preview on the row without driving the real worker
+// (which needs Postgres this suite deliberately avoids).
+func (f *gateFixture) publishSheetPreview(t *testing.T, content []byte) {
+	t.Helper()
+	previewID := uuid.New()
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		t.Fatalf("preview data key: %v", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(content), dataKey, previewID)
+	if err != nil {
+		t.Fatalf("encrypt preview: %v", err)
+	}
+	ciphertext, err := io.ReadAll(encrypted)
+	if err != nil {
+		t.Fatalf("read preview envelope: %v", err)
+	}
+	wrapped, keyID, err := f.keys.Wrap(dataKey, crypto.Binding{
+		AttachmentID:           previewID,
+		WorkspaceID:            uuid.MustParse(gateWorkspaceID),
+		PlaintextSize:          int64(len(content)),
+		KeyWrapVersion:         crypto.KeyWrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		t.Fatalf("wrap preview key: %v", err)
+	}
+	f.objects.put(domain.PreviewObjectKey(previewID), ciphertext)
+
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	f.store.preview = service.StoredAttachment{
+		PreviewStatus:          domain.PreviewStatusReady,
+		PreviewObjectID:        previewID.String(),
+		PreviewSize:            int64(len(content)),
+		PreviewWrappedDEK:      wrapped,
+		PreviewKEKKeyID:        keyID,
+		PreviewEnvelopeVersion: crypto.EnvelopeVersion,
+		PreviewKeyWrapVersion:  crypto.KeyWrapVersion,
+		PreviewPageCount:       1,
+		PreviewContentType:     domain.PreviewContentTypeSheet,
+	}
+}
+
+// publishExtraPage adds one page beyond the first to an attachment that
+// already has publishPreview's page one, exactly as MarkPreviewReady's
+// unnest insert would for a multi-page PDF. It bumps PreviewPageCount to
+// match, the same single write the real statement makes atomically.
+func (f *gateFixture) publishExtraPage(t *testing.T, page int, content []byte) {
+	t.Helper()
+	objectID := uuid.New()
+	dataKey, err := crypto.NewDataKey()
+	if err != nil {
+		t.Fatalf("page data key: %v", err)
+	}
+	encrypted, err := crypto.NewEncryptingReader(bytes.NewReader(content), dataKey, objectID)
+	if err != nil {
+		t.Fatalf("encrypt page: %v", err)
+	}
+	ciphertext, err := io.ReadAll(encrypted)
+	if err != nil {
+		t.Fatalf("read page envelope: %v", err)
+	}
+	wrapped, keyID, err := f.keys.Wrap(dataKey, crypto.Binding{
+		AttachmentID:           objectID,
+		WorkspaceID:            uuid.MustParse(gateWorkspaceID),
+		PlaintextSize:          int64(len(content)),
+		KeyWrapVersion:         crypto.KeyWrapVersion,
+		ContentEnvelopeVersion: crypto.EnvelopeVersion,
+	})
+	if err != nil {
+		t.Fatalf("wrap page key: %v", err)
+	}
+	f.objects.put(domain.PreviewObjectKey(objectID), ciphertext)
+
+	f.store.mu.Lock()
+	defer f.store.mu.Unlock()
+	if f.store.pages == nil {
+		f.store.pages = map[int]service.PreviewPage{}
+	}
+	f.store.pages[page] = service.PreviewPage{
+		PageNumber: page, ObjectID: objectID.String(), Size: int64(len(content)),
+		WrappedDEK: wrapped, KEKKeyID: keyID,
+		EnvelopeVersion: crypto.EnvelopeVersion, KeyWrapVersion: crypto.KeyWrapVersion,
+		ContentType: domain.PreviewContentTypeJPEG,
+	}
+	if f.store.preview.PreviewPageCount < page {
+		f.store.preview.PreviewPageCount = page
 	}
 }
 
@@ -500,9 +612,103 @@ func TestACleanAttachmentStillServesItsPreview(t *testing.T) {
 	if response.Body.String() != "jpeg-preview-bytes" {
 		t.Fatalf("preview served %q", response.Body.String())
 	}
-	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentType {
+	if got := response.Header().Get("Content-Type"); got != domain.PreviewContentTypeJPEG {
 		t.Fatalf("preview content type = %q", got)
 	}
+}
+
+func TestDocumentPreviewManifestAndFirstPageReuseTheAuthorizedPreview(t *testing.T) {
+	fixture := newGateFixture(t)
+	fixture.publishPreview(t, []byte("jpeg-preview-bytes"))
+	fixture.publishExtraPage(t, 2, []byte("jpeg-preview-page-2"))
+	fixture.publishExtraPage(t, 3, []byte("jpeg-preview-page-3"))
+	fixture.store.setStatus(domain.StatusClean)
+
+	manifest := fixture.get(t, "/document-preview", nil)
+	if manifest.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d: %s", manifest.Code, manifest.Body.String())
+	}
+	if got := manifest.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("manifest cache policy = %q", got)
+	}
+	for _, fragment := range []string{
+		`"attachmentId":"` + fixture.store.attachmentID() + `"`,
+		`"pageCount":3`,
+		`"labels":["Página 1","Página 2","Página 3"]`,
+	} {
+		if !strings.Contains(manifest.Body.String(), fragment) {
+			t.Fatalf("manifest missing %q: %s", fragment, manifest.Body.String())
+		}
+	}
+
+	page1 := fixture.get(t, "/document-preview/pages/1", nil)
+	if page1.Code != http.StatusOK || page1.Body.String() != "jpeg-preview-bytes" {
+		t.Fatalf("page 1 response = %d %q", page1.Code, page1.Body.String())
+	}
+	page2 := fixture.get(t, "/document-preview/pages/2", nil)
+	if page2.Code != http.StatusOK || page2.Body.String() != "jpeg-preview-page-2" {
+		t.Fatalf("page 2 response = %d %q", page2.Code, page2.Body.String())
+	}
+	page3 := fixture.get(t, "/document-preview/pages/3", nil)
+	if page3.Code != http.StatusOK || page3.Body.String() != "jpeg-preview-page-3" {
+		t.Fatalf("page 3 response = %d %q", page3.Code, page3.Body.String())
+	}
+	if got := page2.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("page 2 cache policy = %q", got)
+	}
+}
+
+func TestDocumentPreviewRoutesCannotBypassScanOrPageBounds(t *testing.T) {
+	fixture := newGateFixture(t)
+	fixture.publishPreview(t, []byte("jpeg-preview-bytes"))
+	fixture.publishExtraPage(t, 2, []byte("jpeg-preview-page-2"))
+	for _, route := range []string{"/document-preview", "/document-preview/pages/1", "/document-preview/pages/2"} {
+		fixture.store.setStatus(domain.StatusPendingScan)
+		assertRefusedWithoutContent(t, fixture.get(t, route, nil), fixture.objects)
+	}
+	fixture.store.setStatus(domain.StatusClean)
+	for _, route := range []string{"/document-preview/pages/3", "/document-preview/pages/0", "/document-preview/pages/-1"} {
+		response := fixture.get(t, route, nil)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", route, response.Code)
+		}
+	}
+}
+
+// A CSV/XLSX preview reports kind:"sheets" and serves its bounded JSON table
+// with the sheet content type — the same authorization and scan gate as a
+// PDF/image preview, just a different payload shape end to end.
+func TestDocumentPreviewManifestAndPageServeASheetPreview(t *testing.T) {
+	fixture := newGateFixture(t)
+	sheetJSON := `{"columns":["A","B"],"rows":[["1","2"]],"truncatedRows":false,"truncatedColumns":false,"totalRowsRead":1}`
+	fixture.publishSheetPreview(t, []byte(sheetJSON))
+	fixture.store.setStatus(domain.StatusClean)
+
+	manifest := fixture.get(t, "/document-preview", nil)
+	if manifest.Code != http.StatusOK {
+		t.Fatalf("manifest status = %d: %s", manifest.Code, manifest.Body.String())
+	}
+	for _, fragment := range []string{`"kind":"sheets"`, `"pageCount":1`, `"labels":["Planilha"]`} {
+		if !strings.Contains(manifest.Body.String(), fragment) {
+			t.Fatalf("manifest missing %q: %s", fragment, manifest.Body.String())
+		}
+	}
+
+	page := fixture.get(t, "/document-preview/pages/1", nil)
+	if page.Code != http.StatusOK {
+		t.Fatalf("page status = %d: %s", page.Code, page.Body.String())
+	}
+	if got := page.Header().Get("Content-Type"); got != domain.PreviewContentTypeSheet {
+		t.Fatalf("page content type = %q, want %q", got, domain.PreviewContentTypeSheet)
+	}
+	if page.Body.String() != sheetJSON {
+		t.Fatalf("page body = %q, want %q", page.Body.String(), sheetJSON)
+	}
+	// The scan gate applies identically to a sheet preview: nothing is served
+	// to a caller before the file is approved.
+	fixture.store.setStatus(domain.StatusPendingScan)
+	assertRefusedWithoutContent(t, fixture.get(t, "/document-preview", nil), fixture.objects)
+	assertRefusedWithoutContent(t, fixture.get(t, "/document-preview/pages/1", nil), fixture.objects)
 }
 
 // The scan verdict is not a substitute for authorization, in either direction.

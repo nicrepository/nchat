@@ -23,7 +23,7 @@ trap 'rm -rf "$RENDER_DIR"' EXIT
 ERRORS=0
 SLOTS=(blue green)
 STABLE_SERVICES=(nchat-web nchat-admin-web auth-service chat-service file-service
-  notification-service admin-service search-service media-service)
+  document-converter notification-service admin-service search-service media-service)
 # Shared by both slots on purpose: a pinned nginx and a virus scanner that no
 # NChat release changes.
 SHARED_WORKLOADS=(clamav upload-guard)

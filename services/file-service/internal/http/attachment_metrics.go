@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"time"
+
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -12,14 +14,16 @@ import (
 // never labels: they are unbounded, and two of them are the identifiers this
 // service exists to keep private.
 type AttachmentMetrics struct {
-	uploads      *prometheus.CounterVec
-	downloads    *prometheus.CounterVec
-	previews     *prometheus.CounterVec
-	linkPreviews *prometheus.CounterVec
-	cleanups     *prometheus.CounterVec
-	scans        *prometheus.CounterVec
-	scanQueue    prometheus.Gauge
-	orphans      prometheus.Counter
+	uploads         *prometheus.CounterVec
+	downloads       *prometheus.CounterVec
+	previews        *prometheus.CounterVec
+	previewAttempts *prometheus.CounterVec
+	previewDuration *prometheus.HistogramVec
+	linkPreviews    *prometheus.CounterVec
+	cleanups        *prometheus.CounterVec
+	scans           *prometheus.CounterVec
+	scanQueue       prometheus.Gauge
+	orphans         prometheus.Counter
 }
 
 // NewAttachmentMetrics registers the attachment counters on the shared
@@ -50,6 +54,14 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 			Name: "nchat_file_previews_total",
 			Help: "Attachment preview generation and delivery by outcome.",
 		}, []string{"result"}),
+		previewAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nchat_file_preview_attempts_total",
+			Help: "Document preview attempts by bounded format and outcome.",
+		}, []string{"format", "result", "reason"}),
+		previewDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "nchat_file_preview_duration_seconds",
+			Help: "Document preview attempt duration by bounded format and outcome.",
+		}, []string{"format", "result"}),
 		// Open Graph link preview outcomes (RF-10): hit, success, invalid_url,
 		// blocked, unsupported_content_type, timeout, upstream_error,
 		// no_metadata.
@@ -103,9 +115,17 @@ func NewAttachmentMetrics(metrics *observability.Metrics) *AttachmentMetrics {
 	}
 	// Register reports false when metrics are disabled; the counters still work
 	// as no-op accumulators, so callers never need a nil check.
-	metrics.Register(m.uploads, m.downloads, m.previews, m.linkPreviews, m.cleanups,
+	metrics.Register(m.uploads, m.downloads, m.previews, m.previewAttempts, m.previewDuration, m.linkPreviews, m.cleanups,
 		m.scans, m.scanQueue, m.orphans)
 	return m
+}
+
+func (m *AttachmentMetrics) ObserveDocumentPreview(format, result, reason string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.previewAttempts.WithLabelValues(format, result, reason).Inc()
+	m.previewDuration.WithLabelValues(format, result).Observe(duration.Seconds())
 }
 
 // ObserveLinkPreview satisfies linkpreview.Observer.

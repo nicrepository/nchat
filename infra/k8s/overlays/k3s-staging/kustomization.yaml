@@ -19,6 +19,8 @@ images:
     newTag: 0.0.0
   - name: ghcr.io/nicrepository/nchat/chat-service
     newTag: 0.0.0
+  - name: ghcr.io/nicrepository/nchat/document-converter
+    newTag: 0.0.0
   - name: ghcr.io/nicrepository/nchat/file-service
     newTag: 0.0.0
   - name: ghcr.io/nicrepository/nchat/notification-service

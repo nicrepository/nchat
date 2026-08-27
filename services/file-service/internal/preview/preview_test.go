@@ -26,7 +26,28 @@ import (
 // WebAssembly sandbox, which costs a few hundred milliseconds on first use.
 const renderTimeout = 60 * time.Second
 
+// renderBytes renders and returns page one, which is every page for every
+// source these single-page tests use — image renders always produce one page,
+// and the PDF fixtures here are one-page documents. Multi-page PDF rendering
+// has its own tests in pdf_test.go.
 func renderBytes(t *testing.T, detectedMIME string, source []byte) ([]byte, error) {
+	t.Helper()
+	pages, err := renderPages(t, detectedMIME, source)
+	if err != nil {
+		return nil, err
+	}
+	return pages[0], nil
+}
+
+func renderPages(t *testing.T, detectedMIME string, source []byte) ([][]byte, error) {
+	t.Helper()
+	pages, _, err := renderPagesWithType(t, detectedMIME, source)
+	return pages, err
+}
+
+func renderPagesWithType(
+	t *testing.T, detectedMIME string, source []byte,
+) ([][]byte, string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
 	defer cancel()
@@ -212,7 +233,7 @@ func TestRenderRefusesASourceLargerThanTheReadLimit(t *testing.T) {
 	oversized := io.LimitReader(zeroReader{}, domain.MaxPreviewSourceBytes+1)
 	ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
 	defer cancel()
-	_, err := preview.New().Render(ctx, "image/png", oversized)
+	_, _, err := preview.New().Render(ctx, "image/png", oversized)
 	if !errors.Is(err, preview.ErrUnsupported) {
 		t.Fatalf("error = %v, want ErrUnsupported", err)
 	}
@@ -314,7 +335,7 @@ func TestRenderReportsAPDFWithoutPagesAsUnsupported(t *testing.T) {
 func TestRenderStopsWhenTheContextIsAlreadyCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := preview.New().Render(ctx, "application/pdf", bytes.NewReader(singlePagePDF()))
+	_, _, err := preview.New().Render(ctx, "application/pdf", bytes.NewReader(singlePagePDF()))
 	if err == nil {
 		t.Fatal("render returned no error for a cancelled context")
 	}
@@ -357,7 +378,7 @@ func TestRenderKeepsAtLeastOnePixelOnTheShortEdge(t *testing.T) {
 func TestRenderReportsAFailingSourceAsTransient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
 	defer cancel()
-	_, err := preview.New().Render(ctx, "image/png", failingReader{})
+	_, _, err := preview.New().Render(ctx, "image/png", failingReader{})
 	if err == nil {
 		t.Fatal("expected the read failure to be reported")
 	}
@@ -373,12 +394,12 @@ func (failingReader) Read([]byte) (int, error) { return 0, errors.New("storage s
 // The PDF path must work without a deadline on the context: the job always sets
 // one, but the renderer must not depend on it to decide anything.
 func TestRenderAPDFWithoutADeadline(t *testing.T) {
-	rendered, err := preview.New().Render(
+	rendered, _, err := preview.New().Render(
 		context.Background(), "application/pdf", bytes.NewReader(singlePagePDF()))
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	decodePreview(t, rendered)
+	decodePreview(t, rendered[0])
 }
 
 // An encrypted PDF is a legitimate file this service cannot look inside, so it
@@ -538,7 +559,7 @@ func TestRenderStopsAPDFAtTheDeadline(t *testing.T) {
 	// Give the deadline time to pass before the sandbox is even built.
 	<-ctx.Done()
 
-	_, err := preview.New().Render(ctx, "application/pdf", bytes.NewReader(singlePagePDF()))
+	_, _, err := preview.New().Render(ctx, "application/pdf", bytes.NewReader(singlePagePDF()))
 	if err == nil {
 		t.Fatal("an expired deadline must stop the render")
 	}

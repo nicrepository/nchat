@@ -759,6 +759,70 @@ func TestLinkSafetyIsValidatedIndependentlyOfPreviews(t *testing.T) {
 	}
 }
 
+func enableLinkSafety(t *testing.T) {
+	t.Helper()
+	t.Setenv("FILE_LINK_SAFETY_ENABLED", "true")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", "acct-123")
+	t.Setenv("FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN", "token-abc")
+}
+
+func TestValidateAcceptsTheDefaultLinkSafetyCapacity(t *testing.T) {
+	enableLinkSafety(t)
+	if err := Load().Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateRejectsNegativeLinkSafetyCapacityValues(t *testing.T) {
+	for _, env := range []string{
+		"FILES_LINK_SAFETY_NEW_URL_BUDGET",
+		"FILES_LINK_SAFETY_MAX_PENDING_JOBS",
+		"FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT",
+	} {
+		t.Run(env, func(t *testing.T) {
+			enableLinkSafety(t)
+			t.Setenv(env, "-1")
+			assertValidationError(t, Load(), env)
+		})
+	}
+}
+
+func TestValidateRejectsAZeroWindowWhenItsLimitIsEnabled(t *testing.T) {
+	tests := []struct {
+		windowEnv string
+	}{
+		{"FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS"},
+		{"FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.windowEnv, func(t *testing.T) {
+			enableLinkSafety(t)
+			t.Setenv(tt.windowEnv, "0")
+			assertValidationError(t, Load(), tt.windowEnv)
+		})
+	}
+}
+
+func TestValidateRejectsANonPositiveSubmitUncertainTimeout(t *testing.T) {
+	enableLinkSafety(t)
+	t.Setenv("FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", "0")
+	assertValidationError(t, Load(), "FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS")
+}
+
+func TestValidateRejectsAnUnusablePerUserUploadCap(t *testing.T) {
+	t.Run("zero", func(t *testing.T) {
+		enableUploads(t)
+		t.Setenv("FILE_UPLOAD_MAX_CONCURRENT_PER_USER", "0")
+		assertValidationError(t, Load(), "FILE_UPLOAD_MAX_CONCURRENT_PER_USER")
+	})
+	t.Run("exceeds the cluster cap", func(t *testing.T) {
+		enableUploads(t)
+		t.Setenv("FILE_UPLOAD_MAX_CONCURRENT", "4")
+		t.Setenv("FILE_UPLOAD_MAX_CONCURRENT_PER_USER", "5")
+		assertValidationError(t, Load(), "FILE_UPLOAD_MAX_CONCURRENT_PER_USER")
+	})
+}
+
 // The same structural guarantee in file-service: no setting can make an
 // uncertain submission be sent again, because no field exists to carry the
 // policy. See the chat-service config test for the reasoning.

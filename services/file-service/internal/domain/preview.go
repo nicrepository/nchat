@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"mime"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -18,6 +19,46 @@ var ErrPreviewUnavailable = errors.New("attachment preview not available")
 // PreviewStatus is the lifecycle of an attachment's inline preview (RF-31).
 // The client never supplies it, exactly like Status.
 type PreviewStatus string
+
+type PreviewLifecycleStatus string
+
+const (
+	PreviewLifecyclePending    PreviewLifecycleStatus = "pending"
+	PreviewLifecycleScanning   PreviewLifecycleStatus = "scanning"
+	PreviewLifecycleGenerating PreviewLifecycleStatus = "generating"
+	PreviewLifecycleAvailable  PreviewLifecycleStatus = "available"
+	PreviewLifecycleFailed     PreviewLifecycleStatus = "failed"
+	PreviewLifecycleBlocked    PreviewLifecycleStatus = "blocked"
+	PreviewLifecycleExpired    PreviewLifecycleStatus = "expired"
+)
+
+func (s PreviewLifecycleStatus) Valid() bool {
+	switch s {
+	case PreviewLifecyclePending, PreviewLifecycleScanning, PreviewLifecycleGenerating,
+		PreviewLifecycleAvailable, PreviewLifecycleFailed, PreviewLifecycleBlocked,
+		PreviewLifecycleExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s PreviewLifecycleStatus) CanTransitionTo(next PreviewLifecycleStatus) bool {
+	switch s {
+	case PreviewLifecyclePending:
+		return next == PreviewLifecycleScanning || next == PreviewLifecycleGenerating || next == PreviewLifecycleBlocked
+	case PreviewLifecycleScanning:
+		return next == PreviewLifecyclePending || next == PreviewLifecycleBlocked
+	case PreviewLifecycleGenerating:
+		return next == PreviewLifecycleAvailable || next == PreviewLifecycleFailed || next == PreviewLifecycleBlocked
+	case PreviewLifecycleAvailable:
+		return next == PreviewLifecycleExpired || next == PreviewLifecycleBlocked
+	case PreviewLifecycleFailed, PreviewLifecycleExpired:
+		return next == PreviewLifecyclePending
+	default:
+		return false
+	}
+}
 
 const (
 	// PreviewStatusPending is the state a previewable attachment finishes its
@@ -59,13 +100,30 @@ func (s PreviewStatus) Terminal() bool {
 	return s == PreviewStatusReady || s == PreviewStatusUnsupported || s == PreviewStatusFailed
 }
 
-// PreviewContentType is the single type every preview is encoded in.
-//
-// One output format, decided by the server, is what makes the response safe to
-// render inline: the bytes are always a re-encoded raster produced by this
-// service, never the uploaded file, so an HTML, SVG or script upload cannot
-// become a preview that a browser would execute.
-const PreviewContentType = "image/jpeg"
+// Preview content types. Every preview is one of these two, decided by the
+// server and recorded per attachment/page (preview_content_type / content_type,
+// migration 000017) — never inferred from the uploaded file's own declared or
+// detected type. That is what makes serving a preview inline safe: the bytes
+// are always either a re-encoded raster or this service's own bounded JSON
+// table shape, never the uploaded file, so an HTML, SVG or script upload
+// cannot become a preview a browser would execute.
+const (
+	// PreviewContentTypeJPEG is every raster preview: images, and every page
+	// of a rendered PDF.
+	PreviewContentTypeJPEG = "image/jpeg"
+	// PreviewContentTypeSheet is a spreadsheet/CSV preview: a single bounded
+	// JSON document (columns, rows, truncation flags — see
+	// internal/preview/csv.go and xlsx.go), never arbitrary JSON. A private,
+	// versioned type rather than a bare application/json, so a client
+	// dispatches on it without ambiguity about whose shape it is.
+	PreviewContentTypeSheet = "application/vnd.nchat.preview-sheet+json"
+)
+
+// PreviewContentTypeValid reports whether t is one of the two content types the
+// preview_content_type/content_type CHECK constraints allow.
+func PreviewContentTypeValid(t string) bool {
+	return t == PreviewContentTypeJPEG || t == PreviewContentTypeSheet
+}
 
 // Preview generation limits. They are constants rather than configuration: they
 // bound how much CPU and memory one hostile file may cost, and an operator who
@@ -84,11 +142,39 @@ const (
 
 	// MaxPreviewDimension is the longest edge of the produced thumbnail. The
 	// aspect ratio is preserved, so this bounds the output on both axes.
-	MaxPreviewDimension = 512
+	// 1280 puts a 16:9 source at exactly 1280x720 — 720p on the long edge —
+	// which is the floor a document preview needs to stay legible when a user
+	// zooms in, not just recognisable as a thumbnail.
+	MaxPreviewDimension = 1280
 
-	// PreviewJPEGQuality is the encoder quality. 80 is the usual thumbnail
-	// trade-off: a 512px preview lands in tens of kilobytes.
+	// PreviewJPEGQuality is the encoder quality. 80 is the usual trade-off; at
+	// 1280px a preview lands in the hundreds of kilobytes rather than tens.
 	PreviewJPEGQuality = 80
+
+	// MaxPreviewPDFPages bounds how many pages of one PDF this service will
+	// ever render and store. It is a cost ceiling, not a product limit: it
+	// keeps a 400-page report's whole render inside the one job that already
+	// renders its cover, instead of multiplying the job's cost by the
+	// document's length. A PDF longer than this is previewed up to the cap;
+	// the rest is reachable only through the full download.
+	MaxPreviewPDFPages = 20
+
+	// MaxPreviewSheetRows bounds how many data rows of a spreadsheet/CSV
+	// preview this service will ever render and store, the same cost-ceiling
+	// reasoning as MaxPreviewPDFPages applied to rows instead of pages. A row
+	// beyond this is reachable only through the full download.
+	MaxPreviewSheetRows = 500
+
+	// MaxPreviewSheetColumns bounds how many columns of each row are read. A
+	// hostile file with an enormous number of columns on one line is a
+	// memory-exhaustion vector distinct from row count, and is bounded
+	// independently of it.
+	MaxPreviewSheetColumns = 50
+
+	// MaxPreviewCellBytes bounds one cell's rendered length, so a single
+	// absurdly long field cannot make one row cost as much as the whole row
+	// limit.
+	MaxPreviewCellBytes = 2048
 )
 
 // previewableMIMEs is the allowlist of *detected* content types that have a
@@ -97,11 +183,35 @@ const (
 //
 // image/webp is absent: the standard library has no webp decoder and this
 // change adds no dependency for one.
+//
+// # Why text/plain and application/zip, not text/csv or the XLSX MIME
+//
+// This allowlist is checked against the *coarse* sniff — net/http.
+// DetectContentType — at upload finalisation, and that detector has no
+// signature for CSV or for any OOXML subtype: it can only ever produce
+// text/plain for delimited text (CSV included, indistinguishable from any
+// other readable text by content alone) and application/zip for any
+// zip-shaped file (XLSX included, indistinguishable at this layer from
+// DOCX, PPTX, ODT/ODS/ODP, or an arbitrary .zip). Allowlisting the specific
+// strings a real upload can never produce would silently never schedule a
+// render for anything — exactly the bug this comment now documents against.
+//
+// The finer classification happens one layer down, inside the renderer
+// itself: internal/preview/xlsx.go calls InspectDocumentContainer to learn
+// which OOXML/ODF subtype a zip-shaped upload actually is, and refuses
+// anything that is not XLSX (DOCX/PPTX/ODT/ODP/ODS included) with
+// ErrUnsupported — the same terminal, non-retried outcome as today, just
+// decided after one cheap render attempt instead of never being attempted.
+// A plain-text file that is not delimited data similarly renders as a
+// (possibly single-column) table rather than being pre-filtered — see
+// internal/preview/csv.go's own comment on that trade-off.
 var previewableMIMEs = map[string]struct{}{
 	"image/jpeg":      {},
 	"image/png":       {},
 	"image/gif":       {},
 	"application/pdf": {},
+	"text/plain":      {},
+	"application/zip": {},
 }
 
 // NormalizeDetectedMIME reduces a stored detected type to the bare type for
@@ -139,6 +249,19 @@ func InitialPreviewStatus(detectedMIME string, size int64) PreviewStatus {
 		return PreviewStatusUnsupported
 	}
 	return PreviewStatusPending
+}
+
+// InitialDocumentPreviewStatus additionally admits a legacy PowerPoint only
+// as a candidate. The worker still requires the CFB signature and converter
+// validation before the bytes can cross the trust boundary.
+func InitialDocumentPreviewStatus(detectedMIME, originalFilename string, size int64) PreviewStatus {
+	if NormalizeDetectedMIME(detectedMIME) == "application/octet-stream" && strings.EqualFold(filepath.Ext(originalFilename), ".ppt") {
+		if size > 0 && size <= MaxPreviewSourceBytes {
+			return PreviewStatusPending
+		}
+		return PreviewStatusUnsupported
+	}
+	return InitialPreviewStatus(detectedMIME, size)
 }
 
 // PreviewObjectKey derives the SeaweedFS key of a preview object.

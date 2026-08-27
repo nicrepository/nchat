@@ -2622,6 +2622,17 @@
   flex-wrap: wrap;
 }
 
+/* The document card's own action row (task #494): Visualizar beside Baixar,
+   below the icon/name/size line — the same chat-msg-area__attachment-action
+   buttons every other attachment type already uses, just grouped on their
+   own line so the large preview above reads as one WhatsApp-style card. */
+.chat-msg-area__attachment-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .chat-msg-area__attachment-icon {
   flex: none;
   width: 32px;

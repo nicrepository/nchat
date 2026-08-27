@@ -92,6 +92,13 @@ patches:
       apiVersion: apps/v1
       kind: Deployment
       metadata:
+        name: document-converter
+        namespace: nchat
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
         name: notification-service
         namespace: nchat
       $patch: delete
@@ -127,7 +134,7 @@ patches:
   # no slot, and a slot key in their selector would make them select nothing.
   - target:
       kind: Service
-      name: ^(nchat-web|nchat-admin-web|auth-service|chat-service|file-service|notification-service|admin-service|search-service|media-service)$
+      name: ^(nchat-web|nchat-admin-web|auth-service|chat-service|file-service|document-converter|notification-service|admin-service|search-service|media-service)$
     patch: |-
       - op: add
         path: /spec/selector/nchat.io~1release-slot

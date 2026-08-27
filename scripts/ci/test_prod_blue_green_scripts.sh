@@ -22,7 +22,7 @@ PATH="$FAKE_BIN:$PATH"
 export PATH
 
 SERVICES=(nchat-web nchat-admin-web auth-service chat-service file-service
-  notification-service admin-service search-service media-service)
+  document-converter notification-service admin-service search-service media-service)
 FAILURES=0
 CASE=""
 CASE_FAILURES=0
@@ -112,6 +112,7 @@ component_for() {
     auth-service) printf 'auth' ;;
     chat-service) printf 'chat' ;;
     file-service) printf 'file' ;;
+    document-converter) printf 'document-converter' ;;
     notification-service) printf 'notification' ;;
     admin-service) printf 'admin' ;;
     search-service) printf 'search' ;;
@@ -650,7 +651,7 @@ echo "--- bootstrap ---"
 ARTIFACTS="$WORK/artifacts"
 mkdir -p "$ARTIFACTS"
 for image in web admin-web auth-service chat-service file-service \
-  notification-service admin-service search-service media-service migrations; do
+  document-converter notification-service admin-service search-service media-service migrations; do
   printf 'sha256:%064d' 1 >"$ARTIFACTS/digest-$image.txt"
 done
 TOPOLOGY="$WORK/topology.env"

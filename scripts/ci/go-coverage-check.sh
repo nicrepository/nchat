@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 COVERAGE_DIR="$ROOT_DIR/coverage/go"
 THRESHOLD="${GO_COVERAGE_THRESHOLD:-90}"
 
+# shellcheck source=lib/go-retry.sh
+source "$ROOT_DIR/scripts/ci/lib/go-retry.sh"
+
 mkdir -p "$COVERAGE_DIR"
 
 echo "Go coverage threshold: ${THRESHOLD}%"
@@ -26,7 +29,10 @@ while IFS= read -r module; do
   fi
 
   echo "==> go test coverage threshold $module"
-  (cd "$ROOT_DIR/$module" && go test "${packages[@]}" -covermode=atomic -coverprofile="$profile")
+  run_go_test_coverage() {
+    (cd "$ROOT_DIR/$module" && go test "${packages[@]}" -covermode=atomic -coverprofile="$profile")
+  }
+  go_retry run_go_test_coverage
 
   if [ ! -s "$profile" ]; then
     echo "Coverage profile is empty for $module." >&2

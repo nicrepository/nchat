@@ -74,9 +74,37 @@ type AttachmentUseCases interface {
 	Metadata(ctx context.Context, input service.AttachmentAuthInput) (service.AttachmentView, error)
 	Download(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
 	Preview(ctx context.Context, input service.AttachmentAuthInput) (service.Download, error)
+	// DocumentPreviewPage returns page N (N >= 2) of a multi-page preview.
+	// Page 1 is served by Preview above, unchanged.
+	DocumentPreviewPage(ctx context.Context, input service.AttachmentAuthInput, page int) (service.Download, error)
 	ListDestinationAttachments(ctx context.Context, input service.ListDestinationAttachmentsInput) ([]service.AttachmentView, error)
 	CancelDraft(ctx context.Context, input service.CancelDraftInput) error
 	Ready() bool
+}
+
+type documentPreviewRegenerator interface {
+	RegenerateDocumentPreview(ctx context.Context, input service.AttachmentAuthInput) error
+}
+
+func (h *AttachmentHandler) RegenerateDocumentPreview(w http.ResponseWriter, r *http.Request) {
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	regenerator, ok := h.useCases.(documentPreviewRegenerator)
+	if !ok {
+		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
+		return
+	}
+	err := regenerator.RegenerateDocumentPreview(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"), UserID: principal.UserID, SessionID: principal.SessionID,
+	})
+	if err != nil {
+		writeAttachmentError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // CancelDraft handles DELETE /attachments/{attachmentID}. Authorization uses
@@ -676,6 +704,129 @@ func (h *AttachmentHandler) GetPreview(w http.ResponseWriter, r *http.Request) {
 	if !streamExactly(w, preview) {
 		// Headers are already committed, so the status cannot be corrected — the
 		// short body is what stops a truncated object being accepted as whole.
+		result = "stream_failed"
+	}
+	h.metrics.ObservePreview(result)
+	h.logAttachment(r, startedAt, "preview", result, http.StatusOK, r.PathValue("attachmentID"))
+}
+
+type documentPreviewManifest struct {
+	AttachmentID string   `json:"attachmentId"`
+	Kind         string   `json:"kind"`
+	PageCount    int      `json:"pageCount"`
+	Labels       []string `json:"labels"`
+}
+
+// GetDocumentPreviewManifest exposes only bounded navigation metadata. It
+// intentionally reuses Metadata authorization and derives every identifier
+// from the authenticated request and stored attachment.
+//
+// PageCount and Labels are real, from the attachment's own
+// preview_page_count (task #494, Fase 1) — every attachment with a
+// single-page preview, which is every image and every preview produced
+// before multi-page rendering existed, still reports exactly one page.
+//
+// Kind is derived from preview_content_type, never stored redundantly: a
+// spreadsheet/CSV preview (task #494's sheet phase) always has PageCount 1 —
+// no sheet switching yet — but reports "sheets" so the client knows to fetch
+// and render a table instead of an image.
+func (h *AttachmentHandler) GetDocumentPreviewManifest(w http.ResponseWriter, r *http.Request) {
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	view, err := h.useCases.Metadata(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"), UserID: principal.UserID, SessionID: principal.SessionID,
+	})
+	if err != nil {
+		writeAttachmentError(w, err)
+		return
+	}
+	if view.Status != string(domain.StatusClean) {
+		writeAttachmentError(w, domain.ErrNotDownloadable)
+		return
+	}
+	if view.PreviewStatus != string(domain.PreviewStatusReady) {
+		writeAttachmentError(w, domain.ErrPreviewUnavailable)
+		return
+	}
+	pageCount := view.PreviewPageCount
+	if pageCount < 1 {
+		// Defensive only: the schema defaults preview_page_count to 1 and
+		// never allows it below that for a ready preview.
+		pageCount = 1
+	}
+	kind := "pages"
+	labels := make([]string, pageCount)
+	if view.PreviewContentType == domain.PreviewContentTypeSheet {
+		kind = "sheets"
+		labels = []string{"Planilha"}
+	} else {
+		for i := range labels {
+			labels[i] = fmt.Sprintf("Página %d", i+1)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	httputil.WriteJSON(w, http.StatusOK, documentPreviewManifest{
+		AttachmentID: view.ID, Kind: kind, PageCount: pageCount, Labels: labels,
+	})
+}
+
+// GetDocumentPreviewPage serves one page of a document preview. Page one is
+// the existing safe JPEG resource, served byte-for-byte unchanged; page two
+// and beyond are read from the multi-page preview added in task #494's
+// Fase 1. An unparseable or non-positive page number is non-enumerating and
+// never reaches the service.
+func (h *AttachmentHandler) GetDocumentPreviewPage(w http.ResponseWriter, r *http.Request) {
+	page, err := strconv.Atoi(r.PathValue("page"))
+	if err != nil || page < 1 {
+		writeAttachmentError(w, domain.ErrNotFound)
+		return
+	}
+	if page == 1 {
+		h.GetPreview(w, r)
+		return
+	}
+
+	startedAt := time.Now()
+	principal, ok := AuthenticatedPrincipal(r)
+	if !ok {
+		writeAttachmentError(w, domain.ErrUnauthorized)
+		return
+	}
+	if !h.Ready() {
+		writeAttachmentError(w, domain.ErrDependenciesUnavailable)
+		return
+	}
+	download, err := h.useCases.DocumentPreviewPage(r.Context(), service.AttachmentAuthInput{
+		AttachmentID: r.PathValue("attachmentID"),
+		UserID:       principal.UserID,
+		SessionID:    principal.SessionID,
+	}, page)
+	if err != nil {
+		status, code := attachmentErrorStatus(err)
+		h.metrics.ObservePreview(code)
+		h.logAttachment(r, startedAt, "preview", code, status, "")
+		writeAttachmentError(w, err)
+		return
+	}
+	defer func() { _ = download.Content.Close() }()
+
+	// Same delivery contract as GetPreview: never cached, never named after
+	// the uploaded file, never range-served.
+	w.Header().Set("Content-Type", download.ContentType)
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Length", strconv.FormatInt(download.Size, 10))
+	w.WriteHeader(http.StatusOK)
+
+	result := "served"
+	if !streamExactly(w, download) {
 		result = "stream_failed"
 	}
 	h.metrics.ObservePreview(result)

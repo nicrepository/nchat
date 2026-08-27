@@ -180,6 +180,46 @@ func TestIsObjectReferencedAsksAboutPublishedPreviews(t *testing.T) {
 	}
 }
 
+func TestExpireDuePreviewsReturnsTheAffectedCount(t *testing.T) {
+	pool := &fakePool{exec: func(sql string, args ...any) (pgconn.CommandTag, error) {
+		if !strings.Contains(sql, "preview_expires_at") {
+			t.Errorf("query does not target preview_expires_at:\n%s", sql)
+		}
+		if len(args) != 1 || args[0] != 25 {
+			t.Errorf("arguments = %v", args)
+		}
+		return pgconn.NewCommandTag("UPDATE 3"), nil
+	}}
+	got, err := storage.NewPGXObjectCleanupStore(pool).ExpireDuePreviews(context.Background(), 25)
+	if err != nil {
+		t.Fatalf("ExpireDuePreviews: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("count = %d, want 3", got)
+	}
+}
+
+func TestExpireDuePreviewsRejectsANonPositiveLimit(t *testing.T) {
+	pool := &fakePool{}
+	if _, err := storage.NewPGXObjectCleanupStore(pool).ExpireDuePreviews(
+		context.Background(), 0,
+	); !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestExpireDuePreviewsWrapsDatabaseFailures(t *testing.T) {
+	dbErr := errors.New("connection reset")
+	pool := &fakePool{exec: func(string, ...any) (pgconn.CommandTag, error) {
+		return pgconn.CommandTag{}, dbErr
+	}}
+	if _, err := storage.NewPGXObjectCleanupStore(pool).ExpireDuePreviews(
+		context.Background(), 25,
+	); err == nil || !strings.Contains(err.Error(), "expire document previews") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestObjectCleanupStoreRefusesToRunWithoutAPool(t *testing.T) {
 	store := storage.NewPGXObjectCleanupStore(nil)
 	if err := store.Enqueue(context.Background(), testCleanupKey); !errors.Is(
@@ -201,5 +241,10 @@ func TestObjectCleanupStoreRefusesToRunWithoutAPool(t *testing.T) {
 		err, domain.ErrUnavailable,
 	) {
 		t.Fatalf("reference error = %v, want ErrUnavailable", err)
+	}
+	if _, err := store.ExpireDuePreviews(context.Background(), 1); !errors.Is(
+		err, domain.ErrUnavailable,
+	) {
+		t.Fatalf("expire error = %v, want ErrUnavailable", err)
 	}
 }

@@ -43,6 +43,9 @@ import {
   unfavoriteMessage,
 } from "./chatApi";
 import { markPresenceActivity } from "./chatSocket";
+import { fetchConversationAttachments } from "./filesApi";
+import { isPreviewWorkPending } from "./useAttachmentPreview";
+import { previewReconcileDelayMs, previewReconcileMaxAttempts } from "./useConversationDetails";
 import { ApiRequestError } from "../lib/api";
 import { randomId } from "../lib/randomId";
 import {
@@ -206,7 +209,68 @@ type Action =
   | { type: "reaction_revert"; messageId: string; emoji: string; error: string }
   | { type: "ws_fetch_error"; error: string }
   | { type: "attachment_status"; attachmentId: string; status: ChannelAttachment["status"] }
+  | { type: "attachments_reconciled"; attachments: ChannelAttachment[] }
   | { type: "ws_subscription_ready" };
+
+// ── Preview reconciliation window ────────────────────────────────────────────
+//
+// Mirrors useConversationDetails.ts's ReconcileWindow/reconcileReducer exactly
+// (same shape, same "polled"/"resumed" vocabulary), kept local rather than
+// shared because the two hooks watch different data — this one a loaded page
+// of messages, that one a destination's file listing — and importing a
+// reducer across hook modules for one struct's worth of bookkeeping would be
+// tighter coupling than the bookkeeping is worth.
+//
+// Only "generation" (waiting for a preview to appear) is needed here, not
+// useConversationDetails.ts's open-ended "revocation": a preview that stops
+// being servable after publication is a scan re-verdict, and that already
+// arrives as attachment_status over the socket.
+interface PreviewReconcileWindow {
+  round: number;
+  attempt: number;
+  target: string;
+  progressKey: string;
+}
+
+type PreviewReconcileAction =
+  | { type: "polled"; target: string; progressKey: string }
+  | { type: "restart" }
+  | { type: "resumed" };
+
+const initialPreviewReconcile: PreviewReconcileWindow = {
+  round: 0,
+  attempt: 0,
+  target: "",
+  progressKey: "",
+};
+
+function previewReconcileReducer(
+  state: PreviewReconcileWindow,
+  action: PreviewReconcileAction,
+): PreviewReconcileWindow {
+  switch (action.type) {
+    case "polled": {
+      const sameWindow = state.target === action.target && state.progressKey === action.progressKey;
+      return {
+        round: state.round + 1,
+        attempt: sameWindow ? state.attempt + 1 : 1,
+        target: action.target,
+        progressKey: action.progressKey,
+      };
+    }
+    case "restart":
+      return { ...initialPreviewReconcile, round: state.round + 1 };
+    case "resumed":
+      return { ...state, round: state.round + 1 };
+  }
+}
+
+/** How many of a destination's most recent attachments one reconciliation poll reads back. */
+const messagePreviewReconcileLimit = 20;
+
+function isAbort(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
 
 /** Applies a local toggle to a message's reaction list, mirroring server semantics for count/reactedByMe. */
 function toggleOptimisticReaction(
@@ -1354,6 +1418,45 @@ function applyAttachmentStatus(
   return changed ? { ...state, messages, lastMutation: "none" } : state;
 }
 
+function applyAttachmentsReconciled(
+  state: MessagesState,
+  action: ActionOf<"attachments_reconciled">,
+): MessagesState {
+  // Preview reconciliation (RF-31/#464 pattern, applied to the inline
+  // thread rather than the details panel). There is no WebSocket event
+  // for "the preview finished" — only attachment_status above, and that
+  // fires on the scan verdict, before the render even starts — so a
+  // message posted with previewStatus "pending" would otherwise show the
+  // icon fallback forever until the thread is reloaded. This patches in
+  // whatever a polled listing found, by id.
+  //
+  // Keyed by id and applied field by field, exactly like attachment_status:
+  // a listing for one destination can carry attachments this timeline has
+  // never rendered (older messages outside the loaded page), and those
+  // update nothing.
+  if (action.attachments.length === 0) return state;
+  const byId = new Map(action.attachments.map((attachment) => [attachment.id, attachment]));
+  let changed = false;
+  const messages = state.messages.map((message) => {
+    if (!message.attachments?.some((item) => byId.has(item.id))) {
+      return message;
+    }
+    let messageChanged = false;
+    const attachments = message.attachments.map((item) => {
+      const fresh = byId.get(item.id);
+      if (!fresh || (fresh.status === item.status && fresh.previewStatus === item.previewStatus)) {
+        return item;
+      }
+      messageChanged = true;
+      return { ...item, status: fresh.status, previewStatus: fresh.previewStatus };
+    });
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, attachments };
+  });
+  return changed ? { ...state, messages, lastMutation: "none" } : state;
+}
+
 function applyReactionError(
   state: MessagesState,
   action: ActionOf<"reaction_error">,
@@ -1525,6 +1628,8 @@ function reduceRealtime(state: MessagesState, action: Action): MessagesState | u
       return applyMessageSnapshot(state, action);
     case "attachment_status":
       return applyAttachmentStatus(state, action);
+    case "attachments_reconciled":
+      return applyAttachmentsReconciled(state, action);
     case "ws_fetch_error":
       return { ...state, realtimeError: action.error, lastMutation: "none" };
     case "ws_subscription_ready":
@@ -2655,6 +2760,92 @@ export function useMessages({
     onSubscriptionError: handleSubscriptionError,
     onSubscribed: handleSubscribed,
   });
+
+  // ── Preview reconciliation for inline attachments (RF-31/#464) ─────────────
+  //
+  // A message posts with previewStatus "pending" the instant its upload
+  // finishes — the malware scan and the render both still have to run. There
+  // is no socket event for "the preview finished" (attachment_status above
+  // fires on the scan verdict, before the render even starts), so without
+  // this the card sits on its icon fallback until the thread is reloaded.
+  //
+  // Bounded and backed off exactly like the details panel's own
+  // reconciliation: the render is normally done within the worker's ~10s
+  // poll, so the delay starts there and doubles up to a ceiling, and the
+  // window ends after previewReconcileMaxAttempts unchanged polls — giving up
+  // costs nothing but a late thumbnail, and one reload opens a fresh window.
+  const [reconcile, dispatchReconcile] = useReducer(
+    previewReconcileReducer,
+    initialPreviewReconcile,
+  );
+
+  const previewProgressKey = state.messages
+    .flatMap((message) => message.attachments ?? [])
+    .map((attachment) => `${attachment.id}:${attachment.status}:${attachment.previewStatus}`)
+    .join("|");
+  const awaitingPreview = state.messages.some((message) =>
+    message.attachments?.some(isPreviewWorkPending),
+  );
+  const reconcileTargetKey = `${kind}:${targetId}`;
+  const reconcileAttempt =
+    reconcile.target === reconcileTargetKey && reconcile.progressKey === previewProgressKey
+      ? reconcile.attempt
+      : 0;
+  const previewReconcileActive = awaitingPreview && reconcileAttempt < previewReconcileMaxAttempts;
+
+  useEffect(() => {
+    if (!previewReconcileActive) return;
+    const onVisibilityChange = () => dispatchReconcile({ type: "resumed" });
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [previewReconcileActive]);
+
+  useEffect(() => {
+    if (!previewReconcileActive) return;
+    if (document.visibilityState === "hidden") return;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      fetchConversationAttachments(
+        { kind, id: targetId },
+        messagePreviewReconcileLimit,
+        controller.signal,
+      ).then(
+        (attachments) => {
+          if (controller.signal.aborted) return;
+          dispatch({ type: "attachments_reconciled", attachments });
+          dispatchReconcile({
+            type: "polled",
+            target: reconcileTargetKey,
+            progressKey: previewProgressKey,
+          });
+        },
+        (error: unknown) => {
+          if (controller.signal.aborted || isAbort(error)) return;
+          // A transient failure leaves the timeline exactly as it is and
+          // costs only the next backoff step, never an immediate retry.
+          dispatchReconcile({
+            type: "polled",
+            target: reconcileTargetKey,
+            progressKey: previewProgressKey,
+          });
+        },
+      );
+    }, previewReconcileDelayMs(reconcileAttempt));
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    previewReconcileActive,
+    reconcileAttempt,
+    kind,
+    targetId,
+    reconcileTargetKey,
+    previewProgressKey,
+    reconcile.round,
+  ]);
 
   const toggleReaction = useCallback(
     (messageId: string, emoji: string) => {

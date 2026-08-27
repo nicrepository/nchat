@@ -25,6 +25,7 @@ resources:
   - ../../../../base/services/auth-service
   - ../../../../base/services/chat-service
   - ../../../../base/services/file-service
+  - ../../../../base/services/document-converter
   - ../../../../base/services/notification-service
   - ../../../../base/services/admin-service
   - ../../../../base/services/search-service
