@@ -923,6 +923,7 @@ func domainAttachmentsToWSPayload(attachments []domain.MessageAttachment) []ws.M
 			ID: attachment.ID, Filename: attachment.Filename,
 			ContentType: attachment.ContentType, Size: attachment.SizeBytes,
 			Status: attachment.Status, PreviewStatus: attachment.PreviewStatus,
+			AudioKind: attachment.AudioKind, DurationMs: attachment.DurationMs,
 		}
 	}
 	return payload

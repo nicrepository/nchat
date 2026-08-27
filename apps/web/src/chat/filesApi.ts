@@ -18,6 +18,7 @@ import { formatUploadLimit } from "../lib/uploadLimit";
 import {
   parseAttachmentPreviewStatus,
   parseAttachmentStatus,
+  parseAudioKind,
   type ChannelAttachment,
 } from "./chatTypes";
 
@@ -31,6 +32,8 @@ interface AttachmentResponse {
   status?: unknown;
   previewStatus?: unknown;
   createdAt?: unknown;
+  audioKind?: unknown;
+  durationMs?: unknown;
 }
 
 interface AttachmentsEnvelope {
@@ -44,6 +47,7 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const item = raw as AttachmentResponse;
   if (typeof item.id !== "string" || item.id === "") return undefined;
+  const audioKind = parseAudioKind(item.audioKind);
   return {
     id: item.id,
     filename: typeof item.filename === "string" ? item.filename : "",
@@ -52,6 +56,10 @@ function mapAttachment(raw: unknown): ChannelAttachment | undefined {
     status: parseAttachmentStatus(item.status),
     previewStatus: parseAttachmentPreviewStatus(item.previewStatus),
     createdAt: typeof item.createdAt === "string" ? item.createdAt : "",
+    ...(audioKind ? { audioKind } : {}),
+    ...(typeof item.durationMs === "number" && Number.isFinite(item.durationMs) && item.durationMs > 0
+      ? { durationMs: item.durationMs }
+      : {}),
   };
 }
 
@@ -241,12 +249,19 @@ function mapUploadError(error: unknown, maxUploadBytes: number | null): Attachme
  * authentication and the 401 refresh-and-retry are still authenticatedFetch's,
  * which is what keeps the upload from growing a second copy of them.
  */
+export interface VoiceMessageUploadOptions {
+  purpose: "voice_message";
+  /** Client-measured wall-clock recording length. Display only — see filesApi module doc. */
+  durationMs: number;
+}
+
 export async function uploadAttachment(
   target: { kind: "channel" | "dm"; id: string },
   file: File,
   maxUploadBytes: number | null,
   signal?: AbortSignal,
   onProgress?: (progress: UploadProgress) => void,
+  voiceOptions?: VoiceMessageUploadOptions,
 ): Promise<ChannelAttachment> {
   if (maxUploadBytes !== null && file.size > maxUploadBytes) {
     throw new AttachmentUploadError("too_large", tooLargeMessage(maxUploadBytes));
@@ -254,7 +269,10 @@ export async function uploadAttachment(
 
   const collection = target.kind === "channel" ? "channels" : "dm";
   const form = new FormData();
-  form.append("purpose", "message_draft");
+  form.append("purpose", voiceOptions?.purpose ?? "message_draft");
+  if (voiceOptions && Number.isFinite(voiceOptions.durationMs) && voiceOptions.durationMs > 0) {
+    form.append("duration_ms", String(Math.round(voiceOptions.durationMs)));
+  }
   form.append("file", file);
 
   let body: { data: unknown };

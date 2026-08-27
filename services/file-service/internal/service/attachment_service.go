@@ -30,6 +30,13 @@ const compensationTimeout = 10 * time.Second
 
 const (
 	UploadPurposeMessageDraft = "message_draft"
+	// UploadPurposeVoiceMessage marks the upload as a composer recording
+	// (issue #670), not a file the user picked from disk. It shares the
+	// draft's expiry — a voice message is a draft exactly like any other
+	// attachment until a message binds it — and additionally tags the row's
+	// AudioKind so the client can render it as a voice bubble rather than an
+	// ordinary file row. The tag is client-requested and never inferred.
+	UploadPurposeVoiceMessage = "voice_message"
 	messageDraftTTL           = 24 * time.Hour
 )
 
@@ -99,6 +106,11 @@ type NewAttachment struct {
 	// row in the first place.
 	KeyWrapVersion int
 	DraftExpiresAt *time.Time
+	// AudioKind and DeclaredDurationMs are both known at creation time,
+	// unlike the sniffed fields on UploadedAttachment: they come from the
+	// client's request, not from the bytes, so there is nothing to wait for.
+	AudioKind          domain.AudioKind
+	DeclaredDurationMs int32
 }
 
 // UploadedAttachment finalises a row once its object is durable. It carries the
@@ -152,6 +164,11 @@ type StoredAttachment struct {
 	KeyWrapVersion   int
 	CreatedAt        time.Time
 	SessionExpiresAt time.Time
+	// AudioKind and DeclaredDurationMs are the RF-670 display hints: set once
+	// at upload, from the client's request, never derived from the stored
+	// bytes and never consulted for authorization.
+	AudioKind          domain.AudioKind
+	DeclaredDurationMs int32
 
 	// Preview state (RF-31). The preview is a separate stored object with its
 	// own identity and its own data key, so it carries its own binding
@@ -187,13 +204,15 @@ type ListDestinationAttachmentsQuery struct {
 // never needs them, and not selecting them means they cannot leak through a
 // listing bug.
 type ListedAttachment struct {
-	ID            string
-	Status        domain.Status
-	PreviewStatus domain.PreviewStatus
-	Filename      string
-	DetectedMIME  string
-	Size          int64
-	CreatedAt     time.Time
+	ID                 string
+	Status             domain.Status
+	PreviewStatus      domain.PreviewStatus
+	Filename           string
+	DetectedMIME       string
+	Size               int64
+	CreatedAt          time.Time
+	AudioKind          domain.AudioKind
+	DeclaredDurationMs int32
 }
 
 // ScanRejection names the attachment a malware scan has condemned.
@@ -368,7 +387,11 @@ type UploadInput struct {
 	Filename     string
 	DeclaredMIME string
 	Purpose      string
-	Content      io.Reader
+	// DurationMs is the optional client-declared recording length, as a
+	// decimal string straight off the multipart field. Never trusted for
+	// anything beyond display — see domain.NormalizeDeclaredDurationMs.
+	DurationMs string
+	Content    io.Reader
 }
 
 // AttachmentView is the client-facing projection. Storage keys, object
@@ -389,6 +412,15 @@ type AttachmentView struct {
 	PreviewStatus   string    `json:"previewStatus"`
 	DestinationKind string    `json:"destinationKind"`
 	CreatedAt       time.Time `json:"createdAt"`
+	// AudioKind is "voice" for a composer recording and absent for every
+	// other attachment, including an ordinary audio file. It is the one
+	// field a client may use to decide the voice-bubble presentation —
+	// content type and filename must never be used for that (issue #670).
+	AudioKind string `json:"audioKind,omitempty"`
+	// DurationMs is the client-declared recording length, in milliseconds.
+	// Display only: nothing in this service authorizes or bounds anything by
+	// it, and it is never verified against the actual decoded audio.
+	DurationMs int64 `json:"durationMs,omitempty"`
 }
 
 // Download is an authorised, decrypted content stream. Closing Content closes
@@ -509,6 +541,12 @@ type uploadTarget struct {
 	// ceiling. Resolved once, here, so the policy cannot change underneath a
 	// transfer already in progress.
 	maxUploadBytes int64
+	// audioKind and declaredDurationMs are the RF-670 display hints, resolved
+	// from the request's purpose and duration fields before the body is read
+	// — like every other field here, they never change once the transfer has
+	// started.
+	audioKind          domain.AudioKind
+	declaredDurationMs int32
 }
 
 // sniffedContent is the head of the stream plus the type detected from it.
@@ -605,6 +643,14 @@ func (s *AttachmentService) Upload(ctx context.Context, input UploadInput) (Atta
 	if err != nil {
 		return AttachmentView{}, err
 	}
+	// Nothing is persisted yet, so an obviously-wrong voice request is refused
+	// as cheaply as any other unsupported upload — before a row or an object
+	// exists. This is not a stronger gate than allowedUploadContent already
+	// is; it only stops a request tagged voice_message from becoming a
+	// message-timeline voice bubble with content nothing can play.
+	if target.audioKind == domain.AudioKindVoice && !domain.VoiceCompatibleContent(content.detectedMIME) {
+		return AttachmentView{}, domain.ErrUnsupportedMedia
+	}
 
 	pending, encrypted, err := s.preparePendingAttachment(ctx, target, content, source)
 	if err != nil {
@@ -637,22 +683,30 @@ func (s *AttachmentService) resolveUploadTarget(input UploadInput) (uploadTarget
 		return uploadTarget{}, domain.ErrUnauthorized
 	}
 	var draftExpiresAt *time.Time
+	var audioKind domain.AudioKind
 	switch input.Purpose {
 	case "":
 	case UploadPurposeMessageDraft:
 		expiresAt := time.Now().UTC().Add(messageDraftTTL)
 		draftExpiresAt = &expiresAt
+	case UploadPurposeVoiceMessage:
+		expiresAt := time.Now().UTC().Add(messageDraftTTL)
+		draftExpiresAt = &expiresAt
+		audioKind = domain.AudioKindVoice
 	default:
 		return uploadTarget{}, fmt.Errorf("%w: unsupported upload purpose", domain.ErrInvalidInput)
 	}
+	declaredDurationMs, _ := domain.NormalizeDeclaredDurationMs(input.DurationMs)
 	return uploadTarget{
-		destination:    input.Target.Destination,
-		workspaceID:    input.Target.WorkspaceID,
-		uploaderID:     input.Target.UploaderID,
-		filename:       filename,
-		declaredMIME:   domain.NormalizeDeclaredMIME(input.DeclaredMIME),
-		draftExpiresAt: draftExpiresAt,
-		maxUploadBytes: input.Target.MaxUploadBytes,
+		destination:        input.Target.Destination,
+		workspaceID:        input.Target.WorkspaceID,
+		uploaderID:         input.Target.UploaderID,
+		filename:           filename,
+		declaredMIME:       domain.NormalizeDeclaredMIME(input.DeclaredMIME),
+		draftExpiresAt:     draftExpiresAt,
+		maxUploadBytes:     input.Target.MaxUploadBytes,
+		audioKind:          audioKind,
+		declaredDurationMs: declaredDurationMs,
 	}, nil
 }
 
@@ -751,17 +805,19 @@ func (s *AttachmentService) preparePendingAttachment(
 	// pending row therefore has wrapped_dek NULL and is not openable by
 	// construction, rather than carrying a placeholder that would be.
 	if err := s.store.CreatePending(ctx, NewAttachment{
-		ID:               attachmentID.String(),
-		WorkspaceID:      target.workspaceID,
-		UploaderID:       target.uploaderID,
-		Destination:      target.destination,
-		Filename:         target.filename,
-		DeclaredMIME:     target.declaredMIME,
-		StorageProvider:  domain.StorageProviderSeaweedFS,
-		StorageObjectKey: pending.objectKey,
-		EnvelopeVersion:  crypto.EnvelopeVersion,
-		KeyWrapVersion:   crypto.KeyWrapVersion,
-		DraftExpiresAt:   target.draftExpiresAt,
+		ID:                 attachmentID.String(),
+		WorkspaceID:        target.workspaceID,
+		UploaderID:         target.uploaderID,
+		Destination:        target.destination,
+		Filename:           target.filename,
+		DeclaredMIME:       target.declaredMIME,
+		StorageProvider:    domain.StorageProviderSeaweedFS,
+		StorageObjectKey:   pending.objectKey,
+		EnvelopeVersion:    crypto.EnvelopeVersion,
+		KeyWrapVersion:     crypto.KeyWrapVersion,
+		DraftExpiresAt:     target.draftExpiresAt,
+		AudioKind:          target.audioKind,
+		DeclaredDurationMs: target.declaredDurationMs,
 	}); err != nil {
 		// The insert failed, so no row and no object exist: nothing to undo.
 		return pendingAttachment{}, nil, fmt.Errorf("persist attachment metadata: %w", err)
@@ -858,6 +914,8 @@ func (s *AttachmentService) finalizeUpload(
 		PreviewStatus:   string(previewStatus),
 		DestinationKind: string(target.destination.Kind),
 		CreatedAt:       time.Now().UTC(),
+		AudioKind:       string(target.audioKind),
+		DurationMs:      int64(target.declaredDurationMs),
 	}, nil
 }
 
@@ -892,6 +950,8 @@ func (s *AttachmentService) Metadata(ctx context.Context, input AttachmentAuthIn
 		PreviewStatus:   string(record.PreviewStatus),
 		DestinationKind: string(record.Kind),
 		CreatedAt:       record.CreatedAt,
+		AudioKind:       string(record.AudioKind),
+		DurationMs:      int64(record.DeclaredDurationMs),
 	}, nil
 }
 
@@ -961,6 +1021,8 @@ func (s *AttachmentService) ListDestinationAttachments(
 			PreviewStatus:   string(record.PreviewStatus),
 			DestinationKind: string(destination.Kind),
 			CreatedAt:       record.CreatedAt,
+			AudioKind:       string(record.AudioKind),
+			DurationMs:      int64(record.DeclaredDurationMs),
 		})
 	}
 	return views, nil

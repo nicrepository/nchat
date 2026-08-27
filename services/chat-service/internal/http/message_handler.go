@@ -246,6 +246,10 @@ type messageAttachmentJSON struct {
 	Size          int64  `json:"size"`
 	Status        string `json:"status"`
 	PreviewStatus string `json:"preview_status"`
+	// AudioKind and DurationMs are the RF-670 voice-message fields, absent for
+	// every other attachment. See domain.MessageAttachment.
+	AudioKind  string `json:"audio_kind,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
 type quoteJSON struct {
@@ -563,6 +567,7 @@ func mapAttachmentsJSON(attachments []domain.MessageAttachment) []messageAttachm
 			ID: attachment.ID, Filename: attachment.Filename,
 			ContentType: attachment.ContentType, Size: attachment.SizeBytes,
 			Status: attachment.Status, PreviewStatus: attachment.PreviewStatus,
+			AudioKind: attachment.AudioKind, DurationMs: attachment.DurationMs,
 		}
 	}
 	return out
