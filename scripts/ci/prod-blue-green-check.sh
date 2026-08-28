@@ -205,11 +205,13 @@ check_preview_access_control() {
 # The failure is silent in the direction that matters: the natural repair is to
 # put the Cloudflare ranges in sourceRange, which turns the allowlist into a
 # permit for every visitor Cloudflare forwards, and nothing in the manifest
-# would say so. depth 1 takes the rightmost X-Forwarded-For entry, which in
-# this chain is the address Cloudflare appends and the client cannot forge.
+# would say so. In the expected public chain, depth 1 takes the rightmost
+# X-Forwarded-For entry Cloudflare supplies; for a request delivered by
+# Cloudflare, the client cannot forge that appended position.
 #
-# Exactly 1, not merely present: any other depth names a different hop of a
-# proxy chain this deployment does not have.
+# Exactly 1, not merely present: any other depth names a different hop in that
+# public chain. Additional origins in Traefik's global trustedIPs are part of
+# the infrastructure trust boundary and cannot be hardened by this gate.
 check_preview_client_ip_strategy() {
   local depth
   depth="$(query 'Middleware|preview-allowlist|ip-strategy-depth')"
