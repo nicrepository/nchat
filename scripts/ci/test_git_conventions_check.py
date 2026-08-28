@@ -110,6 +110,17 @@ class GitConventionsCheckTest(unittest.TestCase):
             with self.subTest(subject=subject):
                 self.assertTrue(git_conventions_check.is_valid_conventional_subject(subject))
 
+    def test_accepts_optional_canonical_pull_request_suffix(self) -> None:
+        for subject in (
+            "feat: add feature (#1)",
+            "fix(files): strip API prefix (#488)",
+            "ci(repo): enforce git contribution conventions (#522)",
+            "feat(api)!: change attachment contract (#999)",
+            "feat: add feature",
+        ):
+            with self.subTest(subject=subject):
+                self.assertTrue(git_conventions_check.is_valid_conventional_subject(subject))
+
     def test_rejects_invalid_conventional_commit_subjects(self) -> None:
         for subject in (
             "unknown(repo): add gate",
@@ -122,6 +133,21 @@ class GitConventionsCheckTest(unittest.TestCase):
             "fix(repo): add `id`",
             'fix(repo): add "; id; #',
             "fix(repo): add\nnewline",
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(git_conventions_check.is_valid_conventional_subject(subject))
+
+    def test_rejects_malformed_or_misplaced_pull_request_suffix(self) -> None:
+        for subject in (
+            "fix: thing #123",
+            "fix: thing (#abc)",
+            "fix: thing (#123) trailing",
+            "fix: thing (#12a)",
+            "fix: thing (#)",
+            "fix: thing (#-1)",
+            "fix: thing (#0)",
+            "fix: thing (#001)",
+            'fix(repo): add "; id; #',
         ):
             with self.subTest(subject=subject):
                 self.assertFalse(git_conventions_check.is_valid_conventional_subject(subject))

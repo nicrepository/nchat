@@ -17,6 +17,7 @@ CONVENTIONAL_SUBJECT_PATTERN = re.compile(
     r"(?:feat|fix|docs|test|refactor|chore|ci|build|security|perf)"
     r"(?:\([a-z0-9][a-z0-9._/-]*\))?!?: "
     r"[^\s$`\"';#&|<>\\](?:[^\r\n$`\"';#&|<>\\]*[^\s$`\"';#&|<>\\])?"
+    r"(?: \(#[1-9][0-9]*\))?"
 )
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DEPENDABOT_ACTOR = "dependabot[bot]"
