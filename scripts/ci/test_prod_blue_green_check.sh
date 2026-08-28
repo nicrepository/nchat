@@ -233,18 +233,41 @@ echo "--- preview access control ---"
 
 QUERY_FIXTURE=$(printf 'Ingress|name\tnchat-prod-preview-admin-blue
 Ingress|nchat-prod-preview-admin-blue|middlewares\tnchat-prod-preview-allowlist@kubernetescrd
-Middleware|preview-allowlist|source-range\t198.51.100.0/24')
+Middleware|preview-allowlist|source-range\t198.51.100.0/24
+Middleware|preview-allowlist|ip-strategy-depth\t1')
 expect "an allowlisted preview is accepted" accept check_preview_access_control
 
 QUERY_FIXTURE=$(printf 'Ingress|name\tnchat-prod-preview-admin-green
 Ingress|nchat-prod-preview-admin-green|middlewares\tnchat-prod-auth-api-prefix@kubernetescrd
-Middleware|preview-allowlist|source-range\t198.51.100.0/24')
+Middleware|preview-allowlist|source-range\t198.51.100.0/24
+Middleware|preview-allowlist|ip-strategy-depth\t1')
 expect "an admin preview without the allowlist is rejected" reject check_preview_access_control
 
 QUERY_FIXTURE=$(printf 'Ingress|name\tnchat-prod-preview-blue
 Ingress|nchat-prod-preview-blue|middlewares\tnchat-prod-preview-allowlist@kubernetescrd
-Middleware|preview-allowlist|source-range\t0.0.0.0/0')
+Middleware|preview-allowlist|source-range\t0.0.0.0/0
+Middleware|preview-allowlist|ip-strategy-depth\t1')
 expect "an allowlist open to the world is rejected" reject check_preview_access_control
+
+# Behind Cloudflare, an allowlist with no ipStrategy matches the edge address
+# rather than the operator: the CIDR still looks right in topology.env and means
+# something else entirely. These drive that regression directly.
+QUERY_FIXTURE=$(printf 'Ingress|name\tnchat-prod-preview-blue
+Ingress|nchat-prod-preview-blue|middlewares\tnchat-prod-preview-allowlist@kubernetescrd
+Middleware|preview-allowlist|source-range\t198.51.100.0/24')
+expect "an allowlist with no ipStrategy.depth is rejected" reject check_preview_access_control
+
+QUERY_FIXTURE=$(printf 'Ingress|name\tnchat-prod-preview-blue
+Ingress|nchat-prod-preview-blue|middlewares\tnchat-prod-preview-allowlist@kubernetescrd
+Middleware|preview-allowlist|source-range\t198.51.100.0/24
+Middleware|preview-allowlist|ip-strategy-depth\t2')
+expect "an ipStrategy.depth naming a hop this chain does not have is rejected" reject check_preview_access_control
+
+QUERY_FIXTURE=$(printf 'Middleware|preview-allowlist|ip-strategy-depth\t1')
+expect "depth 1 is the client behind Cloudflare" accept check_preview_client_ip_strategy
+
+QUERY_FIXTURE=""
+expect "a bare allowlist trusts RemoteAddr and is rejected" reject check_preview_client_ip_strategy
 
 echo
 echo "--- release identity ---"
