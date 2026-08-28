@@ -126,18 +126,18 @@ func memberWithRole(role domain.WorkspaceRole) *domain.WorkspaceMember {
 // channels, manages categories, manages channel members.
 func TestWorkspaceCapabilities_RF74Matrix(t *testing.T) {
 	for _, tc := range []struct {
-		role                             domain.WorkspaceRole
-		reachPublic, manage, moderate    bool
-		createChannel, categories, chMem bool
+		role                                             domain.WorkspaceRole
+		reachPublic, manage, moderate                    bool
+		createChannel, categories, addChMem, manageChMem bool
 	}{
-		{domain.WorkspaceRoleOwner, true, true, true, true, true, true},
-		{domain.WorkspaceRoleAdmin, true, true, true, true, true, true},
-		{domain.WorkspaceRoleModerator, true, false, true, true, true, true},
-		{domain.WorkspaceRoleMember, true, false, false, true, false, false},
-		{domain.WorkspaceRoleGuest, false, false, false, false, false, false},
+		{domain.WorkspaceRoleOwner, true, true, true, true, true, true, true},
+		{domain.WorkspaceRoleAdmin, true, true, true, true, true, true, true},
+		{domain.WorkspaceRoleModerator, true, false, true, true, true, true, true},
+		{domain.WorkspaceRoleMember, true, false, false, true, false, true, false},
+		{domain.WorkspaceRoleGuest, false, false, false, false, false, false, false},
 		// Deny by default: a role no predicate recognises gets nothing at all.
-		{domain.WorkspaceRole("wizard"), false, false, false, false, false, false},
-		{domain.WorkspaceRole(""), false, false, false, false, false, false},
+		{domain.WorkspaceRole("wizard"), false, false, false, false, false, false, false},
+		{domain.WorkspaceRole(""), false, false, false, false, false, false, false},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			wm := memberWithRole(tc.role)
@@ -151,7 +151,8 @@ func TestWorkspaceCapabilities_RF74Matrix(t *testing.T) {
 				{"CanModerateWorkspace", domain.CanModerateWorkspace(wm), tc.moderate},
 				{"CanCreateChannel", domain.CanCreateChannel(wm), tc.createChannel},
 				{"CanManageChannelCategories", domain.CanManageChannelCategories(wm), tc.categories},
-				{"CanManageChannelMembers", domain.CanManageChannelMembers(wm), tc.chMem},
+				{"CanAddChannelMembers", domain.CanAddChannelMembers(wm), tc.addChMem},
+				{"CanManageChannelMembers", domain.CanManageChannelMembers(wm), tc.manageChMem},
 			} {
 				if check.got != check.want {
 					t.Errorf("%s = %v, want %v", check.name, check.got, check.want)
@@ -170,6 +171,7 @@ func TestWorkspaceCapabilities_InactiveAndNilMembershipDeniedForEveryRole(t *tes
 		"CanModerateWorkspace":       domain.CanModerateWorkspace,
 		"CanCreateChannel":           domain.CanCreateChannel,
 		"CanManageChannelCategories": domain.CanManageChannelCategories,
+		"CanAddChannelMembers":       domain.CanAddChannelMembers,
 		"CanManageChannelMembers":    domain.CanManageChannelMembers,
 	}
 	members := []*domain.WorkspaceMember{nil}

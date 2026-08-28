@@ -487,10 +487,9 @@ func (f *fakeMemberStore) AddChannelMembers(
 	// Models the transactional re-check the real store performs: the actor must
 	// still hold the capability at write time, so a test that revokes the role
 	// between the service check and here sees the write refused. It asks the
-	// same domain predicate the store's SQL role list restates, so the two
-	// cannot drift as RF-74 widened that list.
+	// same add-specific domain predicate the store's SQL role list restates.
 	actor, ok := f.workspaceMembers[wmKey(workspaceID, callerID)]
-	if !ok || !domain.CanManageChannelMembers(&actor) {
+	if !ok || !domain.CanAddChannelMembers(&actor) {
 		return storage.AddMembersResult{}, domain.ErrForbidden
 	}
 	for _, userID := range userIDs {

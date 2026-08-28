@@ -226,6 +226,39 @@ func TestChannelService_GetChannelDetails_ReturnsTheVisibleChannel(t *testing.T)
 	}
 }
 
+func TestChannelService_GetChannelDetails_ReportsAddCapability(t *testing.T) {
+	for _, test := range []struct {
+		role      domain.WorkspaceRole
+		isGeneral bool
+		want      bool
+	}{
+		{domain.WorkspaceRoleOwner, false, true},
+		{domain.WorkspaceRoleAdmin, false, true},
+		{domain.WorkspaceRoleModerator, false, true},
+		{domain.WorkspaceRoleMember, false, true},
+		{domain.WorkspaceRoleGuest, false, false},
+		{domain.WorkspaceRoleMember, true, false},
+	} {
+		t.Run(fmt.Sprintf("%s/general=%v", test.role, test.isGeneral), func(t *testing.T) {
+			ms := detailsMemberStore()
+			member := ms.workspaceMembers[wmKey("ws-1", "user-1")]
+			member.Role = test.role
+			ms.workspaceMembers[wmKey("ws-1", "user-1")] = member
+			channels := detailsChannelStore()
+			channels.visibleChannel.IsGeneral = test.isGeneral
+
+			got, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, ms).
+				GetChannelDetails(context.Background(), detailsInput(nil, 1))
+			if err != nil {
+				t.Fatalf("GetChannelDetails: %v", err)
+			}
+			if got.CanManageMembers != test.want {
+				t.Fatalf("CanManageMembers = %v, want %v", got.CanManageMembers, test.want)
+			}
+		})
+	}
+}
+
 func TestChannelService_GetChannelDetails_RefusesNonMembersBeforeReadingMembers(t *testing.T) {
 	// No workspace membership seeded: the caller has no business here at all.
 	ms := newFakeMemberStore()

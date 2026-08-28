@@ -21,6 +21,7 @@ const (
 	amOtherWS  = "f2000000-0000-4000-8000-000000000001"
 	amGeneral  = "f1000000-0000-4000-8000-000000000020"
 	amGeneralB = "f2000000-0000-4000-8000-000000000021"
+	amPublic   = "f1000000-0000-4000-8000-000000000029"
 	amPrivate  = "f1000000-0000-4000-8000-000000000030"
 	amArchived = "f1000000-0000-4000-8000-000000000031"
 	amForeignC = "f2000000-0000-4000-8000-000000000032"
@@ -240,6 +241,69 @@ func TestPGXAddChannelMembersPostgreSQL(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNoMembersRequested", err)
 		}
 	})
+}
+
+func TestPGXAddChannelMembersAuthorizationPostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, is_general, status)
+		VALUES ($1, $2, 'publico', 'Publico', 'public', false, 'active')`, amPublic, amWS); err != nil {
+		t.Fatalf("seed public channel: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		role          domain.WorkspaceRole
+		status        domain.MemberStatus
+		channelID     string
+		privateMember bool
+		wantAllowed   bool
+	}{
+		{"owner private administrative add", domain.WorkspaceRoleOwner, domain.MemberStatusActive, amPrivate, false, true},
+		{"admin private administrative add", domain.WorkspaceRoleAdmin, domain.MemberStatusActive, amPrivate, false, true},
+		{"moderator private administrative add", domain.WorkspaceRoleModerator, domain.MemberStatusActive, amPrivate, false, true},
+		{"member public", domain.WorkspaceRoleMember, domain.MemberStatusActive, amPublic, false, true},
+		{"member private with membership", domain.WorkspaceRoleMember, domain.MemberStatusActive, amPrivate, true, true},
+		{"member private without membership", domain.WorkspaceRoleMember, domain.MemberStatusActive, amPrivate, false, false},
+		{"guest private with membership", domain.WorkspaceRoleGuest, domain.MemberStatusActive, amPrivate, true, false},
+		{"suspended member", domain.WorkspaceRoleMember, domain.MemberStatusSuspended, amPrivate, true, false},
+		{"left member", domain.WorkspaceRoleMember, domain.MemberStatusLeft, amPrivate, true, false},
+		{"general channel", domain.WorkspaceRoleAdmin, domain.MemberStatusActive, amGeneral, false, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := pool.Exec(ctx, `
+				DELETE FROM chat.channel_members
+				WHERE channel_id IN ($1, $2) AND user_id IN ($3, $4)`,
+				amPrivate, amPublic, amActive3, amActive1,
+			); err != nil {
+				t.Fatalf("reset channel memberships: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `
+				UPDATE chat.workspace_members SET role = $3, status = $4
+				WHERE workspace_id = $1 AND user_id = $2`,
+				amWS, amActive3, test.role, test.status,
+			); err != nil {
+				t.Fatalf("set actor membership: %v", err)
+			}
+			if test.privateMember {
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO chat.channel_members (channel_id, user_id, role)
+					VALUES ($1, $2, 'member')`, amPrivate, amActive3); err != nil {
+					t.Fatalf("seed actor channel membership: %v", err)
+				}
+			}
+
+			_, err := store.AddChannelMembers(ctx, amWS, test.channelID, amActive3, []string{amActive1})
+			if test.wantAllowed && err != nil {
+				t.Fatalf("AddChannelMembers: %v", err)
+			}
+			if !test.wantAllowed && !errors.Is(err, domain.ErrForbidden) {
+				t.Fatalf("err = %v, want ErrForbidden", err)
+			}
+		})
+	}
 }
 
 // Two managers adding the same person at the same moment must converge on one
@@ -784,15 +848,13 @@ func TestPGXSearchChannelMemberCandidatesPostgreSQL(t *testing.T) {
 
 	// A channel from another tenant must not resolve, so its members are not
 	// excluded and — more importantly — nothing about it is revealed.
-	t.Run("a cross-workspace channel excludes nobody", func(t *testing.T) {
+	t.Run("a cross-workspace channel returns no candidates", func(t *testing.T) {
 		got, err := store.SearchChannelMemberCandidates(ctx, amWS, amForeignC, amAdmin, "", 50)
 		if err != nil {
 			t.Fatalf("SearchChannelMemberCandidates: %v", err)
 		}
-		// Everyone eligible in *this* workspace is still a candidate: the foreign
-		// channel's membership has no effect here.
-		if !containsID(candidateIDs(t, got), amActive1) {
-			t.Fatal("a cross-workspace channel wrongly excluded a local member")
+		if len(got) != 0 {
+			t.Fatalf("cross-workspace channel returned candidates: %+v", got)
 		}
 	})
 
@@ -812,6 +874,67 @@ func TestPGXSearchChannelMemberCandidatesPostgreSQL(t *testing.T) {
 			t.Fatalf("ordering is not stable: %s then %s", first[0].UserID, second[0].UserID)
 		}
 	})
+}
+
+func TestPGXSearchChannelMemberCandidatesAuthorizationPostgreSQL(t *testing.T) {
+	pool, ctx := addMembersPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, is_general, status)
+		VALUES ($1, $2, 'publico', 'Publico', 'public', false, 'active')`, amPublic, amWS); err != nil {
+		t.Fatalf("seed public channel: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		role          domain.WorkspaceRole
+		channelID     string
+		privateMember bool
+		wantAllowed   bool
+	}{
+		{"manager private without membership", domain.WorkspaceRoleModerator, amPrivate, false, true},
+		{"member public", domain.WorkspaceRoleMember, amPublic, false, true},
+		{"member private with membership", domain.WorkspaceRoleMember, amPrivate, true, true},
+		{"member private without membership", domain.WorkspaceRoleMember, amPrivate, false, false},
+		{"guest private with membership", domain.WorkspaceRoleGuest, amPrivate, true, false},
+		{"general channel", domain.WorkspaceRoleAdmin, amGeneral, false, false},
+		{"archived channel", domain.WorkspaceRoleAdmin, amArchived, false, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := pool.Exec(ctx, `
+				DELETE FROM chat.channel_members
+				WHERE channel_id IN ($1, $2) AND user_id = $3`, amPrivate, amPublic, amActive3,
+			); err != nil {
+				t.Fatalf("reset actor channel membership: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `
+				UPDATE chat.workspace_members SET role = $3, status = 'active'
+				WHERE workspace_id = $1 AND user_id = $2`, amWS, amActive3, test.role,
+			); err != nil {
+				t.Fatalf("set actor role: %v", err)
+			}
+			if test.privateMember {
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO chat.channel_members (channel_id, user_id, role)
+					VALUES ($1, $2, 'member')`, amPrivate, amActive3); err != nil {
+					t.Fatalf("seed actor channel membership: %v", err)
+				}
+			}
+
+			got, err := store.SearchChannelMemberCandidates(ctx, amWS, test.channelID, amActive3, "", 50)
+			if err != nil {
+				t.Fatalf("SearchChannelMemberCandidates: %v", err)
+			}
+			found := containsID(candidateIDs(t, got), amActive1)
+			if found != test.wantAllowed {
+				t.Fatalf("target present = %v, want %v; candidates=%+v", found, test.wantAllowed, got)
+			}
+			if !test.wantAllowed && len(got) != 0 {
+				t.Fatalf("unauthorized search leaked candidates: %+v", got)
+			}
+		})
+	}
 }
 
 // The group defect is sharper: the panel caps its participant list at 30, so in

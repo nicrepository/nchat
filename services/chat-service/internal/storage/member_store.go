@@ -27,9 +27,9 @@ type MemberStore interface {
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	// AddChannelMembers adds every user in userIDs to channelID, or none (issue
 	// #398). callerID is the authenticated actor: the transaction re-establishes
-	// their owner/admin membership itself rather than trusting the service's
-	// earlier check, so a role revoked in between persists nothing. Eligibility
-	// of the targets is decided by the same statement that writes. Returns
+	// their add capability and channel scope itself rather than trusting the
+	// service's earlier check, so a role revoked in between persists nothing.
+	// Eligibility of the targets is decided by the same statement that writes. Returns
 	// domain.ErrForbidden — without naming anyone — for a revoked actor or an
 	// ineligible target.
 	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
@@ -318,8 +318,7 @@ func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID str
 // member is joined to automatically. #geral is where a workspace's traffic
 // lives; auto-joining a guest to it would mean "restricted to the channels it
 // was explicitly added to" started with the busiest channel in the workspace
-// already granted. A guest reaches #geral the same way it reaches any other
-// channel: somebody with domain.CanManageChannelMembers adds it.
+// already granted. Manual add is a separate flow and refuses #geral.
 //
 // The role is not passed in and not read separately: the insert selects it from
 // the membership row inside the caller's transaction, so the decision cannot be
@@ -517,11 +516,11 @@ func (s *PGXMemberStore) AddChannelMembers(
 	// memberships. Locking the row also serialises this against a concurrent
 	// role change rather than merely observing it.
 	//
-	// The role list is the SQL statement of domain.CanManageChannelMembers,
-	// which RF-74 widened from owner/admin to include the workspace moderator.
-	// The two must agree; the service's decision is deliberately not passed down
-	// as a boolean, because a boolean computed a moment ago is exactly the thing
-	// this query exists to distrust.
+	// This is the SQL statement of domain.CanAddChannelMembers plus #705's
+	// channel rule: managers retain administrative add scope, while a plain
+	// member must still be able to read the channel. The service's decision is
+	// deliberately not passed down as a boolean, because a boolean computed a
+	// moment ago is exactly the thing this query exists to distrust.
 	//
 	// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
 	// channel_category_store.go: demoting a role, suspending a membership and
@@ -540,11 +539,21 @@ func (s *PGXMemberStore) AddChannelMembers(
 		JOIN chat.workspaces w
 		  ON w.id = wm.workspace_id AND w.status = 'active'
 		JOIN chat.channels c
-		  ON c.id = $2::uuid AND c.workspace_id = wm.workspace_id AND c.status = 'active'
+		  ON c.id = $2::uuid
+		 AND c.workspace_id = wm.workspace_id
+		 AND c.status = 'active'
+		 AND c.is_general = false
 		WHERE wm.workspace_id = $1::uuid
 		  AND wm.user_id = $3::uuid
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin', 'moderator')
+		  AND wm.role IN ('owner', 'admin', 'moderator', 'member')
+		  AND (
+		        wm.role IN ('owner', 'admin', 'moderator')
+		        OR (
+		            wm.role = 'member'
+		            AND chat.channel_visible_to_user(c.id, wm.user_id)
+		        )
+		      )
 		FOR SHARE OF wm`,
 		workspaceID, channelID, callerID,
 	).Scan(&actorAuthorized)
@@ -913,7 +922,7 @@ func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, ca
 // Everything else mirrors SearchDMCandidates so the two searches cannot drift
 // about who counts as an eligible person: the workspace must be active, the
 // membership active, the account active and not deleted, and the caller must
-// still hold an active membership in the same workspace (the EXISTS below).
+// still satisfy the complete #705 add policy (the EXISTS below).
 // The caller is also excluded from their own results.
 //
 // Ordering is the same deterministic (lower(display_name), id) the rest of the
@@ -934,10 +943,23 @@ func (s *PGXMemberStore) SearchChannelMemberCandidates(
 		  AND left(lower(u.display_name), length($4)) = lower($4)
 		  AND EXISTS (
 		      SELECT 1
-		      FROM chat.workspace_members caller
-		      WHERE caller.workspace_id = wm.workspace_id
-		        AND caller.user_id = $3::uuid
-		        AND caller.status = 'active'
+		      FROM chat.channels actor_channel
+		      JOIN chat.workspace_members actor
+		        ON actor.workspace_id = actor_channel.workspace_id
+		       AND actor.user_id = $3::uuid
+		       AND actor.status = 'active'
+		      WHERE actor_channel.id = $2::uuid
+		        AND actor_channel.workspace_id = $1::uuid
+		        AND actor_channel.status = 'active'
+		        AND actor_channel.is_general = false
+		        AND actor.role IN ('owner', 'admin', 'moderator', 'member')
+		        AND (
+		              actor.role IN ('owner', 'admin', 'moderator')
+		              OR (
+		                  actor.role = 'member'
+		                  AND chat.channel_visible_to_user(actor_channel.id, actor.user_id)
+		              )
+		            )
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1

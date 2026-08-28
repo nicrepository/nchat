@@ -42,7 +42,7 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 	// chat.channel_members obeys.
 	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator'\).*FOR SHARE OF wm`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*c\.is_general = false.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\).*wm\.role IN \('owner', 'admin', 'moderator'\).*wm\.role = 'member'.*channel_visible_to_user\(c\.id, wm\.user_id\).*FOR SHARE OF wm`).
 		WithArgs(msWorkspace, msChannel, msActor).
 		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
 	mock.ExpectQuery(`(?s)WITH eligible AS.*INSERT INTO chat\.channel_members.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).
@@ -559,7 +559,7 @@ func TestPGXMemberStore_SearchChannelMemberCandidates_ExcludesCurrentMembersInSQ
 	}
 	defer mock.Close()
 
-	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*EXISTS.*actor_channel\.is_general = false.*actor\.role IN \('owner', 'admin', 'moderator', 'member'\).*actor\.role = 'member'.*channel_visible_to_user\(actor_channel\.id, actor\.user_id\).*NOT EXISTS.*FROM chat\.channel_members cm.*cm\.channel_id = \$2::uuid`).
 		WithArgs(msWorkspace, msChannel, msActor, "an", 20).
 		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow("u-1", "Ana"))
 
