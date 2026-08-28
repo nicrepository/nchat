@@ -1,7 +1,32 @@
+# syntax=docker/dockerfile:1.7
 FROM golang:1.25.13-bookworm AS build
 WORKDIR /src
-COPY go.work go.work.sum ./
-COPY services/document-converter/go.mod ./services/document-converter/go.mod
+
+# This stage builds with GOWORK=off, so go.work's `use` directives never apply
+# and the module's own `replace` is what resolves the shared library:
+#
+#   replace github.com/nicrepository/nchat/libs/go/platform => ../../libs/go/platform
+#
+# From /src/services/document-converter that is /src/libs/go/platform, which
+# makes libs/go a real build input rather than an optional convenience. Omitting
+# it is what failed the image build with "replacement directory
+# ../../libs/go/platform does not exist" — a failure that only appears inside
+# the container, because a developer's checkout always has the directory.
+#
+# GOWORK=off is deliberate and not a workaround: honouring go.work would require
+# every workspace member (all eight services) to be present in this stage, which
+# would make an unrelated service's source a cache key for this image. The
+# module plus its one local replace is the smaller, honest input set.
+#
+# go.mod/go.sum and libs/go are copied before the service source so that editing
+# a handler does not re-download modules.
+COPY services/document-converter/go.mod services/document-converter/go.sum ./services/document-converter/
+# The whole of libs/go, matching Dockerfile.service: every current and future
+# shared module is a build input, and listing them one by one silently breaks
+# the next one added.
+COPY libs/go ./libs/go
+RUN cd services/document-converter && GOWORK=off go mod download
+
 COPY services/document-converter ./services/document-converter
 RUN cd services/document-converter && GOWORK=off CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/document-converter ./cmd/document-converter
 
