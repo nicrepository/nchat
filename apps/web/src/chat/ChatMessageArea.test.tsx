@@ -5374,9 +5374,7 @@ describe("ChatMessageArea — unread divider", () => {
     await userEvent.click(screen.getByRole("button", { name: "Abrir segunda conversa" }));
 
     await screen.findByRole("log");
-    await waitFor(() =>
-      expect(screen.getByText("second message 9")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("second message 9")).toBeInTheDocument());
     expect(screen.queryByTestId("unread-divider")).not.toBeInTheDocument();
   });
 });

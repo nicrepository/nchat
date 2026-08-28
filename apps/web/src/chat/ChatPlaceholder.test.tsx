@@ -37,10 +37,7 @@ function renderIndexWithOutletContext(
       <Routes>
         <Route path="/chat" element={<Outlet context={fullCtx} />}>
           <Route index element={<ChatPlaceholder />} />
-          <Route
-            path="channel/:id"
-            element={<div data-testid="landed">channel</div>}
-          />
+          <Route path="channel/:id" element={<div data-testid="landed">channel</div>} />
           <Route path="dm/:id" element={<div data-testid="landed">dm</div>} />
         </Route>
       </Routes>
@@ -54,7 +51,11 @@ function channel(id: string, overrides: Partial<Channel> = {}): Channel {
   return { id, name: id, type: "public", canWrite: true, ...overrides };
 }
 
-function dm(id: string, type: "1:1" | "group", overrides: Partial<DMConversation> = {}): DMConversation {
+function dm(
+  id: string,
+  type: "1:1" | "group",
+  overrides: Partial<DMConversation> = {},
+): DMConversation {
   return { id, type, name: id, participants: [], ...overrides };
 }
 
@@ -124,9 +125,7 @@ describe("ChatPlaceholder — default-conversation redirect", () => {
 
   it("redirects to the most recently active unread conversation", () => {
     renderIndexWithOutletContext({
-      channels: [
-        channel("geral", { unreadCount: 2, lastMessageAt: "2026-08-04T10:00:00Z" }),
-      ],
+      channels: [channel("geral", { unreadCount: 2, lastMessageAt: "2026-08-04T10:00:00Z" })],
       dms: [dm("alvaro", "1:1", { unreadCount: 1, lastMessageAt: "2026-08-04T12:00:00Z" })],
     });
     expect(screen.getByTestId("landed")).toHaveTextContent("dm");
@@ -167,7 +166,9 @@ describe("ChatPlaceholder — default-conversation redirect", () => {
                 context={{
                   currentUserId: "current-user",
                   channels: [channel("geral")],
-                  dms: [dm("alvaro", "1:1", { unreadCount: 1, lastMessageAt: "2026-08-04T12:00:00Z" })],
+                  dms: [
+                    dm("alvaro", "1:1", { unreadCount: 1, lastMessageAt: "2026-08-04T12:00:00Z" }),
+                  ],
                 }}
               />
             }

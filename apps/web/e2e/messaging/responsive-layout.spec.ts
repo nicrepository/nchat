@@ -643,7 +643,10 @@ test.describe("layout responsivo", () => {
     // Let the one-time "initial" settle rAF (ChatMessageArea.tsx) finish before
     // scrolling up, so it can't race the assertion below.
     await page.evaluate(
-      () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
     );
 
     await list.evaluate((el) => {
@@ -658,9 +661,9 @@ test.describe("layout responsivo", () => {
       body_text: "mensagem chegando enquanto o usuário lê o histórico antigo",
     });
     await emitMessageCreated(page, scenario, { kind: "dm", targetId, message: incoming });
-    await expect(page.getByText("mensagem chegando enquanto o usuário lê o histórico antigo")).toHaveCount(
-      1,
-    );
+    await expect(
+      page.getByText("mensagem chegando enquanto o usuário lê o histórico antigo"),
+    ).toHaveCount(1);
 
     const geometryAfter = await list.evaluate((el) => ({
       scrollTop: el.scrollTop,
