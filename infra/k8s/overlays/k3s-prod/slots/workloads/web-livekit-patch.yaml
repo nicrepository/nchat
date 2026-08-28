@@ -1,0 +1,37 @@
+# base pins NCHAT_WEB_LIVEKIT_CONNECT_SRC to "" as an explicit container env,
+# and an explicit env entry wins over envFrom — so without this patch production
+# would render LIVEKIT_ENABLED=true beside a CSP that blocks every LiveKit
+# connection, and calls would fail in the browser with nothing wrong in the
+# cluster.
+#
+# Reading it from the shared nchat-config rather than restating a literal here
+# is what guarantees the two slots address the same LiveKit: there is one value,
+# in one place, filled from the production topology.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nchat-web
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          # The whole list is replaced, not merged: base sets this variable with a
+          # literal `value`, and merging a `valueFrom` onto it leaves both keys
+          # present, which the API server rejects. Replacing means every variable
+          # the container needs is restated here, which is the cost of the
+          # guarantee that no empty literal survives.
+          env:
+            - $patch: replace
+            - name: APP_ENV
+              value: production
+            - name: PORT
+              value: "8080"
+            - name: SERVICE_NAME
+              value: web
+            - name: NCHAT_WEB_LIVEKIT_CONNECT_SRC
+              valueFrom:
+                configMapKeyRef:
+                  name: nchat-config
+                  key: NCHAT_WEB_LIVEKIT_CONNECT_SRC

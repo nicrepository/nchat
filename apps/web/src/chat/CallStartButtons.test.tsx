@@ -1,0 +1,90 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { expect, it, vi } from "vitest";
+
+import { HeaderChannel, HeaderDM } from "./ChatMessageArea";
+
+it("starts audio or video only for the server-resolved DM counterpart", () => {
+  const start = vi.fn(() => true);
+  render(
+    <HeaderDM
+      name="Ana"
+      counterpart={{
+        userId: "00000000-0000-4000-8000-000000000401",
+        displayName: "Ana",
+      }}
+      onStartCall={start}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de áudio" }));
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de vídeo" }));
+  expect(start).toHaveBeenNthCalledWith(1, "00000000-0000-4000-8000-000000000401", "audio");
+  expect(start).toHaveBeenNthCalledWith(2, "00000000-0000-4000-8000-000000000401", "video");
+});
+
+it("does not offer call buttons for a 1:1 DM when onStartCall is unavailable (RF-24 direct call already in progress)", () => {
+  render(
+    <HeaderDM
+      name="Ana"
+      counterpart={{ userId: "00000000-0000-4000-8000-000000000401", displayName: "Ana" }}
+    />,
+  );
+  expect(screen.queryByRole("button", { name: /Iniciar chamada/ })).not.toBeInTheDocument();
+});
+
+// Issue #622 round 2: no active call — a plain "Chamada" starts a fresh one.
+it('RF-24 "none" state: joins the group\'s resource room via a single Chamada action, never the RF-23 1:1 call actions', () => {
+  const onCall = vi.fn();
+  render(<HeaderDM name="Equipe" resourceCall={{ onCall }} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada" }));
+
+  expect(onCall).toHaveBeenCalledOnce();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+  ).not.toBeInTheDocument();
+});
+
+it("a group with a resolved counterpart never happens, but resourceCall is ignored when counterpart is set", () => {
+  const start = vi.fn(() => true);
+  const onCall = vi.fn();
+  render(
+    <HeaderDM
+      name="Ana"
+      counterpart={{ userId: "00000000-0000-4000-8000-000000000401", displayName: "Ana" }}
+      onStartCall={start}
+      resourceCall={{ onCall }}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada de áudio" }));
+
+  expect(start).toHaveBeenCalledOnce();
+  expect(onCall).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Chamada" })).not.toBeInTheDocument();
+});
+
+it('RF-24 "none" state: joins the channel\'s resource room via a single Chamada action', () => {
+  const onCall = vi.fn();
+  render(<HeaderChannel name="geral" resourceCall={{ onCall }} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Iniciar chamada" }));
+
+  expect(onCall).toHaveBeenCalledOnce();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de áudio" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Iniciar chamada de vídeo" }),
+  ).not.toBeInTheDocument();
+});
+
+it("hides the channel call buttons entirely when resourceCall is absent (e.g. not yet resolvable)", () => {
+  render(<HeaderChannel name="geral" />);
+  expect(
+    screen.queryByRole("button", { name: /Iniciar chamada|Entrar na chamada/ }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText("Chamada ativa")).not.toBeInTheDocument();
+});

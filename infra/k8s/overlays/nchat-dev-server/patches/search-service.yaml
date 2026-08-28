@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search-service
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: search-service
+          # envFrom is a list without a merge key, so this replaces the base's
+          # entirely — including its `secretRef: nchat-secrets` entry. That is
+          # the overlay's established pattern (see auth-service and
+          # chat-service), and it is also why the service started without
+          # AUTH_JWT_HMAC_SECRET: the replacement dropped the only source it
+          # had. Both secrets it needs are therefore named key by key below.
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          # Config.Validate refuses to start without either of these — the
+          # database URL and a JWT secret of at least 32 bytes — so neither is
+          # optional here.
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET

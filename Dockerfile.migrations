@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1.7
+FROM postgres:16.10-alpine
+USER root
+RUN apk add --no-cache bash coreutils
+COPY --chmod=0555 scripts/db/migrate.sh /app/scripts/db/migrate.sh
+COPY --chmod=0555 scripts/db/run-migrations.sh /app/scripts/db/run-migrations.sh
+COPY --chmod=0444 scripts/db/grant-runtime.sql /app/scripts/db/grant-runtime.sql
+COPY migrations /app/migrations
+WORKDIR /app
+USER 70:70
+ENTRYPOINT ["/app/scripts/db/run-migrations.sh"]
+CMD ["up"]

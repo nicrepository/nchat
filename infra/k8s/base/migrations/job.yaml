@@ -1,0 +1,70 @@
+# The single logical execution of a schema migration.
+#
+# A Job, not an init container and not a step inside a service: an init
+# container would run once per replica and once per release slot, and Blue and
+# Green share one database. backoffLimit: 0 means a failed run stays failed and
+# visible rather than retrying into a half-applied schema, and the deploy script
+# waits on this Job's completion before anything is promoted — a migration that
+# did not finish blocks the release instead of being discovered afterwards.
+#
+# Which node it runs on, and which image digest it carries, are environment
+# facts: the overlays supply them.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nchat-migrations
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/component: migrations
+spec:
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/component: migrations
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrations
+          image: ghcr.io/nicrepository/nchat/migrations:sha-placeholder
+          args:
+            - up
+          env:
+            - name: MIGRATIONS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-migrator
+                  key: MIGRATIONS_DATABASE_URL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

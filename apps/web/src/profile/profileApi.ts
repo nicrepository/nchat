@@ -1,0 +1,283 @@
+/**
+ * Profile API client — avatar upload and removal.
+ *
+ * The image bytes are sent as multipart/form-data; the server validates,
+ * re-encodes and stores them, then returns a same-origin avatar URL. The client
+ * never chooses the persisted URL and never sends a user_id — identity comes
+ * from the session token via authenticatedFetch.
+ */
+
+import { authenticatedFetch } from "../lib/authClient";
+import { ApiRequestError } from "../lib/api";
+
+const AUTH_BASE = import.meta.env.VITE_AUTH_API_BASE_URL ?? "/api/auth";
+
+/** Client-side limits mirrored from the server, so obviously-bad files are
+ * rejected before a wasted round-trip. The server remains authoritative. */
+export const AVATAR_MAX_BYTES = 5 * 1024 * 1024;
+export const AVATAR_ACCEPTED_TYPES = ["image/jpeg", "image/png"] as const;
+
+export type AvatarUploadErrorReason = "too_large" | "unsupported" | "forbidden" | "unknown";
+
+export class AvatarUploadError extends Error {
+  readonly reason: AvatarUploadErrorReason;
+  constructor(reason: AvatarUploadErrorReason, message: string) {
+    super(message);
+    this.name = "AvatarUploadError";
+    this.reason = reason;
+  }
+}
+
+interface AvatarResponse {
+  data: { avatar_url: string };
+}
+
+interface SelfProfileResponse {
+  data: {
+    id: string;
+    display_name?: unknown;
+    avatar_url?: unknown;
+    job_title?: unknown;
+    bio?: unknown;
+    timezone?: unknown;
+    custom_status?: unknown;
+  };
+}
+
+export interface SelfProfile {
+  id: string;
+  /**
+   * Trimmed display name, and "" when the server has no usable one. Callers get
+   * a single rule for "is there a name to show?" instead of each re-deciding
+   * whether whitespace counts.
+   */
+  displayName: string;
+  /** Present only when set and same-origin; a cross-origin value is dropped. */
+  avatarUrl?: string;
+  /**
+   * Trimmed, "" when unset — same convention as displayName. All four are
+   * optional at the domain level (matching auth.users' nullable columns) and
+   * optional here on the TS type too, for the same reason avatarUrl is:
+   * every real response includes them (selfProfileFromResponse always sets
+   * them), but a test fixture elsewhere constructing a partial SelfProfile
+   * should not be forced to invent values for fields it does not care about.
+   */
+  jobTitle?: string;
+  bio?: string;
+  /** An IANA time zone name (e.g. "America/Sao_Paulo"), or "" when unset. */
+  timezone?: string;
+  customStatus?: string;
+}
+
+/**
+ * Loads the authenticated user's own profile (identity from the session, never a
+ * client-supplied id). The avatar URL is run through the same same-origin guard
+ * the sidebar uses, so a value that could not be rendered is never returned.
+ */
+export async function fetchMyProfile(signal?: AbortSignal): Promise<SelfProfile> {
+  const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+    method: "GET",
+    signal,
+  });
+  return selfProfileFromResponse(res);
+}
+
+/**
+ * "" for anything that is not a name: absent, null, empty, whitespace-only.
+ * Trimming here rather than at render time means the same value decides both
+ * what is shown and what the initials are derived from. Reused for
+ * job_title/bio/timezone/custom_status too — the rule ("" when there is
+ * nothing usable) is identical for every optional text field this client
+ * reads.
+ */
+function normalizeDisplayName(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+/**
+ * Accepts an avatar URL only when it resolves same-origin, mirroring the sidebar
+ * normaliser. Belt-and-suspenders: the server already persists only same-origin
+ * URLs, but the client must never render a cross-origin image.
+ */
+function sameOriginAvatarUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  if (typeof window === "undefined") return undefined;
+  const origin = window.location?.origin;
+  if (typeof origin !== "string" || origin === "" || origin === "null") return undefined;
+  try {
+    const parsed = new URL(raw, origin);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    if (parsed.origin !== origin) return undefined;
+    if (parsed.username !== "" || parsed.password !== "") return undefined;
+    return raw;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Uploads an avatar image and returns the persisted same-origin URL. Throws an
+ * AvatarUploadError with a typed reason on rejection so the UI can show a
+ * specific message.
+ */
+export async function uploadAvatar(file: File, signal?: AbortSignal): Promise<string> {
+  const form = new FormData();
+  form.append("avatar", file);
+  try {
+    const res = await authenticatedFetch<AvatarResponse>(`${AUTH_BASE}/me/avatar`, {
+      method: "POST",
+      body: form,
+      signal,
+    });
+    return res.data.avatar_url;
+  } catch (error) {
+    throw mapAvatarError(error);
+  }
+}
+
+/** Removes the current user's avatar. Idempotent on the server (204). */
+export async function removeAvatar(signal?: AbortSignal): Promise<void> {
+  try {
+    await authenticatedFetch<void>(`${AUTH_BASE}/me/avatar`, { method: "DELETE", signal });
+  } catch (error) {
+    throw mapAvatarError(error);
+  }
+}
+
+function mapAvatarError(error: unknown): AvatarUploadError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 413:
+        return new AvatarUploadError("too_large", "A imagem é muito grande.");
+      case 415:
+        return new AvatarUploadError("unsupported", "Formato de imagem não suportado.");
+      case 403:
+        return new AvatarUploadError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new AvatarUploadError("unknown", "Não foi possível atualizar o avatar.");
+}
+
+export type UpdateDisplayNameErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateDisplayNameError extends Error {
+  readonly reason: UpdateDisplayNameErrorReason;
+  constructor(reason: UpdateDisplayNameErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateDisplayNameError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Updates the authenticated user's display name and returns the profile as
+ * persisted by the server — never the optimistic input. The body carries only
+ * display_name; identity comes from the session via authenticatedFetch, never
+ * from a client-supplied id.
+ *
+ * PATCH /auth/me treats an absent field as "leave it alone," so this call
+ * never touches job_title/bio/timezone/custom_status even though it does not
+ * mention them.
+ */
+export async function updateDisplayName(
+  displayName: string,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: displayName }),
+      signal,
+    });
+    return selfProfileFromResponse(res);
+  } catch (error) {
+    throw mapUpdateDisplayNameError(error);
+  }
+}
+
+function mapUpdateDisplayNameError(error: unknown): UpdateDisplayNameError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateDisplayNameError("invalid", "Nome inválido.");
+      case 403:
+        return new UpdateDisplayNameError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateDisplayNameError("unknown", "Não foi possível atualizar o nome.");
+}
+
+function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
+  return {
+    id: res.data.id,
+    displayName: normalizeDisplayName(res.data.display_name),
+    avatarUrl: sameOriginAvatarUrl(res.data.avatar_url),
+    jobTitle: normalizeDisplayName(res.data.job_title),
+    bio: normalizeDisplayName(res.data.bio),
+    timezone: normalizeDisplayName(res.data.timezone),
+    customStatus: normalizeDisplayName(res.data.custom_status),
+  };
+}
+
+export type UpdateProfileFieldsErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateProfileFieldsError extends Error {
+  readonly reason: UpdateProfileFieldsErrorReason;
+  constructor(reason: UpdateProfileFieldsErrorReason, message: string) {
+    super(message);
+    this.name = "UpdateProfileFieldsError";
+    this.reason = reason;
+  }
+}
+
+/** The "Detalhes do perfil" form always submits all four together — see
+ * ProfilePage's onSaveDetails — so this takes a plain object rather than four
+ * positional parameters, matching that grouping. */
+export interface ProfileFieldsInput {
+  jobTitle: string;
+  bio: string;
+  timezone: string;
+  customStatus: string;
+}
+
+/**
+ * Updates job_title, bio, timezone and custom_status, and returns the profile
+ * as persisted. Does not send display_name at all: PATCH /auth/me treats an
+ * absent field as "leave it alone," so there is nothing to preserve here —
+ * unlike a design that would need to resend the current display name to
+ * avoid clobbering it.
+ */
+export async function updateProfileFields(
+  fields: ProfileFieldsInput,
+  signal?: AbortSignal,
+): Promise<SelfProfile> {
+  try {
+    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_title: fields.jobTitle,
+        bio: fields.bio,
+        timezone: fields.timezone,
+        custom_status: fields.customStatus,
+      }),
+      signal,
+    });
+    return selfProfileFromResponse(res);
+  } catch (error) {
+    throw mapUpdateProfileFieldsError(error);
+  }
+}
+
+function mapUpdateProfileFieldsError(error: unknown): UpdateProfileFieldsError {
+  if (error instanceof ApiRequestError) {
+    switch (error.status) {
+      case 400:
+        return new UpdateProfileFieldsError("invalid", "Dados inválidos.");
+      case 403:
+        return new UpdateProfileFieldsError("forbidden", "Conta indisponível para esta ação.");
+    }
+  }
+  return new UpdateProfileFieldsError("unknown", "Não foi possível atualizar o perfil.");
+}

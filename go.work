@@ -1,0 +1,14 @@
+go 1.25.13
+toolchain go1.25.13
+
+use (
+	./libs/go/platform
+	./services/admin-service
+	./services/auth-service
+	./services/chat-service
+	./services/document-converter
+	./services/file-service
+	./services/media-service
+	./services/notification-service
+	./services/search-service
+)

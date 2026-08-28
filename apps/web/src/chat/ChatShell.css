@@ -1,0 +1,261 @@
+/*
+ * ChatShell — full-screen chat layout.
+ * Scoped token overrides mirror AdminShell.css — purple palette for the chat
+ * context without touching the global teal tokens used by auth.
+ *
+ * ── Responsive strategy (issue #467) ───────────────────────────────────────
+ * The shell is one grid, and every width is the same grid with a different
+ * template. Nothing is mounted or unmounted by width: the sidebar, the
+ * conversation and the details panel are the same elements in every mode, so a
+ * resize changes where they sit and never what they hold.
+ *
+ * Three thresholds, stated here and reused by the chat stylesheets rather than
+ * restated with numbers of their own:
+ *
+ *   >= 1280px           wide      nav column (240px) │ conversation │ details
+ *                                 column (320px). The conversation keeps at
+ *                                 least 720px with everything open.
+ *   1024px – 1279.98px  compact   nav column (200px) │ conversation. Details
+ *                                 covers the conversation instead of splitting
+ *                                 it, which is what stops two side columns from
+ *                                 squeezing the messages.
+ *   768px – 1023.98px   tablet    nav is a drawer over the conversation; details
+ *                                 still covers the conversation. One reading
+ *                                 surface at a time, no three-column layout
+ *                                 where there is no room for one.
+ *   < 768px             phone     as tablet, plus the density and safe-area
+ *                                 rules the message area applies to itself.
+ *
+ * The drawer band is the one number JavaScript also needs — the drawer is modal
+ * there and nowhere else — and it lives in useNavDrawer.ts's NAV_DRAWER_QUERY.
+ * Nothing else about the layout is duplicated outside this file.
+ */
+
+/* ── Root scroll lock ───────────────────────────────────────────────────────────
+   Added to <html> and <body> by ChatShell for exactly as long as it is mounted,
+   and removed on unmount so auth, profile and admin keep the document scroll
+   they rely on. See useRootScrollLock in ChatShell.tsx for why the shell's own
+   `overflow: hidden` is not enough on its own. */
+html.chat-root-locked,
+body.chat-root-locked {
+  overflow: hidden;
+}
+
+/* ── Scoped tokens ──────────────────────────────────────────────────────────── */
+/*
+ * The chat surface's own palette, radius scale and shadows.
+ *
+ * Declared on `.chat-theme` as well as on the shell so that an overlay portalled
+ * to <body> — the emoji picker, its skin-tone palette — can opt into the same
+ * tokens without inheriting the shell's grid, its 100dvh height or its overflow
+ * rule. A portal that took the whole `.chat-app` class would be laid out as a
+ * full-screen grid.
+ */
+.chat-app,
+.chat-theme {
+  /* Prototype purple accent */
+  --color-primary: #6d28d9;
+  --color-primary-strong: #5b21b6;
+  --color-primary-tint: #f3ebfb;
+  --color-primary-tint-strong: #e6d7f7;
+
+  /* Prototype light surfaces */
+  --color-bg: #f7f5fb;
+  --color-surface: #ffffff;
+  --color-surface-2: #faf8fd;
+  --color-border: #e8e3f0;
+  --color-border-strong: #d4cde3;
+
+  /* Prototype text */
+  --color-ink: #16121f;
+  --color-ink-2: #3d3550;
+  --color-muted: #7c7390;
+  --color-muted-2: #a39cb3;
+
+  /* Semantic */
+  --color-danger: #dc2626;
+  --color-danger-tint: #fee2e2;
+  --color-danger-ink: #991b1b;
+  --color-warning-tint: #fef3c7;
+  --color-warning-ink: #92400e;
+
+  /* Prototype radius scale */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* Shadow */
+  --shadow-md: 0 4px 16px rgba(22, 18, 31, 0.06);
+
+  /* Column widths, so the tracks and the elements in them cannot disagree. */
+  --chat-nav-w: 240px;
+  --chat-details-w: 320px;
+}
+
+.chat-app {
+  display: grid;
+  /*
+   * The trailing `auto` track is the details column. It collapses to zero when
+   * no panel is open, which is what lets the panel be a plain grid child of the
+   * shell — the row menu opens details for a conversation other than the one on
+   * screen (issue #527), and that panel has to land in a column of its own
+   * rather than wherever auto-placement would put it.
+   */
+  grid-template-columns: var(--chat-nav-w) minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: "nav main details";
+  /* dvh first-class, vh as the fallback for engines without it: a mobile
+     browser's bars must not push the composer past the bottom of the screen. */
+  height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+}
+
+.chat-app > .chat-sidebar {
+  grid-area: nav;
+  /* The track owns the width; the sidebar fills whatever it is given, so a
+     narrower mode is one number in one place. */
+  width: 100%;
+}
+
+.chat-app__main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--color-bg, #f6fafb);
+  overflow: hidden;
+}
+
+/* The shell-level details panel (issue #527), in its own column. */
+.chat-app > .chat-details {
+  width: var(--chat-details-w);
+}
+
+/* ── Navigation toggle ──────────────────────────────────────────────────────── */
+
+/* Absent while the sidebar is a column: there is nothing to disclose. */
+.chat-app__nav-bar {
+  display: none;
+  grid-area: navbar;
+  align-items: center;
+  gap: 8px;
+  padding: 6px clamp(8px, 2vw, 16px);
+  padding-top: max(6px, env(safe-area-inset-top));
+  background: var(--color-surface, #fff);
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-app__nav-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* A touch target, not a pointer target: this is the only way back to the
+     conversation list on a phone. */
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-app__nav-toggle:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-app__nav-toggle .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-app__nav-backdrop {
+  grid-area: main;
+  z-index: 30;
+  border: 0;
+  padding: 0;
+  background: rgba(22, 18, 31, 0.45);
+  cursor: pointer;
+}
+
+/* ── Compact desktop / notebook ─────────────────────────────────────────────── */
+
+@media (max-width: 1279.98px) {
+  .chat-app {
+    --chat-nav-w: 200px;
+    grid-template-columns: var(--chat-nav-w) minmax(0, 1fr);
+    grid-template-areas: "nav main";
+  }
+
+  /*
+   * The panel covers the conversation instead of taking a column from it. The
+   * conversation is still there — same elements, same scroll position, same
+   * composer, nothing remounted — and `visibility` is what keeps the covered
+   * surface out of the tab order and out of the accessibility tree while it is
+   * behind the panel, without a focus trap or an `inert` attribute to keep in
+   * step with the width.
+   */
+  .chat-app > .chat-details {
+    grid-area: main;
+    width: auto;
+    z-index: 5;
+    border-left: 0;
+    box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
+  }
+
+  .chat-app[data-details-open="true"] > .chat-app__main {
+    visibility: hidden;
+  }
+}
+
+/* ── Tablet and phone: the navigation is a drawer ───────────────────────────── */
+
+@media (max-width: 1023.98px) {
+  .chat-app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas:
+      "navbar"
+      "main";
+  }
+
+  .chat-app__nav-bar {
+    display: flex;
+  }
+
+  /*
+   * The drawer shares the `main` cell with the conversation rather than being
+   * fixed to the viewport: it is then clipped by the shell, it cannot cover the
+   * toggle that opened it, and it needs no viewport-height arithmetic of its
+   * own. Hidden rather than merely translated away, so a closed drawer holds no
+   * tab stops.
+   */
+  .chat-app > .chat-sidebar {
+    grid-area: main;
+    justify-self: start;
+    z-index: 40;
+    width: min(300px, calc(100% - 48px));
+    padding-left: max(10px, env(safe-area-inset-left));
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition:
+      transform 180ms ease,
+      visibility 180ms;
+  }
+
+  .chat-app[data-nav-open="true"] > .chat-sidebar {
+    transform: none;
+    visibility: visible;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-app > .chat-sidebar {
+    transition: none;
+  }
+}

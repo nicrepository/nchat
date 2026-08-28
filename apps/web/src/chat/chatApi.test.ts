@@ -1,0 +1,3575 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiRequestError } from "../lib/api";
+
+// ── Mock authenticatedFetch ───────────────────────────────────────────────────
+
+const { mockAuthFetch } = vi.hoisted(() => ({
+  mockAuthFetch: vi.fn(),
+}));
+
+vi.mock("../lib/authClient", () => ({
+  authenticatedFetch: (...args: unknown[]) => mockAuthFetch(...args),
+}));
+
+import {
+  addChannelMembers,
+  addGroupParticipants,
+  createChannel,
+  createGroupDM,
+  deleteMessage,
+  editMessage,
+  favoriteMessage,
+  forwardChannelMessage,
+  ERR_INVALID_RESPONSE,
+  fetchChannelDetails,
+  fetchDirectProfile,
+  fetchGroupDetails,
+  fetchChannelMessage,
+  fetchChannelMessageSecuritySnapshots,
+  fetchChannelMessages,
+  fetchChannelCallParticipantProfiles,
+  fetchGroupCallParticipantProfiles,
+  fetchPins,
+  fetchFavorites,
+  fetchAllowedReactionEmojis,
+  fetchChannels,
+  fetchDMMessage,
+  fetchDMMessageSecuritySnapshots,
+  fetchDMMessages,
+  fetchDMs,
+  fetchMentionCandidates,
+  getOrCreateDirectDM,
+  getMessageHistory,
+  markConversationRead,
+  MessageEditError,
+  fetchSidebarData,
+  messagesPath,
+  pinMessage,
+  postChannelMessage,
+  postDMMessage,
+  reconcileMessageLinkSafety,
+  resetAllowedReactionEmojisCache,
+  resolveChannelMessageReferences,
+  resolveDMMessageReferences,
+  searchChannelMemberCandidates,
+  searchDMCandidates,
+  searchGroupParticipantCandidates,
+  renameChannel,
+  setSidebarConversationPinned,
+  unfavoriteMessage,
+  unpinMessage,
+} from "./chatApi";
+
+describe("message link-safety reconciliation", () => {
+  it("returns the authoritative state version used for event ordering", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        link_safety_state: "safe",
+        updated_at: "2026-08-18T12:00:00Z",
+        retry_after_seconds: 60,
+      },
+    });
+
+    await expect(reconcileMessageLinkSafety("message 1")).resolves.toEqual({
+      state: "safe",
+      updatedAt: "2026-08-18T12:00:00Z",
+      retryAfterSeconds: 60,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/messages/message%201/link-safety/reconcile",
+      { method: "POST", signal: undefined },
+    );
+  });
+
+  it("rejects a response without an authoritative version", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { link_safety_state: "safe", retry_after_seconds: 60 },
+    });
+
+    await expect(reconcileMessageLinkSafety("message-1")).rejects.toThrow(
+      "invalid link-safety reconcile response",
+    );
+  });
+});
+
+describe("message reference batch resolution", () => {
+  it("posts destination IDs once and maps authorized and unavailable references", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        references: [
+          {
+            message_id: "destination-1",
+            reference: {
+              available: true,
+              message_id: "source-1",
+              target_type: "channel",
+              target_id: "private-source",
+              target_label: "Privado",
+              author_display_name: "Ana",
+              body: "segredo",
+              body_format: "v3",
+              created_at: "2026-07-21T12:00:00Z",
+            },
+          },
+          { message_id: "destination-2", reference: { available: false } },
+        ],
+      },
+    });
+    const signal = new AbortController().signal;
+
+    const references = await resolveChannelMessageReferences(
+      "canal privado",
+      ["destination-1", "destination-2"],
+      signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/message-references",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ message_ids: ["destination-1", "destination-2"] }),
+        signal,
+      }),
+    );
+    expect(references["destination-1"]).toMatchObject({
+      available: true,
+      messageId: "source-1",
+      bodyText: "segredo",
+    });
+    expect(references["destination-2"]).toEqual({ available: false });
+  });
+
+  it("uses the DM batch endpoint", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { references: [] } });
+    await resolveDMMessageReferences("dm-1", ["destination-1"]);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/message-references",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+});
+
+describe("message security snapshots", () => {
+  it("posts only message IDs and conservatively maps the security projection", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        snapshots: [
+          {
+            message_id: "message-1",
+            available: true,
+            status: "active",
+            link_safety_state: "future-state",
+            updated_at: "2026-08-18T12:00:00Z",
+            quoted: {
+              message_id: "source-1",
+              status: "active",
+              link_safety_state: "malicious",
+              updated_at: "2026-08-18T11:00:00Z",
+            },
+          },
+          {
+            message_id: "ignored",
+            available: true,
+            status: "future-status",
+            link_safety_state: "safe",
+          },
+          { message_id: "missing", available: false },
+        ],
+      },
+    });
+    const signal = new AbortController().signal;
+
+    const snapshots = await fetchChannelMessageSecuritySnapshots(
+      "canal privado",
+      ["message-1"],
+      signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/message-security-snapshots",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ message_ids: ["message-1"] }),
+        signal,
+      }),
+    );
+    expect(snapshots).toEqual([
+      {
+        messageId: "message-1",
+        available: true,
+        status: "active",
+        linkSafetyState: "unknown",
+        updatedAt: "2026-08-18T12:00:00Z",
+        quoted: {
+          messageId: "source-1",
+          status: "active",
+          linkSafetyState: "malicious",
+          updatedAt: "2026-08-18T11:00:00Z",
+        },
+      },
+      { messageId: "missing", available: false },
+    ]);
+  });
+
+  it("uses the DM target without accepting URLs or scan identifiers", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { snapshots: [] } });
+    await fetchDMMessageSecuritySnapshots("dm-1", ["message-1"]);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm-1/message-security-snapshots",
+      expect.objectContaining({
+        body: JSON.stringify({ message_ids: ["message-1"] }),
+      }),
+    );
+  });
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function sidebarResponse(
+  overrides: {
+    channels?: object[];
+    dms?: object[];
+  } = {},
+) {
+  return {
+    data: {
+      workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+      channels: overrides.channels ?? [],
+      dm_conversations: overrides.dms ?? [],
+    },
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  resetAllowedReactionEmojisCache();
+});
+afterEach(() => vi.clearAllMocks());
+
+describe("fetchAllowedReactionEmojis", () => {
+  it("fetches the authenticated allowlist once and reuses the in-memory result", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", "❤️", "🚀"] } });
+
+    const [first, second] = await Promise.all([
+      fetchAllowedReactionEmojis(),
+      fetchAllowedReactionEmojis(),
+    ]);
+
+    expect(first).toEqual(["👍", "❤️", "🚀"]);
+    expect(second).toEqual(first);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/reactions/allowed-emojis"),
+      { method: "GET" },
+    );
+  });
+
+  it("fetches again after the cache is reset", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["👍"] } });
+    await fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops non-string values from a malformed allowlist response", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: ["👍", 42, null, "🚀"] } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["👍", "🚀"]);
+  });
+
+  it("fails closed when the allowlist is not an array", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { emojis: "👍" } });
+
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual([]);
+  });
+
+  it("does not let a stale request failure clear the new session cache", async () => {
+    let rejectStale!: (error: Error) => void;
+    mockAuthFetch.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectStale = reject)),
+    );
+    const staleRequest = fetchAllowedReactionEmojis();
+
+    resetAllowedReactionEmojisCache();
+    mockAuthFetch.mockResolvedValueOnce({ data: { emojis: ["🚀"] } });
+    const currentRequest = fetchAllowedReactionEmojis();
+    await expect(currentRequest).resolves.toEqual(["🚀"]);
+
+    rejectStale(new Error("stale session"));
+    await expect(staleRequest).rejects.toThrow("stale session");
+    await expect(fetchAllowedReactionEmojis()).resolves.toEqual(["🚀"]);
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── fetchChannels ─────────────────────────────────────────────────────────────
+
+describe("fetchChannels", () => {
+  it("returns channels mapped from sidebar response", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            is_general: true,
+            can_write: true,
+          },
+          {
+            id: "ch-2",
+            slug: "eng",
+            display_name: "eng",
+            type: "private",
+            is_general: false,
+            can_write: false,
+          },
+        ],
+      }),
+    );
+
+    const channels = await fetchChannels();
+    expect(channels).toHaveLength(2);
+    expect(channels[0]).toEqual({
+      id: "ch-1",
+      name: "geral",
+      type: "public",
+      canWrite: true,
+      // Absent from the payload, so "no" — a server that predates the field
+      // must never be read as granting the rename (issue #527). isGeneral and
+      // muted read the same way: absent is the safe answer.
+      canRename: false,
+      // The fixture's ch-1 is the workspace's general channel, so the mapper
+      // must carry that through — it is what the row menu reads to omit rename,
+      // mute and leave (issue #527).
+      isGeneral: true,
+      muted: false,
+      createdAt: null,
+      lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
+    });
+    expect(channels[1]).toEqual({
+      id: "ch-2",
+      name: "eng",
+      type: "private",
+      canWrite: false,
+      canRename: false,
+      isGeneral: false,
+      muted: false,
+      createdAt: null,
+      lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
+    });
+  });
+
+  it("fails closed when can_write is missing or unexpected", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "missing", slug: "missing", display_name: "Missing", type: "public" },
+          {
+            id: "unexpected",
+            slug: "unexpected",
+            display_name: "Unexpected",
+            type: "public",
+            can_write: "true",
+          },
+        ],
+      }),
+    );
+
+    const channels = await fetchChannels();
+    expect(channels.map(({ id, canWrite }) => ({ id, canWrite }))).toEqual([
+      { id: "missing", canWrite: false },
+      { id: "unexpected", canWrite: false },
+    ]);
+  });
+
+  it("falls back to slug when display_name is empty", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "ch-1", slug: "geral", display_name: "", type: "public", is_general: false },
+        ],
+      }),
+    );
+
+    const channels = await fetchChannels();
+    expect(channels[0].name).toBe("geral");
+  });
+
+  it("returns empty array when channels list is empty", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarResponse({ channels: [] }));
+    const channels = await fetchChannels();
+    expect(channels).toEqual([]);
+  });
+
+  it("calls /api/chat/sidebar with GET method", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarResponse());
+    await fetchChannels();
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/sidebar"),
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("network error"));
+    await expect(fetchChannels()).rejects.toThrow("network error");
+  });
+
+  it("makes an independent request per call (no cross-call caching)", async () => {
+    // Each fetchChannels() call fires two requests (sidebar + channel
+    // categories, via Promise.all), so two invocations need four queued
+    // responses in call order: sidebar, categories, sidebar, categories.
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            { id: "ch-a", slug: "a", display_name: "a", type: "public", is_general: false },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(sidebarResponse())
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            { id: "ch-b", slug: "b", display_name: "b", type: "public", is_general: false },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(sidebarResponse());
+
+    const first = await fetchChannels();
+    const second = await fetchChannels();
+
+    expect(first[0].id).toBe("ch-a");
+    expect(second[0].id).toBe("ch-b");
+    expect(mockAuthFetch).toHaveBeenCalledTimes(4);
+  });
+});
+
+// ── fetchDMs ──────────────────────────────────────────────────────────────────
+
+describe("fetchDMs", () => {
+  it("returns direct DMs mapped from sidebar response", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [{ id: "dm-1", type: "direct", name: "Juliane Lino" }],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms).toHaveLength(1);
+    expect(dms[0]).toEqual({
+      id: "dm-1",
+      type: "1:1",
+      name: "Juliane Lino",
+      participants: [],
+      muted: false,
+      createdAt: null,
+      lastMessageAt: null,
+    });
+  });
+
+  it("maps the counterpart identity of a 1:1 DM", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-1",
+            type: "direct",
+            name: "Juliane Lino",
+            counterpart: {
+              user_id: "user-2",
+              display_name: "Juliane Lino",
+              avatar_url: "/media/avatars/juliane.png",
+            },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart).toEqual({
+      userId: "user-2",
+      displayName: "Juliane Lino",
+      avatarUrl: "/media/avatars/juliane.png",
+    });
+    // The counterpart must not be smuggled into the presence-bearing list.
+    expect(dms[0].participants).toEqual([]);
+  });
+
+  it("keeps the DM usable when the server sends no counterpart", async () => {
+    // Compatibility: a server that predates the counterpart field.
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-1", type: "direct", name: "Juliane Lino" }] }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].name).toBe("Juliane Lino");
+    expect(dms[0].counterpart).toBeUndefined();
+  });
+
+  it("drops a counterpart that is missing an id or a name", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-1", type: "direct", name: "A", counterpart: { display_name: "A" } },
+          { id: "dm-2", type: "direct", name: "B", counterpart: { user_id: "user-3" } },
+          { id: "dm-3", type: "direct", name: "C", counterpart: { user_id: "", display_name: "" } },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms.map((dm) => dm.counterpart)).toEqual([undefined, undefined, undefined]);
+  });
+
+  // jsdom serves these tests from http://localhost:3000, so that is the origin
+  // the same-origin policy is measured against.
+  it("rejects every avatar URL that is not same-origin, keeping the rest of the identity", async () => {
+    const hostile: unknown[] = [
+      42, // not a string at all
+      null,
+      "http://", // parses to an error, not to a URL
+      "http://user:pass@localhost:3000/a.png", // credentials on the page's own origin
+      "javascript:alert(1)",
+      "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+      "vbscript:msgbox(1)",
+      "file:///etc/passwd",
+      "blob:http://localhost:3000/abc",
+      "https://evil.example.test/a.png", // cross-origin absolute
+      "http://localhost:3001/a.png", // different port
+      "http://sub.localhost:3000/a.png", // different subdomain
+      "//evil.example.test/a.png", // protocol-relative cross-origin
+      "/\\evil.example.test/a.png", // backslash escape
+      "https://user:pass@localhost:3000/a.png", // credentials, even same host
+      "/media/a.png\u0000", // control character
+      "media/a.png", // no leading slash -> would resolve relative to /chat, still same-origin? see below
+      "  ",
+      "\t\n",
+      `/${"a".repeat(512)}`, // over the length cap
+    ];
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: hostile.map((avatar, index) => ({
+          id: `dm-${index}`,
+          type: "direct",
+          name: "Juliane Lino",
+          counterpart: { user_id: `user-${index}`, display_name: "Juliane", avatar_url: avatar },
+        })),
+      }),
+    );
+
+    const dms = await fetchDMs();
+    for (const [index, dm] of dms.entries()) {
+      // "media/a.png" (no leading slash) resolves to a same-origin URL, so it
+      // is the one entry that is legitimately accepted.
+      if (hostile[index] === "media/a.png") {
+        expect(dm.counterpart?.avatarUrl).toBe("media/a.png");
+      } else {
+        expect(dm.counterpart?.avatarUrl).toBeUndefined();
+      }
+      // The rejection is scoped to the avatar; the counterpart survives.
+      expect(dm.counterpart?.displayName).toBe("Juliane");
+    }
+  });
+
+  it("accepts same-origin avatar URLs, relative or absolute, unchanged", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-rel",
+            type: "direct",
+            name: "A",
+            counterpart: { user_id: "u1", display_name: "A", avatar_url: "/media/a.png" },
+          },
+          {
+            id: "dm-abs",
+            type: "direct",
+            name: "B",
+            counterpart: {
+              user_id: "u2",
+              display_name: "B",
+              avatar_url: "http://localhost:3000/media/b.png?v=2#frag",
+            },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart?.avatarUrl).toBe("/media/a.png");
+    // The original string is returned verbatim — query and fragment intact.
+    expect(dms[1].counterpart?.avatarUrl).toBe("http://localhost:3000/media/b.png?v=2#frag");
+  });
+
+  it("never attaches a counterpart to a group DM", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          {
+            id: "dm-grp",
+            type: "group",
+            name: "Equipe Infra",
+            counterpart: { user_id: "user-2", display_name: "Juliane Lino" },
+          },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].counterpart).toBeUndefined();
+    expect(dms[0].name).toBe("Equipe Infra");
+  });
+
+  it("maps group DM type correctly", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [{ id: "dm-grp", type: "group", name: "Equipe Infra" }],
+      }),
+    );
+
+    const dms = await fetchDMs();
+    expect(dms[0].type).toBe("group");
+  });
+
+  // The discriminator is a closed set ('direct' | 'group', enforced by a CHECK
+  // constraint on chat.dm_conversations.type). A value outside it can only come
+  // from a corrupted or hostile payload; the conversation is still one the
+  // server authorized, so it is kept and read as 1:1 — the section that grants
+  // nothing extra — rather than dropped or promoted to a group.
+  it("drops a conversation whose type this build does not recognise", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-ok", type: "direct", name: "Juliane" },
+          { id: "dm-unknown", type: "broadcast", name: "Desconhecida" },
+          { id: "dm-missing", name: "Sem tipo" },
+          { id: "dm-empty", type: "", name: "Vazio" },
+          { id: "dm-null", type: null, name: "Nulo" },
+          { id: "dm-number", type: 1, name: "Número" },
+          { id: "dm-object", type: { kind: "direct" }, name: "Objeto" },
+          // chat.dm_conversations.type is CHECK'd to the exact lowercase
+          // literals, so casing is not a variant the contract admits.
+          { id: "dm-case", type: "GROUP", name: "Maiúsculas" },
+          { id: "dm-grp", type: "group", name: "Equipe" },
+        ],
+      }),
+    );
+
+    const dms = await fetchDMs();
+
+    // An unrecognised type is not a 1:1. Rendering it as one would give it a
+    // profile control and a request for a counterpart it may not have.
+    expect(dms.map((dm) => dm.id)).toEqual(["dm-ok", "dm-grp"]);
+    expect(dms.map((dm) => dm.type)).toEqual(["1:1", "group"]);
+    // Per-item tolerance, like the other list parsers here: one bad row does not
+    // cost the user the rest of their conversations.
+    expect(dms).toHaveLength(2);
+  });
+
+  it("returns empty array when dm_conversations list is empty", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarResponse({ dms: [] }));
+    const dms = await fetchDMs();
+    expect(dms).toEqual([]);
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("auth error"));
+    await expect(fetchDMs()).rejects.toThrow("auth error");
+  });
+
+  it("makes an independent request per call — different users see different data", async () => {
+    // Regression: no _inflight singleton means session changes are safe.
+    // User A starts a request; before it resolves, User B starts their own.
+    // B must receive their own response, not A's.
+    let resolveUserA!: (v: ReturnType<typeof sidebarResponse>) => void;
+    const userAPromise = new Promise<ReturnType<typeof sidebarResponse>>((r) => {
+      resolveUserA = r;
+    });
+
+    const userBResponse = sidebarResponse({
+      dms: [{ id: "dm-b", type: "direct", name: "User B DM" }],
+    });
+
+    mockAuthFetch.mockReturnValueOnce(userAPromise).mockResolvedValueOnce(userBResponse);
+
+    // User A starts a request (in-flight, not yet resolved).
+    const userADMs = fetchDMs();
+
+    // User B starts their own independent request while A is still in flight.
+    const userBDMs = fetchDMs();
+
+    // Resolve user A's request — must not affect B's independent promise.
+    resolveUserA(sidebarResponse({ dms: [{ id: "dm-a", type: "direct", name: "User A DM" }] }));
+
+    const [resultA, resultB] = await Promise.all([userADMs, userBDMs]);
+
+    // A gets A's data.
+    expect(resultA[0].id).toBe("dm-a");
+    // B gets B's own data, not A's.
+    expect(resultB[0].id).toBe("dm-b");
+    expect(resultB[0].name).toBe("User B DM");
+  });
+});
+
+// ── fetchSidebarData ──────────────────────────────────────────────────────────
+
+describe("fetchSidebarData", () => {
+  it("returns channels, DMs and categories together", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            is_general: true,
+            can_write: true,
+          },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Juliane" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toEqual({
+      id: "ch-1",
+      name: "geral",
+      type: "public",
+      canWrite: true,
+      canRename: false,
+      isGeneral: true,
+      muted: false,
+      createdAt: null,
+      lastMessageAt: null,
+      categoryId: undefined,
+      categoryName: "Geral",
+    });
+    expect(dms).toHaveLength(1);
+    expect(dms[0]).toEqual({
+      id: "dm-1",
+      type: "1:1",
+      name: "Juliane",
+      participants: [],
+      muted: false,
+      createdAt: null,
+      lastMessageAt: null,
+    });
+    // Sidebar and channel categories, via Promise.all — not one request.
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("maps group DM type correctly", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-g", type: "group", name: "Equipe" }] }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].type).toBe("group");
+  });
+
+  it("maps server-side pin timestamps without inventing a client preference", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            pinned_at: "2026-08-12T10:00:00Z",
+          },
+        ],
+        dms: [{ id: "group-1", type: "group", name: "Equipe", pinned_at: "2026-08-12T11:00:00Z" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({ id: "ch-1", pinnedAt: "2026-08-12T10:00:00Z" });
+    expect(dms[0]).toMatchObject({ id: "group-1", pinnedAt: "2026-08-12T11:00:00Z" });
+  });
+
+  it("maps only valid authoritative unread counts", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          { id: "ch-1", slug: "geral", display_name: "geral", type: "public", unread_count: 3 },
+          { id: "ch-2", slug: "ruim", display_name: "ruim", type: "public", unread_count: -1 },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Ana", unread_count: 2 }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0].unreadCount).toBe(3);
+    expect(channels[1].unreadCount).toBeUndefined();
+    expect(dms[0].unreadCount).toBe(2);
+  });
+
+  it("keeps the sidebar's authoritative unread count for categorized channels", async () => {
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            {
+              id: "ch-1",
+              slug: "geral",
+              display_name: "geral",
+              type: "public",
+              unread_count: 3,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [
+            {
+              kind: "category",
+              id: "cat-1",
+              name: "Equipe",
+              channels: [
+                {
+                  id: "ch-1",
+                  slug: "geral",
+                  display_name: "geral",
+                  type: "public",
+                  unread_count: 0,
+                },
+              ],
+            },
+          ],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({ id: "ch-1", categoryId: "cat-1", unreadCount: 3 });
+  });
+
+  // ISSUE #527 — a categorized channel is mapped from the categories endpoint,
+  // so its rename capability has to survive that path too. A channel offering
+  // "Renomear canal" when uncategorized and hiding it once someone files it in a
+  // category is the same channel answering two different questions.
+  it("maps can_rename for categorized channels, not only for uncategorized ones", async () => {
+    const categorized = {
+      id: "ch-cat",
+      slug: "infra",
+      display_name: "Infra",
+      type: "public",
+      can_write: true,
+      can_rename: true,
+    };
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            categorized,
+            {
+              id: "ch-flat",
+              slug: "avulso",
+              display_name: "Avulso",
+              type: "public",
+              can_write: true,
+              can_rename: true,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [{ kind: "category", id: "cat-1", name: "Equipe", channels: [categorized] }],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+    const byId = new Map(channels.map((channel) => [channel.id, channel]));
+    expect(byId.get("ch-cat")).toMatchObject({ categoryId: "cat-1", canRename: true });
+    expect(byId.get("ch-flat")).toMatchObject({ categoryId: undefined, canRename: true });
+  });
+
+  it("uses target-specific idempotent pin endpoints without user or workspace payload", async () => {
+    mockAuthFetch.mockResolvedValue({});
+    await setSidebarConversationPinned("channel", "ch 1", true);
+    await setSidebarConversationPinned("dm", "dm 1", false);
+
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/sidebar-pin", {
+      method: "POST",
+    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/sidebar-pin", {
+      method: "DELETE",
+    });
+  });
+
+  // ISSUE #527 — the rename request carries the channel and the name, and
+  // nothing that could claim a privilege or aim the write somewhere else.
+  it("renames a channel with only the display name in the body", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { id: "ch 1", display_name: "Plataforma" } });
+
+    const result = await renameChannel("ch 1", "  Plataforma  ");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ display_name: "Plataforma" }),
+      signal: undefined,
+    });
+    // The id comes back unchanged: a rename is not a new channel.
+    expect(result).toEqual({ id: "ch 1", name: "Plataforma" });
+  });
+
+  it("surfaces a refused rename instead of swallowing it", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(renameChannel("ch-1", "Plataforma")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  // can_rename is a capability, so anything that is not an explicit `true` — a
+  // server that predates the field, a rewritten payload — must be read as "no".
+  it("reads can_rename strictly, and only from the server", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "a",
+            display_name: "a",
+            type: "public",
+            is_general: false,
+            can_write: true,
+            can_rename: true,
+          },
+          {
+            id: "ch-2",
+            slug: "b",
+            display_name: "b",
+            type: "public",
+            is_general: false,
+            can_write: true,
+            can_rename: "yes",
+          },
+          {
+            id: "ch-3",
+            slug: "c",
+            display_name: "c",
+            type: "public",
+            is_general: false,
+            can_write: true,
+          },
+        ],
+        dms: [],
+      }),
+    );
+
+    const { channels } = await fetchSidebarData();
+    expect(channels.map((channel) => channel.canRename)).toEqual([true, false, false]);
+  });
+
+  // ISSUE #527 — the grouped listing is a narrower projection of the same
+  // channel (it drops the unread count). Building a categorized row from it is
+  // what once lost can_rename, so the canonical sidebar entry is the base and a
+  // capability the grouped copy omits must still survive.
+  it("does not let the grouped projection drop a capability the sidebar published", async () => {
+    mockAuthFetch
+      .mockResolvedValueOnce(
+        sidebarResponse({
+          channels: [
+            {
+              id: "ch-cat",
+              slug: "infra",
+              display_name: "Infra",
+              type: "public",
+              can_write: true,
+              can_rename: true,
+              unread_count: 4,
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce({
+        data: {
+          groups: [
+            {
+              kind: "category",
+              id: "cat-1",
+              name: "Equipe",
+              // An older server, or one that narrows this projection further:
+              // the capability is simply absent from the grouped copy.
+              channels: [{ id: "ch-cat", slug: "infra", display_name: "Infra", type: "public" }],
+            },
+          ],
+        },
+      });
+
+    const { channels } = await fetchSidebarData();
+
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toMatchObject({
+      id: "ch-cat",
+      categoryId: "cat-1",
+      categoryName: "Equipe",
+      // Every server-derived field comes from the canonical payload.
+      canRename: true,
+      canWrite: true,
+      unreadCount: 4,
+    });
+  });
+
+  // A channel the grouped response carries and the sidebar response does not is
+  // still placed, never dropped: the two requests can race across a deploy.
+  it("still places a grouped channel the sidebar response does not carry", async () => {
+    mockAuthFetch.mockResolvedValueOnce(sidebarResponse({ channels: [] })).mockResolvedValueOnce({
+      data: {
+        groups: [
+          {
+            kind: "category",
+            id: "cat-1",
+            name: "Equipe",
+            channels: [
+              {
+                id: "ch-orfao",
+                slug: "orfao",
+                display_name: "Orfao",
+                type: "public",
+                can_write: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const { channels } = await fetchSidebarData();
+    expect(channels).toHaveLength(1);
+    expect(channels[0]).toMatchObject({ id: "ch-orfao", categoryId: "cat-1", canWrite: true });
+  });
+
+  it("marks target-specific conversations read with an optional message id", async () => {
+    mockAuthFetch.mockResolvedValue({});
+    await markConversationRead("channel", "ch 1");
+    await markConversationRead("dm", "dm 1", "message-1");
+
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(1, "/api/chat/channels/ch%201/read", {
+      method: "POST",
+    });
+    expect(mockAuthFetch).toHaveBeenNthCalledWith(2, "/api/chat/dm/dm%201/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ last_read_message_id: "message-1" }),
+    });
+  });
+
+  // ISSUE #414 — the two ordering keys travel on the items the sidebar already
+  // loads, and an empty conversation reports no activity rather than borrowing
+  // its creation instant.
+  it("maps the activity timestamps of channels and conversations", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            created_at: "2026-01-01T00:00:00Z",
+            last_message_at: "2026-07-30T10:00:00Z",
+          },
+          {
+            id: "ch-2",
+            slug: "vazio",
+            display_name: "vazio",
+            type: "public",
+            can_write: true,
+            created_at: "2026-07-31T00:00:00Z",
+            last_message_at: null,
+          },
+        ],
+        dms: [
+          {
+            id: "dm-1",
+            type: "direct",
+            name: "Juliane",
+            created_at: "2026-02-02T00:00:00Z",
+            last_message_at: "2026-07-29T18:00:00Z",
+          },
+        ],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]).toMatchObject({
+      createdAt: "2026-01-01T00:00:00Z",
+      lastMessageAt: "2026-07-30T10:00:00Z",
+    });
+    expect(channels[1]).toMatchObject({
+      createdAt: "2026-07-31T00:00:00Z",
+      lastMessageAt: null,
+    });
+    expect(dms[0]).toMatchObject({
+      createdAt: "2026-02-02T00:00:00Z",
+      lastMessageAt: "2026-07-29T18:00:00Z",
+    });
+  });
+
+  // A server that predates the field, or a payload where it is not a string,
+  // must not be turned into an invented instant.
+  it("treats a missing or non-string activity timestamp as absent", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            can_write: true,
+            last_message_at: 1_754_000_000,
+          },
+        ],
+        dms: [{ id: "dm-1", type: "direct", name: "Juliane" }],
+      }),
+    );
+
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels[0]?.lastMessageAt).toBeNull();
+    expect(channels[0]?.createdAt).toBeNull();
+    expect(dms[0]?.lastMessageAt).toBeNull();
+  });
+
+  it("returns empty arrays when sidebar lists are empty", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarResponse());
+    const { channels, dms } = await fetchSidebarData();
+    expect(channels).toEqual([]);
+    expect(dms).toEqual([]);
+  });
+
+  it("falls back to slug when display_name is empty", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        channels: [{ id: "ch-1", slug: "geral", display_name: "", type: "public" }],
+      }),
+    );
+    const { channels } = await fetchSidebarData();
+    expect(channels[0].name).toBe("geral");
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("network error"));
+    await expect(fetchSidebarData()).rejects.toThrow("network error");
+  });
+
+  it("keeps distinct names for distinct 1:1 conversations", async () => {
+    // The backend resolves `name` per viewer; the client must not collapse or
+    // reorder them.
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [
+          { id: "dm-1", type: "direct", name: "Juliane Lino" },
+          { id: "dm-2", type: "direct", name: "Caio Almeida" },
+        ],
+      }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms.map((dm) => [dm.id, dm.name])).toEqual([
+      ["dm-1", "Juliane Lino"],
+      ["dm-2", "Caio Almeida"],
+    ]);
+  });
+
+  it("keeps the conversation id untouched for navigation", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({
+        dms: [{ id: "9f1c0d2e-0000-4000-8000-000000000001", type: "direct", name: "Ana" }],
+      }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].id).toBe("9f1c0d2e-0000-4000-8000-000000000001");
+  });
+
+  it("passes the generic backend fallback through unchanged", async () => {
+    mockAuthFetch.mockResolvedValue(
+      sidebarResponse({ dms: [{ id: "dm-1", type: "direct", name: "Mensagem Direta" }] }),
+    );
+    const { dms } = await fetchSidebarData();
+    expect(dms[0].name).toBe("Mensagem Direta");
+  });
+
+  it("handles missing dm_conversations field with empty array fallback", async () => {
+    // Covers the `?? []` null-coalescing branch for dm_conversations.
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+        channels: [],
+        // dm_conversations intentionally omitted
+      },
+    });
+    const { dms } = await fetchSidebarData();
+    expect(dms).toEqual([]);
+  });
+});
+
+describe("partial sidebar compatibility", () => {
+  it("normalizes missing destination arrays to empty lists", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        current_user_id: "user-1",
+        workspace: { id: "ws-1", name: "NIC Labs", slug: "default" },
+      },
+    });
+
+    await expect(fetchChannels()).resolves.toEqual([]);
+    await expect(fetchDMs()).resolves.toEqual([]);
+    await expect(fetchSidebarData()).resolves.toEqual({
+      currentUserId: "user-1",
+      workspaceId: "ws-1",
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      channels: [],
+      dms: [],
+      categories: [],
+    });
+  });
+});
+
+describe("direct DM contracts", () => {
+  it("searches candidates with the authenticated endpoint and maps the response", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        candidates: [{ user_id: "user-2", display_name: "Joana Silva" }],
+      },
+    });
+    const controller = new AbortController();
+
+    await expect(searchDMCandidates("  Joana  ", controller.signal)).resolves.toEqual([
+      { userId: "user-2", displayName: "Joana Silva" },
+    ]);
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm-candidates?query=Joana&limit=20", {
+      method: "GET",
+      signal: controller.signal,
+    });
+  });
+
+  it("posts only the selected user ID and returns the canonical conversation", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { conversation_id: "dm-canonical", created: false },
+    });
+    const controller = new AbortController();
+
+    await expect(getOrCreateDirectDM("user-2", controller.signal)).resolves.toEqual({
+      conversationId: "dm-canonical",
+      created: false,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ other_user_id: "user-2" }),
+      signal: controller.signal,
+    });
+  });
+
+  it("creates a group with a trimmed title and never sends session-derived fields", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+    const controller = new AbortController();
+
+    await expect(createGroupDM(["user-2", "user-3"], "  Infra  ", controller.signal)).resolves.toBe(
+      "dm-group",
+    );
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dms/group", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ participant_user_ids: ["user-2", "user-3"], title: "Infra" }),
+      signal: controller.signal,
+    });
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    for (const forbidden of ["workspace_id", "caller_id", "actor_id", "created_by", "role"]) {
+      expect(init.body).not.toContain(forbidden);
+    }
+  });
+
+  it("omits the title entirely when it is blank so the server applies its own name", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+
+    for (const blank of ["", "   "]) {
+      mockAuthFetch.mockClear();
+      await createGroupDM(["user-2", "user-3"], blank);
+      const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+      expect(init.body).toBe(JSON.stringify({ participant_user_ids: ["user-2", "user-3"] }));
+    }
+  });
+
+  it("trims an emoji title without breaking a surrogate pair on the wire", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { conversation_id: "dm-group" } });
+    const emojiTitle = Array.from({ length: 120 }, () => "🙂").join("");
+
+    await createGroupDM(["user-2", "user-3"], `  ${emojiTitle}  `);
+
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    const sent = JSON.parse(init.body) as { title: string };
+    expect(sent.title).toBe(emojiTitle);
+    // The server measures runes: 120 code points must survive serialisation.
+    expect(Array.from(sent.title)).toHaveLength(120);
+  });
+});
+
+// ── Message API helpers ───────────────────────────────────────────────────────
+
+function msgRaw(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "msg-1",
+    sender_id: "user-abc",
+    kind: "user",
+    body_text: "Olá",
+    is_removed: false,
+    status: "active",
+    created_at: "2024-01-15T10:00:00Z",
+    updated_at: "2024-01-15T10:00:00Z",
+    ...overrides,
+  };
+}
+
+function msgListEnvelope(messages: object[] = [], nextCursor?: string) {
+  return { data: { messages, next_cursor: nextCursor } };
+}
+
+function msgEnvelope(msg: object) {
+  return { data: msg };
+}
+
+// ── fetchChannelMessages ──────────────────────────────────────────────────────
+
+describe("fetchChannelMessages", () => {
+  it("calls the correct URL for a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/geral/messages");
+  });
+
+  it("percent-encodes channel ID with special characters", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("equipe infra");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("appends before cursor as query param when provided", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral", "cursor==abc");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("?before=cursor%3D%3Dabc");
+  });
+
+  it("does not append before param when cursor is absent", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchChannelMessages("geral");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).not.toContain("?before=");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    const ctrl = new AbortController();
+    await fetchChannelMessages("geral", undefined, ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("maps snake_case response fields to camelCase Message", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages).toHaveLength(1);
+    expect(page.messages[0]).toMatchObject({
+      id: "msg-1",
+      senderId: "user-abc",
+      kind: "user",
+      bodyText: "Olá",
+      bodyFormat: "v1",
+      isRemoved: false,
+      status: "active",
+      createdAt: "2024-01-15T10:00:00Z",
+      updatedAt: "2024-01-15T10:00:00Z",
+    });
+  });
+
+  // Issue #495: the same auth.users JOIN that already resolves display name
+  // and email now also resolves an avatar, and it must reach the mapped
+  // Message under the same same-origin policy as every other avatarUrl.
+  it("maps a same-origin sender avatar URL", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "/media/avatars/user-abc.png" })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBe("/media/avatars/user-abc.png");
+  });
+
+  it("drops a sender avatar URL that is not a safe same-origin target", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "https://evil.test/tracker.png" })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
+  it("leaves senderAvatarUrl undefined when the field is absent (pre-#495 server)", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
+  it("maps the server-derived forwarding marker", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ is_forwarded: true })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isForwarded).toBe(true);
+  });
+
+  it.each([
+    ["false", false],
+    ["missing", undefined],
+    ["unexpected", "true"],
+  ])("normalizes %s is_forwarded to false", async (_case, isForwarded) => {
+    const legacyFields = _case === "missing" ? { body_text: undefined } : {};
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ is_forwarded: isForwarded, ...legacyFields })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isForwarded).toBe(false);
+    if (_case === "missing") expect(page.messages[0].bodyText).toBe("");
+  });
+
+  it("maps reaction aggregates with their named authors", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            {
+              emoji: "👍",
+              count: 2,
+              reacted_by_me: true,
+              users: [{ user_id: "u-1", display_name: "Álvaro Neto" }],
+            },
+          ],
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions).toEqual([
+      {
+        emoji: "👍",
+        count: 2,
+        reactedByMe: true,
+        users: [{ userId: "u-1", displayName: "Álvaro Neto" }],
+      },
+    ]);
+  });
+
+  // A pre-#496 server sends no authors at all, and a malformed entry must not
+  // reach a tooltip as an empty name.
+  it("tolerates missing or malformed reaction authors", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reactions: [
+            { emoji: "👍", count: 1, reacted_by_me: false },
+            {
+              emoji: "🎉",
+              count: 3,
+              reacted_by_me: false,
+              users: [
+                { user_id: "u-1", display_name: "" },
+                { user_id: 7, display_name: "Caio" },
+                "nope",
+                { user_id: "u-2", display_name: "Caio Almeida" },
+              ],
+            },
+          ],
+        }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reactions[0].users).toEqual([]);
+    expect(page.messages[0].reactions[1].users).toEqual([
+      { userId: "u-2", displayName: "Caio Almeida" },
+    ]);
+  });
+
+  it("maps inline quoted message previews", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent-1",
+            author_id: "user-parent",
+            body: "texto citado",
+            body_format: "v3",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].quoted).toEqual({
+      id: "parent-1",
+      authorId: "user-parent",
+      bodyText: "texto citado",
+      bodyFormat: "v3",
+      isRemoved: false,
+      deletedAt: null,
+      createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
+    });
+  });
+
+  it("maps removed quoted previews without body", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          quoted: {
+            id: "parent-1",
+            author_id: "user-parent",
+            body_format: "v2",
+            is_removed: true,
+            deleted_at: "2024-01-15T09:30:00Z",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].quoted).toMatchObject({
+      id: "parent-1",
+      bodyText: "",
+      bodyFormat: "v2",
+      isRemoved: true,
+      deletedAt: "2024-01-15T09:30:00Z",
+    });
+  });
+
+  it("maps authorized and unavailable cross-channel references", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          reference: {
+            available: true,
+            message_id: "source-1",
+            target_type: "channel",
+            target_id: "private-1",
+            target_label: "privado",
+            author_display_name: "Ana",
+            body: "<img src=x onerror=alert(1)>",
+            body_format: "v3",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({ id: "msg-2", reference: { available: false } }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0].reference).toEqual({
+      available: true,
+      messageId: "source-1",
+      targetType: "channel",
+      targetId: "private-1",
+      targetLabel: "privado",
+      authorDisplayName: "Ana",
+      bodyText: "<img src=x onerror=alert(1)>",
+      bodyFormat: "v3",
+      createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
+    });
+    expect(page.messages[1].reference).toEqual({ available: false });
+  });
+
+  it("fails closed when an available reference is missing navigation fields", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ reference: { available: true, body: "must not render" } })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].reference).toEqual({ available: false });
+  });
+
+  it("fails closed for each malformed navigation field and defaults optional preview text", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          id: "bad-type",
+          reference: {
+            available: true,
+            message_id: "source-1",
+            target_type: "workspace",
+            target_id: "target-1",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({
+          id: "missing-target",
+          reference: {
+            available: true,
+            message_id: "source-2",
+            target_type: "channel",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+        msgRaw({
+          id: "missing-created-at",
+          reference: {
+            available: true,
+            message_id: "source-3",
+            target_type: "dm",
+            target_id: "dm-1",
+          },
+        }),
+        msgRaw({
+          id: "minimal-valid",
+          reference: {
+            available: true,
+            message_id: "source-4",
+            target_type: "dm",
+            target_id: "dm-1",
+            created_at: "2024-01-15T09:00:00Z",
+          },
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages.slice(0, 3).map((message) => message.reference)).toEqual([
+      { available: false },
+      { available: false },
+      { available: false },
+    ]);
+    expect(page.messages[3].reference).toEqual({
+      available: true,
+      messageId: "source-4",
+      targetType: "dm",
+      targetId: "dm-1",
+      targetLabel: "",
+      authorDisplayName: "",
+      bodyText: "",
+      bodyFormat: "v1",
+      createdAt: "2024-01-15T09:00:00Z",
+      updatedAt: "2024-01-15T09:00:00Z",
+      linkSafetyState: "",
+    });
+  });
+
+  it("maps an explicit v2 body format", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v2" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].bodyFormat).toBe("v2");
+  });
+
+  it("maps an explicit v3 body format", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ body_format: "v3" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].bodyFormat).toBe("v3");
+  });
+
+  it("returns nextCursor from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()], "next-page-cursor"));
+    const page = await fetchChannelMessages("geral");
+    expect(page.nextCursor).toBe("next-page-cursor");
+  });
+
+  it("returns empty nextCursor when not in response", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.nextCursor).toBe("");
+  });
+
+  it("sets isRemoved true for removed message", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ is_removed: true, body_text: undefined })]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isRemoved).toBe(true);
+    expect(page.messages[0].bodyText).toBe("");
+  });
+
+  it("handles absent is_removed field as false", async () => {
+    // Covers `r.is_removed ?? false` null-coalescing branch when field is absent.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { is_removed: _, ...withoutRemoved } = msgRaw();
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([withoutRemoved]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].isRemoved).toBe(false);
+  });
+
+  it("maps status deleted correctly", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ status: "deleted" })]));
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages[0].status).toBe("deleted");
+    expect(page.messages[0].bodyText).toBe("");
+  });
+
+  it("fails closed when deleted_at is present despite an active status", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({
+          status: "active",
+          body_text: "não expor",
+          deleted_at: "2026-07-14T12:00:00Z",
+        }),
+      ]),
+    );
+
+    const page = await fetchChannelMessages("geral");
+
+    expect(page.messages[0]).toMatchObject({
+      bodyText: "",
+      status: "deleted",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+    });
+  });
+
+  it("handles absent messages field as empty array", async () => {
+    // Covers `res.data.messages ?? []` null-coalescing branch when field is absent.
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages).toEqual([]);
+    expect(page.nextCursor).toBe("");
+  });
+});
+
+describe("message editing", () => {
+  it("sends only the editable fields and maps the authoritative response", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          body_text: "Texto editado",
+          body_format: "v3",
+          edited_at: "2026-07-13T12:00:00Z",
+          edit_count: 2,
+          is_edited: true,
+        }),
+      ),
+    );
+
+    const message = await editMessage("msg/1", "Texto editado", 3);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body: "Texto editado", body_format: "v3" }),
+    });
+    expect(message).toMatchObject({
+      bodyText: "Texto editado",
+      bodyFormat: "v3",
+      isEdited: true,
+      editCount: 2,
+      editedAt: "2026-07-13T12:00:00Z",
+    });
+  });
+
+  it.each([
+    [403, "forbidden"],
+    [404, "not_found"],
+    [409, "window_expired"],
+    [429, "rate_limited"],
+  ] as const)("maps HTTP %s to a typed %s error", async (status, reason) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "request_failed", "failed"));
+
+    await expect(editMessage("msg-1", "body", 2)).rejects.toMatchObject({
+      status,
+      reason,
+      name: "MessageEditError",
+    } satisfies Partial<MessageEditError>);
+  });
+
+  it.each([
+    ["transport error", new Error("network unavailable")],
+    ["unmapped HTTP error", new ApiRequestError(500, "internal_error", "failed")],
+  ])("preserves an unexpected %s", async (_name, error) => {
+    mockAuthFetch.mockRejectedValue(error);
+
+    await expect(editMessage("msg-1", "body", 2)).rejects.toBe(error);
+  });
+
+  it("maps history, pagination and body formats", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        history: [
+          { body: "mais recente", body_format: "v3", versioned_at: "2026-07-13T12:00:00Z" },
+          { body: "anterior", body_format: "v2", versioned_at: "2026-07-13T11:00:00Z" },
+          { body: "legado", body_format: "v1", versioned_at: "2026-07-13T10:00:00Z" },
+        ],
+        offset: 2,
+      },
+    });
+
+    const page = await getMessageHistory("msg-1", { cursor: "2", limit: 3 });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/messages/msg-1/history?limit=3&offset=2",
+      {
+        method: "GET",
+      },
+    );
+    expect(page).toEqual({
+      entries: [
+        { body: "mais recente", bodyFormat: 3, versionedAt: "2026-07-13T12:00:00Z" },
+        { body: "anterior", bodyFormat: 2, versionedAt: "2026-07-13T11:00:00Z" },
+        { body: "legado", bodyFormat: 1, versionedAt: "2026-07-13T10:00:00Z" },
+      ],
+      nextCursor: "5",
+    });
+  });
+});
+
+describe("message deletion", () => {
+  it("DELETEs the encoded message path and maps a sanitized placeholder", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          body_text: "conteúdo que não deve reaparecer",
+          quoted: { id: "parent-1", body: "citação antiga" },
+          status: "deleted",
+          deleted_at: "2026-07-14T12:00:00Z",
+        }),
+      ),
+    );
+
+    const message = await deleteMessage("msg/1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1", {
+      method: "DELETE",
+    });
+    expect(message).toMatchObject({
+      id: "msg-1",
+      bodyText: "",
+      status: "deleted",
+      isRemoved: true,
+      deletedAt: "2026-07-14T12:00:00Z",
+    });
+    expect(message.quoted).toBeUndefined();
+  });
+
+  it("propagates a rejected deletion without changing its error details", async () => {
+    const error = new ApiRequestError(403, "forbidden", "request failed");
+    mockAuthFetch.mockRejectedValue(error);
+
+    await expect(deleteMessage("msg-1")).rejects.toBe(error);
+  });
+});
+
+// ── fetchDMMessages ───────────────────────────────────────────────────────────
+
+describe("fetchDMMessages", () => {
+  it("calls the correct URL for a DM conversation", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm-juliane");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm-juliane/messages");
+  });
+
+  it("percent-encodes DM ID with special characters", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm user/special");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm%20user%2Fspecial/messages");
+  });
+
+  it("appends before cursor when provided", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    await fetchDMMessages("dm-juliane", "abc123");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("?before=abc123");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope());
+    const ctrl = new AbortController();
+    await fetchDMMessages("dm-juliane", undefined, ctrl.signal);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("maps response fields correctly", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw({ kind: "system" })]));
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].kind).toBe("system");
+  });
+
+  it("handles absent messages field as empty array", async () => {
+    // Covers `res.data.messages ?? []` null-coalescing branch in fetchDMMessages.
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages).toEqual([]);
+    expect(page.nextCursor).toBe("");
+  });
+
+  // Issue #495: group DMs and 1:1 DMs both list through fetchDMMessages —
+  // there is no per-conversation-type mapping to duplicate this for, so one
+  // set of tests covers both, mirroring the fetchChannelMessages coverage
+  // above (mapMessage/safeAvatarUrl are shared, not reimplemented here).
+  it("maps a same-origin sender avatar URL", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "/media/avatars/user-abc.png" })]),
+    );
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBe("/media/avatars/user-abc.png");
+  });
+
+  it("leaves senderAvatarUrl undefined when the field is absent (pre-#495 server)", async () => {
+    mockAuthFetch.mockResolvedValue(msgListEnvelope([msgRaw()]));
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+
+  it("drops a sender avatar URL that is not a safe same-origin target", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([msgRaw({ sender_avatar_url: "https://evil.test/tracker.png" })]),
+    );
+    const page = await fetchDMMessages("dm-juliane");
+    expect(page.messages[0].senderAvatarUrl).toBeUndefined();
+  });
+});
+
+describe("fetchChannelMessage", () => {
+  it("fetches one channel message with the encoded message id", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ id: "msg/1" })));
+    const ctrl = new AbortController();
+
+    const msg = await fetchChannelMessage("geral", "msg/1", ctrl.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/channels/geral/messages/msg%2F1"),
+      expect.objectContaining({ method: "GET", signal: ctrl.signal }),
+    );
+    expect(msg.id).toBe("msg/1");
+  });
+});
+
+describe("fetchDMMessage", () => {
+  it("fetches one DM message with the encoded message id", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ id: "msg dm" })));
+    const ctrl = new AbortController();
+
+    const msg = await fetchDMMessage("dm-juliane", "msg dm", ctrl.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/dm/dm-juliane/messages/msg%20dm"),
+      expect.objectContaining({ method: "GET", signal: ctrl.signal }),
+    );
+    expect(msg.id).toBe("msg dm");
+  });
+});
+
+// ── postChannelMessage ────────────────────────────────────────────────────────
+
+// ── RF-32 attachments ─────────────────────────────────────────────────────────
+
+describe("message attachments", () => {
+  it("sends attachment_ids and omits the field when there is none", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "", { attachmentIds: ["att-1"] });
+    const [, withAttachment] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(withAttachment.body as string)).toEqual({
+      body_text: "",
+      body_format: "v3",
+      attachment_ids: ["att-1"],
+    });
+
+    mockAuthFetch.mockClear();
+    await postChannelMessage("geral", "texto", { attachmentIds: [] });
+    const [, withoutAttachment] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(withoutAttachment.body as string)).toEqual({
+      body_text: "texto",
+      body_format: "v3",
+    });
+  });
+
+  it("sends attachment_ids from a DM too", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-1", "", { attachmentIds: ["att-1"] });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "",
+      body_format: "v2",
+      attachment_ids: ["att-1"],
+    });
+  });
+
+  it("maps the attachment metadata a message carries", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          attachments: [
+            {
+              id: "att-1",
+              filename: "relatorio.pdf",
+              content_type: "application/pdf",
+              size: 2048,
+              status: "clean",
+              preview_status: "ready",
+            },
+          ],
+        }),
+      ),
+    );
+    const message = await postChannelMessage("geral", "veja");
+    expect(message.attachments).toEqual([
+      {
+        id: "att-1",
+        filename: "relatorio.pdf",
+        contentType: "application/pdf",
+        size: 2048,
+        status: "clean",
+        previewStatus: "available",
+        createdAt: "",
+      },
+    ]);
+  });
+
+  it("degrades an unknown status to the non-downloadable one", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          attachments: [{ id: "att-1", status: "totally_fine", preview_status: "whatever" }],
+        }),
+      ),
+    );
+    const message = await postChannelMessage("geral", "veja");
+    expect(message.attachments?.[0]).toMatchObject({
+      status: "pending_scan",
+      previewStatus: "blocked",
+    });
+  });
+
+  it("drops malformed entries and treats a non-array as absent", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(msgRaw({ attachments: [null, {}, { id: "" }, "att-1"] })),
+    );
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ attachments: { id: "att-1" } })));
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+  });
+
+  it("withholds attachments from a removed message", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(
+        msgRaw({
+          is_removed: true,
+          status: "deleted",
+          attachments: [{ id: "att-1", filename: "secreto.pdf" }],
+        }),
+      ),
+    );
+    expect((await postChannelMessage("geral", "veja")).attachments).toBeUndefined();
+  });
+});
+
+describe("postChannelMessage", () => {
+  it("calls the correct URL for a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/geral/messages");
+  });
+
+  it("percent-encodes channel ID", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("equipe infra", "Hello");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("uses POST method", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("sends body_text as format v3 in JSON payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello world");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ body_text: "Hello world", body_format: "v3" });
+  });
+
+  it("does not include author_id in payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("author_id");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postChannelMessage("geral", "Hello", { signal: ctrl.signal });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("sends parent_message_id when replying in a channel", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Hello world", { parentMessageId: "parent-1" });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({
+      body_text: "Hello world",
+      body_format: "v3",
+      parent_message_id: "parent-1",
+    });
+  });
+
+  it("sends referenced_message_id for RF-09", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "Veja", { referencedMessageId: "source-1" });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v3",
+      referenced_message_id: "source-1",
+    });
+  });
+
+  it("preserves reply and reference with an abort signal", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postChannelMessage("geral", "Veja", {
+      parentMessageId: "parent-1",
+      referencedMessageId: "source-1",
+      signal: ctrl.signal,
+    });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v3",
+      parent_message_id: "parent-1",
+      referenced_message_id: "source-1",
+    });
+    expect(options.signal).toBe(ctrl.signal);
+  });
+
+  it("returns mapped Message from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ body_text: "Hello" })));
+    const msg = await postChannelMessage("geral", "Hello");
+    expect(msg.bodyText).toBe("Hello");
+    expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+describe("forwardChannelMessage", () => {
+  it("posts only source_message_id to the encoded dedicated destination route", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgEnvelope(msgRaw({ body_text: "snapshot", body_format: "v3", is_forwarded: true })),
+    );
+    const controller = new AbortController();
+
+    const message = await forwardChannelMessage(
+      "canal privado",
+      "source-1",
+      "forward-action-1",
+      controller.signal,
+    );
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/canal%20privado/messages/forward",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": "forward-action-1",
+        },
+        body: JSON.stringify({ source_message_id: "source-1" }),
+        signal: controller.signal,
+      }),
+    );
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const payload = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("body_text");
+    expect(payload).not.toHaveProperty("forwarded_from_message_id");
+    expect(message).toMatchObject({ bodyText: "snapshot", bodyFormat: "v3", isForwarded: true });
+  });
+});
+
+describe("fetchMentionCandidates", () => {
+  it("scopes the query to the current channel and maps user candidates", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        users: [{ type: "user", id: "user-1", label: "Ana" }],
+        channels: [{ type: "channel", id: "channel-2", label: "anuncios" }],
+      },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/channels/channel-1/mentions?q=an"),
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+  });
+
+  it("drops channel candidates even when the backend still returns them — mentions are for people only", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        users: [{ type: "user", id: "user-1", label: "Ana" }],
+        channels: [{ type: "channel", id: "channel-2", label: "anuncios" }],
+      },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    // MentionCandidate no longer has a "channel" variant at all — this
+    // exhaustively proves nothing from res.data.channels leaked through.
+    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+  });
+
+  it("fails safe to an empty list when the response shape is malformed", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { users: [{ id: "user-1" }], channels: null } });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
+  });
+
+  it("fails safe to an empty list when a candidate has an out-of-enum type", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { users: [{ type: "admin", id: "user-1", label: "Ana" }], channels: [] },
+    });
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
+  });
+
+  it("fails safe to an empty list when a candidate is not an object", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { users: ["ana", null], channels: [] } });
+
+    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
+  });
+
+  it("fails safe to an empty list when the envelope itself is not an object", async () => {
+    mockAuthFetch.mockResolvedValue(null);
+
+    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
+  });
+
+  it("fails safe to an empty list when data is missing entirely", async () => {
+    mockAuthFetch.mockResolvedValue({});
+
+    const candidates = await fetchMentionCandidates("channel-1", "an");
+
+    expect(candidates).toEqual([]);
+  });
+});
+
+// ── postDMMessage ─────────────────────────────────────────────────────────────
+
+describe("postDMMessage", () => {
+  it("calls the correct URL for a DM conversation", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Oi!");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm-juliane/messages");
+  });
+
+  it("percent-encodes DM ID", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm user/1", "Oi!");
+    const [url] = mockAuthFetch.mock.calls[0] as [string];
+    expect(url).toContain("/dm/dm%20user%2F1/messages");
+  });
+
+  it("sends body_text as format v2 in JSON payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Mensagem direta");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({ body_text: "Mensagem direta", body_format: "v2" });
+  });
+
+  it("does not include author_id in payload", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Hi");
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("author_id");
+  });
+
+  it("passes abort signal to authenticatedFetch", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postDMMessage("dm-juliane", "Hi", { signal: ctrl.signal });
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ signal: ctrl.signal }),
+    );
+  });
+
+  it("sends parent_message_id when replying in a DM", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Mensagem direta", { parentMessageId: "parent-dm-1" });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string) as Record<string, unknown>;
+    expect(body).toEqual({
+      body_text: "Mensagem direta",
+      body_format: "v2",
+      parent_message_id: "parent-dm-1",
+    });
+  });
+
+  it("sends referenced_message_id when citing into a DM", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-juliane", "Veja", { referencedMessageId: "source-1" });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v2",
+      referenced_message_id: "source-1",
+    });
+  });
+
+  it("preserves reply and reference with an abort signal", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    const ctrl = new AbortController();
+    await postDMMessage("dm-juliane", "Veja", {
+      parentMessageId: "parent-1",
+      referencedMessageId: "source-1",
+      signal: ctrl.signal,
+    });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "Veja",
+      body_format: "v2",
+      parent_message_id: "parent-1",
+      referenced_message_id: "source-1",
+    });
+    expect(options.signal).toBe(ctrl.signal);
+  });
+
+  it("returns mapped Message from response", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw({ body_text: "Oi!" })));
+    const msg = await postDMMessage("dm-juliane", "Oi!");
+    expect(msg.bodyText).toBe("Oi!");
+    expect(msg.senderId).toBe("user-abc");
+  });
+});
+
+// ── messagesPath ──────────────────────────────────────────────────────────────
+
+describe("messagesPath", () => {
+  it("returns channel messages path", () => {
+    expect(messagesPath("channel", "geral")).toMatch(/\/channels\/geral\/messages$/);
+  });
+
+  it("returns DM messages path", () => {
+    expect(messagesPath("dm", "dm-juliane")).toMatch(/\/dm\/dm-juliane\/messages$/);
+  });
+
+  it("percent-encodes channel ID", () => {
+    expect(messagesPath("channel", "equipe infra")).toContain("/channels/equipe%20infra/messages");
+  });
+
+  it("percent-encodes DM ID", () => {
+    expect(messagesPath("dm", "dm user/1")).toContain("/dm/dm%20user%2F1/messages");
+  });
+
+  it("channel and dm produce distinct paths for the same ID", () => {
+    const ch = messagesPath("channel", "abc");
+    const dm = messagesPath("dm", "abc");
+    expect(ch).not.toBe(dm);
+    expect(ch).toContain("/channels/");
+    expect(dm).toContain("/dm/");
+  });
+});
+
+// ── Favorites (RF-06) ─────────────────────────────────────────────────────────
+
+describe("favoriteMessage / unfavoriteMessage", () => {
+  it("POSTs to the favorite path with the encoded message ID", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await favoriteMessage("msg/1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg%2F1/favorite", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+
+  it("DELETEs the favorite path", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await unfavoriteMessage("msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/messages/msg-1/favorite", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(favoriteMessage("msg-1")).rejects.toThrow("boom");
+    await expect(unfavoriteMessage("msg-1")).rejects.toThrow("boom");
+  });
+});
+
+describe("fetchFavorites", () => {
+  const favoriteResponse = {
+    data: {
+      favorites: [
+        {
+          message: {
+            id: "msg-1",
+            sender_id: "user-1",
+            sender_display_name: "Ana",
+            kind: "user",
+            body_text: "olá",
+            body_format: "v2",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            updated_at: "2025-01-15T10:00:00Z",
+            is_favorited: true,
+          },
+          channel_id: "ch-1",
+          favorited_at: "2025-02-01T12:00:00Z",
+        },
+        {
+          message: {
+            id: "msg-2",
+            sender_id: "user-2",
+            kind: "user",
+            is_removed: true,
+            status: "deleted",
+            created_at: "2025-01-10T10:00:00Z",
+            updated_at: "2025-01-10T10:00:00Z",
+          },
+          dm_conversation_id: "dm-1",
+          favorited_at: "2025-01-20T12:00:00Z",
+        },
+      ],
+      next_cursor: "cursor-abc",
+    },
+  };
+
+  it("maps favorites, source IDs, and next cursor", async () => {
+    mockAuthFetch.mockResolvedValue(favoriteResponse);
+    const page = await fetchFavorites();
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/favorites", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(page.nextCursor).toBe("cursor-abc");
+    expect(page.favorites).toHaveLength(2);
+    expect(page.favorites[0]).toMatchObject({
+      channelId: "ch-1",
+      dmConversationId: "",
+      favoritedAt: "2025-02-01T12:00:00Z",
+    });
+    expect(page.favorites[0].message).toMatchObject({ id: "msg-1", isFavorited: true });
+    expect(page.favorites[1]).toMatchObject({ channelId: "", dmConversationId: "dm-1" });
+    expect(page.favorites[1].message).toMatchObject({ isRemoved: true, status: "deleted" });
+  });
+
+  it("appends the before cursor as a query param", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { favorites: [] } });
+    const page = await fetchFavorites("cur|sor");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/favorites?before=cur%7Csor", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(page).toEqual({ favorites: [], nextCursor: "" });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(fetchFavorites()).rejects.toThrow("boom");
+  });
+});
+
+describe("pinMessage / unpinMessage (RF-05)", () => {
+  it("POSTs to the channel-scoped pin path with encoded IDs", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await pinMessage({ kind: "channel", id: "ch/1" }, "msg/1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%2F1/messages/msg%2F1/pin", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+
+  it("DELETEs the channel-scoped pin path", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await unpinMessage({ kind: "channel", id: "ch-1" }, "msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/messages/msg-1/pin", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("forbidden"));
+    await expect(pinMessage({ kind: "channel", id: "ch-1" }, "msg-1")).rejects.toThrow("forbidden");
+    await expect(unpinMessage({ kind: "channel", id: "ch-1" }, "msg-1")).rejects.toThrow(
+      "forbidden",
+    );
+  });
+
+  it("uses the DM pin path for DM targets", async () => {
+    mockAuthFetch.mockResolvedValue(undefined);
+    await pinMessage({ kind: "dm", id: "dm-1" }, "msg-1");
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/messages/msg-1/pin", {
+      method: "POST",
+      signal: undefined,
+    });
+  });
+});
+
+describe("fetchPins (RF-05)", () => {
+  const pinsResponse = {
+    data: {
+      pins: [
+        {
+          message: {
+            id: "msg-1",
+            sender_id: "user-1",
+            sender_display_name: "Ana",
+            kind: "user",
+            body_text: "importante",
+            body_format: "v3",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            updated_at: "2025-01-15T10:00:00Z",
+          },
+          pinned_by_user_id: "mod-1",
+          pinned_at: "2025-02-01T12:00:00Z",
+        },
+        {
+          message: {
+            id: "msg-2",
+            sender_id: "user-2",
+            kind: "user",
+            is_removed: true,
+            status: "deleted",
+            created_at: "2025-01-10T10:00:00Z",
+            updated_at: "2025-01-10T10:00:00Z",
+          },
+          pinned_by_user_id: "mod-1",
+          pinned_at: "2025-01-20T12:00:00Z",
+        },
+      ],
+    },
+  };
+
+  it("maps pins with pinnedBy and preserves deleted-message placeholder", async () => {
+    mockAuthFetch.mockResolvedValue(pinsResponse);
+    const pins = await fetchPins({ kind: "channel", id: "ch-1" });
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/pins", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(pins).toHaveLength(2);
+    expect(pins[0]).toMatchObject({ pinnedByUserId: "mod-1", pinnedAt: "2025-02-01T12:00:00Z" });
+    expect(pins[0].message).toMatchObject({ id: "msg-1", bodyText: "importante" });
+    expect(pins[1].message).toMatchObject({ isRemoved: true, status: "deleted" });
+  });
+
+  it("returns an empty list when the payload has no pins", async () => {
+    mockAuthFetch.mockResolvedValue({ data: {} });
+    await expect(fetchPins({ kind: "channel", id: "ch-1" })).resolves.toEqual([]);
+  });
+
+  it("uses the DM pins path for DM targets", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { pins: [] } });
+    await expect(fetchPins({ kind: "dm", id: "dm-1" })).resolves.toEqual([]);
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/pins", {
+      method: "GET",
+      signal: undefined,
+    });
+  });
+
+  it("propagates errors from authenticatedFetch", async () => {
+    mockAuthFetch.mockRejectedValue(new Error("boom"));
+    await expect(fetchPins({ kind: "channel", id: "ch-1" })).rejects.toThrow("boom");
+  });
+});
+
+describe("createChannel", () => {
+  it("sends only caller-owned fields, normalizing the slug the way the server does", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "ch-1", slug: "infra", display_name: "Infraestrutura", type: "private" },
+    });
+    const controller = new AbortController();
+
+    await expect(
+      createChannel(
+        { slug: "  INFRA  ", displayName: "  Infraestrutura  ", type: "private" },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ id: "ch-1", name: "Infraestrutura", type: "private", canWrite: true });
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: "infra", display_name: "Infraestrutura", type: "private" }),
+      signal: controller.signal,
+    });
+    const [, init] = mockAuthFetch.mock.calls[0] as [string, { body: string }];
+    for (const forbidden of ["workspace_id", "created_by", "caller_id", "is_general", "position"]) {
+      expect(init.body).not.toContain(forbidden);
+    }
+  });
+
+  it("propagates the API status so the caller can tell a denial from a failure", async () => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    await expect(
+      createChannel({ slug: "infra", displayName: "Infra", type: "public" }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("fetchSidebarData", () => {
+  const sidebarPayload = (extra: Record<string, unknown> = {}) => ({
+    data: {
+      current_user_id: "user-1",
+      workspace: { id: "ws-1", name: "NIC", slug: "nic" },
+      channels: [],
+      dm_conversations: [],
+      ...extra,
+    },
+  });
+
+  // The sidebar no longer advertises a create-channel capability (BUG #393):
+  // channel creation takes active membership, which a 200 here already implies,
+  // and POST /api/chat/channels decides on every call regardless. A leftover
+  // flag from an older server must not resurface as client-side state.
+  it("ignores a create-channel flag a server may still send", async () => {
+    for (const value of [true, false, "true", 1, {}, null]) {
+      mockAuthFetch.mockResolvedValue(sidebarPayload({ can_create_channel: value }));
+      const data = await fetchSidebarData();
+      expect(data).toEqual({
+        currentUserId: "user-1",
+        workspaceId: "ws-1",
+        maxUploadBytes: null,
+        maxFiles: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+        channels: [],
+        dms: [],
+        categories: [],
+      });
+    }
+  });
+
+  it("returns the caller identity and the two lists", async () => {
+    mockAuthFetch.mockResolvedValue(sidebarPayload());
+    await expect(fetchSidebarData()).resolves.toEqual({
+      currentUserId: "user-1",
+      workspaceId: "ws-1",
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+      channels: [],
+      dms: [],
+      categories: [],
+    });
+  });
+});
+
+describe("fetchChannelDetails", () => {
+  it("maps the payload and encodes the channel in the path", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch 1",
+        slug: "infra",
+        display_name: "Infraestrutura",
+        type: "private",
+        created_at: "2024-01-12T09:30:00Z",
+        member_count: 12,
+        online_member_count: 3,
+        online_members: [
+          {
+            user_id: "u-1",
+            display_name: "Álvaro",
+            avatar_url: "/media/a.png",
+            role: "moderator",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch 1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/details", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      id: "ch 1",
+      slug: "infra",
+      name: "Infraestrutura",
+      type: "private",
+      createdAt: "2024-01-12T09:30:00Z",
+      memberCount: 12,
+      onlineCount: 3,
+      onlineMembers: [
+        {
+          userId: "u-1",
+          displayName: "Álvaro",
+          avatarUrl: "/media/a.png",
+          role: "moderator",
+          presence: "online",
+        },
+      ],
+      // Absent from this payload, so it must be false: an add-members action is
+      // never enabled by a field the server did not send (issue #398).
+      canManageMembers: false,
+    });
+  });
+
+  it("keeps the server's totals independent of the preview length", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 40,
+        online_member_count: 9,
+        online_members: [{ user_id: "u-1", display_name: "Ana", presence: "online" }],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    // A capped preview must never become the channel's size, nor the number of
+    // people online.
+    expect(details.memberCount).toBe(40);
+    expect(details.onlineCount).toBe(9);
+    expect(details.onlineMembers).toHaveLength(1);
+  });
+
+  it("reports a channel with nobody online without zeroing the member total", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "ch-1", member_count: 31, online_member_count: 0, online_members: [] },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers).toEqual([]);
+    expect(details.onlineCount).toBe(0);
+    expect(details.memberCount).toBe(31);
+  });
+
+  it("drops a member the server did not state is online", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 5,
+        online_member_count: 1,
+        online_members: [
+          { user_id: "u-1", display_name: "Online", presence: "online" },
+          // An inconsistent payload: away and offline are not online, and a
+          // member with no stated presence is not vouched for at all.
+          { user_id: "u-2", display_name: "Ausente", presence: "away" },
+          { user_id: "u-3", display_name: "Offline", presence: "offline" },
+          { user_id: "u-4", display_name: "Sem presença" },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers.map((member) => member.userId)).toEqual(["u-1"]);
+  });
+
+  it("refuses to invent a presence the server did not send", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        member_count: 2,
+        online_members: [
+          { user_id: "u-1", display_name: "Sem presença" },
+          { user_id: "u-2", display_name: "Valor inesperado", presence: "busy" },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    // Neither is vouched for as online, so neither reaches an online list.
+    expect(details.onlineMembers).toEqual([]);
+  });
+
+  it("ignores a negative or non-numeric count instead of propagating it", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "ch-1", member_count: -3, online_member_count: "muitos", online_members: [] },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.memberCount).toBe(0);
+    expect(details.onlineCount).toBe(0);
+  });
+
+  it("drops malformed members and cross-origin avatars instead of rendering them", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "ch-1",
+        type: "public",
+        member_count: 1,
+        online_member_count: 2,
+        online_members: [
+          null,
+          { display_name: "sem id", presence: "online" },
+          { user_id: "", presence: "online" },
+          {
+            user_id: "u-1",
+            display_name: "Com avatar hostil",
+            avatar_url: "javascript:alert(1)",
+            presence: "online",
+          },
+          {
+            user_id: "u-2",
+            display_name: "Externo",
+            avatar_url: "https://evil.test/a.png",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchChannelDetails("ch-1");
+
+    expect(details.onlineMembers.map((member) => member.userId)).toEqual(["u-1", "u-2"]);
+    expect(details.onlineMembers[0].avatarUrl).toBeUndefined();
+    expect(details.onlineMembers[1].avatarUrl).toBeUndefined();
+    // An unknown role degrades to the least privileged one.
+    expect(details.onlineMembers[0].role).toBe("member");
+  });
+
+  it("defaults an unknown channel type to public rather than guessing private", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: "ch-1", type: "secret" } });
+
+    await expect(fetchChannelDetails("ch-1")).resolves.toMatchObject({ type: "public" });
+  });
+
+  it("propagates a refusal instead of rendering a partial channel", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "channel not found"));
+
+    await expect(fetchChannelDetails("ch-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+// ── Add members (issue #398) ─────────────────────────────────────────────────
+
+describe("addChannelMembers", () => {
+  it("posts only the user IDs and maps the server's counts", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: 2, already_members: 1, member_count: 14 },
+    });
+
+    const result = await addChannelMembers("ch 1", ["u-1", "u-2"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["u-1", "u-2"] }),
+      signal: undefined,
+    });
+    expect(result).toEqual({ added: 2, alreadyMembers: 1, memberCount: 14 });
+  });
+
+  // The payload must carry nothing else. A workspace, an actor or a role in the
+  // body would be rejected by the server's strict decoder, and sending one would
+  // mean the client believes it has authority it does not.
+  it("sends no field other than user_ids", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { added: 1, already_members: 0, member_count: 2 } });
+
+    await addChannelMembers("ch-1", ["u-1"]);
+
+    const body = JSON.parse(mockAuthFetch.mock.calls[0][1].body as string);
+    expect(Object.keys(body)).toEqual(["user_ids"]);
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { added: 0, already_members: 0, member_count: 1 } });
+    const controller = new AbortController();
+
+    await addChannelMembers("ch-1", ["u-1"], controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // A hostile or truncated payload must not produce NaN counters in the panel.
+  it("normalizes missing or invalid counts to zero", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: "2", already_members: null, member_count: -5 },
+    });
+
+    expect(await addChannelMembers("ch-1", ["u-1"])).toEqual({
+      added: 0,
+      alreadyMembers: 0,
+      memberCount: 0,
+    });
+  });
+
+  it.each([400, 401, 403, 404, 409, 413, 429, 500])(
+    "propagates HTTP %s to the caller",
+    async (status) => {
+      mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+      await expect(addChannelMembers("ch-1", ["u-1"])).rejects.toMatchObject({ status });
+    },
+  );
+
+  it("propagates an abort", async () => {
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    mockAuthFetch.mockRejectedValue(abort);
+
+    await expect(addChannelMembers("ch-1", ["u-1"])).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
+});
+
+describe("addGroupParticipants", () => {
+  it("posts to the DM route with the same payload shape", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { added: 1, already_members: 0, member_count: 6 },
+    });
+
+    const result = await addGroupParticipants("dm 1", ["u-9"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm%201/members", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["u-9"] }),
+      signal: undefined,
+    });
+    expect(result).toEqual({ added: 1, alreadyMembers: 0, memberCount: 6 });
+  });
+
+  it.each([403, 404, 409, 429])("propagates HTTP %s to the caller", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(addGroupParticipants("dm-1", ["u-1"])).rejects.toMatchObject({ status });
+  });
+});
+
+describe("fetchChannelDetails — can_manage_members", () => {
+  function detailsPayload(extra: Record<string, unknown>) {
+    return {
+      data: {
+        id: "ch-1",
+        slug: "infra",
+        display_name: "Infra",
+        type: "private",
+        created_at: "2024-01-12T09:30:00Z",
+        member_count: 3,
+        online_member_count: 0,
+        online_members: [],
+        ...extra,
+      },
+    };
+  }
+
+  it("accepts the permission only when the server sends exactly true", async () => {
+    mockAuthFetch.mockResolvedValue(detailsPayload({ can_manage_members: true }));
+
+    expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(true);
+  });
+
+  // Anything that is not literally true must read as "no permission": a truthy
+  // string or a missing field must never enable a control the server refuses.
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["null", null],
+    ["truthy string", "true"],
+    ["number one", 1],
+  ])("treats %s as no permission", async (_label, value) => {
+    const extra = value === undefined ? {} : { can_manage_members: value };
+    mockAuthFetch.mockResolvedValue(detailsPayload(extra));
+
+    expect((await fetchChannelDetails("ch-1")).canManageMembers).toBe(false);
+  });
+});
+
+describe("fetchGroupDetails (issue #441)", () => {
+  it("maps the payload from the DM resource, not the channel one", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv 1",
+        type: "group",
+        name: "Time de Infra",
+        created_at: "2024-03-04T15:00:00Z",
+        participant_count: 12,
+        participants: [
+          {
+            user_id: "u-1",
+            display_name: "Álvaro",
+            avatar_url: "/media/a.png",
+            presence: "online",
+          },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv 1");
+
+    // A group is a conversation: its details live under /dm/, never /channels/.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/details", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      id: "conv 1",
+      name: "Time de Infra",
+      createdAt: "2024-03-04T15:00:00Z",
+      participantCount: 12,
+      participants: [
+        {
+          userId: "u-1",
+          displayName: "Álvaro",
+          avatarUrl: "/media/a.png",
+          presence: "online",
+        },
+      ],
+      // Absent in this payload, so the add action stays hidden (issue #398).
+      canManageMembers: false,
+    });
+  });
+
+  it("keeps offline participants, unlike the channel's online-only list", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 3,
+        participants: [
+          { user_id: "u-1", display_name: "Conectada", presence: "online" },
+          { user_id: "u-2", display_name: "Desconectado", presence: "offline" },
+          { user_id: "u-3", display_name: "Sem presença" },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participants.map((participant) => participant.userId)).toEqual([
+      "u-1",
+      "u-2",
+      "u-3",
+    ]);
+    expect(details.participants[2].presence).toBeUndefined();
+  });
+
+  it("keeps the server's participant total independent of the preview", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 40,
+        participants: [{ user_id: "u-1", display_name: "Ana" }],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participantCount).toBe(40);
+    expect(details.participants).toHaveLength(1);
+  });
+
+  it("drops malformed participants and unsafe avatars", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: "conv-1",
+        participant_count: 2,
+        participants: [
+          null,
+          { display_name: "sem id" },
+          { user_id: "" },
+          { user_id: "u-1", display_name: "Hostil", avatar_url: "javascript:alert(1)" },
+          { user_id: "u-2", display_name: "Externo", avatar_url: "https://evil.test/a.png" },
+        ],
+      },
+    });
+
+    const details = await fetchGroupDetails("conv-1");
+
+    expect(details.participants.map((participant) => participant.userId)).toEqual(["u-1", "u-2"]);
+    expect(details.participants[0].avatarUrl).toBeUndefined();
+    expect(details.participants[1].avatarUrl).toBeUndefined();
+  });
+
+  it("ignores a negative or non-numeric total", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: -2, participants: [] },
+    });
+
+    await expect(fetchGroupDetails("conv-1")).resolves.toMatchObject({ participantCount: 0 });
+  });
+
+  it("propagates a refusal instead of rendering a partial group", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(fetchGroupDetails("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  // The add-participants permission (issue #398), normalized exactly like the
+  // channel's: only a literal true enables the action.
+  it("accepts can_manage_members only when the server sends exactly true", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: 1, participants: [], can_manage_members: true },
+    });
+
+    expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(true);
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["null", null],
+    ["truthy string", "true"],
+    ["number one", 1],
+  ])("treats can_manage_members %s as no permission", async (_label, value) => {
+    const extra = value === undefined ? {} : { can_manage_members: value };
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: "conv-1", participant_count: 1, participants: [], ...extra },
+    });
+
+    expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(false);
+  });
+});
+
+describe("fetchChannelCallParticipantProfiles (issue #612)", () => {
+  it("posts the requested user ids and maps the response", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        profiles: [{ user_id: "user-a", display_name: "Ana Souza", avatar_url: "/media/a.png" }],
+      },
+    });
+
+    const profiles = await fetchChannelCallParticipantProfiles("ch-1", ["user-a"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch-1/call-participants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["user-a"] }),
+      signal: undefined,
+    });
+    expect(profiles).toEqual([
+      { userId: "user-a", displayName: "Ana Souza", avatarUrl: "/media/a.png" },
+    ]);
+  });
+
+  it("omits avatarUrl when the server sends none", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { profiles: [{ user_id: "user-a", display_name: "Ana Souza" }] },
+    });
+
+    const [profile] = await fetchChannelCallParticipantProfiles("ch-1", ["user-a"]);
+
+    expect(profile!.avatarUrl).toBeUndefined();
+  });
+
+  it("omits an entry with no user_id rather than inventing one", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { profiles: [{ display_name: "Ana Souza" }] },
+    });
+
+    expect(await fetchChannelCallParticipantProfiles("ch-1", ["user-a"])).toEqual([]);
+  });
+
+  it("returns an empty list when the server sends no profiles field", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: {} });
+
+    expect(await fetchChannelCallParticipantProfiles("ch-1", ["user-a"])).toEqual([]);
+  });
+});
+
+describe("fetchGroupCallParticipantProfiles (issue #612)", () => {
+  it("posts to the dm call-participants route", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { profiles: [] } });
+
+    await fetchGroupCallParticipantProfiles("conv-1", ["user-a"]);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv-1/call-participants", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: ["user-a"] }),
+      signal: undefined,
+    });
+  });
+});
+
+describe("fetchDirectProfile (issue #443)", () => {
+  it("asks the profile endpoint of the conversation and never names a user", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv 1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          avatar_url: "/media/juliane.png",
+          email: "juliane@nic.test",
+          presence: "online",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv 1");
+
+    // Only the conversation is in the URL: who the profile belongs to is the
+    // server's decision, so there is no user ID to tamper with.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/profile", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(details).toEqual({
+      kind: "direct",
+      conversationId: "conv 1",
+      profile: {
+        userId: "u-other",
+        displayName: "Juliane Lino",
+        avatarUrl: "/media/juliane.png",
+        email: "juliane@nic.test",
+        presence: "online",
+        jobTitle: undefined,
+        department: undefined,
+        timezone: undefined,
+      },
+    });
+  });
+
+  it("reads the professional fields when the server sends them", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          job_title: "Infraestrutura & Suporte",
+          department: "TI",
+          timezone: "America/Sao_Paulo",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.profile).toMatchObject({
+      jobTitle: "Infraestrutura & Suporte",
+      department: "TI",
+      timezone: "America/Sao_Paulo",
+    });
+  });
+
+  it("leaves absent and blank fields undefined rather than empty strings", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: {
+          user_id: "u-other",
+          display_name: "Juliane Lino",
+          email: "   ",
+          job_title: "",
+          presence: "unknown-state",
+        },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.profile.email).toBeUndefined();
+    expect(details.profile.jobTitle).toBeUndefined();
+    // A presence value outside the domain is not "offline": the UI must not
+    // assert a state the server did not send.
+    expect(details.profile.presence).toBeUndefined();
+  });
+
+  it("drops an unsafe or cross-origin avatar", async () => {
+    for (const avatarUrl of ["javascript:alert(1)", "https://evil.test/a.png", "/\\evil.test"]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: "conv-1",
+          profile: { user_id: "u-other", display_name: "Juliane", avatar_url: avatarUrl },
+        },
+      });
+
+      const details = await fetchDirectProfile("conv-1");
+      expect(details.profile.avatarUrl).toBeUndefined();
+    }
+  });
+
+  it("rejects a payload without an identity instead of returning a blank profile", async () => {
+    for (const profile of [
+      undefined,
+      null,
+      {},
+      { user_id: "u-other" },
+      { display_name: "Sem id" },
+      { user_id: "", display_name: "Juliane" },
+      { user_id: "u-other", display_name: "   " },
+    ]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: { kind: "direct", conversation_id: "conv-1", profile },
+      });
+
+      // The panel's contract is that a rendered profile is a real person; a card
+      // of "Não informado" rows must never stand in for a broken response.
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it('rejects every kind that is not exactly "direct"', async () => {
+    for (const kind of [undefined, null, "", "group", "channel", "Direct", "broadcast", 1, {}]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind,
+          conversation_id: "conv-1",
+          profile: { user_id: "u-other", display_name: "Juliane" },
+        },
+      });
+
+      // The tag is the only thing separating a profile from a conversation
+      // projection. Substituting "direct" for a missing or wrong one would let a
+      // group payload be rendered as a person.
+      const error = await fetchDirectProfile("conv-1").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ApiRequestError);
+      expect((error as ApiRequestError).code).toBe(ERR_INVALID_RESPONSE);
+    }
+  });
+
+  it("rejects a missing, empty or non-string conversation_id", async () => {
+    for (const conversationId of [undefined, null, "", "   ".trim(), 42, {}]) {
+      mockAuthFetch.mockResolvedValueOnce({
+        data: {
+          kind: "direct",
+          conversation_id: conversationId,
+          profile: { user_id: "u-other", display_name: "Juliane" },
+        },
+      });
+
+      // Never substituted with the requested ID: doing so would make a response
+      // that identifies no conversation indistinguishable from a correct one.
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it("rejects a profile answered for a different conversation", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-B",
+        profile: {
+          user_id: "u-bruno",
+          display_name: "Bruno",
+          email: "bruno@nic.test",
+        },
+      },
+    });
+
+    // A misrouted response — A's request answered with B's profile. Echoing the
+    // requested ID back would hide exactly this.
+    const error = await fetchDirectProfile("conv-A").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect((error as ApiRequestError).code).toBe(ERR_INVALID_RESPONSE);
+    // Nothing about B may travel in the error either.
+    expect((error as Error).message).not.toContain("conv-B");
+    expect((error as Error).message).not.toContain("bruno@nic.test");
+  });
+
+  it("rejects an envelope whose data is not an object", async () => {
+    for (const data of [undefined, null, "direct", 7, []]) {
+      mockAuthFetch.mockResolvedValueOnce({ data });
+
+      await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+    }
+  });
+
+  it("returns an already-discriminated variant, so no caller has to tag it", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: { user_id: "u-other", display_name: "Juliane" },
+      },
+    });
+
+    const details = await fetchDirectProfile("conv-1");
+
+    expect(details.kind).toBe("direct");
+    // The value the server sent, which was checked against the request — not the
+    // argument echoed back.
+    expect(details.conversationId).toBe("conv-1");
+  });
+
+  it("propagates a refusal instead of rendering a partial profile", async () => {
+    // A group, a conversation in another workspace and one the caller is not in
+    // all arrive as the same 404.
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(fetchDirectProfile("conv-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+
+  it("forwards the abort signal so a conversation switch cancels the request", async () => {
+    const controller = new AbortController();
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        kind: "direct",
+        conversation_id: "conv-1",
+        profile: { user_id: "u-other", display_name: "Juliane" },
+      },
+    });
+
+    await fetchDirectProfile("conv-1", controller.signal);
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv-1/profile", {
+      method: "GET",
+      signal: controller.signal,
+    });
+  });
+});
+
+// ── Contextual candidate search (issue #398) ────────────────────────────────
+
+describe("searchChannelMemberCandidates", () => {
+  it("queries the channel-scoped route and maps the minimal payload", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { candidates: [{ user_id: "u-1", display_name: "Ana" }] },
+    });
+
+    const result = await searchChannelMemberCandidates("ch 1", "  an  ");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/ch%201/member-candidates?query=an&limit=20",
+      { method: "GET", signal: undefined },
+    );
+    expect(result).toEqual([{ userId: "u-1", displayName: "Ana" }]);
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { candidates: [] } });
+    const controller = new AbortController();
+
+    await searchChannelMemberCandidates("ch-1", "an", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // The workspace is never sent: it is derived from the session server-side.
+  it("sends no workspace or actor", async () => {
+    mockAuthFetch.mockResolvedValue({ data: { candidates: [] } });
+
+    await searchChannelMemberCandidates("ch-1", "an");
+
+    const url = mockAuthFetch.mock.calls[0][0] as string;
+    expect(url).not.toContain("workspace");
+    expect(url).not.toContain("actor");
+    expect(mockAuthFetch.mock.calls[0][1].body).toBeUndefined();
+  });
+
+  it.each([400, 401, 403, 404, 429, 500])("propagates HTTP %s", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(searchChannelMemberCandidates("ch-1", "an")).rejects.toMatchObject({ status });
+  });
+});
+
+describe("searchGroupParticipantCandidates", () => {
+  it("queries the group-scoped route", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { candidates: [{ user_id: "u-9", display_name: "Bruno" }] },
+    });
+
+    const result = await searchGroupParticipantCandidates("dm 1", "br");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/dm/dm%201/member-candidates?query=br&limit=20",
+      { method: "GET", signal: undefined },
+    );
+    expect(result).toEqual([{ userId: "u-9", displayName: "Bruno" }]);
+  });
+
+  it.each([403, 404, 429])("propagates HTTP %s", async (status) => {
+    mockAuthFetch.mockRejectedValue(new ApiRequestError(status, "err", "failed"));
+
+    await expect(searchGroupParticipantCandidates("dm-1", "br")).rejects.toMatchObject({ status });
+  });
+});
+
+describe("fetchSidebarData attachment limits", () => {
+  it("returns all published workspace limits from the canonical sidebar request", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: {
+          id: "ws-1",
+          name: "NIC Labs",
+          slug: "default",
+          max_upload_bytes: 104857600,
+          max_message_attachments: 10,
+          max_message_attachment_bytes: 536870912,
+        },
+        channels: [],
+        dm_conversations: [],
+      },
+    });
+
+    const result = await fetchSidebarData();
+    expect(result).toMatchObject({
+      maxUploadBytes: 104857600,
+      maxFiles: 10,
+      maxBytes: 536870912,
+    });
+    expect(mockAuthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses conservative rollout defaults for missing or invalid limits", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: {
+        workspace: {
+          id: "ws-1",
+          name: "NIC Labs",
+          slug: "default",
+          max_upload_bytes: 0,
+          max_message_attachments: 11,
+          max_message_attachment_bytes: -1,
+        },
+        channels: [],
+        dm_conversations: [],
+      },
+    });
+    await expect(fetchSidebarData()).resolves.toMatchObject({
+      maxUploadBytes: null,
+      maxFiles: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    });
+  });
+});

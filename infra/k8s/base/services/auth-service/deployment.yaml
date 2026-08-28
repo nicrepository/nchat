@@ -1,0 +1,159 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: auth
+    app.kubernetes.io/version: "0.0.0"
+  annotations:
+    nchat.nicrepository.io/image-placeholder: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: auth
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: auth
+        app.kubernetes.io/version: "0.0.0"
+      annotations:
+        nchat.nicrepository.io/image-placeholder: "true"
+    spec:
+      serviceAccountName: nchat-auth-service
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: auth-service
+          image: ghcr.io/nicrepository/nchat/auth-service:0.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+            - secretRef:
+                name: nchat-secrets
+                optional: true
+          env:
+            - name: PORT
+              value: "8081"
+            - name: SERVICE_NAME
+              value: auth-service
+            - name: AUTH_AVATAR_DIR
+              value: /var/lib/nchat/avatars
+            - name: AUTH_AVATAR_BASE_URL
+              value: /api/auth/avatars
+            - name: OIDC_ISSUER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_ISSUER_URL
+                  optional: true
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_CLIENT_ID
+                  optional: true
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_CLIENT_SECRET
+                  optional: true
+            - name: OIDC_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_REDIRECT_URL
+                  optional: true
+            # Provider callback URI for the administrative console host
+            # (issue #578). It sits beside OIDC_REDIRECT_URL rather than in the
+            # ConfigMap for one reason: the two must be registered together on
+            # the same identity-provider client, and an operator who sets one
+            # and forgets the other is the failure this co-location prevents.
+            # Optional and absent means the console simply has no single
+            # sign-on; it never falls back to the chat host's URI.
+            - name: OIDC_ADMIN_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_ADMIN_REDIRECT_URL
+                  optional: true
+            - name: OIDC_FRONTEND_CALLBACK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: OIDC_FRONTEND_CALLBACK_URL
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: avatars
+              mountPath: /var/lib/nchat/avatars
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Durable avatar storage. readOnlyRootFilesystem stays true; only this
+        # mounted volume is writable, and fsGroup 65532 makes it writable by the
+        # non-root runtime user.
+        - name: avatars
+          persistentVolumeClaim:
+            claimName: auth-service-avatars

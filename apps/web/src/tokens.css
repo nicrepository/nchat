@@ -1,0 +1,115 @@
+/* NIC Chat production design tokens. Prototype-inspired, tuned for corporate auth UI. */
+
+/* ── Self-hosted fonts ──────────────────────────────────────────────────────── */
+/* Inter: SIL Open Font License 1.1 — https://rsms.me/inter/
+   Subsets: latin-ext (U+0100-02BA …) and latin (U+0000-00FF …).
+   Variable font: single woff2 covers weight 100–900. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/inter-latin-ext.woff2") format("woff2");
+  unicode-range:
+    U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F,
+    U+A720-A7FF;
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/inter-latin.woff2") format("woff2");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* Material Symbols Outlined: Apache License 2.0
+   Self-hosted — eliminates external CDN dependency (CSP: font-src 'self').
+   Full variable font; ligature-based icon lookup. */
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/material-symbols-outlined.woff2") format("woff2");
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-feature-settings: "liga";
+  -webkit-font-smoothing: antialiased;
+}
+
+:root {
+  /* Brand */
+  --color-primary: #0e7490;
+  --color-primary-strong: #155e75;
+  --color-primary-soft: #67e8f9;
+  --color-primary-tint: #ecfeff;
+  --color-accent: #6d28d9;
+
+  /* Surfaces */
+  --color-bg: #f6fafb;
+  --color-surface: #ffffff;
+  --color-surface-2: #f8fbfc;
+  --color-border: #dbe7eb;
+  --color-border-strong: #b8cdd5;
+
+  /* Text */
+  --color-ink: #102a33;
+  --color-ink-2: #264653;
+  --color-muted: #5c7380;
+  --color-muted-2: #8aa0aa;
+
+  /* Semantic */
+  --color-danger: #dc2626;
+  --color-danger-tint: #fee2e2;
+  --color-danger-ink: #991b1b;
+  --color-success: #16a34a;
+  --color-success-tint: #dcfce7;
+  --color-success-ink: #166534;
+
+  /* Presence (RF-58).
+     One definition for every surface that draws a presence dot, so the sidebar,
+     the details panel, the conversation header and the message list cannot
+     drift apart. The away colour is red by product decision, not by the usual
+     market convention of amber — do not "fix" it to amber.
+     Colour is never the only carrier: every indicator is accompanied by the
+     word Online / Ausente / Offline. */
+  --presence-online: var(--color-success);
+  --presence-away: var(--color-danger);
+  --presence-offline: var(--color-muted-2);
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 8px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(16, 42, 51, 0.05);
+  --shadow-md: 0 6px 18px rgba(16, 42, 51, 0.08);
+  --shadow-lg: 0 18px 48px rgba(16, 42, 51, 0.12);
+
+  /* Overlay stacking order (chat composer popovers) */
+  --z-overlay-emoji: 200;
+  --z-overlay-mention: 300;
+
+  /* Typography */
+  --font-sans:
+    "Inter", "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}

@@ -1,0 +1,11 @@
+go admin-service admin-service
+go auth-service auth-service
+go chat-service chat-service
+go document-converter document-converter
+go file-service file-service
+go media-service media-service
+go notification-service notification-service
+go search-service search-service
+migration migrations -
+web admin-web nchat-admin-web
+web web nchat-web

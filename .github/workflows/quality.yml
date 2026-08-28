@@ -1,0 +1,148 @@
+name: Quality
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    # `pnpm test:coverage` includes the Go coverage gate, which merges in the
+    # RF-21 Link Safety profile when a database is offered. Ephemeral and local
+    # to this job; the *_test name is what the suites insist on.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nchat
+          POSTGRES_PASSWORD: REPLACE_ME
+          POSTGRES_DB: nchat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nchat -d nchat_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      # Read only by scripts/ci/go-coverage-check.sh, so `pnpm test` and the race
+      # step keep skipping every opt-in PostgreSQL suite.
+      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # O SonarQube usa o historico completo para atribuir autoria e datas
+          # (analise SCM); um clone raso deixa toda a base como codigo novo.
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.13"
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install golangci-lint
+        run: bash scripts/ci/install-golangci-lint.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Check dev environment config
+        run: pnpm dev:env:config-check
+
+      - name: Check local gateway config
+        run: pnpm gateway:config-check
+
+      - name: Check web security headers
+        run: pnpm web:security-headers-check
+
+      - name: Check TLS config
+        run: pnpm tls:config-check
+
+      - name: Check Sealed Secrets policy
+        run: pnpm sealed-secrets:policy-check
+
+      - name: Check Kubernetes manifests
+        run: pnpm k8s:ci
+
+      - name: Check health contract
+        run: pnpm health:contract-check
+
+      - name: Check migrations
+        run: pnpm migrations:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck web
+        run: pnpm typecheck:web
+
+      - name: Test
+        run: pnpm test
+
+      - name: Run Go race tests
+        run: bash scripts/ci/go-test.sh -race
+
+      # The RF-21 suites read the schema the real migrations produce, across both
+      # the chat and files domains, so the official runner applies them.
+      - name: Apply migrations to the coverage database
+        run: bash scripts/db/migrate.sh up
+        env:
+          MIGRATIONS_DATABASE_URL: ${{ env.LINK_SAFETY_TEST_DATABASE_URL }}
+
+      - name: Test coverage
+        run: pnpm test:coverage
+
+      - name: Build
+        run: pnpm build
+
+      # O SonarQube Community Build analisa uma unica branch principal e nao faz
+      # analise de pull request, entao so `develop` (a branch de integracao) e
+      # enviada. Todos os demais gates continuam rodando normalmente nos PRs.
+      - name: SonarQube scan
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300

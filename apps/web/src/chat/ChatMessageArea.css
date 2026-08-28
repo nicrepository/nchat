@@ -1,0 +1,3006 @@
+/*
+ * ChatMessageArea — message area for channel and DM views.
+ * Scoped under .chat-msg-area to avoid conflicts.
+ * Follows the NIC Chat design system: purple accent, light content area.
+ */
+
+/* ── Layout ──────────────────────────────────────────────────────────────────── */
+
+/*
+ * The message area is a grid of two columns: the conversation and the optional
+ * details panel (issue #435). The conversation keeps its own flex column inside
+ * __conversation, so the header, the pinned bar, the list and the composer are
+ * laid out exactly as before and none of them is remounted when the panel is
+ * added or removed — the panel is a *trailing sibling*, and React reconciles the
+ * preceding subtree untouched.
+ */
+.chat-msg-area {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "conversation";
+  height: 100%;
+  min-height: 0;
+  background: var(--color-bg, #f7f5fb);
+  overflow: hidden;
+}
+
+.chat-msg-area--with-details {
+  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-areas: "conversation details";
+}
+
+.chat-msg-area__conversation {
+  grid-area: conversation;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+ * Below the wide-desktop threshold documented in ChatShell.css, two columns
+ * would leave the conversation unusable, so the panel covers it instead of
+ * narrowing it. The conversation keeps its full width underneath — nothing is
+ * unmounted, the scroll position and the composer are intact — and closing the
+ * panel reveals it again. Nothing overflows the viewport, so the page never
+ * scrolls horizontally.
+ *
+ * The two share the grid cell rather than the panel being taken out of flow, and
+ * `visibility` is what keeps the covered conversation out of the tab order and
+ * the accessibility tree for exactly as long as it is covered — the same
+ * mechanism the shell uses, so overlay mode never needs a focus trap that would
+ * have to be kept in step with the width.
+ */
+@media (max-width: 1279.98px) {
+  .chat-msg-area--with-details {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "conversation";
+  }
+
+  .chat-msg-area--with-details .chat-msg-area__conversation {
+    visibility: hidden;
+  }
+
+  .chat-msg-area--with-details .chat-details {
+    grid-area: conversation;
+    visibility: visible;
+    z-index: 5;
+    border-left: 0;
+    box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.06));
+  }
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────────── */
+
+/*
+ * The header never scrolls and never clips (issue #467): a long conversation
+ * name truncates, and the actions wrap to a second line rather than being
+ * pushed out of reach — which is what a 200% zoom does to a one-line header.
+ * min-height rather than height, so the wrapped state has somewhere to go.
+ */
+.chat-msg-area__header {
+  flex-shrink: 0;
+  min-height: 60px;
+  background: var(--color-surface, #fff);
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 8px clamp(12px, 2vw, 24px);
+  gap: 12px;
+  row-gap: 6px;
+}
+
+.chat-msg-area__header-icon {
+  color: var(--color-muted-2, #a39cb3);
+  font-weight: 400;
+  font-size: 22px;
+  flex-shrink: 0;
+}
+
+/* The one element that gives way: it shrinks and ellipsises so the icon, the
+   presence pill and every action keep their room. */
+.chat-msg-area__header-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+/* The DM header's presence word (RF-58). A pill beside the name, sized so it
+   reads as metadata rather than as a second title. It is only rendered for a
+   state the server has stated, so it never occupies space with a placeholder. */
+.chat-msg-area__header-presence {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-muted, #5c7380);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chat-msg-area__header-presence--online {
+  background: var(--color-success-tint, #dcfce7);
+  color: var(--color-success-ink, #166534);
+}
+
+.chat-msg-area__header-presence--away {
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+}
+
+/* Pushes the header actions to the trailing edge without a wrapper element. */
+.chat-msg-area__header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+/* RF-24/#622 round 2: the channel/group-DM resource call indicator + join
+   action. No participant count is ever shown here, by design. */
+.chat-msg-area__call-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.chat-msg-area__call-actions button {
+  /* Touch-sized wherever there is no pointer to be precise with. */
+  min-height: 34px;
+}
+
+.chat-msg-area__call-status {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-msg-area__call-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.chat-msg-area__header-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-msg-area__header-btn:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+/* The open state is carried visually as well as through aria-expanded, so the
+   control reads as a toggle for sighted and assistive users alike. */
+.chat-msg-area__header-btn[aria-expanded="true"] {
+  background: var(--color-primary-tint-strong, #e6d7f7);
+  color: var(--color-primary-strong, #5b21b6);
+}
+
+.chat-msg-area__header-btn .material-symbols-outlined {
+  font-size: 20px;
+}
+
+/* DM avatar in header */
+.chat-msg-area__header-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  /* Anchors the presence dot (RF-58). The picture is rounded by its own rule
+     rather than by clipping this box, because clipping here would cut the dot
+     off at the circle's edge along with it. */
+  position: relative;
+}
+
+/* Deterministic fallback colours, mirroring the sidebar palette so the same
+   person reads the same colour on both surfaces. The JS colour is chosen by
+   avatarColorFor(); these classes only carry the gradient. */
+.chat-msg-area__header-avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.chat-msg-area__header-avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.chat-msg-area__header-avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.chat-msg-area__header-avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.chat-msg-area__header-avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.chat-msg-area__header-avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
+
+.chat-msg-area__header-avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ── Message list ────────────────────────────────────────────────────────────── */
+
+.chat-msg-area__list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px clamp(12px, 2vw, 24px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  /* Smooth scroll when new messages arrive */
+  scroll-behavior: smooth;
+}
+
+/* ── Day divider ─────────────────────────────────────────────────────────────── */
+
+.chat-msg-area__day-divider {
+  align-self: center;
+  background: var(--color-surface, #fff);
+  color: var(--color-muted, #7c7390);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 9999px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  margin: 12px 0 8px;
+  letter-spacing: 0.02em;
+}
+
+/* ── Message row ─────────────────────────────────────────────────────────────── */
+
+.chat-msg-area__msg {
+  position: relative;
+  display: flex;
+  gap: 10px;
+  padding: 2px 0;
+  min-width: 0;
+  /* A readable measure on a wide column, the column itself on a narrow one — a
+     bubble is never the reason the page scrolls sideways. */
+  max-width: min(560px, 100%);
+}
+
+.chat-msg-area__msg--mine {
+  flex-direction: row-reverse;
+  align-self: flex-end;
+}
+
+.chat-msg-area__msg-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  align-self: flex-end;
+  /* Anchors the presence dot (RF-58); the avatar's own box is unchanged. */
+  position: relative;
+}
+
+.chat-msg-area__msg-avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
+.chat-msg-area__msg-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-msg-area__msg--mine .chat-msg-area__msg-body {
+  align-items: flex-end;
+}
+
+.chat-msg-area__msg-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+
+.chat-msg-area__msg--mine .chat-msg-area__msg-meta {
+  flex-direction: row-reverse;
+}
+
+.chat-msg-area__msg-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+}
+
+.chat-msg-area__msg-time {
+  font-size: 10.5px;
+  color: var(--color-muted-2, #a39cb3);
+}
+
+.chat-msg-area__msg-bubble {
+  box-sizing: border-box;
+  max-width: 100%;
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 12px;
+  border-top-left-radius: 4px;
+  padding: 9px 13px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--color-ink, #16121f);
+  white-space: pre-wrap; /* preserves spaces/newlines; <pre> inside overrides with white-space:pre */
+  word-break: break-word;
+}
+
+.chat-msg-area__msg--mine .chat-msg-area__msg-bubble {
+  background: var(--color-primary-tint, #f3ebfb);
+  border-color: var(--color-primary-tint-strong, #e6d7f7);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 4px;
+}
+
+.chat-msg-area__msg-bubble--removed {
+  background: var(--color-surface-2, #faf8fd);
+  border-style: dashed;
+  color: var(--color-muted, #7c7390);
+  font-style: italic;
+  font-size: 13px;
+}
+
+.chat-msg-area__quote {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-left: 3px solid var(--color-primary-soft, #a865f7);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+  text-align: left;
+}
+
+.chat-msg-area__forwarded {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.chat-msg-area__forwarded .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* RF-21: a message the backend accepted and is withholding while its links are
+   scanned. Only its own sender ever sees one, so this is a status note and not
+   a warning about content — it reads as "in progress", like the forwarded
+   marker above it, rather than as an error. */
+.chat-msg-area__pending-scan {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.chat-msg-area__pending-scan .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* Dimmed while it is withheld, so "sent" and "waiting" are not the same shape. */
+.chat-msg-area__msg-bubble--pending-scan {
+  opacity: 0.72;
+}
+
+/*
+ * RF-21 link-safety notices (issue #135).
+ *
+ * Two states, two deliberately different weights. The "could not verify" notice
+ * is informational and reuses the muted palette the pending-scan line already
+ * uses, because it is not an allegation about the link — the provider simply
+ * declined to produce a verdict. The blocked notice is the only one that reads as
+ * a warning, and it is the only one that withholds content.
+ */
+.chat-msg-area__link-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+
+.chat-msg-area__link-notice .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.chat-msg-area__link-notice-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Discreet by design: a text button, not a call to action. Pressing it asks the
+   server to re-read a verdict it may already have — it never starts a scan, and
+   nothing about its prominence should suggest otherwise. */
+.chat-msg-area__link-notice-action {
+  flex: 0 0 auto;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--color-primary, #6b3fa0);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.chat-msg-area__link-notice-action:disabled {
+  color: var(--color-muted, #7c7390);
+  text-decoration: none;
+  cursor: default;
+}
+
+.chat-msg-area__link-notice-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6b3fa0);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.chat-msg-area__link-blocked {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: var(--color-danger, #b3261e);
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
+.chat-msg-area__link-blocked .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* The same treatment the removed-message placeholder gets: this is a tombstone
+   for content, not content. */
+.chat-msg-area__link-blocked-body {
+  color: var(--color-muted, #7c7390);
+  font-style: italic;
+}
+
+/*
+ * Autolinked URLs in a message body (issue #135).
+ *
+ * Underlined and coloured so a link is distinguishable from text without relying
+ * on colour alone — the underline is what carries the affordance for a reader who
+ * cannot tell the two hues apart. `overflow-wrap` keeps a long URL from widening
+ * the bubble past the column.
+ */
+.rtr-link {
+  color: var(--color-primary, #6b3fa0);
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+.rtr-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+.rtr-link:focus-visible {
+  outline: 2px solid var(--color-primary, #6b3fa0);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.chat-msg-area__quote--clickable {
+  cursor: pointer;
+}
+
+.chat-msg-area__quote--clickable:hover,
+.chat-msg-area__quote--clickable:focus-visible {
+  border-color: var(--color-primary-tint-strong, #e6d7f7);
+  background: var(--color-primary-tint, #f3ebfb);
+  outline: none;
+}
+
+.chat-msg-area__quote--disabled {
+  cursor: default;
+}
+
+.chat-msg-area__quote-author {
+  margin-bottom: 2px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-primary-strong, #5b21b6);
+}
+
+.chat-msg-area__quote-excerpt {
+  max-height: 42px;
+  overflow: hidden;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--color-muted, #7c7390);
+  white-space: normal;
+}
+
+.chat-msg-area__quote-excerpt .rtr-code-block {
+  max-height: 38px;
+  overflow: hidden;
+  margin: 0;
+}
+
+.chat-msg-area__reference {
+  display: grid;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-left: 3px solid var(--color-primary, #6d28d9);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  text-align: left;
+}
+
+.chat-msg-area__reference--clickable {
+  position: relative;
+  cursor: pointer;
+}
+
+.chat-msg-area__reference--clickable:hover {
+  border-color: var(--color-primary-tint-strong, #e6d7f7);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+.chat-msg-area__reference--clickable:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__reference--unavailable {
+  color: var(--color-muted, #7c7390);
+  font-size: 12.5px;
+  font-style: italic;
+}
+
+.chat-msg-area__reference-origin {
+  color: var(--color-primary-strong, #5b21b6);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chat-msg-area__reference-author {
+  margin-top: 2px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chat-msg-area__reference-body {
+  max-height: 42px;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--color-muted, #7c7390);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.chat-msg-area__msg--highlight .chat-msg-area__msg-bubble {
+  animation: chat-quote-highlight 1.2s ease-out;
+}
+
+@keyframes chat-quote-highlight {
+  0% {
+    box-shadow: 0 0 0 3px var(--color-primary-tint-strong, #e6d7f7);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+
+.chat-reference-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.chat-reference-dialog {
+  width: min(460px, 100%);
+  max-height: min(560px, calc(100vh - 32px));
+  overflow: auto;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 16px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+}
+
+.chat-reference-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 24px 16px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-reference-dialog h2,
+.chat-reference-dialog p {
+  margin: 0;
+}
+
+.chat-reference-dialog h2 {
+  font-size: 19px;
+}
+
+.chat-reference-dialog header p,
+.chat-reference-dialog__empty {
+  margin-top: 5px;
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+}
+
+.chat-forward-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 410;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.chat-forward-dialog {
+  width: min(460px, 100%);
+  max-height: min(600px, calc(100vh - 32px));
+  overflow: auto;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 16px;
+  background: var(--color-surface, #fff);
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+}
+
+.chat-forward-dialog header,
+.chat-forward-dialog footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-forward-dialog header {
+  align-items: flex-start;
+}
+
+.chat-forward-dialog footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  border-bottom: 0;
+}
+
+.chat-forward-dialog h2,
+.chat-forward-dialog p {
+  margin: 0;
+}
+
+.chat-forward-dialog h2 {
+  font-size: 19px;
+}
+
+.chat-forward-dialog header p {
+  margin-top: 4px;
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+}
+
+.chat-forward-dialog header > button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-forward-dialog__content {
+  padding: 18px 22px;
+}
+
+.chat-forward-dialog__content > label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chat-forward-dialog__content > input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 10px;
+  color: var(--color-ink, #16121f);
+  font: inherit;
+}
+
+.chat-forward-dialog ul {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-forward-dialog li button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-forward-dialog li button:hover,
+.chat-forward-dialog li button:focus-visible,
+.chat-forward-dialog__selected {
+  border-color: var(--color-primary-tint-strong, #e6d7f7) !important;
+  background: var(--color-primary-tint, #f3ebfb) !important;
+  color: var(--color-primary-strong, #5b21b6) !important;
+  outline: none;
+}
+
+.chat-forward-dialog__empty,
+.chat-forward-dialog__error {
+  margin-top: 14px !important;
+  font-size: 13px;
+}
+
+.chat-forward-dialog__empty {
+  color: var(--color-muted, #7c7390);
+  text-align: center;
+}
+
+.chat-forward-dialog__error {
+  color: var(--color-danger, #b42318);
+}
+
+.chat-forward-dialog footer button {
+  padding: 9px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 9px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.chat-forward-dialog__cancel {
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-forward-dialog__confirm {
+  border-color: var(--color-primary, #6d28d9) !important;
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+}
+
+.chat-forward-dialog footer button:disabled,
+.chat-forward-dialog li button:disabled,
+.chat-forward-dialog input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.chat-reference-dialog header > button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-reference-dialog ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 10px 14px 16px;
+  list-style: none;
+}
+
+.chat-reference-dialog li button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-reference-dialog button:hover,
+.chat-reference-dialog button:focus-visible {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  outline: none;
+}
+
+.chat-reference-dialog__empty {
+  padding: 28px 24px;
+  text-align: center;
+}
+
+.chat-msg-area__reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+
+/* Positioned so the badge's accessible description — visually hidden, 1×1 and
+   clipped — is anchored to the badge rather than to a distant ancestor. The
+   visible tooltip is not here: it is portalled, so that nothing drawn against a
+   badge can widen the conversation. */
+.chat-msg-area__reaction-slot {
+  position: relative;
+  display: inline-flex;
+}
+
+/* The picker inside .chat-emoji-surface styles its own buttons; this is the
+   reaction badge under a message and nothing else. */
+.chat-msg-area__reaction {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--color-ink-2);
+  transition:
+    transform 140ms ease-out,
+    background-color 140ms ease-out,
+    border-color 140ms ease-out;
+}
+
+/* Scale only: the badge grows within its own box and never nudges the badge
+   beside it, so hovering a reaction cannot reflow the row. */
+.chat-msg-area__reaction:hover,
+.chat-msg-area__reaction:focus-visible {
+  border-color: var(--color-primary-tint-strong);
+  background: var(--color-primary-tint);
+  transform: scale(1.08);
+}
+
+/* Active state is a filled background *and* a heavier outline, never colour
+   alone. */
+.chat-msg-area__reaction--mine {
+  border-color: var(--color-primary-strong);
+  border-width: 2px;
+  padding: 1px 7px;
+  background: var(--color-primary-tint);
+  color: var(--color-primary-strong);
+}
+
+/* Replayed by React remounting this span whenever the count changes — a
+   reaction landing, from anyone — and by nothing else. */
+.chat-msg-area__reaction-emoji {
+  display: inline-block;
+  animation: chat-reaction-pop 200ms ease-out;
+}
+
+/* A badge that has just appeared grows into place; one that is leaving shrinks
+   and fades, and is unmounted by its own animationend rather than by a timer. */
+.chat-msg-area__reaction-slot {
+  animation: chat-reaction-enter 180ms ease-out;
+}
+
+.chat-msg-area__reaction-slot--exiting {
+  animation: chat-reaction-exit 180ms ease-in forwards;
+  pointer-events: none;
+}
+
+@keyframes chat-reaction-pop {
+  0% {
+    transform: scale(1);
+  }
+  55% {
+    transform: scale(1.2);
+  }
+  80% {
+    transform: scale(0.96);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes chat-reaction-enter {
+  from {
+    transform: scale(0.82);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes chat-reaction-exit {
+  from {
+    transform: scale(1);
+    opacity: 1;
+  }
+  to {
+    transform: scale(0.84);
+    opacity: 0;
+  }
+}
+
+@keyframes chat-reaction-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+/*
+ * Who reacted, floating above the badge.
+ *
+ * Fixed, and portalled out of the conversation, because a tooltip must not be
+ * able to make the conversation scroll.
+ *
+ * It used to be absolutely positioned inside the badge and centred on it. An
+ * absolutely positioned box still counts towards the scrollable overflow of its
+ * scroll container, and the message list is one — `overflow-y: auto` makes the
+ * computed `overflow-x` `auto` as well — so half a tooltip hanging past a
+ * right-aligned own message was enough to give the whole conversation a
+ * horizontal scrollbar. Fixed and portalled, its containing block is the
+ * viewport: it cannot grow anything.
+ *
+ * Placement is the emoji picker's, so it is clamped inside the viewport by the
+ * same rules and stays whole against either edge instead of being centred off
+ * the side of the screen.
+ */
+.chat-msg-area__reaction-authors {
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
+  max-width: 220px;
+  width: max-content;
+  padding: 4px 8px;
+  border-radius: var(--radius-md);
+  background: var(--color-ink);
+  color: var(--color-surface);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+  pointer-events: none;
+  animation: chat-reaction-tooltip-in 120ms ease-out;
+}
+
+@keyframes chat-reaction-tooltip-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.chat-msg-area__reaction:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.chat-msg-area__reaction-menu {
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.chat-msg-area__reaction-menu button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.chat-msg-area__reaction-menu button:hover,
+.chat-msg-area__reaction-menu button:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+.chat-msg-area__reaction-menu .material-symbols-outlined {
+  font-size: 17px;
+}
+
+.chat-msg-area__favorite--active .material-symbols-outlined {
+  color: var(--color-warning, #f5a623);
+  font-variation-settings: "FILL" 1;
+}
+
+.chat-msg-area__pin--active .material-symbols-outlined {
+  color: var(--color-accent, #4a7dff);
+  font-variation-settings: "FILL" 1;
+}
+
+/* ── Mensagens fixadas / pins (RF-05) ───────────────────────────────────── */
+
+.chat-msg-area__pins {
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  background: var(--color-surface-muted, #f7f8fa);
+}
+
+/* One row: the pin icon, the current pinned message, and an unpin action. */
+.chat-msg-area__pins-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.chat-msg-area__pins-item > .material-symbols-outlined {
+  flex: none;
+  font-size: 18px;
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__pins-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--color-text, #111827);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-msg-area__pins-sender {
+  font-weight: 600;
+}
+
+.chat-msg-area__pins-item button {
+  flex: none;
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary, #6b7280);
+  cursor: pointer;
+}
+
+.chat-msg-area__pins-item button .material-symbols-outlined {
+  font-size: 18px;
+}
+
+/* ── Meus favoritos (RF-06) ─────────────────────────────────────────────── */
+
+.chat-favorites {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+
+.chat-favorites__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.chat-favorites__sub {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chat-favorites__item {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+}
+
+.chat-favorites__item-meta {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.chat-favorites__sender {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.chat-favorites__time {
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.chat-favorites__link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
+  color: var(--color-primary, #2563eb);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.chat-favorites__link-btn:hover {
+  text-decoration: underline;
+}
+
+.chat-favorites__status {
+  font-size: 13px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.chat-favorites__load-more {
+  align-self: center;
+  padding: 6px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/*
+ * The floating shell every emoji surface is drawn in: the "Mais reações"
+ * picker over a message, and the composer's picker. Both are portalled and
+ * placed by useAnchoredPicker, so both are `fixed` and want the same frame.
+ */
+.chat-emoji-surface {
+  position: fixed;
+  z-index: var(--z-overlay-emoji);
+  padding: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+}
+
+/* ── Emoji picker (issue #496) ───────────────────────────────────────────────── */
+
+/*
+ * Proportions validated in Figma against NChat's own tokens: 336px wide, an
+ * eight-column grid of 38px cells with a 22px glyph, and a single row of ten
+ * category glyphs. A nine-column grid at 34px was tried and read as cramped.
+ */
+.chat-emoji-picker {
+  display: flex;
+  flex-direction: column;
+  width: min(21rem, calc(100vw - 24px));
+  max-height: min(24rem, calc(100vh - 96px));
+  animation: chat-emoji-picker-in 150ms ease-out;
+}
+
+.chat-emoji-picker__search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-2);
+  transition: border-color 140ms ease-out;
+}
+
+.chat-emoji-picker__search:focus-within {
+  border-color: var(--color-primary);
+}
+
+.chat-emoji-picker__search-icon {
+  font-size: 17px;
+  color: var(--color-muted);
+}
+
+.chat-emoji-picker__search input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: var(--color-ink);
+  font-size: 13px;
+}
+
+.chat-emoji-picker__search input:focus {
+  outline: none;
+}
+
+/* Ten glyphs, one row, no scrollbar: the bar fits every width the picker is
+   offered, which is what the text pills it replaced could not do. */
+.chat-emoji-picker__tabs {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 0;
+  margin: 6px 0 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.chat-emoji-picker__tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  height: 30px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: transparent;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease-out,
+    transform 140ms ease-out;
+}
+
+.chat-emoji-picker__tab:hover,
+.chat-emoji-picker__tab:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+/* The active category is marked by a filled ground *and* an underline, so it
+   survives a colour-blind reader and a high-contrast theme. */
+.chat-emoji-picker__tab[aria-selected="true"] {
+  background: var(--color-primary-tint);
+  border-bottom-color: var(--color-primary-strong);
+}
+
+.chat-emoji-picker__sections {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-top: 6px;
+}
+
+.chat-emoji-picker__section-title {
+  margin: 6px 0 2px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-muted);
+}
+
+/* Eight columns, matching gridColumns in EmojiPicker.tsx: the arrow keys move
+   by exactly one row. */
+.chat-emoji-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 0;
+}
+
+/*
+ * A grid item's automatic minimum size is its content, so a wide emoji glyph —
+ * and how wide one is depends on the reader's own font — pushes its column past
+ * the 1fr it was given, and eight of them push the last column off the picker.
+ * On a 390px viewport that clipped the eighth emoji of every row. `1fr` only
+ * caps a column once its item is allowed to be narrower than its content.
+ */
+.chat-emoji-picker__grid > .chat-emoji-picker__emoji {
+  /*
+   * The column decides the cell, not the glyph.
+   *
+   * A grid item's automatic minimum size is its content, and how wide an emoji
+   * glyph is depends on the reader's own font; sizing the cell by `aspect-ratio`
+   * alone let a taller line box make it wider than the 1fr column it sits in,
+   * and on a 390px viewport the eighth emoji of every row was clipped. Taking
+   * the width from the column and the height from the width instead keeps the
+   * cell square at whatever width eight columns work out to.
+   */
+  min-width: 0;
+  width: 100%;
+  aspect-ratio: 1;
+}
+
+.chat-emoji-tone__option {
+  width: 38px;
+  aspect-ratio: 1;
+}
+
+.chat-emoji-picker__emoji,
+.chat-emoji-tone__option {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  /* The UA gives a button 6px of side padding, which on a mobile viewport made
+     the cell wider than the column it sits in. The glyph is centred by flex, so
+     there is nothing for the padding to do. */
+  padding: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 140ms ease-out,
+    background-color 140ms ease-out;
+}
+
+.chat-emoji-picker__emoji:hover,
+.chat-emoji-picker__emoji:focus-visible,
+.chat-emoji-tone__option:hover,
+.chat-emoji-tone__option:focus-visible {
+  background: var(--color-primary-tint);
+  transform: scale(1.12);
+}
+
+/* The pop on a deliberate choice. Applied by the parent for one animation
+   frame, so it plays when an emoji is picked and never on a re-render. */
+.chat-emoji-picker__emoji:active {
+  animation: chat-emoji-pop 200ms ease-out;
+}
+
+.chat-emoji-picker__status {
+  margin: 10px 4px;
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
+
+.chat-emoji-picker__retry {
+  margin-top: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 140ms ease-out;
+}
+
+.chat-emoji-picker__retry:hover,
+.chat-emoji-picker__retry:focus-visible {
+  background: var(--color-primary-tint);
+}
+
+/* ── Contextual skin-tone palette (issue #496) ───────────────────────────────── */
+
+.chat-emoji-tone {
+  position: fixed;
+  z-index: var(--z-overlay-mention);
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-md);
+  animation: chat-emoji-tone-in 130ms ease-out;
+}
+
+.chat-emoji-tone__option {
+  min-height: 34px;
+  font-size: 20px;
+}
+
+/* The tone in use is marked with a ring rather than only a tint, so "current"
+   is legible without colour. */
+.chat-emoji-tone__option[aria-current="true"] {
+  background: var(--color-primary-tint);
+  outline: 2px solid var(--color-primary-strong);
+  outline-offset: -2px;
+}
+
+@keyframes chat-emoji-picker-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes chat-emoji-tone-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes chat-emoji-pop {
+  0% {
+    transform: scale(1);
+  }
+  55% {
+    transform: scale(1.22);
+  }
+  80% {
+    transform: scale(0.97);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+/* A coarse pointer has no hover to aim with, so the target grows instead. */
+@media (pointer: coarse) {
+  .chat-emoji-picker__emoji,
+  .chat-emoji-tone__option {
+    min-height: 44px;
+  }
+
+  .chat-emoji-picker__tab {
+    height: 38px;
+  }
+}
+
+/* Movement is decoration here: every state it expresses is also expressed by
+   colour, weight, outline and the accessible name, so removing it costs a
+   reader nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__reaction,
+  .chat-emoji-picker__emoji,
+  .chat-emoji-picker__retry,
+  .chat-emoji-picker__search,
+  .chat-emoji-picker__tab,
+  .chat-emoji-tone__option {
+    transition-duration: 1ms;
+  }
+
+  .chat-msg-area__reaction:hover,
+  .chat-msg-area__reaction:focus-visible,
+  .chat-emoji-picker__emoji:hover,
+  .chat-emoji-picker__emoji:focus-visible,
+  .chat-emoji-tone__option:hover,
+  .chat-emoji-tone__option:focus-visible {
+    transform: none;
+  }
+
+  /* Movement goes; the states these animations expressed are still expressed by
+     colour, weight, outline and the accessible name. The exit keeps only its
+     fade, because the badge still has to finish leaving before it is unmounted
+     — animationend is what removes it. */
+  .chat-msg-area__reaction-emoji,
+  .chat-msg-area__reaction-authors,
+  .chat-emoji-picker__emoji:active,
+  .chat-emoji-picker,
+  .chat-emoji-tone {
+    animation: none;
+  }
+
+  .chat-msg-area__reaction-slot--exiting {
+    animation: chat-reaction-fade-out 1ms linear forwards;
+  }
+}
+
+/* ── Message grouping (same sender, same minute) ─────────────────────────────── */
+
+/* ponytail: opacity-0 ghost keeps column alignment for grouped avatar slots */
+.chat-msg-area__msg--grouped {
+  margin-top: -8px;
+}
+
+.chat-msg-area__msg--grouped .chat-msg-area__msg-avatar {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chat-msg-area__empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  text-align: center;
+}
+
+.chat-msg-area__empty-icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+}
+
+.chat-msg-area__empty-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+  margin: 0 0 6px;
+}
+
+.chat-msg-area__empty-sub {
+  font-size: 13.5px;
+  color: var(--color-muted, #7c7390);
+  margin: 0;
+  max-width: 300px;
+  line-height: 1.55;
+}
+
+/* ── Loading skeleton ────────────────────────────────────────────────────────── */
+
+.chat-msg-area__loading {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+  overflow: hidden;
+}
+
+.chat-msg-area__skel-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.chat-msg-area__skel-row--right {
+  flex-direction: row-reverse;
+}
+
+.chat-msg-area__skel-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--color-border, #e8e3f0);
+  flex-shrink: 0;
+  animation: chat-skel-pulse 1.5s ease-in-out infinite;
+}
+
+.chat-msg-area__skel-bubble {
+  height: 38px;
+  border-radius: 12px;
+  background: var(--color-border, #e8e3f0);
+  animation: chat-skel-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes chat-skel-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* ── Error state ─────────────────────────────────────────────────────────────── */
+
+.chat-msg-area__error {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  text-align: center;
+  gap: 12px;
+}
+
+.chat-msg-area__error-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger, #dc2626);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-msg-area__error-msg {
+  font-size: 14px;
+  color: var(--color-ink-2, #3d3550);
+  margin: 0;
+}
+
+.chat-msg-area__retry-btn {
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: 10px;
+  color: var(--color-ink, #16121f);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 20px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.chat-msg-area__retry-btn:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+/* ── Send error banner ───────────────────────────────────────────────────────── */
+
+.chat-msg-area__send-error,
+.chat-msg-area__reaction-error {
+  margin: 0 24px 8px;
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Realtime status banner ─────────────────────────────────────────────────── */
+
+.chat-msg-area__realtime-error {
+  margin: 0 24px 8px;
+  background: var(--color-warning-tint, #fff7ed);
+  color: var(--color-warning-ink, #9a3412);
+  border: 1px solid #fed7aa;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Typing indicator ─────────────────────────────────────────────────────── */
+
+.chat-msg-area__typing-indicator {
+  align-self: flex-start;
+  margin: 0 24px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-text-muted, #6b6580);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.chat-msg-area__typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.chat-msg-area__typing-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-primary, #6d28d9);
+  opacity: 0.4;
+  animation: chat-typing-bounce 1.2s ease-in-out infinite;
+}
+
+.chat-msg-area__typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.chat-msg-area__typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes chat-typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__typing-dots span {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
+/* ── Load-more indicator (infinite scroll) ───────────────────────────────────── */
+
+.chat-msg-area__load-more {
+  align-self: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--color-border, #e8e3f0);
+  border-top-color: var(--color-primary, #6d28d9);
+  animation: chat-load-more-spin 0.7s linear infinite;
+  margin: 8px 0;
+  flex-shrink: 0;
+}
+
+@keyframes chat-load-more-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.chat-msg-area__composer {
+  flex-shrink: 0;
+  /* The bottom inset keeps the send row clear of a phone's home indicator; it
+     resolves to 0 everywhere else, so the desktop spacing is unchanged. */
+  padding: 12px clamp(12px, 2vw, 24px) calc(20px + env(safe-area-inset-bottom));
+  background: var(--color-bg, #f7f5fb);
+}
+
+.chat-msg-area__composer-box {
+  background: var(--color-surface, #fff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 14px;
+  overflow: visible;
+  transition:
+    border-color 0.12s,
+    box-shadow 0.12s;
+}
+
+.chat-msg-area__composer-box:focus-within {
+  border-color: var(--color-primary, #6d28d9);
+  box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.1);
+}
+
+.chat-msg-area__composer-box--disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* RF-32 (issue #458): the composer is the attachment drop zone. */
+.chat-msg-area__composer-box--drag {
+  border-color: var(--color-primary, #6d28d9);
+  border-style: dashed;
+}
+
+.chat-msg-area__composer-upload {
+  margin: 0 10px 10px;
+  padding: 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  font-size: 13px;
+  color: var(--color-text-muted, #6b6580);
+}
+
+.chat-msg-area__composer-upload-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-msg-area__composer-upload-header > .material-symbols-outlined {
+  font-size: 17px;
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-upload-header strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.chat-msg-area__composer-upload-total {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-msg-area__composer-upload-notice {
+  display: block;
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  line-height: 1.35;
+}
+
+.chat-msg-area__composer-upload-list {
+  display: grid;
+  gap: 6px;
+}
+
+.chat-msg-area__composer-upload-item {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 8px;
+  background: var(--color-surface, #fff);
+}
+
+.chat-msg-area__composer-upload-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-upload-icon .material-symbols-outlined {
+  font-size: 19px;
+}
+
+.chat-msg-area__composer-upload-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.chat-msg-area__composer-upload-name {
+  overflow: hidden;
+  color: var(--color-ink, #16121f);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-msg-area__composer-upload-state {
+  grid-column: 1;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.chat-msg-area__composer-upload-state--success {
+  color: var(--color-success-strong, #166534);
+}
+
+.chat-msg-area__composer-upload-state--failed {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+.chat-msg-area__composer-upload-size {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  color: var(--color-text-muted, #6b6580);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chat-msg-area__composer-upload-retry {
+  justify-self: start;
+  margin-top: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-primary, #6d28d9);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-msg-area__composer-upload-retry:hover,
+.chat-msg-area__composer-upload-retry:focus-visible {
+  text-decoration: underline;
+  outline: none;
+}
+
+.chat-msg-area__composer-progress {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 6px;
+  margin-top: 4px;
+  accent-color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-progress--total {
+  display: block;
+  margin-top: 8px;
+}
+
+.chat-msg-area__composer-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 9px 10px 0;
+  padding: 8px 9px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-left: 3px solid var(--color-primary-soft, #a865f7);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-msg-area__composer-quote-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-msg-area__composer-quote-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-msg-area__composer-quote-close:hover,
+.chat-msg-area__composer-quote-close:focus-visible {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+  outline: none;
+}
+
+.chat-msg-area__composer-quote-close .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-msg-area__composer-input {
+  display: block;
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13.5px;
+  font-family: inherit;
+  color: var(--color-ink, #16121f);
+  min-height: 20px;
+  max-height: 200px;
+  line-height: 1.5;
+  box-sizing: border-box;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+/* Remove browser-default paragraph margins inside TipTap editor */
+.chat-msg-area__composer-input p {
+  margin: 0;
+}
+
+/* ── TipTap editor wrapper (relative-positioned for placeholder) ── */
+
+.chat-msg-area__composer-editor-wrap {
+  position: relative;
+}
+
+.chat-msg-area__composer-placeholder {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  color: var(--color-muted-2, #a39cb3);
+  pointer-events: none;
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  max-width: calc(100% - 32px);
+}
+
+/* Toolbar, attachment control and send share one row and wrap onto a second
+   before they would ever overlap — the composer loses no action to a narrow
+   viewport or to a high zoom level, it only stacks. */
+.chat-msg-area__composer-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  row-gap: 6px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-msg-area__send-btn {
+  margin-left: auto; /* push to the right of the toolbar */
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+  border: none;
+  width: 34px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    opacity 0.12s;
+  flex-shrink: 0;
+}
+
+.chat-msg-area__send-btn:hover:not(:disabled) {
+  background: var(--color-primary-strong, #5b21b6);
+}
+
+.chat-msg-area__send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Rich text renderer (RichTextRenderer.tsx) ───────────────────────────────── */
+
+.chat-msg-area__msg-bubble .rtr-inline-code {
+  background: var(--color-surface-2, #faf8fd);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 0.875em;
+}
+
+.chat-msg-area__msg-bubble .rtr-code-block {
+  background: var(--color-surface-2, #faf8fd);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  padding: 10px 12px;
+  margin: 4px 0 0;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
+
+.chat-msg-area__msg-bubble .rtr-code-block code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.chat-msg-area__msg-bubble .rtr-list {
+  margin: 4px 0 0;
+  padding-left: 20px;
+}
+
+.chat-msg-area__msg-bubble .rtr-list li {
+  line-height: 1.55;
+}
+
+.chat-msg-area__msg-bubble .rtr-list + .rtr-list {
+  margin-top: 4px;
+}
+
+.rtr-mention,
+.chat-mention {
+  color: var(--color-primary, #0e7490);
+  background: var(--color-primary-tint, #ecfeff);
+  border-radius: 4px;
+  padding: 1px 3px;
+  font-weight: 600;
+}
+
+.mention-popup {
+  position: fixed;
+  z-index: var(--z-overlay-mention, 300);
+}
+
+.mention-list,
+.mention-list__empty {
+  min-width: 220px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.12));
+}
+
+.mention-list__empty {
+  color: var(--color-muted, #7c7390);
+  font-size: 13px;
+}
+
+.mention-list__item {
+  display: flex;
+  width: 100%;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-ink, #16121f);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mention-list__item--active,
+.mention-list__item:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.mention-list__sigil {
+  color: var(--color-primary, #0e7490);
+  font-weight: 700;
+}
+
+/* ── ComposerToolbar ─────────────────────────────────────────────────────────── */
+
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.composer-toolbar__wrap {
+  position: relative;
+}
+
+.composer-toolbar__btn {
+  width: 32px;
+  height: 30px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md, 10px);
+  color: var(--color-muted, #7c7390);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  flex-shrink: 0;
+}
+
+.composer-toolbar__btn:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.composer-toolbar__btn--active,
+.composer-toolbar__btn--active:hover:not(:disabled) {
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+}
+
+.composer-toolbar__btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* ── Message editing and history (RF-13) ─────────────────────────────────── */
+
+.chat-msg-area__edited {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-msg-area__edited:hover,
+.chat-msg-area__edited:focus-visible {
+  color: var(--color-primary, #0e7490);
+  text-decoration: underline;
+}
+
+.chat-msg-area__inline-edit {
+  min-width: min(520px, 60vw);
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+}
+
+.chat-msg-area__inline-edit .chat-msg-area__composer-input {
+  min-height: 44px;
+  max-height: 240px;
+}
+
+.chat-msg-area__inline-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-msg-area__inline-edit-bar > button {
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-md, 10px);
+  background: transparent;
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-msg-area__inline-edit-bar > .composer-toolbar {
+  margin-right: auto;
+}
+
+.chat-msg-area__inline-edit-bar > .chat-msg-area__inline-save {
+  background: var(--color-primary, #0e7490);
+  color: #fff;
+}
+
+.chat-msg-area__inline-edit-bar > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.chat-msg-area__inline-edit > p {
+  margin: 0;
+  padding: 0 10px 8px;
+  color: var(--color-danger, #dc2626);
+  font-size: 12px;
+}
+
+.message-history__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(22 18 31 / 42%);
+}
+
+.message-history {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: min(680px, 85vh);
+  overflow: hidden;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 12px 40px rgb(22 18 31 / 20%));
+}
+
+.message-history__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.message-history__header h2,
+.message-history__header p {
+  margin: 0;
+}
+
+.message-history__header h2 {
+  font-size: 17px;
+}
+
+.message-history__header p,
+.message-history__entry time,
+.message-history__status {
+  color: var(--color-muted, #7c7390);
+  font-size: 12px;
+}
+
+.message-history__header button {
+  border: 0;
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.message-history__content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 14px 20px;
+}
+
+.message-history__entry {
+  padding: 12px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.message-history__body {
+  margin-top: 6px;
+  color: var(--color-ink, #16121f);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message-history__status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 64px;
+}
+
+.message-history__status button,
+.message-history__load-more {
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink-2, #3d3550);
+  font: inherit;
+  cursor: pointer;
+}
+
+.message-history__load-more {
+  align-self: center;
+  margin: 0 0 14px;
+  padding: 7px 14px;
+  font-size: 12px;
+}
+
+@media (max-width: 680px) {
+  .chat-msg-area__inline-edit {
+    min-width: min(280px, 72vw);
+  }
+
+  .chat-msg-area__inline-edit-bar > .composer-toolbar {
+    display: none;
+  }
+}
+
+/* RF-32: attachments rendered inside a message.
+   The thumbnail and the video player are AttachmentThumbnail's and
+   AttachmentVideo's own elements, so they keep the chat-details__* classes the
+   details panel styles them with — one visual definition, reused rather than
+   restated. Everything below is only the frame around them. */
+.chat-msg-area__attachments {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-msg-area__image-run {
+  position: relative;
+  list-style: none;
+}
+
+.chat-msg-area__image-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  align-items: stretch;
+}
+
+.chat-msg-area__image-grid--1 {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(280px, 38vh);
+}
+
+.chat-msg-area__image-grid--2 {
+  grid-template-rows: minmax(240px, 32vh);
+}
+
+.chat-msg-area__image-grid--3 {
+  grid-template-rows: repeat(2, minmax(190px, 25vh));
+}
+
+.chat-msg-area__image-grid--3 > :first-child {
+  grid-row: span 2;
+}
+
+.chat-msg-area__image-grid--4 {
+  grid-template-rows: repeat(2, minmax(220px, 28vh));
+}
+
+/* Every image owns two explicit tracks: media and footer. The footer therefore
+   consumes space inside its card instead of painting over the next grid row.
+   This is especially important for the first item in the three-image mosaic,
+   whose card spans two rows while its metadata must remain attached to it. */
+.chat-msg-area__image-grid .chat-msg-area__attachment {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-preview {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  border-radius: 0;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment > .chat-msg-area__attachment-note {
+  align-self: center;
+  margin: 0;
+  padding: 12px;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-row {
+  min-width: 0;
+  padding: 8px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-text {
+  min-width: 0;
+}
+
+.chat-msg-area__image-grid .chat-msg-area__attachment-action {
+  flex: none;
+  padding-inline: 7px;
+}
+
+.chat-msg-area__image-grid-more {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgb(0 0 0 / 72%);
+  color: #fff;
+  cursor: pointer;
+}
+
+.chat-msg-area__image-grid-more:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+  .chat-msg-area__image-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-auto-rows: minmax(240px, 32vh);
+  }
+
+  .chat-msg-area__image-grid--3 > :first-child {
+    grid-row: auto;
+  }
+}
+
+.chat-msg-area__attachment {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  min-width: 0;
+}
+
+.chat-msg-area__attachment-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* The document card's own action row (task #494): Visualizar beside Baixar,
+   below the icon/name/size line — the same chat-msg-area__attachment-action
+   buttons every other attachment type already uses, just grouped on their
+   own line so the large preview above reads as one WhatsApp-style card. */
+.chat-msg-area__attachment-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chat-msg-area__attachment-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm, 6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__attachment-icon .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-msg-area__attachment-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-msg-area__attachment-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-msg-area__attachment-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--color-text-muted, #6b6580);
+}
+
+/* A file still being scanned and a blocked one are visually distinct from an
+   approved one, because "wait" and "blocked" are not the same instruction. */
+.chat-msg-area__attachment-status--pending_scan {
+  color: var(--color-warning-strong, #92400e);
+}
+
+.chat-msg-area__attachment-status--clean {
+  color: var(--color-success-strong, #166534);
+}
+
+.chat-msg-area__attachment-status--rejected {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+.chat-msg-area__attachment-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-msg-area__attachment-action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chat-msg-area__attachment-action .material-symbols-outlined {
+  font-size: 16px;
+}
+
+.chat-msg-area__attachment-note {
+  font-size: 11px;
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+/* Large image/GIF preview (issue #491). AttachmentImagePreview's own box,
+   drawn above the row instead of the 32px thumbnail for the raster types it
+   covers — everything else keeps the row/thumbnail layout above unchanged.
+   Height is fixed, not min/max-height driven by content: the attachment
+   contract carries no width/height, so the skeleton cannot know the real
+   image's aspect ratio ahead of load. A min/max pair would let the skeleton
+   collapse to the floor (percentage heights need a definite parent height to
+   resolve, and an auto-height flex container is not one) while the loaded
+   image grows toward the ceiling — precisely the scroll jump this box exists
+   to avoid. A fixed height sidesteps that: the footprint never changes, the
+   image is letterboxed inside it via object-fit, and img's own
+   max-height: 100% has an actual number to resolve against. */
+.chat-msg-area__attachment-preview {
+  position: relative;
+  flex: 1 0 100%;
+  max-width: 100%;
+  height: 260px;
+  margin-top: 8px;
+  border-radius: var(--radius-md, 10px);
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.chat-msg-area__attachment-preview-trigger {
+  all: unset;
+  cursor: zoom-in;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.chat-msg-area__attachment-preview-trigger:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px; /* all: unset drops the native ring; this puts one back
+                            inside the box instead of outside its rounded corner */
+}
+
+.chat-msg-area__attachment-preview-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain; /* never cover: cropping a message attachment without
+                           being asked is the one thing this box must not do */
+}
+
+.chat-msg-area__attachment-preview-skeleton {
+  width: 100%;
+  height: 100%;
+  background: var(--color-border, #e8e3f0);
+  animation: chat-skel-pulse 1.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__attachment-preview-skeleton {
+    animation: none;
+  }
+}
+
+.chat-msg-area__attachment-gif-toggle {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chat-msg-area__attachment-gif-toggle:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+@media (max-width: 480px) {
+  .chat-msg-area__attachment-preview {
+    height: 200px;
+  }
+}
+
+/* ── Inline audio player (issue #670) ─────────────────────────────────────────
+   Shared by an ordinary audio file's row (AttachmentAudio) and the voice
+   bubble below it — one look for "there is audio here you can play". */
+.chat-msg-area__audio-player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-muted, #f5f2fa);
+}
+
+.chat-msg-area__audio-playbtn,
+.chat-msg-area__audio-rate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chat-msg-area__audio-rate {
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  border: 1px solid var(--color-border, #e8e3f0);
+}
+
+.chat-msg-area__audio-playbtn:disabled,
+.chat-msg-area__audio-rate:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chat-msg-area__audio-playbtn:focus-visible,
+.chat-msg-area__audio-rate:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__audio-seek {
+  flex: 1 1 120px;
+  min-width: 80px;
+  accent-color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__audio-time {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary, #6b6478);
+  white-space: nowrap;
+}
+
+.chat-msg-area__audio-note {
+  font-size: 11px;
+  color: var(--color-text-secondary, #6b6478);
+  flex-basis: 100%;
+}
+
+.chat-msg-area__audio-note[role="alert"] {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+/* ── Voice message compact presentation (issue #670) ──────────────────────────
+   No filename, no size: a recording is identified by playing it, not by a
+   name like "recording-1699999999.webm". */
+.chat-msg-area__attachment--voice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.chat-msg-area__voice-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ── Voice recorder panel (issue #670) ─────────────────────────────────────── */
+.chat-msg-area__voice-recorder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 4px;
+  min-height: 40px;
+}
+
+.chat-msg-area__voice-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-danger, #dc2626);
+  flex: 0 0 auto;
+}
+
+.chat-msg-area__voice-dot--live {
+  animation: chat-voice-dot-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes chat-voice-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-area__voice-dot--live {
+    animation: none;
+  }
+}
+
+.chat-msg-area__voice-elapsed {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text, #1f1a2e);
+  min-width: 3ch;
+}
+
+.chat-msg-area__voice-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 50%;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #1f1a2e);
+  cursor: pointer;
+}
+
+.chat-msg-area__voice-btn--primary {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+}
+
+.chat-msg-area__voice-btn:hover:not(:disabled) {
+  background: var(--color-surface-2, #f5f2fa);
+}
+
+.chat-msg-area__voice-btn--primary:hover:not(:disabled) {
+  background: var(--color-primary-strong, #4c1d95);
+}
+
+.chat-msg-area__voice-btn:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__voice-status {
+  font-size: 13px;
+  color: var(--color-text-secondary, #6b6478);
+  flex: 1 1 auto;
+}
+
+.chat-msg-area__voice-status[role="alert"] {
+  color: var(--color-danger-strong, #b91c1c);
+}
+
+/* ── Phone density (issue #467) ──────────────────────────────────────────────
+   Only spacing and one redundant label; every control stays where it was and
+   stays reachable. The thresholds are the ones documented in ChatShell.css. */
+@media (max-width: 767.98px) {
+  .chat-msg-area__header {
+    gap: 8px;
+    padding-block: 6px;
+  }
+
+  .chat-msg-area__header-title {
+    font-size: 16px;
+  }
+
+  /* The button beside it already says "Entrar na chamada". The action is what
+     has to survive a narrow header; the word next to it does not. */
+  .chat-msg-area__call-status {
+    display: none;
+  }
+
+  .chat-msg-area__list {
+    padding-block: 12px;
+  }
+
+  .chat-msg-area__composer {
+    padding-top: 8px;
+  }
+}

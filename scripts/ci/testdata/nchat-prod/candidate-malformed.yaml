@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-blue
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: broken
+          resources:
+            requests:
+              cpu: not-a-quantity
+              memory: 128Mi

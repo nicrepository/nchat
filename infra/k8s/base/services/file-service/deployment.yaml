@@ -1,0 +1,152 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-service
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: file
+    app.kubernetes.io/version: "0.0.0"
+  annotations:
+    nchat.nicrepository.io/image-placeholder: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: file
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: file
+        app.kubernetes.io/version: "0.0.0"
+      annotations:
+        nchat.nicrepository.io/image-placeholder: "true"
+    spec:
+      serviceAccountName: nchat-file-service
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: file-service
+          image: ghcr.io/nicrepository/nchat/file-service:0.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+            - secretRef:
+                name: nchat-secrets
+                optional: true
+            # RF-33 / RNF-17: the attachment envelope-encryption key ring, kept
+            # out of the shared nchat-secrets so that no other service receives
+            # it through its own envFrom. Optional for the same reason the shared
+            # one is: with FILE_UPLOADS_ENABLED=false the service is health-only
+            # and needs no key, and with uploads enabled a missing key stops
+            # start-up in Config.Validate rather than being silently defaulted.
+            - secretRef:
+                name: nchat-file-encryption
+                optional: true
+            # RF-21: the Cloudflare URL Scanner credentials for link previews.
+            # Shared with chat-service, scoped to the two services that call
+            # Cloudflare, and optional for the same reason as above — the flag
+            # decides, and an enabled flag with no credentials stops start-up.
+            - secretRef:
+                name: nchat-link-safety
+                optional: true
+          env:
+            - name: PORT
+              value: "8083"
+            - name: SERVICE_NAME
+              value: file-service
+            - name: DOCUMENT_CONVERTER_URL
+              value: http://document-converter:8089
+          ports:
+            - name: http
+              containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          # The request is what the service needs to serve traffic: uploads and
+          # downloads are streamed in 64 KiB chunks, so steady state is small.
+          #
+          # The limit has to cover something else — the RF-31 preview worker.
+          # Rendering a PDF's first page builds a WebAssembly sandbox around
+          # PDFium, which costs roughly 180 MiB while it runs and is released
+          # when the render finishes. That peak is transient and only occurs
+          # when a PDF is attached, but a limit it can cross is a limit that
+          # OOM-kills the pod mid-upload, so it is budgeted for rather than
+          # hoped against. Image previews cost a fraction of it.
+          #
+          # Only one preview is rendered at a time per replica, so the peak does
+          # not scale with the backlog.
+          #
+          # ephemeral-storage is bounded for the same reason the memory is: this
+          # service handles files it did not choose. Nothing it does writes to
+          # disk — uploads, downloads and preview rendering are all in memory or
+          # streamed — so the budget only has to cover container logs and the
+          # /tmp volume below, and a limit is what stops an unexpected writer
+          # from filling the node's disk instead of failing.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only, so /tmp is the one writable path in
+        # the container. Nothing in file-service writes there — attachments are
+        # streamed, and preview rendering happens in memory inside the
+        # WebAssembly sandbox, which is given no filesystem at all — but the Go
+        # runtime and any library that ever wants a scratch file need the path
+        # to exist. sizeLimit is what keeps "exists" from becoming "unbounded":
+        # the volume is capped, private to the pod, and gone when it restarts.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

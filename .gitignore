@@ -1,0 +1,161 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+infra/compose/.env.dev
+*.local
+*.local.*
+*.bat
+*ps1
+
+# Rendered LiveKit/coturn dev config (contains real secrets, see *.template sources)
+infra/compose/livekit/livekit.runtime.yaml
+infra/compose/coturn/turnserver.runtime.conf
+
+# Operator's local copy of the office-network LAN bind override (real IP —
+# never the committed .example.yml). See TASK-158 runbook.
+infra/compose/compose.media.lan-office-test.override.yml
+
+# Secrets, private keys, certificates, and dumps
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.jks
+*.keystore
+!*.example.pem
+!*.example.crt
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.dump
+*.sql.gz
+*.bak
+*.backup
+*.enc
+secrets/
+private/
+!infra/k8s/secrets/
+!infra/k8s/secrets/**
+!scripts/secrets/
+!scripts/secrets/**
+
+# Local TLS material
+infra/traefik/local/certs/*.pem
+infra/traefik/local/certs/*.key
+infra/traefik/local/certs/*.crt
+infra/traefik/local/certs/*
+!infra/traefik/local/certs/.gitkeep
+!infra/traefik/local/certs/README.md
+
+# Kubernetes unsealed secrets
+infra/k8s/secrets/unsealed/*
+!infra/k8s/secrets/unsealed/.gitkeep
+!infra/k8s/secrets/unsealed/README.md
+
+# Local Sealed Secrets public cert cache
+infra/k8s/secrets/public-certs/*
+!infra/k8s/secrets/public-certs/.gitkeep
+!infra/k8s/secrets/public-certs/README.md
+
+# Logs and runtime files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Go
+bin/
+dist/
+coverage.out
+*.out
+*.coverprofile
+*.test
+vendor/
+
+# Node, React, and TypeScript
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.turbo/
+.vite/
+.next/
+coverage/
+build/
+storybook-static/
+*.tsbuildinfo
+
+# Docker and containers
+.docker/
+docker-compose.override.yml
+compose.override.yml
+*.pid
+
+# Kubernetes and local cluster tooling
+.kube/
+kubeconfig
+*.kubeconfig
+kind-kubeconfig*
+*.sealed-secret.local.yaml
+infra/k8s/overlays/nchat-dev-server/topology.env
+
+# IDEs and editors
+.idea/
+.vscode/
+*.code-workspace
+
+# OS and tooling caches
+.cache/
+.pytest_cache/
+.ruff_cache/
+.scannerwork/
+# Local agent/tooling artifacts
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+
+# Local PoC outputs
+poc-results/*
+!poc-results/.gitkeep
+# WebRTC office network validation (TASK-158): keep the sanitized template
+# versioned, but never the raw run summaries (may contain office network IPs).
+!poc-results/webrtc-office-network/
+poc-results/webrtc-office-network/*
+!poc-results/webrtc-office-network/RESULT-TEMPLATE.md
+
+# Playwright local artifacts
+apps/web/playwright-report/
+apps/admin-web/playwright-report/
+apps/admin-web/test-results/
+apps/web/test-results/
+
+# NChat local development bootstrap (machine-specific config and seed data)
+.nchat-local/
+scripts/dev/nchat-local.sh
+scripts/dev/nchat-local-test.sh
+scripts/db/local-seed.sh
+scripts/db/local-seed.sql
+
+# Security scan artifacts
+results.sarif
+*.sarif
+*.patch
+*_results.txt
+semgrep_results.json
+trivy_results.json
+kustomize_render.yaml
+
+# Python bytecode. The repository versions Python under scripts/ci and
+# scripts/deploy, so running or importing any of it leaves these behind.
+__pycache__/
+*.py[cod]

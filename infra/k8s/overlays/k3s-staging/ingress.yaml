@@ -1,0 +1,258 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-k3s-staging
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.options: nchat-staging-tls-options@kubernetescrd
+    # Issue #425: see the identical rule in the k3s-dev overlay. auth-service
+    # registers /auth/*, so /api/auth/* must be rewritten before it reaches the
+    # pod or every auth route answers 404.
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-staging-auth-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - staging.nchat.local
+      secretName: nchat-staging-tls
+  rules:
+    - host: staging.nchat.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-web
+                port:
+                  number: 80
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 8081
+          - path: /api/chat
+            pathType: Prefix
+            backend:
+              service:
+                name: chat-service
+                port:
+                  number: 8082
+          - path: /api/files
+            pathType: Prefix
+            backend:
+              service:
+                name: file-service
+                port:
+                  number: 8083
+          - path: /api/notifications
+            pathType: Prefix
+            backend:
+              service:
+                name: notification-service
+                port:
+                  number: 8084
+          # No /api/admin here: the Admin API is published only on the
+          # administrative host, so the chat origin cannot reach it (issue #578
+          # origin isolation).
+          - path: /api/search
+            pathType: Prefix
+            backend:
+              service:
+                name: search-service
+                port:
+                  number: 8086
+          - path: /api/media
+            pathType: Prefix
+            backend:
+              service:
+                name: media-service
+                port:
+                  number: 8087
+---
+# Rewrites the public /api/auth/<rest> contract onto the /auth/<rest> paths the
+# auth-service router actually registers (issue #425). Kept identical across
+# every overlay and to the local Traefik gateway so the contract is one rule,
+# not three. Paths that do not start with /api/auth/ are left unchanged.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/auth/(.*)"
+    replacement: "/auth/${1}"
+---
+# RF-32: the two attachment upload routes, and only those, go through the
+# upload guard. It caps the request body while streaming it, which Traefik's
+# buffering middleware cannot do without reading the whole body first — a
+# pre-authentication disk-exhaustion vector on exactly these routes.
+#
+# Everything else under /api/files (health, download, listing, metadata) stays
+# on the shared Ingress and reaches file-service directly, so nothing else pays
+# the extra hop. This Ingress is matched by method and exact path shape, so
+# there is no upload path that reaches file-service around the cap.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nchat-k3s-staging-uploads
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`staging.nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      middlewares:
+        - name: upload-inflight
+        - name: strip-files-prefix
+      services:
+        - name: upload-guard
+          port: 8080
+  # IngressRoute TLS is a mapping, not the Ingress host list: the host the
+  # certificate must cover comes from the match rule above.
+  tls:
+    secretName: nchat-staging-tls
+---
+# Conservative ceiling on concurrent upload requests at the edge, as
+# infrastructure defence in depth.
+#
+# A total per router, not per source: these sources sit behind corporate NAT and
+# other proxies, so an IP-keyed limit would either punish a whole office sharing
+# one address or be trivially spread across an IPv6 prefix. It is deliberately
+# set above file-service's cluster-wide slot count so it never becomes the
+# binding limit — file-service answers 429/503 with a stable code and a
+# Retry-After, which is a better answer than a proxy rejection. It substitutes
+# for none of authentication, authorization, the per-user limit, distributed
+# admission control or the authoritative stream cap.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: upload-inflight
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  inFlightReq:
+    amount: 16
+---
+# Strips the public /api/files prefix before the request reaches the guard, so
+# the guard stays a dumb pipe and file-service receives the paths it registers.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-files-prefix
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: upload-guard
+spec:
+  stripPrefix:
+    prefixes:
+      - /api/files
+---
+# Rewrites the public /api/admin/<rest> contract onto the paths admin-service
+# actually registers (issue #578). Same class of rule as auth-api-prefix and
+# media-api-prefix above, and the same one the local Traefik gateway applies as
+# strip-admin-prefix, so the contract is one shape everywhere instead of three
+# that can drift.
+#
+# Without it every Admin API route — the session handshake, the bootstrap, the
+# audit trail — reaches the pod with the /api/admin prefix still attached and
+# answers 404 from the router's catch-all.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: admin-api-prefix
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+spec:
+  replacePathRegex:
+    regex: "^/api/admin/(.*)"
+    replacement: "/${1}"
+---
+# Administrative console host (issue #578).
+#
+# A host of its own, not a path on the chat host. That separation is what makes
+# the console's CSP, its cookie scope and its access policy
+# independent of the chat app: a __Host- cookie set here cannot be read or
+# planted by the chat origin, and a future VPN, IP allowlist or mTLS rule can be
+# attached to this router without touching the application everyone uses.
+#
+# Only three backends are reachable from it: the console bundle, the Admin API,
+# and auth-service for the sign-in handshake. Nothing else on the platform is
+# routed here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nchat-k3s-staging-admin
+  namespace: nchat-staging
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: admin-web
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.options: nchat-staging-tls-options@kubernetescrd
+    traefik.ingress.kubernetes.io/router.middlewares: nchat-staging-auth-api-prefix@kubernetescrd,nchat-staging-admin-api-prefix@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - admin.staging.nchat.local
+      secretName: nchat-staging-admin-tls
+  rules:
+    - host: admin.staging.nchat.local
+      http:
+        paths:
+          - path: /api/admin
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service
+                port:
+                  number: 8085
+          - path: /api/auth
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-service
+                port:
+                  number: 8081
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nchat-admin-web
+                port:
+                  number: 80

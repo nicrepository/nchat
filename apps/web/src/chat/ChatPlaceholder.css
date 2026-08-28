@@ -1,0 +1,42 @@
+.chat-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 32px;
+  text-align: center;
+  max-width: 400px;
+  margin: 0 auto;
+}
+
+.chat-placeholder__icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+}
+
+.chat-placeholder__icon svg {
+  width: 40px;
+  height: 40px;
+}
+
+.chat-placeholder__title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-ink, #102a33);
+  margin: 0 0 8px;
+}
+
+.chat-placeholder__sub {
+  font-size: 14px;
+  color: var(--color-muted, #5c7380);
+  margin: 0;
+  line-height: 1.55;
+}

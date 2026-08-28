@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-service
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: chat-service
+          # envFrom is a list without a merge key, so this replaces the base's
+          # entirely — including its secretRef entries. Every secret this
+          # service uses is therefore named key by key below.
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET
+            - name: VALKEY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: VALKEY_URL
+            # RF-21 Safe Browsing, from a Secret only this Deployment and
+            # file-service reference — the token has no business in
+            # nchat-secrets, which every service mounts wholesale.
+            #
+            # Not optional, and the Secret must exist before
+            # CHAT_LINK_SAFETY_ENABLED=true reaches the cluster: with the flag
+            # on, Config.Validate refuses to start on a missing credential
+            # rather than running with the check silently absent. See
+            # docs/runbooks/sealed-secrets-rotation.md.
+            - name: CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+            - name: CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN

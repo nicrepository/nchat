@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-service
+  namespace: nchat
+spec:
+  template:
+    spec:
+      containers:
+        - name: admin-service
+          envFrom:
+            - configMapRef:
+                name: nchat-config
+          # The Admin API needs exactly two secrets and no more: the database it
+          # authorizes against, and the JWT secret it verifies the sign-in token
+          # with. Both are named individually rather than pulled in with a
+          # secretRef, so the pod's environment cannot grow a credential nobody
+          # decided to give it. Without them the service still serves /healthz
+          # and /version and answers 503 on every privileged route.
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-postgres-runtime
+                  key: DATABASE_URL
+                  optional: true
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET
+                  optional: true

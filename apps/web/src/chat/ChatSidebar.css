@@ -1,0 +1,1293 @@
+/*
+ * ChatSidebar — dark sidebar for Nchat.
+ * Scoped under .chat-sidebar to avoid leaking into auth/admin pages.
+ * Overrides design tokens for the prototype purple/dark palette,
+ * following the same pattern as AdminShell.css.
+ */
+
+/* ── Scoped layout ──────────────────────────────────────────────────────────── */
+
+.chat-sidebar {
+  /* Prototype purple/dark palette scoped here */
+  --cs-sidebar-bg: #1f1b2e;
+  --cs-sidebar-hover: rgba(255, 255, 255, 0.06);
+  --cs-sidebar-active: rgba(168, 101, 247, 0.14);
+  --cs-sidebar-text: #e5e1f0;
+  --cs-sidebar-muted: #9991b0;
+  --cs-sidebar-divider: rgba(255, 255, 255, 0.08);
+  --cs-primary: #6d28d9;
+  --cs-primary-strong: #5b21b6;
+  --cs-primary-soft: #a865f7;
+  --cs-sidebar-w: 240px;
+
+  width: var(--cs-sidebar-w);
+  background: var(--cs-sidebar-bg);
+  color: var(--cs-sidebar-text);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+  border-right: 1px solid rgba(255, 255, 255, 0.04);
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── Brand ──────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 14px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.chat-sidebar__brand-img {
+  width: 30px;
+  height: 34px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.chat-sidebar__brand-copy {
+  min-width: 0;
+}
+
+.chat-sidebar__brand-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: #fff;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__brand-sub {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--cs-sidebar-muted);
+  margin: 1px 0 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── CTA ─────────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__cta {
+  background: var(--cs-primary);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  /* Bottom margin carries the gap the removed second CTA used to provide. */
+  margin: 0 6px 14px;
+  transition: background 0.15s;
+  cursor: pointer;
+}
+
+.chat-sidebar__cta:hover:not(:disabled) {
+  background: var(--cs-primary-strong);
+}
+
+.chat-sidebar__cta:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* The default UA outline is barely visible on the dark sidebar, so the focus
+   ring is stated explicitly. */
+.chat-sidebar__cta:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+/* ── Nav scrollable container ────────────────────────────────────────────────── */
+
+.chat-sidebar__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 0 6px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.chat-sidebar__nav::-webkit-scrollbar {
+  width: 4px;
+}
+
+.chat-sidebar__nav::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-sidebar__nav::-webkit-scrollbar-thumb {
+  background: var(--cs-sidebar-divider);
+  border-radius: 2px;
+}
+
+/* ── Sections ────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__section {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Keeps the 1px rhythm the nav container used to apply to the rows directly,
+   now that each section owns its own list. */
+.chat-sidebar__section-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.chat-sidebar__item-row {
+  display: flex;
+  align-items: center;
+}
+.chat-sidebar__item-row > .chat-sidebar__nav-item,
+.chat-sidebar__item-row > .chat-sidebar__dm-item {
+  flex: 1;
+  min-width: 0;
+}
+/* ── Row trailing area (issue #527) ───────────────────────────────────────────
+   One stable slot at the end of every row, wide enough for what can appear
+   there at once: the unread badge, the pinned indicator and the "…" trigger.
+   Its width does not depend on which of them are present, which is what keeps
+   hover from moving the avatar, the name or the badge by a pixel.
+
+   Nothing is display:none. A hidden button is not focusable, and the trigger has
+   to be reachable by Tab; the trigger is always laid out and only its opacity
+   changes. */
+.chat-sidebar__trailing {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  flex: 0 0 auto;
+  /* Reserved for indicator + trigger. A pinned row shows both, an unpinned one
+     shows only the trigger, and both occupy the same width. */
+  min-width: 3.25rem;
+  justify-content: flex-end;
+}
+
+.chat-sidebar__pinned {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  flex: 0 0 auto;
+  /* State, not decoration-by-colour: the pin is only ever drawn on a pinned row
+     (absent otherwise, never greyed out), and the row's accessible name says
+     "fixado" for anyone not looking at it. White against the sidebar's dark
+     surface, so it reads at a glance without competing with the unread badge —
+     which is a filled pill, a different shape at a different weight. */
+  color: #fff;
+  opacity: 0.92;
+}
+
+.chat-sidebar__pinned .chat-sidebar__icon {
+  /* Smaller than a row icon: it annotates the row, it does not label it. */
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.chat-sidebar__actions {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.chat-sidebar__actions-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* A comfortable target on touch, where there is no hover to reveal it. */
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+/* Visible whenever the row is hovered, whenever anything inside the row has
+   focus, and for as long as the menu is open — so it never disappears out from
+   under the pointer that is on it. The pinned indicator stays visible through
+   all of it: hover reveals the menu, it never replaces the state. */
+.chat-sidebar__item-row:hover .chat-sidebar__actions-trigger,
+.chat-sidebar__item-row:focus-within .chat-sidebar__actions-trigger,
+.chat-sidebar__actions-trigger[aria-expanded="true"] {
+  opacity: 1;
+}
+
+/* Coarse pointers have no hover to reveal anything, so the trigger is simply
+   always visible there. This is the discoverable touch affordance; long-press is
+   deliberately not the way in. */
+@media (hover: none) {
+  .chat-sidebar__actions-trigger {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-sidebar__actions-trigger {
+    transition: none;
+  }
+}
+
+.chat-sidebar__actions-trigger:hover,
+.chat-sidebar__actions-trigger:focus-visible {
+  background: var(--color-surface-hover, rgba(255, 255, 255, 0.12));
+  opacity: 1;
+}
+
+.chat-sidebar__actions-trigger:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
+.chat-sidebar__more-icon {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+
+/* ── The popover ──────────────────────────────────────────────────────────────
+   Width follows the content between a floor and a ceiling, so a two-item menu is
+   not a wide empty box and a long channel name cannot push it past the sidebar.
+   It is anchored to the row's trailing edge and flips above when there is no
+   room below. */
+/* Portalled into <body>, so it is positioned in viewport coordinates by
+   ConversationActionsMenu and cannot be clipped by the nav's `overflow-y: auto`.
+   Two consequences: `top`/`left` are written by that component (the values here
+   only keep the first frame off the corner), and the palette it used to inherit
+   from .chat-sidebar has to be restated — outside the sidebar there is nothing
+   to inherit it from. The width is fixed because the same number is used to
+   right-align the popup with its trigger in JS. */
+.chat-sidebar__actions-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 40;
+  width: 14rem;
+  max-width: calc(100vw - 1rem);
+  color: #e5e1f0;
+  --cs-sidebar-hover: rgba(255, 255, 255, 0.06);
+  padding: 0.25rem;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 0.5rem;
+  background: #241f31;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.chat-sidebar__actions-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4375rem 0.5rem;
+  /* A comfortable pointer and touch target without making the menu tall. */
+  min-height: 2rem;
+  text-align: left;
+  font: inherit;
+  font-size: 0.8125rem;
+  color: inherit;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.chat-sidebar__actions-icon {
+  width: 1rem;
+  height: 1rem;
+  /* Fixed, so every label starts at the same x whatever glyph precedes it. */
+  flex: 0 0 auto;
+  opacity: 0.85;
+}
+
+.chat-sidebar__actions-label {
+  flex: 1;
+  min-width: 0;
+  /* A long channel name is truncated rather than allowed to widen the popover
+     past its ceiling. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__actions-item:hover,
+.chat-sidebar__actions-item:focus-visible {
+  background: var(--cs-sidebar-hover);
+}
+
+.chat-sidebar__actions-item:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
+/* One rule between groups. Semantically it is nothing — role="none" — because a
+   separator that a screen reader announces in a menu is noise. */
+.chat-sidebar__actions-separator {
+  display: block;
+  height: 1px;
+  margin: 0.25rem 0.25rem;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* The only destructive colour in this surface, and the only action that earns
+   it: leaving is the one item here that removes the viewer from something. */
+.chat-sidebar__actions-item--destructive {
+  color: #ff9a8f;
+}
+
+.chat-sidebar__actions-item--destructive:hover,
+.chat-sidebar__actions-item--destructive:focus-visible {
+  background: rgba(255, 154, 143, 0.14);
+}
+
+.chat-sidebar__pin-error {
+  margin: 0.5rem;
+  font-size: 0.75rem;
+}
+
+/* ── Section labels ──────────────────────────────────────────────────────────── */
+
+.chat-sidebar__section-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  /* The heading is an h2 for assistive navigation; its size comes from the
+     sidebar scale, not from the UA default. */
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cs-sidebar-muted);
+  margin: 0;
+  padding: 10px 10px 4px;
+}
+
+.chat-sidebar__section-label--mt {
+  margin-top: 18px;
+}
+
+/* ── Collapsible Categories (RF-17) ─────────────────────────────────────────── */
+
+.chat-sidebar__categories-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-sidebar__category-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-sidebar__category-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  color: var(--cs-sidebar-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  transition: color 0.12s;
+}
+
+.chat-sidebar__category-header:hover {
+  color: var(--cs-sidebar-text);
+}
+
+.chat-sidebar__category-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease;
+}
+
+.chat-sidebar__category-chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.chat-sidebar__chevron-icon {
+  width: 12px;
+  height: 12px;
+  opacity: 0.8;
+}
+
+.chat-sidebar__category-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__category-channels {
+  padding-left: 8px;
+  margin-top: 2px;
+}
+
+/* ── Nav items (channels) ────────────────────────────────────────────────────── */
+
+.chat-sidebar__nav-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  position: relative;
+  width: 100%;
+}
+
+.chat-sidebar__nav-item:hover {
+  background: var(--cs-sidebar-hover);
+  color: #fff;
+}
+
+.chat-sidebar__nav-item--active {
+  background: var(--cs-sidebar-active);
+  color: #fff;
+}
+
+.chat-sidebar__nav-item--active::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--cs-primary-soft);
+}
+
+.chat-sidebar__nav-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Icons ───────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__icon {
+  width: 16px;
+  height: 16px;
+  opacity: 0.75;
+  flex-shrink: 0;
+}
+
+.chat-sidebar__icon--sm {
+  width: 13px;
+  height: 13px;
+  opacity: 0.65;
+}
+
+.chat-sidebar__add-icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* ── DM items ────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__dm-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  width: 100%;
+}
+
+.chat-sidebar__dm-item:hover {
+  background: var(--cs-sidebar-hover);
+}
+
+.chat-sidebar__dm-item--active {
+  background: var(--cs-sidebar-active);
+  color: #fff;
+}
+
+.chat-sidebar__dm-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Avatars ─────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-weight: 600;
+  color: #fff;
+  flex-shrink: 0;
+  position: relative;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+
+/* Fills the circle without changing its size, so a row keeps the same height
+   whether the counterpart has a picture or only initials. */
+.chat-sidebar__avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
+
+.chat-sidebar__avatar--sm {
+  width: 24px;
+  height: 24px;
+  font-size: 9.5px;
+}
+
+.chat-sidebar__avatar--md {
+  width: 30px;
+  height: 30px;
+  font-size: 11px;
+}
+
+.chat-sidebar__avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.chat-sidebar__avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.chat-sidebar__avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.chat-sidebar__avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.chat-sidebar__avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.chat-sidebar__avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
+
+/* The presence indicator lives in PresenceDot.css (RF-58): one definition for
+   every surface, so the sidebar cannot drift from the details panel again. The
+   avatar passes its own background as the dot's ring colour. */
+
+/* ── Group avatars ───────────────────────────────────────────────────────────── */
+
+.chat-sidebar__group-avatars {
+  position: relative;
+  width: 28px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.chat-sidebar__avatar--group-back {
+  position: absolute;
+  left: 0;
+  top: 0;
+  opacity: 0.8;
+}
+
+.chat-sidebar__avatar--group-front {
+  position: absolute;
+  left: 8px;
+  top: 0;
+  border: 1.5px solid var(--cs-sidebar-bg);
+}
+
+/* ── Unread badge ────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__unread-badge {
+  margin-left: auto;
+  background: var(--cs-primary);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  gap: 1px;
+}
+
+/* Distinct from a plain unread badge by more than color alone: the "@" mark
+   below is a visible glyph, and the accessible name adds "incluindo menção". */
+.chat-sidebar__unread-badge--mention {
+  background: #f59e0b;
+}
+.chat-sidebar__unread-badge-mention-mark {
+  font-size: 9px;
+}
+
+/* ── Badges (sr-only for type indicators) ────────────────────────────────────── */
+
+.chat-sidebar__badge {
+  font-size: 10px;
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--cs-sidebar-divider);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-sidebar__footer-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition:
+    background 0.12s,
+    color 0.12s;
+  margin: 2px 6px;
+}
+
+.chat-sidebar__footer-item:hover {
+  background: var(--cs-sidebar-hover);
+  color: #fff;
+}
+
+/* Profile and Settings sit on one line: the profile link takes the space that
+   is left and the icon keeps its own, so a long name is clipped by the name
+   itself and never pushes the settings control out of the sidebar. */
+.chat-sidebar__user-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px 2px;
+}
+
+.chat-sidebar__user {
+  flex: 1;
+  /* Without this a flex item refuses to shrink below its content, which is what
+     turns a long name into an overflow instead of an ellipsis. */
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  text-decoration: none;
+  transition: background 0.12s;
+}
+
+.chat-sidebar__user:hover {
+  background: var(--cs-sidebar-hover);
+}
+
+.chat-sidebar__user-name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__user-settings {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  color: var(--cs-sidebar-text);
+  text-decoration: none;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.chat-sidebar__user-settings:hover {
+  background: var(--cs-sidebar-hover);
+  color: #fff;
+}
+
+.chat-sidebar__user:focus-visible,
+.chat-sidebar__user-settings:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+/* Identity-neutral stand-in while the profile is unknown. Same box as the real
+   row, so the footer does not jump when the answer arrives. */
+.chat-sidebar__user-placeholder {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.chat-sidebar__user-avatar-skeleton {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.chat-sidebar__user-name-skeleton {
+  height: 10px;
+  width: 96px;
+  max-width: 100%;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Only loading pulses: a failed load is not in progress. */
+.chat-sidebar__user-placeholder[data-state="loading"] .chat-sidebar__user-avatar-skeleton,
+.chat-sidebar__user-placeholder[data-state="loading"] .chat-sidebar__user-name-skeleton {
+  animation: cs-pulse 1.4s ease-in-out infinite;
+}
+
+/* ── Loading skeleton ────────────────────────────────────────────────────────── */
+
+.chat-sidebar__skeleton {
+  padding: 0 4px;
+}
+
+.chat-sidebar__skeleton-label {
+  height: 10px;
+  width: 60%;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  margin: 14px 10px 8px;
+  animation: cs-pulse 1.4s ease-in-out infinite;
+}
+
+.chat-sidebar__skeleton-label--mt {
+  margin-top: 28px;
+}
+
+.chat-sidebar__skeleton-item {
+  height: 32px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  margin-bottom: 2px;
+  animation: cs-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cs-pulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── Error state ─────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__error {
+  padding: 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-sidebar__error-msg {
+  font-size: 12px;
+  color: var(--cs-sidebar-muted);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.chat-sidebar__retry-btn {
+  background: rgba(168, 101, 247, 0.14);
+  color: var(--cs-primary-soft);
+  border: 1px solid rgba(168, 101, 247, 0.22);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.chat-sidebar__retry-btn:hover {
+  background: rgba(168, 101, 247, 0.22);
+}
+
+/* ── Empty state ─────────────────────────────────────────────────────────────── */
+
+.chat-sidebar__empty {
+  font-size: 12px;
+  color: var(--cs-sidebar-muted);
+  padding: 8px 10px;
+  margin: 0;
+}
+
+/* ── Utility ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Visually hidden, and pinned (issue #467 follow-up — root scroll).
+ *
+ * `top`/`left` are not decoration: without them an absolutely positioned box
+ * with auto offsets stays at its *static* position, and its containing block is
+ * the nearest positioned ancestor — here, none, so the initial containing
+ * block. A scroller only clips descendants whose containing block is inside it,
+ * so a badge sitting 1500px down the sidebar's `overflow-y: auto` nav escaped
+ * both that clip and `.chat-app`'s, and grew the document's scroll area by the
+ * whole length of the conversation list. Pinning the box removes the only thing
+ * about it that ever had a position; it is 1px and fully clipped either way.
+ */
+.sr-only {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+/* ── New direct message dialog ─────────────────────────────────────────────── */
+
+.new-dm-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.new-dm-dialog {
+  --new-dm-primary: #6d28d9;
+  --new-dm-primary-strong: #5b21b6;
+  --new-dm-border: #e8e3f0;
+  --new-dm-muted: #7c7390;
+  width: min(500px, 100%);
+  max-height: min(640px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--new-dm-border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+  color: #16121f;
+}
+
+.new-dm-dialog__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 24px 16px;
+}
+
+.new-dm-dialog__header h2 {
+  margin: 0;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.new-dm-dialog__header p {
+  margin: 5px 0 0;
+  color: var(--new-dm-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.new-dm-dialog__close {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--new-dm-muted);
+  cursor: pointer;
+}
+
+.new-dm-dialog__close:hover:not(:disabled) {
+  background: #f3ebfb;
+  color: var(--new-dm-primary);
+}
+
+.new-dm-dialog__close:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.new-dm-dialog__mode {
+  display: flex;
+  gap: 8px;
+  margin: 0 24px 16px;
+  padding: 0;
+  border: 0;
+}
+
+.new-dm-dialog__mode legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.new-dm-dialog__mode label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 13px;
+  border: 1px solid #d4cde3;
+  border-radius: 999px;
+  color: #3d3550;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.new-dm-dialog__mode-option--on {
+  border-color: var(--new-dm-primary);
+  background: #f3ebfb;
+  color: var(--new-dm-primary-strong);
+}
+
+.new-dm-dialog__mode input:focus-visible {
+  outline: 2px solid var(--new-dm-primary);
+  outline-offset: 2px;
+}
+
+.new-dm-dialog__search {
+  padding: 0 24px 18px;
+}
+
+.new-dm-dialog__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.new-dm-dialog__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px 4px 11px;
+  border-radius: 999px;
+  background: #f3ebfb;
+  color: var(--new-dm-primary-strong);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.new-dm-dialog__chip button {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.new-dm-dialog__chip button:hover:not(:disabled) {
+  background: #e3d4f7;
+}
+
+.new-dm-dialog__chip .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.new-dm-dialog__group-name {
+  margin-top: 16px;
+}
+
+.new-dm-dialog__search input#new-dm-group-name {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid #d4cde3;
+  border-radius: 11px;
+  background: #faf8fd;
+  color: #16121f;
+  font: inherit;
+  font-size: 14px;
+}
+
+.new-dm-dialog__search input#new-dm-group-name:focus {
+  border-color: var(--new-dm-primary);
+  background: #fff;
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.12);
+}
+
+.new-dm-dialog__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 24px 18px;
+  border-top: 1px solid var(--new-dm-border);
+}
+
+.new-dm-dialog__footer-hint {
+  margin: 0;
+  color: var(--new-dm-muted);
+  font-size: 12.5px;
+}
+
+.new-dm-dialog__submit {
+  padding: 10px 18px;
+  border: 0;
+  border-radius: 11px;
+  background: var(--new-dm-primary);
+  color: #fff;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.new-dm-dialog__submit:hover:not(:disabled) {
+  background: var(--new-dm-primary-strong);
+}
+
+.new-dm-dialog__submit:disabled {
+  background: #cbc3da;
+  cursor: not-allowed;
+}
+
+.new-dm-dialog__search label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #3d3550;
+}
+
+.new-dm-dialog__search-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 12px;
+  border: 1px solid #d4cde3;
+  border-radius: 11px;
+  background: #faf8fd;
+  color: var(--new-dm-muted);
+}
+
+.new-dm-dialog__search-field:focus-within {
+  border-color: var(--new-dm-primary);
+  box-shadow: 0 0 0 3px rgba(109, 40, 217, 0.12);
+  background: #fff;
+}
+
+.new-dm-dialog__search-field .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.new-dm-dialog__search-field input {
+  width: 100%;
+  min-width: 0;
+  height: 42px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #16121f;
+  font: inherit;
+  font-size: 14px;
+}
+
+.new-dm-dialog__results {
+  min-height: 150px;
+  overflow-y: auto;
+  padding: 4px 14px 18px;
+  border-top: 1px solid var(--new-dm-border);
+}
+
+.new-dm-dialog__hint,
+.new-dm-dialog__status {
+  margin: 0;
+  padding: 28px 12px;
+  color: var(--new-dm-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.new-dm-dialog__list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 8px 0 0;
+  list-style: none;
+}
+
+.new-dm-dialog__list button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: #3d3550;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.new-dm-dialog__list button:hover:not(:disabled) {
+  background: #f3ebfb;
+  color: var(--new-dm-primary-strong);
+}
+
+.new-dm-dialog__list button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.new-dm-dialog__avatar {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.new-dm-dialog__opening {
+  margin-left: auto;
+  color: var(--new-dm-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.new-dm-dialog__error {
+  margin: 18px 10px 0;
+  padding: 11px 12px;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  background: #fee2e2;
+  color: #991b1b;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.new-dm-dialog__error button {
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.new-dm-dialog__error--open {
+  margin-top: 10px;
+}
+
+.new-dm-dialog button:focus-visible,
+.new-dm-dialog input:focus-visible {
+  outline: 2px solid var(--new-dm-primary);
+  outline-offset: 2px;
+}
+
+@media (max-width: 560px) {
+  .new-dm-dialog__backdrop {
+    align-items: end;
+    padding: 0;
+  }
+
+  .new-dm-dialog {
+    width: 100%;
+    max-height: min(78vh, 640px);
+    border-radius: 16px 16px 0 0;
+  }
+
+  .new-dm-dialog__header,
+  .new-dm-dialog__search {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+}

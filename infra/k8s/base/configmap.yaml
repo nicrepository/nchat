@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: platform
+data:
+  APP_ENV: development
+  LOG_LEVEL: info
+  LIVEKIT_ENABLED: "false"
+  LIVEKIT_TTL_SECONDS: "300"
+  READ_HEADER_TIMEOUT_SECONDS: "5"
+  AUTH_JWT_ISSUER: nchat-auth
+  AUTH_JWT_AUDIENCE: nchat-api
+  AUTH_TRUSTED_PROXY_CIDRS: ""
+  OIDC_ENABLED: "false"
+  OIDC_PROVIDER_NAME: keycloak
+  OIDC_SCOPES: openid email profile
+  OIDC_HTTP_TIMEOUT_SECONDS: "10"
+  OIDC_STATE_TTL_MINUTES: "10"
+  OIDC_AUTO_PROVISION_ENABLED: "false"
+  OIDC_ALLOWED_EMAIL_DOMAINS: ""
+  # Administrative authentication context (issue #578). Empty states no
+  # requirement; a value makes administrative single sign-on fail-closed against
+  # the `acr` the deployment's Keycloak flow emits. Not a secret — it is a
+  # policy identifier, and it must match the identity provider's configuration.
+  OIDC_ADMIN_ACR_VALUES: ""
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: nchat
+  VALKEY_HOST: valkey
+  VALKEY_PORT: "6379"
+  SEAWEEDFS_FILER_URL: http://seaweedfs-filer:8888
+  SEAWEEDFS_S3_ENDPOINT: http://seaweedfs-s3:8333
+  SMTP_WORKER_ENABLED: "false"

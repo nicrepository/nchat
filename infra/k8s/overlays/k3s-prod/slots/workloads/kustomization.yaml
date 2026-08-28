@@ -1,0 +1,71 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The slot-scoped half of production (issue #626).
+#
+# Exactly the workloads built from an NChat release image participate in
+# Blue/Green: those are the ones a release changes. Everything else in the
+# namespace — the shared ConfigMap, the ServiceAccounts, the quota, ClamAV,
+# upload-guard and the whole stateful layer — is deployed once by ../../shared
+# and is deliberately absent here, because duplicating it per slot would
+# duplicate a source of truth.
+#
+# Each directory below contributes a Deployment and the Service beside it, so a
+# slot ships with its own address (nchat-web-blue, chat-service-green, ...).
+# Those per-slot Services are what the preview routes and the candidate smoke
+# talk to; they never move between slots, so they can never be confused with the
+# stable Services that carry production traffic.
+#
+# The directories are referenced from ../../../../base rather than copied: a
+# workload added to base and not to this list would silently never get a slot,
+# so scripts/ci/prod-blue-green-check.sh compares the two and fails.
+namespace: nchat-prod
+resources:
+  - ../../../../base/web
+  - ../../../../base/admin-web
+  - ../../../../base/services/auth-service
+  - ../../../../base/services/chat-service
+  - ../../../../base/services/file-service
+  - ../../../../base/services/document-converter
+  - ../../../../base/services/notification-service
+  - ../../../../base/services/admin-service
+  - ../../../../base/services/search-service
+  - ../../../../base/services/media-service
+  - pdb.yaml
+patches:
+  - path: runtime-patch.yaml
+    target:
+      kind: Deployment
+      annotationSelector: nchat.nicrepository.io/image-placeholder=true
+  - path: web-livekit-patch.yaml
+  # The avatar claim is storage, and storage is never duplicated per slot: an
+  # avatar uploaded while Blue serves traffic has to be there after the cutover.
+  # base ships it beside auth-service, so the slot build drops it and ../../shared
+  # keeps the single claim both slots mount.
+  - patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: auth-service-avatars
+        namespace: nchat
+      $patch: delete
+  # auth-service is the one workload that stays single-replica. Its avatar
+  # volume is ReadWriteOnce and a single replica owns writes — see the comment
+  # on base/services/auth-service/avatar-pvc.yaml. During a release both slots'
+  # auth-service pods mount that one claim; the volume's node affinity puts them
+  # on the same node, and they only ever create distinct files, so the shared
+  # mount is safe but not scalable.
+  #
+  # Horizontal scaling of auth-service needs RWX or avatars in object storage,
+  # which is a data-model change and not part of issue #626.
+  - target:
+      kind: Deployment
+      name: auth-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-prod

@@ -1,0 +1,204 @@
+// Package preview turns an attachment's plaintext into the small preview the
+// client shows inline (RF-31): a raster for images and PDFs, a bounded JSON
+// table for spreadsheets and CSV.
+//
+// Everything in this package is a pure transformation: bytes in, a preview
+// out. It has no database, no storage, no authorization and no knowledge of
+// who is asking — those belong to the caller, which has already decided that
+// this content may be rendered. That separation is what keeps the risky part
+// of the feature, the decoders, small and testable.
+//
+// # Threat posture
+//
+// Both decoders are fed attacker-controlled bytes by definition, so the limits
+// below are the feature, not decoration:
+//
+//   - the source is read through a bounded reader, so no attachment larger than
+//     domain.MaxPreviewSourceBytes is ever held in memory;
+//   - an image's declared dimensions are checked from its header, before a
+//     single pixel is allocated, so a decompression bomb is refused rather than
+//     decoded;
+//   - a PDF is parsed by PDFium compiled to WebAssembly and run under wazero,
+//     in a memory-isolated sandbox with an explicit page limit and a context
+//     that closes the module when it expires. Nothing is executed by the host;
+//   - there is no subprocess, no shell, no temporary file and no path built
+//     from anything the client supplied. A hostile filename cannot reach this
+//     package at all: only bytes and a detected type do.
+//
+// Failures are classified for the caller: ErrUnsupported is an expected absence
+// (no renderer, or beyond the limits), ErrRender is an operational failure of a
+// file that claimed a supported type. Anything else is transient and worth a
+// retry.
+package preview
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"path/filepath"
+	"strings"
+
+	converterapi "github.com/nicrepository/nchat/services/file-service/internal/converter"
+	"github.com/nicrepository/nchat/services/file-service/internal/domain"
+)
+
+// Error classes. They are the whole contract with the job: one means "this will
+// never work, and that is fine", the other means "this should have worked".
+var (
+	// ErrUnsupported marks content this service will not render: a type with no
+	// decoder, or a file outside the render limits. It is permanent and
+	// expected, and the client shows an icon.
+	ErrUnsupported = errors.New("preview unsupported")
+	// ErrRender marks content that claimed a supported type and could not be
+	// rendered: malformed, truncated, encrypted, or empty of pages. It is
+	// permanent and operational.
+	ErrRender = errors.New("preview render failed")
+)
+
+// Renderer produces previews. It holds no state: a PDF render builds and tears
+// down its own sandbox, so a renderer that is never asked for a PDF costs
+// nothing and a process that has finished one holds nothing.
+type DocumentConverter interface {
+	Convert(ctx context.Context, format converterapi.Format, source io.Reader) ([]byte, error)
+}
+
+type Renderer struct{ converter DocumentConverter }
+
+// New returns the renderer used by the preview job.
+func New() *Renderer { return &Renderer{} }
+
+func NewWithDocumentConverter(converter DocumentConverter) *Renderer {
+	return &Renderer{converter: converter}
+}
+
+// Render reads src and returns every rendered page plus the one content type
+// they all share. A raster renderer (image or PDF) returns one JPEG per page,
+// each no larger than domain.MaxPreviewDimension on its longest edge — every
+// non-PDF raster is exactly one page, a PDF up to domain.MaxPreviewPDFPages,
+// bounded by the document's real page count. A spreadsheet/CSV renderer
+// returns exactly one page: a single bounded JSON table document.
+//
+// detectedMIME is the type detected from the content at upload — never a
+// declared type and never an extension. It selects the decoder; the decoder
+// then validates the bytes itself, so a mismatch fails rather than being
+// coerced.
+func (r *Renderer) Render(
+	ctx context.Context, detectedMIME string, src io.Reader,
+) ([][]byte, string, error) {
+	return r.RenderDocument(ctx, detectedMIME, "", src)
+}
+
+func (r *Renderer) RenderDocument(
+	ctx context.Context, detectedMIME, originalFilename string, src io.Reader,
+) ([][]byte, string, error) {
+	if !domain.PreviewSupported(detectedMIME) {
+		if domain.NormalizeDetectedMIME(detectedMIME) != "application/octet-stream" || !strings.EqualFold(filepath.Ext(originalFilename), ".ppt") {
+			return nil, "", fmt.Errorf("%w: no renderer for this content type", ErrUnsupported)
+		}
+	}
+	data, err := readBounded(src, domain.MaxPreviewSourceBytes)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	switch domain.NormalizeDetectedMIME(detectedMIME) {
+	case "application/pdf":
+		pages, err := renderPDFPages(ctx, data)
+		if err != nil {
+			return nil, "", err
+		}
+		return pages, domain.PreviewContentTypeJPEG, nil
+	case "text/plain":
+		// The only sniff net/http.DetectContentType ever produces for
+		// delimited text — CSV included, and indistinguishable from any other
+		// readable text at this layer. See previewableMIMEs' own comment.
+		page, err := renderCSV(data)
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
+	case "application/zip":
+		detected, err := InspectDocumentContainer(data)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: %w", ErrUnsupported, err)
+		}
+		var page []byte
+		switch detected {
+		case xlsxSpreadsheetMIME:
+			page, err = renderXLSX(data)
+		case odsSpreadsheetMIME:
+			page, err = renderODS(data)
+		case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+			return r.convertAndRasterize(ctx, converterapi.FormatDOCX, data)
+		case "application/vnd.oasis.opendocument.text":
+			return r.convertAndRasterize(ctx, converterapi.FormatODT, data)
+		case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+			return r.convertAndRasterize(ctx, converterapi.FormatPPTX, data)
+		default:
+			return nil, "", fmt.Errorf("%w: no renderer for document container", ErrUnsupported)
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{page}, domain.PreviewContentTypeSheet, nil
+	case "application/octet-stream":
+		if len(data) < 8 || !bytes.Equal(data[:8], []byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1}) {
+			return nil, "", fmt.Errorf("%w: legacy PPT candidate is not CFB", ErrUnsupported)
+		}
+		return r.convertAndRasterize(ctx, converterapi.FormatPPT, data)
+	default:
+		image, err := renderImage(data)
+		if err != nil {
+			return nil, "", err
+		}
+		return [][]byte{image}, domain.PreviewContentTypeJPEG, nil
+	}
+}
+
+func (r *Renderer) convertAndRasterize(ctx context.Context, format converterapi.Format, data []byte) ([][]byte, string, error) {
+	if r.converter == nil {
+		return nil, "", fmt.Errorf("%w: document converter unavailable", ErrUnsupported)
+	}
+	pdf, err := r.converter.Convert(ctx, format, bytes.NewReader(data))
+	if err != nil {
+		switch {
+		case errors.Is(err, converterapi.ErrBlocked):
+			return nil, "", fmt.Errorf("%w: converter blocked document", ErrUnsupported)
+		case errors.Is(err, converterapi.ErrPermanent):
+			return nil, "", fmt.Errorf("%w: converter rejected document", ErrRender)
+		default:
+			return nil, "", err
+		}
+	}
+	pages, err := renderPDFPages(ctx, pdf)
+	if err != nil {
+		return nil, "", err
+	}
+	return pages, domain.PreviewContentTypeJPEG, nil
+}
+
+// readBounded reads at most limit bytes and refuses anything longer.
+//
+// The check is "one byte past the limit", so an oversized source is detected
+// without ever being buffered. An empty source is refused here rather than in a
+// decoder, because zero bytes are not a malformed image — they are nothing.
+func readBounded(src io.Reader, limit int64) ([]byte, error) {
+	var buf bytes.Buffer
+	n, err := io.Copy(&buf, io.LimitReader(src, limit+1))
+	if err != nil {
+		// A failed read of an already stored object is transient: storage or
+		// the network, not the content.
+		return nil, fmt.Errorf("read preview source: %w", err)
+	}
+	if n > limit {
+		return nil, fmt.Errorf("%w: source exceeds the preview size limit", ErrUnsupported)
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: empty source", ErrRender)
+	}
+	return buf.Bytes(), nil
+}

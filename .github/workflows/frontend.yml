@@ -1,0 +1,108 @@
+name: Frontend
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @nchat/web exec playwright install --with-deps chromium
+
+      - name: Check web formatting
+        run: pnpm format:check:web
+
+      - name: Lint web
+        run: pnpm lint:web
+
+      - name: Typecheck web
+        run: pnpm typecheck:web
+
+      - name: Test web
+        run: pnpm test:web
+
+      - name: Test web E2E
+        run: pnpm test:e2e:web
+
+      - name: Test web coverage
+        run: pnpm test:coverage:web
+
+      - name: Build web
+        run: pnpm build:web
+
+  admin-web:
+    name: Admin console
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @nchat/admin-web exec playwright install --with-deps chromium
+
+      - name: Lint admin console
+        run: pnpm lint:admin-web
+
+      - name: Typecheck admin console
+        run: pnpm typecheck:admin-web
+
+      - name: Test admin console
+        run: pnpm test:admin-web
+
+      - name: Test admin console E2E
+        run: pnpm test:e2e:admin-web
+
+      - name: Test admin console coverage
+        run: pnpm test:coverage:admin-web
+
+      - name: Build admin console
+        run: pnpm build:admin-web

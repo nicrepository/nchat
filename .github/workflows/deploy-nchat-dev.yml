@@ -1,0 +1,55 @@
+name: Deploy nchat-dev
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: nchat-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, nchat-dev-deploy]
+    environment: nchat-dev
+    timeout-minutes: 20
+    steps:
+      - name: Validate deployment SHA
+        env:
+          DEPLOY_SHA: ${{ inputs.sha }}
+        run: '[[ "$DEPLOY_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      - name: Checkout approved commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Download image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          path: artifacts
+          merge-multiple: true
+      - name: Install verified Kustomize
+        run: scripts/deploy/nchat-dev/install-kustomize.sh
+      - name: Test deployment helpers
+        env:
+          NCHAT_DEV_NODE_IP: ${{ vars.NCHAT_DEV_NODE_IP }}
+          NCHAT_DEV_NODE_CIDR: ${{ vars.NCHAT_DEV_NODE_CIDR }}
+          NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+          NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
+        run: scripts/ci/nchat-dev-deployment-check.sh
+      - name: Deploy data, migrations and application
+        env:
+          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+          DEPLOY_SHA: ${{ inputs.sha }}
+          NCHAT_DEV_NODE_IP: ${{ vars.NCHAT_DEV_NODE_IP }}
+          NCHAT_DEV_NODE_CIDR: ${{ vars.NCHAT_DEV_NODE_CIDR }}
+          NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+          NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
+        run: scripts/deploy/nchat-dev/deploy.sh

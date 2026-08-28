@@ -1,0 +1,239 @@
+# clamav — antimalware daemon for attachment scanning (RF-22).
+#
+# file-service streams every finished upload here over clamd's INSTREAM and
+# persists the verdict. A daemon that is down never produces an approval, so
+# losing this workload leaves attachments in pending_scan rather than making
+# them downloadable. See the README beside this manifest.
+#
+# This directory lives under base/ so that one clamd.conf serves both Docker
+# Compose and Kubernetes, but it is deliberately NOT a resource of
+# base/kustomization.yaml: only the nchat-dev-server overlay renders it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clamav
+  namespace: nchat
+  labels:
+    app.kubernetes.io/name: nchat
+    app.kubernetes.io/part-of: nchat
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: clamav
+    app.kubernetes.io/version: "0.0.0"
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the engine holds ~1 GiB of signatures, so
+  # overlapping pods would book twice that against the namespace quota for no
+  # availability gain — file-service already fails closed while the scanner is
+  # away, and a queued attachment simply waits.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nchat
+      app.kubernetes.io/part-of: nchat
+      app.kubernetes.io/component: clamav
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nchat
+        app.kubernetes.io/part-of: nchat
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/component: clamav
+        app.kubernetes.io/version: "0.0.0"
+    spec:
+      # The daemon talks to nobody and nobody's API: no token, no service
+      # environment variables.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        # The image's own clamav account. Measured from the pinned image:
+        # clamav:x:100:101::/var/lib/clamav:/bin/false — the group is 101, not
+        # 100. fsGroup makes the signature emptyDir writable by the init
+        # container and readable by the daemon.
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Seeds the signature database into the emptyDir the daemon reads.
+        #
+        # A Kubernetes emptyDir does not inherit the image's content the way a
+        # Docker named volume does, so mounting one straight onto
+        # /var/lib/clamav would mask the database and clamd would refuse to
+        # start. Copying it in is what keeps start-up deterministic without a
+        # PVC, without freshclam and without a single byte of egress.
+        - name: seed-signatures
+          # Identical image and identical digest to the daemon below: the
+          # database that gets copied must come from the build that will scan
+          # with it.
+          image: clamav/clamav:1.4@sha256:d97f5ef70fbe9f1f8e5490278082067f16f5824eca2eb4176f4df3748a45a4c2
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              src=/var/lib/clamav
+              dst=/signatures
+              [ -d "$src" ] || { echo "FATAL: $src is missing from the image" >&2; exit 1; }
+              copied=0
+              # Only the signature database, named explicitly. A glob over the
+              # whole directory would copy whatever a future base image happens
+              # to leave there.
+              for file in "$src"/*.cvd "$src"/*.cld "$src"/*.cud; do
+                [ -f "$file" ] || continue
+                # Never traverse a link: the source is supposed to be plain
+                # files, and silently following one would copy something this
+                # check never looked at.
+                if [ -L "$file" ]; then
+                  echo "FATAL: unexpected symlink in $src: $file" >&2
+                  exit 1
+                fi
+                cp -- "$file" "$dst/"
+                copied=$((copied + 1))
+              done
+              [ "$copied" -gt 0 ] || { echo "FATAL: no signature database found in $src" >&2; exit 1; }
+              [ -n "$(ls -A "$dst")" ] || { echo "FATAL: $dst is empty after the copy" >&2; exit 1; }
+              # The daemon runs as this same uid; a database it cannot read is
+              # a daemon that will not start, and failing here says why.
+              for file in "$dst"/*; do
+                [ -r "$file" ] || { echo "FATAL: $file is not readable by uid $(id -u)" >&2; exit 1; }
+              done
+              echo "seeded $copied signature database file(s)"
+          # Kept well below the daemon's, because a pod's effective request is
+          # max(sum of containers, largest init container): a greedy init
+          # container would raise what the whole pod books against the quota.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: signatures
+              mountPath: /signatures
+      containers:
+        - name: clamav
+          image: clamav/clamav:1.4@sha256:d97f5ef70fbe9f1f8e5490278082067f16f5824eca2eb4176f4df3748a45a4c2
+          imagePullPolicy: IfNotPresent
+          # The image's entrypoint, but told exactly what to run.
+          #
+          # Left to its own devices, /init-unprivileged starts clamd and then
+          # blocks waiting for /tmp/clamd.sock to appear, giving up after
+          # CLAMD_STARTUP_TIMEOUT. This deployment's clamd.conf is TCP-only —
+          # no LocalSocket — so that socket never appears and the container
+          # would fail its own start-up while the daemon was answering
+          # perfectly on 3310. Passing a command takes the entrypoint's first
+          # branch, which execs it under tini and skips both the socket wait
+          # and freshclam.
+          command:
+            - /init-unprivileged
+          args:
+            - clamd
+            - --foreground
+          ports:
+            - name: clamd
+              containerPort: 3310
+          # Probes speak the protocol file-service speaks, on the port
+          # file-service uses.
+          #
+          # clamdcheck.sh — the image's own health check — is deliberately not
+          # used: it was observed reporting "Unable to contact server" against
+          # this exact configuration while PING returned PONG on 3310 and real
+          # INSTREAM scans succeeded, because it expects the unix socket this
+          # config does not create. A probe that disagrees with the consumer is
+          # worse than no probe.
+          #
+          # clamdscan --ping reads /etc/clamav/clamd.conf, finds TCPSocket and
+          # no LocalSocket, and connects over TCP. Verified against the pinned
+          # image: exit 0 on PONG, exit 21 when nothing is listening.
+          startupProbe:
+            exec:
+              command: ["clamdscan", "--ping", "1"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            # Loading ~110 MiB of signatures into ~1 GiB of engine takes tens of
+            # seconds; ten minutes of headroom keeps a slow node from turning a
+            # cold start into a restart loop.
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["clamdscan", "--ping", "1"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # TCP only, and unhurried on purpose: a liveness probe that competes
+          # with a 512 MiB scan for the daemon's attention is a probe that
+          # restarts the pod mid-scan. Accepting the connection is enough to
+          # say the process is alive; whether it is *ready* is the readiness
+          # probe's question.
+          livenessProbe:
+            tcpSocket:
+              port: clamd
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          # Measured, not guessed: ~945 MiB resident at idle and ~1 GiB peak
+          # while streaming a 512 MiB attachment, with CPU peaking near 177%.
+          # The memory limit is ~3x the observed peak because the measurement
+          # used an incompressible flat file and does not represent the worst
+          # case for archive and document parsers. The CPU limit is the one the
+          # design review lowered from 1500m so the namespace keeps 500m of
+          # limits.cpu headroom; the resulting throttling can only stretch a
+          # scan that took 4.3 s against a 300 s budget.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: 1250m
+              memory: 3Gi
+              ephemeral-storage: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/clamav/clamd.conf
+              subPath: clamd.conf
+              readOnly: true
+            - name: signatures
+              mountPath: /var/lib/clamav
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: clamav-config
+        # Bounded because the daemon handles files it did not choose. The worst
+        # case for one scan is the INSTREAM spool (StreamMaxLength, 512 MiB)
+        # plus what archive scanning unpacks (MaxScanSize, 1 GiB); one scan runs
+        # at a time, since the worker claims a single attachment per pass. An
+        # emptyDir without a ceiling is how a user-supplied file fills the
+        # node's disk.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        # The signature database is ~110 MiB in the pinned image. 1Gi leaves
+        # room for it to grow across image bumps; a bump that outgrows the
+        # ceiling fails the init container, the pod never starts, and nothing
+        # is approved — visible and closed, which is the right failure.
+        - name: signatures
+          emptyDir:
+            sizeLimit: 1Gi

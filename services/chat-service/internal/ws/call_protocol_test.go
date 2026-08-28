@@ -1,0 +1,420 @@
+package ws
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+)
+
+const (
+	callTestWorkspace     = "00000000-0000-4000-8000-000000000101"
+	callTestRequest       = "00000000-0000-4000-8000-000000000102"
+	callTestID            = "00000000-0000-4000-8000-000000000103"
+	callTestCaller        = "00000000-0000-4000-8000-000000000104"
+	callTestCallee        = "00000000-0000-4000-8000-000000000105"
+	callTestOutsider      = "00000000-0000-4000-8000-000000000106"
+	callTestParticipation = "00000000-0000-4000-8000-000000000107"
+)
+
+type fakeCallHandler struct {
+	call                    domain.Call
+	started                 StartCallCommand
+	action                  ClientMessageType
+	actorID                 string
+	callID                  string
+	presenceCallID          string
+	syncCallID              string
+	leaveActorID            string
+	leaveCallID             string
+	found                   bool
+	observedAt              time.Time
+	joinCallID              string
+	joinTargetType          TargetType
+	joinTargetID            string
+	participationID         string
+	presenceParticipationID string
+	leaveParticipationID    string
+	leaveReleased           bool
+	err                     error
+}
+
+func (h *fakeCallHandler) StartCall(_ context.Context, command StartCallCommand) (domain.Call, string, error) {
+	h.started = command
+	return h.call, h.participationID, h.err
+}
+
+func (h *fakeCallHandler) TransitionCall(_ context.Context, workspaceID, actorID, callID string, action ClientMessageType) (domain.Call, error) {
+	h.action, h.actorID, h.callID = action, actorID, callID
+	return h.call, h.err
+}
+
+func (h *fakeCallHandler) CurrentCall(_ context.Context, _, _, callID string) (domain.Call, error) {
+	h.syncCallID = callID
+	return h.call, h.err
+}
+
+func (h *fakeCallHandler) RenewCallPresence(_ context.Context, _ string, actorID, callID, participationID string) error {
+	h.actorID, h.presenceCallID, h.presenceParticipationID = actorID, callID, participationID
+	return h.err
+}
+
+func (h *fakeCallHandler) LeaveCall(_ context.Context, _ string, actorID, callID, participationID string) (domain.Call, bool, error) {
+	h.leaveActorID, h.leaveCallID, h.leaveParticipationID = actorID, callID, participationID
+	return h.call, h.leaveReleased, h.err
+}
+
+func (h *fakeCallHandler) ResourceSync(_ context.Context, _, _ string, _ TargetType, _ string) (domain.Call, bool, time.Time, error) {
+	return h.call, h.found, h.observedAt, h.err
+}
+
+func (h *fakeCallHandler) JoinCall(_ context.Context, _, _, callID string, targetType TargetType, targetID string) (domain.Call, string, error) {
+	h.joinCallID, h.joinTargetType, h.joinTargetID = callID, targetType, targetID
+	return h.call, h.participationID, h.err
+}
+
+type allowCallLimiter struct{ allowed bool }
+
+func (l allowCallLimiter) AllowActionWithLimit(context.Context, string, string, int, int) (bool, error) {
+	return l.allowed, nil
+}
+
+func callProtocolCall(status domain.CallStatus, version int64) domain.Call {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	return domain.Call{
+		ID: callTestID, WorkspaceID: callTestWorkspace, RequestID: callTestRequest,
+		CallerID: callTestCaller, CalleeID: callTestCallee, Type: domain.CallTypeVideo,
+		Status: status, Version: version, CreatedAt: now, UpdatedAt: now,
+		ExpiresAt: now.Add(30 * time.Second),
+	}
+}
+
+func TestCallStartUsesAuthenticatedClientIdentity(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusRinging, 1)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-test",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("caller-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register caller")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetUserID: callTestCallee, CallType: domain.CallTypeVideo,
+	})
+	if err != nil {
+		t.Fatalf("start call: %v", err)
+	}
+	if handler.started.CallerID != callTestCaller || handler.started.WorkspaceID != callTestWorkspace {
+		t.Fatalf("identity did not come from session: %+v", handler.started)
+	}
+}
+
+func TestCallSyncByIDUsesAuthenticatedIdentityAndRepliesOnlyToRequester(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 2)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-sync-test", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("sync-client", callTestCallee, callTestWorkspace, &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallSync, CallID: callTestID,
+	})
+	if err != nil {
+		t.Fatalf("sync call: %v", err)
+	}
+	if handler.syncCallID != callTestID || handler.actorID != "" {
+		t.Fatalf("unexpected sync input: call=%q actor side effect=%q", handler.syncCallID, handler.actorID)
+	}
+	select {
+	case payload := <-client.outbox:
+		var event Event
+		if err := json.Unmarshal(payload, &event); err != nil || event.Call == nil || event.Call.ID != callTestID {
+			t.Fatalf("unexpected sync response: %s (%v)", payload, err)
+		}
+	default:
+		t.Fatal("expected direct sync response")
+	}
+}
+
+func TestResourceCallStartAndPresenceUseAuthenticatedClientIdentity(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1), participationID: callTestParticipation}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-call-test",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("caller-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register caller")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
+	})
+	if err != nil {
+		t.Fatalf("start resource call: %v", err)
+	}
+	if handler.started.CallerID != callTestCaller || handler.started.TargetType != TargetTypeChannel ||
+		handler.started.TargetID != callTestCallee {
+		t.Fatalf("resource command=%+v", handler.started)
+	}
+
+	if err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallPresence, CallID: callTestID, ParticipationID: callTestParticipation,
+	}); err != nil {
+		t.Fatalf("presence: %v", err)
+	}
+	if handler.actorID != callTestCaller || handler.presenceCallID != callTestID ||
+		handler.presenceParticipationID != callTestParticipation {
+		t.Fatalf("presence actor=%q call=%q", handler.actorID, handler.presenceCallID)
+	}
+}
+
+func TestResourceCallStartBusyProducesParticipantBusyCallError(t *testing.T) {
+	handler := &fakeCallHandler{err: domain.ErrCallParticipantBusy}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "resource-call-busy-test",
+		WithCallHandler(handler), WithCallLimiter(allowCallLimiter{allowed: true}, 10, 60))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("busy-resource-client", callTestCaller, callTestWorkspace, &fakeSender{})
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallStart, RequestID: callTestRequest,
+		TargetType: TargetTypeChannel, TargetID: callTestCallee, CallType: domain.CallTypeVideo,
+	})
+	if !errors.Is(err, domain.ErrCallParticipantBusy) ||
+		!handleCallClientError(client, ClientMessageTypeCallStart, "", "", err) {
+		t.Fatalf("unexpected resource start error: %v", err)
+	}
+
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode call error: %v", err)
+	}
+	if response.Type != "call.error" || response.Operation != "call.start" ||
+		response.Code != "call_participant_busy" {
+		t.Fatalf("unexpected call error: %+v", response)
+	}
+}
+
+func TestCallCommandValidationRejectsClientControlledIdentity(t *testing.T) {
+	_, err := decodeClientMessage([]byte(`{"type":"call.start","request_id":"` + callTestRequest +
+		`","target_user_id":"` + callTestCallee + `","call_type":"audio","actor_user_id":"` + callTestOutsider + `"}`))
+	if err == nil {
+		t.Fatal("client-controlled actor_user_id must be rejected")
+	}
+}
+
+func TestPublishCallDeliversOnlyToParticipants(t *testing.T) {
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-publisher")
+	t.Cleanup(hub.Shutdown)
+	caller := newClient("caller", callTestCaller, callTestWorkspace, &fakeSender{})
+	callee := newClient("callee", callTestCallee, callTestWorkspace, &fakeSender{})
+	outsider := newClient("outsider", callTestOutsider, callTestWorkspace, &fakeSender{})
+	for _, client := range []*Client{caller, callee, outsider} {
+		if !hub.Register(client) {
+			t.Fatal("register client")
+		}
+	}
+
+	hub.PublishCall(context.Background(), callProtocolCall(domain.CallStatusActive, 2))
+	waitForOutbox(caller, 1)
+	waitForOutbox(callee, 1)
+	if len(outsider.outbox) != 0 {
+		t.Fatal("outsider received call event")
+	}
+	for _, client := range []*Client{caller, callee} {
+		var event Event
+		if err := json.Unmarshal(<-client.outbox, &event); err != nil {
+			t.Fatalf("decode call event: %v", err)
+		}
+		if event.Type != EventTypeCallAccepted || event.Call == nil || event.Call.Version != 2 {
+			t.Fatalf("unexpected event: %+v", event)
+		}
+	}
+}
+
+func TestPublishResourceCallUsesAuthorizedTargetSubscription(t *testing.T) {
+	auth := &fakeAuthorizer{}
+	auth.setAccess(callTestCaller, callTestWorkspace, TargetTypeChannel, callTestCallee, true)
+	hub := NewHub(auth, newTestLogger(), NopBus{}, "resource-call-publisher")
+	t.Cleanup(hub.Shutdown)
+	member := newClient("member", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(member) {
+		t.Fatal("register member")
+	}
+	if err := hub.Subscribe(context.Background(), member, TargetTypeChannel, callTestCallee); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	call := callProtocolCall(domain.CallStatusActive, 1)
+	call.CalleeID = ""
+	call.TargetType = domain.CallTargetChannel
+	call.TargetID = callTestCallee
+	hub.PublishCall(context.Background(), call)
+	waitForOutbox(member, 1)
+	var event Event
+	if err := json.Unmarshal(<-member.outbox, &event); err != nil {
+		t.Fatalf("decode event: %v", err)
+	}
+	if event.TargetType != TargetTypeChannel || event.TargetID != callTestCallee ||
+		event.Call == nil || event.Call.TargetType != domain.CallTargetChannel {
+		t.Fatalf("resource event=%+v", event)
+	}
+}
+
+func TestResourceCallLeaveUsesAuthenticatedIdentityAndAcksOnlyTheRequester(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 2), leaveReleased: true}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-leave-test", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	requester := newClient("leaver-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	other := newClient("other-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	for _, client := range []*Client{requester, other} {
+		if !hub.Register(client) {
+			t.Fatal("register client")
+		}
+	}
+
+	err := hub.handleClientMessage(context.Background(), requester, ClientMessage{
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation,
+	})
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if handler.leaveActorID != callTestCaller || handler.leaveCallID != callTestID ||
+		handler.leaveParticipationID != callTestParticipation {
+		t.Fatalf("leave actor=%q call=%q", handler.leaveActorID, handler.leaveCallID)
+	}
+
+	// The requester receives an explicit command result, never a lifecycle
+	// event reused as an ACK. A leave that does not end the call must never
+	// reach anyone else.
+	select {
+	case payload := <-requester.outbox:
+		var response struct {
+			Type       string           `json:"type"`
+			Operation  string           `json:"operation"`
+			ResponseTo string           `json:"response_to"`
+			Released   bool             `json:"released"`
+			Call       CallEventPayload `json:"call"`
+		}
+		if err := json.Unmarshal(payload, &response); err != nil || response.Type != "call.left" ||
+			response.Operation != "call.leave" || response.ResponseTo != callTestRequest ||
+			!response.Released || response.Call.ID != callTestID {
+			t.Fatalf("unexpected leave ack: %s (%v)", payload, err)
+		}
+	default:
+		t.Fatal("expected a direct leave ack")
+	}
+	if len(other.outbox) != 0 {
+		t.Fatal("a non-terminal leave must not reach other participants")
+	}
+}
+
+func TestResourceCallLeaveRejectsUnexpectedFields(t *testing.T) {
+	handler := &fakeCallHandler{call: callProtocolCall(domain.CallStatusActive, 1)}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-leave-validation", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("leaver-client", callTestCaller, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register client")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation, TargetType: TargetTypeChannel,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want invalid input", err)
+	}
+}
+
+// Issue #569 follow-up: an unauthorized call.leave (storage now returns
+// domain.ErrNotFound for it, same as a call_id that does not exist at all —
+// see TestPGXCallStoreLeaveResourceCallRejectsUnauthorizedActorWithoutMetadata)
+// must map through the exact same generic call.error the hub already sends
+// for every other "not found" call command, carrying no call metadata and no
+// distinct code that would let a prober tell "not found" apart from
+// "found, but you're not authorized for it".
+func TestResourceCallLeaveUnauthorizedMapsToTheSameGenericNotFoundError(t *testing.T) {
+	handler := &fakeCallHandler{err: domain.ErrNotFound}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-leave-errors", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("outsider-client", callTestOutsider, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register outsider")
+	}
+
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallLeave, RequestID: callTestRequest, CallID: callTestID,
+		ParticipationID: callTestParticipation,
+	})
+	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallLeave, callTestID, callTestRequest, err) {
+		t.Fatalf("unexpected error classification: %v", err)
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode call error: %v", err)
+	}
+	if response.Code != "call_not_found" || response.Operation != "call.leave" {
+		t.Fatalf("unexpected call error: %+v", response)
+	}
+}
+
+func TestCallErrorsAreStableAndDoNotConsumeInvalidBudget(t *testing.T) {
+	handler := &fakeCallHandler{err: domain.ErrNotFound}
+	hub := NewHub(&fakeAuthorizer{}, newTestLogger(), NopBus{}, "call-errors", WithCallHandler(handler))
+	t.Cleanup(hub.Shutdown)
+	client := newClient("callee-client", callTestCallee, callTestWorkspace, &fakeSender{})
+	if !hub.Register(client) {
+		t.Fatal("register callee")
+	}
+	err := hub.handleClientMessage(context.Background(), client, ClientMessage{
+		Type: ClientMessageTypeCallAccept, CallID: callTestID,
+	})
+	if !errors.Is(err, domain.ErrNotFound) || !handleCallClientError(client, ClientMessageTypeCallAccept, callTestID, "", err) {
+		t.Fatalf("unexpected error classification: %v", err)
+	}
+	var response clientErrorResponse
+	if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+		t.Fatalf("decode call error: %v", err)
+	}
+	if response.Code != "call_not_found" || response.Operation != "call.accept" {
+		t.Fatalf("unexpected call error: %+v", response)
+	}
+}
+
+// TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback covers issue
+// #575: domain.ErrCallParticipantBusy wraps domain.ErrConflict, so its case
+// in handleCallClientError's switch MUST be evaluated before the generic
+// errors.Is(callErr, domain.ErrConflict) case, or every busy rejection would
+// keep falling through to the misleading "call already changed state"
+// message. A plain domain.ErrConflict (a real lifecycle/version conflict)
+// must still map to call_invalid_state, unchanged.
+func TestCallErrorClassifiesBusyBeforeTheGenericConflictFallback(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{name: "busy participant", err: domain.ErrCallParticipantBusy, wantCode: "call_participant_busy"},
+		{name: "real lifecycle conflict", err: domain.ErrConflict, wantCode: "call_invalid_state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newClient("busy-client", callTestCaller, callTestWorkspace, &fakeSender{})
+			if !handleCallClientError(client, ClientMessageTypeCallStart, "", "", test.err) {
+				t.Fatal("expected call error to be handled")
+			}
+			var response clientErrorResponse
+			if err := json.Unmarshal(<-client.outbox, &response); err != nil {
+				t.Fatalf("decode call error: %v", err)
+			}
+			if response.Code != test.wantCode || response.Operation != "call.start" {
+				t.Fatalf("unexpected call error: %+v, want code %q", response, test.wantCode)
+			}
+		})
+	}
+}

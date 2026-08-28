@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# The whole of production, for rendering and validation only.
+#
+# Nothing applies this. A release applies ./shared once, then ./slots/<candidate>
+# and ./migrations per release — applying both slots together would overwrite the
+# live slot with whatever image its committed Kustomization happens to name.
+#
+# It exists so that CI can see production as one picture and assert the
+# invariants that only hold across the pieces: that every release workload has
+# both a Blue and a Green Deployment, that no Deployment is missing a slot, that
+# each stable Service selects exactly one slot, that the Ingresses reach only
+# stable Services and the previews only per-slot ones, and that no production
+# image reference is mutable. See scripts/ci/prod-blue-green-check.sh.
+namespace: nchat-prod
+resources:
+  - shared
+  - slots/blue
+  - slots/green
+  - migrations

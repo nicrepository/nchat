@@ -1,0 +1,210 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nchat-dev
+components:
+  - ../../components/least-privilege-network-policies
+resources:
+  - ../../base
+  # ClamAV is referenced here and only here. It lives under base/services/ so
+  # that one clamd.conf serves both Compose and Kubernetes, but it is not a
+  # resource of base/kustomization.yaml: k3s-dev and k3s-staging do not enable
+  # uploads and must not render a 1 GiB scanner they never call.
+  - ../../base/services/clamav
+  - ../../secrets/sealed/nchat-dev
+  - certificate.yaml
+  - ingress.yaml
+  - media.yaml
+configMapGenerator:
+  - name: nchat-dev-topology
+    envs:
+      - topology.env
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  - target:
+      kind: Namespace
+      name: nchat
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: nchat-dev
+  - path: configmap-patch.yaml
+  - path: quota-patch.yaml
+  - path: patches/web.yaml
+  - path: patches/auth-service.yaml
+  - path: patches/chat-service.yaml
+  - path: patches/file-service.yaml
+  - path: patches/notification-service.yaml
+  - path: patches/admin-service.yaml
+  - path: patches/search-service.yaml
+  - path: patches/media-service.yaml
+  - target:
+      kind: Deployment
+      annotationSelector: nchat.nicrepository.io/image-placeholder=true
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value:
+          - name: ghcr-pull
+images:
+  - name: ghcr.io/nicrepository/nchat/web
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/admin-web
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/auth-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/chat-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/document-converter
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/file-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/notification-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/admin-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/search-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/media-service
+    newTag: sha-placeholder
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-dev
+# NOTE: a replacement target's select.kind/select.name match the resource's
+# exact Kind and metadata.name (resid.ResId.IsSelectedBy does a plain string
+# comparison, not a regex) — so `kind: Ingress` cannot match `IngressRoute`
+# and `name: nchat-dev` cannot match `nchat-dev-uploads`. Anchoring these
+# values (e.g. `^Ingress$`) would instead break the match: it compares the
+# literal anchored string against the unanchored Kind/name and never equals.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-dev-tls
+        fieldPaths:
+          - spec.dnsNames.0
+      - select:
+          kind: Ingress
+          name: nchat-dev
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+      - select:
+          kind: IngressRoute
+          name: nchat-dev-uploads
+        fieldPaths:
+          - spec.routes.0.match
+        options:
+          delimiter: "`"
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-dev-livekit
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+      - select:
+          kind: Ingress
+          name: nchat-dev-http
+        fieldPaths:
+          - spec.rules.0.host
+  # The administrative console host (issue #578): the fixed label "admin" under
+  # the deployment host, so it cannot drift from the deployment's own domain and
+  # no operator has to restate it.
+  #
+  # The targets below hold "admin.REPLACE_ME_ADMIN_HOST"; the delimiter splits
+  # that on the first dot and replaces only the second segment, leaving the
+  # label intact. Deriving it here rather than in the deploy shell is what makes
+  # every renderer — the CI contract checks included — produce the same host.
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_HOST
+    targets:
+      - select:
+          kind: Certificate
+          name: nchat-dev-tls
+        fieldPaths:
+          - spec.dnsNames.1
+        options:
+          delimiter: "."
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-dev-admin
+        fieldPaths:
+          - spec.tls.0.hosts.0
+          - spec.rules.0.host
+        options:
+          delimiter: "."
+          index: 1
+      - select:
+          kind: Ingress
+          name: nchat-dev-http
+        fieldPaths:
+          - spec.rules.1.host
+        options:
+          delimiter: "."
+          index: 1
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.NCHAT_DEV_PUBLIC_URL
+    targets:
+      - select:
+          kind: ConfigMap
+          name: nchat-config
+        fieldPaths:
+          - data.AUTH_PUBLIC_WEB_BASE_URL
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_API_PORT
+    targets:
+      - select:
+          kind: Service
+          name: livekit
+        fieldPaths:
+          - spec.ports.[name=http].port
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=http].containerPort
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_RTC_TCP_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=rtc-tcp].containerPort
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.LIVEKIT_RTC_UDP_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: livekit
+        fieldPaths:
+          - spec.template.spec.containers.[name=livekit].ports.[name=rtc-udp].containerPort
+  - source:
+      kind: ConfigMap
+      name: nchat-dev-topology
+      fieldPath: data.TURN_LISTEN_PORT
+    targets:
+      - select:
+          kind: Deployment
+          name: coturn
+        fieldPaths:
+          - spec.template.spec.containers.[name=coturn].ports.[name=turn-tcp].containerPort
+          - spec.template.spec.containers.[name=coturn].ports.[name=turn-udp].containerPort

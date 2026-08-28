@@ -1,0 +1,453 @@
+tls:
+  certificates:
+    - certFile: /certs/nchat.local.pem
+      keyFile: /certs/nchat.local-key.pem
+  options:
+    default:
+      minVersion: VersionTLS13
+      sniStrict: true
+
+http:
+  routers:
+    traefik-dashboard:
+      entryPoints:
+        - dashboard
+      rule: PathPrefix(`/api`) || PathPrefix(`/dashboard`)
+      service: api@internal
+
+    nchat-auth-health:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && (Path(`/api/auth/healthz`) || Path(`/api/auth/readyz`) || Path(`/api/auth/version`))
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-probe-prefix
+
+    nchat-auth-health-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && (Path(`/api/auth/healthz`) || Path(`/api/auth/readyz`) || Path(`/api/auth/version`))
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-probe-prefix
+      tls: {}
+
+    nchat-auth:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 100
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-api-prefix
+
+    nchat-auth-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 100
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-api-prefix
+      tls: {}
+
+    nchat-chat-health:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && (Path(`/api/chat/healthz`) || Path(`/api/chat/readyz`) || Path(`/api/chat/version`))
+      priority: 200
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+
+    nchat-chat-health-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && (Path(`/api/chat/healthz`) || Path(`/api/chat/readyz`) || Path(`/api/chat/version`))
+      priority: 200
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-chat-prefix
+      tls: {}
+
+    nchat-chat:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/chat`)
+      priority: 100
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+
+    nchat-chat-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/chat`)
+      priority: 100
+      service: chat-service
+      middlewares:
+        - security-headers
+        - compress
+      tls: {}
+
+    # RF-32: only the two attachment upload routes go through the upload guard,
+    # which caps the request body while streaming it. Higher priority than
+    # nchat-files below, and narrowed by method and path so nothing else — not
+    # health, not download, not listing — pays the extra hop or could be used to
+    # reach file-service around the cap.
+    nchat-files-upload:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      service: upload-guard
+      middlewares:
+        - security-headers
+        - upload-inflight
+        - strip-files-prefix
+
+    nchat-files-upload-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && Method(`POST`) && PathRegexp(`^/api/files/(channels|dm)/[^/]+/attachments$`)
+      priority: 200
+      service: upload-guard
+      middlewares:
+        - security-headers
+        - upload-inflight
+        - strip-files-prefix
+      tls: {}
+
+    nchat-files:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/files`)
+      priority: 100
+      service: file-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-files-prefix
+
+    nchat-files-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/files`)
+      priority: 100
+      service: file-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-files-prefix
+      tls: {}
+
+    nchat-notifications:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/notifications`)
+      priority: 100
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-notifications-prefix
+
+    nchat-notifications-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/notifications`)
+      priority: 100
+      service: notification-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-notifications-prefix
+      tls: {}
+
+    # There is deliberately no /api/admin router on nchat.local. The Admin API
+    # is published only on admin.nchat.local (see nchat-admin-console-api
+    # below), so a request forged from the chat origin — by injected script, for
+    # instance — reaches no administrative backend at all. Removing the route is
+    # what makes that true; hiding a link in the frontend would not.
+
+    nchat-search:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/search`)
+      priority: 100
+      service: search-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-search-prefix
+
+    nchat-search-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/search`)
+      priority: 100
+      service: search-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-search-prefix
+      tls: {}
+
+    nchat-media:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/api/media`)
+      priority: 100
+      service: media-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-media-prefix
+
+    nchat-media-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/api/media`)
+      priority: 100
+      service: media-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-media-prefix
+      tls: {}
+
+    # ── Console administrativo (issue #578) ─────────────────────────────────
+    #
+    # Host proprio, mesmo em desenvolvimento. Rodar o console em admin.nchat.local
+    # em vez de num path de nchat.local e o que faz o ambiente local exercitar a
+    # mesma fronteira que producao: o cookie __Host- do console nao e visivel
+    # para a origem do chat, a CSP e outra, e a Admin API e same-origin para o
+    # console e cross-origin para todo o resto.
+    #
+    # Tres rotas e nada mais chegam a este host: o bundle, a Admin API e o
+    # auth-service usado no login.
+    nchat-admin-console-api:
+      entryPoints:
+        - web
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/api/admin`)
+      priority: 200
+      service: admin-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-admin-prefix
+
+    nchat-admin-console-api-https:
+      entryPoints:
+        - websecure
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/api/admin`)
+      priority: 200
+      service: admin-service
+      middlewares:
+        - security-headers
+        - compress
+        - strip-admin-prefix
+      tls: {}
+
+    nchat-admin-console-auth:
+      entryPoints:
+        - web
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-api-prefix
+
+    nchat-admin-console-auth-https:
+      entryPoints:
+        - websecure
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/api/auth`)
+      priority: 200
+      service: auth-service
+      middlewares:
+        - security-headers
+        - compress
+        - rewrite-auth-api-prefix
+      tls: {}
+
+    nchat-admin-console:
+      entryPoints:
+        - web
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: admin-web
+      middlewares:
+        - security-headers
+        - compress
+
+    nchat-admin-console-https:
+      entryPoints:
+        - websecure
+      rule: Host(`admin.nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: admin-web
+      middlewares:
+        - security-headers
+        - compress
+      tls: {}
+
+    nchat-web:
+      entryPoints:
+        - web
+      rule: Host(`nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: web
+      middlewares:
+        - security-headers
+        - compress
+
+    nchat-web-https:
+      entryPoints:
+        - websecure
+      rule: Host(`nchat.local`) && PathPrefix(`/`)
+      priority: 1
+      service: web
+      middlewares:
+        - security-headers
+        - compress
+      tls: {}
+
+  services:
+    web:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:5173
+
+    admin-web:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:5174
+
+    auth-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8081
+
+    chat-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8082
+
+    file-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8083
+
+    upload-guard:
+      loadBalancer:
+        servers:
+          - url: http://nchat-upload-guard:8080
+
+    notification-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8084
+
+    admin-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8085
+
+    search-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8086
+
+    media-service:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8087
+
+  middlewares:
+    security-headers:
+      headers:
+        browserXssFilter: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+        customResponseHeaders:
+          X-Gateway: traefik-local
+
+    compress:
+      compress: {}
+
+    # RF-32: a conservative ceiling on concurrent upload requests reaching the
+    # gateway, as infrastructure defence in depth.
+    #
+    # It is a total per router, not per source: the sources here sit behind
+    # corporate NAT and other proxies, so an IP-keyed limit would either punish
+    # a whole office sharing one address or be trivially spread across a v6
+    # prefix. A flat ceiling is honest about what it protects — the gateway —
+    # and leaves per-user fairness to the place that knows who the user is.
+    #
+    # It is deliberately above the cluster-wide slot count enforced by
+    # file-service (FILE_UPLOAD_MAX_CONCURRENT), so this never becomes the
+    # binding limit: file-service answers 429/503 with a code and a Retry-After,
+    # which is a far better answer than a proxy rejection. This middleware
+    # substitutes for none of authentication, authorization, the per-user limit,
+    # distributed admission control or the real stream cap.
+    upload-inflight:
+      inFlightReq:
+        amount: 16
+
+    rewrite-auth-api-prefix:
+      replacePathRegex:
+        regex: "^/api/auth/(.*)"
+        replacement: "/auth/${1}"
+
+    rewrite-auth-probe-prefix:
+      replacePathRegex:
+        regex: "^/api/auth/(healthz|readyz|version)$"
+        replacement: "/${1}"
+
+    strip-chat-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/chat
+
+    strip-files-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/files
+
+    strip-notifications-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/notifications
+
+    strip-admin-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/admin
+
+    strip-search-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/search
+
+    strip-media-prefix:
+      stripPrefix:
+        prefixes:
+          - /api/media

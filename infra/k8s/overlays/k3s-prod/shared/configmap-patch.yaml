@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+# One ConfigMap, mounted identically by both slots. Every key here is a
+# deliberate production value, not a default that happens to be right: a slot
+# that inherited a different implicit default from the other would be an
+# untested configuration rather than an untested version, which is the one thing
+# Blue/Green must never be.
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  # Filled from topology.env by the replacement in kustomization.yaml. Both
+  # slots read this one value, which is what keeps the public callback on the
+  # stable host: a slot must never publish itself as the application's address.
+  AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
+  # k3s pod CIDR. The gateway is the only trusted hop in front of the services.
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
+
+  # --- realtime ---------------------------------------------------------
+  # Not optional in production, and stated rather than defaulted (the code
+  # default is false).
+  #
+  # chat-service falls back to ws.NopBus and pod-local presence when this is
+  # off. Production runs two replicas of chat-service in the active slot alone,
+  # and during a release the previous slot's replicas are still holding the
+  # WebSockets that have not reconnected yet. Without the Valkey bus a message
+  # published on one pod never reaches a subscriber on another, so a user would
+  # see their own messages and nobody else's — and the failure would look like
+  # a realtime bug rather than a missing key.
+  VALKEY_WS_BROADCAST_ENABLED: "true"
+  # chat-service sends 1 call.sync + 12 subscribe messages right after open
+  # (issue #455); raising only the burst absorbs that spike while the sustained
+  # rate stays at the code default.
+  WS_INBOUND_BURST: "60"
+
+  # --- attachments ------------------------------------------------------
+  # Uploads are a production feature, so the flag is on. With it off the routes
+  # answer 503 "attachment uploads are disabled", which is the documented
+  # behaviour of the default and not a fault — which is exactly why leaving it
+  # implicit would have shipped a silently crippled production.
+  FILE_UPLOADS_ENABLED: "true"
+  # Never false. A fresh upload stays in pending_scan and no byte derived from
+  # it is served until a real scan approves it.
+  FILE_MALWARE_SCAN_REQUIRED: "true"
+  # The shared ClamAV Service rendered by this same overlay
+  # (base/services/clamav/service.yaml, port 3310). Plain host:port dial target:
+  # no scheme, no path, no credentials. One scanner for both slots — an
+  # attachment accepted while Blue serves must be readable after the cutover.
+  FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
+  # The external, fail-closed authority over one scan. It must stay below
+  # clamd's own MaxScanTime (420000 ms) and it derives the worker's claim lease;
+  # the ordering 300 < 330 < 420 is asserted in CI.
+  FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"
+
+  # --- calls ------------------------------------------------------------
+  LIVEKIT_ENABLED: "true"
+  LIVEKIT_TTL_SECONDS: "300"
+  # The browser's connect-src allowlist for the media plane, filled from
+  # topology.env. Both slots read this one key, so the two of them address the
+  # same shared LiveKit — LiveKit is deliberately not part of the Blue/Green
+  # rotation. An empty value with LIVEKIT_ENABLED=true would leave the CSP
+  # blocking the very connection the feature needs, so
+  # scripts/ci/prod-blue-green-check.sh refuses that combination.
+  NCHAT_WEB_LIVEKIT_CONNECT_SRC: REPLACE_ME_LIVEKIT_CONNECT_SRC
+  # Where media-service tells the browser to connect, and where media-service
+  # itself probes LiveKit for readiness. One value, because the code has one:
+  # config.LiveKitAPIURL is handed to the token handler, returned to the client
+  # as the response's `serverUrl`, and dialled server-side by the critical
+  # `livekit-api` health check.
+  #
+  # It names the external media plane: one LiveKit deployment on AWS, the same
+  # one nchat-dev uses. This cluster runs no LiveKit, publishes none, and
+  # forwards no media ports. So the browser dials that host directly and WebRTC
+  # never touches this deployment's Traefik; a value on nchat.nic-labs.com would
+  # mean it did.
+  #
+  # Scheme and host only: the LiveKit SDK appends its own paths. Filled from
+  # NCHAT_PROD_LIVEKIT_URL by the replacement in kustomization.yaml, because an
+  # external host cannot be derived from this deployment's own.
+  #
+  # This is NOT the same thing as NCHAT_WEB_LIVEKIT_CONNECT_SRC above, which is
+  # a CSP allowlist carrying both schemes. They must name the same host, and
+  # prod-blue-green-check asserts exactly that.
+  #
+  # LIVEKIT_API_KEY and LIVEKIT_API_SECRET are not here: they are credentials
+  # and come from the sealed nchat-secrets, per slot, through envFrom.
+  LIVEKIT_API_URL: REPLACE_ME_LIVEKIT_URL
+
+  # --- storage ----------------------------------------------------------
+  # Explicitly removed, not merely unset. base/configmap.yaml declares
+  # SEAWEEDFS_S3_ENDPOINT=http://seaweedfs-s3:8333 for a gateway this
+  # deployment does not run: `weed server` is started without -s3 and no Service
+  # by that name is rendered, so the address resolves to nothing.
+  #
+  # Nothing consumes it either. file-service reads SEAWEEDFS_FILER_URL and only
+  # that; the single other reference in the repository is admin-service's
+  # read-only configuration catalogue, which merely displays whichever
+  # infrastructure variables are set and is unaffected by one being absent --
+  # nchat-dev has removed this same key for the same reason and the console
+  # handles it. Inheriting it would leave production's ConfigMap advertising a
+  # dead address, which is the kind of configuration someone later mistakes for
+  # a requirement and builds on.
+  #
+  # A null value removes the key from the generated ConfigMap rather than
+  # setting it to the empty string, so the absence is unambiguous.
+  # SEAWEEDFS_FILER_URL is deliberately left at base's value: it names
+  # seaweedfs-filer, the Service the stateful layer publishes for exactly this.
+  SEAWEEDFS_S3_ENDPOINT: null
+
+  # --- identity ---------------------------------------------------------
+  OIDC_ENABLED: "true"
+  OIDC_AUTO_PROVISION_ENABLED: "true"
+
+  # --- link safety ------------------------------------------------------
+  # Written out rather than left absent: the application default is also false,
+  # so a silently missing key and a deliberate "no" would look identical. Off
+  # until the provider's behaviour is judged fit to gate production messages;
+  # turning it on requires the nchat-link-safety Secret to exist first, because
+  # both services refuse to start rather than accept links nobody checked.
+  CHAT_LINK_SAFETY_ENABLED: "false"
+  FILE_LINK_SAFETY_ENABLED: "false"
+
+  SMTP_WORKER_ENABLED: "true"

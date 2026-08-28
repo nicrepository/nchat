@@ -1,0 +1,128 @@
+# Upload guard — static request-body ceiling for attachment uploads (RF-32).
+#
+# Why this exists at all: Traefik v3.6 has exactly one native way to cap a
+# request body, the `buffering` middleware, and it works by reading the whole
+# body first — into memory up to memRequestBodyBytes and onto disk beyond it.
+# On the attachment routes that would happen before file-service authenticates
+# anything, so an unauthenticated client could fill the gateway's temporary
+# storage at will. nginx caps the body while streaming it, which is the property
+# Traefik cannot provide, so the two are used for what each does well: Traefik
+# routes, nginx caps.
+#
+# This is NOT the RF-32 policy. It is the static technical ceiling:
+# 536870912 (512 MiB, the largest limit an administrator may set) plus 8192
+# bytes of multipart framing overhead. It does not vary per workspace and it is
+# never the thing that refuses a legitimately sized file — file-service enforces
+# the workspace's own limit on the real bytes of the file. Keeping a dynamic
+# per-workspace value in sync with a static proxy config would guarantee drift,
+# so this sits at the ceiling where it can never be smaller than any policy.
+#
+# The value is asserted against libs/go/platform/uploadpolicy.GatewayHardCapBytes
+# by scripts/ci/gateway-config-check.sh.
+
+worker_processes auto;
+
+error_log /dev/stderr warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # No version banner in responses or error pages.
+    server_tokens off;
+
+    # Everything nginx would otherwise write under /var goes to a writable
+    # temp mount, so the container can run with a read-only root filesystem.
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+
+    # The access log carries no body, no Authorization and no Cookie: the
+    # default combined format is deliberately not used, and the format below
+    # names only the connection and the outcome. The CI gate asserts that no
+    # body, token or cookie variable appears anywhere in this file.
+    log_format upload_guard '$remote_addr "$request_method $uri" $status '
+                            '$body_bytes_sent $request_time';
+    access_log /dev/stdout upload_guard;
+
+    # Uploads are long-lived streams; these must outlast a slow but legitimate
+    # transfer, while the read-header timeout stays short.
+    client_header_timeout 10s;
+    client_body_timeout 300s;
+    send_timeout 300s;
+    keepalive_timeout 65s;
+
+    upstream file_service {
+        server ${UPLOAD_GUARD_UPSTREAM};
+        keepalive 8;
+    }
+
+    server {
+        listen ${UPLOAD_GUARD_PORT};
+        server_name _;
+
+        # Own health, so the container can be probed without reaching upstream.
+        location = /healthz {
+            access_log off;
+            add_header Content-Type application/json always;
+            return 200 '{"status":"ok"}';
+        }
+
+        location / {
+            # The hard cap. nginx compares Content-Length up front and, for a
+            # chunked body with no declared length, aborts the moment the
+            # streamed bytes pass it — in both cases without ever holding the
+            # whole body.
+            client_max_body_size 536879104;
+
+            # The property that separates this from Traefik's buffering: bytes
+            # are forwarded as they arrive instead of being collected first.
+            proxy_request_buffering off;
+            # Required for a chunked request to be relayed as chunked.
+            proxy_http_version 1.1;
+            # Keepalive to the upstream needs an empty Connection header.
+            proxy_set_header Connection "";
+
+            # Preserve what the service authenticates and authorises with. The
+            # bearer token rides on the untouched Authorization header;
+            # Content-Type carries the multipart boundary; Transfer-Encoding and
+            # Content-Length are managed by nginx for the relayed stream.
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+
+            # No caching, and no retrying a POST: a retry would need the body
+            # replayed, which is exactly what streaming makes impossible and
+            # would risk creating the same attachment twice.
+            proxy_cache off;
+            proxy_next_upstream off;
+            proxy_buffering off;
+
+            # A client that disappears must take its upstream request with it,
+            # so the slot file-service reserved is released promptly.
+            proxy_ignore_client_abort off;
+
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+
+            proxy_pass http://file_service;
+        }
+
+        # Normalised 413, in the same envelope the services use, so the client
+        # needs no special case for "refused by the edge". It names no host, no
+        # path, no upstream and no configuration.
+        error_page 413 = @too_large;
+        location @too_large {
+            internal;
+            add_header Content-Type application/json always;
+            return 413 '{"error":{"code":"payload_too_large","message":"file exceeds the maximum allowed size"}}';
+        }
+    }
+}

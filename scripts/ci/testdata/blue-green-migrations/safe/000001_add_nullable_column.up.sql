@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE chat.messages ADD COLUMN pinned_at TIMESTAMPTZ;
+COMMIT;

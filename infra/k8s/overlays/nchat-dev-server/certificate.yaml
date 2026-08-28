@@ -1,0 +1,15 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nchat-dev-tls
+spec:
+  secretName: nchat-dev-tls
+  # Both origins on one certificate: the chat host and the administrative
+  # console host (issue #578). A second Certificate would mean a second secret
+  # and a second renewal to notice when it fails.
+  dnsNames:
+    - REPLACE_ME_HOST
+    - admin.REPLACE_ME_ADMIN_HOST
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod

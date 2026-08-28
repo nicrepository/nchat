@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nchat-dev
+resources:
+  - resources.yaml
+  - postgres-bootstrap-job.yaml
+configMapGenerator:
+  - name: postgres-bootstrap
+    files:
+      - postgres-bootstrap.sh
+generatorOptions:
+  disableNameSuffixHash: true
+images:
+  - name: postgres
+    newTag: 16.10-alpine
+    digest: sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+  - name: valkey/valkey
+    newTag: 8.1.3-alpine
+    digest: sha256:d827e7f7552cdee40cc7482dbae9da020f42bc47669af6f71182a4ef76a22773
+  - name: chrislusf/seaweedfs
+    newTag: "4.29"
+    digest: sha256:d47c7ee99fcb951351d7194915f4e3a5ea604a8e8871183d713907dec4fb9bf5
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/instance: nchat-dev

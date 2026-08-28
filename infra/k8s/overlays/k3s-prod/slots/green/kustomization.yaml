@@ -1,0 +1,59 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Release slot "green" (issue #626).
+#
+# nameSuffix and the slot label are the whole mechanism: they turn one set of
+# base manifests into a second, independently deployable copy whose pods carry
+# nchat.io/release-slot=green. includeSelectors is what makes the label reach
+# the Deployment's own selector and the per-slot Service's selector, so a pod
+# can only ever be picked up by its own slot.
+#
+# The images below are the one thing that legitimately differs between the two
+# slots. They are committed as sha-placeholder on purpose: an operator never
+# edits them, the deploy script rewrites them with the release digest in a
+# throwaway tree, and validate_rendered_placeholders refuses to apply a
+# manifest where the rewrite did not happen.
+namespace: nchat-prod
+resources:
+  - ../workloads
+nameSuffix: -green
+labels:
+  - includeSelectors: true
+    includeTemplates: true
+    pairs:
+      nchat.io/release-slot: green
+# The release this slot is running, stamped identically onto every workload it
+# contains. Reading a slot's version from one service's image tells you what
+# that one service is running, not what the slot is: a deploy that failed
+# half-way leaves some workloads on the previous release, and an operator
+# deciding whether to promote must be able to see that. The deploy script sets
+# this to the release commit SHA and prod-blue-green-status compares it, and the
+# workloads' digests, across the whole slot.
+#
+# An annotation rather than a label: it must never reach a selector, and it is
+# not something to group or query by. Committed as a REPLACE_ME_* token so a
+# manifest that reached kubectl without the deploy script setting it is refused
+# by validate_rendered_placeholders instead of running as "unknown".
+commonAnnotations:
+  nchat.io/release-sha: REPLACE_ME_RELEASE_SHA
+images:
+  - name: ghcr.io/nicrepository/nchat/web
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/admin-web
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/auth-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/chat-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/file-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/document-converter
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/notification-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/admin-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/search-service
+    newTag: sha-placeholder
+  - name: ghcr.io/nicrepository/nchat/media-service
+    newTag: sha-placeholder

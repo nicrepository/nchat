@@ -1,0 +1,881 @@
+.incoming-call,
+.outgoing-call,
+.global-call-indicator {
+  position: fixed;
+  z-index: 80;
+  color: var(--color-text, #f8fafc);
+  background: color-mix(in srgb, var(--color-surface, #111827) 94%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(18px);
+}
+
+/*
+ * Own opaque dark surface, independent of --color-surface/--color-text:
+ * the floating call renders as a sibling of ChatShell's light-theme surface
+ * tokens, but :root also defines --color-surface (#fff) for the auth pages,
+ * so the shared rule above silently resolved to a near-white background here.
+ */
+.floating-call {
+  position: fixed;
+  z-index: 80;
+  color: #f8fafc;
+  background: rgb(15 23 42 / 96%);
+  border: 1px solid rgb(255 255 255 / 16%);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 32%);
+  backdrop-filter: blur(18px);
+}
+
+.incoming-call,
+.outgoing-call {
+  right: 1rem;
+  bottom: 1rem;
+  width: min(24rem, calc(100vw - 2rem));
+  padding: 1rem;
+  border-radius: 1rem;
+}
+.incoming-call__identity,
+.incoming-call__actions,
+.outgoing-call__identity,
+.outgoing-call__actions,
+.global-call-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.incoming-call__identity > div:last-child,
+.outgoing-call__identity > div:last-child,
+.global-call-indicator > div {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.incoming-call__identity span,
+.outgoing-call__identity span,
+.global-call-indicator span {
+  color: var(--color-text-muted, #94a3b8);
+  font-size: 0.82rem;
+}
+.incoming-call__avatar,
+.outgoing-call__avatar {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #334155;
+  font-weight: 700;
+}
+.incoming-call__avatar img,
+.outgoing-call__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.incoming-call__actions,
+.outgoing-call__actions {
+  justify-content: flex-end;
+  margin-top: 1rem;
+}
+.incoming-call button,
+.outgoing-call button,
+.global-call-indicator button {
+  min-height: 2.5rem;
+  padding: 0 0.85rem;
+  border: 0;
+  border-radius: 0.65rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.incoming-call__accept {
+  color: #052e16;
+  background: #86efac;
+}
+.incoming-call__reject,
+.outgoing-call__cancel {
+  color: #fff;
+  background: #be123c;
+}
+.outgoing-call__cancel:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+/*
+ * #616 redesign: the shared `.incoming-call, .outgoing-call { color: var(--color-text,
+ * #f8fafc) }` rule above falls back to a near-white value because this app never
+ * defines --color-text/--color-text-muted (the real tokens are --color-ink/--color-muted,
+ * see tokens.css) — so the caller name rendered nearly invisible on the near-white
+ * card. Scoped to .incoming-call only: outgoing (#615, just validated) is left as-is.
+ */
+.incoming-call {
+  color: var(--color-ink, #102a33);
+}
+.incoming-call__identity span {
+  color: var(--color-muted, #5c7380);
+}
+.incoming-call__name {
+  display: block;
+  overflow: hidden;
+  font-size: 1.05rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.incoming-call__actions {
+  min-height: 2.5rem;
+  margin-top: 0.6rem;
+}
+.incoming-call__reject:focus-visible,
+.incoming-call__accept:focus-visible,
+.incoming-call__retry:focus-visible {
+  outline: 3px solid var(--color-ink, #102a33);
+  outline-offset: 2px;
+}
+
+@media (max-width: 420px) {
+  .incoming-call__actions {
+    flex-wrap: wrap;
+  }
+  .incoming-call__actions > button {
+    flex: 1 1 auto;
+  }
+}
+
+/*
+ * #648 (follow-up to #616): same root cause as the incoming comment above —
+ * the shared `.outgoing-call { color: var(--color-text, #f8fafc) }` and
+ * `.outgoing-call__identity span { color: var(--color-text-muted, #94a3b8) }`
+ * fall back to near-white because --color-text/--color-text-muted are never
+ * defined here (real tokens: --color-ink/--color-muted). #616 deliberately
+ * left outgoing untouched; this scopes the same fix to it. Also closes the
+ * dead space above Cancelar: outgoing was still on the shared 1rem
+ * margin-top instead of the 0.6rem incoming got in #616.
+ */
+.outgoing-call {
+  color: var(--color-ink, #102a33);
+}
+.outgoing-call__identity span {
+  color: var(--color-muted, #5c7380);
+}
+.outgoing-call__name {
+  display: block;
+  overflow: hidden;
+  font-size: 1.05rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.outgoing-call__actions {
+  min-height: 2.5rem;
+  margin-top: 0.6rem;
+}
+.outgoing-call__cancel:focus-visible {
+  outline: 3px solid var(--color-ink, #102a33);
+  outline-offset: 2px;
+}
+
+/*
+ * #642: persistent, compact resource (channel/group-DM) call bar inside the
+ * conversation view — the `.voicebanner` concept from
+ * prototype/claude-design-v1/nic-chat/chamada.html, restyled with this app's
+ * real tokens (the prototype's --space-* and --radius-pill do not exist in
+ * tokens.css, so literal rem/px values are used instead, matching the rest
+ * of this file). The prototype's search field is explicitly out of scope.
+ */
+.voicebanner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--color-border, #dbe7eb);
+  border-left: 3px solid var(--color-primary, #0e7490);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #102a33);
+}
+.voicebanner__open {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.voicebanner__open:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+  border-radius: 0.35rem;
+}
+.voicebanner__open--info {
+  cursor: default;
+}
+.voicebanner__icon {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+}
+.voicebanner__icon .material-symbols-outlined {
+  font-size: 1.1rem;
+}
+.voicebanner__info {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+.voicebanner__title {
+  overflow: hidden;
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voicebanner__meta {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  overflow: hidden;
+  color: var(--color-muted, #5c7380);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voicebanner__dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-danger, #dc2626);
+  animation: voicebanner-pulse 1.4s infinite;
+}
+@keyframes voicebanner-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.voicebanner__avatars {
+  display: flex;
+  flex: 0 0 auto;
+}
+.voicebanner__avatar {
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  margin-left: -0.5rem;
+  border: 2px solid var(--color-surface, #fff);
+  border-radius: 50%;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+.voicebanner__avatar:first-child {
+  margin-left: 0;
+}
+.voicebanner__avatar--speaking {
+  box-shadow: 0 0 0 2px var(--color-success, #16a34a);
+}
+.voicebanner__avatar--overflow {
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink-2, #264653);
+}
+.voicebanner__controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.4rem;
+}
+.voicebanner__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 2rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--color-border, #dbe7eb);
+  border-radius: 999px;
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink-2, #264653);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.voicebanner__btn .material-symbols-outlined {
+  font-size: 1rem;
+}
+.voicebanner__btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+.voicebanner__btn:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+}
+.voicebanner__btn--end {
+  border-color: var(--color-danger, #dc2626);
+  background: var(--color-danger, #dc2626);
+  color: #fff;
+}
+.voicebanner__btn--end:focus-visible {
+  outline-color: var(--color-danger, #dc2626);
+}
+.voicebanner__sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+@media (max-width: 420px) {
+  .voicebanner {
+    flex-wrap: wrap;
+  }
+  .voicebanner__open {
+    flex: 1 1 100%;
+  }
+  .voicebanner__avatars {
+    order: 3;
+  }
+  .voicebanner__controls {
+    order: 4;
+    flex: 1 1 auto;
+    justify-content: flex-end;
+  }
+}
+
+.floating-call {
+  top: 0;
+  left: 0;
+  width: min(22rem, calc(100vw - 2rem));
+  overflow: hidden;
+  border-radius: 1rem;
+  touch-action: none;
+}
+.floating-call__handle,
+.dedicated-call__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+.floating-call__handle {
+  cursor: grab;
+  user-select: none;
+}
+.floating-call__handle > div {
+  display: grid;
+}
+.floating-call__handle span[role="status"] {
+  color: var(--color-text-muted, #94a3b8);
+  font-size: 0.8rem;
+}
+.floating-call__handle button,
+.dedicated-call__header button {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  color: inherit;
+  background: rgb(255 255 255 / 14%);
+  cursor: pointer;
+}
+.floating-call__handle button:hover,
+.dedicated-call__header button:hover {
+  background: rgb(255 255 255 / 24%);
+}
+.floating-call__handle button:focus-visible,
+.dedicated-call__header button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.floating-call__stage {
+  position: relative;
+  min-height: 10rem;
+  overflow: hidden;
+  background: #020617;
+}
+.floating-call__remote-participant {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.floating-call__remote {
+  position: absolute;
+  inset: 0;
+}
+/*
+ * The fallback avatar and the three status indicators (count/speaker/share)
+ * are each pinned to an explicit absolute slot instead of stacking in normal
+ * flow. Mounting/unmounting one must never shift another — the old markup
+ * centered every indicator as a `display: grid; place-items: center` block
+ * and used a `span + span { margin-top }` sibling rule, so the whole stack's
+ * center of mass (and therefore the participant count's own position) moved
+ * every time active-speaker/screen-share appeared or disappeared.
+ */
+.floating-call__avatar-wrap {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+.floating-call__remote video,
+.floating-call__local-media video,
+.dedicated-call__media video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.floating-call__local {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  width: 5.5rem;
+  height: 4rem;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 30%);
+  border-radius: 0.55rem;
+  background: #1e293b;
+}
+.floating-call__local-media {
+  position: absolute;
+  inset: 0;
+}
+.floating-call__avatar {
+  width: 3.5rem;
+  height: 3.5rem;
+  font-size: 1.15rem;
+}
+.floating-call__local-avatar {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  margin: auto;
+  font-size: 0.7rem;
+}
+.floating-call__count,
+.floating-call__speaker,
+.floating-call__share {
+  position: absolute;
+  z-index: 1;
+  max-width: calc(100% - 1rem);
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  background: rgb(2 6 23 / 72%);
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.floating-call__count {
+  top: 0.5rem;
+  left: 0.5rem;
+}
+.floating-call__speaker {
+  top: 0.5rem;
+  right: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+.floating-call__speaker .material-symbols-outlined {
+  flex: 0 0 auto;
+  font-size: 0.95rem;
+}
+.floating-call__share {
+  bottom: 0.5rem;
+  left: 0.5rem;
+}
+.call-presentation__controls {
+  display: flex;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.75rem;
+}
+.call-presentation__control {
+  display: grid;
+  width: 2.65rem;
+  height: 2.65rem;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 26%);
+  border-radius: 50%;
+  color: #f8fafc;
+  background: rgb(255 255 255 / 16%);
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+}
+.call-presentation__control:hover:not(:disabled) {
+  background: rgb(255 255 255 / 26%);
+}
+.call-presentation__control:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.call-presentation__control[aria-pressed="false"] {
+  border-color: rgb(254 205 213 / 45%);
+  color: #fecdd3;
+  background: rgb(190 18 60 / 24%);
+}
+.call-presentation__control[aria-pressed="false"]:hover:not(:disabled) {
+  background: rgb(190 18 60 / 34%);
+}
+.call-presentation__control:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.call-presentation__control--danger {
+  color: #fff;
+  border-color: #be123c;
+  background: #be123c;
+}
+.call-presentation__control--danger:hover:not(:disabled) {
+  background: #9f1239;
+}
+.floating-call__activate {
+  display: block;
+  min-height: 2.5rem;
+  margin: 0 auto 0.65rem;
+  border: 0;
+  border-radius: 0.6rem;
+  padding: 0 0.8rem;
+  font-weight: 700;
+}
+.floating-call__recovery {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0 0.75rem 0.65rem;
+  font-size: 0.8rem;
+}
+
+.call-global-error {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 45;
+  max-width: min(24rem, calc(100vw - 2rem));
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--color-danger, #dc2626);
+  border-radius: 0.75rem;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #111827);
+  box-shadow: 0 0.75rem 2rem rgb(15 23 42 / 18%);
+}
+.global-call-indicator {
+  top: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(32rem, calc(100vw - 2rem));
+  padding: 0.65rem 0.75rem;
+  border-radius: 0.85rem;
+}
+.global-call-indicator__pulse {
+  width: 0.65rem;
+  height: 0.65rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #22c55e;
+}
+.global-call-indicator > div {
+  flex: 1;
+}
+
+.dedicated-call {
+  display: grid;
+  min-height: 100dvh;
+  grid-template-rows: auto 1fr auto;
+  color: var(--color-text, #f8fafc);
+  background: #020617;
+}
+.dedicated-call--message {
+  place-items: center;
+}
+.dedicated-call__header span {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+.dedicated-call__header-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+.dedicated-call__header-avatar {
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: 0 0 auto;
+  font-size: 0.85rem;
+}
+.dedicated-call__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
+  gap: 0.75rem;
+  padding: 0.75rem;
+}
+.dedicated-call__tile {
+  position: relative;
+  display: grid;
+  min-height: 15rem;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 0.85rem;
+  background: #111827;
+}
+/*
+ * Primary screen-share tile (issue #611): spans every column of the
+ * existing auto-fit grid so it reads as the primary content area, with a
+ * clearly taller aspect than a participant tile. Every other tile (camera
+ * previews/avatars) stays exactly where it already is in the same grid,
+ * which — once this tile claims the full row above them — is what forms the
+ * secondary strip, with no separate layout system to keep in sync.
+ */
+.dedicated-call__tile--screen {
+  grid-column: 1 / -1;
+  min-height: min(60vh, 34rem);
+  aspect-ratio: 16 / 9;
+}
+.dedicated-call__tile--screen .dedicated-call__media video {
+  object-fit: contain;
+}
+.dedicated-call__participant-status {
+  display: none;
+}
+.dedicated-call--screen-share {
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+.dedicated-call__screen-share-layout {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) clamp(13rem, 22vw, 20rem);
+  gap: 0.75rem;
+  padding: 0.75rem;
+  overflow: hidden;
+}
+.dedicated-call__screen-stage {
+  min-width: 0;
+  min-height: 0;
+}
+.dedicated-call__screen-stage .dedicated-call__tile--screen {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  aspect-ratio: auto;
+}
+.dedicated-call__participant-sidebar {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.dedicated-call__participant-sidebar:focus-visible {
+  outline: 2px solid #f8fafc;
+  outline-offset: -2px;
+}
+.dedicated-call__participant-list {
+  display: grid;
+  gap: 0.6rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__participant {
+  min-height: 8rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__participant-status {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  z-index: 3;
+  display: flex;
+  gap: 0.3rem;
+}
+.dedicated-call__participant-sidebar .dedicated-call__name {
+  right: 6.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dedicated-call__participant-status > span {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  border-radius: 50%;
+  color: #f8fafc;
+  background: rgb(2 6 23 / 78%);
+}
+.dedicated-call__participant-status .material-symbols-outlined {
+  font-size: 1rem;
+}
+.dedicated-call__name {
+  position: absolute;
+  z-index: 3;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.35rem;
+  background: rgb(0 0 0 / 65%);
+}
+.call-speaker-surface::after {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 3px #34d399;
+  opacity: 0;
+  pointer-events: none;
+  content: "";
+  transition: opacity 0.15s ease;
+}
+.call-speaker-surface--active::after {
+  opacity: 1;
+}
+.call-speaker-indicator {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 3;
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border-radius: 50%;
+  color: #052e16;
+  background: #86efac;
+  box-shadow: 0 0.25rem 0.75rem rgb(0 0 0 / 28%);
+}
+.call-speaker-indicator .material-symbols-outlined {
+  font-size: 1.15rem;
+}
+.dedicated-call__media {
+  position: absolute;
+  inset: 0;
+}
+.dedicated-call__avatar {
+  width: 4rem;
+  height: 4rem;
+  font-size: 1.4rem;
+}
+
+/*
+ * Shared identity-fallback styling for both the dedicated grid and the
+ * floating stage. Sizing comes from .dedicated-call__avatar/.floating-call__avatar;
+ * color comes from one of these modifiers, mapped 1:1 to the AvatarColor
+ * palette already used for chat avatars (see chat-sidebar__avatar--*) so a
+ * participant's fallback swatch matches the color they show up as elsewhere.
+ */
+.call-avatar {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  color: #f8fafc;
+  font-weight: 700;
+}
+.call-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.call-avatar--purple {
+  background: linear-gradient(135deg, #7b43e8, #b485f4);
+}
+.call-avatar--green {
+  background: linear-gradient(135deg, #16a34a, #4ade80);
+}
+.call-avatar--blue {
+  background: linear-gradient(135deg, #2563eb, #60a5fa);
+}
+.call-avatar--rose {
+  background: linear-gradient(135deg, #db2777, #f472b6);
+}
+.call-avatar--amber {
+  background: linear-gradient(135deg, #d97706, #fbbf24);
+}
+.call-avatar--teal {
+  background: linear-gradient(135deg, #0d9488, #2dd4bf);
+}
+.dedicated-call footer {
+  position: sticky;
+  bottom: 0;
+  background: rgb(2 6 23 / 82%);
+  backdrop-filter: blur(16px);
+}
+
+@media (max-width: 720px) {
+  .floating-call {
+    top: auto !important;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    left: 0.5rem;
+    width: auto;
+    transform: none !important;
+    touch-action: auto;
+  }
+  .floating-call__handle {
+    cursor: default;
+  }
+  .floating-call__stage {
+    min-height: 7rem;
+  }
+  .dedicated-call__screen-share-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+  .dedicated-call__participant-sidebar {
+    max-height: 8rem;
+  }
+  .dedicated-call__participant-list {
+    display: flex;
+    width: max-content;
+  }
+  .dedicated-call__participant-sidebar .dedicated-call__participant {
+    width: 10rem;
+    min-height: 7rem;
+    flex: 0 0 auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .incoming-call,
+  .outgoing-call,
+  .floating-call,
+  .global-call-indicator,
+  .call-presentation__control,
+  .call-speaker-surface::after,
+  .voicebanner__dot {
+    scroll-behavior: auto;
+    transition: none;
+    animation: none;
+  }
+}

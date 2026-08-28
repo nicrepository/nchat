@@ -1,0 +1,169 @@
+package storage
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/nicrepository/nchat/libs/go/platform/authsession"
+	"github.com/nicrepository/nchat/services/media-service/internal/domain"
+	"github.com/nicrepository/nchat/services/media-service/internal/service"
+)
+
+type PGXResourceAuthorizer struct {
+	pool Pool
+}
+
+func NewPGXResourceAuthorizer(pool Pool) *PGXResourceAuthorizer {
+	return &PGXResourceAuthorizer{pool: pool}
+}
+
+func (a *PGXResourceAuthorizer) Authorize(ctx context.Context, input service.AuthorizationInput) (service.AuthorizedResource, error) {
+	if a == nil || a.pool == nil {
+		return service.AuthorizedResource{}, domain.ErrUnavailable
+	}
+	var query string
+	switch input.Kind {
+	case domain.ResourceKindChannel:
+		query = channelAuthorizationQuery
+	case domain.ResourceKindDM:
+		query = dmAuthorizationQuery
+	case domain.ResourceKindCall:
+		query = callAuthorizationQuery
+	default:
+		return service.AuthorizedResource{}, domain.ErrInvalidInput
+	}
+
+	var sessionExpiresAt pgtype.Timestamptz
+	var resourceID pgtype.Text
+	var displayName pgtype.Text
+	args := []any{input.SessionID, input.UserID, input.ResourceID}
+	if input.Kind == domain.ResourceKindCall {
+		args = append(args, input.ParticipationID)
+	}
+	if err := a.pool.QueryRow(ctx, query, args...).
+		Scan(&sessionExpiresAt, &resourceID, &displayName); err != nil {
+		return service.AuthorizedResource{}, fmt.Errorf("authorize media resource: %w", err)
+	}
+	if !sessionExpiresAt.Valid {
+		return service.AuthorizedResource{}, domain.ErrUnauthorized
+	}
+	if !resourceID.Valid {
+		return service.AuthorizedResource{}, domain.ErrNotFound
+	}
+	return service.AuthorizedResource{
+		ID:               resourceID.String,
+		SessionExpiresAt: sessionExpiresAt.Time.UTC(),
+		DisplayName:      displayName.String,
+	}, nil
+}
+
+// authorizedResourceSelect resolves the caller's own presentation name
+// alongside the session/resource check — server-derived only, from the same
+// active_session the authorization decision already uses. It is never part
+// of the authorization decision itself (a name never grants or denies
+// access): a caller with no resolvable name still gets session_expires_at
+// and resource_id decided exactly as before, just an empty display_name.
+const authorizedResourceSelect = `
+	SELECT
+		(SELECT session_expires_at FROM active_session) AS session_expires_at,
+		(SELECT id::text FROM authorized_resource) AS resource_id,
+		(SELECT ` + authsession.DisplayNameExpr + `
+		   FROM auth.users AS u
+		   JOIN active_session AS active ON active.user_id = u.id) AS display_name`
+
+const channelAuthorizationQuery = authsession.ActiveSessionCTE + `,
+	authorized_resource AS (
+		SELECT c.id
+		FROM active_session AS active
+		JOIN chat.channels AS c ON c.id = $3
+		JOIN chat.workspaces AS w
+		  ON w.id = c.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members AS wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = active.user_id
+		 AND wm.status = 'active'
+		WHERE c.status = 'active'
+		  AND chat.channel_visible_to_user(c.id, active.user_id)
+	)
+	` + authorizedResourceSelect
+
+const dmAuthorizationQuery = authsession.ActiveSessionCTE + `,
+	authorized_resource AS (
+		SELECT dc.id
+		FROM active_session AS active
+		JOIN chat.dm_conversations AS dc ON dc.id = $3
+		JOIN chat.workspaces AS w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members AS wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = active.user_id
+		 AND wm.status = 'active'
+		JOIN chat.dm_members AS dm
+		  ON dm.conversation_id = dc.id
+		 AND dm.user_id = active.user_id
+		 AND dm.status = 'active'
+		WHERE dc.status = 'active'
+		  AND dc.type = 'group'
+	)
+	` + authorizedResourceSelect
+
+// callAuthorizationQuery authorizes a LiveKit token request scoped to one
+// call. Direct (target_type = 'user') calls are authorized by caller/callee
+// identity alone, unchanged. Resource (channel/group-DM) calls additionally
+// require a live chat.call_participant_leases row for this call and this
+// user (issue #622/#609): membership/visibility of the channel or DM is
+// necessary but no longer sufficient — a workspace member who can see the
+// room but never actually joined the call (no call.join/call.start ever
+// admitted them, or their lease already expired) must not receive a token.
+// Observing a resource call (e.g. via call.resource.sync) never grants a
+// lease and so never grants a token either.
+const callAuthorizationQuery = authsession.ActiveSessionCTE + `,
+	authorized_resource AS (
+		SELECT c.id
+		FROM active_session AS active
+		JOIN chat.calls AS c ON c.id = $3
+		JOIN chat.workspaces AS w
+		  ON w.id = c.workspace_id AND w.status = 'active'
+		JOIN chat.workspace_members AS wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = active.user_id
+		 AND wm.status = 'active'
+		WHERE c.status = 'active'
+		  AND (
+			(c.target_type = 'user' AND (c.caller_id = active.user_id OR c.callee_id = active.user_id))
+			OR
+			(c.target_type = 'channel' AND EXISTS (
+				SELECT 1 FROM chat.channels AS channel
+				WHERE channel.id = c.target_id
+				  AND channel.workspace_id = c.workspace_id
+				  AND channel.status = 'active'
+				  AND chat.channel_visible_to_user(channel.id, active.user_id)
+			) AND EXISTS (
+				SELECT 1 FROM chat.call_participant_leases AS lease
+				WHERE lease.call_id = c.id
+				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
+				  AND lease.expires_at > clock_timestamp()
+			))
+			OR
+			(c.target_type = 'dm' AND EXISTS (
+				SELECT 1 FROM chat.dm_conversations AS conversation
+				JOIN chat.dm_members AS member
+				  ON member.conversation_id = conversation.id
+				 AND member.user_id = active.user_id
+				 AND member.status = 'active'
+				WHERE conversation.id = c.target_id
+				  AND conversation.workspace_id = c.workspace_id
+				  AND conversation.status = 'active'
+				  AND conversation.type = 'group'
+			) AND EXISTS (
+				SELECT 1 FROM chat.call_participant_leases AS lease
+				WHERE lease.call_id = c.id
+				  AND lease.user_id = active.user_id
+				  AND lease.participation_id IS NOT DISTINCT FROM NULLIF($4, '')::uuid
+				  AND lease.expires_at > clock_timestamp()
+			))
+		  )
+	)
+	` + authorizedResourceSelect

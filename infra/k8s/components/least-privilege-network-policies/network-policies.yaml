@@ -1,0 +1,600 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-default-deny-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-dns-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - auth
+          - chat
+          - notification
+          - migrations
+          - postgres-bootstrap
+          - seaweedfs
+          - livekit
+          - coturn
+          - media
+          # admin-service resolves postgres for the Admin API (issue #578).
+          - admin
+          # file resolves postgres, valkey, seaweedfs and clamav; upload-guard
+          # resolves file-service at nginx config load, so without DNS it does
+          # not even start. clamav is absent on purpose: freshclam is off and
+          # the daemon only accepts connections, it never opens any.
+          - file
+          - upload-guard
+          # search-service resolves postgres for the message index (issue
+          # #601). Without DNS its startup database ping never leaves the pod.
+          - search
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-traefik-http
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - web
+          # The administrative console frontend (issue #578). Served on its own
+          # host, so Traefik must reach it directly; it talks to nothing else.
+          - admin-web
+          - auth
+          - chat
+          - file
+          - notification
+          - admin
+          - search
+          - media
+          # The two attachment upload routes are sent here by an IngressRoute
+          # instead of straight to file-service. Note what this rule does NOT
+          # do: it cannot make that hop mandatory. A NetworkPolicy matches
+          # pods and ports, never methods or paths, and Traefik legitimately
+          # needs file-service for download, Range, preview and listing on the
+          # same /api/files prefix. "Every upload POST passes the guard" is a
+          # property of the Traefik routing table, asserted by
+          # scripts/ci/gateway-config-check.sh.
+          - upload-guard
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - auth
+                  - chat
+                  - notification
+                  - migrations
+                  - postgres-bootstrap
+                  - media
+                  # Attachment metadata, and the advisory locks that upload
+                  # admission control reserves one connection at a time from.
+                  - file
+                  # Administrative principals, capabilities, sessions and the
+                  # audit trail (issue #578). admin-service is the only writer
+                  # of auth.admin_* and reads auth.user_sessions to
+                  # re-authorize on every request.
+                  - admin
+                  # The message index search-service queries, and the readiness
+                  # ping it refuses to start without (issue #601).
+                  - search
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-valkey
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: valkey
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - chat
+                  # file publishes attachment status changes onto the same bus
+                  # chat-service consumes, so a pending_scan -> clean verdict
+                  # reaches open clients without a reload.
+                  - file
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-auth-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: auth
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-chat-data-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: chat
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-notification-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: notification
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-migrations-postgres-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - migrations
+          - postgres-bootstrap
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# admin-service reaches PostgreSQL and nothing else. It has no object storage,
+# no cache and no outbound internet: the Admin API is a database-backed
+# authorization boundary, not an integration hub.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-admin-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: admin
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# The sending half of the search ingress above. It is a policy of its own
+# because that is this overlay's shape: one minimal egress rule per service,
+# so removing a service's database access is deleting a document rather than
+# editing a shared list.
+#
+# The name is deliberate: a policy with exactly this name was created by hand
+# in nchat-dev while search-service was being diagnosed, so `kubectl apply`
+# adopts that object instead of leaving an unmanaged twin beside it. The two
+# other temporary policies from that session (search DNS egress and search
+# postgres ingress) are absent on purpose — their flows moved into the
+# aggregated nchat-allow-dns-egress and nchat-allow-postgres above, and they
+# are to be deleted by hand once this overlay is applied.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-search-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: search
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-media-postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: media
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-livekit-api-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: media
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # Kubernetes NetworkPolicy has no FQDN selector. Keep this exception
+        # scoped to media-service and the TLS port used by the fixed WSS URL.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# The upload guard's only upstream. It proxies the two attachment upload routes
+# and talks to nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-upload-guard-file-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: upload-guard
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file
+      ports:
+        - protocol: TCP
+          port: 8083
+---
+# The receiving half of the same hop.
+#
+# The name is deliberate: a policy with exactly this name was created by hand in
+# nchat-dev while the upload path was being diagnosed. Versioning it under the
+# same name makes `kubectl apply` adopt that object instead of leaving an
+# unmanaged twin beside a differently named one. It is never to be deleted after
+# adoption — only the two policies whose flows moved into differently shaped
+# rules are removed, and nominally.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-upload-guard-file-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: file
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: upload-guard
+      ports:
+        - protocol: TCP
+          port: 8083
+---
+# Everything file-service needs to reach to serve an attachment: metadata and
+# admission locks in PostgreSQL, ciphertext in the SeaweedFS filer, and the
+# status bus. The scanner is deliberately a separate policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-file-data-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: file
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seaweedfs
+      ports:
+        # The filer, and only the filer. The master (9333) is cluster
+        # administration and the S3 gateway (8333) does not run here; neither
+        # belongs in an object read/write path. The volume server (8080) is not
+        # an API file-service consumes either: it never addresses a volume
+        # directly, it hands the object to the filer and the filer relays it.
+        - protocol: TCP
+          port: 8888
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-seaweedfs
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: seaweedfs
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file
+      ports:
+        - protocol: TCP
+          port: 8888
+    # The second hop of the same write, internal to the all-in-one `weed
+    # server`: the master answers the filer with seaweedfs:8080, so the filer
+    # persists the chunk by dialling the Service back into this very pod. The
+    # source is restricted to the seaweedfs component itself — 8080 is not open
+    # to file-service or anything else.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seaweedfs
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# The sending half of that second hop. It needs saying separately because the
+# dial leaves the pod: seaweedfs:8080 is a Service name, so the filer's
+# connection to its own volume server is egress, and nchat-default-deny-egress
+# selects every pod in the namespace. Ingress alone would leave the write
+# failing, only on a timeout instead of `connection refused`.
+#
+# Both halves stay pinned to the seaweedfs component, and DNS is not repeated
+# here — nchat-allow-dns-egress already covers it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-seaweedfs-volume-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: seaweedfs
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: seaweedfs
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Kept apart from nchat-allow-file-data-egress so that removing the scanner is
+# deleting one rule rather than editing a shared one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-file-clamav-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: file
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: clamav
+      ports:
+        - protocol: TCP
+          port: 3310
+---
+# clamd authenticates nobody: whoever reaches 3310 can ask it to scan. Reach is
+# therefore the access control, and exactly one component gets it. No egress
+# policy exists for clamav at all — freshclam is off, so the daemon never opens
+# a connection, not even to DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-clamav
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: clamav
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: file
+      ports:
+        - protocol: TCP
+          port: 3310
+---
+# RF-21. The only rule in this overlay that leaves the cluster, and the reason
+# it has to exist: nchat-default-deny-egress covers every pod, so with the flags
+# on and no egress the Cloudflare lookup would time out, the fail-closed policy
+# would answer link_check_unavailable, and every message carrying a link would
+# be refused.
+#
+# The destination is stated as "the public internet minus everything private"
+# rather than as Cloudflare's addresses: the API is behind an anycast range that
+# changes, and pinning it would break the control on a routing change. The
+# exclusions are what keep this from becoming a hole — RFC 1918, the k3s pod and
+# service CIDRs, loopback, link-local (169.254.169.254 is the cloud metadata
+# endpoint) and the reserved blocks — so an SSRF through this rule reaches no
+# internal address. Port 443 only, and only for the two components that call it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-link-safety-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - chat
+          - file
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Keycloak SSO resolves to the node HTTPS endpoint in nchat-dev, which the CNI
+# HostPort rules DNAT to Traefik's websecure port. Since the namespace uses
+# default-deny egress, auth-service needs an explicit path to that endpoint.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-auth-keycloak-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: auth
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 7443

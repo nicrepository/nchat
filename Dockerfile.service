@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.7
+FROM golang:1.25.13-alpine AS build
+ARG SERVICE
+WORKDIR /src
+COPY scripts/deploy/nchat-dev/images.txt /tmp/nchat-dev-images.txt
+RUN case "$SERVICE" in *[!a-z0-9-]*|'') exit 1 ;; esac && \
+    grep -Fqx "go $SERVICE $SERVICE" /tmp/nchat-dev-images.txt
+COPY go.work go.work.sum ./
+COPY services/admin-service/go.mod services/admin-service/go.sum ./services/admin-service/
+COPY services/auth-service/go.mod services/auth-service/go.sum ./services/auth-service/
+COPY services/chat-service/go.mod services/chat-service/go.sum ./services/chat-service/
+COPY services/document-converter/go.mod services/document-converter/go.sum ./services/document-converter/
+COPY services/file-service/go.mod services/file-service/go.sum ./services/file-service/
+COPY services/media-service/go.mod services/media-service/go.sum ./services/media-service/
+COPY services/notification-service/go.mod services/notification-service/go.sum ./services/notification-service/
+COPY services/search-service/go.mod services/search-service/go.sum ./services/search-service/
+# Shared workspace modules are real build inputs; include every current/future libs/go module.
+COPY libs/go ./libs/go
+RUN go mod download
+COPY services/${SERVICE} ./services/${SERVICE}
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/service "./services/${SERVICE}/cmd/${SERVICE}"
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/service /service
+USER nonroot:nonroot
+ENTRYPOINT ["/service"]

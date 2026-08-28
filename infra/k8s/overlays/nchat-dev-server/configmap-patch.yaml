@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+data:
+  LIVEKIT_ENABLED: "true"
+  APP_ENV: nchat-dev
+  AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
+  VALKEY_WS_BROADCAST_ENABLED: "true"
+  # chat-service bootstrap sends 1 call.sync + 12 subscribe messages right
+  # after open (issue #455); raising only the burst absorbs that spike while
+  # WS_INBOUND_MESSAGES_PER_MINUTE (sustained rate) stays at its code default.
+  # See docs/ws-hub-foundation.md#inbound-rate-limiting.
+  WS_INBOUND_BURST: "60"
+  # The base value names seaweedfs-filer, a Service that does not exist here:
+  # this cluster runs one `weed server` process behind a Service called
+  # seaweedfs, whose filer port is 8888. file-service refuses to start with
+  # uploads enabled and an unusable endpoint, and /readyz probes this exact URL.
+  SEAWEEDFS_FILER_URL: http://seaweedfs:8888
+  # Still absent: nothing in this deployment speaks S3, and the SeaweedFS
+  # StatefulSet does not run the S3 gateway.
+  SEAWEEDFS_S3_ENDPOINT: null
+  # RF-30/RF-22 attachment stack. Until this key existed the routes answered
+  # 503 "attachment uploads are disabled", which is the documented behaviour of
+  # the default, not a fault.
+  FILE_UPLOADS_ENABLED: "true"
+  # Never false. APP_ENV=nchat-dev is inside the allowlist that would let
+  # config.validateScanPolicy accept it, so the manifest — and a CI assertion —
+  # is what keeps the gate on. A fresh upload stays in pending_scan, and no
+  # byte derived from it is served, until a real scan approves it.
+  FILE_MALWARE_SCAN_REQUIRED: "true"
+  # Plain host:port dial target. No scheme, no path, no credentials.
+  FILE_MALWARE_SCANNER_ADDRESS: clamav:3310
+  # RF-21 Safe Browsing, temporarily OFF in this environment for the MVP.
+  #
+  # This is a decision, not a default and not a fallback. The application
+  # default happens to also be false, which is exactly why the value is written
+  # out here and asserted in CI as the literal "false": a silently absent key
+  # and a deliberate "no" would otherwise look identical, and the next person to
+  # read this file could not tell which one they were looking at.
+  #
+  # Why off: the Cloudflare URL Scanner's behaviour makes the feature
+  # operationally unfit to gate messages in nchat-dev right now. Turning it off
+  # is the smaller harm than a link check that leaves submissions unresolved.
+  #
+  # Nothing was removed to achieve it. The implementation, the workers, the
+  # migrations and the nchat-link-safety Secret all stay exactly where they are,
+  # and both Deployments still wire the credentials — so this is one value away
+  # from being on again, which is the whole point of doing it here rather than
+  # in code. Flipping these two keys back to "true" (and the matching CI
+  # expectation in scripts/ci/k8s-manifests-check.sh) is the entire resumption.
+  #
+  # What being off means: no URL is submitted, no verdict is consulted, and
+  # links are delivered unchecked. Enabling again without the Secret remains a
+  # deliberate CrashLoopBackOff rather than a degraded mode — both services
+  # refuse to start rather than accept links nobody checked.
+  CHAT_LINK_SAFETY_ENABLED: "false"
+  FILE_LINK_SAFETY_ENABLED: "false"
+  # RF-21 capacity. Stated explicitly per environment rather than left to the
+  # application default, because the right numbers depend on the Cloudflare plan
+  # this cluster is billed under and no code may assume one.
+  #
+  # The unit is a *new canonical URL*. Cached verdicts, URLs already queued and
+  # duplicates inside one message are free, so these limit provider spend rather
+  # than usage. Credentials stay in the nchat-link-safety Secret; nothing here is
+  # sensitive.
+  CHAT_LINK_SAFETY_WORKSPACE_BUDGET: "20"
+  CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  CHAT_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
+  FILES_LINK_SAFETY_NEW_URL_BUDGET: "40"
+  FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  FILES_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
+  # The external, fail-closed authority over one scan. It must stay below
+  # clamd's own MaxScanTime (420000 ms) and it derives the worker's 330 s claim
+  # lease; the ordering 300 < 330 < 420 is asserted in CI.
+  FILE_MALWARE_SCAN_TIMEOUT_SECONDS: "300"
+
+  # RF-44: corporate Keycloak SSO enabled only for nchat-dev.
+  # Provider credentials and public callback values remain in nchat-secrets.
+  OIDC_ENABLED: "true"
+  OIDC_AUTO_PROVISION_ENABLED: "true"
+  OIDC_ALLOWED_EMAIL_DOMAINS: "nic-labs.com.br"

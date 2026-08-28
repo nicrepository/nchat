@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nchat-config
+  namespace: nchat
+  annotations:
+    nchat.nicrepository.io/data-services: placeholders-only
+data:
+  APP_ENV: development
+  LOG_LEVEL: info
+  # k3s local default pod CIDR. Replace if Traefik runs from a different CIDR.
+  AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
+  # RF-21 Safe Browsing. Explicit rather than left to the application default:
+  # the default is false, so an absent key here is a deployment with link
+  # checking off and no symptom other than nothing ever being blocked. CI
+  # asserts all three supported overlays state it.
+  #
+  # The credentials are not here and never can be — they are the
+  # nchat-link-safety Secret, mounted only by chat-service and file-service.
+  # Both services refuse to start without them while these flags are true, which
+  # is the intended failure: enabled with no scanner would accept every link
+  # unchecked. See docs/runbooks/sealed-secrets-rotation.md.
+  CHAT_LINK_SAFETY_ENABLED: "true"
+  FILE_LINK_SAFETY_ENABLED: "true"
+  # RF-21 capacity. Stated explicitly per environment rather than left to the
+  # application default, because the right numbers depend on the Cloudflare plan
+  # this cluster is billed under and no code may assume one.
+  #
+  # The unit is a *new canonical URL*. Cached verdicts, URLs already queued and
+  # duplicates inside one message are free, so these limit provider spend rather
+  # than usage. Credentials stay in the nchat-link-safety Secret; nothing here is
+  # sensitive.
+  CHAT_LINK_SAFETY_WORKSPACE_BUDGET: "20"
+  CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  CHAT_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  CHAT_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
+  FILES_LINK_SAFETY_NEW_URL_BUDGET: "40"
+  FILES_LINK_SAFETY_BUDGET_WINDOW_SECONDS: "3600"
+  FILES_LINK_SAFETY_MAX_PENDING_JOBS: "100"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_LIMIT: "10"
+  FILES_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS: "60"
+  FILES_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS: "900"
