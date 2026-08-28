@@ -26,4 +26,11 @@ describe("ProfileInfoCard", () => {
     render(<ProfileInfoCard profile={{ ...profile, timezone: "" }} />);
     expect(screen.queryByText("Fuso horário")).not.toBeInTheDocument();
   });
+
+  it("returns null when both job title and timezone are empty", () => {
+    const { container } = render(
+      <ProfileInfoCard profile={{ ...profile, jobTitle: "", timezone: "" }} />
+    );
+    expect(container.firstChild).toBeNull();
+  });
 });
