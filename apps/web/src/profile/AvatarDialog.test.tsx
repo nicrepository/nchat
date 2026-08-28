@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AvatarDialog from "./AvatarDialog";
@@ -251,5 +252,154 @@ describe("AvatarDialog", () => {
     const status = screen.getByRole("status");
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveTextContent(/escolha uma imagem jpeg ou png/i);
+  });
+
+  it("stages nothing when the file picker is cancelled (empty selection)", () => {
+    render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [] } });
+    expect(screen.queryByAltText(/pré-visualização/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("");
+    expect(uploadBtn()).toBeDisabled();
+    expect(mockUpload).not.toHaveBeenCalled();
+  });
+
+  it("wraps focus forward from the last enabled button back to the first on Tab", () => {
+    render(<AvatarDialog onClose={vi.fn()} />);
+    const dialog = screen.getByRole("dialog");
+    closeBtn().focus();
+    expect(closeBtn()).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(selectBtn()).toHaveFocus();
+  });
+
+  it("wraps focus backward from the first enabled button to the last on Shift+Tab", () => {
+    render(<AvatarDialog onClose={vi.fn()} />);
+    const dialog = screen.getByRole("dialog");
+    selectBtn().focus();
+    expect(selectBtn()).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(closeBtn()).toHaveFocus();
+  });
+
+  it("ignores non-Tab, non-Escape keys", () => {
+    const onClose = vi.fn();
+    render(<AvatarDialog onClose={onClose} />);
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "a" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(selectBtn()).not.toHaveFocus();
+  });
+
+  it("does nothing on Tab when focus is on neither the first nor the last enabled button", () => {
+    render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    const middle = cancelSelectionBtn()!;
+    middle.focus();
+    expect(middle).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" });
+    expect(middle).toHaveFocus();
+  });
+
+  it("does nothing on Tab when every button is disabled during a pending upload", async () => {
+    mockUpload.mockReturnValue(new Promise(() => {}));
+    render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    fireEvent.click(uploadBtn());
+    await waitFor(() => expect(selectBtn()).toBeDisabled());
+    expect(() =>
+      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" }),
+    ).not.toThrow();
+  });
+
+  it("ignores a second upload click fired before the disabled attribute commits", async () => {
+    let resolveUpload!: (value: string) => void;
+    mockUpload.mockReturnValue(new Promise((resolve) => (resolveUpload = resolve)));
+    render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    const btn = uploadBtn();
+    // Batching both clicks inside one `act` call lands them before React
+    // commits the `disabled` attribute from the first click's setUploading(true);
+    // only the uploadingRef guard in onUpload() stops the re-entrant call.
+    act(() => {
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    resolveUpload("/api/auth/avatars/once.png");
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("ignores a second remove click fired before the disabled attribute commits", async () => {
+    let resolveRemove!: () => void;
+    mockRemove.mockReturnValue(new Promise<void>((resolve) => (resolveRemove = resolve)));
+    render(<AvatarDialog currentAvatarUrl="/api/auth/avatars/old.png" onClose={vi.fn()} />);
+    const btn = removeBtn();
+    act(() => {
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(mockRemove).toHaveBeenCalledTimes(1);
+    resolveRemove();
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not throw when an upload resolves after unmount", async () => {
+    let resolveUpload!: (value: string) => void;
+    mockUpload.mockReturnValue(new Promise((resolve) => (resolveUpload = resolve)));
+    const { unmount } = render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    fireEvent.click(uploadBtn());
+    unmount();
+    expect(() => resolveUpload("/api/auth/avatars/late.png")).not.toThrow();
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
+  });
+
+  it("does not throw when an upload rejects after unmount", async () => {
+    let rejectUpload!: (error: Error) => void;
+    mockUpload.mockReturnValue(new Promise((_resolve, reject) => (rejectUpload = reject)));
+    const { unmount } = render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    fireEvent.click(uploadBtn());
+    unmount();
+    expect(() => rejectUpload(new Error("boom"))).not.toThrow();
+    await waitFor(() => expect(mockUpload).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not throw when a remove resolves after unmount", async () => {
+    let resolveRemove!: () => void;
+    mockRemove.mockReturnValue(new Promise<void>((resolve) => (resolveRemove = resolve)));
+    const { unmount } = render(
+      <AvatarDialog currentAvatarUrl="/api/auth/avatars/old.png" onClose={vi.fn()} />,
+    );
+    fireEvent.click(removeBtn());
+    unmount();
+    expect(() => resolveRemove()).not.toThrow();
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
+  });
+
+  it("does not throw when a remove rejects after unmount", async () => {
+    let rejectRemove!: (error: Error) => void;
+    mockRemove.mockReturnValue(new Promise<void>((_resolve, reject) => (rejectRemove = reject)));
+    const { unmount } = render(
+      <AvatarDialog currentAvatarUrl="/api/auth/avatars/old.png" onClose={vi.fn()} />,
+    );
+    fireEvent.click(removeBtn());
+    unmount();
+    expect(() => rejectRemove(new Error("boom"))).not.toThrow();
+    await waitFor(() => expect(mockRemove).toHaveBeenCalledTimes(1));
+  });
+
+  it("falls back to a generic message when an upload rejects with a non-AvatarUploadError", async () => {
+    mockUpload.mockRejectedValueOnce(new Error("network down"));
+    render(<AvatarDialog onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+    fireEvent.click(uploadBtn());
+    expect(await screen.findByText(/não foi possível enviar o avatar/i)).toBeInTheDocument();
+  });
+
+  it("falls back to a generic message when a remove rejects with a non-AvatarUploadError", async () => {
+    mockRemove.mockRejectedValueOnce(new Error("network down"));
+    render(<AvatarDialog currentAvatarUrl="/api/auth/avatars/old.png" onClose={vi.fn()} />);
+    fireEvent.click(removeBtn());
+    expect(await screen.findByText(/não foi possível remover o avatar/i)).toBeInTheDocument();
   });
 });
