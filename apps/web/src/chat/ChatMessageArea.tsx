@@ -1442,14 +1442,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     };
   }, []);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    authorDMMountedRef.current = true;
+    const pendingAuthorDMs = openingAuthorDMRef.current;
+    return () => {
       authorDMMountedRef.current = false;
-      for (const controller of openingAuthorDMRef.current.values()) controller.abort();
-      openingAuthorDMRef.current.clear();
-    },
-    [],
-  );
+      for (const controller of pendingAuthorDMs.values()) controller.abort();
+      pendingAuthorDMs.clear();
+    };
+  }, []);
 
   const handleSend = useCallback(
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
@@ -1566,6 +1567,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       setOpenDMError(null);
       void getOrCreateDirectDM(recipientId, controller.signal)
         .then(({ conversationId }) => {
+          if (!authorDMMountedRef.current) return;
           ctx.refreshConversations?.();
           navigate(`/chat/dm/${encodeURIComponent(conversationId)}`);
         })
@@ -1620,7 +1622,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onReferenceMessage: setReferenceSource,
     onForwardMessage: selectForwardSource,
     onReferenceJump: jumpToReference,
-    onOpenAuthorDM: ctx.currentUserId ? openAuthorDM : undefined,
+    onOpenAuthorDM:
+      ctx.currentUserId && (kind === "channel" || activeDM?.type === "group")
+        ? openAuthorDM
+        : undefined,
     openingAuthorDMIds,
     onToggleFavorite: toggleFavorite,
     onReconcileLinkSafety: reconcileLinkSafety,

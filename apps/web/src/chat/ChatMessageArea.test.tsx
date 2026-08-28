@@ -5433,6 +5433,73 @@ describe("ChatMessageArea — sender display", () => {
     await waitFor(() => expect(sender).not.toBeDisabled());
   });
 
+  it("aborts a pending author DM open and skips refresh/navigation after unmount", async () => {
+    const refreshConversations = vi.fn();
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    let capturedSignal: AbortSignal | undefined;
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        resolveOpen = resolve;
+      });
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function LeaveConversation() {
+      const navigateAway = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigateAway("/else")}>
+            Sair da conversa
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <LeaveConversation />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+          <Route path="/else" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sair da conversa" }));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent("/else");
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-after-unmount", created: true });
+    });
+    expect(refreshConversations).not.toHaveBeenCalled();
+    expect(screen.getByTestId("current-path")).toHaveTextContent("/else");
+  });
+
   it("keeps the current conversation usable after a generic open failure", async () => {
     mockGetOrCreateDirectDM.mockRejectedValue(new ApiRequestError(403, "forbidden", "Forbidden"));
     mockFetchChannelMessages.mockResolvedValue(
@@ -5453,6 +5520,77 @@ describe("ChatMessageArea — sender display", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("abrir a conversa");
     expect(screen.getByText("mensagem atual")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Abrir conversa com Fernanda" })).toBeEnabled();
+  });
+
+  it("renders another sender name as a DM action in group DMs", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/group-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "group-1", type: "group", name: "Grupo", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not add the issue #445 author action inside an open 1:1 DM", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/direct-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "direct-1",
+                      type: "1:1",
+                      name: "Fernanda",
+                      participants: [],
+                      counterpart: { userId: "other-456", displayName: "Fernanda" },
+                    },
+                  ],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("chat-msg-sender")).toHaveTextContent("Fernanda");
+    expect(
+      screen.queryByRole("button", { name: "Abrir conversa com Fernanda" }),
+    ).not.toBeInTheDocument();
   });
 
   it("own message does not show sender span", async () => {
