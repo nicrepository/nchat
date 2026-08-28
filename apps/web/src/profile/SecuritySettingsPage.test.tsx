@@ -30,7 +30,9 @@ describe("SecuritySettingsPage", () => {
     vi.stubEnv("VITE_KEYCLOAK_ACCOUNT_URL", "");
     render(<SecuritySettingsPage />);
     expect(screen.queryByRole("link", { name: /gerenciar segurança/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/gerencie senha e autenticação no provedor de identidade/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/gerencie senha e autenticação no provedor de identidade/i),
+    ).toBeInTheDocument();
   });
 
   it("does not claim MFA is enabled or disabled — no fabricated status", () => {

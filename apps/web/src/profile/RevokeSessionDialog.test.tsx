@@ -94,9 +94,7 @@ describe("RevokeSessionDialog", () => {
     await user.click(screen.getByRole("button", { name: /revogar sessão/i }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled());
     // Should not throw even though no button matches "button:not(:disabled)".
-    expect(() =>
-      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" }),
-    ).not.toThrow();
+    expect(() => fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" })).not.toThrow();
   });
 
   it("ignores non-Tab, non-Escape keys", () => {

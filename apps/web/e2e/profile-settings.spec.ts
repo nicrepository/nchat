@@ -252,17 +252,18 @@ test.describe("Profile & account settings (#672)", () => {
 
     const newSrc = "/media/avatars/e2e-user-uploaded.png";
     await expect(page.locator("img.profile-identity__avatar-img")).toHaveAttribute("src", newSrc);
-    await expect(page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img")).toHaveAttribute(
-      "src",
-      newSrc,
-    );
+    await expect(
+      page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img"),
+    ).toHaveAttribute("src", newSrc);
   });
 
   test("removing the avatar falls back to initials", async ({ page }) => {
     await mockProfileApi(page, { avatar_url: "/media/avatars/e2e-user-existing.png" });
     await page.reload();
     await expect(page.locator("img.profile-identity__avatar-img")).toBeVisible();
-    await expect(page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img")).toBeVisible();
+    await expect(
+      page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img"),
+    ).toBeVisible();
 
     await page.getByRole("button", { name: "Trocar foto" }).click();
     const dialog = page.getByRole("dialog", { name: "Trocar foto" });
@@ -271,7 +272,9 @@ test.describe("Profile & account settings (#672)", () => {
 
     await expect(page.locator("img.profile-identity__avatar-img")).toHaveCount(0);
     await expect(page.locator(".profile-identity__avatar")).toContainText("EU");
-    await expect(page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img")).toHaveCount(0);
+    await expect(page.locator(".chat-sidebar__user-row img.chat-sidebar__avatar-img")).toHaveCount(
+      0,
+    );
   });
 
   test("navigates all four sections via tabs, and each is a real deep link surviving reload", async ({
@@ -356,7 +359,9 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(page.getByTestId("session-row")).toHaveCount(3);
     await expect(page.getByText("Sessão atual")).toHaveCount(1);
 
-    await sessionRow(page, "Chrome on Windows").getByRole("button", { name: "Revogar sessão" }).click();
+    await sessionRow(page, "Chrome on Windows")
+      .getByRole("button", { name: "Revogar sessão" })
+      .click();
     const revokeOneDialog = page.getByRole("dialog", { name: "Revogar sessão?" });
     await expect(revokeOneDialog).toBeVisible();
     await revokeOneDialog.getByRole("button", { name: "Revogar sessão" }).click();
@@ -393,7 +398,9 @@ test.describe("Profile & account settings (#672)", () => {
     );
 
     await page.goto("/profile/sessions");
-    await sessionRow(page, "Dispositivo Suspeito").getByRole("button", { name: "Revogar sessão" }).click();
+    await sessionRow(page, "Dispositivo Suspeito")
+      .getByRole("button", { name: "Revogar sessão" })
+      .click();
     const dialog = page.getByRole("dialog", { name: "Revogar sessão?" });
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Revogar sessão" }).click();
@@ -409,7 +416,9 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(page.getByTestId("session-row")).toHaveCount(2);
   });
 
-  test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({ page }) => {
+  test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({
+    page,
+  }) => {
     for (const viewport of [
       { width: 1920, height: 1080 },
       { width: 1366, height: 768 },

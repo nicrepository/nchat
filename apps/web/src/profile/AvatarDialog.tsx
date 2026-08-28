@@ -204,7 +204,11 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
               className="avatar-dialog__preview-img"
             />
           ) : (
-            <PersonAvatarImage src={shownSrc} initials="" imgClassName="avatar-dialog__preview-img" />
+            <PersonAvatarImage
+              src={shownSrc}
+              initials=""
+              imgClassName="avatar-dialog__preview-img"
+            />
           )}
         </div>
         <p className="avatar-dialog__hint">JPEG ou PNG, até 5 MB.</p>
@@ -256,7 +260,12 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
           >
             {removing ? "Removendo…" : "Remover avatar"}
           </button>
-          <button type="button" className="avatar-dialog__btn" onClick={requestClose} disabled={busy}>
+          <button
+            type="button"
+            className="avatar-dialog__btn"
+            onClick={requestClose}
+            disabled={busy}
+          >
             Fechar
           </button>
         </div>

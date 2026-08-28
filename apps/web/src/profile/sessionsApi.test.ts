@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
-import { listSessions, revokeAllOtherSessions, revokeSession, SessionsApiError } from "./sessionsApi";
+import {
+  listSessions,
+  revokeAllOtherSessions,
+  revokeSession,
+  SessionsApiError,
+} from "./sessionsApi";
 
 vi.mock("../lib/authClient");
 
@@ -37,7 +42,10 @@ describe("sessionsApi", () => {
         revokedAt: undefined,
       },
     ]);
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", { method: "GET", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", {
+      method: "GET",
+      signal: undefined,
+    });
   });
 
   it("listSessions falls back to empty strings when ip_address/user_agent are absent", async () => {
@@ -70,13 +78,19 @@ describe("sessionsApi", () => {
   it("revokeSession calls DELETE on the session's own path", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(undefined);
     await revokeSession("s2");
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions/s2", { method: "DELETE", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions/s2", {
+      method: "DELETE",
+      signal: undefined,
+    });
   });
 
   it("revokeAllOtherSessions calls DELETE on the collection endpoint", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(undefined);
     await revokeAllOtherSessions();
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", { method: "DELETE", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", {
+      method: "DELETE",
+      signal: undefined,
+    });
   });
 
   it("maps a 401 on revokeAllOtherSessions to SessionsApiError('unauthorized')", async () => {

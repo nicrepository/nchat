@@ -82,7 +82,10 @@ export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
 /** Revokes one session. Idempotent from the caller's perspective: a 404 (already gone / not this user's) is not surfaced as a distinct case here — the list is always revalidated after, so the row converges to "gone" either way. */
 export async function revokeSession(sessionId: string, signal?: AbortSignal): Promise<void> {
   try {
-    await authenticatedFetch<void>(`${AUTH_BASE}/me/sessions/${sessionId}`, { method: "DELETE", signal });
+    await authenticatedFetch<void>(`${AUTH_BASE}/me/sessions/${sessionId}`, {
+      method: "DELETE",
+      signal,
+    });
   } catch (error) {
     throw mapSessionsError(error);
   }

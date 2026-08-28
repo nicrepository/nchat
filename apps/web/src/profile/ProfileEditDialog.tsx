@@ -114,7 +114,9 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
     } catch (failure) {
       if (!mountedRef.current) return;
       const message =
-        failure instanceof UpdateProfileError ? failure.message : "Não foi possível salvar o perfil.";
+        failure instanceof UpdateProfileError
+          ? failure.message
+          : "Não foi possível salvar o perfil.";
       setError(message);
       nameInputRef.current?.focus();
     } finally {
@@ -224,7 +226,12 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
           )}
 
           <div className="profile-edit__actions">
-            <button type="button" className="profile-edit__cancel" disabled={pending} onClick={requestClose}>
+            <button
+              type="button"
+              className="profile-edit__cancel"
+              disabled={pending}
+              onClick={requestClose}
+            >
               Cancelar
             </button>
             <button

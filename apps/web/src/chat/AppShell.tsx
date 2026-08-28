@@ -173,8 +173,16 @@ function mainAriaLabel(pathname: string): string {
 export default function AppShell() {
   useRootScrollLock();
   const sidebar = useChatSidebar();
-  const { state, retry, setPinned, markRead, renameChannel, renameGroup, setMuted, leaveConversation } =
-    sidebar;
+  const {
+    state,
+    retry,
+    setPinned,
+    markRead,
+    renameChannel,
+    renameGroup,
+    setMuted,
+    leaveConversation,
+  } = sidebar;
   // Details opened from a row menu, for that row's target (issue #527). Held
   // here rather than in ChatMessageArea because the target may be a
   // conversation other than the open one, and opening it must not navigate.
@@ -202,7 +210,12 @@ export default function AppShell() {
   // The navigation is a column on wide viewports and a drawer below them
   // (issue #467). Only the open/closed boolean lives here; which of the two it
   // is at a given width is decided in AppShell.css.
-  const { open: navOpen, modal: navModal, toggle: toggleNav, close: setNavClosed } = useNavDrawer(pathname);
+  const {
+    open: navOpen,
+    modal: navModal,
+    toggle: toggleNav,
+    close: setNavClosed,
+  } = useNavDrawer(pathname);
   const navToggleRef = useRef<HTMLButtonElement>(null);
   // Closing always hands focus back to the control that opened the drawer: it
   // is the one element that is on screen in every drawer state, so a keyboard

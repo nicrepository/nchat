@@ -10,14 +10,22 @@ interface ProfileIdentityCardProps {
   onChangePhoto: () => void;
 }
 
-export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: ProfileIdentityCardProps) {
+export default function ProfileIdentityCard({
+  profile,
+  onEdit,
+  onChangePhoto,
+}: ProfileIdentityCardProps) {
   const presence = usePresence(profile.id);
   const initials = profile.displayName ? initialsFrom(profile.displayName) : "";
 
   return (
     <section className="profile-identity" aria-label="Identidade">
       <div className="profile-identity__avatar" style={{ color: avatarColorFor(profile.id) }}>
-        <PersonAvatarImage src={profile.avatarUrl} initials={initials} imgClassName="profile-identity__avatar-img" />
+        <PersonAvatarImage
+          src={profile.avatarUrl}
+          initials={initials}
+          imgClassName="profile-identity__avatar-img"
+        />
       </div>
       <div className="profile-identity__info">
         <h1 className="profile-identity__name">{profile.displayName || "Sem nome"}</h1>
@@ -32,10 +40,16 @@ export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: 
             </span>
           )}
         </div>
-        {profile.customStatus && <p className="profile-identity__custom-status">{profile.customStatus}</p>}
+        {profile.customStatus && (
+          <p className="profile-identity__custom-status">{profile.customStatus}</p>
+        )}
         {profile.bio && <p className="profile-identity__bio">{profile.bio}</p>}
         <div className="profile-identity__actions">
-          <button type="button" className="profile-identity__btn profile-identity__btn--primary" onClick={onEdit}>
+          <button
+            type="button"
+            className="profile-identity__btn profile-identity__btn--primary"
+            onClick={onEdit}
+          >
             Editar
           </button>
           <button type="button" className="profile-identity__btn" onClick={onChangePhoto}>
@@ -48,5 +62,10 @@ export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: 
 }
 
 function PresenceDotInline({ state }: { state: string }) {
-  return <span className={`profile-identity__presence-dot profile-identity__presence-dot--${state}`} aria-hidden="true" />;
+  return (
+    <span
+      className={`profile-identity__presence-dot profile-identity__presence-dot--${state}`}
+      aria-hidden="true"
+    />
+  );
 }

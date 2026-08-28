@@ -18,13 +18,17 @@ describe("ProfileTabs", () => {
   it("marks Perfil active on the exact /profile route", () => {
     renderAt("/profile");
     expect(screen.getByRole("link", { name: "Perfil" })).toHaveClass("profile-tabs__link--active");
-    expect(screen.getByRole("link", { name: "Sessões" })).not.toHaveClass("profile-tabs__link--active");
+    expect(screen.getByRole("link", { name: "Sessões" })).not.toHaveClass(
+      "profile-tabs__link--active",
+    );
   });
 
   it("marks Sessões active on /profile/sessions and not Perfil", () => {
     renderAt("/profile/sessions");
     expect(screen.getByRole("link", { name: "Sessões" })).toHaveClass("profile-tabs__link--active");
-    expect(screen.getByRole("link", { name: "Perfil" })).not.toHaveClass("profile-tabs__link--active");
+    expect(screen.getByRole("link", { name: "Perfil" })).not.toHaveClass(
+      "profile-tabs__link--active",
+    );
   });
 
   it("renders all four sections as links", () => {
@@ -32,7 +36,9 @@ describe("ProfileTabs", () => {
     for (const label of ["Perfil", "Notificações", "Segurança", "Sessões"]) {
       expect(screen.getByRole("link", { name: label })).toHaveAttribute(
         "href",
-        label === "Perfil" ? "/profile" : `/profile/${label === "Notificações" ? "notifications" : label === "Segurança" ? "security" : "sessions"}`,
+        label === "Perfil"
+          ? "/profile"
+          : `/profile/${label === "Notificações" ? "notifications" : label === "Segurança" ? "security" : "sessions"}`,
       );
     }
   });

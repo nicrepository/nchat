@@ -41,7 +41,11 @@ const copy = {
   },
 } as const;
 
-export default function RevokeSessionDialog({ target, onClose, onConfirm }: RevokeSessionDialogProps) {
+export default function RevokeSessionDialog({
+  target,
+  onClose,
+  onConfirm,
+}: RevokeSessionDialogProps) {
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);

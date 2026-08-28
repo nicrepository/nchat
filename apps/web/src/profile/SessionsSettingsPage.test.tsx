@@ -12,8 +12,22 @@ afterEach(() => {
 });
 
 const sessions: sessionsApi.Session[] = [
-  { id: "current", createdAt: "", lastSeenAt: "", ipAddress: "1.2.x.x", userAgent: "Firefox", current: true },
-  { id: "other", createdAt: "", lastSeenAt: "", ipAddress: "3.4.x.x", userAgent: "Chrome", current: false },
+  {
+    id: "current",
+    createdAt: "",
+    lastSeenAt: "",
+    ipAddress: "1.2.x.x",
+    userAgent: "Firefox",
+    current: true,
+  },
+  {
+    id: "other",
+    createdAt: "",
+    lastSeenAt: "",
+    ipAddress: "3.4.x.x",
+    userAgent: "Chrome",
+    current: false,
+  },
 ];
 
 describe("SessionsSettingsPage", () => {
@@ -25,25 +39,35 @@ describe("SessionsSettingsPage", () => {
   });
 
   it("shows a retry-capable error independent of other sections", async () => {
-    vi.mocked(sessionsApi.listSessions).mockRejectedValueOnce(new sessionsApi.SessionsApiError("unknown", "x"));
+    vi.mocked(sessionsApi.listSessions).mockRejectedValueOnce(
+      new sessionsApi.SessionsApiError("unknown", "x"),
+    );
     render(<SessionsSettingsPage />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /tentar novamente/i })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /tentar novamente/i })).toBeInTheDocument(),
+    );
   });
 
   it("revokes a single session through the confirm dialog and relists", async () => {
-    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions).mockResolvedValueOnce([sessions[0]]);
+    vi.mocked(sessionsApi.listSessions)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce([sessions[0]]);
     vi.mocked(sessionsApi.revokeSession).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
     await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(2));
     await user.click(screen.getByRole("button", { name: "Revogar sessão" }));
-    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }),
+    );
     await waitFor(() => expect(sessionsApi.revokeSession).toHaveBeenCalledWith("other"));
     await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(1));
   });
 
   it("revokes all others and preserves the current session", async () => {
-    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions).mockResolvedValueOnce([sessions[0]]);
+    vi.mocked(sessionsApi.listSessions)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce([sessions[0]]);
     vi.mocked(sessionsApi.revokeAllOtherSessions).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
@@ -107,7 +131,9 @@ describe("SessionsSettingsPage", () => {
     const { unmount } = render(<SessionsSettingsPage />);
     await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(2));
     await user.click(screen.getByRole("button", { name: "Revogar sessão" }));
-    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }),
+    );
     await waitFor(() => expect(sessionsApi.revokeSession).toHaveBeenCalledWith("other"));
     unmount();
     resolveRevoke();

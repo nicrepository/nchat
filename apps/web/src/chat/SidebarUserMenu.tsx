@@ -105,7 +105,8 @@ export default function SidebarUserMenu() {
     );
     if (items.length === 0) return;
     const current = items.findIndex((item) => item === document.activeElement);
-    const next = (((current < 0 ? -1 : current) + delta) % items.length + items.length) % items.length;
+    const next =
+      ((((current < 0 ? -1 : current) + delta) % items.length) + items.length) % items.length;
     items[next]?.focus();
   }
 

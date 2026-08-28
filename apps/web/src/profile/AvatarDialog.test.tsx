@@ -305,9 +305,7 @@ describe("AvatarDialog", () => {
     fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
     fireEvent.click(uploadBtn());
     await waitFor(() => expect(selectBtn()).toBeDisabled());
-    expect(() =>
-      fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" }),
-    ).not.toThrow();
+    expect(() => fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" })).not.toThrow();
   });
 
   it("ignores a second upload click fired before the disabled attribute commits", async () => {

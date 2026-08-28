@@ -29,7 +29,7 @@ describe("ProfileInfoCard", () => {
 
   it("returns null when both job title and timezone are empty", () => {
     const { container } = render(
-      <ProfileInfoCard profile={{ ...profile, jobTitle: "", timezone: "" }} />
+      <ProfileInfoCard profile={{ ...profile, jobTitle: "", timezone: "" }} />,
     );
     expect(container.firstChild).toBeNull();
   });

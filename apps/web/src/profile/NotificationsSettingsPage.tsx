@@ -104,7 +104,10 @@ export default function NotificationsSettingsPage() {
           />
           Somente menções
         </label>
-        <label className="notifications-settings__checkbox-row" htmlFor="sound-mode-mentions-and-dms">
+        <label
+          className="notifications-settings__checkbox-row"
+          htmlFor="sound-mode-mentions-and-dms"
+        >
           <input
             id="sound-mode-mentions-and-dms"
             type="radio"
@@ -118,7 +121,10 @@ export default function NotificationsSettingsPage() {
       </fieldset>
 
       <div className="notifications-settings__browser-notifications">
-        <label className="notifications-settings__checkbox-row" htmlFor="incoming-call-ringtone-enabled">
+        <label
+          className="notifications-settings__checkbox-row"
+          htmlFor="incoming-call-ringtone-enabled"
+        >
           <input
             id="incoming-call-ringtone-enabled"
             type="checkbox"
@@ -176,8 +182,8 @@ export default function NotificationsSettingsPage() {
         {browserPermission === "default" && (
           <>
             <p className="notifications-settings__browser-notifications-status">
-              Ative notificações do navegador para ser avisado de novas mensagens mesmo com a aba
-              em segundo plano.
+              Ative notificações do navegador para ser avisado de novas mensagens mesmo com a aba em
+              segundo plano.
             </p>
             <button
               type="button"

@@ -60,7 +60,9 @@ describe("ProfileEditDialog", () => {
     await user.click(saveButton);
     expect(profileApi.updateProfile).toHaveBeenCalledTimes(1);
     resolveUpdate({ ...profile, displayName: "Ana Costa" });
-    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ displayName: "Ana Costa" })));
+    await waitFor(() =>
+      expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ displayName: "Ana Costa" })),
+    );
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -173,9 +175,7 @@ describe("ProfileEditDialog", () => {
     render(<ProfileEditDialog profile={profile} onClose={vi.fn()} onSaved={vi.fn()} />);
     await user.type(screen.getByLabelText("Nome de exibição"), " Costa");
     await user.click(screen.getByRole("button", { name: /salvar alterações/i }));
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled(),
-    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled());
     expect(() => fireEvent.keyDown(screen.getByRole("dialog"), { key: "Tab" })).not.toThrow();
   });
 
@@ -194,9 +194,7 @@ describe("ProfileEditDialog", () => {
     render(<ProfileEditDialog profile={profile} onClose={onClose} onSaved={vi.fn()} />);
     await user.type(screen.getByLabelText("Nome de exibição"), " Costa");
     await user.click(screen.getByRole("button", { name: /salvar alterações/i }));
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled(),
-    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Cancelar" })).toBeDisabled());
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
   });

@@ -16,7 +16,14 @@ describe("ProfileOverviewPage", () => {
 
     vi.mocked(selfProfile.useSelfProfile).mockReturnValue({
       status: "ready",
-      profile: { id: "u1", displayName: "Ana", jobTitle: "", bio: "", timezone: "", customStatus: "" },
+      profile: {
+        id: "u1",
+        displayName: "Ana",
+        jobTitle: "",
+        bio: "",
+        timezone: "",
+        customStatus: "",
+      },
     });
     rerender(<ProfileOverviewPage />);
     expect(screen.getByRole("heading", { name: "Ana" })).toBeInTheDocument();
@@ -31,7 +38,14 @@ describe("ProfileOverviewPage", () => {
   it("opens ProfileEditDialog from Editar and AvatarDialog from Trocar foto", async () => {
     vi.mocked(selfProfile.useSelfProfile).mockReturnValue({
       status: "ready",
-      profile: { id: "u1", displayName: "Ana", jobTitle: "", bio: "", timezone: "", customStatus: "" },
+      profile: {
+        id: "u1",
+        displayName: "Ana",
+        jobTitle: "",
+        bio: "",
+        timezone: "",
+        customStatus: "",
+      },
     });
     const user = userEvent.setup();
     render(<ProfileOverviewPage />);

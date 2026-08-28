@@ -15,7 +15,10 @@ import { listSessions, revokeAllOtherSessions, revokeSession, type Session } fro
 import RevokeSessionDialog from "./RevokeSessionDialog";
 import SessionRow from "./SessionRow";
 
-type LoadState = { status: "loading" } | { status: "error" } | { status: "ready"; sessions: Session[] };
+type LoadState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; sessions: Session[] };
 type ConfirmState = { target: "single"; sessionId: string } | { target: "others" } | null;
 
 export default function SessionsSettingsPage() {
@@ -115,7 +118,11 @@ export default function SessionsSettingsPage() {
         ))}
       </ul>
       {confirm && (
-        <RevokeSessionDialog target={confirm.target} onClose={() => setConfirm(null)} onConfirm={handleConfirm} />
+        <RevokeSessionDialog
+          target={confirm.target}
+          onClose={() => setConfirm(null)}
+          onConfirm={handleConfirm}
+        />
       )}
     </div>
   );
