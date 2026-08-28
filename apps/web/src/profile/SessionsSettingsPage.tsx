@@ -30,8 +30,10 @@ export default function SessionsSettingsPage() {
     };
   }, []);
 
+  // Callers that already know the fetch is starting (a click handler, a
+  // retry, a post-mutation reload) set the loading state themselves before
+  // calling load() — an effect body must not call setState synchronously.
   const load = useCallback((signal?: AbortSignal) => {
-    setState({ status: "loading" });
     listSessions(signal)
       .then((sessions) => {
         if (signal?.aborted || !mountedRef.current) return;
@@ -49,6 +51,11 @@ export default function SessionsSettingsPage() {
     return () => controller.abort();
   }, [load]);
 
+  function retry() {
+    setState({ status: "loading" });
+    load();
+  }
+
   async function handleConfirm() {
     if (!confirm) return;
     if (confirm.target === "single") {
@@ -56,7 +63,10 @@ export default function SessionsSettingsPage() {
     } else {
       await revokeAllOtherSessions();
     }
-    if (mountedRef.current) load();
+    if (mountedRef.current) {
+      setState({ status: "loading" });
+      load();
+    }
   }
 
   if (state.status === "loading") {
@@ -71,7 +81,7 @@ export default function SessionsSettingsPage() {
     return (
       <div className="sessions-settings sessions-settings__error">
         <p>Não foi possível carregar suas sessões.</p>
-        <button type="button" onClick={() => load()}>
+        <button type="button" onClick={retry}>
           Tentar novamente
         </button>
       </div>
