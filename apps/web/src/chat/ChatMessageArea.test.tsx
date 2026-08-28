@@ -23,9 +23,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
+import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage } from "./chatTypes";
 import type {
+  WSClientErrorEvent,
   WSMessageCreatedEvent,
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
@@ -147,6 +149,7 @@ const {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
+    capturedReactionError: null as ((event: WSClientErrorEvent) => void) | null,
     capturedSubscribed: null as ((event: WSSubscribedEvent) => void) | null,
     capturedOnTypingUpdated: null as ((event: WSTypingUpdatedEvent) => void) | null,
     toggleReaction: vi.fn(() => true),
@@ -241,18 +244,21 @@ vi.mock("./useChatWebSocket", () => ({
       onMessageCreated,
       onMessageUpdated,
       onReactionUpdated,
+      onReactionError,
       onSubscribed,
       onTypingUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
       onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+      onReactionError?: (event: WSClientErrorEvent) => void;
       onSubscribed?: (event: WSSubscribedEvent) => void;
       onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
@@ -480,14 +486,23 @@ beforeEach(() => {
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
+  wsMockState.capturedReactionError = null;
   wsMockState.capturedSubscribed = null;
   wsMockState.capturedOnTypingUpdated = null;
   vi.clearAllMocks();
   vi.mocked(useChatWebSocket).mockImplementation(
-    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onSubscribed, onTypingUpdated }) => {
+    ({
+      onMessageCreated,
+      onMessageUpdated,
+      onReactionUpdated,
+      onReactionError,
+      onSubscribed,
+      onTypingUpdated,
+    }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
@@ -2562,6 +2577,64 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
 
+  // The badge's emoji is not a value this client picked: it came back on the
+  // message the server sent, and the server validates it again on the toggle.
+  // The lazy catalog is a picker's index, so whether it happens to be in memory
+  // must not decide whether an existing reaction can be joined (issue #496).
+  it("allows toggling an existing server reaction before the lazy catalog has loaded", async () => {
+    resetEmojiCatalogCache();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🏳️‍🌈", count: 1, reactedByMe: false, users: [] }],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const badge = await screen.findByRole("button", { name: "Adicionar reação 🏳️‍🌈" });
+    // The reproduction depends on this: nothing has loaded the chunk, so the
+    // catalog cannot answer for an emoji outside the server's quick row.
+    expect(isCatalogedEmoji("🏳️‍🌈")).toBe(false);
+    await userEvent.click(badge);
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "🏳️‍🌈");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
+  it("toggles the same existing reaction once the catalog is loaded", async () => {
+    resetEmojiCatalogCache();
+    await loadEmojiCatalog();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🏳️‍🌈", count: 2, reactedByMe: true, users: [] }],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Remover reação 🏳️‍🌈" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "🏳️‍🌈");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
+  it("toggles a quick reaction before the lazy catalog has loaded", async () => {
+    resetEmojiCatalogCache();
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+
+    expect(isCatalogedEmoji("👍")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
   // A use is what the reader chose *here* and the server confirmed, so the
   // reaction has to start as a local toggle: an event with no intent behind it
   // came from somewhere else and does not shape this client's history (#496).
@@ -3073,21 +3146,38 @@ describe("ChatMessageArea — message list", () => {
     expect(badge).toHaveAccessibleDescription("👍: Você e Bruna");
   });
 
-  it("rejects a reaction whose bytes do not match the server allowlist", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([
-        makeMessage({
-          id: "m1",
-          reactions: [{ emoji: "❤", count: 1, reactedByMe: false, users: [] }],
-        }),
-      ]),
+  // Whether a reaction may exist is the server's decision, and nothing this
+  // client draws can pre-empt it: the toggle below is as legitimate as one gets
+  // — the server's own quick row — and the server still refuses it. What the
+  // reader must not be left with is the reaction they never got: the optimistic
+  // badge goes away again and the refusal is read.
+  it("rolls the optimistic reaction back when the server refuses the toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    expect(screen.queryByRole("button", { name: /reação 👍/ })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+
+    // Drawn before any confirmation: that is the whole point of the optimism,
+    // and the whole reason a refusal has to undo it.
+    const optimistic = await screen.findByRole("button", { name: "Remover reação 👍" });
+    expect(optimistic).toHaveAttribute("aria-pressed", "true");
+    expect(optimistic).toHaveTextContent("1");
+
+    act(() =>
+      wsMockState.capturedReactionError?.({
+        type: "error",
+        operation: "reaction",
+        code: "invalid_emoji",
+      }),
     );
-    renderChannelArea();
 
-    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação ❤" }));
-
-    expect(wsMockState.toggleReaction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent(/emoji não permitido/i);
+    // The reaction only ever existed locally, so back to confirmed state is back
+    // to no badge at all — not a badge showing zero.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /reação 👍/ })).toBeNull());
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível atualizar a reação.");
   });
 
   it("renders N reactions and toggles an existing pill without opening the grid", async () => {

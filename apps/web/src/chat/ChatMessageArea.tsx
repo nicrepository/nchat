@@ -39,7 +39,6 @@ import type { Channel, DMConversation, DMCounterpart, Message, PinnedItem } from
 import { fetchAllowedReactionEmojis } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
-import { isCatalogedEmoji } from "./emoji/emojiCatalog";
 import { recentEmojis, type EmojiUsage } from "./emoji/emojiUsage";
 import { useEmojiUsage } from "./emoji/useEmojiUsage";
 import { useMessages, type LastMutation, type MessagesState, type SendResult } from "./useMessages";
@@ -102,18 +101,6 @@ function typingIndicatorText(
  * a reaction may be is the catalog's decision, made again on the server for
  * every toggle.
  */
-/**
- * Whether this UI ever offered the emoji: the server's quick row, or the
- * catalog the picker is built from.
- *
- * A local echo of the server's answer, not a second policy — the same catalog
- * decides again on the server for every toggle. It exists so a value this UI
- * never showed is refused before it reaches the socket.
- */
-function isOfferedReactionEmoji(emoji: string, quickRow: string[]): boolean {
-  return quickRow.includes(emoji) || isCatalogedEmoji(emoji);
-}
-
 function quickReactionEmojis(usage: EmojiUsage, serverShortlist: string[]): string[] {
   const candidates = [...recentEmojis(usage, quickReactionCount), ...serverShortlist];
   return [...new Set(candidates)].slice(0, quickReactionCount);
@@ -1117,25 +1104,23 @@ function ConversationTimeline({
  * The strip between the timeline and the composer: a failed send, an unstable
  * connection, a refused action, and who is typing.
  *
- * The three errors share one line because only one of them can usefully be read
- * at a time, and the order is the order they matter in.
+ * The refusals share one line because only one of them can usefully be read at
+ * a time, and the order is the order they matter in.
  */
 function ConversationNotices({
   sendError,
   realtimeError,
-  reactionError,
   actionError,
   pinError,
   typingLabel,
 }: {
   sendError: string | null;
   realtimeError: string | null;
-  reactionError: string | null;
   actionError: string | null;
   pinError: string | null;
   typingLabel: string | null;
 }) {
-  const refusal = reactionError ?? actionError ?? pinError;
+  const refusal = actionError ?? pinError;
   return (
     <>
       {sendError && (
@@ -1281,7 +1266,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     remember: rememberReaction,
     changeTone: changeEmojiTone,
   } = useEmojiUsage(ctx.currentUserId);
-  const [reactionInputError, setReactionInputError] = useState<string | null>(null);
   const [editDisabledIds, setEditDisabledIds] = useState<Set<string>>(new Set());
   const lastReactionToggleRef = useRef({ key: "", at: 0 });
   const recentReactionEmojis = useMemo(
@@ -1507,12 +1491,19 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     [state.replyTo],
   );
 
+  /**
+   * Toggle a reaction, whatever the reader touched to ask for it.
+   *
+   * Nothing is checked against the emoji catalog here. Every value that reaches
+   * this comes from a control this UI drew — the server's quick row, an entry
+   * picked out of the loaded catalog, or a reaction the server already returned
+   * on the message — and the server validates the sequence again on the toggle.
+   * The catalog is loaded lazily with the picker, so asking it was really asking
+   * whether the picker had been opened yet: an existing reaction someone else
+   * made was refused until it had, and accepted afterwards (issue #496).
+   */
   const handleToggleReaction = useCallback(
     (messageId: string, emoji: string) => {
-      if (!isOfferedReactionEmoji(emoji, allowedReactionEmojis)) {
-        setReactionInputError("Emoji não permitido para reações.");
-        return;
-      }
       const key = `${messageId}\u0000${emoji}`;
       const now = Date.now();
       if (
@@ -1522,10 +1513,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         return;
       }
       lastReactionToggleRef.current = { key, at: now };
-      setReactionInputError(null);
       toggleReaction(messageId, emoji);
     },
-    [allowedReactionEmojis, toggleReaction],
+    [toggleReaction],
   );
 
   const handleEditForbidden = useCallback(
@@ -1637,7 +1627,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         <ConversationNotices
           sendError={state.sendError}
           realtimeError={state.realtimeError}
-          reactionError={reactionInputError}
           actionError={state.actionError}
           pinError={pinError}
           typingLabel={typingIndicatorLabel}
