@@ -57,4 +57,22 @@ describe("SessionsSettingsPage", () => {
       expect(screen.getByText("Sessão atual")).toBeInTheDocument();
     });
   });
+
+  it("does not update state after unmount when a pending fetch resolves late", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    let resolveList!: (value: sessionsApi.Session[]) => void;
+    vi.mocked(sessionsApi.listSessions).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+    );
+    const { unmount } = render(<SessionsSettingsPage />);
+    unmount();
+    resolveList(sessions);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
 });
