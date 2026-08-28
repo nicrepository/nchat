@@ -43,6 +43,17 @@ describe("ProfileIdentityCard", () => {
     expect(screen.queryByTestId("profile-identity-timezone")).not.toBeInTheDocument();
   });
 
+  it("shows a 'Sem nome' placeholder and empty initials when displayName is empty", () => {
+    render(
+      <ProfileIdentityCard
+        profile={{ ...profile, displayName: "" }}
+        onEdit={vi.fn()}
+        onChangePhoto={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "Sem nome" })).toBeInTheDocument();
+  });
+
   it("Editar and Trocar foto call their handlers", async () => {
     const user = userEvent.setup();
     const onEdit = vi.fn();
