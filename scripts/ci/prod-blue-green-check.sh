@@ -192,7 +192,32 @@ check_preview_access_control() {
   allowlist="$(query 'Middleware|preview-allowlist|source-range')"
   [[ -n "$allowlist" ]] || fail "preview-allowlist declares no sourceRange"
   [[ "$allowlist" != *0.0.0.0/0* ]] || fail "preview-allowlist is open to the world"
+  check_preview_client_ip_strategy
   ok "every preview is restricted in the configuration, not only in a comment"
+}
+
+# The allowlist must compare its sourceRange against the operator, not against
+# whatever proxied the request.
+#
+# The preview hosts are behind Cloudflare. With no ipStrategy, IPAllowList
+# matches sourceRange against RemoteAddr -- the Cloudflare edge -- so
+# NCHAT_PROD_PREVIEW_ALLOW_CIDR would stop meaning "the operator's network".
+# The failure is silent in the direction that matters: the natural repair is to
+# put the Cloudflare ranges in sourceRange, which turns the allowlist into a
+# permit for every visitor Cloudflare forwards, and nothing in the manifest
+# would say so. depth 1 takes the rightmost X-Forwarded-For entry, which in
+# this chain is the address Cloudflare appends and the client cannot forge.
+#
+# Exactly 1, not merely present: any other depth names a different hop of a
+# proxy chain this deployment does not have.
+check_preview_client_ip_strategy() {
+  local depth
+  depth="$(query 'Middleware|preview-allowlist|ip-strategy-depth')"
+  case "$depth" in
+    1) ;;
+    "") fail "preview-allowlist declares no ipStrategy.depth; behind Cloudflare it would allowlist the edge address instead of the operator" ;;
+    *) fail "preview-allowlist uses ipStrategy.depth=$depth; this chain is client -> Cloudflare -> Traefik, where only depth 1 is the client" ;;
+  esac
 }
 
 # Both slots must be previewable, chat and console, or a candidate cannot be

@@ -905,6 +905,31 @@ Keycloak must list all four preview callbacks as additional valid redirect URIs
 on the production client — the two administrative hosts as much as the two chat
 ones, since the console signs in through the same provider.
 
+### The allowlist and the proxy in front of it
+
+In the current operational topology the four preview hosts are **proxied by
+Cloudflare**, so the connection Traefik accepts comes from a Cloudflare edge
+address and never from the operator's machine.
+
+- `NCHAT_PROD_PREVIEW_ALLOW_CIDR` is the **operator's own address or network**.
+  It is never the Cloudflare ranges. Putting them there would not restore the
+  restriction — it would turn the allowlist into a permit for every visitor
+  Cloudflare forwards, while still reading like an allowlist.
+- `preview-allowlist` therefore takes the client from `X-Forwarded-For` with
+  `ipStrategy.depth: 1`. Depth counts from the **right**, and Cloudflare appends
+  the real visitor to whatever the client sent, so entry 1 is the address the
+  client cannot forge. `scripts/ci/prod-blue-green-check.sh` refuses a rendered
+  manifest whose depth is absent or anything but 1.
+- That header is only trustworthy because Traefik's `entryPoints.web` and
+  `entryPoints.websecure` set `forwardedHeaders.trustedIPs` to the Cloudflare
+  ranges and nothing else: forwarded headers from any other source are dropped
+  rather than believed.
+
+Without that trusted proxy chain in place — previews served directly, fronted by
+a different proxy, or Traefik trusting a wider set of IPs — the depth names a
+different hop and **the mechanism is not equivalent to an allowlist**. Treat the
+previews as unrestricted until the chain is confirmed.
+
 To disable previews:
 
 ```bash
