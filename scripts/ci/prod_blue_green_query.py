@@ -176,6 +176,18 @@ def _field_source_range(document: Document) -> str:
     return " ".join(value.lstrip("- ").strip() for value in values)
 
 
+def _field_ip_strategy_depth(document: Document) -> str:
+    """How an IPAllowList picks the client address out of X-Forwarded-For.
+
+    Read as its own field rather than through the generic `spec.` path because
+    the answer is a security property, not a setting: an absent ipStrategy is
+    not "unset", it is IPAllowList matching sourceRange against RemoteAddr --
+    the proxy in front, not the client -- and the empty string this returns is
+    what the gate refuses.
+    """
+    return document.nested("spec", "ipAllowList", "ipStrategy", "depth") or ""
+
+
 def _field_node_hosts(document: Document) -> str:
     """Every hostname a node affinity admits, space separated.
 
@@ -236,6 +248,7 @@ FIELD_QUERIES = {
     "selector-slot": _field_selector_slot,
     "middlewares": _field_middlewares,
     "source-range": _field_source_range,
+    "ip-strategy-depth": _field_ip_strategy_depth,
     "release-sha": _field_release_sha,
     "probes": _field_probes,
     "livekit-env": _field_livekit_env,

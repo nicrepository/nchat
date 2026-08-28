@@ -905,6 +905,37 @@ Keycloak must list all four preview callbacks as additional valid redirect URIs
 on the production client — the two administrative hosts as much as the two chat
 ones, since the console signs in through the same provider.
 
+### The allowlist and the proxy in front of it
+
+On the expected public path the four preview hosts are **proxied by Cloudflare**,
+so the connection Traefik accepts comes from a Cloudflare edge rather than the
+operator's machine.
+
+- `NCHAT_PROD_PREVIEW_ALLOW_CIDR` is the **operator's own address or network**.
+  It is never the Cloudflare ranges. Putting them there would not restore the
+  restriction — it would turn the allowlist into a permit for every visitor
+  Cloudflare forwards, while still reading like an allowlist.
+- `preview-allowlist` therefore takes the client from `X-Forwarded-For` with
+  `ipStrategy.depth: 1`. In the expected public path, client -> Cloudflare ->
+  Traefik, depth counts from the **right** and selects the visitor address that
+  Cloudflare puts in the rightmost position. For a request delivered by
+  Cloudflare, the client cannot forge that appended position.
+  `scripts/ci/prod-blue-green-check.sh` refuses a rendered manifest whose depth
+  is absent or anything but 1.
+- Header trust is a separate property. Traefik's current
+  `forwardedHeaders.trustedIPs` includes loopback, the RFC1918 private ranges,
+  and the Cloudflare IPv4 ranges. These additional origins are part of the
+  infrastructure trust boundary. Consequently, `preview-allowlist` does not
+  protect against a requester that can reach Traefik from one of those trusted
+  private networks and control forwarded headers.
+
+If operator-only access must also be enforced against clients on those trusted
+internal networks, harden the global Traefik configuration or add a network
+control. Do not improvise that protection in this middleware, and do not change
+the global setting as part of a preview change: it is shared by other services.
+For any public path other than client -> Cloudflare -> Traefik, revalidate which
+hop `depth: 1` selects before treating the preview as restricted.
+
 To disable previews:
 
 ```bash
