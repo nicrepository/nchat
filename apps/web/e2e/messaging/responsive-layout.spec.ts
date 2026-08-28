@@ -532,6 +532,25 @@ test.describe("layout responsivo", () => {
       ),
     });
     await installMessagingMocks(page, scenario);
+    await page.route("**/api/chat/sidebar", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            current_user_id: CURRENT_USER_ID,
+            workspace: {
+              id: "workspace-e2e",
+              max_upload_bytes: 8 * 1024 * 1024,
+              max_message_attachments: 10,
+              max_message_attachment_bytes: 64 * 1024 * 1024,
+            },
+            channels: scenario.sidebarChannels,
+            dm_conversations: scenario.sidebarDMs,
+          },
+        }),
+      }),
+    );
 
     await page.goto(`/chat/channel/${targetId}`);
 
@@ -555,6 +574,40 @@ test.describe("layout responsivo", () => {
     await input.press("Enter");
     await expect(page.getByText("Mensagem enviada com foco preservado")).toBeVisible();
     await expect(input).toBeFocused();
+
+    let uploaded = 0;
+    await page.route("**/api/files/channels/*/attachments", async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      uploaded += 1;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            id: `document-${uploaded}`,
+            filename: uploaded === 1 ? "um.pdf" : "dois.pdf",
+            contentType: "application/pdf",
+            size: 3,
+            status: "pending_scan",
+            previewStatus: "pending",
+            createdAt: "2026-08-27T12:00:00Z",
+          },
+        }),
+      });
+    });
+    await page.getByTestId("chat-composer-file-input").setInputFiles([
+      { name: "um.pdf", mimeType: "application/pdf", buffer: Buffer.from("um") },
+      { name: "dois.pdf", mimeType: "application/pdf", buffer: Buffer.from("dois") },
+    ]);
+    await expect(page.getByTestId("chat-composer-pending-attachment")).toHaveCount(2);
+    await expect(input).toBeFocused();
+    const attachmentSend = page.waitForRequest(
+      (request) => request.method() === "POST" && request.url().endsWith(`/messages`),
+    );
+    await page.keyboard.press("Enter");
+    expect((await attachmentSend).postDataJSON()).toMatchObject({
+      attachment_ids: ["document-1", "document-2"],
+    });
   });
 
   /**
