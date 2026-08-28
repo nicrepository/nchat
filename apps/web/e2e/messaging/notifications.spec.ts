@@ -88,8 +88,9 @@ async function installNotificationMock(page: Page) {
 
 async function setNotificationPermission(page: Page, permission: NotificationPermission) {
   await page.evaluate((value) => {
-    (window as unknown as { __e2eNotificationPermission: NotificationPermission }).__e2eNotificationPermission =
-      value;
+    (
+      window as unknown as { __e2eNotificationPermission: NotificationPermission }
+    ).__e2eNotificationPermission = value;
   }, permission);
 }
 
@@ -113,8 +114,9 @@ async function capturedNotifications(page: Page) {
 async function triggerNotificationClick(page: Page, index = 0) {
   await page.evaluate(
     (i) =>
-      (window as unknown as { __e2eTriggerNotificationClick: (index: number) => void })
-        .__e2eTriggerNotificationClick(i),
+      (
+        window as unknown as { __e2eTriggerNotificationClick: (index: number) => void }
+      ).__e2eTriggerNotificationClick(i),
     index,
   );
 }
@@ -178,7 +180,11 @@ test.describe("notificações — badge, notificação nativa, som e navegação
       sender_display_name: OTHER_USER_NAME,
       body_text: "mensagem nova para o badge",
     });
-    await emitMessageCreated(page, scenario, { kind: "dm", targetId: GROUP_DM_ID, message: incoming });
+    await emitMessageCreated(page, scenario, {
+      kind: "dm",
+      targetId: GROUP_DM_ID,
+      message: incoming,
+    });
 
     await expect(groupOption.getByLabel("1 não lidas")).toBeVisible();
 
@@ -209,7 +215,11 @@ test.describe("notificações — badge, notificação nativa, som e navegação
       sender_display_name: OTHER_USER_NAME,
       body_text: "conteúdo relevante da notificação",
     });
-    await emitMessageCreated(page, scenario, { kind: "dm", targetId: GROUP_DM_ID, message: incoming });
+    await emitMessageCreated(page, scenario, {
+      kind: "dm",
+      targetId: GROUP_DM_ID,
+      message: incoming,
+    });
 
     await expect.poll(() => capturedNotifications(page)).toHaveLength(1);
     const [notification] = await capturedNotifications(page);
@@ -245,7 +255,11 @@ test.describe("notificações — badge, notificação nativa, som e navegação
       sender_display_name: OTHER_USER_NAME,
       body_text: "mensagem com permissão bloqueada",
     });
-    await emitMessageCreated(page, scenario, { kind: "dm", targetId: GROUP_DM_ID, message: incoming });
+    await emitMessageCreated(page, scenario, {
+      kind: "dm",
+      targetId: GROUP_DM_ID,
+      message: incoming,
+    });
 
     // Confirma que o evento chegou de fato (via badge) antes de afirmar a
     // ausência de notificação — sem isso, um falso positivo seria possível
@@ -271,7 +285,10 @@ test.describe("notificações — badge, notificação nativa, som e navegação
     // e não apenas por já estar vazia.
     messagesFor(scenario, "dm", GROUP_DM_ID).push(
       ...Array.from({ length: 40 }, (_, index) =>
-        makeMessage({ id: `${GROUP_DM_ID}-history-${index}`, body_text: `Histórico ${index} do grupo.` }),
+        makeMessage({
+          id: `${GROUP_DM_ID}-history-${index}`,
+          body_text: `Histórico ${index} do grupo.`,
+        }),
       ),
     );
     await installMessagingMocks(page, scenario);
@@ -286,7 +303,11 @@ test.describe("notificações — badge, notificação nativa, som e navegação
       sender_display_name: OTHER_USER_NAME,
       body_text: "clique para navegar até o grupo",
     });
-    await emitMessageCreated(page, scenario, { kind: "dm", targetId: GROUP_DM_ID, message: incoming });
+    await emitMessageCreated(page, scenario, {
+      kind: "dm",
+      targetId: GROUP_DM_ID,
+      message: incoming,
+    });
     await expect.poll(() => capturedNotifications(page)).toHaveLength(1);
 
     // A Notification API nativa não é clicável pelo Playwright — o teste

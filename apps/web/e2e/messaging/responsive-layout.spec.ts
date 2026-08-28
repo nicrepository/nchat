@@ -8,6 +8,7 @@ import {
   OTHER_USER_NAME,
   channelDetailsFixture,
   createScenario,
+  emitMessageCreated,
   fillComposer,
   installMessagingMocks,
   makeMessage,
@@ -608,6 +609,68 @@ test.describe("layout responsivo", () => {
     expect((await attachmentSend).postDataJSON()).toMatchObject({
       attachment_ids: ["document-1", "document-2"],
     });
+  });
+
+  /**
+   * The `ws_append` branch of the scroll-management effect (ChatMessageArea.tsx)
+   * only auto-scrolls when `isNearBottomRef.current` is true — this proves that
+   * rule in a real browser (real overflow/scrollTop/scrollHeight), not just in
+   * the jsdom-level component test that already exercises the same branch with
+   * simulated geometry.
+   */
+  test("mensagem nova não move o scroll de quem está lendo histórico antigo", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const targetId = uniqueId(testInfo, "old-history-preserved");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "Conversa Com Histórico",
+      messages: Array.from({ length: 60 }, (_, i) =>
+        makeMessage({ id: `${targetId}-m${i}`, body_text: `Mensagem ${i} do histórico.` }),
+      ),
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(async () =>
+        list.evaluate((el) => Math.abs(el.scrollHeight - el.clientHeight - el.scrollTop)),
+      )
+      .toBeLessThanOrEqual(1);
+    // Let the one-time "initial" settle rAF (ChatMessageArea.tsx) finish before
+    // scrolling up, so it can't race the assertion below.
+    await page.evaluate(
+      () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+    );
+
+    await list.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await expect.poll(() => list.evaluate((el) => el.scrollTop)).toBe(0);
+
+    const incoming = makeMessage({
+      id: `${targetId}-late-arrival`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: "mensagem chegando enquanto o usuário lê o histórico antigo",
+    });
+    await emitMessageCreated(page, scenario, { kind: "dm", targetId, message: incoming });
+    await expect(page.getByText("mensagem chegando enquanto o usuário lê o histórico antigo")).toHaveCount(
+      1,
+    );
+
+    const geometryAfter = await list.evaluate((el) => ({
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(geometryAfter.scrollTop).toBe(0);
+    expect(geometryAfter.scrollHeight - geometryAfter.clientHeight).toBeGreaterThan(
+      geometryAfter.clientHeight,
+    );
   });
 
   /**
