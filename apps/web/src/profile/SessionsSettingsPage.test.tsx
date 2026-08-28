@@ -75,4 +75,45 @@ describe("SessionsSettingsPage", () => {
     expect(consoleError).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
+
+  it("does not update state after unmount when a pending fetch rejects late", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    let rejectList!: (error: Error) => void;
+    vi.mocked(sessionsApi.listSessions).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectList = reject;
+        }),
+    );
+    const { unmount } = render(<SessionsSettingsPage />);
+    unmount();
+    rejectList(new Error("boom"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it("does not reload after unmount when a pending revoke resolves late", async () => {
+    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions);
+    let resolveRevoke!: () => void;
+    vi.mocked(sessionsApi.revokeSession).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRevoke = resolve;
+        }),
+    );
+    const user = userEvent.setup();
+    const { unmount } = render(<SessionsSettingsPage />);
+    await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(2));
+    await user.click(screen.getByRole("button", { name: "Revogar sessão" }));
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }));
+    await waitFor(() => expect(sessionsApi.revokeSession).toHaveBeenCalledWith("other"));
+    unmount();
+    resolveRevoke();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Only the initial load; the post-revoke reload must not fire once unmounted.
+    expect(sessionsApi.listSessions).toHaveBeenCalledTimes(1);
+  });
 });
