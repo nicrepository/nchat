@@ -5433,6 +5433,172 @@ describe("ChatMessageArea — sender display", () => {
     await waitFor(() => expect(sender).not.toBeDisabled());
   });
 
+  it("allows independent pending opens for different recipients", async () => {
+    mockGetOrCreateDirectDM.mockImplementation(() => new Promise(() => {}));
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "msg-fernanda", senderId: "user-1", senderDisplayName: "Fernanda" }),
+        makeMessage({ id: "msg-marcos", senderId: "user-2", senderDisplayName: "Marcos" }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const fernanda = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    const marcos = screen.getByRole("button", { name: "Abrir conversa com Marcos" });
+    fireEvent.click(fernanda);
+    fireEvent.click(marcos);
+
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(2);
+    expect(fernanda).toBeDisabled();
+    expect(marcos).toBeDisabled();
+  });
+
+  it("invalidates a pending author DM open when the reused area changes channel", async () => {
+    const refreshConversations = vi.fn();
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    let capturedSignal: AbortSignal | undefined;
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        resolveOpen = resolve;
+      });
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function SwitchChannel() {
+      const switchChannel = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => switchChannel("/chat/channel/B")}>
+            Trocar canal
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/A"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <SwitchChannel />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const area = await screen.findByTestId("chat-message-area");
+    fireEvent.click(screen.getByRole("button", { name: "Abrir conversa com Fernanda" }));
+    fireEvent.click(screen.getByRole("button", { name: "Trocar canal" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-path")).toHaveTextContent("/chat/channel/B"),
+    );
+    expect(screen.getByTestId("chat-message-area")).toBe(area);
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-from-A", created: true });
+    });
+    expect(refreshConversations).not.toHaveBeenCalled();
+    expect(screen.getByTestId("current-path")).toHaveTextContent("/chat/channel/B");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps a new open registered when the invalidated operation settles late", async () => {
+    const refreshConversations = vi.fn();
+    const resolvers: Array<(value: { conversationId: string; created: boolean }) => void> = [];
+    const signals: AbortSignal[] = [];
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      if (signal) signals.push(signal);
+      return new Promise((resolve) => resolvers.push(resolve));
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function SwitchChannel() {
+      const switchChannel = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => switchChannel("/chat/channel/B")}>
+            Trocar canal
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/A"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <SwitchChannel />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    fireEvent.click(screen.getByRole("button", { name: "Trocar canal" }));
+    await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+
+    const senderInB = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    fireEvent.click(senderInB);
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(2);
+    expect(senderInB).toBeDisabled();
+
+    await act(async () => {
+      resolvers[0]({ conversationId: "dm-from-A", created: true });
+    });
+    expect(senderInB).toBeDisabled();
+    expect(refreshConversations).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolvers[1]({ conversationId: "dm-from-B", created: true });
+    });
+    await waitFor(() => expect(refreshConversations).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent("/chat/dm/dm-from-B");
+  });
+
   it("aborts a pending author DM open and skips refresh/navigation after unmount", async () => {
     const refreshConversations = vi.fn();
     let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;

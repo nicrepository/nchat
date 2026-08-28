@@ -1284,6 +1284,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const lastReactionToggleRef = useRef({ key: "", at: 0 });
   const openingAuthorDMRef = useRef(new Map<string, AbortController>());
   const authorDMMountedRef = useRef(true);
+  const authorDMGenerationRef = useRef(0);
   const recentReactionEmojis = useMemo(
     () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
     [allowedReactionEmojis, emojiUsage],
@@ -1452,6 +1453,17 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     };
   }, []);
 
+  useLayoutEffect(() => {
+    const generation = (authorDMGenerationRef.current += 1);
+    for (const controller of openingAuthorDMRef.current.values()) controller.abort();
+    openingAuthorDMRef.current.clear();
+    queueMicrotask(() => {
+      if (!authorDMMountedRef.current || authorDMGenerationRef.current !== generation) return;
+      setOpeningAuthorDMIds(new Set());
+      setOpenDMError(null);
+    });
+  }, [kind, targetId]);
+
   const handleSend = useCallback(
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
       const result = await sendMessage(
@@ -1562,22 +1574,36 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         return;
       }
       const controller = new AbortController();
+      const generation = authorDMGenerationRef.current;
       openingAuthorDMRef.current.set(recipientId, controller);
       setOpeningAuthorDMIds((current) => new Set(current).add(recipientId));
       setOpenDMError(null);
       void getOrCreateDirectDM(recipientId, controller.signal)
         .then(({ conversationId }) => {
-          if (!authorDMMountedRef.current) return;
+          if (
+            !authorDMMountedRef.current ||
+            authorDMGenerationRef.current !== generation ||
+            openingAuthorDMRef.current.get(recipientId) !== controller
+          ) {
+            return;
+          }
           ctx.refreshConversations?.();
           navigate(`/chat/dm/${encodeURIComponent(conversationId)}`);
         })
         .catch((error: unknown) => {
-          if (!authorDMMountedRef.current) return;
+          if (
+            !authorDMMountedRef.current ||
+            authorDMGenerationRef.current !== generation ||
+            openingAuthorDMRef.current.get(recipientId) !== controller
+          ) {
+            return;
+          }
           if (!(error instanceof DOMException && error.name === "AbortError")) {
             setOpenDMError("NÃ£o foi possÃ­vel abrir a conversa. Tente novamente.");
           }
         })
         .finally(() => {
+          if (openingAuthorDMRef.current.get(recipientId) !== controller) return;
           openingAuthorDMRef.current.delete(recipientId);
           if (!authorDMMountedRef.current) return;
           setOpeningAuthorDMIds((current) => {
