@@ -34,4 +34,14 @@ describe("SessionRow", () => {
     expect(screen.getByText("187.10.x.x")).toBeInTheDocument();
     expect(screen.getByText("Mozilla/5.0 Firefox")).toBeInTheDocument();
   });
+
+  it("falls back to 'Dispositivo desconhecido' when userAgent is empty", () => {
+    render(<SessionRow session={{ ...base, userAgent: "" }} onRevoke={vi.fn()} />);
+    expect(screen.getByText("Dispositivo desconhecido")).toBeInTheDocument();
+  });
+
+  it("omits the IP line entirely when ipAddress is empty", () => {
+    render(<SessionRow session={{ ...base, ipAddress: "" }} onRevoke={vi.fn()} />);
+    expect(screen.queryByText(/aproximado/i)).not.toBeInTheDocument();
+  });
 });
