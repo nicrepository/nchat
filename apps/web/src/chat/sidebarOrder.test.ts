@@ -1,13 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  compareByActivity,
-  laterActivity,
-  parseInstant,
-  selectDefaultConversation,
-  sortByActivity,
-} from "./sidebarOrder";
-import type { ActivityOrdered, DefaultSelectionCandidate } from "./sidebarOrder";
+import { compareByActivity, laterActivity, parseInstant, sortByActivity } from "./sidebarOrder";
+import type { ActivityOrdered } from "./sidebarOrder";
 
 /**
  * ISSUE #414 — the sidebar's ordering rule, stated once and exercised here on
@@ -305,80 +299,5 @@ describe("parseInstant", () => {
     for (const value of ["not-a-date", "", null, undefined]) {
       expect(parseInstant(value)).toBeUndefined();
     }
-  });
-});
-
-function candidate(
-  overrides: Partial<DefaultSelectionCandidate> & { id: string; kind: "channel" | "dm" },
-): DefaultSelectionCandidate {
-  return { name: overrides.id, ...overrides };
-}
-
-describe("selectDefaultConversation", () => {
-  it("returns null when there is nothing to select", () => {
-    expect(selectDefaultConversation([])).toBeNull();
-  });
-
-  it("picks the most recently active unread conversation across channels and DMs", () => {
-    const result = selectDefaultConversation([
-      candidate({
-        id: "chan-old-unread",
-        kind: "channel",
-        unreadCount: 2,
-        lastMessageAt: "2026-08-04T10:00:00Z",
-      }),
-      candidate({
-        id: "dm-new-unread",
-        kind: "dm",
-        unreadCount: 1,
-        lastMessageAt: "2026-08-04T12:00:00Z",
-      }),
-      candidate({
-        id: "chan-newest-read",
-        kind: "channel",
-        unreadCount: 0,
-        lastMessageAt: "2026-08-04T13:00:00Z",
-      }),
-    ]);
-    expect(result).toEqual({ kind: "dm", id: "dm-new-unread" });
-  });
-
-  it("treats a mention-only unread the same as a counted unread", () => {
-    const result = selectDefaultConversation([
-      candidate({
-        id: "chan-newer-read",
-        kind: "channel",
-        lastMessageAt: "2026-08-04T12:00:00Z",
-      }),
-      candidate({
-        id: "dm-mentioned",
-        kind: "dm",
-        hasMentionUnread: true,
-        lastMessageAt: "2026-08-04T10:00:00Z",
-      }),
-    ]);
-    expect(result).toEqual({ kind: "dm", id: "dm-mentioned" });
-  });
-
-  it("falls back to the most recently active conversation overall when nothing is unread", () => {
-    const result = selectDefaultConversation([
-      candidate({ id: "chan-a", kind: "channel", lastMessageAt: "2026-08-04T10:00:00Z" }),
-      candidate({ id: "dm-b", kind: "dm", lastMessageAt: "2026-08-04T12:00:00Z" }),
-      candidate({ id: "chan-c", kind: "channel", lastMessageAt: "2026-08-04T09:00:00Z" }),
-    ]);
-    expect(result).toEqual({ kind: "dm", id: "dm-b" });
-  });
-
-  it("prefers a pinned conversation over a more recently active unpinned one, matching the sidebar's own order", () => {
-    const result = selectDefaultConversation([
-      candidate({
-        id: "chan-pinned",
-        kind: "channel",
-        pinnedAt: "2026-08-01T00:00:00Z",
-        lastMessageAt: "2026-08-01T00:00:00Z",
-      }),
-      candidate({ id: "dm-recent", kind: "dm", lastMessageAt: "2026-08-04T12:00:00Z" }),
-    ]);
-    expect(result).toEqual({ kind: "channel", id: "chan-pinned" });
   });
 });

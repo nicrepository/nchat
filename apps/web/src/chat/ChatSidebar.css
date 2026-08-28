@@ -389,19 +389,6 @@
   margin-top: 18px;
 }
 
-/* ── Unread/read subgrouping ───────────────────────────────────────────────── */
-
-.chat-sidebar__subgroup-label {
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--cs-sidebar-muted);
-  opacity: 0.75;
-  margin: 0;
-  padding: 6px 10px 2px;
-}
-
 /* ── Collapsible Categories (RF-17) ─────────────────────────────────────────── */
 
 .chat-sidebar__categories-list {

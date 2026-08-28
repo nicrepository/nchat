@@ -160,51 +160,6 @@ describe("useChatEditor — successful send (status: sent)", () => {
 
     await waitFor(() => expect(result.current.canSend).toBe(false));
   });
-
-  it("restores focus only after a confirmed send becomes editable again", async () => {
-    mockOnSend.mockResolvedValue({ status: "sent" });
-    const { result } = renderHook(() => useChatEditor({ ...defaults, restoreFocusOnSend: true }));
-    await waitForEditor(result);
-    await fill(result, "focus me");
-    const focus = vi.spyOn(result.current.editor!.view.dom, "focus");
-
-    await act(() => result.current.handleSend());
-
-    await waitFor(() => expect(focus).toHaveBeenCalledOnce());
-    expect(result.current.editor!.isEditable).toBe(true);
-  });
-});
-
-describe("useChatEditor — opt-in initial focus", () => {
-  it("focuses once when the editor transitions from disabled to editable", async () => {
-    const { result, rerender } = renderHook(
-      ({ disabled }: { disabled: boolean }) =>
-        useChatEditor({ ...defaults, disabled, focusOnReady: true }),
-      { initialProps: { disabled: true } },
-    );
-    await waitForEditor(result);
-    const focus = vi.spyOn(result.current.editor!.view.dom, "focus");
-
-    rerender({ disabled: false });
-    await waitFor(() => expect(focus).toHaveBeenCalledTimes(1));
-    rerender({ disabled: false });
-
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not focus an isolated editor without the opt-in", async () => {
-    const { result, rerender } = renderHook(
-      ({ disabled }: { disabled: boolean }) => useChatEditor({ ...defaults, disabled }),
-      { initialProps: { disabled: true } },
-    );
-    await waitForEditor(result);
-    const focus = vi.spyOn(result.current.editor!.view.dom, "focus");
-
-    rerender({ disabled: false });
-    await act(async () => Promise.resolve());
-
-    expect(focus).not.toHaveBeenCalled();
-  });
 });
 
 describe("useChatEditor — stale send (status: stale)", () => {

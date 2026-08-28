@@ -539,8 +539,6 @@ interface MessageListProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId?: string;
-  /** How many of `messages` (the newest ones) were unread when this conversation was opened. */
-  unreadCountAtOpen: number;
 }
 
 function MessageList({
@@ -570,12 +568,10 @@ function MessageList({
   emojiUsage,
   onEmojiToneChange,
   focusMessageId,
-  unreadCountAtOpen,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
-  const unreadDividerRef = useRef<HTMLDivElement | null>(null);
   const messageRefs = useRef(new Map<string, HTMLDivElement>());
   const highlightTimerRef = useRef<number | null>(null);
   const hoverCloseTimerRef = useRef<number | null>(null);
@@ -674,8 +670,7 @@ function MessageList({
 
   // Scroll management driven by lastMutation — explicit and race-condition-free.
   // "prepend"    → restore position via scrollHeight delta (older messages added above).
-  // "initial"    → set the exact bottom synchronously, before paint.
-  // "append"     → scroll to bottom smoothly after a local send.
+  // "initial" | "append" → scroll to bottom unconditionally.
   // "ws_append"  → scroll to bottom only when the user is already near the bottom;
   //                otherwise preserve position so reading history is not interrupted.
   // "none"       → no action (intermediate transition).
@@ -688,31 +683,11 @@ function MessageList({
   useLayoutEffect(() => {
     if (!listRef.current) return;
     const el = listRef.current;
-    let initialFrame: number | null = null;
 
     if (lastMutation === "prepend") {
       // Shift scrollTop by the amount the container grew so the user's view is stable.
       el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
-    } else if (lastMutation === "initial") {
-      // When this conversation was opened with unread messages, land on the
-      // divider instead of the bottom — "where you left off" — so the new
-      // messages are the first thing visible. No unread divider (the common
-      // case): unchanged, land at the exact bottom.
-      const dividerEl = unreadDividerRef.current;
-      if (dividerEl) {
-        dividerEl.scrollIntoView({ block: "start" });
-        initialFrame = window.requestAnimationFrame(() => {
-          if (listRef.current === el && unreadDividerRef.current === dividerEl) {
-            dividerEl.scrollIntoView({ block: "start" });
-          }
-        });
-      } else {
-        el.scrollTop = el.scrollHeight;
-        initialFrame = window.requestAnimationFrame(() => {
-          if (listRef.current === el) el.scrollTop = el.scrollHeight;
-        });
-      }
-    } else if (lastMutation === "append") {
+    } else if (lastMutation === "initial" || lastMutation === "append") {
       scrollToBottom(bottomRef);
     } else if (lastMutation === "ws_append" && isNearBottomRef.current) {
       // Only auto-scroll on WS messages when user is already near the bottom.
@@ -724,28 +699,7 @@ function MessageList({
     if (lastMutation !== "none") {
       prevScrollHeightRef.current = el.scrollHeight;
     }
-    return () => {
-      if (initialFrame !== null) window.cancelAnimationFrame(initialFrame);
-    };
   }, [messages, lastMutation]);
-
-  // Corrects the initial position if ctx.unreadAtOpen becomes known only
-  // AFTER the "initial" scroll-to-bottom above already ran — the sidebar's
-  // own data and this conversation's messages load from two independent
-  // fetches, not ordered relative to each other. Deliberately NOT gated on
-  // lastMutation === "initial": an unrelated WS event (e.g. a presence
-  // snapshot) can advance lastMutation to "none" in between, which would
-  // make that guard miss the correction entirely. Keyed only on
-  // unreadCountAtOpen changing to a value not yet corrected for — a no-op
-  // when the divider isn't in the DOM yet (messages haven't loaded), in
-  // which case the effect above already handles it correctly once they do,
-  // using whatever unreadCountAtOpen is current by then.
-  const correctedForUnreadRef = useRef<number>(-1);
-  useEffect(() => {
-    if (correctedForUnreadRef.current === unreadCountAtOpen) return;
-    correctedForUnreadRef.current = unreadCountAtOpen;
-    unreadDividerRef.current?.scrollIntoView({ block: "start" });
-  }, [unreadCountAtOpen]);
 
   // IntersectionObserver: fire loadMore when the top sentinel enters the viewport.
   //
@@ -776,23 +730,12 @@ function MessageList({
 
   // Group messages by day for dividers; track same-sender/same-minute for visual grouping.
   const withDividers: Array<
-    | { type: "divider"; label: string }
-    | { type: "unread-divider" }
-    | { type: "msg"; message: Message; isGrouped: boolean }
+    { type: "divider"; label: string } | { type: "msg"; message: Message; isGrouped: boolean }
   > = [];
-  // The last `unreadCountAtOpen` loaded messages are the unread ones — the
-  // only unread signal that exists is the per-conversation aggregate count,
-  // so the boundary is derived from it rather than from any per-message
-  // server field (none exists). Clamped to 0 when unreadCountAtOpen exceeds
-  // what is currently loaded (pagination doesn't guarantee the boundary
-  // message is in the first page) — the divider lands at the top of what is
-  // loaded rather than crashing or guessing further back.
-  const unreadBoundaryIndex =
-    unreadCountAtOpen > 0 ? Math.max(0, messages.length - unreadCountAtOpen) : -1;
   let lastDay = "";
   let lastSenderId = "";
   let lastMinute = "";
-  messages.forEach((msg, index) => {
+  for (const msg of messages) {
     const day = formatDayLabel(msg.createdAt);
     if (day !== lastDay) {
       withDividers.push({ type: "divider", label: day });
@@ -800,15 +743,12 @@ function MessageList({
       lastSenderId = "";
       lastMinute = "";
     }
-    if (index === unreadBoundaryIndex) {
-      withDividers.push({ type: "unread-divider" });
-    }
     const minute = formatTime(msg.createdAt);
     const isGrouped = msg.senderId === lastSenderId && minute === lastMinute;
     withDividers.push({ type: "msg", message: msg, isGrouped });
     lastSenderId = msg.senderId;
     lastMinute = minute;
-  });
+  }
 
   return (
     <div
@@ -828,20 +768,7 @@ function MessageList({
         />
       )}
       {withDividers.map((item, i) =>
-        item.type === "unread-divider" ? (
-          <div
-            key="unread-divider"
-            ref={unreadDividerRef}
-            className="chat-msg-area__unread-divider"
-            role="separator"
-            aria-label="Mensagens não lidas"
-            data-testid="unread-divider"
-          >
-            <span className="chat-msg-area__unread-divider-line" />
-            <span className="chat-msg-area__unread-divider-label">Mensagens não lidas</span>
-            <span className="chat-msg-area__unread-divider-line" />
-          </div>
-        ) : item.type === "divider" ? (
+        item.type === "divider" ? (
           <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
             {item.label}
           </div>
@@ -1109,7 +1036,6 @@ interface ConversationTimelineProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId: string;
-  unreadCountAtOpen: number;
 }
 
 /**
@@ -1134,7 +1060,6 @@ function ConversationTimeline({
   emojiUsage,
   onEmojiToneChange,
   focusMessageId,
-  unreadCountAtOpen,
 }: ConversationTimelineProps) {
   if (state.status === "loading") return <LoadingSkeleton />;
   if (state.status === "error") return <ErrorState onRetry={actions.onRetry} />;
@@ -1171,7 +1096,6 @@ function ConversationTimeline({
       emojiUsage={emojiUsage}
       onEmojiToneChange={onEmojiToneChange}
       focusMessageId={focusMessageId}
-      unreadCountAtOpen={unreadCountAtOpen}
     />
   );
 }
@@ -1333,17 +1257,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const navigate = useNavigate();
   const target = useConversationTarget(kind);
   const { ctx, targetId, focusMessageId, activeDM, resolvedName } = target;
-  // Discord-style unread divider: how many messages were unread at the exact
-  // moment this conversation was marked read. Deliberately NOT captured by
-  // reading ctx's live unreadCount from this component (React 18 can batch
-  // the sidebar's "loaded" and "target_opened" reducer actions into a single
-  // visible render, so there is no reliably observable intermediate render
-  // where the fresh count exists before it's cleared — confirmed empirically
-  // while building this). Instead useChatSidebar.ts's own clearUnread
-  // snapshots the value it is about to clear, in the same reducer update, so
-  // there is no race: ctx.unreadAtOpen and the cleared unreadCount always
-  // change together, in the one render this component will ever observe.
-  const unreadCountAtOpen = ctx.unreadAtOpen?.[`${kind}:${targetId}`] ?? 0;
   const [referenceSource, setReferenceSource] = useState<Message | null>(null);
   const [forwardSource, setForwardSource] = useState<ForwardSourceContext | null>(null);
   const pendingReference = usePendingReference(location.state, ctx.channels, ctx.dms);
@@ -1709,7 +1622,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           emojiUsage={emojiUsage}
           onEmojiToneChange={changeEmojiTone}
           focusMessageId={focusMessageId}
-          unreadCountAtOpen={unreadCountAtOpen}
         />
 
         <ConversationNotices
@@ -1732,7 +1644,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
         <ChatComposer
           key={`${kind}:${targetId}`}
-          focusOnReady
           channelId={target.channelId}
           bodyFormat={target.isChannel ? "v3" : "v2"}
           placeholder={target.composerPlaceholder}
