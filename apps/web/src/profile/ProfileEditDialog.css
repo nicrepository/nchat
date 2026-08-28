@@ -73,9 +73,11 @@
 }
 
 /* The invalid state is not carried by colour alone: the message below the field
-   is associated with it through role="alert" and is what actually says
+   is associated with it through aria-describedby and is what actually says
    what is wrong. */
-.profile-edit input[aria-invalid="true"] {
+.profile-edit input[aria-invalid="true"],
+.profile-edit textarea[aria-invalid="true"],
+.profile-edit select[aria-invalid="true"] {
   border-color: var(--profile-edit-danger);
 }
 

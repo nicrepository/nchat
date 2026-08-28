@@ -11,6 +11,8 @@ import {
 } from "./profileForm";
 import { updateProfile, UpdateProfileError, type SelfProfile } from "./profileApi";
 
+// ~419 timezone options; computed once at module scope to avoid rebuilding
+// the entire list on every keystroke in any field.
 const TIMEZONE_OPTION_ELEMENTS = supportedTimezones().map((tz) => (
   <option key={tz} value={tz}>
     {tz}
@@ -24,6 +26,7 @@ interface ProfileEditDialogProps {
 }
 
 const titleId = "profile-edit-title";
+const errorId = "profile-edit-error";
 
 export default function ProfileEditDialog({ profile, onClose, onSaved }: ProfileEditDialogProps) {
   const [displayName, setDisplayName] = useState(profile.displayName);
@@ -73,7 +76,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
   }
 
   const trimmedName = displayName.trim();
-  const nameError = trimmedName === "" ? null : validateDisplayName(trimmedName);
+  const nameError = validateDisplayName(trimmedName);
   const jobTitleError = validateShortProfileField(jobTitle, "Cargo");
   const bioError = validateBio(bio);
   const timezoneError = validateTimezone(timezone);
@@ -145,6 +148,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             value={displayName}
             disabled={pending}
             aria-invalid={nameError !== null}
+            aria-describedby={error ? errorId : undefined}
             onChange={(e) => {
               setDisplayName(e.target.value);
               setError(null);
@@ -169,6 +173,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             value={jobTitle}
             disabled={pending}
             aria-invalid={jobTitleError !== null}
+            aria-describedby={error ? errorId : undefined}
             onChange={(e) => setJobTitle(e.target.value)}
           />
 
@@ -179,6 +184,8 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             id="profile-edit-timezone"
             value={timezone}
             disabled={pending}
+            aria-invalid={timezoneError !== null}
+            aria-describedby={error ? errorId : undefined}
             onChange={(e) => setTimezone(e.target.value)}
           >
             <option value="">Não definido</option>
@@ -193,6 +200,8 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             type="text"
             value={customStatus}
             disabled={pending}
+            aria-invalid={customStatusError !== null}
+            aria-describedby={error ? errorId : undefined}
             onChange={(e) => setCustomStatus(e.target.value)}
           />
 
@@ -203,11 +212,13 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             id="profile-edit-bio"
             value={bio}
             disabled={pending}
+            aria-invalid={bioError !== null}
+            aria-describedby={error ? errorId : undefined}
             onChange={(e) => setBio(e.target.value)}
           />
 
           {error && (
-            <p role="alert" className="profile-edit__error">
+            <p id={errorId} role="alert" className="profile-edit__error">
               {error}
             </p>
           )}
