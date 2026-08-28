@@ -5176,6 +5176,121 @@ describe("ChatMessageArea — infinite scroll", () => {
   });
 });
 
+// ── Unread divider ────────────────────────────────────────────────────────────
+
+describe("ChatMessageArea — unread divider", () => {
+  // unreadAtOpen mirrors what useChatSidebar.ts's clearUnread snapshots in
+  // the SAME reducer update that zeroes the live unreadCount — the component
+  // never reads the live channels[i].unreadCount for this, precisely because
+  // that value can already be cleared by the time any render observes it
+  // (React 18 can batch the sidebar's "loaded" and "target_opened" actions
+  // into one visible render — confirmed while building this feature).
+  function renderChannelWithUnread(unreadCount: number, messageCount = 20) {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: Array.from({ length: messageCount }, (_, index) =>
+        makeMessage({ id: `u-${index}`, bodyText: `Message ${index}` }),
+      ),
+      nextCursor: "",
+    });
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true }],
+      dms: [],
+      unreadAtOpen: unreadCount > 0 ? { "channel:geral": unreadCount } : {},
+    };
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route path="/chat" element={<ParentWithContext ctx={ctx} />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders the divider at the read/unread boundary and scrolls to it, not the bottom", async () => {
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+
+    renderChannelWithUnread(5, 20);
+    await screen.findByRole("log");
+
+    const divider = await screen.findByTestId("unread-divider");
+    expect(divider).toHaveTextContent("Mensagens não lidas");
+    // 20 messages, 5 unread → boundary at index 15 (messages 0..14 read, 15..19 unread).
+    expect(divider.nextElementSibling).toHaveTextContent("Message 15");
+
+    expect(scrollMock).toHaveBeenCalledWith({ block: "start" });
+    expect(scrollMock.mock.contexts[scrollMock.mock.calls.length - 1]).toBe(divider);
+  });
+
+  it("clamps the divider to the top when unreadCount exceeds the loaded messages", async () => {
+    renderChannelWithUnread(999, 20);
+    await screen.findByRole("log");
+
+    const divider = await screen.findByTestId("unread-divider");
+    // Nothing loaded is read in this case — the divider is the very first row.
+    const list = await screen.findByRole("log");
+    const firstChild = list.querySelector(
+      ":scope > [data-testid='unread-divider'], :scope > [data-testid='chat-msg-bubble']",
+    );
+    expect(firstChild).toBe(divider);
+  });
+
+  it("renders no divider and preserves the exact-bottom scroll when nothing is unread", async () => {
+    const scrollHeight = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(4800);
+
+    renderChannelWithUnread(0, 20);
+    const list = await screen.findByRole("log");
+
+    expect(screen.queryByTestId("unread-divider")).not.toBeInTheDocument();
+    await waitFor(() => expect(list.scrollTop).toBe(4800));
+    scrollHeight.mockRestore();
+  });
+
+  it("re-derives the boundary per conversation when switching, not the previous target's count", async () => {
+    mockFetchChannelMessages.mockImplementation((channelId: string) =>
+      Promise.resolve({
+        messages: Array.from({ length: 10 }, (_, index) =>
+          makeMessage({ id: `${channelId}-${index}`, bodyText: `${channelId} message ${index}` }),
+        ),
+        nextCursor: "",
+      }),
+    );
+    const ctx: ChatOutletContext = {
+      currentUserId: "me-123",
+      channels: [
+        { id: "first", name: "Primeiro", type: "public", canWrite: true },
+        { id: "second", name: "Segundo", type: "public", canWrite: true },
+      ],
+      dms: [],
+      unreadAtOpen: { "channel:first": 3 },
+    };
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/first"]}>
+        <Routes>
+          <Route path="/chat" element={<ConversationNavigation ctx={ctx} />}>
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("log");
+    expect(await screen.findByTestId("unread-divider")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Abrir segunda conversa" }));
+
+    await screen.findByRole("log");
+    await waitFor(() =>
+      expect(screen.getByText("second message 9")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("unread-divider")).not.toBeInTheDocument();
+  });
+});
+
 // ── Security: no runtime fixture import ──────────────────────────────────────
 
 describe("ChatMessageArea — no runtime fixture import", () => {
