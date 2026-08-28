@@ -122,4 +122,17 @@ data:
   CHAT_LINK_SAFETY_ENABLED: "false"
   FILE_LINK_SAFETY_ENABLED: "false"
 
-  SMTP_WORKER_ENABLED: "true"
+  # --- transactional email ----------------------------------------------
+  # Transactional SMTP is opt-in, and this release has no production SMTP
+  # provisioned: no host, no sender, no credential exists to point at. Enabling
+  # the worker without SMTP_HOST and SMTP_FROM makes cfg.SMTPWorkerReady() fail,
+  # and the notification-service publishes that as a critical `smtp-worker-config`
+  # check — so the pod never becomes Ready and the slot never takes traffic.
+  # Written out rather than left to base, because a missing key and a deliberate
+  # "not yet" must not look alike.
+  #
+  # Turning this on is a single change together with its configuration: SMTP_HOST,
+  # SMTP_FROM, an SMTP_TLS_MODE that is not `none` (the code refuses `none`
+  # outside development/test/local), and SMTP_PASSWORD delivered through the
+  # sealed nchat-secrets — never as a key in this ConfigMap.
+  SMTP_WORKER_ENABLED: "false"

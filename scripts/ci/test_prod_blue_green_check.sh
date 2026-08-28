@@ -150,6 +150,33 @@ expect "Blue cannot override APP_ENV with its slot name" reject check_livekit_en
 QUERY_FIXTURE="${good_environment_contract/Deployment|media-service-green|app-env$'\t'/Deployment|media-service-green|app-env$'\t'green}"
 expect "Green cannot override APP_ENV with its slot name" reject check_livekit_environment_namespace
 
+echo "--- transactional smtp ---"
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED\tfalse')
+expect "an unconfigured SMTP with the worker off is accepted" accept check_smtp
+
+# The blocker this gate exists for: the worker switched on against an SMTP that
+# was never provisioned, which fails notification-service's readiness probe.
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED\ttrue')
+expect "the worker enabled without a host or sender is rejected" reject check_smtp
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED\ttrue
+ConfigMap|nchat-config|data.SMTP_HOST\tsmtp.example.net')
+expect "the worker enabled without a sender is rejected" reject check_smtp
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED\ttrue
+ConfigMap|nchat-config|data.SMTP_HOST\tsmtp.example.net
+ConfigMap|nchat-config|data.SMTP_FROM\tno-reply@example.net
+ConfigMap|nchat-config|data.SMTP_TLS_MODE\tnone')
+expect "cleartext SMTP in production is rejected" reject check_smtp
+
+QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED\ttrue
+ConfigMap|nchat-config|data.SMTP_HOST\tsmtp.example.net
+ConfigMap|nchat-config|data.SMTP_FROM\tno-reply@example.net
+ConfigMap|nchat-config|data.SMTP_TLS_MODE\tstarttls')
+expect "a fully configured SMTP worker is accepted" accept check_smtp
+
+echo
 echo "--- dangling service endpoints ---"
 
 QUERY_FIXTURE=$(printf 'ConfigMap|nchat-config|data.SEAWEEDFS_FILER_URL\thttp://seaweedfs-filer:8888

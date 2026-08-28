@@ -336,6 +336,30 @@ check_scanner() {
   fi
 }
 
+# SMTP_WORKER_ENABLED is a switch the readiness probe enforces: with it on and
+# SMTP_HOST or SMTP_FROM absent, cfg.SMTPWorkerReady() fails the critical
+# `smtp-worker-config` check and notification-service never becomes Ready, so
+# the slot never takes traffic. The gate therefore does not demand the worker be
+# on or off -- it demands the switch and its configuration move together.
+check_smtp() {
+  local enabled key value missing=()
+  enabled="$(query 'ConfigMap|nchat-config|data.SMTP_WORKER_ENABLED')"
+  if [[ "$enabled" != "true" ]]; then
+    ok "SMTP worker is off (${enabled:-unset}); no transactional SMTP is required"
+    return
+  fi
+  for key in SMTP_HOST SMTP_FROM; do
+    [[ -n "$(query "ConfigMap|nchat-config|data.$key")" ]] || missing+=("$key")
+  done
+  [[ "${#missing[@]}" -eq 0 ]] ||
+    fail "SMTP_WORKER_ENABLED=true without ${missing[*]}; notification-service would never become Ready"
+  value="$(query 'ConfigMap|nchat-config|data.SMTP_TLS_MODE')"
+  [[ "$value" != "none" ]] ||
+    fail "SMTP_TLS_MODE=none is refused outside development/test/local"
+  [[ "${#missing[@]}" -ne 0 || "$value" == "none" ]] ||
+    ok "SMTP worker is on and carries the host, sender and TLS mode it needs"
+}
+
 check_livekit() {
   local connect_src slot
   connect_src="$(query 'ConfigMap|nchat-config|data.NCHAT_WEB_LIVEKIT_CONNECT_SRC')"
@@ -511,6 +535,7 @@ check_configuration() {
   check_required_true VALKEY_WS_BROADCAST_ENABLED FILE_UPLOADS_ENABLED \
     FILE_MALWARE_SCAN_REQUIRED LIVEKIT_ENABLED OIDC_ENABLED
   check_scanner
+  check_smtp
   check_livekit
   check_livekit_client_contract
   check_livekit_environment_namespace
