@@ -34,7 +34,10 @@
   background: #fff;
   box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
   color: #16121f;
+  /* dvh first-class, vh as the fallback for engines without it: on mobile the
+     virtual keyboard must not push the dialog's footer off-screen. */
   max-height: 90vh;
+  max-height: 90dvh;
   overflow-y: auto;
 }
 

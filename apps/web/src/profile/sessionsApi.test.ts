@@ -53,7 +53,9 @@ describe("sessionsApi", () => {
   });
 
   it("maps a 401 on revokeAllOtherSessions to SessionsApiError('unauthorized')", async () => {
-    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new ApiRequestError(401, "no current session"));
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(
+      new ApiRequestError(401, "unauthorized", "no current session"),
+    );
     await expect(revokeAllOtherSessions()).rejects.toMatchObject({ reason: "unauthorized" });
     expect(SessionsApiError).toBeDefined();
   });
