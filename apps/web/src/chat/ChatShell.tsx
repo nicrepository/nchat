@@ -115,6 +115,7 @@ export interface ChatOutletContext {
   channels: Channel[];
   dms: DMConversation[];
   attachmentLimits?: WorkspaceAttachmentLimits;
+  refreshConversations?: () => void;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
    * Discovery only (issue #622 round 2): whether a channel/group-DM has an
@@ -493,6 +494,7 @@ export default function ChatShell() {
     channels: ready.channels,
     dms: ready.dms,
     attachmentLimits: ready.attachmentLimits,
+    refreshConversations: retry,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,

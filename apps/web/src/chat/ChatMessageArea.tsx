@@ -36,7 +36,7 @@ import ActiveDirectCallBar, { type ActiveDirectCallBarProps } from "../calls/Act
 import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
 import type { Channel, DMConversation, DMCounterpart, Message, PinnedItem } from "./chatTypes";
-import { fetchAllowedReactionEmojis } from "./chatApi";
+import { fetchAllowedReactionEmojis, getOrCreateDirectDM } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
 import { recentEmojis, type EmojiUsage } from "./emoji/emojiUsage";
@@ -514,6 +514,8 @@ interface MessageListProps {
   onReferenceMessage: (message: Message) => void;
   onForwardMessage?: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
+  onOpenAuthorDM?: MessageBubbleProps["onOpenAuthorDM"];
+  openingAuthorDMIds?: Set<string>;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /** RF-21 "Verificar novamente" (issue #135); see MessageBubbleProps. */
   onReconcileLinkSafety?: MessageBubbleProps["onReconcileLinkSafety"];
@@ -553,6 +555,8 @@ function MessageList({
   onReferenceMessage,
   onForwardMessage,
   onReferenceJump,
+  onOpenAuthorDM,
+  openingAuthorDMIds,
   onToggleFavorite,
   onReconcileLinkSafety,
   onEditMessage,
@@ -816,6 +820,8 @@ function MessageList({
             canJumpToQuote={item.message.quoted ? messagesById.has(item.message.quoted.id) : false}
             onQuoteJump={handleQuoteJump}
             onReferenceJump={onReferenceJump}
+            onOpenAuthorDM={onOpenAuthorDM}
+            openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
             isHighlighted={highlightedMessageId === item.message.id}
             setMessageRef={setMessageRef}
           />
@@ -1013,6 +1019,8 @@ interface TimelineActions {
   onReferenceMessage: (message: Message) => void;
   onForwardMessage: (message: Message) => void;
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
+  onOpenAuthorDM?: MessageBubbleProps["onOpenAuthorDM"];
+  openingAuthorDMIds?: Set<string>;
   onToggleFavorite: MessageBubbleProps["onToggleFavorite"];
   onReconcileLinkSafety: MessageBubbleProps["onReconcileLinkSafety"];
   onEditMessage: MessageBubbleProps["onEditMessage"];
@@ -1082,6 +1090,8 @@ function ConversationTimeline({
       onReferenceMessage={actions.onReferenceMessage}
       onForwardMessage={channelId ? actions.onForwardMessage : undefined}
       onReferenceJump={actions.onReferenceJump}
+      onOpenAuthorDM={actions.onOpenAuthorDM}
+      openingAuthorDMIds={actions.openingAuthorDMIds}
       onToggleFavorite={actions.onToggleFavorite}
       onReconcileLinkSafety={actions.onReconcileLinkSafety}
       onEditMessage={actions.onEditMessage}
@@ -1111,16 +1121,18 @@ function ConversationNotices({
   sendError,
   realtimeError,
   actionError,
+  openDMError,
   pinError,
   typingLabel,
 }: {
   sendError: string | null;
   realtimeError: string | null;
   actionError: string | null;
+  openDMError: string | null;
   pinError: string | null;
   typingLabel: string | null;
 }) {
-  const refusal = actionError ?? pinError;
+  const refusal = actionError ?? openDMError ?? pinError;
   return (
     <>
       {sendError && (
@@ -1266,8 +1278,12 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     remember: rememberReaction,
     changeTone: changeEmojiTone,
   } = useEmojiUsage(ctx.currentUserId);
+  const [openDMError, setOpenDMError] = useState<string | null>(null);
+  const [openingAuthorDMIds, setOpeningAuthorDMIds] = useState<Set<string>>(new Set());
   const [editDisabledIds, setEditDisabledIds] = useState<Set<string>>(new Set());
   const lastReactionToggleRef = useRef({ key: "", at: 0 });
+  const openingAuthorDMRef = useRef(new Map<string, AbortController>());
+  const authorDMMountedRef = useRef(true);
   const recentReactionEmojis = useMemo(
     () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
     [allowedReactionEmojis, emojiUsage],
@@ -1426,6 +1442,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     };
   }, []);
 
+  useEffect(
+    () => () => {
+      authorDMMountedRef.current = false;
+      for (const controller of openingAuthorDMRef.current.values()) controller.abort();
+      openingAuthorDMRef.current.clear();
+    },
+    [],
+  );
+
   const handleSend = useCallback(
     async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
       const result = await sendMessage(
@@ -1525,6 +1550,43 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     },
     [retry],
   );
+  const openAuthorDM = useCallback(
+    (message: Message) => {
+      const recipientId = message.senderId;
+      if (
+        !recipientId ||
+        recipientId === ctx.currentUserId ||
+        openingAuthorDMRef.current.has(recipientId)
+      ) {
+        return;
+      }
+      const controller = new AbortController();
+      openingAuthorDMRef.current.set(recipientId, controller);
+      setOpeningAuthorDMIds((current) => new Set(current).add(recipientId));
+      setOpenDMError(null);
+      void getOrCreateDirectDM(recipientId, controller.signal)
+        .then(({ conversationId }) => {
+          ctx.refreshConversations?.();
+          navigate(`/chat/dm/${encodeURIComponent(conversationId)}`);
+        })
+        .catch((error: unknown) => {
+          if (!authorDMMountedRef.current) return;
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            setOpenDMError("NÃ£o foi possÃ­vel abrir a conversa. Tente novamente.");
+          }
+        })
+        .finally(() => {
+          openingAuthorDMRef.current.delete(recipientId);
+          if (!authorDMMountedRef.current) return;
+          setOpeningAuthorDMIds((current) => {
+            const next = new Set(current);
+            next.delete(recipientId);
+            return next;
+          });
+        });
+    },
+    [ctx, navigate],
+  );
   const closeForwardDialog = useCallback(() => setForwardSource(null), []);
   const selectForwardSource = useCallback(
     (message: Message) => {
@@ -1558,6 +1620,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onReferenceMessage: setReferenceSource,
     onForwardMessage: selectForwardSource,
     onReferenceJump: jumpToReference,
+    onOpenAuthorDM: ctx.currentUserId ? openAuthorDM : undefined,
+    openingAuthorDMIds,
     onToggleFavorite: toggleFavorite,
     onReconcileLinkSafety: reconcileLinkSafety,
     onEditMessage: editMessageLocal,
@@ -1628,6 +1692,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           sendError={state.sendError}
           realtimeError={state.realtimeError}
           actionError={state.actionError}
+          openDMError={openDMError}
           pinError={pinError}
           typingLabel={typingIndicatorLabel}
         />

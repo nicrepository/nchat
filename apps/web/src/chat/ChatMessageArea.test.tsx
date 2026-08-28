@@ -8,7 +8,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes, useLocation, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
 
@@ -81,6 +81,7 @@ const {
   mockFetchGroupDetails,
   mockFetchDirectProfile,
   mockFetchChannelAttachments,
+  mockGetOrCreateDirectDM,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -145,6 +146,13 @@ const {
   mockFetchGroupDetails: vi.fn(),
   mockFetchDirectProfile: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
+  mockGetOrCreateDirectDM:
+    vi.fn<
+      (
+        otherUserId: string,
+        signal?: AbortSignal,
+      ) => Promise<{ conversationId: string; created: boolean }>
+    >(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
@@ -219,6 +227,8 @@ vi.mock("./chatApi", () => ({
     mockFetchGroupDetails(conversationId, signal),
   fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
     mockFetchDirectProfile(conversationId, signal),
+  getOrCreateDirectDM: (otherUserId: string, signal?: AbortSignal) =>
+    mockGetOrCreateDirectDM(otherUserId, signal),
 }));
 
 // file-service lives behind its own client; the panel's files section is mocked
@@ -547,6 +557,7 @@ beforeEach(() => {
   mockFetchDirectProfile.mockImplementation((conversationId: string) =>
     Promise.resolve(directProfileFor(conversationId)),
   );
+  mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-created", created: true });
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -5214,6 +5225,10 @@ function ParentWithContext({ ctx }: { ctx: ChatOutletContext }) {
   );
 }
 
+function CurrentPath() {
+  return <span data-testid="current-path">{useLocation().pathname}</span>;
+}
+
 // ── Message alignment ─────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — message alignment", () => {
@@ -5314,6 +5329,130 @@ describe("ChatMessageArea — sender display", () => {
     await waitFor(() => {
       expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("abcdef12");
     });
+  });
+
+  it("renders another sender name as an accessible DM action", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    expect(sender).toHaveAttribute("type", "button");
+    sender.focus();
+    expect(sender).toHaveFocus();
+  });
+
+  it("opens the canonical DM from the sender id, refreshes sidebar, and navigates", async () => {
+    const refreshConversations = vi.fn();
+    mockGetOrCreateDirectDM.mockResolvedValue({
+      conversationId: "dm/with space",
+      created: false,
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <CurrentPath />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    );
+
+    await waitFor(() => expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("other-456", expect.any(AbortSignal));
+    await waitFor(() => expect(refreshConversations).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent(
+      "/chat/dm/dm%2Fwith%20space",
+    );
+  });
+
+  it("keyboard activation opens a DM", async () => {
+    const user = userEvent.setup();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+    sender.focus();
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("other-456", expect.any(AbortSignal)),
+    );
+  });
+
+  it("coalesces rapid repeated opens per recipient and communicates pending state", async () => {
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+    fireEvent.click(sender);
+    fireEvent.click(sender);
+
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+    expect(sender).toHaveAttribute("aria-busy", "true");
+    expect(sender).toBeDisabled();
+
+    resolveOpen({ conversationId: "dm-456", created: true });
+    await waitFor(() => expect(sender).not.toBeDisabled());
+  });
+
+  it("keeps the current conversation usable after a generic open failure", async () => {
+    mockGetOrCreateDirectDM.mockRejectedValue(new ApiRequestError(403, "forbidden", "Forbidden"));
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "Fernanda",
+          bodyText: "mensagem atual",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("abrir a conversa");
+    expect(screen.getByText("mensagem atual")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Abrir conversa com Fernanda" })).toBeEnabled();
   });
 
   it("own message does not show sender span", async () => {
