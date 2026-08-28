@@ -1203,6 +1203,100 @@ describe("ChatShell — #642 review, blocker 5 (leave rejection)", () => {
     // first place — the error stays entirely CallSessionProvider's own
     // resource.status/resource.error retry authority.
   });
+
+  it("wires resourceCallSession's onToggleMicrophone to media.toggleMicrophone() and onOpenFullCall to expand()", async () => {
+    vi.resetModules();
+    const toggleMicrophone = vi.fn();
+    const expand = vi.fn();
+    const resourcePresentationCall = {
+      call_id: "call-2",
+      request_id: "req-2",
+      caller_id: currentUserId,
+      callee_id: "",
+      target_type: "channel" as const,
+      target_id: "chan-1",
+      call_type: "audio" as const,
+      status: "active" as const,
+      version: 1,
+      created_at: "2024-01-01T12:00:00.000Z",
+      occurred_at: "2024-01-01T12:00:00.000Z",
+      expires_at: "2024-01-01T13:00:00.000Z",
+    };
+    vi.doMock("../calls/CallSessionProvider", () => ({
+      useCallSession: () => ({
+        calls: { call: null, start: vi.fn() },
+        resource: {
+          active: { kind: "channel", id: "chan-1", name: "Geral" },
+          callId: "call-2",
+          status: "active",
+          error: null,
+        },
+        joinResourceParticipation: vi.fn(),
+        registerDirectory: vi.fn(),
+        registerIdentity: vi.fn(),
+        getResourceCall: vi.fn(() => null),
+        media: {
+          participants: [],
+          activeSpeakerId: null,
+          microphoneEnabled: true,
+          pendingControl: null,
+          toggleMicrophone,
+        },
+        expand,
+        leaveResourceParticipation: vi.fn(),
+        localIdentity: { name: "Você", initials: "V" },
+        resourcePresentationCall,
+      }),
+    }));
+    vi.doMock("./useChatSidebar", () => ({
+      useChatSidebar: () => ({
+        state: { status: "ready", currentUserId, channels: [], dms: [] },
+        retry: vi.fn(),
+        setPinned: vi.fn(),
+        markRead: vi.fn(),
+        renameChannel: vi.fn(),
+      }),
+    }));
+    vi.doMock("./ChatSidebar", async () => {
+      const actual = await vi.importActual<typeof import("./ChatSidebar")>("./ChatSidebar");
+      return { ...actual, default: () => null };
+    });
+
+    const { default: ChatShellFresh } = await import("./ChatShell");
+    const { default: AppShellFresh } = await import("./AppShell");
+
+    function ResourceSessionProbe() {
+      const ctx = useOutletContext<ChatOutletContext>();
+      return (
+        <>
+          <button type="button" onClick={() => ctx.resourceCallSession?.onToggleMicrophone()}>
+            Alternar microfone
+          </button>
+          <button type="button" onClick={() => ctx.resourceCallSession?.onOpenFullCall()}>
+            Abrir chamada
+          </button>
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Routes>
+          <Route element={<AppShellFresh />}>
+            <Route path="/chat" element={<ChatShellFresh />}>
+              <Route index element={<ResourceSessionProbe />} />
+            </Route>
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Alternar microfone" }));
+    expect(toggleMicrophone).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Abrir chamada" }));
+    expect(expand).toHaveBeenCalledOnce();
+  });
 });
 
 // ── issue #673: directCallSession is derived from directPresentationCall,
@@ -1274,6 +1368,9 @@ describe("ChatShell — #673 directCallSession derivation", () => {
         </button>
         <button type="button" onClick={() => ctx.directCallSession?.onOpenFullCall()}>
           Abrir chamada
+        </button>
+        <button type="button" onClick={() => ctx.directCallSession?.onToggleMicrophone()}>
+          Alternar microfone
         </button>
       </>
     );
@@ -1381,6 +1478,38 @@ describe("ChatShell — #673 directCallSession derivation", () => {
     expect(end).toHaveBeenCalledOnce();
     await user.click(screen.getByRole("button", { name: "Abrir chamada" }));
     expect(expand).toHaveBeenCalledOnce();
+  });
+
+  it("wires onToggleMicrophone to media.toggleMicrophone()", async () => {
+    vi.resetModules();
+    const toggleMicrophone = vi.fn();
+    mockUseCallSession({
+      media: {
+        participants: [],
+        activeSpeakerId: null,
+        microphoneEnabled: true,
+        pendingControl: null,
+        toggleMicrophone,
+      },
+      directPresentationCall: {
+        call_id: "call-direct-4",
+        request_id: "req-4",
+        caller_id: currentUserId,
+        callee_id: "user-jl",
+        target_type: "user" as const,
+        call_type: "audio" as const,
+        status: "active" as const,
+        version: 1,
+        created_at: "2024-01-01T12:00:00.000Z",
+        occurred_at: "2024-01-01T12:00:00.000Z",
+        expires_at: "2024-01-01T13:00:00.000Z",
+      },
+    });
+
+    await renderWithDirectSessionProbe();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Alternar microfone" }));
+    expect(toggleMicrophone).toHaveBeenCalledOnce();
   });
 });
 
@@ -1491,6 +1620,58 @@ describe("ChatShell — leaving the conversation on screen", () => {
 
     await waitFor(() => expect(screen.getByText("vazio")).toBeInTheDocument());
     expect(leaveConversation).toHaveBeenCalledWith("channel", readingId);
+  });
+});
+
+// AppShell's resolveDetailsTarget resolves a row menu's "details" target
+// through the sidebar's own dms list — exercised so far only for channels
+// above. A DM row (not a group) must resolve to the panel's "direct" kind.
+describe("ChatShell — abre detalhes de uma conversa direta", () => {
+  const dmId = "00000000-0000-4000-8000-0000000005d1";
+
+  it("resolve o alvo de uma DM 1:1 como 'direct'", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [],
+      dms: [
+        {
+          id: dmId,
+          type: "1:1",
+          name: "Juliane Lino",
+          participants: [],
+          counterpart: { userId: callerId, displayName: "Juliane Lino" },
+        },
+      ],
+      categories: [],
+    });
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route index element={<div>vazio</div>} />
+            </Route>
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("option", { name: /Juliane Lino/ });
+
+    await user.click(
+      screen.getByRole("button", { name: "Mais opções para conversa com Juliane Lino" }),
+    );
+    await user.click(screen.getByRole("menuitem", { name: "Detalhes da conversa" }));
+
+    expect(screen.getByTestId("sidebar-details")).toHaveTextContent(`direct:${dmId}`);
   });
 });
 
