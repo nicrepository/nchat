@@ -141,6 +141,37 @@ describe("fetchMyProfile", () => {
     }
   });
 
+  it("drops a malformed URL that new URL() cannot parse at all", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "u1", display_name: "Ana", avatar_url: "http://[not-valid-host" },
+    });
+    expect((await fetchMyProfile()).avatarUrl).toBeUndefined();
+  });
+
+  it("drops every avatar URL when window.location.origin is the opaque-origin sentinel 'null'", async () => {
+    // A sandboxed iframe (or a file:// document) reports "null" as its
+    // origin — the same value a browser really produces, not a test-only
+    // fabrication. sameOriginAvatarUrl must treat that as "no safe origin
+    // to compare against" and drop the URL rather than risk a same-origin
+    // check that can never be satisfied honestly.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, origin: "null" },
+    });
+    try {
+      mockAuthFetch.mockResolvedValue({
+        data: { id: "u1", display_name: "Ana", avatar_url: "/api/auth/avatars/x.png" },
+      });
+      expect((await fetchMyProfile()).avatarUrl).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
   it("accepts an absolute same-origin URL unchanged", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
@@ -188,11 +219,30 @@ describe("updateProfile", () => {
     expect(result.displayName).toBe("Ana");
   });
 
-  it("maps a 400 to an invalid UpdateProfileError and a 403 to forbidden", async () => {
+  it("maps a 400 to an invalid UpdateProfileError", async () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(400, "bad", "bad"));
     await expect(
       updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
     ).rejects.toMatchObject({ reason: "invalid" });
+  });
+
+  it("maps a 403 to forbidden", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "no"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "forbidden" });
+  });
+
+  it("maps an unrecognized status and a non-ApiRequestError both to 'unknown'", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(500, "server_error", "boom"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "unknown" });
+
+    mockAuthFetch.mockRejectedValueOnce(new TypeError("network down"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "unknown" });
   });
 });
 
