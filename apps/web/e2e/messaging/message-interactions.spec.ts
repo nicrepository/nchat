@@ -59,13 +59,13 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
       .getByRole("button", { name: `Abrir conversa com ${OTHER_USER_NAME}` })
       .click();
 
-    const conversationId = `e2e-dm-with-${OTHER_USER_ID}`;
-    await expect(page).toHaveURL(`/chat/dm/${conversationId}`);
-    await expect(
-      page.getByRole("region", { name: "Mensagens diretas" }).getByRole("option", {
-        name: OTHER_USER_NAME,
-      }),
-    ).toBeVisible();
+    await expect(page).toHaveURL("/chat/dm/e2e-dm-other");
+    const directMessages = page.getByRole("region", { name: "Mensagens diretas" });
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveCount(1);
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     expect(scenario.requests.dmCreates).toEqual([{ otherUserId: OTHER_USER_ID }]);
   });
   test("recebe message.created de outro participante uma única vez na DM correta", async ({

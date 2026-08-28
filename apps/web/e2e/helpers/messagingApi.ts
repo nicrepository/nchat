@@ -1832,13 +1832,21 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
       await route.fulfill({ status: 404 });
       return;
     }
-    const conversationId = `e2e-dm-with-${otherUserId}`;
-    if (!scenario.sidebarDMs.some((dm) => dm.id === conversationId)) {
+    const existingDirect = scenario.sidebarDMs.find(
+      (dm) => dm.type === "direct" && dm.counterpart?.user_id === otherUserId,
+    );
+    const conversationId = existingDirect?.id ?? `e2e-dm-with-${otherUserId}`;
+    const created = !existingDirect;
+    if (created) {
       scenario.sidebarDMs.push({
         id: conversationId,
         type: "direct",
         name: candidate.displayName,
         unread_count: 0,
+        counterpart: {
+          user_id: otherUserId,
+          display_name: candidate.displayName,
+        },
       });
     }
     if (!scenario.messagesByTarget.has(targetKey("dm", conversationId))) {
@@ -1847,7 +1855,7 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ data: { conversation_id: conversationId, created: true } }),
+      body: JSON.stringify({ data: { conversation_id: conversationId, created } }),
     });
   });
 
