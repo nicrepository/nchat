@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 import { Link } from "react-router";
 
 import "./ProfilePage.css";
+import { initialsFrom } from "../chat/messageDisplay";
 import {
   type BrowserNotificationPermission,
   getBrowserNotificationPermission,
@@ -353,6 +354,23 @@ export default function ProfilePage() {
   const hasPersistedAvatar = persistedAvatarUrl !== undefined && persistedAvatarUrl !== "";
   const shownImage = previewUrl ?? (hasPersistedAvatar ? persistedAvatarUrl : null);
 
+  // A broken/expired image (404, corrupt file, network blip) must fall back to
+  // initials rather than the browser's broken-image icon — same rule and same
+  // reset-on-src-change pattern ChatSidebar's Avatar already uses for every
+  // other avatar in the app (initials fallback is not invented here, it is
+  // reused). The failure is scoped to the URL that was current when it
+  // happened, so a change of shownImage (new preview, new persisted URL,
+  // avatar removed) clears it — an A → B → A cycle must retry A rather than
+  // stay stuck on the earlier failure.
+  const [avatarFailedSrc, setAvatarFailedSrc] = useState<string | null>(null);
+  const [trackedAvatarSrc, setTrackedAvatarSrc] = useState(shownImage);
+  if (shownImage !== trackedAvatarSrc) {
+    setTrackedAvatarSrc(shownImage);
+    setAvatarFailedSrc(null);
+  }
+  const showAvatarImage = Boolean(shownImage) && avatarFailedSrc !== shownImage;
+  const avatarInitials = initialsFrom(persistedDisplayName ?? "");
+
   const trimmedNameDraft = nameDraft.trim();
   // Reported while the user types rather than only on submit, so shortening a
   // too-long name shows the fix immediately. The empty case is guarded here
@@ -535,16 +553,17 @@ export default function ProfilePage() {
         <div className="profile-page__avatar-preview">
           {loadingProfile ? (
             <span className="profile-page__avatar-loading" role="status" aria-label="Carregando" />
-          ) : shownImage ? (
+          ) : showAvatarImage ? (
             <img
               className="profile-page__avatar-img"
-              src={shownImage}
+              src={shownImage ?? undefined}
               alt="Pré-visualização do avatar"
               referrerPolicy="no-referrer"
+              onError={() => setAvatarFailedSrc(shownImage)}
             />
           ) : (
             <span className="profile-page__avatar-placeholder" aria-hidden="true">
-              ?
+              {avatarInitials}
             </span>
           )}
         </div>
