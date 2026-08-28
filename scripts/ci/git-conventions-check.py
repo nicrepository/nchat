@@ -107,40 +107,50 @@ def is_ancestor(ancestor_sha: str, descendant_sha: str) -> bool:
     )
 
 
-def effective_base_sha(base_sha: str, head_sha: str) -> str:
-    """The commit to validate from: the pull request's base, or the adoption commit.
+def subject_revision_arguments(base_sha: str, head_sha: str) -> list[str]:
+    """The revision arguments selecting exactly the commits this pull request adds.
 
-    The boundary moves only when both things are true at once:
+    Three sets, never two:
 
-      * the adoption commit is on this head's history, so the policy genuinely
-        applies to the work being proposed; and
-      * the base predates adoption, which is what makes the range retroactive.
+        validated = ancestors(head) - ancestors(base) - ancestors(adoption)
 
-    Everything else keeps PR_BASE_SHA, so an ordinary feature -> develop pull
-    request is validated exactly as before: develop is long past adoption, so
-    its base is already after the boundary and nothing changes.
+    The base exclusion is not optional and never substitutable. A commit already
+    reachable from the base is, by definition, not something this pull request
+    proposes -- it is already on the branch being merged into, and the author has
+    no way to change it. Dropping that exclusion is what let a legacy subject
+    reappear when `main` was merged into a release branch: the merge pulled
+    main's lineage into the head, and a commit sitting on that lineage is not an
+    ancestor of the adoption commit, so an adoption-only range let it back in.
 
-    A head that does not contain the adoption commit keeps its base too. That is
-    the conservative direction — more commits validated, not fewer — and it is
-    the right answer for a branch cut before the policy that has not merged it.
+    The adoption exclusion is a *second* filter layered on top, for the case the
+    base itself predates the policy -- a release pull request promoting an old
+    `main`. It removes the pre-policy history the base does not already cover.
+
+    Expressed as `head ^base ^adoption` rather than a single `X..head`, because
+    a single two-dot range can only ever subtract one set. `head ^base` is
+    exactly `base..head`, so a head without the adoption commit is validated
+    precisely as it was before.
     """
-    if not is_ancestor(GOVERNANCE_ENFORCEMENT_SHA, head_sha):
-        return base_sha
-    if is_ancestor(GOVERNANCE_ENFORCEMENT_SHA, base_sha):
-        return base_sha
-    return GOVERNANCE_ENFORCEMENT_SHA
+    revisions = [head_sha, f"^{base_sha}"]
+    if is_ancestor(GOVERNANCE_ENFORCEMENT_SHA, head_sha):
+        revisions.append(f"^{GOVERNANCE_ENFORCEMENT_SHA}")
+    return revisions
 
 
 def pull_request_subjects(base_sha: str, head_sha: str) -> tuple[str, ...]:
     if not SHA_PATTERN.fullmatch(base_sha) or not SHA_PATTERN.fullmatch(head_sha):
         raise ValueError("Pull request base and head SHAs must be full lowercase SHAs")
 
-    # The adoption commit itself is excluded by the exclusive range: it is the
+    # Both the base and the adoption commit are excluded by `^`: each is a
     # boundary, not a commit this policy has to re-approve.
-    range_base = effective_base_sha(base_sha, head_sha)
-
     result = subprocess.run(
-        ["git", "log", "--no-merges", "--format=%s", f"{range_base}..{head_sha}"],
+        [
+            "git",
+            "log",
+            "--no-merges",
+            "--format=%s",
+            *subject_revision_arguments(base_sha, head_sha),
+        ],
         check=True,
         capture_output=True,
         text=True,
