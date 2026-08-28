@@ -42,6 +42,18 @@ export type SidebarState =
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
+      /**
+       * How many messages were unread the moment each conversation was last
+       * opened, keyed by `${kind}:${id}` — snapshotted by clearUnread in the
+       * same reducer update that zeroes the live unreadCount, so a consumer
+       * (the unread divider in ChatMessageArea) can know what to show without
+       * racing the clear: both values always change together, in the one
+       * render such a consumer will ever observe. Optional so component
+       * tests that build a "ready" SidebarState by hand (bypassing the
+       * reducer) keep compiling unchanged; absent reads the same as "nothing
+       * captured yet".
+       */
+      unreadAtOpen?: Record<string, number>;
     };
 
 type Action =
@@ -210,6 +222,7 @@ function applyLoaded(
     channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
     dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
     categories: action.categories || [],
+    unreadAtOpen: previous?.unreadAtOpen ?? {},
   };
 }
 
@@ -281,11 +294,20 @@ function applyTargetOpened(
   action: Extract<Action, { type: "target_opened" }>,
 ): SidebarState {
   if (state.status !== "ready") return state;
-  const { targetId } = action.target;
-  if (action.target.kind === "channel") {
-    return { ...state, channels: clearUnread(state.channels, targetId) };
+  const { kind, targetId } = action.target;
+  const items = kind === "channel" ? state.channels : state.dms;
+  const key = `${kind}:${targetId}`;
+  const previousUnread = items.find((item) => item.id === targetId)?.unreadCount ?? 0;
+  // Snapshot what is being cleared, in this same update, so a consumer of
+  // ctx.unreadAtOpen can never observe the clear without also seeing what it
+  // cleared (no render exists where unreadCount is 0 but unreadAtOpen isn't
+  // set yet, or vice versa — they are the same state transition).
+  const unreadAtOpen =
+    previousUnread > 0 ? { ...state.unreadAtOpen, [key]: previousUnread } : state.unreadAtOpen;
+  if (kind === "channel") {
+    return { ...state, channels: clearUnread(state.channels, targetId), unreadAtOpen };
   }
-  return { ...state, dms: clearUnread(state.dms, targetId) };
+  return { ...state, dms: clearUnread(state.dms, targetId), unreadAtOpen };
 }
 
 // Routing only: each case names the transition and hands the state to the pure
@@ -775,7 +797,11 @@ export function useChatSidebar() {
       const wasReading = openedTargetKind === target.kind && openedTargetId === target.targetId;
       await leaveConversationRequest(target.kind, target.targetId);
       refreshSidebar();
-      if (wasReading) navigate("/chat");
+      // Explicitly the neutral route, not wherever the default-conversation
+      // redirect would otherwise send the reader next — leaving is its own
+      // deliberate action, not "nothing selected yet", so it must not be
+      // treated as an invitation to auto-navigate elsewhere.
+      if (wasReading) navigate("/chat", { state: { skipDefaultConversationRedirect: true } });
     },
     [refreshSidebar, navigate, openedTargetKind, openedTargetId],
   );

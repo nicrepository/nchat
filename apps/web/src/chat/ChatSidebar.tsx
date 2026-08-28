@@ -370,6 +370,40 @@ function hasUnread(count: number | undefined): boolean {
 }
 
 /**
+ * Splits an already activity-sorted list into its unread and read halves,
+ * preserving the caller's order within each — Discord-style grouping,
+ * without a second sort: "most recent first" already means the same thing
+ * inside each half that it meant before the split.
+ */
+function partitionByUnread<T extends { unreadCount?: number; hasMentionUnread?: boolean }>(
+  items: T[],
+): { unread: T[]; read: T[] } {
+  const unread: T[] = [];
+  const read: T[] = [];
+  for (const item of items) {
+    (hasUnread(item.unreadCount) || item.hasMentionUnread ? unread : read).push(item);
+  }
+  return { unread, read };
+}
+
+/**
+ * A pinned conversation floats to the top regardless of read state — the same
+ * precedence `compareByActivity` already gives pins over activity/unread —
+ * so it is never pulled into the "não lidas"/"lidas" split below it; that
+ * split only ever applies to the unpinned remainder.
+ */
+function partitionByPinned<T extends { pinnedAt?: string | null }>(
+  items: T[],
+): { pinned: T[]; unpinned: T[] } {
+  const pinned: T[] = [];
+  const unpinned: T[] = [];
+  for (const item of items) {
+    (item.pinnedAt ? pinned : unpinned).push(item);
+  }
+  return { pinned, unpinned };
+}
+
+/**
  * The row's accessible name carries the pinned state in words.
  *
  * That is what lets the pin itself stay decorative: a screen-reader user hears
@@ -390,6 +424,64 @@ interface ChannelListProps {
   actions: RowActionsProps;
 }
 
+function channelRows(
+  channels: Channel[],
+  activeChannelId: string | undefined,
+  onSelect: (id: string) => void,
+  actions: RowActionsProps,
+) {
+  return channels.map((ch) => {
+    const isActive = ch.id === activeChannelId;
+    const target: ConversationTarget = {
+      kind: "channel",
+      id: ch.id,
+      name: ch.name,
+      pinned: Boolean(ch.pinnedAt),
+      canRename: ch.canRename,
+      isGeneral: ch.isGeneral,
+      muted: Boolean(ch.muted),
+      hasUnread: hasUnread(ch.unreadCount),
+    };
+    return (
+      <div key={ch.id} className="chat-sidebar__item-row">
+        <button
+          type="button"
+          role="option"
+          aria-selected={isActive}
+          aria-label={withPinnedSuffix(
+            `Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`,
+            target.pinned,
+          )}
+          className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
+          onClick={() => onSelect(ch.id)}
+        >
+          {ch.type === "private" ? <IconLock /> : <IconHash />}
+          <span className="chat-sidebar__nav-item-name">{ch.name}</span>
+          {ch.type === "private" && (
+            <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
+              privado
+            </span>
+          )}
+          {ch.unreadCount != null && ch.unreadCount > 0 && (
+            <span
+              className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+              aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
+            >
+              {ch.hasMentionUnread && (
+                <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
+                  @
+                </span>
+              )}
+              {ch.unreadCount}
+            </span>
+          )}
+        </button>
+        <RowActions target={target} {...actions} />
+      </div>
+    );
+  });
+}
+
 function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: ChannelListProps) {
   if (channels.length === 0) {
     return (
@@ -399,59 +491,42 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
     );
   }
 
+  // Split into "não lidas"/"lidas" only when the unpinned remainder actually
+  // mixes both — a list that is entirely one or the other (or has nothing
+  // unpinned to split) renders exactly as it always has, with no extra
+  // heading to announce a distinction that doesn't exist here.
+  const { pinned, unpinned } = partitionByPinned(channels);
+  const { unread, read } = partitionByUnread(unpinned);
+  if (unread.length === 0 || read.length === 0) {
+    return (
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
+        {channelRows(channels, activeChannelId, onSelect, actions)}
+      </div>
+    );
+  }
+
+  const unreadLabelId = `${labelId}-unread`;
+  const readLabelId = `${labelId}-read`;
   return (
-    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
-      {channels.map((ch) => {
-        const isActive = ch.id === activeChannelId;
-        const target: ConversationTarget = {
-          kind: "channel",
-          id: ch.id,
-          name: ch.name,
-          pinned: Boolean(ch.pinnedAt),
-          canRename: ch.canRename,
-          isGeneral: ch.isGeneral,
-          muted: Boolean(ch.muted),
-          hasUnread: hasUnread(ch.unreadCount),
-        };
-        return (
-          <div key={ch.id} className="chat-sidebar__item-row">
-            <button
-              type="button"
-              role="option"
-              aria-selected={isActive}
-              aria-label={withPinnedSuffix(
-                `Canal ${ch.type === "private" ? "privado " : ""}${ch.name}`,
-                target.pinned,
-              )}
-              className={`chat-sidebar__nav-item${isActive ? " chat-sidebar__nav-item--active" : ""}`}
-              onClick={() => onSelect(ch.id)}
-            >
-              {ch.type === "private" ? <IconLock /> : <IconHash />}
-              <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-              {ch.type === "private" && (
-                <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                  privado
-                </span>
-              )}
-              {ch.unreadCount != null && ch.unreadCount > 0 && (
-                <span
-                  className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
-                  aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
-                >
-                  {ch.hasMentionUnread && (
-                    <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
-                      @
-                    </span>
-                  )}
-                  {ch.unreadCount}
-                </span>
-              )}
-            </button>
-            <RowActions target={target} {...actions} />
-          </div>
-        );
-      })}
-    </div>
+    <>
+      {pinned.length > 0 && (
+        <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
+          {channelRows(pinned, activeChannelId, onSelect, actions)}
+        </div>
+      )}
+      <h3 id={unreadLabelId} className="chat-sidebar__subgroup-label">
+        Não lidas
+      </h3>
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={unreadLabelId}>
+        {channelRows(unread, activeChannelId, onSelect, actions)}
+      </div>
+      <h3 id={readLabelId} className="chat-sidebar__subgroup-label">
+        Lidas
+      </h3>
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={readLabelId}>
+        {channelRows(read, activeChannelId, onSelect, actions)}
+      </div>
+    </>
   );
 }
 
@@ -560,6 +635,23 @@ function DMRow({
   );
 }
 
+function dmRows(
+  dms: DMConversation[],
+  activeDMId: string | undefined,
+  onSelect: (id: string) => void,
+  actions: RowActionsProps,
+) {
+  return dms.map((dm) => (
+    <DMRow
+      key={dm.id}
+      dm={dm}
+      isActive={dm.id === activeDMId}
+      onSelect={onSelect}
+      actions={actions}
+    />
+  ));
+}
+
 function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: DMListProps) {
   if (dms.length === 0) {
     return (
@@ -569,18 +661,40 @@ function DMList({ dms, activeDMId, onSelect, labelId, emptyMessage, actions }: D
     );
   }
 
+  // Same "only split when the unpinned remainder is actually mixed" rule as
+  // ChannelList — see partitionByUnread/partitionByPinned.
+  const { pinned, unpinned } = partitionByPinned(dms);
+  const { unread, read } = partitionByUnread(unpinned);
+  if (unread.length === 0 || read.length === 0) {
+    return (
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
+        {dmRows(dms, activeDMId, onSelect, actions)}
+      </div>
+    );
+  }
+
+  const unreadLabelId = `${labelId}-unread`;
+  const readLabelId = `${labelId}-read`;
   return (
-    <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
-      {dms.map((dm) => (
-        <DMRow
-          key={dm.id}
-          dm={dm}
-          isActive={dm.id === activeDMId}
-          onSelect={onSelect}
-          actions={actions}
-        />
-      ))}
-    </div>
+    <>
+      {pinned.length > 0 && (
+        <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={labelId}>
+          {dmRows(pinned, activeDMId, onSelect, actions)}
+        </div>
+      )}
+      <h3 id={unreadLabelId} className="chat-sidebar__subgroup-label">
+        Não lidas
+      </h3>
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={unreadLabelId}>
+        {dmRows(unread, activeDMId, onSelect, actions)}
+      </div>
+      <h3 id={readLabelId} className="chat-sidebar__subgroup-label">
+        Lidas
+      </h3>
+      <div className="chat-sidebar__section-list" role="listbox" aria-labelledby={readLabelId}>
+        {dmRows(read, activeDMId, onSelect, actions)}
+      </div>
+    </>
   );
 }
 

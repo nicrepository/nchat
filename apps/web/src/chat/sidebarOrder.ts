@@ -181,6 +181,40 @@ export function sortByActivity<T extends ActivityOrdered>(items: readonly T[]): 
  * equal keeps `current` — an equivalent rewrite is not a change and must not
  * look like one to the caller deciding whether to allocate new state.
  */
+/**
+ * One row from either the channel or the DM collection, reduced to what
+ * "which conversation should open when nothing is selected" needs.
+ */
+export interface DefaultSelectionCandidate extends ActivityOrdered {
+  kind: "channel" | "dm";
+  unreadCount?: number;
+  hasMentionUnread?: boolean;
+}
+
+/**
+ * The conversation to open when the chat is reached with nothing explicitly
+ * selected: the most recently active unread conversation, or — when nothing
+ * is unread — the most recently active conversation overall.
+ *
+ * Reuses the sidebar's own total order (`sortByActivity`) rather than a
+ * second "most recent" rule: "most recent" means exactly what it already
+ * means everywhere else in the sidebar, pinned conversations included. Never
+ * called for a route where the user already picked a conversation — the
+ * caller only runs this while nothing is selected, so it can never override
+ * a manual choice.
+ */
+export function selectDefaultConversation(
+  candidates: readonly DefaultSelectionCandidate[],
+): { kind: "channel" | "dm"; id: string } | null {
+  if (candidates.length === 0) return null;
+  const ordered = sortByActivity(candidates);
+  const firstUnread = ordered.find(
+    (item) => (item.unreadCount ?? 0) > 0 || item.hasMentionUnread === true,
+  );
+  const chosen = firstUnread ?? ordered[0];
+  return { kind: chosen.kind, id: chosen.id };
+}
+
 export function laterActivity(
   current: string | null | undefined,
   incoming: string | null | undefined,

@@ -8,6 +8,7 @@ import {
   OTHER_USER_NAME,
   channelDetailsFixture,
   createScenario,
+  emitMessageCreated,
   fillComposer,
   installMessagingMocks,
   makeMessage,
@@ -515,6 +516,164 @@ test.describe("layout responsivo", () => {
     });
     expect(await list.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
     await expectNoRootScroll(page, "histórico rolado");
+  });
+
+  test("abre histórico longo no final com o composer focado", async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const targetId = uniqueId(testInfo, "initial-focus-scroll");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: LONG_NAME,
+      messages: Array.from({ length: 60 }, (_, index) =>
+        makeMessage({
+          id: `${targetId}-m${index}`,
+          body_text: `Mensagem inicial ${index} desta conversa longa.`,
+        }),
+      ),
+    });
+    await installMessagingMocks(page, scenario);
+    await page.route("**/api/chat/sidebar", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            current_user_id: CURRENT_USER_ID,
+            workspace: {
+              id: "workspace-e2e",
+              max_upload_bytes: 8 * 1024 * 1024,
+              max_message_attachments: 10,
+              max_message_attachment_bytes: 64 * 1024 * 1024,
+            },
+            channels: scenario.sidebarChannels,
+            dm_conversations: scenario.sidebarDMs,
+          },
+        }),
+      }),
+    );
+
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const input = composer(page);
+    await expect(input).toBeFocused();
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(async () =>
+        list.evaluate((element) =>
+          Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop),
+        ),
+      )
+      .toBeLessThanOrEqual(1);
+
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.type("d");
+    await expect(input).toHaveText("d");
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
+    await page.keyboard.press("Backspace");
+    await fillComposer(page, "Mensagem enviada com foco preservado");
+    await input.press("Enter");
+    await expect(page.getByText("Mensagem enviada com foco preservado")).toBeVisible();
+    await expect(input).toBeFocused();
+
+    let uploaded = 0;
+    await page.route("**/api/files/channels/*/attachments", async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      uploaded += 1;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            id: `document-${uploaded}`,
+            filename: uploaded === 1 ? "um.pdf" : "dois.pdf",
+            contentType: "application/pdf",
+            size: 3,
+            status: "pending_scan",
+            previewStatus: "pending",
+            createdAt: "2026-08-27T12:00:00Z",
+          },
+        }),
+      });
+    });
+    await page.getByTestId("chat-composer-file-input").setInputFiles([
+      { name: "um.pdf", mimeType: "application/pdf", buffer: Buffer.from("um") },
+      { name: "dois.pdf", mimeType: "application/pdf", buffer: Buffer.from("dois") },
+    ]);
+    await expect(page.getByTestId("chat-composer-pending-attachment")).toHaveCount(2);
+    await expect(input).toBeFocused();
+    const attachmentSend = page.waitForRequest(
+      (request) => request.method() === "POST" && request.url().endsWith(`/messages`),
+    );
+    await page.keyboard.press("Enter");
+    expect((await attachmentSend).postDataJSON()).toMatchObject({
+      attachment_ids: ["document-1", "document-2"],
+    });
+  });
+
+  /**
+   * The `ws_append` branch of the scroll-management effect (ChatMessageArea.tsx)
+   * only auto-scrolls when `isNearBottomRef.current` is true — this proves that
+   * rule in a real browser (real overflow/scrollTop/scrollHeight), not just in
+   * the jsdom-level component test that already exercises the same branch with
+   * simulated geometry.
+   */
+  test("mensagem nova não move o scroll de quem está lendo histórico antigo", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const targetId = uniqueId(testInfo, "old-history-preserved");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: "Conversa Com Histórico",
+      messages: Array.from({ length: 60 }, (_, i) =>
+        makeMessage({ id: `${targetId}-m${i}`, body_text: `Mensagem ${i} do histórico.` }),
+      ),
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+
+    const list = page.locator(".chat-msg-area__list");
+    await expect
+      .poll(async () =>
+        list.evaluate((el) => Math.abs(el.scrollHeight - el.clientHeight - el.scrollTop)),
+      )
+      .toBeLessThanOrEqual(1);
+    // Let the one-time "initial" settle rAF (ChatMessageArea.tsx) finish before
+    // scrolling up, so it can't race the assertion below.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+
+    await list.evaluate((el) => {
+      el.scrollTop = 0;
+    });
+    await expect.poll(() => list.evaluate((el) => el.scrollTop)).toBe(0);
+
+    const incoming = makeMessage({
+      id: `${targetId}-late-arrival`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: "mensagem chegando enquanto o usuário lê o histórico antigo",
+    });
+    await emitMessageCreated(page, scenario, { kind: "dm", targetId, message: incoming });
+    await expect(
+      page.getByText("mensagem chegando enquanto o usuário lê o histórico antigo"),
+    ).toHaveCount(1);
+
+    const geometryAfter = await list.evaluate((el) => ({
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    }));
+    expect(geometryAfter.scrollTop).toBe(0);
+    expect(geometryAfter.scrollHeight - geometryAfter.clientHeight).toBeGreaterThan(
+      geometryAfter.clientHeight,
+    );
   });
 
   /**
