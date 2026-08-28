@@ -1,7 +1,12 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
-import { createScenario, installMessagingMocks, makeMessage, uniqueId } from "../helpers/messagingApi";
+import {
+  createScenario,
+  installMessagingMocks,
+  makeMessage,
+  uniqueId,
+} from "../helpers/messagingApi";
 
 const EVIDENCE_DIR =
   "/tmp/claude-1000/-home-mateusevangelista-Documentos-Projetos-internos-nchat/2857ce59-b684-456c-9075-fde6ca7aa8c3/scratchpad/evidence";

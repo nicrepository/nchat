@@ -642,7 +642,13 @@ function dmRows(
   actions: RowActionsProps,
 ) {
   return dms.map((dm) => (
-    <DMRow key={dm.id} dm={dm} isActive={dm.id === activeDMId} onSelect={onSelect} actions={actions} />
+    <DMRow
+      key={dm.id}
+      dm={dm}
+      isActive={dm.id === activeDMId}
+      onSelect={onSelect}
+      actions={actions}
+    />
   ));
 }
 
