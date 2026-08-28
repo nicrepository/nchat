@@ -67,10 +67,6 @@ export interface UseChatEditorOptions {
   initialContent?: TTNode;
   clearOnSend?: boolean;
   testId?: string;
-  /** Focus once when this editor first becomes editable. Conversation composers opt in. */
-  focusOnReady?: boolean;
-  /** Restore focus after a confirmed send, once editing has been re-enabled. */
-  restoreFocusOnSend?: boolean;
   /**
    * Whether the message has content this editor cannot see — today, a pending
    * attachment (RF-32).
@@ -131,17 +127,12 @@ export function useChatEditor({
   initialContent,
   clearOnSend = true,
   testId = "chat-composer-input",
-  focusOnReady = false,
-  restoreFocusOnSend = false,
   canSendEmpty = false,
   onSend,
   onActivity,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
-  const [sendFocusRequest, setSendFocusRequest] = useState(0);
-  const initialFocusCompletedRef = useRef(false);
-  const handledSendFocusRequestRef = useRef(0);
 
   // Ref, like handleSendRef below: onUpdate is captured once per extensions
   // instance, so a new onActivity identity each render must not require
@@ -220,51 +211,6 @@ export function useChatEditor({
     dom.setAttribute("aria-label", placeholder);
   }, [editor, disabled, sending, placeholder]);
 
-  useEffect(() => {
-    if (!editor || disabled || sending) return;
-    const modalActive = document.querySelector('[aria-modal="true"]') !== null;
-
-    if (focusOnReady && !initialFocusCompletedRef.current && !modalActive) {
-      initialFocusCompletedRef.current = true;
-      editor.view.dom.focus();
-      return;
-    }
-
-    if (restoreFocusOnSend && sendFocusRequest > handledSendFocusRequestRef.current) {
-      handledSendFocusRequestRef.current = sendFocusRequest;
-      if (!modalActive) editor.view.dom.focus();
-    }
-  }, [disabled, editor, focusOnReady, restoreFocusOnSend, sendFocusRequest, sending]);
-
-  useEffect(() => {
-    if (!focusOnReady || !editor || disabled || sending) return;
-    const startComposing = (event: globalThis.KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.isComposing ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.altKey ||
-        event.key.length !== 1 ||
-        document.querySelector('[aria-modal="true"]')
-      ) {
-        return;
-      }
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest('input, textarea, select, button, a[href], [contenteditable="true"]')
-      ) {
-        return;
-      }
-      event.preventDefault();
-      editor.view.dom.focus();
-      editor.commands.insertContent(event.key);
-    };
-    document.addEventListener("keydown", startComposing);
-    return () => document.removeEventListener("keydown", startComposing);
-  }, [disabled, editor, focusOnReady, sending]);
-
   const canSend = (hasContent || canSendEmpty) && !sending && !disabled;
 
   async function handleSend() {
@@ -276,9 +222,6 @@ export function useChatEditor({
       const result = await onSend(body);
       if (result.status === "sent" && clearOnSend) {
         editor.commands.clearContent(true);
-      }
-      if (result.status === "sent" && restoreFocusOnSend) {
-        setSendFocusRequest((request) => request + 1);
       }
       // result.status === "stale": target changed — editor content preserved
     } catch {

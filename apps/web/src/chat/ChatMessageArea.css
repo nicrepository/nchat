@@ -280,36 +280,6 @@
   letter-spacing: 0.02em;
 }
 
-/* ── Unread divider ─────────────────────────────────────────────────────────────
-   Discord-style "new messages" boundary: a horizontal rule with a centered
-   label, distinct from the day-divider pill above (that one is a rounded
-   badge; this one is a literal line-label-line row spanning the width). */
-
-.chat-msg-area__unread-divider {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 14px 0;
-  padding: 0 4px;
-}
-
-.chat-msg-area__unread-divider-line {
-  flex: 1 1 auto;
-  height: 1px;
-  background: var(--color-danger, #dc2626);
-  opacity: 0.55;
-}
-
-.chat-msg-area__unread-divider-label {
-  flex: 0 0 auto;
-  color: var(--color-danger, #dc2626);
-  font-size: 11.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
 /* ── Message row ─────────────────────────────────────────────────────────────── */
 
 .chat-msg-area__msg {

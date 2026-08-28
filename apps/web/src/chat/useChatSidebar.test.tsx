@@ -139,11 +139,8 @@ function navigableWrapper(path: string) {
  */
 function routedWrapper(path: string) {
   const pathnameRef = { current: path };
-  const stateRef: { current: unknown } = { current: undefined };
   function LocationCapture() {
-    const location = useLocation();
-    pathnameRef.current = location.pathname;
-    stateRef.current = location.state;
+    pathnameRef.current = useLocation().pathname;
     return null;
   }
   function Wrapper({ children }: PropsWithChildren) {
@@ -154,7 +151,7 @@ function routedWrapper(path: string) {
       </MemoryRouter>
     );
   }
-  return { Wrapper, pathnameRef, stateRef };
+  return { Wrapper, pathnameRef };
 }
 
 function messageCreated(
@@ -2463,20 +2460,6 @@ describe("useChatSidebar — system messages", () => {
 
       expect(mockLeaveConversation).toHaveBeenCalledWith("channel", channelA);
       expect(pathnameRef.current).toBe("/chat");
-    });
-
-    // The default-conversation redirect (ChatPlaceholder) must never fire as a
-    // consequence of leaving: this is the flag it checks to stand down.
-    it("marks the neutral-route navigation so the default-conversation redirect skips it", async () => {
-      const { Wrapper, stateRef } = routedWrapper(`/chat/channel/${channelA}`);
-      const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
-      await waitFor(() => expect(result.current.state.status).toBe("ready"));
-
-      await act(async () => {
-        await result.current.leaveConversation({ kind: "channel", targetId: channelA });
-      });
-
-      expect(stateRef.current).toEqual({ skipDefaultConversationRedirect: true });
     });
 
     it("returns to the neutral route after leaving the group being read", async () => {

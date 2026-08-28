@@ -33,7 +33,6 @@ function readySidebar(state: SidebarState): {
   channels: Channel[];
   dms: DMConversation[];
   attachmentLimits: WorkspaceAttachmentLimits;
-  unreadAtOpen: Record<string, number>;
 } {
   if (state.status !== "ready")
     return {
@@ -45,7 +44,6 @@ function readySidebar(state: SidebarState): {
         maxFiles: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
       },
-      unreadAtOpen: {},
     };
   return {
     currentUserId: state.currentUserId,
@@ -56,7 +54,6 @@ function readySidebar(state: SidebarState): {
       maxFiles: 1,
       maxBytes: Number.MAX_SAFE_INTEGER,
     },
-    unreadAtOpen: state.unreadAtOpen ?? {},
   };
 }
 
@@ -118,13 +115,6 @@ export interface ChatOutletContext {
   channels: Channel[];
   dms: DMConversation[];
   attachmentLimits?: WorkspaceAttachmentLimits;
-  /**
-   * How many messages were unread the moment each conversation was last
-   * opened, keyed by `${kind}:${id}` (issue: unread divider). Optional so
-   * every existing test-only ChatOutletContext literal keeps compiling
-   * unchanged; absent reads the same as "nothing captured yet".
-   */
-  unreadAtOpen?: Record<string, number>;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
    * Discovery only (issue #622 round 2): whether a channel/group-DM has an
@@ -503,7 +493,6 @@ export default function ChatShell() {
     channels: ready.channels,
     dms: ready.dms,
     attachmentLimits: ready.attachmentLimits,
-    unreadAtOpen: ready.unreadAtOpen,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,
