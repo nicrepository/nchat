@@ -168,8 +168,7 @@ describe("ProfileEditDialog", () => {
   });
 
   it("does nothing on Tab when every field is disabled during a pending save", async () => {
-    const onConfirm = vi.fn(() => new Promise<void>(() => {}));
-    vi.mocked(profileApi.updateProfile).mockImplementationOnce(onConfirm);
+    vi.mocked(profileApi.updateProfile).mockReturnValueOnce(new Promise<SelfProfile>(() => {}));
     const user = userEvent.setup();
     render(<ProfileEditDialog profile={profile} onClose={vi.fn()} onSaved={vi.fn()} />);
     await user.type(screen.getByLabelText("Nome de exibição"), " Costa");
