@@ -77,9 +77,24 @@ require_context() {
     prod_fail "kube context is '$actual', expected '$NCHAT_PROD_CONTEXT'"
 }
 
+# Confirms the configured namespace is usable by the current identity, using a
+# namespaced read only.
+#
+# `kubectl get namespace` asked for the cluster-scoped `namespaces` resource,
+# which the production deployer is deliberately not allowed to read: a namespace
+# gate is not a reason to hand a deploy identity a cluster-wide permission. So
+# the gate asks the question in the namespace instead -- listing Services, a
+# permission the Role already grants and the one every later read depends on.
+#
+# Under that identity the authorization is the existence check. The RoleBinding
+# lives in this namespace and nowhere else, so a namespace that does not exist,
+# or any other namespace, answers Forbidden rather than an empty list. The two
+# are not distinguishable here and are not guessed apart: only the exit status
+# decides, kubectl's stderr is never parsed, and anything short of a successful
+# read -- Forbidden, an absent namespace, an API error -- stops the operation.
 require_namespace() {
-  kubectl get namespace "$NCHAT_PROD_NAMESPACE" >/dev/null 2>&1 ||
-    prod_fail "namespace '$NCHAT_PROD_NAMESPACE' does not exist"
+  kubectl get services -n "$NCHAT_PROD_NAMESPACE" >/dev/null 2>&1 ||
+    prod_fail "namespace '$NCHAT_PROD_NAMESPACE' does not exist or is not readable with the current context and credentials"
 }
 
 # The state of one stable Service, as a single token:

@@ -13,12 +13,24 @@
 #   context              the current kube context
 #   patch-fails          newline-separated Service names whose patch fails
 #   patch-log            appended to on every successful patch
+#   namespace            the one namespace this identity may read
+#   services-list-result how `get services` answers: absent or "success" for the
+#                        ordinary case, else not-found | forbidden | api-error
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
 
 prev=""
 read_state() { [[ -f "$STATE/$1" ]] && cat "$STATE/$1" || printf ''; }
+
+# The value of the -n flag, wherever it sits in the argument list.
+namespace_arg() {
+  local arg previous=""
+  for arg in "$@"; do
+    [[ "$previous" == "-n" ]] && printf '%s' "$arg"
+    previous="$arg"
+  done
+}
 
 # kubectl config current-context
 if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
@@ -27,9 +39,56 @@ if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
 fi
 
 # kubectl get namespace <name>
-if [[ "${1:-}" == "get" && "${2:-}" == "namespace" ]]; then
-  [[ "$(read_state namespace)" == "${3:-}" ]] || exit 1
-  echo "namespace/${3:-} found"
+#
+# The production deployer has no cluster-scoped permission at all, so this fake
+# refuses it the way the API does and records the attempt. A script that goes
+# back to reading `namespaces` fails every case here instead of only failing in
+# production, against the one identity nobody runs the tests as.
+if [[ "${1:-}" == "get" && ("${2:-}" == "namespace" || "${2:-}" == "namespaces") ]]; then
+  printf '%s\n' "$*" >>"$STATE/cluster-scoped-log"
+  echo 'Error from server (Forbidden): namespaces is forbidden' >&2
+  exit 1
+fi
+
+# The three ways the namespaced Services listing can fail, each answered the way
+# the API answers it.
+#
+# They are separate states, not one "it failed" flag, because the suite claims
+# to cover them separately: an absent namespace, a namespaced read this identity
+# is not authorised for, and the API being unreachable are three different
+# operational situations, and a fixture that cannot tell them apart cannot show
+# that the gate refuses all three. The production gate reads none of these
+# messages -- it decides on the exit status alone -- so they exist for the test
+# to assert on, never for a script to parse.
+#
+# An unrecognised value is an error too: a typo in a fixture must not quietly
+# become a passing read.
+services_list_error() {
+  local result="$1" namespace="$2"
+  case "$result" in
+    not-found) echo "Error from server (NotFound): namespaces \"$namespace\" not found" >&2 ;;
+    forbidden) echo "Error from server (Forbidden): services is forbidden: User cannot list resource \"services\" in API group \"\" in the namespace \"$namespace\"" >&2 ;;
+    api-error) echo "Unable to connect to the server: dial tcp: i/o timeout" >&2 ;;
+    *) echo "fake: unknown services-list-result '$result'" >&2 ;;
+  esac
+  exit 1
+}
+
+# kubectl get services -n <namespace>
+#
+# The namespaced read the scripts use as their namespace gate. It answers for
+# exactly one namespace -- the one in the `namespace` state file, standing for
+# the single RoleBinding the deployer holds -- so any other namespace is
+# refused, the way the API refuses it, rather than answered with an empty list.
+# That refusal is the fixture's own configuration and needs no injected failure,
+# which is what keeps "the namespace is wrong" a separate claim from the three
+# results below.
+if [[ "${1:-}" == "get" && "${2:-}" == "services" ]]; then
+  requested="$(namespace_arg "$@")"
+  result="$(read_state services-list-result)"
+  [[ -z "$result" || "$result" == "success" ]] || services_list_error "$result" "$requested"
+  [[ "$(read_state namespace)" == "$requested" ]] || services_list_error forbidden "$requested"
+  echo "No resources found in $requested namespace."
   exit 0
 fi
 
