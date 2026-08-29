@@ -1,0 +1,137 @@
+/* ProfileIdentityCard — displays the user's identity (name, avatar, status, presence, etc). */
+
+.profile-identity {
+  display: flex;
+  gap: 16px;
+  padding: 20px;
+  background: var(--color-surface, #fff);
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border, #e8e3f0);
+}
+
+.profile-identity__avatar {
+  flex-shrink: 0;
+  position: relative;
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.profile-identity__avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.profile-identity__info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.profile-identity__name {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+  word-break: break-word;
+}
+
+.profile-identity__job-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-muted, #7c7390);
+}
+
+.profile-identity__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--color-muted, #7c7390);
+}
+
+.profile-identity__presence {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.profile-identity__presence-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.profile-identity__presence-dot--online {
+  background: var(--presence-online, #4ade80);
+}
+
+.profile-identity__presence-dot--away {
+  background: var(--presence-away, #fbbf24);
+}
+
+.profile-identity__presence-dot--offline {
+  background: var(--presence-offline, #9ca3af);
+}
+
+.profile-identity__timezone {
+  display: flex;
+  align-items: center;
+}
+
+.profile-identity__custom-status {
+  margin: 0;
+  font-size: 14px;
+  color: var(--color-ink, #16121f);
+}
+
+.profile-identity__bio {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--color-ink, #16121f);
+}
+
+.profile-identity__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.profile-identity__btn {
+  padding: 8px 16px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-ink, #16121f);
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+}
+
+.profile-identity__btn:hover {
+  background: var(--color-surface-hover, #faf9fc);
+  border-color: var(--color-border-hover, #dcd8e4);
+}
+
+.profile-identity__btn--primary {
+  background: var(--color-primary, #6d28d9);
+  color: white;
+  border-color: var(--color-primary, #6d28d9);
+}
+
+.profile-identity__btn--primary:hover {
+  background: var(--color-primary-hover, #5b21b6);
+  border-color: var(--color-primary-hover, #5b21b6);
+}
