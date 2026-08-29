@@ -36,8 +36,10 @@ begin() {
   CASE_FAILURES="$FAILURES"
   # Reset the per-case release override. "RELEASE_SHA=x status=0" is a plain
   # assignment, not a command prefix, so without this a case that deliberately
-  # supplies a bad SHA leaks it into every case after it.
+  # supplies a bad SHA leaks it into every case after it. EVIDENCE is the same
+  # kind of assignment and leaks the same way.
   RELEASE_SHA=""
+  EVIDENCE=""
 }
 
 pass() {
@@ -667,6 +669,7 @@ release_run() {
   local state="$1"; shift
   FAKE_STATE_DIR="$state" NCHAT_PROD_ASSUME_YES=1 \
     NCHAT_PROD_RELEASE_SHA="${RELEASE_SHA:-$RELEASE_A}" \
+    NCHAT_PROD_CAPACITY_EVIDENCE_DIR="${EVIDENCE:-}" \
     NCHAT_PROD_TOPOLOGY_FILE="$TOPOLOGY" ARTIFACTS_DIR="$ARTIFACTS" \
     "$@" >"$WORK/out.txt" 2>"$WORK/err.txt"
 }
@@ -1113,6 +1116,141 @@ expect_exit 1 "$status"
 grep -q "expected 'nchat-prod-deployer'" "$WORK/err.txt" || fail "did not refuse the context"
 [[ ! -s "$state/patch-log" ]] || fail "patched a Service in the wrong cluster"
 assert_all_on "$state" blue
+pass
+
+
+echo
+echo "--- capacity under the namespaced deploy identity ---"
+#
+# nchat-prod-deployer holds a Role in nchat-prod and nothing cluster-scoped: it
+# is refused `get nodes` and `get pods --all-namespaces`, which is where the
+# preflight got three of its four inputs. The node these workloads share is 94%
+# committed, most of it by other namespaces, so answering from nchat-prod alone
+# would report room that is not there.
+#
+# So the cluster-wide half is collected elsewhere and delivered as evidence, and
+# these cases are the whole claim: a deploy that completes with both reads
+# refused, and one that stops -- before the migration and before any apply --
+# whenever the evidence cannot be believed.
+assert_no_cluster_wide_read() {
+  [[ ! -f "$1/cluster-wide-log" ]] ||
+    fail "read a cluster-wide resource: $(tr '\n' ';' <"$1/cluster-wide-log")"
+}
+
+# Nothing after the gate may have run.
+assert_nothing_deployed() {
+  [[ ! -f "$1/wait-log" ]] || fail "ran the migration despite the capacity gate"
+  [[ ! -f "$1/apply-log" ]] || fail "applied a manifest despite the capacity gate"
+  [[ ! -f "$1/rollout-log" ]] || fail "waited on a candidate that was never admitted"
+}
+
+# The collection a trusted read-only context performs, against the same fixture
+# cluster and before it starts refusing the cluster-wide reads.
+collect_evidence() {
+  local state="$1" out="$2"
+  rm -rf "$out"
+  FAKE_STATE_DIR="$state" bash "$SCRIPTS/capacity-evidence.sh" "$out" >/dev/null ||
+    fail "could not collect capacity evidence"
+  rm -f "$state/cluster-wide-log"
+  printf '1' >"$state/deny-cluster-wide"
+}
+
+begin "deploy passes the capacity gate from evidence with Nodes and other namespaces refused"
+state="$(new_state blue "blue green")"
+collect_evidence "$state" "$WORK/evidence"
+EVIDENCE="$WORK/evidence" status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 0 "$status"
+assert_no_cluster_wide_read "$state"
+assert_no_cluster_scoped_read "$state"
+[[ ! -f "$state/secret-read-log" ]] || fail "deploy read a Secret"
+grep -q "candidate.yaml" "$state/apply-log" || fail "never applied the candidate"
+[[ ! -s "$state/patch-log" ]] || fail "deploy patched a Service; promotion is cutover's job"
+pass
+
+begin "deploy without evidence cannot verify capacity for this identity and stops"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/deny-cluster-wide"
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 1 "$status"
+grep -q "inconclusive" "$WORK/err.txt" || fail "did not report the preflight as inconclusive"
+assert_nothing_deployed "$state"
+pass
+
+# The evidence has to fail closed, and it has to fail before anything moves.
+begin "deploy stops before the migration when the evidence cannot be believed"
+state="$(new_state blue "blue green")"
+collect_evidence "$state" "$WORK/evidence-bad"
+printf 'Running|node-a|1m 1Mi 1Mi\n' >>"$WORK/evidence-bad/cluster-requests.txt"
+EVIDENCE="$WORK/evidence-bad" status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 1 "$status"
+grep -q "capacity evidence" "$WORK/err.txt" || fail "did not name the evidence as the reason"
+assert_nothing_deployed "$state"
+pass
+
+# A real shortfall is still a shortfall when it is read from a snapshot.
+begin "deploy stops when the evidence shows the cluster cannot hold the candidate"
+state="$(new_state blue "blue green")"
+collect_evidence "$state" "$WORK/evidence"
+printf '1' >"$state/quota/hard-cpu"
+printf '900m' >"$state/quota/used-cpu"
+EVIDENCE="$WORK/evidence" status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 1 "$status"
+grep -qE "cannot hold slot .* at production capacity" "$WORK/err.txt" || fail "did not report the shortfall"
+assert_nothing_deployed "$state"
+pass
+
+# Malformed evidence is unusable input, and unusable input is not a gap an
+# operator can acknowledge. The checksums are recomputed after each corruption,
+# so these prove that a well-formed envelope does not make the contents
+# believable -- and that the override reaches INCONCLUSIVE and nothing else.
+#
+# The list covers a line with no structure, a negative quantity, one that
+# overflows to infinity, and a Pod that holds no capacity and would once have
+# been dropped before anything read what it said. Each is run with the override
+# off and on: exit 3 is not exit 2, and only exit 2 is something to acknowledge.
+resign_evidence() {
+  (cd "$1" && sha256sum node-allocatable.txt cluster-requests.txt cluster-pods.txt >sha256sums.txt)
+}
+
+begin "malformed evidence stops the deploy, and the override cannot release it"
+state="$(new_state blue "blue green")"
+collect_evidence "$state" "$WORK/evidence-pristine"
+for corruption in "cluster-pods.txt:not-a-pod-record" \
+  "node-allocatable.txt:not-a-node-record" "cluster-requests.txt:Running|node-a" \
+  "cluster-requests.txt:Running|node-a|-100m 256Mi 1Gi" \
+  "cluster-requests.txt:Running|node-a|1e309 2Gi 64Mi" \
+  "cluster-requests.txt:Succeeded|node-a|not-a-quantity"; do
+  rm -rf "$WORK/evidence-malformed"
+  cp -r "$WORK/evidence-pristine" "$WORK/evidence-malformed"
+  printf '%s\n' "${corruption#*:}" >"$WORK/evidence-malformed/${corruption%%:*}"
+  resign_evidence "$WORK/evidence-malformed"
+  for override in 0 1; do
+    export NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY="$override"
+    EVIDENCE="$WORK/evidence-malformed" status=0
+    release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+    unset NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY
+    expect_exit 1 "$status"
+    grep -q "refused its input" "$WORK/err.txt" ||
+      fail "${corruption%%:*} with override=$override was not refused as unusable input"
+    ! grep -q "explicit acknowledgement" "$WORK/err.txt" ||
+      fail "${corruption%%:*} was waved through as an inconclusive dimension"
+    ! grep -qE "Traceback|OverflowError" "$WORK/err.txt" ||
+      fail "${corruption%%:*} left by way of a traceback"
+    assert_nothing_deployed "$state"
+  done
+done
+pass
+
+# The override is not the fix for a namespaced identity -- evidence is -- but it
+# stays what it was: explicit, opt-in, and never the default.
+begin "an unverifiable capacity picture still needs the operator's explicit acknowledgement"
+state="$(new_state blue "blue green")"
+printf '1' >"$state/deny-cluster-wide"
+export NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+unset NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY
+expect_exit 0 "$status"
+grep -q "explicit acknowledgement" "$WORK/err.txt" || fail "proceeded without saying so"
 pass
 
 

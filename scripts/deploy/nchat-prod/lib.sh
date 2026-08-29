@@ -525,7 +525,9 @@ quota_status_field() {
     -o "jsonpath={.items[0].status.$section['$field']}" 2>/dev/null
 }
 
-# One "<cpu> <memory> <ephemeral-storage>" line per node.
+# One "<cpu> <memory> <ephemeral-storage> <pods>" line per node. Positional: a
+# resource the node does not report leaves its position empty rather than
+# shifting the ones after it.
 node_allocatable_lines() {
   local template='{range .items[*]}{.status.allocatable.cpu}{" "}'
   template+='{.status.allocatable.memory}{" "}'
@@ -544,7 +546,8 @@ cluster_pod_lines() {
     -o "jsonpath={range .items[*]}{.status.phase}|{.spec.nodeName}{'\n'}{end}" 2>/dev/null
 }
 
-# One "<phase>|<nodeName>|<cpu> <memory>" line per container in the cluster.
+# One "<phase>|<nodeName>|<cpu> <memory> <ephemeral-storage>" line per container
+# in the cluster.
 #
 # The shell only collects; candidate-capacity.py decides which of these hold
 # capacity, so that policy is covered by fixtures instead of living inside a
@@ -563,13 +566,8 @@ cluster_container_request_lines() {
   kubectl get pods --all-namespaces -o "jsonpath=$template" 2>/dev/null
 }
 
-# Runs the preflight for a rendered candidate manifest.
-#
-# Exit codes come straight from candidate-capacity.py: 0 sufficient,
-# 1 provably insufficient, 2 inconclusive, 3 unusable input. The caller decides
-# what to do with 2 — this function does not turn "unknown" into "fine".
-# "<deployment>|<replicas>|<cpu>|<memory>", one line per container of every
-# workload the target slot already runs.
+# "<deployment>|<replicas>|<cpu>|<memory>|<ephemeral-storage>", one line per
+# container of every workload the target slot already runs.
 #
 # Replicas alone are not enough. The preflight has to compare what a pod costs
 # now against what it will cost, or a release that raises its requests reads as
@@ -593,11 +591,176 @@ current_slot_workloads() {
     -l "$NCHAT_PROD_SLOT_LABEL=$slot" -o "jsonpath=$template" 2>/dev/null
 }
 
+# --- cluster-wide capacity evidence -------------------------------------
+#
+# The three collectors above read Nodes and Pods across every namespace. The
+# production deploy identity holds a namespaced Role and nothing cluster-scoped,
+# so it cannot run them at all -- and a namespace-only capacity picture would be
+# worse than none: the node these workloads share sits at 94% of its CPU
+# requests, most of it belonging to other namespaces, so a view of nchat-prod
+# alone reports room that does not exist.
+#
+# So collection and evaluation are separated. A trusted read-only context runs
+# capacity-evidence.sh, which writes the same three files plus a metadata
+# record; the deployer reads that evidence and consults the API only for what it
+# is already allowed to see. Evaluation stays where it was, in
+# candidate-capacity.py, against byte-identical input in both modes.
+#
+# Trust boundary. The checksums here detect a truncated or accidentally edited
+# file. They are NOT authenticity: anything that can write the evidence
+# directory can write a matching sha256sums.txt. Evidence is trusted because of
+# where it came from -- an operator-run collection, or later a controlled CI
+# artifact -- not because of anything in it. Freshness, schema and the namespace
+# binding narrow the window in which stale or foreign evidence is accepted; they
+# do not make an untrusted directory safe to point this at.
+NCHAT_PROD_CAPACITY_EVIDENCE_SCHEMA='nchat-prod-capacity-evidence/v1'
+NCHAT_PROD_CAPACITY_EVIDENCE_FILES=(node-allocatable.txt cluster-requests.txt cluster-pods.txt)
+# Fifteen minutes. Long enough to collect, review and deploy by hand; short
+# enough that a snapshot cannot outlive the cluster state it describes by a
+# working day. The rollout remains the second barrier for anything that moved
+# inside the window.
+# "-900", not ":-900": the default applies when the variable is unset, and an
+# explicitly empty setting stays empty so that capacity_evidence_max_age refuses
+# it rather than quietly substituting the default for a misconfiguration.
+NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS="${NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS-900}"
+
+# Writes the three cluster-wide inputs into a directory, reporting whether every
+# one of them was actually produced.
+#
+# The status matters to the collector and not to the live path: live mode hands
+# whatever it got to candidate-capacity.py, which reports a dimension it could
+# not read as INCONCLUSIVE and blocks. The collector must never turn a failed
+# read into a file, so it checks this return value and refuses to publish.
+collect_cluster_capacity_files() {
+  local dir="$1" status=0
+  node_allocatable_lines >"$dir/node-allocatable.txt" || status=1
+  cluster_container_request_lines >"$dir/cluster-requests.txt" || status=1
+  cluster_pod_lines >"$dir/cluster-pods.txt" || status=1
+  return "$status"
+}
+
+# The value of one `key=value` line of an evidence metadata record.
+capacity_evidence_field() {
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# Every collected file must exist and carry something.
+#
+# An empty file is a failed collection, not an empty cluster: there is always at
+# least one node and at least one Pod. Accepting one would hand the evaluator
+# "no allocatable capacity" or "nothing committed" as though the cluster had
+# said so.
+capacity_evidence_files_present() {
+  local dir="$1" name
+  for name in "${NCHAT_PROD_CAPACITY_EVIDENCE_FILES[@]}"; do
+    [[ -s "$dir/$name" ]] ||
+      { echo "capacity evidence file is missing or empty: $name" >&2; return 1; }
+  done
+}
+
+# The freshness limit, refused unless it is a plain non-negative decimal.
+#
+# It reaches an arithmetic context, and bash resolves a bare word there as a
+# variable name: NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS=oops ended the run
+# with "oops: unbound variable", and "1+1" would have been evaluated as an
+# expression. A misconfigured limit is an ordinary operator mistake and has to
+# be reported as one.
+#
+# 10# forces base ten, so 000900 is nine hundred seconds rather than an octal
+# reading of the same digits.
+#
+# The digit cap is the second half of the same problem. "Decimal" was not enough:
+# bash arithmetic is signed 64-bit and wraps silently, so 9999999999999999999
+# became -8446744073709551617 and 18446744073709551616 became 0 -- a limit of
+# zero, which quietly refuses every snapshot, and a negative one, which quietly
+# accepts none of them for the right reason. Eighteen digits keeps every accepted
+# value below 10^18, comfortably inside the range, and is checked as text
+# precisely because measuring it with arithmetic would be the bug itself. Nobody
+# needs a freshness window longer than the age of the universe.
+capacity_evidence_max_age() {
+  local value="$NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS"
+  [[ "$value" =~ ^[0-9]{1,18}$ ]] ||
+    { echo "invalid NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS: expected a non-negative decimal integer of at most 18 digits, got '$value'" >&2; return 1; }
+  printf '%s' "$((10#$value))"
+}
+
+capacity_evidence_is_fresh() {
+  local stamp="$1" collected now age limit
+  limit="$(capacity_evidence_max_age)" || return 1
+  [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+    { echo "capacity evidence has no usable collected_at timestamp: '$stamp'" >&2; return 1; }
+  collected="$(date -u -d "$stamp" +%s 2>/dev/null)" ||
+    { echo "capacity evidence collected_at is not a real instant: '$stamp'" >&2; return 1; }
+  now="$(date -u +%s)"
+  age=$((now - collected))
+  # A stamp in the future is refused too, with a minute of clock skew allowed:
+  # without that, dating evidence forward would make it permanently fresh.
+  ((age >= -60 && age <= limit)) ||
+    { echo "capacity evidence is ${age}s old; the limit is ${limit}s" >&2; return 1; }
+}
+
+capacity_evidence_metadata_ok() {
+  local file="$1" schema namespace
+  schema="$(capacity_evidence_field "$file" schema)"
+  [[ "$schema" == "$NCHAT_PROD_CAPACITY_EVIDENCE_SCHEMA" ]] ||
+    { echo "capacity evidence schema is '$schema', expected $NCHAT_PROD_CAPACITY_EVIDENCE_SCHEMA" >&2; return 1; }
+  namespace="$(capacity_evidence_field "$file" namespace)"
+  [[ "$namespace" == "$NCHAT_PROD_NAMESPACE" ]] ||
+    { echo "capacity evidence was collected for namespace '$namespace', not '$NCHAT_PROD_NAMESPACE'" >&2; return 1; }
+  capacity_evidence_is_fresh "$(capacity_evidence_field "$file" collected_at)"
+}
+
+# Refuses a symlink rather than following one: the evidence path is an operator
+# or CI setting, and a link inside it would let a directory that looks like a
+# snapshot read something else entirely.
+copy_capacity_evidence_file() {
+  local from="$1" to="$2"
+  [[ ! -L "$from" ]] ||
+    { echo "capacity evidence file is a symlink: $from" >&2; return 1; }
+  [[ -f "$from" ]] ||
+    { echo "capacity evidence file is missing: $from" >&2; return 1; }
+  cp -- "$from" "$to"
+}
+
+# Copies the evidence into the deploy's own temporary directory and validates
+# the copies. Copy first, on purpose: validating in place and reading afterwards
+# leaves a window in which the files can change between the two.
+load_capacity_evidence() {
+  local source_dir="$1" dest="$2" name
+  mkdir -p "$dest"
+  for name in "${NCHAT_PROD_CAPACITY_EVIDENCE_FILES[@]}" sha256sums.txt metadata; do
+    copy_capacity_evidence_file "$source_dir/$name" "$dest/$name" || return 1
+  done
+  capacity_evidence_metadata_ok "$dest/metadata" || return 1
+  (cd "$dest" && sha256sum --check --status sha256sums.txt) ||
+    { echo "capacity evidence does not match its recorded checksums" >&2; return 1; }
+  capacity_evidence_files_present "$dest"
+}
+
+# Runs the preflight for a rendered candidate manifest.
+#
+# Exit codes come straight from candidate-capacity.py: 0 sufficient,
+# 1 provably insufficient, 2 inconclusive, 3 unusable input. The caller decides
+# what to do with 2 — this function does not turn "unknown" into "fine".
+#
+# Cluster-wide inputs come from the evidence directory when one is named and
+# from a live collection otherwise. Unusable evidence stops the operation here,
+# rather than becoming an absent file the evaluator would report INCONCLUSIVE --
+# which the operator override could then wave through.
+#
+# The slot's own workloads are read live in both modes. They are namespaced, the
+# deployer can read them, and they are the one input that has to describe the
+# cluster at this instant rather than as a snapshot found it.
 run_capacity_preflight() {
-  local manifest="$1" workdir="$2" slot="$3"
-  node_allocatable_lines >"$workdir/node-allocatable.txt" || true
-  cluster_container_request_lines >"$workdir/cluster-requests.txt" || true
-  cluster_pod_lines >"$workdir/cluster-pods.txt" || true
+  local manifest="$1" workdir="$2" slot="$3" inputs
+  inputs="$workdir"
+  if [[ -n "${NCHAT_PROD_CAPACITY_EVIDENCE_DIR:-}" ]]; then
+    inputs="$workdir/evidence"
+    load_capacity_evidence "$NCHAT_PROD_CAPACITY_EVIDENCE_DIR" "$inputs" ||
+      prod_fail "capacity evidence in '$NCHAT_PROD_CAPACITY_EVIDENCE_DIR' is unusable; collect it again with capacity-evidence.sh"
+  else
+    collect_cluster_capacity_files "$workdir" || true
+  fi
   current_slot_workloads "$slot" >"$workdir/current-slot.txt" || true
   python3 "$NCHAT_PROD_LIB_DIR/candidate-capacity.py" \
     --manifest "$manifest" \
@@ -609,9 +772,9 @@ run_capacity_preflight() {
     --quota-used-pods "$(quota_status_field used pods)" \
     --quota-hard-storage "$(quota_status_field hard requests.ephemeral-storage)" \
     --quota-used-storage "$(quota_status_field used requests.ephemeral-storage)" \
-    --node-allocatable-file "$workdir/node-allocatable.txt" \
-    --cluster-requests-file "$workdir/cluster-requests.txt" \
-    --cluster-pods-file "$workdir/cluster-pods.txt" \
+    --node-allocatable-file "$inputs/node-allocatable.txt" \
+    --cluster-requests-file "$inputs/cluster-requests.txt" \
+    --cluster-pods-file "$inputs/cluster-pods.txt" \
     --current-slot-file "$workdir/current-slot.txt"
 }
 
@@ -746,7 +909,12 @@ check_capacity() {
     0) return 0 ;;
     2) allow_inconclusive_capacity ;;
     1) prod_fail "the cluster cannot hold slot $slot at production capacity" ;;
-    *) prod_fail "capacity preflight could not read the candidate manifest" ;;
+    # Unusable input, from the candidate manifest or from a cluster-wide file
+    # that does not follow the collector's contract. It is a separate case from
+    # inconclusive on purpose: NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY reaches 2
+    # and never this, because "the input is broken" is not something anyone can
+    # verify by hand and acknowledge.
+    *) prod_fail "capacity preflight refused its input; see the error above" ;;
   esac
 }
 
