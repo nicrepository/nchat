@@ -24,7 +24,9 @@ numbers the cluster did not supply is reported INCONCLUSIVE rather than
 counted as a pass.
 
 Exit codes: 0 sufficient, 1 provably insufficient, 2 inconclusive, 3 unusable
-input.
+input -- the candidate manifest or a cluster-wide file that does not follow the
+collector's line contract. Unusable and inconclusive are deliberately different:
+only the second is something an operator may override.
 """
 
 from __future__ import annotations
@@ -32,33 +34,212 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 
 EXIT_OK = 0
 EXIT_INSUFFICIENT = 1
 EXIT_INCONCLUSIVE = 2
 EXIT_BAD_INPUT = 3
 
-_MEMORY_SUFFIXES = (
-    ("Ki", 1024), ("Mi", 1024**2), ("Gi", 1024**3), ("Ti", 1024**4),
-    ("K", 1000), ("M", 1000**2), ("G", 1000**3), ("T", 1000**4),
+# Kubernetes' own grammar, from apimachinery's resource.Quantity:
+#
+#     quantity        ::= signedNumber suffix
+#     suffix          ::= binarySI | decimalExponent | decimalSI
+#     binarySI        ::= Ki | Mi | Gi | Ti | Pi | Ei
+#     decimalSI       ::= n | u | m | "" | k | M | G | T | P | E
+#     decimalExponent ::= ("e" | "E") signedNumber
+#
+# A suffix is one of the three, never a combination: "129e6" is an exponent,
+# "1Ei" is a binary suffix, and "1e3Ki" is not a quantity at all -- hence the
+# alternation rather than two optional groups in sequence. The exponent is
+# handed to Decimal still attached to its digits, which is what makes "129E6"
+# and "129e6" the same value without a second code path.
+#
+# 'K' is accepted alongside 'k' as the one deliberate extension: Kubernetes
+# rejects it, the manifests in this repository have always written it, and
+# reading it as anything other than a thousand would be worse than accepting it.
+_QUANTITY = re.compile(
+    r"(?P<number>[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))"
+    r"(?:(?P<suffix>Ki|Mi|Gi|Ti|Pi|Ei|[numkKMGTPE])|(?P<exponent>[eE][+-]?[0-9]+))?"
 )
+
+# suffix -> (numerator, denominator). Kept as an exact ratio rather than a float
+# so that 'n', 'u' and 'm' are a division by a whole number instead of a binary
+# fraction that cannot represent a tenth.
+_DECIMAL_SI = {"n": -9, "u": -6, "m": -3, "k": 3, "K": 3,
+               "M": 6, "G": 9, "T": 12, "P": 15, "E": 18}
+_BINARY_SI = {"Ki": 10, "Mi": 20, "Gi": 30, "Ti": 40, "Pi": 50, "Ei": 60}
+
+# The ceiling Kubernetes itself imposes: a Quantity is an int64 internally, and
+# the API server refuses what does not fit. Applying the same bound is what
+# keeps '1Ei' (2^60 bytes) a valid quantity while '1e309' is not -- and it is
+# the API's limit rather than one invented here, which is why it can be stated
+# in a message an operator can act on.
+# The largest value this evaluator will carry, in the unit it counts that
+# resource in -- millicores for CPU, bytes for memory and ephemeral-storage.
+#
+# This is the accessor's limit, not a rule of the Kubernetes quantity grammar.
+# Kubernetes' own Value() and MilliValue() return int64 and saturate there, and
+# every figure downstream of here is a Python int compared against a cluster
+# total, so a quantity that cannot be expressed as an int64 of the unit in
+# question is one this program has no way to reason about. The grammar itself
+# is wider; what is bounded is what the evaluator can count.
+_MAX_EVALUATOR_UNITS = 2**63 - 1
+
+# How far a decimal exponent may reach upward before the quantity is refused
+# without being expanded.
+#
+# Only upward. The two directions cost different things. A positive exponent has
+# to be written out as digits -- '1e999999999999999999' asks Python to build an
+# integer with a quintillion of them, and the process stops responding rather
+# than answering, which in front of a production deploy is the one outcome worse
+# than a wrong answer. A negative exponent needs no such thing: a positive value
+# below one unit is one unit after the ceiling, and _in_units settles that by
+# comparing digit counts. Guarding both alike is what made '1e-89' -- an
+# ordinary, if tiny, quantity -- come back as invalid input.
+#
+# Derived from _MAX_EVALUATOR_UNITS rather than chosen: an accepted value is at
+# most 19 digits, the largest a suffix multiplies by is Ei (2^60, under 19
+# digits) and the smallest it divides by is n (10^-9). Nothing past 10^88 can
+# become an accepted value under any suffix, so this refuses only what is
+# already impossible and leaves every borderline case to the exact check below.
+_MAX_POSITIVE_EXPONENT = len(str(_MAX_EVALUATOR_UNITS)) + 60 + 9
+
+
+class InvalidQuantity(ValueError):
+    """A resource quantity outside the contract.
+
+    Every quantity this program reads -- from the candidate manifest, from the
+    slot it is replacing, from the namespace quota, from the nodes and from the
+    cluster's Pods -- names an amount of a resource, and there is no such thing
+    as a negative one, an infinite one or one that is not a number. Each of
+    those reaches an arithmetic that subtracts committed from allocatable, so a
+    negative request does not read as an error: it reads as a cluster with more
+    room than it has. That is the shape of a false pass, which is why this is
+    refused as unusable input rather than absorbed as a zero.
+
+    A ValueError, so that the callers that already treat an unreadable
+    quantity as unusable input keep doing so without a second code path.
+    """
+
+
+def _scale_of(suffix: str) -> tuple[int, int]:
+    """A suffix as the exact ratio it multiplies by."""
+    if suffix in _BINARY_SI:
+        return 2 ** _BINARY_SI[suffix], 1
+    power = _DECIMAL_SI.get(suffix, 0)
+    return (10 ** power, 1) if power >= 0 else (1, 10 ** -power)
+
+
+def parse_quantity(value: str) -> tuple[Decimal, int, int]:
+    """One Kubernetes quantity as (number, scale numerator, scale denominator).
+
+    Every quantity in this program goes through here, so CPU, memory and
+    ephemeral-storage cannot drift apart on what a suffix means or on how a
+    fraction is rounded.
+
+    No float anywhere on the path. The version before last read the number with
+    float() and multiplied by the suffix, which cost it the grammar in both
+    directions: 'm', 'n', 'u', 'k', 'Pi' and 'Ei' were not suffixes it knew, so
+    an ordinary '400m' came back as "not a number" and stopped a deploy; and
+    what it did accept it accepted approximately, because 0.1 is not a binary
+    fraction.
+
+    Unexpanded, and the suffix kept apart from the number: the caller is the one
+    that knows whether this is about to be counted in bytes or in millicores,
+    and it is also the one that can decide a magnitude question without building
+    the digits. Deciding either here is what produced the two regressions this
+    function has already had.
+    """
+    text = str(value).strip().strip('"\'')
+    match = _QUANTITY.fullmatch(text)
+    if match is None:
+        raise InvalidQuantity("quantity is not a Kubernetes quantity")
+    try:
+        number = Decimal(match["number"] + (match["exponent"] or ""))
+    except InvalidOperation:
+        raise InvalidQuantity("quantity is not a number") from None
+    if number < 0:
+        raise InvalidQuantity("quantity is negative")
+    scale_numerator, scale_denominator = _scale_of(match["suffix"] or "")
+    return number, scale_numerator, scale_denominator
+
+
+def _digits_and_exponent(number: Decimal) -> tuple[int, int]:
+    """The digits Decimal is holding, as one integer, and their exponent.
+
+    as_tuple() hands back what Decimal already stores, so this costs what the
+    input is long rather than what the value is big: 1e999999999999999999 is the
+    digit 1 and an exponent, and stays that way.
+    """
+    _, digits, exponent = number.as_tuple()
+    return int("".join(map(str, digits))), exponent
+
+
+def _ceil(numerator: int, denominator: int) -> int:
+    """Integer ceiling. Kubernetes' Value() and MilliValue() round up, and so
+    does a preflight: half a byte of demand costs a byte, and no amount of
+    demand rounds away to nothing."""
+    return -(-numerator // denominator)
+
+
+def _in_units(value: str, per_unit: int) -> int:
+    """A quantity counted in units of 1/per_unit of the resource's base unit.
+
+    Zero is zero. Everything else is positive, and a positive value below one
+    unit is one unit -- which is settled by comparing how many digits the
+    numerator has against how many zeros the denominator would have, rather than
+    by writing those zeros out. That is what lets '1e-999999999999999999' answer
+    as fast as '1', and it is exact rather than an approximation: a denominator
+    of 10^k with k at least the numerator's digit count is strictly larger than
+    the numerator, so the quotient is strictly between 0 and 1.
+    """
+    number, scale_numerator, scale_denominator = parse_quantity(value)
+    if number.is_zero():
+        return 0
+    digits, exponent = _digits_and_exponent(number)
+    numerator = digits * scale_numerator * per_unit
+    if exponent < 0:
+        if -exponent >= len(str(numerator)):
+            return 1
+        return _bounded(_ceil(numerator, scale_denominator * 10 ** -exponent))
+    if exponent > _MAX_POSITIVE_EXPONENT:
+        raise InvalidQuantity("quantity's exponent is beyond any usable magnitude")
+    return _bounded(_ceil(numerator * 10 ** exponent, scale_denominator))
+
+
+def _bounded(units: int) -> int:
+    """The exact size check, on the finished figure in the resource's own unit."""
+    if units > _MAX_EVALUATOR_UNITS:
+        raise InvalidQuantity("quantity is too large to be counted by this evaluator")
+    return units
 
 
 def parse_cpu(value: str) -> int:
     """Kubernetes CPU to millicores: '1500m' -> 1500, '2' -> 2000, '0.5' -> 500."""
+    return _in_units(value, 1000)
+
+
+def parse_count(value: str) -> int:
+    """A whole, non-negative count, for the one dimension measured in pods.
+
+    The quota's pod figures went through int(), which accepts "-5" -- and a
+    negative "used" enlarges the free space the same way a negative request
+    does. Nothing else about the dimension changes: it is still a plain count.
+    """
     text = str(value).strip().strip('"\'')
-    if text.endswith("m"):
-        return int(round(float(text[:-1])))
-    return int(round(float(text) * 1000))
+    if not text.isdigit():
+        raise InvalidQuantity("count is not a whole, non-negative number")
+    return int(text)
 
 
 def parse_memory(value: str) -> int:
-    """Kubernetes memory to bytes, binary and decimal suffixes alike."""
-    text = str(value).strip().strip('"\'')
-    for suffix, factor in _MEMORY_SUFFIXES:
-        if text.endswith(suffix):
-            return int(float(text[: -len(suffix)]) * factor)
-    return int(float(text))
+    """Kubernetes memory or ephemeral-storage to whole bytes, rounded up.
+
+    '2.5' is three bytes, not two: bytes are the base unit here, so the ceiling
+    _in_units applies is the one Kubernetes' Value() applies.
+    """
+    return _in_units(value, 1)
 
 
 def _indent(line: str) -> int:
@@ -244,7 +425,101 @@ def summarise(manifest: str, current: dict[str, CurrentWorkload] | None = None
     return cpu, memory, storage, pods
 
 
+class InvalidClusterInput(ValueError):
+    """A cluster-wide input line that does not follow the collector's contract.
+
+    Kept apart from "the cluster did not report this dimension" on purpose. A
+    file that is absent, empty or short of a column is a gap in what the cluster
+    answered, and INCONCLUSIVE is the honest verdict; an operator who has
+    checked by hand can override it. A line that is not of the shape the
+    collector emits is a broken input, and reporting that as INCONCLUSIVE would
+    put it within reach of the same override.
+
+    It matters because a malformed line is not inert. `not-a-pod-record` parsed
+    as "no node name", which reads as a Pod holding nothing, so a file of them
+    reported an empty cluster and passed a candidate that does not fit.
+    """
+
+
+# Every phase Kubernetes defines for a Pod. The complete enum, not a sample:
+# a line carrying anything else did not come from a Pod listing.
+POD_PHASES = frozenset({"Pending", "Running", "Succeeded", "Failed", "Unknown"})
+
 TERMINAL_PHASES = frozenset({"Succeeded", "Failed"})
+
+
+def _invalid(what: str, number: int,
+             reason: str = "line does not follow the collector's contract") -> InvalidClusterInput:
+    """The line number and a reason, and nothing from the line itself.
+
+    Evidence describes namespaces this deploy has no business reading, and an
+    error message is the one place its contents would otherwise be printed. The
+    reason says what is wrong with the shape, never what the line said.
+    """
+    return InvalidClusterInput(f"invalid {what} input at line {number}: {reason}")
+
+
+def _quantity(value: str, convert, what: str, number: int) -> int:
+    """A quantity that must be there and must be a real one."""
+    try:
+        return convert(value)
+    except InvalidQuantity as error:
+        raise _invalid(what, number, str(error)) from None
+    except ValueError:
+        raise _invalid(what, number) from None
+
+
+def _optional_quantity(value: str, convert, what: str, number: int) -> int:
+    """The same, for a field the cluster is allowed to leave empty."""
+    if not value.strip():
+        return 0
+    return _quantity(value, convert, what, number)
+
+
+def _pod_record(line: str, number: int, what: str, fields: int) -> list[str]:
+    """Split a "<phase>|<nodeName>[|...]" line, or refuse it.
+
+    Two conditions, and neither is about the values: the delimiters have to be
+    there in the right number, and the phase has to be one Kubernetes defines.
+    An empty nodeName is not a missing field -- it is how the collector says the
+    scheduler has not bound this Pod anywhere, which is a real state.
+    """
+    parts = line.split("|")
+    if len(parts) != fields:
+        raise _invalid(what, number, f"expected {fields} fields separated by '|'")
+    if parts[0].strip() not in POD_PHASES:
+        raise _invalid(what, number, "the first field is not a Kubernetes pod phase")
+    return parts
+
+
+def _node_record(line: str, number: int) -> list[str]:
+    """A node's four positional fields: <cpu> <memory> <storage> <pods>.
+
+    Split on the single separator, never on runs of whitespace. The collector
+    emits one space between each position and leaves a position empty when the
+    node does not report it, so a node without ephemeral-storage arrives as
+
+        8 32Gi  110
+
+    and str.split() collapsed that pair of spaces into one separator: the pod
+    ceiling slid into the storage position, 110 was read as 110 *bytes* of
+    allocatable storage, and the run reported a storage shortfall that does not
+    exist while calling the pod dimension unknown. Both answers were wrong, and
+    one of them was a hard FAIL on a cluster with room.
+
+    Trailing positions may be omitted rather than left empty -- '8 32Gi' says
+    the same thing as '8 32Gi  ' -- so short lines are padded here and the
+    caller sees four positions either way. cpu and memory are the contract and
+    must be there; an empty storage or pods position is a dimension the cluster
+    did not report, which the caller answers INCONCLUSIVE.
+    """
+    fields = line.split(" ")
+    if not 2 <= len(fields) <= 4:
+        raise _invalid("node allocatable", number,
+                       "expected the positional fields <cpu> <memory> <ephemeral-storage> <pods>")
+    if not fields[0].strip() or not fields[1].strip():
+        raise _invalid("node allocatable", number, "cpu and memory are not optional")
+    return (fields + ["", ""])[:4]
 
 
 def counts_against_capacity(phase: str, node_name: str) -> bool:
@@ -279,13 +554,16 @@ def sum_node_pod_slots(text: str) -> int | None:
     every deploy, and skipping it would silently overstate the cluster.
     """
     total = 0
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        fields = line.split()
-        if len(fields) < 4 or not fields[3].isdigit():
+        pods = _node_record(line, number)[3].strip()
+        if not pods:
             return None
-        total += int(fields[3])
+        if not pods.isdigit():
+            raise _invalid("node allocatable", number,
+                           "the pod ceiling is not a whole, non-negative number")
+        total += int(pods)
     return total or None
 
 
@@ -302,18 +580,16 @@ def sum_node_allocatable(text: str) -> tuple[int, int, int | None]:
     """
     cpu = memory = storage = 0
     storage_known = True
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        fields = line.split()
-        if len(fields) < 2:
-            raise ValueError(f"node line has no memory figure: {line!r}")
-        cpu += parse_cpu(fields[0])
-        memory += parse_memory(fields[1])
-        if len(fields) < 3:
+        fields = _node_record(line, number)
+        cpu += _quantity(fields[0], parse_cpu, "node allocatable", number)
+        memory += _quantity(fields[1], parse_memory, "node allocatable", number)
+        if not fields[2].strip():
             storage_known = False
             continue
-        storage += parse_memory(fields[2])
+        storage += _quantity(fields[2], parse_memory, "node allocatable", number)
     return cpu, memory, (storage if storage_known else None)
 
 
@@ -329,53 +605,66 @@ def count_scheduled_pods(text: str) -> int:
     not, and Succeeded/Failed have released theirs.
     """
     taken = 0
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        phase, _, node_name = line.partition("|")
+        phase, node_name = _pod_record(line, number, "cluster pod", 2)
         if counts_against_capacity(phase, node_name):
             taken += 1
     return taken
 
 
+def parse_request_quantities(text: str, number: int) -> tuple[int, int, int]:
+    """The "<cpu> <memory> <ephemeral-storage>" tail of one container's line.
+
+    Split positionally, not on whitespace. The collector's jsonpath emits an
+    empty field where a request is absent, so a container declaring only memory
+    arrives as " 128Mi" -- splitting on whitespace would read that lone value as
+    a CPU quantity.
+
+    A container may declare none of the three, one, or all: that is ordinary
+    Kubernetes, it reserves nothing for what it omits, and it is not a malformed
+    line. A field that IS present has to be a real quantity, and a fourth field
+    cannot come from this jsonpath at all.
+    """
+    fields = text.split(" ")
+    if len(fields) > 3:
+        raise _invalid("cluster request", number,
+                       "expected at most <cpu> <memory> <ephemeral-storage>")
+    cpu, memory, storage = (fields + ["", "", ""])[:3]
+    return (
+        _optional_quantity(cpu, parse_cpu, "cluster request", number),
+        _optional_quantity(memory, parse_memory, "cluster request", number),
+        _optional_quantity(storage, parse_memory, "cluster request", number),
+    )
+
+
 def sum_scheduled_pod_requests(text: str) -> tuple[int, int, int]:
-    """Sum "<phase>|<nodeName>|<cpu> <memory> <storage>" for scheduled, live Pods."""
-    kept = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        phase, _, rest = line.partition("|")
-        node_name, _, requests = rest.partition("|")
-        if counts_against_capacity(phase, node_name):
-            kept.append(requests)
-    return sum_request_lines("\n".join(kept))
+    """Sum "<phase>|<nodeName>|<cpu> <memory> <storage>" for scheduled, live Pods.
 
-
-def sum_request_lines(text: str) -> tuple[int, int, int]:
-    """Sum "<cpu> <memory>" lines into (millicores, bytes).
-
-    The caller collects one line per running container from the cluster; either
-    field may be empty, because a container without a declared request reserves
-    nothing and must contribute nothing. Keeping the arithmetic here rather than
-    in the shell means every unit suffix is parsed by the same tested code that
-    parses the candidate.
+    Keeping the arithmetic here rather than in the shell means every unit suffix
+    is parsed by the same tested code that parses the candidate -- and that a
+    line the collector cannot have produced is refused in one place, for the
+    live collection and for evidence alike.
     """
     cpu = memory = storage = 0
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
             continue
-        # Split positionally, not on whitespace. The caller's jsonpath emits
-        # "<cpu> <memory>" with an empty field where a request is absent, so a
-        # container declaring only memory arrives as " 128Mi" -- and splitting on
-        # whitespace would read that lone value as a CPU quantity.
-        cpu_text, _, rest = line.partition(" ")
-        memory_text, _, storage_text = rest.partition(" ")
-        if cpu_text.strip():
-            cpu += parse_cpu(cpu_text)
-        if memory_text.strip():
-            memory += parse_memory(memory_text)
-        if storage_text.strip():
-            storage += parse_memory(storage_text)
+        phase, node_name, requests = _pod_record(line, number, "cluster request", 3)
+        # Parsed before the filter, never after. A Pod that holds no capacity is
+        # still a record the collector produced, and its quantities still have to
+        # follow the contract: "Succeeded|node-a|not-a-quantity" used to be
+        # dropped before anything looked at it, so a file of malformed lines
+        # passed as long as every Pod in it happened to be terminal. Validating
+        # first does not make a terminal Pod count -- the filter below is
+        # unchanged -- it only stops a broken file from arriving unread.
+        line_cpu, line_memory, line_storage = parse_request_quantities(requests, number)
+        if not counts_against_capacity(phase, node_name):
+            continue
+        cpu += line_cpu
+        memory += line_memory
+        storage += line_storage
     return cpu, memory, storage
 
 
@@ -421,15 +710,17 @@ def build_parser() -> argparse.ArgumentParser:
                  "quota-hard-pods", "quota-used-pods",
                  "quota-hard-storage", "quota-used-storage"):
         parser.add_argument(f"--{name}", default="")
-    # One "<cpu> <memory>" line per node.
+    # One "<cpu> <memory> <ephemeral-storage> <pods>" line per node, positional:
+    # a position the node did not report is left empty, never collapsed.
     parser.add_argument("--node-allocatable-file", default="")
-    # One "<phase>|<nodeName>|<cpu> <memory>" line per container in the cluster.
+    # One "<phase>|<nodeName>|<cpu> <memory> <ephemeral-storage>" line per
+    # container in the cluster.
     parser.add_argument("--cluster-requests-file", default="")
     # One "<phase>|<nodeName>" line per Pod in the cluster, for pod slots.
     parser.add_argument("--cluster-pods-file", default="")
-    # One "<deployment>|<replicas>|<cpu>|<memory>" line per container the target
-    # slot already runs. Absent means the slot does not exist yet, which is the
-    # first deploy of it.
+    # One "<deployment>|<replicas>|<cpu>|<memory>|<ephemeral-storage>" line per
+    # container the target slot already runs. Absent means the slot does not
+    # exist yet, which is the first deploy of it.
     parser.add_argument("--current-slot-file", default="")
     return parser
 
@@ -446,13 +737,15 @@ def _read_current_slot(path: str) -> dict[str, CurrentWorkload] | None:
 
 
 def _parse_nodes(text: str | None) -> tuple[int | None, int | None, int | None]:
-    """Node allocatable totals, or all-unknown when the cluster reported nothing."""
+    """Node allocatable totals, or all-unknown when the cluster reported nothing.
+
+    A malformed line is not caught here any more. It used to be, and the result
+    was that garbage and silence gave the same verdict -- which put a broken
+    file behind the same operator override as an honest gap.
+    """
     if text is None:
         return None, None, None
-    try:
-        return sum_node_allocatable(text)
-    except ValueError:
-        return None, None, None
+    return sum_node_allocatable(text)
 
 
 def _read_scheduled_pods(path: str) -> int | None:
@@ -472,8 +765,8 @@ def _read_text(path: str) -> str | None:
     return text if text.strip() else None
 
 
-def _sum_file(path: str, parse=None) -> tuple[int | None, int | None, int | None]:
-    """(cpu, memory) summed from a file, or (None, None) when unavailable.
+def _sum_cluster_requests(path: str) -> tuple[int | None, int | None, int | None]:
+    """Committed requests summed from a file, or all-unknown when unavailable.
 
     Absent, unreadable and EMPTY are the same answer on purpose. An empty file
     means the cluster query returned nothing -- no permission, no metrics, a
@@ -482,31 +775,48 @@ def _sum_file(path: str, parse=None) -> tuple[int | None, int | None, int | None
     look too big, and zero committed makes every candidate look like it fits.
     A dimension the cluster did not supply is reported INCONCLUSIVE, never
     assumed.
+
+    A file that is present and does not parse is a different thing again, and it
+    is not softened here: InvalidClusterInput travels to the caller and ends the
+    run as unusable input.
     """
-    if not path:
+    text = _read_text(path)
+    if text is None:
         return None, None, None
-    try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
-        return None, None, None
-    if not text.strip():
-        return None, None, None
-    try:
-        return (parse or sum_request_lines)(text)
-    except ValueError:
-        return None, None, None
+    return sum_scheduled_pod_requests(text)
+
+
+def _compare_quota(report: "Report", args: argparse.Namespace,
+                   cpu: int, memory: int, storage: int, pods: int) -> None:
+    """The four namespace-quota dimensions, in one place so that a quantity the
+    quota reports outside the contract fails the same way every other one does."""
+    report.compare("namespace quota requests.cpu", cpu,
+                   _optional(args.quota_hard_cpu, parse_cpu),
+                   _optional(args.quota_used_cpu, parse_cpu), "m")
+    report.compare("namespace quota requests.memory", memory,
+                   _optional(args.quota_hard_memory, parse_memory),
+                   _optional(args.quota_used_memory, parse_memory), "B")
+    report.compare("namespace quota requests.ephemeral-storage", storage,
+                   _optional(args.quota_hard_storage, parse_memory),
+                   _optional(args.quota_used_storage, parse_memory), "B")
+    report.compare("namespace quota pods", pods,
+                   _optional(args.quota_hard_pods, parse_count),
+                   _optional(args.quota_used_pods, parse_count), "")
 
 
 def run(args: argparse.Namespace) -> int:
-    current = _read_current_slot(args.current_slot_file)
+    # The current slot is read inside the guard, not before it. It goes through
+    # the same quantity parser as everything else, and a negative or unreadable
+    # request there would otherwise leave by way of a traceback.
     try:
+        current = _read_current_slot(args.current_slot_file)
         with open(args.manifest, encoding="utf-8") as handle:
             manifest = handle.read()
         declared = workloads(manifest)
         cpu, memory, storage, pods = summarise(manifest, current)
     except (OSError, ValueError) as error:
-        print(f"  [ERROR] candidate manifest is unusable: {error}", file=sys.stderr)
+        print(f"  [ERROR] candidate manifest or current slot is unusable: {error}",
+              file=sys.stderr)
         return EXIT_BAD_INPUT
     # Emptiness is a property of the manifest, not of the demand. A release that
     # scales a slot down genuinely adds nothing, and that is a pass, not a
@@ -519,32 +829,29 @@ def run(args: argparse.Namespace) -> int:
     print(f"candidate additional demand ({mode}): "
           f"cpu={cpu}m memory={memory}B ephemeral-storage={storage}B pods={pods}")
     report = Report()
-    report.compare("namespace quota requests.cpu", cpu,
-                   _optional(args.quota_hard_cpu, parse_cpu),
-                   _optional(args.quota_used_cpu, parse_cpu), "m")
-    report.compare("namespace quota requests.memory", memory,
-                   _optional(args.quota_hard_memory, parse_memory),
-                   _optional(args.quota_used_memory, parse_memory), "B")
-    report.compare("namespace quota requests.ephemeral-storage", storage,
-                   _optional(args.quota_hard_storage, parse_memory),
-                   _optional(args.quota_used_storage, parse_memory), "B")
-    report.compare("namespace quota pods", pods,
-                   _optional(args.quota_hard_pods, int),
-                   _optional(args.quota_used_pods, int), "")
+    try:
+        _compare_quota(report, args, cpu, memory, storage, pods)
+    except ValueError as error:
+        print(f"  [ERROR] namespace quota is unusable: {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
     # Read once, then parsed twice. The caller may pass a process substitution,
     # which yields nothing on a second open — reading it again is how the pod
     # dimension came back INCONCLUSIVE against a file that did report it.
     node_text = _read_text(args.node_allocatable_file)
-    allocatable_cpu, allocatable_memory, allocatable_storage = _parse_nodes(node_text)
-    pod_slots = None if node_text is None else sum_node_pod_slots(node_text)
-    committed_cpu, committed_memory, committed_storage = _sum_file(
-        args.cluster_requests_file, sum_scheduled_pod_requests)
+    try:
+        allocatable_cpu, allocatable_memory, allocatable_storage = _parse_nodes(node_text)
+        pod_slots = None if node_text is None else sum_node_pod_slots(node_text)
+        committed_cpu, committed_memory, committed_storage = _sum_cluster_requests(
+            args.cluster_requests_file)
+        scheduled_pods = _read_scheduled_pods(args.cluster_pods_file)
+    except InvalidClusterInput as error:
+        print(f"  [ERROR] {error}", file=sys.stderr)
+        return EXIT_BAD_INPUT
     report.compare("cluster allocatable cpu", cpu, allocatable_cpu, committed_cpu, "m")
     report.compare("cluster allocatable memory", memory, allocatable_memory, committed_memory, "B")
     report.compare("cluster allocatable ephemeral-storage", storage,
                    allocatable_storage, committed_storage, "B")
-    report.compare("cluster allocatable pods", pods,
-                   pod_slots, _read_scheduled_pods(args.cluster_pods_file), "")
+    report.compare("cluster allocatable pods", pods, pod_slots, scheduled_pods, "")
     return report.exit_code()
 
 
