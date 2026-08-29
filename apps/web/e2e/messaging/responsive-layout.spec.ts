@@ -518,25 +518,36 @@ test.describe("layout responsivo", () => {
   });
 
   /**
-   * The lock is scoped to the shell, so leaving the chat has to give the
-   * document its ordinary scrolling back — otherwise a taller route silently
-   * loses its bottom half.
+   * ISSUE #672 — AppShell is a layout route shared by /chat and /profile, kept
+   * mounted (and the sidebar's WebSocket-backed state with it) across
+   * navigation between them. The root lock is scoped to AppShell's lifetime,
+   * not to any one child route, so it stays applied on /profile too — Profile
+   * scrolls inside its own `.profile-settings` scrollport instead of the
+   * document ever regaining ordinary scrolling.
    */
-  test("sair do chat devolve a rolagem normal ao documento", async ({ page }, testInfo) => {
+  test("perfil mantém o shell compartilhado e usa seu próprio scrollport", async ({
+    page,
+  }, testInfo) => {
     await page.setViewportSize({ width: 1366, height: 768 });
     await openChannelWithLongSidebar(page, testInfo);
     await expectNoRootScroll(page, "no chat");
 
     await page.getByRole("link", { name: /Meu perfil/ }).click();
     await expect(page).toHaveURL(/\/profile$/);
-    await expect(page.getByTestId("chat-shell")).toHaveCount(0);
 
-    const unlocked = await page.evaluate(() => ({
+    await expect(page.getByTestId("chat-shell")).toBeVisible();
+    await expect(page.getByTestId("profile-settings-shell")).toBeVisible();
+
+    const locked = await page.evaluate(() => ({
       html: document.documentElement.classList.contains("chat-root-locked"),
       body: document.body.classList.contains("chat-root-locked"),
-      overflowY: getComputedStyle(document.documentElement).overflowY,
     }));
-    expect(unlocked).toEqual({ html: false, body: false, overflowY: "visible" });
+    expect(locked).toEqual({ html: true, body: true });
+
+    const profileOverflowY = await page
+      .getByTestId("profile-settings-shell")
+      .evaluate((element) => getComputedStyle(element).overflowY);
+    expect(profileOverflowY).toBe("auto");
   });
 
   /**

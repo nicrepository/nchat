@@ -593,10 +593,16 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     await page.keyboard.press("Tab");
     await expect(trigger).toBeFocused();
     await page.keyboard.press("Enter");
-    const admin = page.getByRole("menuitem", { name: "Administração" });
-    await expect(admin).toHaveAttribute("href", "/admin/users");
-    await admin.click();
-    await expect(page).toHaveURL(/\/admin\/users/);
+    // ISSUE #672 — SidebarUserMenu deliberately has no "Administração" item:
+    // there is no real capability authority on the client to gate it on, so
+    // the menu stays honest about what it can actually do (Meu perfil, Sair)
+    // rather than pointing at an admin action nothing here can verify.
+    const profile = page.getByRole("menuitem", { name: "Meu perfil" });
+    await expect(profile).toHaveAttribute("href", "/profile");
+    // The menu focuses its first item on open — no extra Tab/ArrowDown needed.
+    await expect(profile).toBeFocused();
+    await profile.click();
+    await expect(page).toHaveURL(/\/profile$/);
   });
 
   test("mantém o rodapé utilizável em largura reduzida", async ({ page }, testInfo) => {
