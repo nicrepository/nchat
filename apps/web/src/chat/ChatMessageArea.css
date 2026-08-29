@@ -351,6 +351,32 @@
   color: var(--color-ink, #16121f);
 }
 
+.chat-msg-area__msg-sender-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-msg-area__msg-sender-action:hover,
+.chat-msg-area__msg-sender-action:focus-visible {
+  color: var(--color-primary, #6d28d9);
+  text-decoration: underline;
+}
+
+.chat-msg-area__msg-sender-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.chat-msg-area__msg-sender-action:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
 .chat-msg-area__msg-time {
   font-size: 10.5px;
   color: var(--color-muted-2, #a39cb3);

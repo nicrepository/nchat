@@ -1,0 +1,138 @@
+/*
+ * ProfileEditDialog styles — unified profile edit form (issue #672).
+ *
+ * The same modal language as RenameChannelDialog and "Adicionar membros" —
+ * backdrop, card, footer — restated under its own class prefix rather than
+ * by borrowing class names, for the same reason those file states: sharing
+ * class names couples two dialogs that are edited for different reasons. The
+ * tokens are the same, so the two stay visually identical.
+ *
+ * Focus is always visible: the last rule applies to every control in the card.
+ */
+
+.profile-edit__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 420;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.profile-edit {
+  --profile-edit-primary: #6d28d9;
+  --profile-edit-primary-strong: #5b21b6;
+  --profile-edit-border: #e8e3f0;
+  --profile-edit-muted: #7c7390;
+  --profile-edit-danger: #b42318;
+  width: min(440px, 100%);
+  padding: 22px 24px 20px;
+  border: 1px solid var(--profile-edit-border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+  color: #16121f;
+  /* dvh first-class, vh as the fallback for engines without it: on mobile the
+     virtual keyboard must not push the dialog's footer off-screen. */
+  max-height: 90vh;
+  max-height: 90dvh;
+  overflow-y: auto;
+}
+
+.profile-edit__title {
+  margin: 0 0 16px;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.profile-edit__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--profile-edit-muted);
+}
+
+.profile-edit input,
+.profile-edit textarea,
+.profile-edit select {
+  width: 100%;
+  padding: 10px 12px;
+  font: inherit;
+  color: inherit;
+  border: 1px solid var(--profile-edit-border);
+  border-radius: 10px;
+  background: #fff;
+  margin-bottom: 14px;
+}
+
+.profile-edit input:disabled,
+.profile-edit textarea:disabled,
+.profile-edit select:disabled {
+  background: #f6f4fa;
+  color: var(--profile-edit-muted);
+}
+
+/* The invalid state is not carried by colour alone: the message below the field
+   is associated with it through aria-describedby and is what actually says
+   what is wrong. */
+.profile-edit input[aria-invalid="true"],
+.profile-edit textarea[aria-invalid="true"],
+.profile-edit select[aria-invalid="true"] {
+  border-color: var(--profile-edit-danger);
+}
+
+.profile-edit__error {
+  margin: -12px 0 8px;
+  font-size: 13px;
+  color: var(--profile-edit-danger);
+}
+
+.profile-edit__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.profile-edit__cancel,
+.profile-edit__submit {
+  min-height: 38px;
+  padding: 0 16px;
+  font: inherit;
+  font-weight: 600;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.profile-edit__cancel {
+  border: 1px solid var(--profile-edit-border);
+  background: #fff;
+  color: #16121f;
+}
+
+.profile-edit__submit {
+  border: 0;
+  background: var(--profile-edit-primary);
+  color: #fff;
+}
+
+.profile-edit__submit:hover:not(:disabled) {
+  background: var(--profile-edit-primary-strong);
+}
+
+.profile-edit__cancel:disabled,
+.profile-edit__submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.profile-edit button:focus-visible,
+.profile-edit input:focus-visible,
+.profile-edit textarea:focus-visible,
+.profile-edit select:focus-visible {
+  outline: 2px solid var(--profile-edit-primary);
+  outline-offset: 2px;
+}

@@ -1,0 +1,129 @@
+/*
+ * AvatarDialog styles (issue #672 §1.5).
+ *
+ * The same modal language as RenameChannelDialog and ProfileEditDialog —
+ * backdrop, card, footer — restated under its own class prefix rather than
+ * by borrowing class names, for the same reason those files state: sharing
+ * class names couples two dialogs that are edited for different reasons. The
+ * tokens are the same, so the three stay visually identical.
+ *
+ * Focus is always visible: the last rule applies to every control in the card.
+ */
+
+.avatar-dialog__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 420;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.avatar-dialog {
+  --avatar-dialog-primary: #6d28d9;
+  --avatar-dialog-primary-strong: #5b21b6;
+  --avatar-dialog-border: #e8e3f0;
+  --avatar-dialog-muted: #7c7390;
+  --avatar-dialog-danger: #b42318;
+  width: min(400px, 100%);
+  padding: 22px 24px 20px;
+  border: 1px solid var(--avatar-dialog-border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(22, 18, 31, 0.24);
+  color: #16121f;
+  /* dvh first-class, vh as the fallback for engines without it: on mobile the
+     virtual keyboard must not push the dialog's actions off-screen. */
+  max-height: 90vh;
+  max-height: 90dvh;
+  overflow-y: auto;
+}
+
+.avatar-dialog__title {
+  margin: 0 0 16px;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+.avatar-dialog__preview {
+  display: grid;
+  place-items: center;
+  width: 96px;
+  height: 96px;
+  margin: 0 auto 12px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #f6f4fa;
+  color: var(--avatar-dialog-muted);
+  font-weight: 600;
+}
+
+.avatar-dialog__preview-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.avatar-dialog__hint {
+  margin: 0 0 16px;
+  font-size: 13px;
+  text-align: center;
+  color: var(--avatar-dialog-muted);
+}
+
+.avatar-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.avatar-dialog__btn {
+  min-height: 38px;
+  padding: 0 16px;
+  font: inherit;
+  font-weight: 600;
+  border: 1px solid var(--avatar-dialog-border);
+  border-radius: 10px;
+  background: #fff;
+  color: #16121f;
+  cursor: pointer;
+}
+
+.avatar-dialog__btn--primary {
+  border: 0;
+  background: var(--avatar-dialog-primary);
+  color: #fff;
+}
+
+.avatar-dialog__btn--primary:hover:not(:disabled) {
+  background: var(--avatar-dialog-primary-strong);
+}
+
+.avatar-dialog__btn--destructive {
+  color: var(--avatar-dialog-danger);
+  border-color: var(--avatar-dialog-danger);
+}
+
+.avatar-dialog__btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.avatar-dialog__status {
+  margin-top: 14px;
+  min-height: 1px;
+  text-align: center;
+}
+
+.avatar-dialog__error {
+  font-size: 13px;
+  color: var(--avatar-dialog-danger);
+}
+
+.avatar-dialog button:focus-visible {
+  outline: 2px solid var(--avatar-dialog-primary);
+  outline-offset: 2px;
+}

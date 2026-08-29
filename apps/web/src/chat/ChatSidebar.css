@@ -759,6 +759,11 @@
   transition:
     background 0.12s,
     color 0.12s;
+  /* This trigger also carries .chat-sidebar__actions-trigger, whose default
+     opacity is 0 — right for a row that only reveals its menu on hover, wrong
+     for the footer's own account control, which is not inside a
+     .chat-sidebar__item-row and must stay visible unconditionally. */
+  opacity: 1;
 }
 
 .chat-sidebar__user-settings:hover {

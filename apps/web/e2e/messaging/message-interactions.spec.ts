@@ -38,6 +38,36 @@ async function expectPinPreview(pinsBar: Locator, bodyText: string) {
  * que as suítes existentes de DM 1:1/canal não cobrem.
  */
 test.describe("interações de mensagem — reação, favorito e pin", () => {
+  test("abre DM canonica ao clicar no nome do autor da mensagem", async ({ page }, testInfo) => {
+    const channelId = uniqueId(testInfo, "author-dm-channel");
+    const message = makeMessage({
+      id: `${channelId}-message`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: "mensagem com autor clicavel",
+    });
+    const scenario = createScenario({
+      kind: "channel",
+      targetId: channelId,
+      targetName: "canal autores",
+      messages: [message],
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${channelId}`);
+
+    await messageBubble(page, message.id)
+      .getByRole("button", { name: `Abrir conversa com ${OTHER_USER_NAME}` })
+      .click();
+
+    await expect(page).toHaveURL("/chat/dm/e2e-dm-other");
+    const directMessages = page.getByRole("region", { name: "Mensagens diretas" });
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveCount(1);
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(scenario.requests.dmCreates).toEqual([{ otherUserId: OTHER_USER_ID }]);
+  });
   test("recebe message.created de outro participante uma única vez na DM correta", async ({
     page,
   }, testInfo) => {
