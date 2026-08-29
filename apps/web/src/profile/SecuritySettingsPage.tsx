@@ -1,20 +1,24 @@
 import "./SecuritySettingsPage.css";
 
+function accountManagementUrl(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && !url.username && !url.password ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export default function SecuritySettingsPage() {
-  const keycloakAccountUrl = import.meta.env.VITE_KEYCLOAK_ACCOUNT_URL;
+  const keycloakAccountUrl = accountManagementUrl(import.meta.env.VITE_KEYCLOAK_ACCOUNT_URL);
 
   return (
     <div className="security-settings">
       <header className="security-settings__header">
-        <h1 className="security-settings__title">Segurança</h1>
+        <h2 className="security-settings__title">Segurança</h2>
       </header>
       <section className="security-settings__card" aria-label="Segurança da conta">
-        <dl className="security-settings__grid">
-          <div className="security-settings__row">
-            <dt>Provedor de identidade</dt>
-            <dd>Keycloak</dd>
-          </div>
-        </dl>
         <p className="security-settings__note">
           Gerencie senha e autenticação no provedor de identidade.
         </p>

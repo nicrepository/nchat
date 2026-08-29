@@ -10,7 +10,12 @@ export default function ProfileSettingsShell() {
         <h1 className="profile-settings__title">Configurações da conta</h1>
       </header>
       <ProfileTabs />
-      <div className="profile-settings__content">
+      <div
+        id="profile-settings-panel"
+        className="profile-settings__content"
+        role="tabpanel"
+        aria-label="Conteúdo da seção selecionada"
+      >
         <Outlet />
       </div>
     </div>

@@ -68,6 +68,7 @@ AFTER
 ### Task 1: Extract `AppShell` from `ChatShell`
 
 **Files:**
+
 - Create: `apps/web/src/chat/AppShell.tsx`
 - Rename: `apps/web/src/chat/ChatShell.css` → `apps/web/src/chat/AppShell.css` (content unchanged in this step)
 - Modify: `apps/web/src/chat/ChatShell.tsx` (shrink drastically)
@@ -75,6 +76,7 @@ AFTER
 - Modify: `apps/web/src/chat/ChatShell.test.tsx`, `apps/web/src/chat/ChatShellDetailsFocus.test.tsx` (update router wrapper)
 
 **Interfaces:**
+
 - Produces: `export default function AppShell(): JSX.Element` — a layout route element, renders `<Outlet context={sidebarContext} />` inside `<main>`.
 - Produces: `export type AppShellOutletContext = ReturnType<typeof useChatSidebar>` (i.e. `{ state, retry, setPinned, markRead, renameChannel, renameGroup, setMuted, leaveConversation }`) — exported so `ChatShell` can type its `useOutletContext<AppShellOutletContext>()` call.
 - Produces: keeps exporting `ROOT_LOCK_CLASS` (moved here from `ChatShell.tsx`; `ChatShell.test.tsx` imports it today — update that import path).
@@ -101,6 +103,7 @@ Write down the diff needed; apply it in Step 6 below (after the split exists), n
 - [ ] **Step 2: Create `AppShell.tsx` by moving (not copying) the chrome out of `ChatShell.tsx`**
 
 Move these from `ChatShell.tsx` into the new file, verbatim, unless noted:
+
 - `readySidebar` helper — **stays in `ChatShell.tsx`** (only `ChatShell`'s outlet-context construction needs `currentUserId`/`channels`/`dms`/`attachmentLimits` in that exact shape; `AppShell` only needs the raw `state` to hand to `ChatSidebar` and to the outlet context).
 - `resolveDetailsTarget`, `detailsTargetExists`, `restoreDetailsFocus`, `dataFlag`, `ChatNavBar`, `useRootScrollLock`, `ROOT_LOCK_CLASS` — move as-is.
 - `handleShellKeyDown` — move as-is (Escape-closes-drawer is chrome, not chat logic).
@@ -133,8 +136,16 @@ function mainAriaLabel(pathname: string): string {
 export default function AppShell() {
   useRootScrollLock();
   const sidebar = useChatSidebar();
-  const { state, retry, setPinned, markRead, renameChannel, renameGroup, setMuted, leaveConversation } =
-    sidebar;
+  const {
+    state,
+    retry,
+    setPinned,
+    markRead,
+    renameChannel,
+    renameGroup,
+    setMuted,
+    leaveConversation,
+  } = sidebar;
   const { pathname } = useLocation();
 
   const [sidebarDetails, setSidebarDetails] = useState<
@@ -142,11 +153,20 @@ export default function AppShell() {
   >(null);
   const dms = state.status === "ready" ? state.dms : [];
   const openDetailsTarget =
-    sidebarDetails?.pathname === pathname && detailsTargetExists(sidebarDetails, { channels: state.status === "ready" ? state.channels : [], dms })
+    sidebarDetails?.pathname === pathname &&
+    detailsTargetExists(sidebarDetails, {
+      channels: state.status === "ready" ? state.channels : [],
+      dms,
+    })
       ? sidebarDetails
       : null;
 
-  const { open: navOpen, modal: navModal, toggle: toggleNav, close: setNavClosed } = useNavDrawer(pathname);
+  const {
+    open: navOpen,
+    modal: navModal,
+    toggle: toggleNav,
+    close: setNavClosed,
+  } = useNavDrawer(pathname);
   const navToggleRef = useRef<HTMLButtonElement>(null);
   const closeNav = useCallback(() => {
     setNavClosed();
@@ -244,14 +264,27 @@ export default function ChatShell() {
   const { state, retry } = useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
-    calls, resource: resourceCall, joinResourceParticipation, registerDirectory, registerIdentity,
-    getResourceCall, media, expand, leaveResourceParticipation, localIdentity,
-    resourcePresentationCall, directPresentationCall,
+    calls,
+    resource: resourceCall,
+    joinResourceParticipation,
+    registerDirectory,
+    registerIdentity,
+    getResourceCall,
+    media,
+    expand,
+    leaveResourceParticipation,
+    localIdentity,
+    resourcePresentationCall,
+    directPresentationCall,
   } = useCallSession();
   useEffect(() => registerIdentity(state.status, retry), [registerIdentity, retry, state.status]);
   useEffect(() => {
     if (state.status === "ready") {
-      registerDirectory({ currentUserId: state.currentUserId, channels: state.channels, dms: state.dms });
+      registerDirectory({
+        currentUserId: state.currentUserId,
+        channels: state.channels,
+        dms: state.dms,
+      });
     }
   }, [registerDirectory, state]);
 
@@ -297,6 +330,7 @@ git commit -m "refactor(chat): extract AppShell from ChatShell for shared shell 
 ### Task 2: Route restructure + `ProfileSettingsShell` + `ProfileTabs`
 
 **Files:**
+
 - Create: `apps/web/src/profile/ProfileSettingsShell.tsx`
 - Create: `apps/web/src/profile/ProfileTabs.tsx`, `apps/web/src/profile/ProfileTabs.css`
 - Create: `apps/web/src/profile/ProfileSettingsShell.css`
@@ -304,6 +338,7 @@ git commit -m "refactor(chat): extract AppShell from ChatShell for shared shell 
 - Test: `apps/web/src/profile/ProfileTabs.test.tsx`, `apps/web/src/profile/ProfileSettingsShell.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `AppShellOutletContext` is available via `useOutletContext()` at this level but **not used** — `ProfileSettingsShell` and its children get identity from `useSelfProfile()` (Task 5+), never from the chat sidebar context.
 - Produces: `export default function ProfileSettingsShell(): JSX.Element` — renders `ProfileTabs` + `<Outlet/>`.
 - Produces: `export default function ProfileTabs(): JSX.Element` — a `<nav>` with four `NavLink`s.
@@ -370,13 +405,17 @@ describe("ProfileTabs", () => {
   it("marks Perfil active on the exact /profile route", () => {
     renderAt("/profile");
     expect(screen.getByRole("link", { name: "Perfil" })).toHaveClass("profile-tabs__link--active");
-    expect(screen.getByRole("link", { name: "Sessões" })).not.toHaveClass("profile-tabs__link--active");
+    expect(screen.getByRole("link", { name: "Sessões" })).not.toHaveClass(
+      "profile-tabs__link--active",
+    );
   });
 
   it("marks Sessões active on /profile/sessions and not Perfil", () => {
     renderAt("/profile/sessions");
     expect(screen.getByRole("link", { name: "Sessões" })).toHaveClass("profile-tabs__link--active");
-    expect(screen.getByRole("link", { name: "Perfil" })).not.toHaveClass("profile-tabs__link--active");
+    expect(screen.getByRole("link", { name: "Perfil" })).not.toHaveClass(
+      "profile-tabs__link--active",
+    );
   });
 
   it("renders all four sections as links", () => {
@@ -384,7 +423,9 @@ describe("ProfileTabs", () => {
     for (const label of ["Perfil", "Notificações", "Segurança", "Sessões"]) {
       expect(screen.getByRole("link", { name: label })).toHaveAttribute(
         "href",
-        label === "Perfil" ? "/profile" : `/profile/${label === "Notificações" ? "notifications" : label === "Segurança" ? "security" : "sessions"}`,
+        label === "Perfil"
+          ? "/profile"
+          : `/profile/${label === "Notificações" ? "notifications" : label === "Segurança" ? "security" : "sessions"}`,
       );
     }
   });
@@ -509,6 +550,7 @@ The current footer (`ChatSidebar.tsx:830-889`, function `SidebarUser`) renders t
 Product decision (document in the PR description, not in code comments): the mockup's "Configurações" item and "Meu perfil" item both point at the same place now that `/profile` covers identity + notifications + security + sessions — so this menu has **three** items, not four: "Meu perfil" (→ `/profile`), "Administração" (→ `/admin/users`, shown unconditionally like every other admin link in this codebase today — no client-side capability gate exists anywhere in `apps/web`; the destination enforces authorization server-side, per the pattern already used for `/admin/anti-spam` and `/admin/upload-limit`), and "Sair" (logout — does not exist as a UI control anywhere in the app today; `logout()` in `authApi.ts` is called from tests only).
 
 **Files:**
+
 - Create: `apps/web/src/chat/SidebarUserMenu.tsx`
 - Modify: `apps/web/src/chat/ChatSidebar.tsx` (swap the gear `<Link>` for `<SidebarUserMenu/>`)
 - Modify: `apps/web/src/chat/ChatSidebar.css` (small additions, reusing `.chat-sidebar__actions-*` class names already defined for `ConversationActionsMenu`)
@@ -516,6 +558,7 @@ Product decision (document in the PR description, not in code comments): the moc
 - Modify: `apps/web/src/chat/ChatSidebar.test.tsx` (any assertion targeting the old gear link's `aria-label="Configurações"` / href)
 
 **Interfaces:**
+
 - Produces: `export default function SidebarUserMenu(): JSX.Element`. No props — it owns its own open/closed state and calls `useNavigate()` + `logout()` + `clearTokens()` internally.
 
 - [ ] **Step 1: Write the failing test**
@@ -604,7 +647,12 @@ import { clearTokens } from "../lib/authSession";
 
 function IconSettings() {
   return (
-    <svg viewBox="0 0 24 24" className="chat-sidebar__more-icon" aria-hidden="true" focusable="false">
+    <svg
+      viewBox="0 0 24 24"
+      className="chat-sidebar__more-icon"
+      aria-hidden="true"
+      focusable="false"
+    >
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
     </svg>
@@ -652,7 +700,9 @@ export default function SidebarUserMenu() {
 
   useEffect(() => {
     if (open) {
-      menuRef.current?.querySelector<HTMLAnchorElement | HTMLButtonElement>("[role='menuitem']")?.focus();
+      menuRef.current
+        ?.querySelector<HTMLAnchorElement | HTMLButtonElement>("[role='menuitem']")
+        ?.focus();
       return;
     }
     if (restoreFocusRef.current) {
@@ -682,7 +732,8 @@ export default function SidebarUserMenu() {
     );
     if (items.length === 0) return;
     const current = items.findIndex((item) => item === document.activeElement);
-    const next = (((current < 0 ? -1 : current) + delta) % items.length + items.length) % items.length;
+    const next =
+      ((((current < 0 ? -1 : current) + delta) % items.length) + items.length) % items.length;
     items[next]?.focus();
   }
 
@@ -746,10 +797,22 @@ export default function SidebarUserMenu() {
             className="chat-sidebar__actions-menu"
             onKeyDown={handleMenuKeyDown}
           >
-            <Link to="/profile" role="menuitem" tabIndex={-1} className="chat-sidebar__actions-item" onClick={() => close(false)}>
+            <Link
+              to="/profile"
+              role="menuitem"
+              tabIndex={-1}
+              className="chat-sidebar__actions-item"
+              onClick={() => close(false)}
+            >
               <span className="chat-sidebar__actions-label">Meu perfil</span>
             </Link>
-            <Link to="/admin/users" role="menuitem" tabIndex={-1} className="chat-sidebar__actions-item" onClick={() => close(false)}>
+            <Link
+              to="/admin/users"
+              role="menuitem"
+              tabIndex={-1}
+              className="chat-sidebar__actions-item"
+              onClick={() => close(false)}
+            >
               <span className="chat-sidebar__actions-label">Administração</span>
             </Link>
             <span className="chat-sidebar__actions-separator" role="none" />
@@ -804,10 +867,12 @@ git commit -m "fix(chat): replace mislabeled sidebar gear with a real account me
 Today `ProfilePage` saves `display_name` and `job_title`/`bio`/`timezone`/`custom_status` through two separate `PATCH /auth/me` calls (`updateDisplayName`, `updateProfileFields`) because it has two separate forms. `ProfileEditDialog` (Task 6) is a single form for all five fields, so it needs a single call.
 
 **Files:**
+
 - Modify: `apps/web/src/profile/profileApi.ts`
 - Modify: `apps/web/src/profile/profileApi.test.ts` (find/read the existing test file first — recon didn't confirm its exact name; if it's colocated inside `ProfilePage.test.tsx` instead, add the new tests there and note that in the task instead)
 
 **Interfaces:**
+
 - Produces: `export interface UpdateProfileInput { displayName: string; jobTitle: string; bio: string; timezone: string; customStatus: string; }`
 - Produces: `export async function updateProfile(fields: UpdateProfileInput, signal?: AbortSignal): Promise<SelfProfile>`
 - Removes: `updateDisplayName`, `UpdateDisplayNameError`, `UpdateDisplayNameErrorReason`, `updateProfileFields`, `UpdateProfileFieldsError`, `UpdateProfileFieldsErrorReason`, `ProfileFieldsInput` (all superseded — `ProfilePage.tsx` is deleted in Task 14, so nothing else calls them after this task's consumer, `ProfileEditDialog`, lands in Task 6). Keep them until Task 6 actually replaces the call sites, to avoid an intermediate broken build — or remove now and let `ProfilePage.tsx` fail to typecheck until Task 14 deletes it. **Do the latter is riskier; instead, keep both old functions until Task 14 deletes `ProfilePage.tsx`, and only remove them in Task 14's cleanup step.** Add `updateProfile` alongside them in this task.
@@ -948,10 +1013,12 @@ git commit -m "feat(profile): add unified updateProfile PATCH for the new edit d
 ### Task 5: `ProfileIdentityCard`
 
 **Files:**
+
 - Create: `apps/web/src/profile/ProfileIdentityCard.tsx`, `apps/web/src/profile/ProfileIdentityCard.css`
 - Test: `apps/web/src/profile/ProfileIdentityCard.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `SelfProfile` (from `profileApi.ts`), `usePresence`/`presenceLabel` (from `../chat/presence`), `PersonAvatarImage` (from `../chat/PersonAvatarImage`), `initialsFrom`/`avatarColorFor` (from `../chat/messageDisplay`).
 - Produces: `export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: { profile: SelfProfile; onEdit: () => void; onChangePhoto: () => void }): JSX.Element`
 
@@ -1033,14 +1100,22 @@ interface ProfileIdentityCardProps {
   onChangePhoto: () => void;
 }
 
-export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: ProfileIdentityCardProps) {
+export default function ProfileIdentityCard({
+  profile,
+  onEdit,
+  onChangePhoto,
+}: ProfileIdentityCardProps) {
   const presence = usePresence(profile.id);
   const initials = profile.displayName ? initialsFrom(profile.displayName) : "";
 
   return (
     <section className="profile-identity" aria-label="Identidade">
       <div className="profile-identity__avatar" style={{ color: avatarColorFor(profile.id) }}>
-        <PersonAvatarImage src={profile.avatarUrl} initials={initials} imgClassName="profile-identity__avatar-img" />
+        <PersonAvatarImage
+          src={profile.avatarUrl}
+          initials={initials}
+          imgClassName="profile-identity__avatar-img"
+        />
       </div>
       <div className="profile-identity__info">
         <h1 className="profile-identity__name">{profile.displayName || "Sem nome"}</h1>
@@ -1055,10 +1130,16 @@ export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: 
             </span>
           )}
         </div>
-        {profile.customStatus && <p className="profile-identity__custom-status">{profile.customStatus}</p>}
+        {profile.customStatus && (
+          <p className="profile-identity__custom-status">{profile.customStatus}</p>
+        )}
         {profile.bio && <p className="profile-identity__bio">{profile.bio}</p>}
         <div className="profile-identity__actions">
-          <button type="button" className="profile-identity__btn profile-identity__btn--primary" onClick={onEdit}>
+          <button
+            type="button"
+            className="profile-identity__btn profile-identity__btn--primary"
+            onClick={onEdit}
+          >
             Editar
           </button>
           <button type="button" className="profile-identity__btn" onClick={onChangePhoto}>
@@ -1071,7 +1152,12 @@ export default function ProfileIdentityCard({ profile, onEdit, onChangePhoto }: 
 }
 
 function PresenceDotInline({ state }: { state: string }) {
-  return <span className={`profile-identity__presence-dot profile-identity__presence-dot--${state}`} aria-hidden="true" />;
+  return (
+    <span
+      className={`profile-identity__presence-dot profile-identity__presence-dot--${state}`}
+      aria-hidden="true"
+    />
+  );
 }
 ```
 
@@ -1091,10 +1177,12 @@ git commit -m "feat(profile): add ProfileIdentityCard"
 ### Task 6: `ProfileEditDialog`
 
 **Files:**
+
 - Create: `apps/web/src/profile/ProfileEditDialog.tsx`, `apps/web/src/profile/ProfileEditDialog.css`
 - Test: `apps/web/src/profile/ProfileEditDialog.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `updateProfile`, `UpdateProfileError` (Task 4); `validateDisplayName`, `validateBio`, `validateShortProfileField`, `validateTimezone`, `supportedTimezones` (existing `profileForm.ts`, unchanged).
 - Produces: `export default function ProfileEditDialog({ profile, onClose, onSaved }: { profile: SelfProfile; onClose: () => void; onSaved: (profile: SelfProfile) => void }): JSX.Element`
 
@@ -1160,7 +1248,9 @@ describe("ProfileEditDialog", () => {
     await user.click(saveButton);
     expect(profileApi.updateProfile).toHaveBeenCalledTimes(1);
     resolveUpdate({ ...profile, displayName: "Ana Costa" });
-    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ displayName: "Ana Costa" })));
+    await waitFor(() =>
+      expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ displayName: "Ana Costa" })),
+    );
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -1298,7 +1388,9 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
     } catch (failure) {
       if (!mountedRef.current) return;
       const message =
-        failure instanceof UpdateProfileError ? failure.message : "Não foi possível salvar o perfil.";
+        failure instanceof UpdateProfileError
+          ? failure.message
+          : "Não foi possível salvar o perfil.";
       setError(message);
       nameInputRef.current?.focus();
     } finally {
@@ -1400,7 +1492,12 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
           )}
 
           <div className="profile-edit__actions">
-            <button type="button" className="profile-edit__cancel" disabled={pending} onClick={requestClose}>
+            <button
+              type="button"
+              className="profile-edit__cancel"
+              disabled={pending}
+              onClick={requestClose}
+            >
               Cancelar
             </button>
             <button
@@ -1432,10 +1529,12 @@ git commit -m "feat(profile): add unified ProfileEditDialog"
 ### Task 7: `AvatarDialog`
 
 **Files:**
+
 - Create: `apps/web/src/profile/AvatarDialog.tsx`, `apps/web/src/profile/AvatarDialog.css`
 - Test: `apps/web/src/profile/AvatarDialog.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `uploadAvatar`, `removeAvatar`, `AvatarUploadError`, `AVATAR_ACCEPTED_TYPES`, `AVATAR_MAX_BYTES` (existing `profileApi.ts`, unchanged), `refreshSelfProfile` (existing `selfProfile.ts`, unchanged), `PersonAvatarImage`.
 - Produces: `export default function AvatarDialog({ currentAvatarUrl, onClose }: { currentAvatarUrl?: string; onClose: () => void }): JSX.Element`
 
@@ -1621,9 +1720,17 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
         </h2>
         <div className="avatar-dialog__preview">
           {previewUrl ? (
-            <img src={previewUrl} alt="Pré-visualização do avatar" className="avatar-dialog__preview-img" />
+            <img
+              src={previewUrl}
+              alt="Pré-visualização do avatar"
+              className="avatar-dialog__preview-img"
+            />
           ) : (
-            <PersonAvatarImage src={shownSrc} initials="" imgClassName="avatar-dialog__preview-img" />
+            <PersonAvatarImage
+              src={shownSrc}
+              initials=""
+              imgClassName="avatar-dialog__preview-img"
+            />
           )}
         </div>
         <p className="avatar-dialog__hint">JPEG ou PNG, até 5 MB.</p>
@@ -1648,7 +1755,12 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
             Selecionar arquivo
           </button>
           {selectedFile && (
-            <button type="button" className="avatar-dialog__btn" onClick={discardSelection} disabled={busy}>
+            <button
+              type="button"
+              className="avatar-dialog__btn"
+              onClick={discardSelection}
+              disabled={busy}
+            >
               Cancelar seleção
             </button>
           )}
@@ -1670,7 +1782,12 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
           >
             {removing ? "Removendo…" : "Remover avatar"}
           </button>
-          <button type="button" className="avatar-dialog__btn" onClick={requestClose} disabled={busy}>
+          <button
+            type="button"
+            className="avatar-dialog__btn"
+            onClick={requestClose}
+            disabled={busy}
+          >
             Fechar
           </button>
         </div>
@@ -1697,12 +1814,14 @@ git commit -m "feat(profile): add dedicated AvatarDialog replacing the exposed f
 ### Task 8: `ProfileInfoCard`
 
 **Files:**
+
 - Create: `apps/web/src/profile/ProfileInfoCard.tsx`, `apps/web/src/profile/ProfileInfoCard.css`
 - Test: `apps/web/src/profile/ProfileInfoCard.test.tsx`
 
 Per the Task 6 backend-contract finding, the self-profile API returns exactly `id`, `display_name`, `avatar_url`, `job_title`, `bio`, `timezone`, `custom_status` — no `email`, `department`, `role`, or `locale`. So this card has exactly two rows: Cargo (editable — same field as the identity card and edit dialog, shown again here for the "two-column info" layout the issue asks for) and Fuso horário. It does **not** invent an e-mail/department/role row. `WorkingHoursCard` is intentionally **not built** in this plan — no backend source of truth exists for it (see plan header); document this omission in the final PR description, don't silently skip it.
 
 **Interfaces:**
+
 - Produces: `export default function ProfileInfoCard({ profile }: { profile: SelfProfile }): JSX.Element`
 
 - [ ] **Step 1: Write the failing test**
@@ -1783,10 +1902,12 @@ git commit -m "feat(profile): add ProfileInfoCard with only real, non-invented f
 ### Task 9: `ProfileOverviewPage`
 
 **Files:**
+
 - Create: `apps/web/src/profile/ProfileOverviewPage.tsx`, `apps/web/src/profile/ProfileOverviewPage.css`
 - Test: `apps/web/src/profile/ProfileOverviewPage.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `useSelfProfile` (existing `selfProfile.ts`, **unchanged** — this is the switch from `ProfilePage`'s own local `fetchMyProfile` call to the shared cache, eliminating the duplicate GET this page and the sidebar both used to make independently), `ProfileIdentityCard`, `ProfileInfoCard`, `ProfileEditDialog`, `AvatarDialog`.
 - Produces: `export default function ProfileOverviewPage(): JSX.Element`
 
@@ -1811,7 +1932,14 @@ describe("ProfileOverviewPage", () => {
 
     vi.mocked(selfProfile.useSelfProfile).mockReturnValue({
       status: "ready",
-      profile: { id: "u1", displayName: "Ana", jobTitle: "", bio: "", timezone: "", customStatus: "" },
+      profile: {
+        id: "u1",
+        displayName: "Ana",
+        jobTitle: "",
+        bio: "",
+        timezone: "",
+        customStatus: "",
+      },
     });
     rerender(<ProfileOverviewPage />);
     expect(screen.getByRole("heading", { name: "Ana" })).toBeInTheDocument();
@@ -1826,7 +1954,14 @@ describe("ProfileOverviewPage", () => {
   it("opens ProfileEditDialog from Editar and AvatarDialog from Trocar foto", async () => {
     vi.mocked(selfProfile.useSelfProfile).mockReturnValue({
       status: "ready",
-      profile: { id: "u1", displayName: "Ana", jobTitle: "", bio: "", timezone: "", customStatus: "" },
+      profile: {
+        id: "u1",
+        displayName: "Ana",
+        jobTitle: "",
+        bio: "",
+        timezone: "",
+        customStatus: "",
+      },
     });
     const user = userEvent.setup();
     render(<ProfileOverviewPage />);
@@ -1884,7 +2019,9 @@ export default function ProfileOverviewPage() {
     <div className="profile-overview">
       <header className="profile-overview__header">
         <h1 className="profile-overview__title">Perfil</h1>
-        <p className="profile-overview__description">Suas informações, disponibilidade e preferências pessoais.</p>
+        <p className="profile-overview__description">
+          Suas informações, disponibilidade e preferências pessoais.
+        </p>
       </header>
       <ProfileIdentityCard
         profile={profile}
@@ -1936,6 +2073,7 @@ git commit -m "feat(profile): add ProfileOverviewPage backed by the shared self-
 ### Task 10: `NotificationsSettingsPage`
 
 **Files:**
+
 - Create: `apps/web/src/profile/NotificationsSettingsPage.tsx`, `apps/web/src/profile/NotificationsSettingsPage.css`
 - Test: `apps/web/src/profile/NotificationsSettingsPage.test.tsx`
 
@@ -1971,7 +2109,9 @@ import {
 } from "../calls/incomingCallRingtone";
 
 export default function NotificationsSettingsPage() {
-  const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() => getSoundNotificationMode());
+  const [soundMode, setSoundModeState] = useState<SoundNotificationMode>(() =>
+    getSoundNotificationMode(),
+  );
   const [incomingCallRingtoneEnabled, setIncomingCallRingtoneEnabledState] = useState(() =>
     getIncomingCallRingtoneEnabled(),
   );
@@ -2046,13 +2186,16 @@ git commit -m "feat(profile): move notification preferences into their own setti
 ### Task 11: `sessionsApi.ts`
 
 **Files:**
+
 - Create: `apps/web/src/profile/sessionsApi.ts`
 - Test: `apps/web/src/profile/sessionsApi.test.ts`
 
 Backend contract confirmed in `services/auth-service/internal/http/session_handler.go`: `GET /auth/me/sessions` → `{ data: SessionRow[], pagination: {...} }` where each row already has `ip_address` IP-masked (`maskIPAddress`) and `user_agent` sanitized (`sanitizeUserAgent`) server-side, plus a `current: boolean`. `DELETE /auth/me/sessions/{id}` → 204, 404 for unknown/cross-user (never distinguishes the two). `DELETE /auth/me/sessions` → 204, revokes all but the caller's current session (401 if the request has no current session bound).
 
 **Interfaces:**
+
 - Produces:
+
 ```ts
 export interface Session {
   id: string;
@@ -2063,10 +2206,12 @@ export interface Session {
   current: boolean;
   revokedAt?: string;
 }
-export async function listSessions(signal?: AbortSignal): Promise<Session[]>
-export async function revokeSession(sessionId: string, signal?: AbortSignal): Promise<void>
-export async function revokeAllOtherSessions(signal?: AbortSignal): Promise<void>
-export class SessionsApiError extends Error { reason: "forbidden" | "unauthorized" | "unknown" }
+export async function listSessions(signal?: AbortSignal): Promise<Session[]>;
+export async function revokeSession(sessionId: string, signal?: AbortSignal): Promise<void>;
+export async function revokeAllOtherSessions(signal?: AbortSignal): Promise<void>;
+export class SessionsApiError extends Error {
+  reason: "forbidden" | "unauthorized" | "unknown";
+}
 ```
 
 Deliberately no UA parsing into "Firefox · Linux"-style labels: the backend hands back one sanitized string, not structured browser/OS fields, and a client-side regex guesser risks mislabeling a session's browser (a false "Chrome" on an actual Firefox session is worse than an honest raw string) — display the sanitized `user_agent` text as-is. Note this decision in the PR description.
@@ -2078,7 +2223,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
-import { listSessions, revokeAllOtherSessions, revokeSession, SessionsApiError } from "./sessionsApi";
+import {
+  listSessions,
+  revokeAllOtherSessions,
+  revokeSession,
+  SessionsApiError,
+} from "./sessionsApi";
 
 vi.mock("../lib/authClient");
 
@@ -2113,23 +2263,34 @@ describe("sessionsApi", () => {
         revokedAt: undefined,
       },
     ]);
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", { method: "GET", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", {
+      method: "GET",
+      signal: undefined,
+    });
   });
 
   it("revokeSession calls DELETE on the session's own path", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(undefined);
     await revokeSession("s2");
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions/s2", { method: "DELETE", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions/s2", {
+      method: "DELETE",
+      signal: undefined,
+    });
   });
 
   it("revokeAllOtherSessions calls DELETE on the collection endpoint", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce(undefined);
     await revokeAllOtherSessions();
-    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", { method: "DELETE", signal: undefined });
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/auth/me/sessions", {
+      method: "DELETE",
+      signal: undefined,
+    });
   });
 
   it("maps a 401 on revokeAllOtherSessions to SessionsApiError('unauthorized')", async () => {
-    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new ApiRequestError(401, "no current session"));
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(
+      new ApiRequestError(401, "no current session"),
+    );
     await expect(revokeAllOtherSessions()).rejects.toMatchObject({ reason: "unauthorized" });
     expect(SessionsApiError).toBeDefined();
   });
@@ -2225,7 +2386,10 @@ export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
 /** Revokes one session. Idempotent from the caller's perspective: a 404 (already gone / not this user's) is not surfaced as a distinct case here — the list is always revalidated after, so the row converges to "gone" either way. */
 export async function revokeSession(sessionId: string, signal?: AbortSignal): Promise<void> {
   try {
-    await authenticatedFetch<void>(`${AUTH_BASE}/me/sessions/${sessionId}`, { method: "DELETE", signal });
+    await authenticatedFetch<void>(`${AUTH_BASE}/me/sessions/${sessionId}`, {
+      method: "DELETE",
+      signal,
+    });
   } catch (error) {
     throw mapSessionsError(error);
   }
@@ -2253,12 +2417,14 @@ git commit -m "feat(profile): add sessionsApi client for GET/DELETE /auth/me/ses
 ### Task 12: `RevokeSessionDialog`, `SessionRow`, `SessionsSettingsPage`
 
 **Files:**
+
 - Create: `apps/web/src/profile/RevokeSessionDialog.tsx`, `.css`
 - Create: `apps/web/src/profile/SessionRow.tsx`, `.css`
 - Create: `apps/web/src/profile/SessionsSettingsPage.tsx`, `.css`
 - Test: three matching `.test.tsx` files
 
 **Interfaces:**
+
 - `RevokeSessionDialog`: mirrors `LeaveConversationDialog.tsx`'s shell exactly (confirm-only, no form field, focus starts on Cancel). `export default function RevokeSessionDialog({ target, onClose, onConfirm }: { target: "single" | "others"; onClose: () => void; onConfirm: () => Promise<void> }): JSX.Element` — one component parameterized by which action it confirms, rather than two near-identical dialogs.
 - `SessionRow`: `export default function SessionRow({ session, onRevoke }: { session: Session; onRevoke: (id: string) => void }): JSX.Element` — pure display + a "Revogar sessão" button (hidden entirely for `session.current`, per issue §4.3: no revoke control on the current session — that's what app logout is for).
 - `SessionsSettingsPage`: owns the list fetch (loading/error/retry, independent of Profile/Notifications/Security per issue's "falha de uma seção não derruba as demais"), the two confirm-dialog open states, and revalidation after a mutation.
@@ -2325,7 +2491,8 @@ const copy = {
   },
   others: {
     title: "Revogar outras sessões?",
-    description: "Esses dispositivos serão desconectados do NChat e precisarão autenticar novamente.",
+    description:
+      "Esses dispositivos serão desconectados do NChat e precisarão autenticar novamente.",
     confirmLabel: "Revogar sessões",
     pendingLabel: "Revogando…",
   },
@@ -2384,7 +2551,13 @@ describe("SessionRow", () => {
 import "./SessionRow.css";
 import type { Session } from "./sessionsApi";
 
-export default function SessionRow({ session, onRevoke }: { session: Session; onRevoke: (id: string) => void }) {
+export default function SessionRow({
+  session,
+  onRevoke,
+}: {
+  session: Session;
+  onRevoke: (id: string) => void;
+}) {
   return (
     <li className="session-row" data-testid="session-row">
       <div className="session-row__info">
@@ -2392,7 +2565,9 @@ export default function SessionRow({ session, onRevoke }: { session: Session; on
         <p className="session-row__meta">
           {session.ipAddress && <span>{session.ipAddress} (aproximado)</span>}
           <span>
-            {session.current ? "Ativa agora" : `Última atividade em ${new Date(session.lastSeenAt).toLocaleString("pt-BR")}`}
+            {session.current
+              ? "Ativa agora"
+              : `Última atividade em ${new Date(session.lastSeenAt).toLocaleString("pt-BR")}`}
           </span>
         </p>
       </div>
@@ -2425,8 +2600,22 @@ import * as sessionsApi from "./sessionsApi";
 vi.mock("./sessionsApi");
 
 const sessions: sessionsApi.Session[] = [
-  { id: "current", createdAt: "", lastSeenAt: "", ipAddress: "1.2.x.x", userAgent: "Firefox", current: true },
-  { id: "other", createdAt: "", lastSeenAt: "", ipAddress: "3.4.x.x", userAgent: "Chrome", current: false },
+  {
+    id: "current",
+    createdAt: "",
+    lastSeenAt: "",
+    ipAddress: "1.2.x.x",
+    userAgent: "Firefox",
+    current: true,
+  },
+  {
+    id: "other",
+    createdAt: "",
+    lastSeenAt: "",
+    ipAddress: "3.4.x.x",
+    userAgent: "Chrome",
+    current: false,
+  },
 ];
 
 describe("SessionsSettingsPage", () => {
@@ -2438,13 +2627,19 @@ describe("SessionsSettingsPage", () => {
   });
 
   it("shows a retry-capable error independent of other sections", async () => {
-    vi.mocked(sessionsApi.listSessions).mockRejectedValueOnce(new sessionsApi.SessionsApiError("unknown", "x"));
+    vi.mocked(sessionsApi.listSessions).mockRejectedValueOnce(
+      new sessionsApi.SessionsApiError("unknown", "x"),
+    );
     render(<SessionsSettingsPage />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /tentar novamente/i })).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /tentar novamente/i })).toBeInTheDocument(),
+    );
   });
 
   it("revokes a single session through the confirm dialog and relists", async () => {
-    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions).mockResolvedValueOnce([sessions[0]]);
+    vi.mocked(sessionsApi.listSessions)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce([sessions[0]]);
     vi.mocked(sessionsApi.revokeSession).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
@@ -2456,7 +2651,9 @@ describe("SessionsSettingsPage", () => {
   });
 
   it("revokes all others and preserves the current session", async () => {
-    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions).mockResolvedValueOnce([sessions[0]]);
+    vi.mocked(sessionsApi.listSessions)
+      .mockResolvedValueOnce(sessions)
+      .mockResolvedValueOnce([sessions[0]]);
     vi.mocked(sessionsApi.revokeAllOtherSessions).mockResolvedValueOnce(undefined);
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
@@ -2483,7 +2680,10 @@ import { listSessions, revokeAllOtherSessions, revokeSession, type Session } fro
 import RevokeSessionDialog from "./RevokeSessionDialog";
 import SessionRow from "./SessionRow";
 
-type LoadState = { status: "loading" } | { status: "error" } | { status: "ready"; sessions: Session[] };
+type LoadState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; sessions: Session[] };
 type ConfirmState = { target: "single"; sessionId: string } | { target: "others" } | null;
 
 export default function SessionsSettingsPage() {
@@ -2554,7 +2754,11 @@ export default function SessionsSettingsPage() {
       <header className="sessions-settings__header">
         <h1 className="sessions-settings__title">Sessões</h1>
         {hasOtherSessions && (
-          <button type="button" className="sessions-settings__revoke-all" onClick={() => setConfirm({ target: "others" })}>
+          <button
+            type="button"
+            className="sessions-settings__revoke-all"
+            onClick={() => setConfirm({ target: "others" })}
+          >
             Revogar todas as outras
           </button>
         )}
@@ -2592,11 +2796,13 @@ git commit -m "feat(profile): add Sessions settings page backed by real /auth/me
 ### Task 13: `SecuritySettingsPage` + Keycloak account URL config
 
 **Files:**
+
 - Create: `apps/web/src/profile/SecuritySettingsPage.tsx`, `.css`
 - Test: `apps/web/src/profile/SecuritySettingsPage.test.tsx`
 - Modify: `apps/web/.env.example` (or wherever `VITE_AUTH_API_BASE_URL` is documented — check for an existing `.env.example`/`vite-env.d.ts` first)
 
 **Interfaces:**
+
 - Produces: `export default function SecuritySettingsPage(): JSX.Element`
 - New env var: `VITE_KEYCLOAK_ACCOUNT_URL` — trusted build-time config, same convention as `VITE_AUTH_API_BASE_URL` in `profileApi.ts:13`. **Never** constructed from any user input or route param.
 
@@ -2639,7 +2845,9 @@ describe("SecuritySettingsPage", () => {
     vi.stubEnv("VITE_KEYCLOAK_ACCOUNT_URL", "");
     render(<SecuritySettingsPage />);
     expect(screen.queryByRole("link", { name: /gerenciar segurança/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/gerencie senha e autenticação no provedor de identidade/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/gerencie senha e autenticação no provedor de identidade/i),
+    ).toBeInTheDocument();
   });
 
   it("does not claim MFA is enabled or disabled — no fabricated status", () => {
@@ -2711,6 +2919,7 @@ git commit -m "feat(profile): add Security settings page linking to the Keycloak
 ### Task 14: Delete `ProfilePage`, clean up dead code, finish CSS
 
 **Files:**
+
 - Delete: `apps/web/src/profile/ProfilePage.tsx`, `apps/web/src/profile/ProfilePage.css`, `apps/web/src/profile/ProfilePage.test.tsx`
 - Modify: `apps/web/src/App.tsx` (remove the now-unused `ProfilePage` import if any stub remains from Task 2 Step 6)
 - Modify: `apps/web/src/profile/profileApi.ts` (remove `updateDisplayName`, `UpdateDisplayNameError`, `UpdateDisplayNameErrorReason`, `updateProfileFields`, `UpdateProfileFieldsError`, `UpdateProfileFieldsErrorReason`, `ProfileFieldsInput` — superseded by `updateProfile` from Task 4, and `ProfilePage.tsx`, their only caller, no longer exists after this task)
@@ -2741,6 +2950,7 @@ Expected: all pass, zero references to the deleted page/functions remain, no unu
 - [ ] **Step 4: Finish responsive CSS pass**
 
 Verify (manually, in the browser — see Task 17) at 1920×1080, 1366×768, 768×1024, 390×844:
+
 - `ProfileSettingsShell`'s content max-width is ~900–1050px and doesn't stretch edge-to-edge on the wide viewport.
 - `ProfileTabs` doesn't overflow horizontally on 390×844 — if it does, add `overflow-x: auto` with visible focus rings preserved (never `overflow: hidden` that clips focus).
 - `ProfileEditDialog`/`AvatarDialog`/`RevokeSessionDialog` don't get obscured by the mobile virtual keyboard — use `max-height: 90dvh; overflow-y: auto` on the dialog body if not already inherited from the shared dialog CSS pattern.
@@ -2760,6 +2970,7 @@ git commit -m "chore(profile): remove superseded ProfilePage and dead profileApi
 ### Task 15: Update `ChatSidebar.test.tsx` for the menu change, add `AppShell.test.tsx` coverage gaps, full suite pass
 
 **Files:**
+
 - Modify: `apps/web/src/chat/ChatSidebar.test.tsx`
 - Modify/Create: `apps/web/src/chat/AppShell.test.tsx` (fill in any coverage gap flagged by Step 3 below)
 
@@ -2795,6 +3006,7 @@ git commit -m "test(profile): close coverage gaps from the shell extraction and 
 Real Playwright infra already exists at `apps/web/e2e/` (`apps/web/playwright.config.ts`), with an established mocking convention: `page.route("**/api/...", (route) => route.fulfill({...}))` per endpoint, helper functions like `mockLoginSuccess`/`mockChatSidebarApi` in `apps/web/e2e/auth.spec.ts`, and `sessionStorage` keys `nchat_at`/`nchat_rt` for token seeding. Mirror that file's helper style, and `apps/web/e2e/messaging/responsive-layout.spec.ts` for the viewport-resize pattern, rather than inventing new conventions.
 
 **Files:**
+
 - Create: `apps/web/e2e/profile-settings.spec.ts`
 
 - [ ] **Step 1: Read `apps/web/e2e/auth.spec.ts` in full and `apps/web/e2e/messaging/responsive-layout.spec.ts` in full**
@@ -2814,7 +3026,9 @@ test.describe("Profile & account settings (#672)", () => {
     // page.goto("/profile")
   });
 
-  test("opens /profile with the sidebar still present, edits and saves the display name without a reload", async ({ page }) => {
+  test("opens /profile with the sidebar still present, edits and saves the display name without a reload", async ({
+    page,
+  }) => {
     await expect(page.getByTestId("chat-shell")).toBeVisible();
     await page.getByRole("button", { name: "Editar" }).click();
     await page.getByLabel("Nome de exibição").fill("Novo Nome");
@@ -2823,7 +3037,9 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(page.getByRole("heading", { name: "Novo Nome" })).toBeVisible();
   });
 
-  test("changes avatar via AvatarDialog and it reflects in the sidebar footer without reload", async ({ page }) => {
+  test("changes avatar via AvatarDialog and it reflects in the sidebar footer without reload", async ({
+    page,
+  }) => {
     // mock POST /api/auth/me/avatar; assert sidebar footer <img> src updates
   });
 
@@ -2831,8 +3047,15 @@ test.describe("Profile & account settings (#672)", () => {
     // mock DELETE /api/auth/me/avatar; assert initials fallback renders
   });
 
-  test("navigates all four sections via tabs, and each is a real deep link surviving reload", async ({ page }) => {
-    for (const path of ["/profile", "/profile/notifications", "/profile/security", "/profile/sessions"]) {
+  test("navigates all four sections via tabs, and each is a real deep link surviving reload", async ({
+    page,
+  }) => {
+    for (const path of [
+      "/profile",
+      "/profile/notifications",
+      "/profile/security",
+      "/profile/sessions",
+    ]) {
       await page.goto(path);
       await expect(page).toHaveURL(path);
       // one distinguishing assertion per section's own heading
@@ -2853,12 +3076,16 @@ test.describe("Profile & account settings (#672)", () => {
     // toggle each, assert the other's state is unaffected
   });
 
-  test("security: no local password/MFA form exists, and the Keycloak link is present when configured", async ({ page }) => {
+  test("security: no local password/MFA form exists, and the Keycloak link is present when configured", async ({
+    page,
+  }) => {
     await page.goto("/profile/security");
     await expect(page.getByLabel(/senha/i)).toHaveCount(0);
   });
 
-  test("sessions: identifies current session, revokes a remote one, and revoke-all-others preserves current", async ({ page }) => {
+  test("sessions: identifies current session, revokes a remote one, and revoke-all-others preserves current", async ({
+    page,
+  }) => {
     await page.goto("/profile/sessions");
     // mock GET/DELETE /api/auth/me/sessions per the sessionsApi.ts contract from Task 11
     // revoke one row, confirm dialog, assert it's gone from the list
@@ -2873,7 +3100,9 @@ test.describe("Profile & account settings (#672)", () => {
     // never a message implying the session existed under someone else
   });
 
-  test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({ page }) => {
+  test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({
+    page,
+  }) => {
     for (const viewport of [
       { width: 1920, height: 1080 },
       { width: 1366, height: 768 },
@@ -2889,7 +3118,9 @@ test.describe("Profile & account settings (#672)", () => {
     }
   });
 
-  test("full keyboard navigation: tabs, edit dialog open/close/Escape, focus returns to trigger", async ({ page }) => {
+  test("full keyboard navigation: tabs, edit dialog open/close/Escape, focus returns to trigger", async ({
+    page,
+  }) => {
     await page.keyboard.press("Tab"); // ... walk to the tabs and the Editar button entirely via keyboard
     // open ProfileEditDialog with Enter, Escape to close, assert focus is back on "Editar"
   });
@@ -2919,6 +3150,7 @@ No code changes in this task — verification only.
 - [ ] **Step 1: Launch the app and walk the golden path**
 
 Use the `run` skill (or `make dev-web` directly) to start the dev server. In a real browser:
+
 1. Log in, confirm `/chat` still shows the sidebar, WebSocket connects, an existing conversation opens normally.
 2. Click the account menu in the sidebar footer → "Meu perfil" → lands on `/profile` with the sidebar still present and still scrolled/selected where it was.
 3. Confirm no visible WS reconnect / loading flash of the channel list when navigating `/chat` ↔ `/profile` back and forth a few times.

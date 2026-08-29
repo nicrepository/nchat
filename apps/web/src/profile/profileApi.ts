@@ -171,11 +171,11 @@ function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
 }
 
 export interface UpdateProfileInput {
-  displayName: string;
-  jobTitle: string;
-  bio: string;
-  timezone: string;
-  customStatus: string;
+  displayName?: string;
+  jobTitle?: string;
+  bio?: string;
+  timezone?: string;
+  customStatus?: string;
 }
 
 export type UpdateProfileErrorReason = "invalid" | "forbidden" | "unknown";
@@ -190,9 +190,8 @@ export class UpdateProfileError extends Error {
 }
 
 /**
- * Saves display_name, job_title, bio, timezone and custom_status in one PATCH,
- * replacing ProfilePage's former two-form/two-request flow now that a single
- * edit dialog owns all five fields together.
+ * Saves only the fields the caller changed. JSON.stringify omits the undefined
+ * values below, preserving PATCH /auth/me's "absent means unchanged" contract.
  */
 export async function updateProfile(
   fields: UpdateProfileInput,

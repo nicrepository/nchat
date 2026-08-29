@@ -216,6 +216,33 @@ describe("AvatarDialog", () => {
     await waitFor(() => expect(mockRefresh).toHaveBeenCalledTimes(1));
   });
 
+  it("allows only one mutation when upload and remove are clicked in the same tick", () => {
+    mockUpload.mockReturnValue(new Promise(() => {}));
+    mockRemove.mockReturnValue(new Promise(() => {}));
+    render(<AvatarDialog currentAvatarUrl="/api/auth/avatars/old.png" onClose={vi.fn()} />);
+    fireEvent.change(fileInput(), { target: { files: [pngFile()] } });
+
+    act(() => {
+      fireEvent.click(uploadBtn());
+      fireEvent.click(removeBtn());
+    });
+
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    expect(mockRemove).not.toHaveBeenCalled();
+  });
+
+  it("focuses the first action and returns focus to the opener on close", () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const { unmount } = render(<AvatarDialog onClose={vi.fn()} />);
+
+    expect(selectBtn()).toHaveFocus();
+    unmount();
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
   it("closes on Escape when not mid-upload/remove", () => {
     const onClose = vi.fn();
     render(<AvatarDialog onClose={onClose} />);
@@ -286,7 +313,7 @@ describe("AvatarDialog", () => {
     render(<AvatarDialog onClose={onClose} />);
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "a" });
     expect(onClose).not.toHaveBeenCalled();
-    expect(selectBtn()).not.toHaveFocus();
+    expect(selectBtn()).toHaveFocus();
   });
 
   it("does nothing on Tab when focus is on neither the first nor the last enabled button", () => {

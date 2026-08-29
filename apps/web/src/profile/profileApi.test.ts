@@ -219,6 +219,16 @@ describe("updateProfile", () => {
     expect(result.displayName).toBe("Ana");
   });
 
+  it("omits untouched fields so a stale dialog cannot clobber a concurrent edit", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: "u1", display_name: "Nome mais novo" } });
+
+    await updateProfile({ bio: "Bio atualizada" });
+
+    expect(JSON.parse(mockAuthFetch.mock.calls[0][1].body as string)).toEqual({
+      bio: "Bio atualizada",
+    });
+  });
+
   it("maps a 400 to an invalid UpdateProfileError", async () => {
     mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(400, "bad", "bad"));
     await expect(

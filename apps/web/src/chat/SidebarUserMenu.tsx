@@ -2,12 +2,12 @@
  * SidebarUserMenu — the sidebar footer's account menu (issue #672 §9).
  *
  * Replaces a gear icon that was labelled "Configurações" but actually
- * navigated to /admin/users. Its real job is a three-item menu: the profile
- * link that belongs under a settings affordance, the admin link that was
- * mislabeled, and this app's first logout control.
+ * navigated to /admin/users. Its real job is the profile link that belongs
+ * under a settings affordance plus this app's first logout control. The admin
+ * action stays absent until the client has a real capability authority.
  *
  * Mirrors ConversationActionsMenu's trigger+portal+role="menu"+keyboard-nav
- * mechanics, simplified for one static trigger with three fixed items — no
+ * mechanics, simplified for one static trigger with two fixed items — no
  * itemCount-based flip math — and opening above by default, since the footer
  * sits at the bottom of the sidebar.
  */
@@ -178,15 +178,6 @@ export default function SidebarUserMenu() {
               onClick={() => close(false)}
             >
               <span className="chat-sidebar__actions-label">Meu perfil</span>
-            </Link>
-            <Link
-              to="/admin/users"
-              role="menuitem"
-              tabIndex={-1}
-              className="chat-sidebar__actions-item"
-              onClick={() => close(false)}
-            >
-              <span className="chat-sidebar__actions-label">Administração</span>
             </Link>
             <span className="chat-sidebar__actions-separator" role="none" />
             <button

@@ -137,7 +137,8 @@ function ChatNavBar({
  * every future descendant to stay inside a scrollport.
  *
  * Scoped to the shell's lifetime rather than declared on `html` in a
- * stylesheet: login, profile and admin are ordinary documents that scroll.
+ * stylesheet: login and admin are ordinary documents that scroll; profile
+ * uses the shell's own `.profile-settings` scrollport.
  * `useLayoutEffect` so the lock and the reset land in the same frame as the
  * first paint, and the reset is instant — a smooth scroll would animate a jump
  * the user never asked for. Both run once: this is about the surface being
@@ -162,6 +163,9 @@ function useRootScrollLock() {
 export const ROOT_LOCK_CLASS = "chat-root-locked";
 
 export type AppShellOutletContext = ReturnType<typeof useChatSidebar>;
+
+const EMPTY_CHANNELS: Channel[] = [];
+const EMPTY_DMS: DMConversation[] = [];
 
 /** "/profile" or "/profile/..." gets the settings label; everything else (today, only "/chat/...") gets the chat one. */
 function mainAriaLabel(pathname: string): string {
@@ -194,8 +198,8 @@ export default function AppShell() {
   const [sidebarDetails, setSidebarDetails] = useState<
     (SidebarDetailsTarget & { pathname: string }) | null
   >(null);
-  const dms = state.status === "ready" ? state.dms : [];
-  const channels = state.status === "ready" ? state.channels : [];
+  const dms = state.status === "ready" ? state.dms : EMPTY_DMS;
+  const channels = state.status === "ready" ? state.channels : EMPTY_CHANNELS;
   // Two conditions, and both are about the target still being real. The route is
   // part of the panel's identity, so navigating away closes it with no extra
   // render pass; and the conversation must still be in the canonical list, so

@@ -12,6 +12,20 @@ describe("RevokeSessionDialog", () => {
     expect(screen.getByRole("heading")).toHaveTextContent(/revogar sessão\?/i);
   });
 
+  it("returns focus to the opener on close", () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const { unmount } = render(
+      <RevokeSessionDialog target="single" onClose={vi.fn()} onConfirm={vi.fn()} />,
+    );
+
+    unmount();
+
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
   it("shows the 'others' copy and calls onConfirm once, then onClose", async () => {
     let resolveConfirm!: () => void;
     const onConfirm = vi.fn(

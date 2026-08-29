@@ -25,7 +25,7 @@ function renderMenu() {
 }
 
 describe("SidebarUserMenu", () => {
-  it("opens a menu with Meu perfil, Administração and Sair", async () => {
+  it("opens a menu with only authorized account actions", async () => {
     const user = userEvent.setup();
     renderMenu();
     await user.click(screen.getByRole("button", { name: /menu da conta/i }));
@@ -34,10 +34,7 @@ describe("SidebarUserMenu", () => {
       "href",
       "/profile",
     );
-    expect(within(menu).getByRole("menuitem", { name: "Administração" })).toHaveAttribute(
-      "href",
-      "/admin/users",
-    );
+    expect(within(menu).queryByRole("menuitem", { name: "Administração" })).not.toBeInTheDocument();
     expect(within(menu).getByRole("menuitem", { name: "Sair" })).toBeInTheDocument();
   });
 
@@ -91,17 +88,12 @@ describe("SidebarUserMenu", () => {
     expect(items[items.length - 1]).toHaveFocus();
   });
 
-  it("clicking Meu perfil or Administração closes the menu without restoring focus to the trigger", async () => {
+  it("clicking Meu perfil closes the menu without restoring focus to the trigger", async () => {
     const user = userEvent.setup();
     renderMenu();
     const trigger = screen.getByRole("button", { name: /menu da conta/i });
     await user.click(trigger);
     await user.click(screen.getByRole("menuitem", { name: "Meu perfil" }));
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    expect(trigger).not.toHaveFocus();
-
-    await user.click(trigger);
-    await user.click(screen.getByRole("menuitem", { name: "Administração" }));
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
     expect(trigger).not.toHaveFocus();
   });

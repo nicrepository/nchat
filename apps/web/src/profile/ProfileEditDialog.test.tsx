@@ -6,11 +6,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import ProfileEditDialog from "./ProfileEditDialog";
 import * as profileApi from "./profileApi";
 import type { SelfProfile } from "./profileApi";
+import * as selfProfile from "./selfProfile";
 
 vi.mock("./profileApi", async (importOriginal) => ({
   ...(await importOriginal<typeof profileApi>()),
   updateProfile: vi.fn(),
 }));
+vi.mock("./selfProfile", () => ({ refreshSelfProfile: vi.fn() }));
 
 const profile: SelfProfile = {
   id: "u1",
@@ -24,6 +26,7 @@ const profile: SelfProfile = {
 describe("ProfileEditDialog", () => {
   beforeEach(() => {
     vi.mocked(profileApi.updateProfile).mockClear();
+    vi.mocked(selfProfile.refreshSelfProfile).mockClear();
   });
 
   it("disables Salvar alterações until a field changes", async () => {
@@ -94,12 +97,24 @@ describe("ProfileEditDialog", () => {
     expect(screen.getByRole("button", { name: /salvar alterações/i })).toBeEnabled();
   });
 
+  it("sends only fields changed from the loaded profile", async () => {
+    vi.mocked(profileApi.updateProfile).mockResolvedValueOnce({ ...profile, bio: "Nova bio" });
+    const user = userEvent.setup();
+    render(<ProfileEditDialog profile={profile} onClose={vi.fn()} onSaved={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("Biografia"), "Nova bio");
+    await user.click(screen.getByRole("button", { name: /salvar alterações/i }));
+
+    await waitFor(() => expect(profileApi.updateProfile).toHaveBeenCalledWith({ bio: "Nova bio" }));
+  });
+
   it("blocks save and flags Cargo when it exceeds the max length", async () => {
     render(<ProfileEditDialog profile={profile} onClose={vi.fn()} onSaved={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Cargo"), { target: { value: "a".repeat(81) } });
     expect(screen.getByLabelText("Cargo")).toHaveAttribute("aria-invalid", "true");
     fireEvent.click(screen.getByRole("button", { name: /salvar alterações/i }));
     expect(screen.getByRole("alert")).toHaveTextContent(/cargo deve ter no máximo/i);
+    expect(screen.getByLabelText("Cargo")).toHaveFocus();
     expect(profileApi.updateProfile).not.toHaveBeenCalled();
   });
 
@@ -240,7 +255,22 @@ describe("ProfileEditDialog", () => {
     unmount();
     expect(() => resolveUpdate({ ...profile, displayName: "Ana Costa" })).not.toThrow();
     await waitFor(() => expect(profileApi.updateProfile).toHaveBeenCalledTimes(1));
+    expect(selfProfile.refreshSelfProfile).toHaveBeenCalledTimes(1);
     expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the opener when it closes", () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const { unmount } = render(
+      <ProfileEditDialog profile={profile} onClose={vi.fn()} onSaved={vi.fn()} />,
+    );
+
+    unmount();
+
+    expect(opener).toHaveFocus();
+    opener.remove();
   });
 
   it("does not throw when the save rejects after unmount", async () => {

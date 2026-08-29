@@ -10,6 +10,7 @@ import {
   validateTimezone,
 } from "./profileForm";
 import { updateProfile, UpdateProfileError, type SelfProfile } from "./profileApi";
+import { refreshSelfProfile } from "./selfProfile";
 
 // ~419 timezone options; computed once at module scope to avoid rebuilding
 // the entire list on every keystroke in any field.
@@ -40,12 +41,20 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
   const mountedRef = useRef(true);
   const dialogRef = useRef<HTMLDivElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const jobTitleInputRef = useRef<HTMLInputElement>(null);
+  const timezoneInputRef = useRef<HTMLSelectElement>(null);
+  const customStatusInputRef = useRef<HTMLInputElement>(null);
+  const bioInputRef = useRef<HTMLTextAreaElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
+    openerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     nameInputRef.current?.focus();
     return () => {
       mountedRef.current = false;
+      if (openerRef.current?.isConnected) openerRef.current.focus();
     };
   }, []);
 
@@ -81,19 +90,26 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
   const bioError = validateBio(bio);
   const timezoneError = validateTimezone(timezone);
   const customStatusError = validateShortProfileField(customStatus, "Status");
+  const trimmedJobTitle = jobTitle.trim();
+  const trimmedBio = bio.trim();
+  const trimmedCustomStatus = customStatus.trim();
   const dirty =
-    displayName !== profile.displayName ||
-    jobTitle !== (profile.jobTitle ?? "") ||
-    bio !== (profile.bio ?? "") ||
+    trimmedName !== profile.displayName ||
+    trimmedJobTitle !== (profile.jobTitle ?? "") ||
+    trimmedBio !== (profile.bio ?? "") ||
     timezone !== (profile.timezone ?? "") ||
-    customStatus !== (profile.customStatus ?? "");
+    trimmedCustomStatus !== (profile.customStatus ?? "");
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const message = validateDisplayName(trimmedName);
     if (message || jobTitleError || bioError || timezoneError || customStatusError) {
-      setError(message ?? jobTitleError ?? bioError ?? timezoneError ?? customStatusError);
-      nameInputRef.current?.focus();
+      setError(message ?? jobTitleError ?? timezoneError ?? customStatusError ?? bioError);
+      if (message) nameInputRef.current?.focus();
+      else if (jobTitleError) jobTitleInputRef.current?.focus();
+      else if (timezoneError) timezoneInputRef.current?.focus();
+      else if (customStatusError) customStatusInputRef.current?.focus();
+      else bioInputRef.current?.focus();
       return;
     }
     if (submittingRef.current) return;
@@ -102,13 +118,17 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
     setError(null);
     try {
       const saved = await updateProfile({
-        displayName: trimmedName,
-        jobTitle: jobTitle.trim(),
-        bio: bio.trim(),
-        timezone,
-        customStatus: customStatus.trim(),
+        displayName: trimmedName !== profile.displayName ? trimmedName : undefined,
+        jobTitle: trimmedJobTitle !== (profile.jobTitle ?? "") ? trimmedJobTitle : undefined,
+        bio: trimmedBio !== (profile.bio ?? "") ? trimmedBio : undefined,
+        timezone: timezone !== (profile.timezone ?? "") ? timezone : undefined,
+        customStatus:
+          trimmedCustomStatus !== (profile.customStatus ?? "") ? trimmedCustomStatus : undefined,
       });
-      if (!mountedRef.current) return;
+      if (!mountedRef.current) {
+        refreshSelfProfile();
+        return;
+      }
       onSaved(saved);
       onClose();
     } catch (failure) {
@@ -170,6 +190,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             Cargo
           </label>
           <input
+            ref={jobTitleInputRef}
             id="profile-edit-job-title"
             type="text"
             value={jobTitle}
@@ -183,6 +204,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             Fuso horário
           </label>
           <select
+            ref={timezoneInputRef}
             id="profile-edit-timezone"
             value={timezone}
             disabled={pending}
@@ -198,6 +220,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             Status customizado
           </label>
           <input
+            ref={customStatusInputRef}
             id="profile-edit-custom-status"
             type="text"
             value={customStatus}
@@ -211,6 +234,7 @@ export default function ProfileEditDialog({ profile, onClose, onSaved }: Profile
             Biografia
           </label>
           <textarea
+            ref={bioInputRef}
             id="profile-edit-bio"
             value={bio}
             disabled={pending}

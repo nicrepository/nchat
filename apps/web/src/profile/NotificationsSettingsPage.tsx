@@ -63,7 +63,7 @@ export default function NotificationsSettingsPage() {
   return (
     <div className="notifications-settings">
       <header className="notifications-settings__header">
-        <h1 className="notifications-settings__title">Notificações</h1>
+        <h2 className="notifications-settings__title">Notificações</h2>
         <p className="notifications-settings__description">
           Gerencie como você é avisado sobre mensagens, menções e chamadas.
         </p>

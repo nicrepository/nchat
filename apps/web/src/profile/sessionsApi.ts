@@ -87,6 +87,7 @@ export async function revokeSession(sessionId: string, signal?: AbortSignal): Pr
       signal,
     });
   } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 404) return;
     throw mapSessionsError(error);
   }
 }

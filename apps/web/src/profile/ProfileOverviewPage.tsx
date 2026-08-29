@@ -37,7 +37,7 @@ export default function ProfileOverviewPage() {
   return (
     <div className="profile-overview">
       <header className="profile-overview__header">
-        <h1 className="profile-overview__title">Perfil</h1>
+        <h2 className="profile-overview__title">Perfil</h2>
         <p className="profile-overview__description">
           Suas informações, disponibilidade e preferências pessoais.
         </p>

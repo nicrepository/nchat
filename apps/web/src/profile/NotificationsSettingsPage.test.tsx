@@ -45,6 +45,7 @@ describe("NotificationsSettingsPage — sound notification mode", () => {
 
   it("defaults to 'all' checked when nothing is persisted", () => {
     renderPage();
+    expect(screen.getByRole("heading", { name: "Notificações" })).toHaveProperty("tagName", "H2");
     expect(allOption().checked).toBe(true);
     expect(offOption().checked).toBe(false);
     expect(mentionsOption().checked).toBe(false);

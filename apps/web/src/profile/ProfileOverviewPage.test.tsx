@@ -26,7 +26,8 @@ describe("ProfileOverviewPage", () => {
       },
     });
     rerender(<ProfileOverviewPage />);
-    expect(screen.getByRole("heading", { name: "Ana" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Perfil" })).toHaveProperty("tagName", "H2");
+    expect(screen.getByRole("heading", { name: "Ana" })).toHaveProperty("tagName", "H3");
   });
 
   it("shows a retry-capable error state independent of the sidebar/other sections", () => {

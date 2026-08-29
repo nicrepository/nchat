@@ -25,6 +25,7 @@ export default function SessionsSettingsPage() {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [confirm, setConfirm] = useState<ConfirmState>(null);
   const mountedRef = useRef(true);
+  const loadControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -33,25 +34,24 @@ export default function SessionsSettingsPage() {
     };
   }, []);
 
-  // Callers that already know the fetch is starting (a click handler, a
-  // retry, a post-mutation reload) set the loading state themselves before
-  // calling load() — an effect body must not call setState synchronously.
-  const load = useCallback((signal?: AbortSignal) => {
-    listSessions(signal)
+  const load = useCallback(() => {
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
+    listSessions(controller.signal)
       .then((sessions) => {
-        if (signal?.aborted || !mountedRef.current) return;
+        if (controller.signal.aborted || !mountedRef.current) return;
         setState({ status: "ready", sessions });
       })
       .catch(() => {
-        if (signal?.aborted || !mountedRef.current) return;
+        if (controller.signal.aborted || !mountedRef.current) return;
         setState({ status: "error" });
       });
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    load(controller.signal);
-    return () => controller.abort();
+    load();
+    return () => loadControllerRef.current?.abort();
   }, [load]);
 
   function retry() {
@@ -97,7 +97,7 @@ export default function SessionsSettingsPage() {
   return (
     <div className="sessions-settings">
       <header className="sessions-settings__header">
-        <h1 className="sessions-settings__title">Sessões</h1>
+        <h2 className="sessions-settings__title">Sessões</h2>
         {hasOtherSessions && (
           <button
             type="button"
@@ -108,6 +108,10 @@ export default function SessionsSettingsPage() {
           </button>
         )}
       </header>
+      <p className="sessions-settings__scope">
+        Estas são sessões do NChat. Revogá-las encerra o acesso ao NChat, mas não encerra a sessão
+        no provedor de identidade.
+      </p>
       <ul className="sessions-settings__list">
         {sessions.map((session) => (
           <SessionRow

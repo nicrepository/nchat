@@ -16,6 +16,7 @@ const profile: SelfProfile = {
 describe("ProfileInfoCard", () => {
   it("renders job title and timezone as a two-column definition list", () => {
     render(<ProfileInfoCard profile={profile} />);
+    expect(screen.getByRole("heading", { name: "Informações" })).toHaveProperty("tagName", "H3");
     expect(screen.getByText("Cargo")).toBeInTheDocument();
     expect(screen.getByText("Engenheira")).toBeInTheDocument();
     expect(screen.getByText("Fuso horário")).toBeInTheDocument();

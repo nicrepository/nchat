@@ -54,13 +54,17 @@ export default function RevokeSessionDialog({
   // click fired in the same tick. This ref is what actually makes submit single.
   const submittingRef = useRef(false);
   const mountedRef = useRef(true);
+  const openerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
+    openerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     // The safe action holds focus.
     cancelRef.current?.focus();
     return () => {
       mountedRef.current = false;
+      if (openerRef.current?.isConnected) openerRef.current.focus();
     };
   }, []);
 

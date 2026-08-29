@@ -23,12 +23,16 @@ const profile: SelfProfile = {
 describe("ProfileIdentityCard", () => {
   it("shows name, cargo, presence, timezone, bio and custom status", () => {
     render(<ProfileIdentityCard profile={profile} onEdit={vi.fn()} onChangePhoto={vi.fn()} />);
-    expect(screen.getByRole("heading", { name: "Ana Costa" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Ana Costa" })).toHaveProperty("tagName", "H3");
     expect(screen.getByText("Infraestrutura & Segurança")).toBeInTheDocument();
     expect(screen.getByText("Online")).toBeInTheDocument();
     expect(screen.getByText("America/Sao_Paulo")).toBeInTheDocument();
     expect(screen.getByText("Trabalho com plataforma.")).toBeInTheDocument();
     expect(screen.getByText("🚀 Focada no deploy")).toBeInTheDocument();
+    expect(document.querySelector(".profile-identity__avatar")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
   });
 
   it("omits empty optional fields instead of rendering a placeholder", () => {

@@ -9,7 +9,7 @@ export default function ProfileInfoCard({ profile }: { profile: SelfProfile }) {
 
   return (
     <section className="profile-info" aria-label="Informações">
-      <h2 className="profile-info__title">Informações</h2>
+      <h3 className="profile-info__title">Informações</h3>
       <dl className="profile-info__grid">
         {rows.map((row) => (
           <div className="profile-info__row" key={row.label}>

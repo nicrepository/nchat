@@ -48,18 +48,22 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
   const [selectionError, setSelectionError] = useState<string | null>(null);
   const [networkError, setNetworkError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // State updates are asynchronous, so `uploading`/`removing` alone cannot
-  // stop a second click fired in the same tick; these refs make each
-  // mutation single, matching RenameChannelDialog's submittingRef.
-  const uploadingRef = useRef(false);
-  const removingRef = useRef(false);
+  // One guard for both mutually exclusive mutations. Separate guards allow an
+  // upload and a removal fired in the same React batch to race each other.
+  const mutationRef = useRef(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(true);
+  const selectButtonRef = useRef<HTMLButtonElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
+    openerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    selectButtonRef.current?.focus();
     return () => {
       mountedRef.current = false;
+      if (openerRef.current?.isConnected) openerRef.current.focus();
     };
   }, []);
 
@@ -87,7 +91,7 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
 
   function requestClose() {
     // Closing mid-mutation would leave the user unable to see whether it landed.
-    if (!uploadingRef.current && !removingRef.current) onClose();
+    if (!mutationRef.current) onClose();
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -136,8 +140,8 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
   );
 
   const onUpload = useCallback(async () => {
-    if (!selectedFile || uploadingRef.current) return;
-    uploadingRef.current = true;
+    if (!selectedFile || mutationRef.current) return;
+    mutationRef.current = true;
     setUploading(true);
     setNetworkError(null);
     try {
@@ -152,28 +156,30 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
         error instanceof AvatarUploadError ? error.message : "Não foi possível enviar o avatar.",
       );
     } finally {
-      uploadingRef.current = false;
+      mutationRef.current = false;
       if (mountedRef.current) setUploading(false);
     }
   }, [selectedFile, onClose]);
 
   const onRemove = useCallback(async () => {
-    if (removingRef.current) return;
-    removingRef.current = true;
+    if (mutationRef.current) return;
+    mutationRef.current = true;
     setRemoving(true);
     setNetworkError(null);
     try {
       await removeAvatar();
       refreshSelfProfile();
-      discardSelection();
-      if (mountedRef.current) onClose();
+      if (mountedRef.current) {
+        discardSelection();
+        onClose();
+      }
     } catch (error) {
       if (!mountedRef.current) return;
       setNetworkError(
         error instanceof AvatarUploadError ? error.message : "Não foi possível remover o avatar.",
       );
     } finally {
-      removingRef.current = false;
+      mutationRef.current = false;
       if (mountedRef.current) setRemoving(false);
     }
   }, [discardSelection, onClose]);
@@ -225,6 +231,7 @@ export default function AvatarDialog({ currentAvatarUrl, onClose }: AvatarDialog
         />
         <div className="avatar-dialog__actions">
           <button
+            ref={selectButtonRef}
             type="button"
             className="avatar-dialog__btn"
             onClick={() => fileInputRef.current?.click()}

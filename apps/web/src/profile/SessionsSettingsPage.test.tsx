@@ -1,5 +1,6 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import SessionsSettingsPage from "./SessionsSettingsPage";
@@ -35,7 +36,16 @@ describe("SessionsSettingsPage", () => {
     vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions);
     render(<SessionsSettingsPage />);
     await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(2));
+    expect(screen.getByRole("heading", { name: "Sessões" })).toHaveProperty("tagName", "H2");
     expect(screen.getByText("Sessão atual")).toBeInTheDocument();
+  });
+
+  it("states that revocation affects NChat sessions, not the identity provider", async () => {
+    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions);
+    render(<SessionsSettingsPage />);
+    expect(
+      await screen.findByText(/não encerra a sessão no provedor de identidade/i),
+    ).toBeInTheDocument();
   });
 
   it("shows a retry-capable error independent of other sections", async () => {
@@ -46,6 +56,28 @@ describe("SessionsSettingsPage", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /tentar novamente/i })).toBeInTheDocument(),
     );
+  });
+
+  it("ignores a stale retry response that finishes after a newer one", async () => {
+    let resolveOlder!: (value: sessionsApi.Session[]) => void;
+    let resolveNewer!: (value: sessionsApi.Session[]) => void;
+    vi.mocked(sessionsApi.listSessions)
+      .mockRejectedValueOnce(new Error("initial failure"))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveOlder = resolve)))
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveNewer = resolve)));
+    render(<SessionsSettingsPage />);
+    const retry = await screen.findByRole("button", { name: /tentar novamente/i });
+
+    act(() => {
+      fireEvent.click(retry);
+      fireEvent.click(retry);
+    });
+    await act(async () => resolveNewer([sessions[0]]));
+    await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(1));
+    await act(async () => resolveOlder(sessions));
+
+    expect(screen.getAllByTestId("session-row")).toHaveLength(1);
+    expect(screen.queryByText("Chrome")).not.toBeInTheDocument();
   });
 
   it("revokes a single session through the confirm dialog and relists", async () => {

@@ -21,34 +21,6 @@
   border-radius: 12px;
 }
 
-.security-settings__grid {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  margin-bottom: 20px;
-}
-
-.security-settings__row {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.security-settings__row dt {
-  font-size: 14px;
-  font-weight: 600;
-  color: #6b7280;
-  margin: 0;
-}
-
-.security-settings__row dd {
-  font-size: 14px;
-  color: #16121f;
-  margin: 0;
-}
-
 .security-settings__note {
   margin: 0 0 16px;
   font-size: 14px;
@@ -82,14 +54,6 @@
 @media (prefers-color-scheme: dark) {
   .security-settings__card {
     border-color: rgba(255, 255, 255, 0.12);
-  }
-
-  .security-settings__row dt {
-    color: #d1d5db;
-  }
-
-  .security-settings__row dd {
-    color: #f3f4f6;
   }
 
   .security-settings__note {

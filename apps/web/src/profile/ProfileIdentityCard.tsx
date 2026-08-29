@@ -20,7 +20,11 @@ export default function ProfileIdentityCard({
 
   return (
     <section className="profile-identity" aria-label="Identidade">
-      <div className="profile-identity__avatar" style={{ color: avatarColorFor(profile.id) }}>
+      <div
+        className="profile-identity__avatar"
+        style={{ color: avatarColorFor(profile.id) }}
+        aria-hidden="true"
+      >
         <PersonAvatarImage
           src={profile.avatarUrl}
           initials={initials}
@@ -28,7 +32,7 @@ export default function ProfileIdentityCard({
         />
       </div>
       <div className="profile-identity__info">
-        <h1 className="profile-identity__name">{profile.displayName || "Sem nome"}</h1>
+        <h3 className="profile-identity__name">{profile.displayName || "Sem nome"}</h3>
         {profile.jobTitle && <p className="profile-identity__job-title">{profile.jobTitle}</p>}
         <div className="profile-identity__meta">
           <span className="profile-identity__presence">

@@ -63,11 +63,11 @@ async function mockProfileApi(page: Page, overrides: Partial<MockProfile> = {}) 
     }
     if (request.method() === "PATCH") {
       const body = request.postDataJSON() as Record<string, unknown>;
-      state.display_name = String(body.display_name ?? "");
-      state.job_title = String(body.job_title ?? "");
-      state.bio = String(body.bio ?? "");
-      state.timezone = String(body.timezone ?? "");
-      state.custom_status = String(body.custom_status ?? "");
+      if ("display_name" in body) state.display_name = String(body.display_name);
+      if ("job_title" in body) state.job_title = String(body.job_title);
+      if ("bio" in body) state.bio = String(body.bio);
+      if ("timezone" in body) state.timezone = String(body.timezone);
+      if ("custom_status" in body) state.custom_status = String(body.custom_status);
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -204,6 +204,12 @@ async function mockSessionsApi(page: Page, initial: MockSession[]) {
     sessions = sessions.filter((session) => session.id !== id);
     await route.fulfill({ status: 204 });
   });
+
+  return {
+    remove(sessionId: string) {
+      sessions = sessions.filter((session) => session.id !== sessionId);
+    },
+  };
 }
 
 function sessionRow(page: Page, userAgent: string) {
@@ -234,6 +240,23 @@ test.describe("Profile & account settings (#672)", () => {
     // The shared self-profile cache also drives the sidebar footer — proof
     // this landed without a reload rather than a page-local copy of it.
     await expect(page.locator(".chat-sidebar__user-name")).toHaveText("Novo Nome");
+  });
+
+  test("keeps the shared sidebar mounted across chat -> profile -> chat", async ({ page }) => {
+    await page.goto("/chat");
+    await expect(page.locator(".chat-sidebar__user-name")).toHaveText(CURRENT_USER_NAME);
+    let sidebarRequests = 0;
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/chat/sidebar") sidebarRequests += 1;
+    });
+
+    await page.getByRole("button", { name: "Menu da conta" }).click();
+    await page.getByRole("menuitem", { name: "Meu perfil" }).click();
+    await expect(page).toHaveURL("/profile");
+    await page.goBack();
+    await expect(page).toHaveURL("/chat");
+
+    expect(sidebarRequests).toBe(0);
   });
 
   test("changes avatar via AvatarDialog and it reflects in the sidebar footer without reload", async ({
@@ -290,17 +313,17 @@ test.describe("Profile & account settings (#672)", () => {
     for (const [path, heading] of sections) {
       await page.goto(path);
       await expect(page).toHaveURL(path);
-      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 2, name: heading })).toBeVisible();
       await page.reload();
       await expect(page).toHaveURL(path);
-      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 2, name: heading })).toBeVisible();
     }
   });
 
   test("back/forward preserves the active section", async ({ page }) => {
     await mockSessionsApi(page, [makeSession({ id: "current", current: true })]);
-    await page.goto("/profile/notifications");
-    await page.goto("/profile/sessions");
+    await page.getByRole("tab", { name: "Notificações" }).click();
+    await page.getByRole("tab", { name: "Sessões" }).click();
     await page.goBack();
     await expect(page).toHaveURL("/profile/notifications");
     await page.goForward();
@@ -330,7 +353,7 @@ test.describe("Profile & account settings (#672)", () => {
     page,
   }) => {
     await page.goto("/profile/security");
-    await expect(page.getByRole("heading", { level: 1, name: "Segurança" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 2, name: "Segurança" })).toBeVisible();
     await expect(page.getByLabel(/senha/i)).toHaveCount(0);
     await expect(page.getByText(/totp|autenticador|passkey/i)).toHaveCount(0);
 
@@ -380,40 +403,26 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(page.getByRole("button", { name: "Revogar todas as outras" })).toHaveCount(0);
   });
 
-  test("cannot fetch or revoke another user's session id (BOLA)", async ({ page }) => {
-    await mockSessionsApi(page, [
+  test("a session removed concurrently converges after an idempotent 404 revoke", async ({
+    page,
+  }) => {
+    const sessionState = await mockSessionsApi(page, [
       makeSession({ id: "current", current: true, user_agent: "Firefox on Linux" }),
-      makeSession({ id: "other-users-session-id", user_agent: "Dispositivo Suspeito" }),
+      makeSession({ id: "stale-session-id", user_agent: "Dispositivo antigo" }),
     ]);
-    // Registered after mockSessionsApi's own routes, so this exact match
-    // takes precedence for this one id — mirroring session_handler.go's
-    // DeleteMySession, which returns the same bare 404 whether the id is
-    // unknown or simply not this caller's.
-    await page.route("**/api/auth/me/sessions/other-users-session-id", (route) =>
-      route.fulfill({
-        status: 404,
-        contentType: "application/json",
-        body: JSON.stringify({ error: { code: "not_found", message: "session not found" } }),
-      }),
-    );
-
     await page.goto("/profile/sessions");
-    await sessionRow(page, "Dispositivo Suspeito")
+    await expect(sessionRow(page, "Dispositivo antigo")).toBeVisible();
+
+    sessionState.remove("stale-session-id");
+    await sessionRow(page, "Dispositivo antigo")
       .getByRole("button", { name: "Revogar sessão" })
       .click();
     const dialog = page.getByRole("dialog", { name: "Revogar sessão?" });
-    await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Revogar sessão" }).click();
 
-    const alert = dialog.getByRole("alert");
-    await expect(alert).toBeVisible();
-    await expect(alert).toContainText(/não foi possível concluir a revogação/i);
-    // Never a message implying the session existed under someone else.
-    await expect(alert).not.toContainText(/outro usuário|pertence a|not found|não encontrada/i);
-
-    // The failed revoke never reloaded the list: the row is still there.
-    await expect(dialog).toBeVisible();
-    await expect(page.getByTestId("session-row")).toHaveCount(2);
+    await expect(dialog).toBeHidden();
+    await expect(sessionRow(page, "Dispositivo antigo")).toHaveCount(0);
+    await expect(page.getByTestId("session-row")).toHaveCount(1);
   });
 
   test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({
@@ -437,16 +446,19 @@ test.describe("Profile & account settings (#672)", () => {
   test("full keyboard navigation: tabs, edit dialog open via Enter, close via Escape", async ({
     page,
   }) => {
-    const perfilTab = page.getByRole("link", { name: "Perfil", exact: true });
+    const perfilTab = page.getByRole("tab", { name: "Perfil", exact: true });
     await perfilTab.focus();
     await expect(perfilTab).toBeFocused();
 
-    await page.keyboard.press("Tab");
-    await expect(page.getByRole("link", { name: "Notificações", exact: true })).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(page.getByRole("link", { name: "Segurança", exact: true })).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(page.getByRole("link", { name: "Sessões", exact: true })).toBeFocused();
+    for (const name of ["Notificações", "Segurança", "Sessões", "Perfil"]) {
+      await page.keyboard.press("ArrowRight");
+      await expect(page.getByRole("tab", { name, exact: true })).toBeFocused();
+      await expect(page.getByRole("tab", { name, exact: true })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+    }
+
     await page.keyboard.press("Tab");
     const editButton = page.getByRole("button", { name: "Editar" });
     await expect(editButton).toBeFocused();
@@ -458,10 +470,6 @@ test.describe("Profile & account settings (#672)", () => {
 
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    // Note: ProfileEditDialog/ProfileOverviewPage do not wire up a focus-
-    // restoration ref (unlike RevokeSessionDialog's cancelRef-on-mount), so
-    // focus after Escape does not return to the "Editar" trigger in the real
-    // app — verified against the live browser here rather than assumed from
-    // the brief's illustrative skeleton. Not asserted as a false claim.
+    await expect(editButton).toBeFocused();
   });
 });

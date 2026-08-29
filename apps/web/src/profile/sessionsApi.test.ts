@@ -111,6 +111,14 @@ describe("sessionsApi", () => {
     });
   });
 
+  it("treats a stale 404 revoke as an idempotent success", async () => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(
+      new ApiRequestError(404, "not_found", "already gone"),
+    );
+
+    await expect(revokeSession("stale-session")).resolves.toBeUndefined();
+  });
+
   it("maps an ApiRequestError with an unhandled status to SessionsApiError('unknown')", async () => {
     vi.mocked(authenticatedFetch).mockRejectedValueOnce(
       new ApiRequestError(500, "server_error", "boom"),
