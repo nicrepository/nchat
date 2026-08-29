@@ -962,6 +962,161 @@ pass
 
 
 echo
+echo "--- namespace gate ---"
+
+# The gate must be satisfiable by the production deploy identity, which holds a
+# namespaced Role and no cluster-scoped permission whatsoever (SEC03). Reading
+# the `namespaces` resource is therefore not a check these scripts may perform,
+# and the fake kubectl records any attempt so a reintroduction fails here.
+assert_no_cluster_scoped_read() {
+  [[ ! -f "$1/cluster-scoped-log" ]] ||
+    fail "read a cluster-scoped resource: $(tr '\n' ';' <"$1/cluster-scoped-log")"
+}
+
+begin "the namespace gate never reads the cluster-scoped namespaces resource"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/status.sh" || status=$?
+expect_exit 0 "$status"
+assert_no_cluster_scoped_read "$state"
+pass
+
+begin "no production script asks for a namespace object"
+# Comments are stripped first: this file and lib.sh both have to be able to
+# name the call they refuse without the check reading its own prose as code.
+sed 's/#.*//' "$SCRIPTS"/*.sh |
+  grep -nE 'kubectl[^|]*get[[:space:]]+(-[^[:space:]]+[[:space:]]+)*namespaces?\b' &&
+  fail "a script reads the cluster-scoped namespaces resource"
+pass
+
+begin "deploy passes the gate without a cluster-scoped read"
+state="$(new_state blue "blue green")"
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 0 "$status"
+assert_no_cluster_scoped_read "$state"
+pass
+
+begin "cutover passes the gate without a cluster-scoped read"
+state="$(new_state blue "blue green")"
+SMOKE="green:$RELEASE_A" status=0; run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+assert_no_cluster_scoped_read "$state"
+pass
+
+begin "rollback passes the gate without a cluster-scoped read"
+state="$(new_state green "blue green")"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" blue
+assert_no_cluster_scoped_read "$state"
+pass
+
+# The gate refuses three different answers from the API, and the fixture has to
+# be able to produce them apart or the cases below all prove the same thing.
+# This asserts the fake's own contract, once, so the script cases that follow
+# can each name the situation they exercise.
+assert_fake_services_error() {
+  local result="$1" pattern="$2" state="$3" status=0
+  printf '%s' "$result" >"$state/services-list-result"
+  FAKE_STATE_DIR="$state" kubectl get services -n nchat-prod \
+    >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+  [[ "$status" -ne 0 ]] || fail "$result answered the listing with success"
+  grep -q "$pattern" "$WORK/err.txt" ||
+    fail "$result did not answer '$pattern': $(cat "$WORK/err.txt")"
+}
+
+begin "the fake answers NotFound, Forbidden and an API error apart"
+state="$(new_state blue "blue green")"
+assert_fake_services_error not-found 'NotFound' "$state"
+! grep -q 'Forbidden' "$WORK/err.txt" || fail "NotFound and Forbidden are the same answer"
+assert_fake_services_error forbidden 'Forbidden' "$state"
+! grep -q 'NotFound' "$WORK/err.txt" || fail "Forbidden and NotFound are the same answer"
+assert_fake_services_error api-error 'Unable to connect to the server' "$state"
+! grep -qE 'NotFound|Forbidden' "$WORK/err.txt" ||
+  fail "a transport error was answered as an authorisation decision"
+pass
+
+# An unset result is the ordinary namespace, and an unrecognised one is still a
+# failure: a typo in a fixture must not become a passing read.
+begin "an unrecognised listing result is refused, not silently accepted"
+state="$(new_state blue "blue green")"
+printf 'sucess' >"$state/services-list-result"
+status=0; run "$state" "$SCRIPTS/status.sh" || status=$?
+expect_exit 1 "$status"
+pass
+
+# The three failures, one per production flow, each proving the flow stopped at
+# the gate and mutated nothing after it.
+begin "deploy stops when the API reports the namespace NotFound"
+state="$(new_state blue "blue green")"
+printf 'not-found' >"$state/services-list-result"
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 1 "$status"
+grep -q "does not exist or is not readable" "$WORK/err.txt" || fail "did not report the namespace gate"
+[[ ! -f "$state/apply-log" ]] || fail "applied a manifest after the gate had failed"
+[[ ! -f "$state/wait-log" ]] || fail "waited on a migration after the gate had failed"
+pass
+
+begin "cutover stops when the namespaced read is Forbidden"
+state="$(new_state blue "blue green")"
+printf 'forbidden' >"$state/services-list-result"
+SMOKE="green:$RELEASE_A" status=0; run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+grep -q "does not exist or is not readable" "$WORK/err.txt" || fail "did not fail closed on a refused read"
+[[ ! -s "$state/patch-log" ]] || fail "patched a Service after the gate had failed"
+assert_all_on "$state" blue
+pass
+
+begin "rollback stops when the API cannot be reached at all"
+state="$(new_state green "blue green")"
+printf 'api-error' >"$state/services-list-result"
+status=0; run "$state" "$SCRIPTS/rollback.sh" --target blue "5xx after cutover" || status=$?
+expect_exit 1 "$status"
+grep -q "does not exist or is not readable" "$WORK/err.txt" || fail "did not report the namespace gate"
+[[ ! -s "$state/patch-log" ]] || fail "patched a Service after the gate had failed"
+assert_all_on "$state" green
+pass
+
+begin "every failed listing is fail-closed, whatever the API answered"
+state="$(new_state blue "blue green")"
+for result in not-found forbidden api-error; do
+  printf '%s' "$result" >"$state/services-list-result"
+  status=0; run "$state" "$SCRIPTS/status.sh" || status=$?
+  expect_exit 1 "$status"
+  grep -q "does not exist or is not readable" "$WORK/err.txt" ||
+    fail "$result was not reported as an unusable namespace"
+done
+pass
+
+# The namespace being wrong is a separate claim, and it is made without
+# injecting any failure: the fixture answers for its own namespace and no other,
+# so a rehearsal pointed somewhere else is refused rather than quietly answered
+# by whatever namespace the kubeconfig happens to select.
+begin "the gate never falls back to another namespace"
+state="$(new_state blue "blue green")"
+[[ ! -f "$state/services-list-result" ]] || fail "the fixture injected a failure into this case"
+export NCHAT_PROD_NAMESPACE=default
+SMOKE="blue:$RELEASE_A" status=0; run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+unset NCHAT_PROD_NAMESPACE
+expect_exit 1 "$status"
+grep -q "namespace 'default' does not exist or is not readable" "$WORK/err.txt" ||
+  fail "accepted a namespace the identity was not bound to"
+[[ ! -s "$state/patch-log" ]] || fail "patched a Service in the wrong namespace"
+assert_all_on "$state" blue
+pass
+
+begin "the context gate still refuses an unexpected cluster"
+state="$(new_state blue "blue green")"
+printf 'some-other-cluster' >"$state/context"
+SMOKE="green:$RELEASE_A" status=0; run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+grep -q "expected 'nchat-prod-deployer'" "$WORK/err.txt" || fail "did not refuse the context"
+[[ ! -s "$state/patch-log" ]] || fail "patched a Service in the wrong cluster"
+assert_all_on "$state" blue
+pass
+
+
+echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "production blue/green script tests failed with $FAILURES failure(s)." >&2
   exit 1
