@@ -16,6 +16,11 @@
 #   namespace            the one namespace this identity may read
 #   services-list-result how `get services` answers: absent or "success" for the
 #                        ordinary case, else not-found | forbidden | api-error
+#   context-fails        "1" makes `config current-context` fail, as an
+#                        unreachable API does
+#   deny-cluster-wide    "1" refuses `get nodes` and `get pods --all-namespaces`,
+#                        as the namespaced production deploy identity is refused
+#   cluster-wide-log     every attempt at either, refused or not
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
@@ -33,7 +38,15 @@ namespace_arg() {
 }
 
 # kubectl config current-context
+#
+# context-fails stands for an API the client cannot reach: kubectl exits
+# non-zero and prints nothing, which is what a caller reading it through a
+# command substitution has to notice on its own.
 if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
+  if [[ "$(read_state context-fails)" == "1" ]]; then
+    echo "error: current-context is not set" >&2
+    exit 1
+  fi
   read_state context
   exit 0
 fi
@@ -185,22 +198,57 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployments" ]]; then
   exit 0
 fi
 
+# Reads that reach beyond nchat-prod: the Nodes, and Pods in every namespace.
+#
+# Every attempt is recorded in cluster-wide-log whether or not it is refused, so
+# a test can assert that a run made none. `deny-cluster-wide` then makes this
+# fake behave like the production deploy identity, which holds a namespaced Role
+# and is refused both -- the identity the capacity gate has to work under, and
+# the one nobody can run the suite as.
+#
+# Separate from cluster-scoped-log, which stays reserved for the `namespaces`
+# resource the namespace gate must never ask for.
+cluster_wide_read() {
+  printf '%s\n' "$*" >>"$STATE/cluster-wide-log"
+  if [[ "$(read_state deny-cluster-wide)" == "1" ]]; then
+    echo "Error from server (Forbidden): $2 is forbidden: User \"system:serviceaccount:nchat-prod:nchat-prod-deployer\" cannot list resource \"$2\" at the cluster scope" >&2
+    exit 1
+  fi
+}
+
 if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then
+  cluster_wide_read "$@"
   read_state node-allocatable
   exit 0
 fi
 
-if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
-  # Two shapes: per-container request lines, and one line per Pod for slots.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"--all-namespaces"* ]]; then
+  cluster_wide_read "$@"
+  # Two shapes, told apart by the one token only the request template carries.
+  #
+  # Both jsonpaths open with "<phase>|", so a pattern on that matched the
+  # request query as well and answered it with the one-field-per-Pod slots file.
+  # Nothing noticed until the parser started refusing a line of the wrong shape:
+  # a request line short of its resources column read as a container that
+  # reserves nothing, which is the direction that hides commitment.
   case "$*" in
-    *"status.phase}|"*) read_state cluster-pod-slots ;;
-    *) read_state cluster-pods ;;
+    *"resources.requests"*) read_state cluster-pods ;;
+    *) read_state cluster-pod-slots ;;
   esac
+  exit 0
+fi
+
+# Any other Pod listing is namespaced diagnostics; the scripts only ever print it.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
+  echo "(fake namespaced pod listing)"
   exit 0
 fi
 
 # Secrets: present when the fixture created the marker file.
 if [[ "${1:-}" == "get" && "${2:-}" == "secret" ]]; then
+  # Recorded so a flow can assert it read none: the deploy identity is not
+  # allowed to read Secrets, and nothing here may start.
+  printf '%s\n' "$*" >>"$STATE/secret-read-log"
   [[ -f "$STATE/secrets/${3:-}" ]] || exit 1
   echo "secret/${3:-} found"
   exit 0

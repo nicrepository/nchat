@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
+.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-capacity-evidence prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci
 
 help:
 	@echo "NChat development commands"
@@ -70,6 +70,7 @@ help:
 	@echo "  make prod-blue-green-test    Run production Blue/Green script tests (CI-safe)"
 	@echo "  make prod-blue-green-query-test Run manifest reader unit tests (CI-safe)"
 	@echo "  make prod-capacity-test      Run capacity preflight fixtures (CI-safe)"
+	@echo "  make prod-capacity-evidence  Collect cluster capacity evidence: ARGS=\"<output-dir>\""
 	@echo "  make prod-blue-green-status  Show the production release slots (requires cluster)"
 	@echo "  make prod-blue-green-bootstrap Establish production with Blue as baseline (requires cluster)"
 	@echo "  make prod-blue-green-deploy  Deploy the release into the candidate slot (requires cluster)"
@@ -351,6 +352,13 @@ prod-blue-green-query-test:
 
 prod-capacity-test:
 	pnpm prod:capacity:test
+
+# Collects the cluster-wide half of the capacity preflight. Run from a context
+# that may read Nodes and Pods across namespaces -- not the deploy identity,
+# which is namespaced and refused both.
+#   make prod-capacity-evidence ARGS=/secure/path/capacity-evidence
+prod-capacity-evidence:
+	pnpm prod:capacity:evidence $(ARGS)
 
 # The operational targets below act on a real production cluster. Each script
 # validates the kube context and refuses an unexpected one; ARGS carries the

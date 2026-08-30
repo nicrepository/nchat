@@ -98,6 +98,7 @@
     "prod:blue-green:test": "bash scripts/ci/test_prod_blue_green_scripts.sh",
     "prod:blue-green:query-test": "python3 scripts/ci/test_prod_blue_green_query.py",
     "prod:capacity:test": "bash scripts/ci/test_prod_capacity_preflight.sh",
+    "prod:capacity:evidence": "bash scripts/deploy/nchat-prod/capacity-evidence.sh",
     "migrations:blue-green:test": "bash scripts/ci/test_blue_green_migration_gate.sh",
     "prod:blue-green:status": "bash scripts/deploy/nchat-prod/status.sh",
     "prod:blue-green:bootstrap": "bash scripts/deploy/nchat-prod/bootstrap.sh",

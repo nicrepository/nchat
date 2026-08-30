@@ -877,6 +877,102 @@ If the cluster does not report a dimension it prints `INCONCLUSIVE` and the
 deploy stops. Verify by hand and re-run with
 `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1`.
 
+### Capacity evidence (the deploy identity is namespaced)
+
+Three of the four inputs — the nodes' allocatable capacity, and the Pods of
+every namespace — are cluster-scoped reads. `nchat-prod-deployer` holds a Role
+in `nchat-prod` and nothing cluster-scoped, so it is refused `kubectl get nodes`
+and `kubectl get pods --all-namespaces`, and under that identity the preflight
+reports `INCONCLUSIVE` on every cluster dimension.
+
+Answering from `nchat-prod` alone is not the fix. The node these workloads share
+sits at ~94% of its CPU requests and most of that belongs to other namespaces; a
+namespace-only view would report room that is not there. Nor is widening the
+Role: a capacity check is not a reason to give a deploy identity cluster-wide
+read.
+
+So collection is separated from evaluation. A context that **may** read those
+resources — a cluster administrator, or a read-only identity kept for the
+purpose — takes the snapshot; the deploy consumes it and consults the API only
+for what it is already allowed to see.
+
+```bash
+# 1. as the trusted read-only context
+make prod-capacity-evidence ARGS=/secure/path/capacity-evidence
+
+# 2. as nchat-prod-deployer, within 15 minutes
+NCHAT_PROD_CAPACITY_EVIDENCE_DIR=/secure/path/capacity-evidence \
+NCHAT_PROD_RELEASE_SHA=<40-hex> \
+NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
+ARTIFACTS_DIR=./artifacts \
+make prod-blue-green-deploy
+```
+
+The directory holds `node-allocatable.txt`, `cluster-requests.txt`,
+`cluster-pods.txt` — the same lines the live collection produces —
+`sha256sums.txt`, and a `metadata` record naming the schema, the collection
+instant in UTC, the namespace it was collected for and the context that produced
+it. It is a snapshot of other namespaces: keep it outside the repository and do
+not commit it.
+
+Leaving `NCHAT_PROD_CAPACITY_EVIDENCE_DIR` unset keeps the previous behaviour,
+which is what a rehearsal cluster or an administrator running the deploy by hand
+should use.
+
+**What the evidence is trusted on.** The checksums detect a truncated or edited
+file. They are **not** authenticity — anything that can write the directory can
+write a matching `sha256sums.txt`. The evidence is believed because of where it
+came from: a collection the operator ran, or later a controlled CI artifact
+produced by a job with its own read-only credentials. Point the deploy only at a
+directory you produced or received through such a channel. Schema, freshness and
+the namespace binding narrow the window in which a stale or foreign snapshot is
+accepted; they do not make an untrusted directory safe.
+
+The gate stops the deploy — before the migration and before any `kubectl apply`
+— when the evidence is absent, incomplete, empty, dated more than
+`NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS` (900) ago or more than 60 seconds
+in the future (the clock-skew allowance), collected for another namespace, of an
+unknown schema, does not match its checksums, or reaches the deploy through a
+symlink. `NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS` itself must be a
+non-negative decimal integer of at most 18 digits; anything else is refused as a
+misconfiguration rather than reaching the comparison.
+
+**A failed refresh withdraws what was there.** Re-collecting into a directory
+that already holds evidence invalidates it before the collection starts, and the
+new snapshot is only accepted once every file, the metadata and the checksums
+are in place. So a refresh that fails — the cluster unreachable, the read
+refused, a resource that came back empty — leaves that destination **unusable**
+rather than leaving the previous snapshot standing. This is deliberate: a
+collector that reports an error while the deploy would still read yesterday's
+picture of the cluster is a failure an operator can walk straight past. Collect
+again into the same directory and it is usable once more.
+
+**Malformed is not the same as missing.** A file the collector cannot have
+produced — a Pod line without its `phase|nodeName` delimiter, a node line
+outside its four positional fields, a request line short of its resources
+column, or a quantity that is negative, infinite, `NaN` or not a number at all —
+ends the preflight as **unusable input** (exit 3), not `INCONCLUSIVE`. Negative
+and non-finite quantities are refused wherever they appear, the candidate
+manifest and the namespace quota included: they subtract from demand or add to
+free space, so absorbing one as a zero would be a pass the cluster cannot
+honour. `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1` reaches exit 2
+and nothing else: a dimension the cluster did not report is something an
+operator can check by hand and acknowledge, a broken input is not. Sparse
+Kubernetes is still valid: a Pod the scheduler has not bound has no nodeName,
+and a container may declare no requests at all.
+
+The node line is **positional** — `<cpu> <memory> <ephemeral-storage> <pods>`,
+one space between each — and an empty position stays empty. A node that reports
+no ephemeral-storage arrives as `8 32Gi  110`, which means storage unknown and a
+ceiling of 110 pods; the two dimensions are answered separately and neither
+value moves into the other's place. Trailing positions may be omitted instead of
+left blank. `cpu` and `memory` are required; the other two, when empty, are
+dimensions the cluster did not report and come back `INCONCLUSIVE`.
+
+The candidate slot's own workloads stay a live namespaced read in both modes:
+they are what the redeploy is priced against and must describe the cluster now,
+not when the snapshot was taken.
+
 ---
 
 ## 8. Preview
@@ -1150,6 +1246,8 @@ After this, rollback needs a redeploy — it is no longer instant.
 | `-> MISSING` in status                 | a stable Service was deleted                                               | re-apply the shared half                                                                                                      |
 | `-> UNSET` in status                   | a Service never got its slot selector                                      | re-apply shared, or converge with cutover                                                                                     |
 | `preflight capacity inconclusive`      | cluster did not report a dimension                                         | check by hand, then `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1`                                                                |
+| `capacity evidence ... is unusable`    | snapshot absent, stale, incomplete or altered                              | collect it again with `make prod-capacity-evidence`; never point the deploy at a directory you did not produce or receive     |
+| `capacity preflight refused its input` | a candidate manifest or evidence file that does not parse                  | read the `[ERROR] invalid ... input: line N` above it; collect the evidence again — the override does not apply to this case  |
 | `cannot hold a second slot`            | quota or nodes genuinely too small                                         | raise quota or free capacity; do not force                                                                                    |
 | `the shared stateful layer must exist` | `stateful.sh` was never run                                                | run `make prod-stateful-apply`, then bootstrap again                                                                          |
 | PVC stuck `Pending`                    | host directory missing or wrongly owned                                    | create it as in 3b.2; do **not** delete the PV                                                                                |
