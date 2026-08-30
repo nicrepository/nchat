@@ -1015,6 +1015,214 @@ with_max_age 000900 "$SUFFICIENT" "a zero-padded freshness limit is read in base
   fail_evidence "evidence mode read a cluster-wide resource: $(tr '\n' ';' <"$STATE/cluster-wide-log")"
 
 echo
+echo "=== what the collectors actually produce ==="
+#
+# Everything above starts from files already in the contract's shape. These
+# cases start one step earlier, at the kubectl queries that produce them: the
+# gate reached BAD INPUT and INCONCLUSIVE in production while every fixture here
+# agreed it was fine, because nothing exercised the queries themselves.
+#
+# Live mode, so the collectors run.
+rm -f "$STATE/deny-cluster-wide" "$STATE/cluster-wide-log"
+
+# One lib.sh function, against the fake.
+lib_call() {
+  FAKE_STATE_DIR="$STATE" bash -c 'set -Eeuo pipefail; source "$1"; shift; "$@"' _ "$LIB" "$@"
+}
+
+expect_value() {
+  local name="$1" expected="$2" got="$3"
+  if [[ "$got" == "$expected" ]]; then
+    echo "  [OK]   $name"
+    return 0
+  fi
+  echo "  [FAIL] $name: got '$got', expected '$expected'" >&2
+  FAILURES=$((FAILURES + 1))
+}
+
+echo
+echo "--- every quota dimension is read, dotted keys included ---"
+#
+# Three of the four keys are literal names with a dot in them. Asked for
+# unescaped, kubectl reads the dot as a step into a nested object no
+# ResourceQuota has and answers with nothing at all -- so cpu, memory and
+# ephemeral-storage arrived as "the namespace declares no such limit" and only
+# `pods`, the one key without a dot, was ever judged. The values here are the
+# ones the fake holds; what is under test is that they arrive at all.
+expect_value "hard requests.cpu is read" 16 "$(lib_call quota_status_field hard requests.cpu)"
+expect_value "used requests.cpu is read" 1 "$(lib_call quota_status_field used requests.cpu)"
+expect_value "hard requests.memory is read" 32Gi "$(lib_call quota_status_field hard requests.memory)"
+expect_value "used requests.memory is read" 2Gi "$(lib_call quota_status_field used requests.memory)"
+expect_value "hard requests.ephemeral-storage is read" 500Gi \
+  "$(lib_call quota_status_field hard requests.ephemeral-storage)"
+expect_value "used requests.ephemeral-storage is read" 10Gi \
+  "$(lib_call quota_status_field used requests.ephemeral-storage)"
+expect_value "hard pods is read" 80 "$(lib_call quota_status_field hard pods)"
+expect_value "used pods is read" 10 "$(lib_call quota_status_field used pods)"
+
+# A dimension the quota does not declare stays unread. It must not acquire a
+# zero on the way through, which would read as a limit of nothing and fail every
+# deploy, nor a default, which would read as room nobody granted.
+: >"$STATE/quota/hard-cpu"
+expect_value "an undeclared limit stays empty" "" "$(lib_call quota_status_field hard requests.cpu)"
+printf '16' >"$STATE/quota/hard-cpu"
+
+echo
+echo "--- one line per container, each carrying its own Pod's phase and node ---"
+#
+# kubectl answers the request query per Pod: the Pod's phase and node once, then
+# its containers. The Pod cannot be reached from inside the container loop --
+# `$` in jsonpath is the current object, not the document root -- so asking for
+# it there produced "||<requests>" for every container in the cluster and the
+# evaluator refused the file at line 1.
+#
+# The Pods below cover the states the sum has to tell apart, and the last of
+# them holds an app container followed by an initContainer: both are collected,
+# because the kubelet reserves the larger of the two and counting both can only
+# overstate a Pod.
+KUBECTL_PODS=(
+  'Running|node-a|500m 1Gi 64Mi;100m 256Mi 64Mi;'
+  'Pending|node-b|250m 512Mi 32Mi;'
+  'Pending||3 6Gi 1Gi;'
+  'Succeeded|node-a|2 4Gi 1Gi;'
+  'Failed|node-a|2 4Gi 1Gi;'
+  'Running|node-b| 128Mi 32Mi;'
+  'Running|node-b|100m  32Mi;'
+  'Running|node-b|100m 128Mi ;'
+  'Running|node-c|  ;'
+  'Running|node-c|50m 64Mi 16Mi;200m 256Mi 64Mi;'
+)
+EXPANDED=(
+  'Running|node-a|500m 1Gi 64Mi'
+  'Running|node-a|100m 256Mi 64Mi'
+  'Pending|node-b|250m 512Mi 32Mi'
+  'Pending||3 6Gi 1Gi'
+  'Succeeded|node-a|2 4Gi 1Gi'
+  'Failed|node-a|2 4Gi 1Gi'
+  'Running|node-b| 128Mi 32Mi'
+  'Running|node-b|100m  32Mi'
+  'Running|node-b|100m 128Mi '
+  'Running|node-c|  '
+  'Running|node-c|50m 64Mi 16Mi'
+  'Running|node-c|200m 256Mi 64Mi'
+)
+printf '%s\n' "${KUBECTL_PODS[@]}" >"$STATE/cluster-pods"
+expect_value "each container becomes its own line, phase and node intact" \
+  "$(printf '%s\n' "${EXPANDED[@]}")" "$(lib_call cluster_container_request_lines)"
+
+# And what comes out is what the evaluator reads, not merely what looks like it.
+lib_call cluster_container_request_lines >"$WORK/collected-requests.txt"
+check "the collected requests are accepted by the evaluator" "$SUFFICIENT" \
+  python3 "$PREFLIGHT" --manifest "$FIXTURES/candidate-small.yaml" \
+  "${QUOTA_OK[@]}" --node-allocatable-file <(printf '8 32Gi 200Gi 110\n') \
+  --cluster-requests-file "$WORK/collected-requests.txt" \
+  --cluster-pods-file "$FIXTURES/cluster-pod-slots.txt"
+
+# A Pod the query could not describe is not quietly dropped: it reaches the
+# evaluator, which refuses the file. Losing it would take its commitment out of
+# the sum, which is the direction that reads as a cluster with room.
+expect_value "a record the query could not fill is passed on, not dropped" \
+  '||500m 1Gi 64Mi' "$(printf '||500m 1Gi 64Mi;\n' | lib_call expand_pod_container_requests)"
+expect_value "a Pod listing no container at all is still a Pod" \
+  'Running|node-a|' "$(printf 'Running|node-a|\n' | lib_call expand_pod_container_requests)"
+
+echo
+echo "--- the gate, end to end, over what the collectors returned ---"
+#
+# The shell half and the Python half against the same cluster, one case per exit
+# code the contract defines. Nothing here reads a file written by hand.
+live_gate() {
+  gate ""
+}
+
+check "a cluster with room admits the candidate" "$SUFFICIENT" live_gate
+
+# Terminal and unscheduled Pods hold nothing. Counted, the 7 CPU they ask for
+# would put this candidate 4.35 CPU past a 4-CPU cluster; released, it fits.
+printf '4 16Gi 200Gi 110\n' >"$STATE/node-allocatable"
+check "Pods that have finished or were never scheduled do not hold capacity" \
+  "$SUFFICIENT" live_gate
+
+printf '2 4Gi 200Gi 110\n' >"$STATE/node-allocatable"
+check "a cluster without room refuses it" "$INSUFFICIENT" live_gate
+printf '8 32Gi 200Gi 110\n' >"$STATE/node-allocatable"
+
+# A dimension the cluster did not declare is unknown, and unknown is not a pass.
+for name in hard-cpu used-cpu hard-memory used-memory hard-storage used-storage; do
+  mv "$STATE/quota/$name" "$STATE/quota/$name.kept"
+done
+check "a quota dimension the namespace did not declare is inconclusive" \
+  "$INCONCLUSIVE" live_gate
+for name in hard-cpu used-cpu hard-memory used-memory hard-storage used-storage; do
+  mv "$STATE/quota/$name.kept" "$STATE/quota/$name"
+done
+
+# A phase the cluster cannot have reported, and a quantity that is not one.
+printf 'Terminating|node-a|500m 1Gi 64Mi;\n' >"$STATE/cluster-pods"
+check "a line whose phase is not one Kubernetes defines is unusable input" \
+  "$BAD_INPUT" live_gate
+printf 'Running|node-a|not-a-quantity 1Gi 64Mi;\n' >"$STATE/cluster-pods"
+check "a request that is not a quantity is unusable input" "$BAD_INPUT" live_gate
+printf '%s\n' "${KUBECTL_PODS[@]}" >"$STATE/cluster-pods"
+
+# A read that came back with nothing is a failed read, never an empty cluster.
+: >"$STATE/cluster-pods"
+check "a request query that answered nothing is not a cluster with nothing on it" \
+  "$INCONCLUSIVE" live_gate
+printf '%s\n' "${KUBECTL_PODS[@]}" >"$STATE/cluster-pods"
+
+echo
+echo "--- the fake refuses a request query production could not use ---"
+#
+# The collector's query is protected by the fake's shape check, not by the
+# fake's topic. Matching on "resources.requests" alone handed the correct
+# fixture to the incident's own jsonpath, so a regression could reintroduce it
+# and leave the suite green. These cases ask the fake directly.
+REQUEST_TAIL="{.resources.requests.cpu}{' '}{.resources.requests.memory}{' '}{.resources.requests.ephemeral-storage}{';'}"
+
+ask_for_requests() {
+  FAKE_STATE_DIR="$STATE" "$FAKE_BIN/kubectl" get pods --all-namespaces -o "jsonpath=$1"
+}
+
+refuse_query() {
+  local name="$1" query="$2" status=0
+  ask_for_requests "$query" >"$WORK/out.txt" 2>"$WORK/err.txt" || status=$?
+  if [[ "$status" -eq 0 ]]; then
+    echo "  [FAIL] $name: the fake answered a query production gets nothing from" >&2
+    FAILURES=$((FAILURES + 1))
+    return 0
+  fi
+  grep -q "capacity request query" "$WORK/err.txt" ||
+    fail_evidence "$name: refused without saying what was wrong with the query"
+  echo "  [OK]   $name"
+}
+
+# The incident. `$` is the current object, so both fields resolve against the
+# container and the collector emits "||<requests>" for every Pod in the cluster.
+refuse_query "the Pod's fields read from inside the container range are refused" \
+  "{range .items[*]}{range .spec.containers[*]}{\$.status.phase}|{\$.spec.nodeName}|$REQUEST_TAIL{end}{range .spec.initContainers[*]}{\$.status.phase}|{\$.spec.nodeName}|$REQUEST_TAIL{end}{end}"
+
+# The same mistake written without the '$', which resolves no better.
+refuse_query "a phase read after the container range has opened is refused" \
+  "{range .items[*]}{range .spec.containers[*]}{.status.phase}|{.spec.nodeName}|$REQUEST_TAIL{end}{range .spec.initContainers[*]}$REQUEST_TAIL{end}{end}"
+
+# initContainers dropped: the kubelet reserves the larger of (max init request,
+# sum of app requests), so a collection without them can understate a Pod.
+refuse_query "a query that never ranges over initContainers is refused" \
+  "{range .items[*]}{.status.phase}|{.spec.nodeName}|{range .spec.containers[*]}$REQUEST_TAIL{end}{'\\n'}{end}"
+
+# And ranging over them without reading what they ask for is the same loss.
+refuse_query "an initContainer range missing a request is refused" \
+  "{range .items[*]}{.status.phase}|{.spec.nodeName}|{range .spec.containers[*]}$REQUEST_TAIL{end}{range .spec.initContainers[*]}{.resources.requests.cpu}{' '}{.resources.requests.memory}{end}{'\\n'}{end}"
+
+# The query the collector actually sends stays answerable, and what it collects
+# is unchanged -- the checks above are a gate on shape, not a rewrite of it.
+check "the collector's own query is still answered" "$SUFFICIENT" \
+  lib_call cluster_container_request_lines
+expect_value "and still returns the same evidence" \
+  "$(printf '%s\n' "${EXPANDED[@]}")" "$(lib_call cluster_container_request_lines)"
+
+echo
 if [ "$FAILURES" -gt 0 ]; then
   echo "capacity preflight tests failed with $FAILURES failure(s)." >&2
   exit 1

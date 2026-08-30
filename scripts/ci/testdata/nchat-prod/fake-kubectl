@@ -179,13 +179,23 @@ fi
 # Capacity inputs. A fixture that sets none of these leaves the preflight with
 # nothing to read, which is INCONCLUSIVE — the fail-safe answer under test.
 if [[ "${1:-}" == "get" && "${2:-}" == "resourcequota" ]]; then
+  # A quota key that contains a dot is answered only in its escaped form, which
+  # is the one real kubectl resolves.
+  #
+  # kubectl re-parses a bracketed key as a field path, so status.hard['requests.cpu']
+  # asks for hard.requests.cpu -- a nested object no ResourceQuota has -- and the
+  # command succeeds with empty output. Matching the unescaped key here would
+  # have answered a query production gets nothing back from, which is how three
+  # of the four dimensions reached the evaluator as "not declared" while every
+  # fixture said they were fine. An unrecognised key falls through to the empty
+  # default, exactly as kubectl leaves it.
   case "$*" in
-    *"hard"*"requests.cpu"*) read_state quota/hard-cpu ;;
-    *"used"*"requests.cpu"*) read_state quota/used-cpu ;;
-    *"hard"*"requests.memory"*) read_state quota/hard-memory ;;
-    *"used"*"requests.memory"*) read_state quota/used-memory ;;
-    *"hard"*"ephemeral-storage"*) read_state quota/hard-storage ;;
-    *"used"*"ephemeral-storage"*) read_state quota/used-storage ;;
+    *"hard"*'requests\.cpu'*) read_state quota/hard-cpu ;;
+    *"used"*'requests\.cpu'*) read_state quota/used-cpu ;;
+    *"hard"*'requests\.memory'*) read_state quota/hard-memory ;;
+    *"used"*'requests\.memory'*) read_state quota/used-memory ;;
+    *"hard"*'requests\.ephemeral-storage'*) read_state quota/hard-storage ;;
+    *"used"*'requests\.ephemeral-storage'*) read_state quota/used-storage ;;
     *"hard"*"pods"*) read_state quota/hard-pods ;;
     *"used"*"pods"*) read_state quota/used-pods ;;
     *) printf '' ;;
@@ -197,6 +207,62 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployments" ]]; then
   read_state current-slot
   exit 0
 fi
+
+# The Pod/container request query, checked for the structure production depends
+# on before it is answered.
+#
+# Matching on "resources.requests" alone was enough to hand the correct fixture
+# to the query that caused the incident: one that opened the container range
+# first and then asked for `{$.status.phase}` and `{$.spec.nodeName}` inside it,
+# where jsonpath resolves `$` as the container and answers with nothing. A fake
+# that answers by topic rather than by shape cannot fail on that, so the suite
+# agreed with a gate that was returning BAD INPUT in production.
+#
+# These are substring checks, not a jsonpath parser -- what has to be protected
+# is one query with one shape. Three properties, and nothing beyond them:
+# the Pod's own fields are read before the container range, they are not read
+# again inside it, and both container lists are ranged with all three requests.
+CONTAINERS_RANGE='{range .spec.containers[*]}'
+INIT_CONTAINERS_RANGE='{range .spec.initContainers[*]}'
+
+query_requires() {
+  [[ "$1" == *"$2"* ]] ||
+    { echo "fake: the capacity request query $3" >&2; return 1; }
+}
+
+query_refuses() {
+  [[ "$1" != *"$2"* ]] ||
+    { echo "fake: the capacity request query $3" >&2; return 1; }
+}
+
+# Both container lists are ranged, and each reads all three requests. A query
+# that drops initContainers collects less than the kubelet reserves.
+check_container_requests() {
+  local containers="$1" init="$2" resource
+  for resource in cpu memory ephemeral-storage; do
+    query_requires "$containers" ".resources.requests.$resource" \
+      "does not read the $resource request of its containers" || return 1
+    query_requires "$init" ".resources.requests.$resource" \
+      "does not read the $resource request of its initContainers" || return 1
+  done
+}
+
+# The Pod's phase and node are read at Pod level and nowhere else. Reading them
+# after the container range has opened is the incident itself, whether they are
+# written `{.status.phase}` or `{$.status.phase}`.
+check_pod_requests_query() {
+  local query="$1" pod ranges field
+  query_requires "$query" "$CONTAINERS_RANGE" "does not range over the Pod's containers" || return 1
+  query_requires "$query" "$INIT_CONTAINERS_RANGE" "does not range over the Pod's initContainers" || return 1
+  pod="${query%%"$CONTAINERS_RANGE"*}"
+  ranges="${query#"$pod"}"
+  for field in .status.phase .spec.nodeName; do
+    query_requires "$pod" "$field" "does not read $field from the Pod before its containers" || return 1
+    query_refuses "$ranges" "$field" "reads $field from inside a container range, where jsonpath has no Pod to read it from" || return 1
+  done
+  check_container_requests "${ranges%%"$INIT_CONTAINERS_RANGE"*}" \
+    "${ranges#*"$INIT_CONTAINERS_RANGE"}"
+}
 
 # Reads that reach beyond nchat-prod: the Nodes, and Pods in every namespace.
 #
@@ -231,8 +297,21 @@ if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"--all-namespaces"* ]]
   # Nothing noticed until the parser started refusing a line of the wrong shape:
   # a request line short of its resources column read as a container that
   # reserves nothing, which is the direction that hides commitment.
+  #
+  # cluster-pods holds the request query's answer in the shape kubectl produces:
+  # one line per Pod, its containers ';'-terminated after the Pod's own phase and
+  # node. The collector expands those into one line per container; jsonpath
+  # cannot, because it has no reference back to the Pod from inside a container
+  # loop.
+  #
+  # A query that looks like the request query and does not have its shape is
+  # refused outright: answering it with the right fixture is what let the
+  # incident's own jsonpath pass the suite.
   case "$*" in
-    *"resources.requests"*) read_state cluster-pods ;;
+    *"resources.requests"*)
+      check_pod_requests_query "$*" || exit 65
+      read_state cluster-pods
+      ;;
     *) read_state cluster-pod-slots ;;
   esac
   exit 0
