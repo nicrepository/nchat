@@ -519,8 +519,28 @@ switch_services_to_slot() {
 # unit conversion and every comparison, so all the arithmetic lives in one place
 # that has fixtures behind it.
 
+# One field of the namespace quota's status, or nothing.
+#
+# The dot in the key is escaped, and that is the whole of it. kubectl's jsonpath
+# resolves a bracketed key by re-parsing it as a field path, so
+# `status.hard['requests.cpu']` asked for `hard.requests.cpu` -- a nested object
+# that does not exist -- and came back empty. Every dimension whose key carries a
+# dot (cpu, memory, ephemeral-storage) was therefore reported as unread, and only
+# `pods` ever arrived. `\.` is the escape the parser understands, and it is the
+# same one kubectl's own documentation uses for keys such as
+# `kubernetes\.io/hostname`.
+#
+# Empty output stays empty output: a quota that does not declare a dimension, a
+# namespace with no quota at all and a read that failed are alike here, and
+# candidate-capacity.py reports each of them INCONCLUSIVE rather than as zero.
+# There is nothing to substitute a default for.
+#
+# .items[0] is unchanged and deliberate: this namespace is provisioned with one
+# ResourceQuota (infra/k8s/nchat-prod), and summing or intersecting several would
+# be a policy decision, not a bug fix. A second quota would be read past, which
+# is why the manifest check keeps the single-quota shape honest.
 quota_status_field() {
-  local section="$1" field="$2"
+  local section="$1" field="${2//./\\.}"
   kubectl get resourcequota -n "$NCHAT_PROD_NAMESPACE" \
     -o "jsonpath={.items[0].status.$section['$field']}" 2>/dev/null
 }
@@ -546,24 +566,63 @@ cluster_pod_lines() {
     -o "jsonpath={range .items[*]}{.status.phase}|{.spec.nodeName}{'\n'}{end}" 2>/dev/null
 }
 
+# Expands one Pod record into the per-container lines the evaluator reads.
+#
+#   in:  "<phase>|<nodeName>|<requests>;<requests>;"
+#   out: "<phase>|<nodeName>|<requests>", once per container.
+#
+# A record that is not three fields, and a record that lists no container at
+# all, is passed through untouched: the first is for candidate-capacity.py to
+# refuse, the second is a Pod that reserves nothing. Dropping either here would
+# take commitment out of the sum, which is the direction that turns a full
+# cluster into a pass.
+expand_pod_container_requests() {
+  awk -F'|' '{
+    if (NF != 3 || $3 == "") { print; next }
+    count = split($3, requests, ";")
+    for (i = 1; i <= count; i++)
+      if (requests[i] != "") print $1 "|" $2 "|" requests[i]
+  }'
+}
+
 # One "<phase>|<nodeName>|<cpu> <memory> <ephemeral-storage>" line per container
 # in the cluster.
+#
+# The Pod's phase and node are read once, at Pod level, and its containers are
+# emitted after them. They used to be read from inside the container loop as
+# `{$.status.phase}`, which is not a parent reference: kubectl's jsonpath treats
+# `$` as the *current* object, so both resolved against the container, came back
+# empty, and every line arrived as "||<requests>" -- refused by the parser as a
+# line whose first field is not a Pod phase. jsonpath cannot reach the Pod from
+# inside the loop at all, so the loop no longer needs it to.
+#
+# The containers of a Pod are ';'-terminated on that Pod's line and split back
+# out by expand_pod_container_requests. The separator is one this collector
+# emits, into a field that holds Kubernetes quantities and nothing else; no
+# human-readable output is parsed to recover it.
 #
 # The shell only collects; candidate-capacity.py decides which of these hold
 # capacity, so that policy is covered by fixtures instead of living inside a
 # jsonpath nobody can test. Init containers are emitted too: the kubelet
 # reserves the larger of (max init request, sum of app requests), so counting
-# both can overstate a Pod but never understates it — the conservative direction
+# both can overstate a Pod but never understates it -- the conservative direction
 # for a preflight.
+#
+# Empty output is a failed read, not an empty cluster: there is always at least
+# one Pod. It is reported as a failure rather than passed on as a file that
+# would read as a cluster with nothing committed on it.
 cluster_container_request_lines() {
-  local template='{range .items[*]}'
-  template+='{range .spec.containers[*]}{$.status.phase}|{$.spec.nodeName}|'
+  local template pods
+  template='{range .items[*]}{.status.phase}|{.spec.nodeName}|'
+  template+='{range .spec.containers[*]}'
   template+="{.resources.requests.cpu}{' '}{.resources.requests.memory}{' '}"
-  template+="{.resources.requests.ephemeral-storage}{'\n'}{end}"
-  template+='{range .spec.initContainers[*]}{$.status.phase}|{$.spec.nodeName}|'
+  template+="{.resources.requests.ephemeral-storage}{';'}{end}"
+  template+='{range .spec.initContainers[*]}'
   template+="{.resources.requests.cpu}{' '}{.resources.requests.memory}{' '}"
-  template+="{.resources.requests.ephemeral-storage}{'\n'}{end}{end}"
-  kubectl get pods --all-namespaces -o "jsonpath=$template" 2>/dev/null
+  template+="{.resources.requests.ephemeral-storage}{';'}{end}{'\n'}{end}"
+  pods="$(kubectl get pods --all-namespaces -o "jsonpath=$template" 2>/dev/null)" || return 1
+  [[ -n "$pods" ]] || return 1
+  printf '%s\n' "$pods" | expand_pod_container_requests
 }
 
 # "<deployment>|<replicas>|<cpu>|<memory>|<ephemeral-storage>", one line per
