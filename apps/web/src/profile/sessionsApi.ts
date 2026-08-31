@@ -26,9 +26,13 @@ interface SessionRowResponse {
   current: boolean;
 }
 
-interface SessionsListResponse {
+interface SessionsListPayload {
   data: SessionRowResponse[];
-  pagination: { limit: number };
+  pagination: { limit: number; next_cursor?: string | null };
+}
+
+interface SessionsListHttpResponse {
+  data: SessionsListPayload;
 }
 
 export type SessionsApiErrorReason = "unauthorized" | "forbidden" | "unknown";
@@ -69,11 +73,14 @@ function fromResponse(row: SessionRowResponse): Session {
 /** Lists the authenticated user's own active sessions, newest first. Never accepts a user id — identity is the session's own. */
 export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
   try {
-    const res = await authenticatedFetch<SessionsListResponse>(`${AUTH_BASE}/me/sessions`, {
-      method: "GET",
-      signal,
-    });
-    return res.data.map(fromResponse);
+    const response = await authenticatedFetch<SessionsListHttpResponse>(
+      `${AUTH_BASE}/me/sessions`,
+      {
+        method: "GET",
+        signal,
+      },
+    );
+    return response.data.data.map(fromResponse);
   } catch (error) {
     throw mapSessionsError(error);
   }

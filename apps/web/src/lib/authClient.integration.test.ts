@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getOrCreateDirectDM } from "../chat/chatApi";
+import { listSessions } from "../profile/sessionsApi";
 import { _resetState, authenticatedFetch } from "./authClient";
 import { getAccessToken, setTokens } from "./authSession";
 
@@ -36,6 +37,27 @@ function dmCreated(): Response {
 
 function refreshed(accessToken: string): Response {
   return jsonResponse({ access_token: accessToken, token_type: "Bearer", expires_in: 900 });
+}
+
+function sessionsListed(): Response {
+  return jsonResponse({
+    data: {
+      data: [
+        {
+          id: "session-current",
+          device_id: null,
+          created_at: "2026-08-31T11:53:47Z",
+          last_seen_at: "2026-08-31T17:08:49Z",
+          idle_expires_at: "2026-09-01T05:08:49Z",
+          absolute_expires_at: "2026-09-30T11:53:47Z",
+          revoked_at: null,
+          user_agent: "test-agent",
+          current: true,
+        },
+      ],
+      pagination: { limit: 50, next_cursor: null },
+    },
+  });
 }
 
 /** The request as the network sees it: url, method, headers and body. */
@@ -146,5 +168,29 @@ describe("DM creation over the real request stack", () => {
 
     expect(callerHeaders.has("authorization")).toBe(false);
     expect(callerHeaders.get("content-type")).toBe("application/json");
+  });
+});
+
+describe("session listing over the real request stack", () => {
+  it("returns sessions after an expired access token is refreshed and retried", async () => {
+    setTokens("expired_at");
+    mockFetch
+      .mockResolvedValueOnce(unauthorized())
+      .mockResolvedValueOnce(refreshed("new_at"))
+      .mockResolvedValueOnce(sessionsListed());
+
+    await expect(listSessions()).resolves.toEqual([
+      expect.objectContaining({
+        id: "session-current",
+        userAgent: "test-agent",
+        current: true,
+      }),
+    ]);
+
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(sentRequest(0).url).toBe("/api/auth/me/sessions");
+    expect(sentRequest(1).url).toBe("/api/auth/refresh");
+    expect(sentRequest(2).url).toBe("/api/auth/me/sessions");
+    expect(sentRequest(2).headers.get("authorization")).toBe("Bearer new_at");
   });
 });
