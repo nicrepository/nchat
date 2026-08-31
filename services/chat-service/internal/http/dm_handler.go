@@ -508,10 +508,42 @@ func (h *DMHandler) GetOrCreateDirect(w http.ResponseWriter, r *http.Request) {
 		writeDMConversationError(w, err)
 		return
 	}
+	h.announceNewDirectConversation(r.Context(), workspaceID, result)
 	httputil.WriteJSON(w, http.StatusOK, createDirectDMResponse{
 		ConversationID: result.Conversation.ID,
 		Created:        result.Created,
 	})
+}
+
+// announceNewDirectConversation tells the counterpart that a DM they have never
+// seen now exists (issue #721).
+//
+// The same signal the add-participants route above emits, for the same reason:
+// the recipient is not subscribed to a conversation they did not know about, so
+// the room-scoped events — message.created included — reach everyone except
+// them. Without it their sidebar only learns of the DM on the next full load.
+//
+// Called only after GetOrCreateDirectConversation returned successfully, which
+// means the store committed: a rolled-back or refused create announces nothing.
+// Created is the gate, so an existing DM — including the one this same caller
+// re-opens a second time — stays silent; the counterpart already has that row.
+//
+// A publish failure is not reported to the caller. The DM is persisted and the
+// response says so; the bus copy is best-effort in the hub exactly as it is for
+// every other publish here, and its cost is a stale sidebar until the next
+// refetch, never a creation the client is told to retry.
+func (h *DMHandler) announceNewDirectConversation(
+	ctx context.Context, workspaceID string, result service.CreateDirectConversationOutput,
+) {
+	if h.broadcast == nil || !result.Created || result.OtherUserID == "" {
+		return
+	}
+	// The counterpart alone: the actor already holds the conversation they just
+	// opened, and a 1:1 has nobody else. The payload names the conversation and
+	// nothing more — no message, no actor, no third identity.
+	h.broadcast.PublishConversationAvailable(
+		ctx, workspaceID, "dm", result.Conversation.ID, []string{result.OtherUserID},
+	)
 }
 
 // CreateGroup handles POST /api/chat/dms/group.
