@@ -166,15 +166,9 @@ func TestDeleteAllMySessions_InvalidCurrentSessionDoesNotRevokeOthers(t *testing
 	}
 }
 
-// TestGetMySessions_ValidCurrentSession_Returns200ThroughRealRouter closes a
-// coverage gap: every other case in this file drives BearerAuth and
-// RequireActiveSession through the real router chain only to prove a
-// *rejection* (401/500/503). Nothing exercised the success path the same
-// way — the handler-level tests in session_handler_test.go inject
-// ctxKeyUserID/ctxKeySessionID directly, bypassing BearerAuth entirely, so a
-// wiring regression between BearerAuth, RequireActiveSession and
-// GetMySessions (e.g. a context key mismatch introduced in router.go) could
-// ship without any red test.
+// This covers router wiring only: a valid Bearer token and UUID sid accepted
+// by the SessionManager reach GetMySessions. It does not exercise persisted
+// session state or prove that the DEV runtime has a coherent session row.
 func TestGetMySessions_ValidCurrentSession_Returns200ThroughRealRouter(t *testing.T) {
 	cfg := testConfigWithJWT()
 	userID := "123e4567-e89b-12d3-a456-426614174600"
@@ -203,12 +197,8 @@ func TestGetMySessions_ValidCurrentSession_Returns200ThroughRealRouter(t *testin
 	}
 }
 
-// TestDeleteAllMySessions_ValidCurrentSession_Returns204ThroughRealRouter is
-// the success-path counterpart to
-// TestDeleteAllMySessions_InvalidCurrentSessionDoesNotRevokeOthers: it proves
-// the bulk-revoke handler actually runs, with the *current* session id taken
-// from the token/context rather than any client-supplied value, when
-// validation succeeds.
+// Like the GET test above, this proves only that accepted token context reaches
+// the handler and supplies the current sid; persistence remains stubbed.
 func TestDeleteAllMySessions_ValidCurrentSession_Returns204ThroughRealRouter(t *testing.T) {
 	cfg := testConfigWithJWT()
 	userID := "123e4567-e89b-12d3-a456-426614174700"
