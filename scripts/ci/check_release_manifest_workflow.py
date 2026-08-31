@@ -32,6 +32,9 @@ PERMISSIONS = {"actions": "read", "contents": "read"}
 RUNNER = "ubuntu-latest"
 PINNED = re.compile(r"[^@]+@[a-f0-9]{40}")
 CHECKOUT_ACTION = "actions/checkout"
+# The builder reports the commit it built; the manifest job has to name that
+# one, not the caller's own ref, which a dispatch does not build.
+CHECKOUT_REF = "${{ needs.build.outputs.sha }}"
 DOWNLOAD_ACTION = "actions/download-artifact"
 UPLOAD_ACTION = "actions/upload-artifact"
 # Confining the download to pattern/path/merge-multiple is what keeps the job on
@@ -52,7 +55,7 @@ UPLOAD_INPUTS = {
 GENERATOR = "scripts/deploy/nchat-prod/release-manifest.sh"
 GENERATOR_RUN = f"{GENERATOR} release-digests release-manifest"
 GENERATOR_ENV = {
-    "NCHAT_RELEASE_SOURCE_SHA": "${{ github.sha }}",
+    "NCHAT_RELEASE_SOURCE_SHA": "${{ needs.build.outputs.sha }}",
     "NCHAT_RELEASE_RUN_ID": "${{ github.run_id }}",
 }
 
@@ -122,8 +125,17 @@ def check_runner(job):
 
 
 def check_checkout(steps):
-    if len(steps_using(steps, CHECKOUT_ACTION)) != 1:
+    """One checkout, of the commit the manifest claims the images were built from.
+
+    A manifest generated from a differently-checked-out tree would name a source
+    SHA whose scripts never ran, so the ref is part of the contract.
+    """
+    checkout = steps_using(steps, CHECKOUT_ACTION)
+    if len(checkout) != 1:
         return [f"{JOB} job must contain exactly one {CHECKOUT_ACTION} step"]
+    ref = checkout[0].get("with", {}).get("ref")
+    if ref != CHECKOUT_REF:
+        return [f"{JOB} checkout must use ref {CHECKOUT_REF!r}, got {ref!r}"]
     return []
 
 
