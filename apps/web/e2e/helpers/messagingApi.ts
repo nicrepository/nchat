@@ -755,6 +755,66 @@ export async function emitPresence(
   );
 }
 
+/**
+ * Makes a conversation subscribable for this session, as the server does once
+ * the membership row is committed. Pair it with any fixture change that adds a
+ * conversation after the mocks were installed.
+ */
+export async function grantConversationAccess(
+  page: Page,
+  target: { kind: TargetKind; targetId: string },
+) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eAllowConversation?: unknown }).__e2eAllowConversation ===
+      "function",
+  );
+  await page.evaluate(
+    ({ kind, targetId }) => {
+      (
+        window as unknown as { __e2eAllowConversation: (targetKey: string) => void }
+      ).__e2eAllowConversation(`${kind}:${targetId}`);
+    },
+    { kind: target.kind, targetId: target.targetId },
+  );
+}
+
+/**
+ * Publishes the user-scoped sidebar invalidation the server addresses to someone
+ * who cannot be subscribed to the target yet — the recipient of a brand-new DM
+ * (issue #721), or a newly added member (issue #398).
+ *
+ * Deliberately not gated on a subscription, unlike emitPresence: not having one
+ * is the entire reason this event exists.
+ */
+export async function emitConversationAvailable(
+  page: Page,
+  target: { kind: TargetKind; targetId: string },
+) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eEmitWebSocketEvent?: unknown })
+        .__e2eEmitWebSocketEvent === "function",
+  );
+  await page.evaluate(
+    ({ kind, targetId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "conversation.available",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        event_id: `available-${kind}-${targetId}`,
+      });
+    },
+    { kind: target.kind, targetId: target.targetId },
+  );
+}
+
 /** Kills the tab's connection so the client takes its own reconnect path. */
 export async function dropWebSocket(page: Page) {
   await page.waitForFunction(
@@ -1402,6 +1462,15 @@ async function installWebSocketMock(
         }
       ).__e2eSetPresenceRoster = (targetKey, users) => {
         presenceRosters[targetKey] = users;
+      };
+      // A conversation this session did not have when the mocks were installed.
+      // The allow-list is seeded from the sidebar fixture, so without this a
+      // subscribe to a conversation created mid-test would be refused by a
+      // server that had just announced it (issue #721).
+      (
+        window as unknown as { __e2eAllowConversation: (targetKey: string) => void }
+      ).__e2eAllowConversation = (targetKey) => {
+        allowed.add(targetKey);
       };
       // Drops every live socket the way a network failure would: no close
       // frame the client can distinguish, so it takes its normal reconnect

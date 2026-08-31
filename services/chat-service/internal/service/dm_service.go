@@ -42,6 +42,13 @@ type CreateDirectConversationInput struct {
 type CreateDirectConversationOutput struct {
 	Conversation domain.DMConversation
 	Created      bool
+	// OtherUserID is the counterpart's canonical id, as the eligibility lookup
+	// resolved it — never the raw value the request carried (issue #721). It is
+	// what the post-commit conversation.available signal is addressed to, so it
+	// has to come from the same authorized state the conversation was written
+	// from: a client-supplied spelling would either miss its recipient or name
+	// somebody the caller was never allowed to reach.
+	OtherUserID string
 }
 
 type SearchDMCandidatesInput struct {
@@ -126,7 +133,9 @@ func (s *DMService) GetOrCreateDirectConversation(ctx context.Context, input Cre
 	if err != nil {
 		return CreateDirectConversationOutput{}, fmt.Errorf("create direct conversation: %w", err)
 	}
-	return CreateDirectConversationOutput{Conversation: result.Conversation, Created: result.Created}, nil
+	return CreateDirectConversationOutput{
+		Conversation: result.Conversation, Created: result.Created, OtherUserID: otherMember.UserID,
+	}, nil
 }
 
 // SearchDMCandidates returns active same-workspace users eligible for a direct DM.
