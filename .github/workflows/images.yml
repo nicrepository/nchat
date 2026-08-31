@@ -1,92 +1,43 @@
 name: Build and push images
 
+# Callers of the single builder. A push to develop builds the commit that was
+# pushed; a manual dispatch builds an approved production SHA, which the builder
+# refuses unless main can reach it.
+#
+# The builder only builds. Sealing the release and deploying to nchat-dev are
+# two independent consumers of that build, so a manifest that cannot be written
+# does not hold back a development deploy whose images already exist.
+
 on:
   push:
     branches: [develop]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-character lowercase commit SHA on main to build.
+        required: true
+        type: string
 
 permissions:
   actions: read
   contents: read
 
+# A production release is keyed by the commit it builds, and is never cancelled
+# by a later dispatch: the digests of a run are the identity of that release.
 concurrency:
-  group: nchat-dev-images-${{ github.ref }}
-  cancel-in-progress: true
+  group: nchat-images-${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  inventory:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      images: ${{ steps.images.outputs.images }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - id: images
-        run: scripts/deploy/nchat-dev/image-matrix.sh >> "$GITHUB_OUTPUT"
-
   build:
-    needs: inventory
-    runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        image: ${{ fromJSON(needs.inventory.outputs.images) }}
-    steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      # docker/setup-buildx-action v3.11.1
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
-      # docker/login-action v3.3.0
-      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Select build
-        id: build
-        shell: bash
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: |
-          set -euo pipefail
-          case "$IMAGE" in
-            web) dockerfile=Dockerfile.web; build_args= ;;
-            admin-web) dockerfile=Dockerfile.admin-web; build_args= ;;
-            migrations) dockerfile=Dockerfile.migrations; build_args= ;;
-            document-converter) dockerfile=Dockerfile.document-converter; build_args= ;;
-            *) dockerfile=Dockerfile.service; build_args="SERVICE=$IMAGE" ;;
-          esac
-          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
-          echo "build_args=$build_args" >> "$GITHUB_OUTPUT"
-      - name: Build and push
-        id: push
-        # docker/build-push-action v6.18.0
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
-        with:
-          context: .
-          file: ${{ steps.build.outputs.dockerfile }}
-          build-args: ${{ steps.build.outputs.build_args }}
-          push: true
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=nchat-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=nchat-${{ matrix.image }}
-          tags: ghcr.io/nicrepository/nchat/${{ matrix.image }}:${{ github.sha }}
-      - name: Record digest
-        env:
-          DIGEST: ${{ steps.push.outputs.digest }}
-          IMAGE: ${{ matrix.image }}
-        run: printf '%s' "$DIGEST" > "digest-$IMAGE.txt"
-      # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: digest-${{ matrix.image }}
-          path: digest-${{ matrix.image }}.txt
-          retention-days: 7
+    uses: ./.github/workflows/build-nchat-images.yml
+    with:
+      sha: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || github.sha }}
+      require_main: ${{ github.event_name == 'workflow_dispatch' }}
 
   # CICD-04: the identity of a release, written once from the digests this run
   # produced and sealed with a SHA-256. It needs no registry write and no token
@@ -99,6 +50,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The commit the builder reported building, never a ref of the
+          # caller's own: a dispatch builds a SHA that is not this run's HEAD.
+          ref: ${{ needs.build.outputs.sha }}
+          persist-credentials: false
       # Without run-id/github-token this reads only the current run's artifacts,
       # which is what makes the eleven digests provably one build.
       - name: Download image digests
@@ -109,7 +65,7 @@ jobs:
           merge-multiple: true
       - name: Generate release manifest
         env:
-          NCHAT_RELEASE_SOURCE_SHA: ${{ github.sha }}
+          NCHAT_RELEASE_SOURCE_SHA: ${{ needs.build.outputs.sha }}
           NCHAT_RELEASE_RUN_ID: ${{ github.run_id }}
         run: scripts/deploy/nchat-prod/release-manifest.sh release-digests release-manifest
       # 90 days: the longest retention every GitHub plan honours, and an order
