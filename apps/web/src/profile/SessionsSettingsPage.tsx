@@ -128,9 +128,7 @@ export default function SessionsSettingsPage() {
           <button
             type="button"
             className="sessions-settings__revoke-all"
-            onClick={() =>
-              setConfirm({ target: "others", generation: getSessionGeneration() })
-            }
+            onClick={() => setConfirm({ target: "others", generation: getSessionGeneration() })}
           >
             Revogar todas as outras
           </button>
