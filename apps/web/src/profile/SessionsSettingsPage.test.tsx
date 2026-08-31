@@ -1,14 +1,16 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { setTokens } from "../lib/authSession";
 import SessionsSettingsPage from "./SessionsSettingsPage";
 import * as sessionsApi from "./sessionsApi";
 
 vi.mock("./sessionsApi");
 
 afterEach(() => {
+  cleanup();
+  sessionStorage.clear();
   vi.clearAllMocks();
 });
 
@@ -80,6 +82,41 @@ describe("SessionsSettingsPage", () => {
     expect(screen.queryByText("Chrome")).not.toBeInTheDocument();
   });
 
+  it("keeps session B data when session A resolves after the auth generation changes", async () => {
+    let resolveA!: (value: sessionsApi.Session[]) => void;
+    let resolveB!: (value: sessionsApi.Session[]) => void;
+    let signalA: AbortSignal | undefined;
+    vi.mocked(sessionsApi.listSessions)
+      .mockImplementationOnce(
+        (signal) =>
+          new Promise((resolve) => {
+            signalA = signal;
+            resolveA = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveB = resolve;
+          }),
+      );
+
+    setTokens("session-a");
+    render(<SessionsSettingsPage />);
+    await waitFor(() => expect(sessionsApi.listSessions).toHaveBeenCalledTimes(1));
+
+    await act(async () => setTokens("session-b"));
+    await waitFor(() => expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2));
+    expect(signalA?.aborted).toBe(true);
+
+    await act(async () => resolveB([sessions[0]]));
+    await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(1));
+
+    await act(async () => resolveA(sessions));
+    expect(screen.getAllByTestId("session-row")).toHaveLength(1);
+    expect(screen.queryByText("Chrome")).not.toBeInTheDocument();
+  });
+
   it("revokes a single session through the confirm dialog and relists", async () => {
     vi.mocked(sessionsApi.listSessions)
       .mockResolvedValueOnce(sessions)
@@ -94,6 +131,45 @@ describe("SessionsSettingsPage", () => {
     );
     await waitFor(() => expect(sessionsApi.revokeSession).toHaveBeenCalledWith("other"));
     await waitFor(() => expect(screen.getAllByTestId("session-row")).toHaveLength(1));
+  });
+
+  it("does not let a revoke from session A restart loading after session B is active", async () => {
+    let resolveRevoke!: () => void;
+    let resolveB!: (value: sessionsApi.Session[]) => void;
+    vi.mocked(sessionsApi.listSessions)
+      .mockResolvedValueOnce(sessions)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveB = resolve;
+          }),
+      )
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(sessionsApi.revokeSession).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRevoke = resolve;
+        }),
+    );
+
+    setTokens("session-a");
+    const user = userEvent.setup();
+    render(<SessionsSettingsPage />);
+    await screen.findByText("Chrome");
+    await user.click(screen.getByRole("button", { name: "Revogar sessão" }));
+    await user.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }),
+    );
+    await waitFor(() => expect(sessionsApi.revokeSession).toHaveBeenCalledWith("other"));
+
+    await act(async () => setTokens("session-b"));
+    await waitFor(() => expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2));
+    await act(async () => resolveB([{ ...sessions[0], userAgent: "Edge" }]));
+    await screen.findByText("Edge");
+
+    await act(async () => resolveRevoke());
+    expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Edge")).toBeInTheDocument();
   });
 
   it("revokes all others and preserves the current session", async () => {
