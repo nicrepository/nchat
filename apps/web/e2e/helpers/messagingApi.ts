@@ -156,11 +156,13 @@ export interface MessagingScenario {
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     }>;
     dmPosts: Array<{
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     }>;
     forwards: Array<{
       destinationChannelId: string;
@@ -182,6 +184,8 @@ export interface MessagingScenario {
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
+    /** Issue #516: what the composer actually uploaded, in order. */
+    attachmentUploads: Array<{ targetId: string; filename: string; purpose: string }>;
   };
   forwardedByIdempotencyKey: Map<
     string,
@@ -456,6 +460,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       reactions: [],
       dmCreates: [],
       groupCreates: [],
+      attachmentUploads: [],
     },
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
@@ -1080,6 +1085,10 @@ async function installChannelDetailsMocks(
   });
 
   await page.route("**/api/files/dm/*/attachments**", async (route) => {
+    if (route.request().method() === "POST") {
+      await acceptAttachmentUpload(route, scenario, "dm");
+      return;
+    }
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;
@@ -1099,6 +1108,10 @@ async function installChannelDetailsMocks(
   });
 
   await page.route("**/api/files/channels/*/attachments**", async (route) => {
+    if (route.request().method() === "POST") {
+      await acceptAttachmentUpload(route, scenario, "channels");
+      return;
+    }
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;
@@ -1114,6 +1127,42 @@ async function installChannelDetailsMocks(
       contentType: "application/json",
       body: JSON.stringify({ data: { attachments } }),
     });
+  });
+}
+
+/**
+ * POST /api/files/{collection}/{id}/attachments — a draft upload (issue #516).
+ *
+ * The multipart part's own filename is recorded rather than derived: it is the
+ * name a pasted screenshot was given on the way out, and the only place a spec
+ * can observe it as the server would.
+ */
+async function acceptAttachmentUpload(
+  route: Route,
+  scenario: MessagingScenario,
+  collection: string,
+): Promise<void> {
+  const request = route.request();
+  // latin1: the part headers are ASCII and sit ahead of the binary body, which
+  // utf-8 decoding would otherwise mangle before the filename is read.
+  const body = request.postDataBuffer()?.toString("latin1") ?? "";
+  const filename = /filename="([^"]*)"/.exec(body)?.[1] ?? "";
+  const purpose = /name="purpose"\r?\n\r?\n([^\r\n]*)/.exec(body)?.[1] ?? "";
+  const targetId = pathSegmentAfter(request.url(), collection) ?? "";
+  scenario.requests.attachmentUploads.push({ targetId, filename, purpose });
+  await route.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        id: `upload-${scenario.requests.attachmentUploads.length}`,
+        filename,
+        contentType: "image/png",
+        size: body.length,
+        status: "pending_scan",
+        createdAt: "2026-07-15T12:03:00.000Z",
+      },
+    }),
   });
 }
 
@@ -2263,6 +2312,7 @@ async function handleTargetMessagesRoute(
       body_format?: RawMessage["body_format"];
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     };
     const requests =
       routeKind === "channel" ? scenario.requests.channelPosts : scenario.requests.dmPosts;
@@ -2270,6 +2320,7 @@ async function handleTargetMessagesRoute(
       body_text: body.body_text,
       parent_message_id: body.parent_message_id,
       referenced_message_id: body.referenced_message_id,
+      attachment_ids: body.attachment_ids,
     });
 
     const parent = messages.find((message) => message.id === body.parent_message_id);
