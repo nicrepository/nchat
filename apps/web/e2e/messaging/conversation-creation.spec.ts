@@ -8,6 +8,8 @@ import {
   THIRD_CANDIDATE_ID,
   THIRD_CANDIDATE_NAME,
   createScenario,
+  emitConversationAvailable,
+  grantConversationAccess,
   installMessagingMocks,
   makeMessage,
   uniqueId,
@@ -140,5 +142,63 @@ test.describe("criação de conversas — DM 1:1 e grupo ad-hoc", () => {
     await expect(dialog).toBeVisible();
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
     expect(scenario.requests.dmCreates).toEqual([{ otherUserId: OTHER_USER_ID }]);
+  });
+
+  /**
+   * Issue #721: o outro lado. Quem *recebe* uma DM inédita não está inscrito
+   * numa conversa que não existia, então nenhum evento de sala o alcança — nem
+   * o message.created da primeira mensagem. O servidor publica
+   * conversation.available para ele, e a sidebar se reconcilia sozinha.
+   *
+   * Sem polling e sem espera fixa: a asserção é o próprio locator do Playwright,
+   * e o marcador de reload prova que a conversa não apareceu por recarga.
+   */
+  test("destinatário: uma DM inédita aparece na sidebar em tempo real, sem recarregar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "dm");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [makeMessage({ id: `${targetId}-msg`, body_text: "olá" })],
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
+
+    // Sobrevive a qualquer navegação/recarga da aba, então some se a sidebar
+    // só se corrigir por reload.
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload = true;
+    });
+
+    const incomingId = `${targetId}-incoming`;
+    const incomingRow = page
+      .getByRole("region", { name: "Mensagens diretas" })
+      .getByRole("option", { name: new RegExp(`^Mensagem direta com ${SECOND_CANDIDATE_NAME}`) });
+    await expect(incomingRow).toHaveCount(0);
+
+    // O servidor já persistiu a DM e a primeira mensagem: a partir daqui
+    // GET /api/chat/sidebar devolve a conversa, e um subscribe a ela é aceito.
+    scenario.sidebarDMs.push({
+      id: incomingId,
+      type: "direct",
+      name: SECOND_CANDIDATE_NAME,
+      unread_count: 1,
+      counterpart: { user_id: SECOND_CANDIDATE_ID, display_name: SECOND_CANDIDATE_NAME },
+      last_message_at: "2026-06-01T12:00:00.000Z",
+    });
+    await grantConversationAccess(page, { kind: "dm", targetId: incomingId });
+
+    await emitConversationAvailable(page, { kind: "dm", targetId: incomingId });
+
+    await expect(incomingRow).toBeVisible();
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload === true,
+      ),
+    ).toBe(true);
+    await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
   });
 });
