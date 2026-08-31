@@ -172,6 +172,27 @@ describe("SessionsSettingsPage", () => {
     expect(screen.getByText("Edge")).toBeInTheDocument();
   });
 
+  it("does not submit a revoke-all confirmation opened by an older auth generation", async () => {
+    vi.mocked(sessionsApi.listSessions).mockResolvedValue(sessions);
+    vi.mocked(sessionsApi.revokeAllOtherSessions).mockResolvedValue(undefined);
+
+    setTokens("session-a");
+    const user = userEvent.setup();
+    render(<SessionsSettingsPage />);
+    await screen.findByText("Chrome");
+    await user.click(screen.getByRole("button", { name: /revogar todas as outras/i }));
+    const staleConfirm = within(screen.getByRole("dialog")).getByRole("button", {
+      name: "Revogar sessões",
+    });
+
+    act(() => {
+      setTokens("session-b");
+      fireEvent.click(staleConfirm);
+    });
+
+    expect(sessionsApi.revokeAllOtherSessions).not.toHaveBeenCalled();
+  });
+
   it("revokes all others and preserves the current session", async () => {
     vi.mocked(sessionsApi.listSessions)
       .mockResolvedValueOnce(sessions)

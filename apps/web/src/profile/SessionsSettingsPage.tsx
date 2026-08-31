@@ -20,7 +20,10 @@ type LoadState =
   | { status: "loading"; generation: number }
   | { status: "error"; generation: number }
   | { status: "ready"; generation: number; sessions: Session[] };
-type ConfirmState = { target: "single"; sessionId: string } | { target: "others" } | null;
+type ConfirmState =
+  | { target: "single"; sessionId: string; generation: number }
+  | { target: "others"; generation: number }
+  | null;
 
 export default function SessionsSettingsPage() {
   const sessionGeneration = useSyncExternalStore(onAuthChange, getSessionGeneration);
@@ -76,8 +79,8 @@ export default function SessionsSettingsPage() {
   }
 
   async function handleConfirm() {
-    if (!confirm) return;
-    const generation = sessionGeneration;
+    if (!confirm || confirm.generation !== getSessionGeneration()) return;
+    const generation = confirm.generation;
     if (confirm.target === "single") {
       await revokeSession(confirm.sessionId);
     } else {
@@ -115,6 +118,7 @@ export default function SessionsSettingsPage() {
 
   const { sessions } = visibleState;
   const hasOtherSessions = sessions.some((s) => !s.current);
+  const visibleConfirm = confirm?.generation === sessionGeneration ? confirm : null;
 
   return (
     <div className="sessions-settings">
@@ -124,7 +128,9 @@ export default function SessionsSettingsPage() {
           <button
             type="button"
             className="sessions-settings__revoke-all"
-            onClick={() => setConfirm({ target: "others" })}
+            onClick={() =>
+              setConfirm({ target: "others", generation: getSessionGeneration() })
+            }
           >
             Revogar todas as outras
           </button>
@@ -139,13 +145,15 @@ export default function SessionsSettingsPage() {
           <SessionRow
             key={session.id}
             session={session}
-            onRevoke={(id) => setConfirm({ target: "single", sessionId: id })}
+            onRevoke={(id) =>
+              setConfirm({ target: "single", sessionId: id, generation: getSessionGeneration() })
+            }
           />
         ))}
       </ul>
-      {confirm && (
+      {visibleConfirm && (
         <RevokeSessionDialog
-          target={confirm.target}
+          target={visibleConfirm.target}
           onClose={() => setConfirm(null)}
           onConfirm={handleConfirm}
         />
