@@ -702,6 +702,55 @@ func TestDMService_GetOrCreateDirectConversation_ReturnsCreatedSemantics(t *test
 	}
 }
 
+// The counterpart the output names is the one the eligibility lookup returned,
+// canonicalised — not the spelling the request carried (issue #721). The
+// post-commit conversation.available signal is addressed to it, and a session
+// is only ever registered under the canonical id.
+func TestDMService_GetOrCreateDirectConversation_ReportsTheResolvedCounterpart(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
+	ms.workspaceMembers[wmKey("ws-1", user2)] = activeMembership("ws-1", user2)
+	dms := &fakeDMStore{
+		createdConversation: domain.DMConversation{ID: "dm-1", Type: domain.DMConversationTypeDirect},
+		directCreated:       true,
+	}
+
+	result, err := service.NewDMService(dms, ms).GetOrCreateDirectConversation(
+		context.Background(),
+		service.CreateDirectConversationInput{
+			WorkspaceID: "ws-1", CallerID: user1, OtherUserID: "  " + strings.ToUpper(user2) + "  ",
+		},
+	)
+	if err != nil {
+		t.Fatalf("GetOrCreateDirectConversation: %v", err)
+	}
+	if result.OtherUserID != user2 {
+		t.Fatalf("OtherUserID = %q, want the canonical %q", result.OtherUserID, user2)
+	}
+	if result.OtherUserID == user1 {
+		t.Fatal("OtherUserID must never be the caller")
+	}
+}
+
+// An ineligible counterpart never reaches the store, so the output carries no
+// recipient for anything downstream to address.
+func TestDMService_GetOrCreateDirectConversation_ReportsNoCounterpartWhenRefused(t *testing.T) {
+	ms := newFakeMemberStore()
+	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
+	dms := &fakeDMStore{}
+
+	result, err := service.NewDMService(dms, ms).GetOrCreateDirectConversation(
+		context.Background(),
+		service.CreateDirectConversationInput{WorkspaceID: "ws-1", CallerID: user1, OtherUserID: user2},
+	)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+	if result.Created || result.OtherUserID != "" {
+		t.Fatalf("unexpected output for a refused create: %+v", result)
+	}
+}
+
 func TestDMService_SearchDMCandidates_UsesTrimmedQueryAndBoundedLimit(t *testing.T) {
 	ms := newFakeMemberStore()
 	ms.workspaceMembers[wmKey("ws-1", user1)] = activeMembership("ws-1", user1)
