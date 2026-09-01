@@ -39,6 +39,8 @@ import type { Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
+import { NAV_DRAWER_QUERY } from "./useNavDrawer";
+import { useMediaQuery } from "./useMediaQuery";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -662,7 +664,10 @@ function ComposerBar({
         className="chat-msg-area__send-btn"
         disabled={!canSend}
         aria-label="Enviar mensagem"
-        onClick={() => void onSend()}
+        onClick={() => {
+          editor?.view.dom.focus({ preventScroll: true });
+          void onSend();
+        }}
         data-testid="chat-send-btn"
       >
         <IconSend />
@@ -737,6 +742,9 @@ export default function ChatComposer({
   emoji,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
+  const initialFocusOwnerRef = useRef(document.activeElement);
+  const initialFocusHandledRef = useRef(false);
+  const suppressInitialFocus = useMediaQuery(`${NAV_DRAWER_QUERY}, (pointer: coarse)`);
   // A picker left hanging over a sent message is noise. Closing on a confirmed
   // send is the only case the toolbar cannot see for itself; a change of
   // conversation needs no code at all, because ChatMessageArea keys this
@@ -822,6 +830,13 @@ export default function ChatComposer({
   const canAcceptAttachments = attachEnabled && !recording;
   const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
   const activeEditor = editor ?? null;
+
+  useEffect(() => {
+    if (initialFocusHandledRef.current || disabled || !editor) return;
+    initialFocusHandledRef.current = true;
+    if (suppressInitialFocus || document.activeElement !== initialFocusOwnerRef.current) return;
+    editor.view.dom.focus({ preventScroll: true });
+  }, [disabled, editor, suppressInitialFocus]);
 
   const startRecording = () => {
     // A picker left open over a recording panel is the same noise a picker

@@ -4555,6 +4555,9 @@ describe("ChatMessageArea — stale response guard", () => {
     // Switch to canal-2 while canal-1 is still loading.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
 
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
+
     // Now let canal-1's stale request resolve.
     resolveChannel1!(messagePage([makeMessage({ bodyText: "Mensagem do canal 1" })]));
 
@@ -4695,11 +4698,15 @@ describe("ChatMessageArea — stale response guard", () => {
     // Navigate to canal-2 while the POST for canal-1 is still in-flight. The
     // composer is keyed by target, so canal-1's draft is destroyed with it.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
 
     // Resolve the stale POST for canal-1 — should return { status: "stale" }.
     await act(async () => {
       resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
     });
+
+    expect(currentInput).toHaveFocus();
 
     // Canal-1's draft must never surface in canal-2 — neither in the composer
     // nor in the timeline — and the stale completion must not touch either.
