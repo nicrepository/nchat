@@ -833,9 +833,20 @@ export default function ChatComposer({
 
   useEffect(() => {
     if (initialFocusHandledRef.current || disabled || !editor) return;
-    initialFocusHandledRef.current = true;
-    if (suppressInitialFocus || document.activeElement !== initialFocusOwnerRef.current) return;
-    editor.view.dom.focus({ preventScroll: true });
+    if (suppressInitialFocus) {
+      initialFocusHandledRef.current = true;
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      if (!editor.isEditable) return;
+      if (document.activeElement !== initialFocusOwnerRef.current) {
+        initialFocusHandledRef.current = true;
+        return;
+      }
+      initialFocusHandledRef.current = true;
+      editor.view.dom.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [disabled, editor, suppressInitialFocus]);
 
   const startRecording = () => {

@@ -4521,6 +4521,100 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
 // ── Stale response guard ──────────────────────────────────────────────────────
 
 describe("ChatMessageArea — stale response guard", () => {
+  it("focuses the new composer only after the switched conversation finishes loading", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)));
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    const channel1Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel1Input).toHaveFocus());
+
+    const switchButton = screen.getByRole("button", { name: "Ir para canal 2" });
+    await user.click(switchButton);
+
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    expect(channel2Input).not.toBe(channel1Input);
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    expect(switchButton).toHaveFocus();
+
+    const focus = vi.spyOn(channel2Input, "focus");
+    await act(async () => resolveChannel2(emptyPage));
+
+    await waitFor(() => expect(channel2Input).toHaveFocus());
+    expect(focus).toHaveBeenCalledOnce();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it("allows only the final composer to autofocus during a rapid conversation switch", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    let resolveChannel3!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel3 = resolve)));
+
+    function ThreeChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <button onClick={() => navigate("/chat/channel/canal-3")}>Ir para canal 3</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <ThreeChannelTest />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("chat-composer-input")).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    const channel2Focus = vi.spyOn(channel2Input, "focus");
+
+    const channel3Button = screen.getByRole("button", { name: "Ir para canal 3" });
+    await user.click(channel3Button);
+    const channel3Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel3Input).toHaveAttribute("aria-disabled", "true"));
+    const channel3Focus = vi.spyOn(channel3Input, "focus");
+
+    await act(async () => resolveChannel2(emptyPage));
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Button).toHaveFocus();
+
+    await act(async () => resolveChannel3(emptyPage));
+    await waitFor(() => expect(channel3Input).toHaveFocus());
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Focus).toHaveBeenCalledOnce();
+  });
+
   it("response for old target does not render when target changes", async () => {
     const user = userEvent.setup();
 
