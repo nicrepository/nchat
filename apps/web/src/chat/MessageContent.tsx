@@ -448,7 +448,9 @@ export default function MessageContent(props: MessageContentProps) {
           the same message, and hidden for a removed one along with everything
           else the placeholder replaces. Editing does not touch attachments, so
           they stay visible while the body is being edited. */}
-      {!message.isRemoved && <MessageAttachments attachments={message.attachments} />}
+      {!message.isRemoved && (
+        <MessageAttachments attachments={message.attachments} sentAt={message.createdAt} />
+      )}
     </>
   );
 }

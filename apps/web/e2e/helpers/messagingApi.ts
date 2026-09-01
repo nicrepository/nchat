@@ -72,6 +72,25 @@ export interface DMCandidateFixture {
   displayName: string;
 }
 
+/**
+ * One attachment of a message, in chat-service's own snake_case (issue #740).
+ *
+ * Deliberately the wire shape and not the client's ChannelAttachment: a spec
+ * that seeds a voice message must seed exactly what the server sends, including
+ * `audio_kind`, which is the only thing that makes the timeline draw a voice
+ * bubble instead of a file row.
+ */
+export interface RawMessageAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  status: "pending_scan" | "clean" | "rejected";
+  preview_status?: string;
+  audio_kind?: "voice";
+  duration_ms?: number;
+}
+
 interface RawMessage {
   id: string;
   sender_id: string;
@@ -102,6 +121,8 @@ interface RawMessage {
   event_payload?: Record<string, string>;
   quoted?: RawQuote;
   reference?: RawReference;
+  /** RF-32 attachments, as the server embeds them in the message. */
+  attachments?: RawMessageAttachment[];
 }
 
 interface RawReference {
@@ -186,6 +207,13 @@ export interface MessagingScenario {
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
     /** Issue #516: what the composer actually uploaded, in order. */
     attachmentUploads: Array<{ targetId: string; filename: string; purpose: string }>;
+    /**
+     * Issue #740: attachment ids whose *content* was requested, in order.
+     * Every byte of every attachment — a download or an inline player — comes
+     * through this one authenticated route, so this list is also how a spec
+     * proves that merely rendering a timeline requested nothing.
+     */
+    attachmentContentFetches: string[];
   };
   forwardedByIdempotencyKey: Map<
     string,
@@ -345,6 +373,7 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     is_forwarded: overrides.is_forwarded ?? false,
     quoted: overrides.quoted,
     reference: overrides.reference,
+    attachments: overrides.attachments,
     // Issue #527: the structured conversation event, on system messages only.
     // The database pairs these with kind='system', so a user message never
     // carries them and neither does a fixture built without them.
@@ -461,6 +490,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       dmCreates: [],
       groupCreates: [],
       attachmentUploads: [],
+      attachmentContentFetches: [],
     },
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
@@ -1084,6 +1114,29 @@ async function installChannelDetailsMocks(
     });
   });
 
+  // GET /api/files/attachments/{id}/content — the one route that serves bytes.
+  // The real service authenticates, re-checks the caller's access to the
+  // conversation and refuses anything the malware scan has not approved; the
+  // Go tests own those decisions. What a spec can only observe here is the
+  // cross-layer contract: which id the browser asked for, and when.
+  await page.route("**/api/files/attachments/*/content", async (route) => {
+    const attachmentId = pathSegmentAfter(route.request().url(), "attachments");
+    if (!attachmentId) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.requests.attachmentContentFetches.push(attachmentId);
+    await route.fulfill({
+      status: 200,
+      headers: {
+        "Content-Type": "audio/wav",
+        "Content-Disposition": 'attachment; filename="voice-message.wav"',
+        "X-Content-Type-Options": "nosniff",
+      },
+      body: silentWav(),
+    });
+  });
+
   await page.route("**/api/files/dm/*/attachments**", async (route) => {
     if (route.request().method() === "POST") {
       await acceptAttachmentUpload(route, scenario, "dm");
@@ -1128,6 +1181,33 @@ async function installChannelDetailsMocks(
       body: JSON.stringify({ data: { attachments } }),
     });
   });
+}
+
+/**
+ * Real, tiny PCM audio for the content route.
+ *
+ * Not a placeholder string: a spec that asserts a recording keeps *playing*
+ * while it is downloaded needs bytes the browser can actually decode, and
+ * uncompressed WAV is the one format that needs no codec to be present.
+ */
+function silentWav(seconds = 5): Buffer {
+  const sampleRate = 8000;
+  const samples = sampleRate * seconds;
+  const wav = Buffer.alloc(44 + samples * 2);
+  wav.write("RIFF", 0);
+  wav.writeUInt32LE(36 + samples * 2, 4);
+  wav.write("WAVE", 8);
+  wav.write("fmt ", 12);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); // PCM
+  wav.writeUInt16LE(1, 22); // mono
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(samples * 2, 40);
+  return wav;
 }
 
 /**
