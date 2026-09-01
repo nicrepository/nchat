@@ -133,6 +133,7 @@ export function useChatEditor({
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
+  const restoreFocusAfterSendRef = useRef(false);
 
   // Ref, like handleSendRef below: onUpdate is captured once per extensions
   // instance, so a new onActivity identity each render must not require
@@ -209,7 +210,23 @@ export function useChatEditor({
     const dom = editor.view.dom;
     dom.setAttribute("aria-disabled", String(!isEditable));
     dom.setAttribute("aria-label", placeholder);
+    if (isEditable && restoreFocusAfterSendRef.current) {
+      dom.focus({ preventScroll: true });
+    }
+    if (!sending) restoreFocusAfterSendRef.current = false;
   }, [editor, disabled, sending, placeholder]);
+
+  useEffect(() => {
+    if (!editor || !sending || !restoreFocusAfterSendRef.current) return;
+    const dom = editor.view.dom;
+    const cancelRestore = (event: FocusEvent) => {
+      if (event.target !== dom && !dom.contains(event.target as Node)) {
+        restoreFocusAfterSendRef.current = false;
+      }
+    };
+    document.addEventListener("focusin", cancelRestore);
+    return () => document.removeEventListener("focusin", cancelRestore);
+  }, [editor, sending]);
 
   const canSend = (hasContent || canSendEmpty) && !sending && !disabled;
 
@@ -217,6 +234,7 @@ export function useChatEditor({
     if (!canSend || !editor) return;
     const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
     if (!body && !canSendEmpty) return;
+    restoreFocusAfterSendRef.current = editor.isFocused;
     setSending(true);
     try {
       const result = await onSend(body);
