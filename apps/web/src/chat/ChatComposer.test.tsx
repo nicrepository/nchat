@@ -50,16 +50,17 @@ function setup() {
 
 describe("ChatComposer focus", () => {
   it("focuses once when a desktop composer becomes writable without scrolling", async () => {
-    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     const { rerender } = render(
       <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
     );
 
     const input = await screen.findByTestId("chat-composer-input");
+    const focus = vi.spyOn(input, "focus");
     expect(input).not.toHaveFocus();
     rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
 
     await waitFor(() => expect(input).toHaveFocus());
+    expect(focus).toHaveBeenCalledOnce();
     expect(focus).toHaveBeenCalledWith({ preventScroll: true });
 
     const other = document.createElement("button");
@@ -67,15 +68,19 @@ describe("ChatComposer focus", () => {
     other.focus();
     rerender(<ChatComposer bodyFormat="v2" placeholder="Nova" onSend={vi.fn()} />);
     expect(other).toHaveFocus();
+    expect(focus).toHaveBeenCalledOnce();
     other.remove();
-    focus.mockRestore();
   });
 
   it("does not autofocus read-only or mobile composers", async () => {
     const originalMatchMedia = window.matchMedia;
+    let matches = true;
+    let onChange!: () => void;
     window.matchMedia = vi.fn().mockReturnValue({
-      matches: true,
-      addEventListener: vi.fn(),
+      get matches() {
+        return matches;
+      },
+      addEventListener: vi.fn((_, listener) => (onChange = listener)),
       removeEventListener: vi.fn(),
     });
     const { rerender } = render(
@@ -85,6 +90,9 @@ describe("ChatComposer focus", () => {
     expect(input).not.toHaveFocus();
 
     rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    await waitFor(() => expect(input).not.toHaveFocus());
+    matches = false;
+    act(() => onChange());
     await waitFor(() => expect(input).not.toHaveFocus());
     window.matchMedia = originalMatchMedia;
   });
