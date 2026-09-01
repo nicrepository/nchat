@@ -249,10 +249,12 @@ print_verdict() {
   echo "Cutover eligibility        : BLOCKED until the checklist above is recorded"
   [[ "$AUTOMATED_FAILURES" -eq 0 ]] || return 1
   echo
-  # The evidence names the release, not just the slot: redeploy the candidate and
-  # this token stops matching, so the next cutover asks for a fresh smoke.
+  # The evidence names the release, not just the slot, and the release is the
+  # commit AND the sealed build: rebuild or redeploy the candidate and this token
+  # stops matching, so the next cutover asks for a fresh smoke.
   echo "When the checklist has been completed and recorded, promote with:"
   echo "  NCHAT_PROD_SMOKE_CONFIRMED=$slot:$SMOKE_RELEASE \\"
+  echo "    NCHAT_PROD_RELEASE_MANIFEST_DIR=<dir holding the sealed release-manifest.json> \\"
   echo "    scripts/deploy/nchat-prod/cutover.sh --target $slot"
 }
 
