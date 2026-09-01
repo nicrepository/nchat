@@ -358,6 +358,14 @@ fi
 
 if [[ "${1:-}" == "apply" ]]; then
   printf '%s\n' "$*" >>"$STATE/apply-log"
+  # Keep what was applied, not just that something was. The manifests are
+  # rendered into a temporary tree the caller deletes on exit, so a test that
+  # wants to assert what a deploy actually produced -- the release annotations,
+  # for instance -- has no other way to see it after the command returns.
+  if [[ "${2:-}" == "-f" && -f "${3:-}" ]]; then
+    mkdir -p "$STATE/applied"
+    cp "$3" "$STATE/applied/$(basename "$3")"
+  fi
   # Applying the migration manifest brings its Job into existence, so the wait
   # that follows has something to observe.
   if [[ "$*" == *migrations.yaml* && -n "$(read_state pending-job-name)" ]]; then

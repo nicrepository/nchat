@@ -83,6 +83,32 @@ validate_release_manifest() {
   [[ "$expected" == "$actual" ]]
 }
 
+# The immutable identity of a release: the SHA-256 its manifest was sealed with.
+#
+# Not the source SHA. Two builds of one commit produce different image digests
+# -- buildx stamps provenance and an SBOM into every layer set -- so a commit
+# names the code a release was built from and never the bytes that will run.
+# This hash covers the manifest, and the manifest carries all eleven digests, so
+# it changes the moment any one of them does.
+#
+# Read from the seal rather than recomputed, so there is exactly one definition
+# of what a release is: the value `sha256sum -c` verifies.
+release_manifest_id() {
+  local manifest_dir="$1" recorded
+  recorded="$(cut -d ' ' -f1 <"$manifest_dir/$RELEASE_MANIFEST_SHA256" 2>/dev/null)" || return 1
+  [[ "$recorded" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s' "$recorded"
+}
+
+# The identity of a manifest that has been proved, in that order: the seal must
+# verify before the value it seals is allowed to mean anything.
+verified_release_manifest_id() {
+  local manifest_dir="$1"
+  (cd "$manifest_dir" && sha256sum -c "$RELEASE_MANIFEST_SHA256" >/dev/null 2>&1) || return 1
+  validate_release_manifest "$manifest_dir/$RELEASE_MANIFEST_JSON" || return 1
+  release_manifest_id "$manifest_dir"
+}
+
 release_manifest_inputs_valid() {
   local artifacts_dir="$1" source_sha="$2" run_id="$3"
   if ! validate_digest_artifacts "$artifacts_dir"; then
