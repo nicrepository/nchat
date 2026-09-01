@@ -261,6 +261,7 @@ test.describe("layout responsivo", () => {
     await expect(page.getByTestId("chat-sidebar")).toBeHidden();
     await expect(page.getByRole("main")).not.toHaveAttribute("inert", "");
     await expect(page.getByTestId("chat-msg-header")).toContainText(OTHER_CHANNEL_NAME);
+    await expect(composer(page)).not.toBeFocused();
 
     // Retorno à lista, e de volta para a conversa original.
     await navToggle(page).click();

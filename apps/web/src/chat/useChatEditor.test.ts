@@ -160,6 +160,22 @@ describe("useChatEditor — successful send (status: sent)", () => {
 
     await waitFor(() => expect(result.current.canSend).toBe(false));
   });
+
+  it("blocks editing while sending, then clears on success", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    mockOnSend.mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    await fill(result, "sent");
+
+    const pending = result.current.handleSend();
+    await waitFor(() => expect(result.current.editor!.isEditable).toBe(false));
+    await act(async () => resolveSend({ status: "sent" }));
+    await pending;
+
+    await waitFor(() => expect(result.current.editor!.isEditable).toBe(true));
+    expect(result.current.editor!.isEmpty).toBe(true);
+  });
 });
 
 describe("useChatEditor — stale send (status: stale)", () => {

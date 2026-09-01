@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -47,6 +47,139 @@ function setup() {
   render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
   return onSend;
 }
+
+describe("ChatComposer focus", () => {
+  it("focuses once when a desktop composer becomes writable without scrolling", async () => {
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    expect(input).not.toHaveFocus();
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Nova" onSend={vi.fn()} />);
+    expect(other).toHaveFocus();
+    other.remove();
+    focus.mockRestore();
+  });
+
+  it("does not autofocus read-only or mobile composers", async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+    const input = await screen.findByTestId("chat-composer-input");
+    expect(input).not.toHaveFocus();
+
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    await waitFor(() => expect(input).not.toHaveFocus());
+    window.matchMedia = originalMatchMedia;
+  });
+
+  it("respects focus moved to another control while loading", async () => {
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    await waitFor(() => expect(other).toHaveFocus());
+    other.remove();
+  });
+
+  it("keeps focus after Enter and preserves it with the draft on failure", async () => {
+    let rejectSend!: (error: Error) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((_, reject) => (rejectSend = reject)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "tentar novamente");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+    await act(async () => rejectSend(new Error("offline")));
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+
+    expect(input).toHaveFocus();
+    expect(input).toHaveTextContent("tentar novamente");
+  });
+
+  it("keeps focus after a successful Enter send", async () => {
+    const onSend = setup();
+    const input = await paste("", "enviar");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    expect(input).toHaveFocus();
+    await waitFor(() => expect(input.textContent?.trim()).toBe(""));
+  });
+
+  it("blocks edits during a pending send, then clears and restores focus", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "sent");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+    await userEvent.type(input, " later", { skipClick: true });
+    expect(input).toHaveTextContent("sent");
+
+    await act(async () => resolveSend({ status: "sent" }));
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+    expect(input.textContent?.trim()).toBe("");
+    expect(input).toHaveFocus();
+  });
+
+  it("does not restore focus over a control chosen during a pending send", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "sent");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+    await act(async () => resolveSend({ status: "sent" }));
+
+    expect(other).toHaveFocus();
+    other.remove();
+  });
+
+  it("returns focus after clicking send and keeps Shift+Enter as a line break", async () => {
+    const onSend = setup();
+    const input = await paste("", "linha um");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter", shiftKey: true });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input.querySelector("br")).not.toBeNull();
+
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+    expect(input).toHaveFocus();
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+  });
+});
 
 async function send(onSend: ReturnType<typeof setup>): Promise<string> {
   await userEvent.click(await screen.findByTestId("chat-send-btn"));
