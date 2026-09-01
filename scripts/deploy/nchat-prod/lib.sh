@@ -17,6 +17,12 @@ NCHAT_PROD_NAMESPACE="${NCHAT_PROD_NAMESPACE:-nchat-prod}"
 # an outage. Overridable for a rehearsal cluster, never silently.
 NCHAT_PROD_CONTEXT="${NCHAT_PROD_CONTEXT:-nchat-prod-deployer}"
 NCHAT_PROD_SLOT_LABEL='nchat.io/release-slot'
+# The two annotations that together identify what a slot is running: the commit
+# it was built from, and the sealed release whose digests it actually pins.
+NCHAT_PROD_RELEASE_SHA_ANNOTATION='nchat.io/release-sha'
+NCHAT_PROD_RELEASE_ID_ANNOTATION='nchat.io/release-id'
+# Written beside the digests by release-digests.sh, read by the deploy.
+NCHAT_PROD_RELEASE_ID_FILE=release-id.txt
 NCHAT_PROD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NCHAT_PROD_SLOTS=(blue green)
 # The slot the first production release is established in. Blue is the baseline
@@ -279,7 +285,11 @@ deployment_observed_releases() {
   component="$(deployment_component "$deployment")" || return 1
   [[ -n "$component" ]] || return 1
   template='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}'
-  template+="{.metadata.annotations['nchat\\.io/release-sha']}{'\n'}{end}"
+  # Both halves of the identity, joined, so every gate downstream compares the
+  # code AND the bytes. A pod missing either annotation yields a value that
+  # matches no valid release and is refused rather than defaulted.
+  template+="{.metadata.annotations['nchat\\.io/release-sha']}{':'}"
+  template+="{.metadata.annotations['nchat\\.io/release-id']}{'\n'}{end}"
   kubectl get pods -n "$NCHAT_PROD_NAMESPACE" \
     -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot" \
     -o "jsonpath=$template" 2>/dev/null
@@ -287,9 +297,10 @@ deployment_observed_releases() {
 
 # The single release every Ready pod of a workload carries, or a state token.
 #
-#   <sha>          every Ready pod runs this release
+#   <sha>:<id>     every Ready pod runs this release
 #   none           the workload has no Ready pod
 #   mixed          Ready pods disagree — a rollout caught in the middle
+#   unset          the pods carry no complete release identity
 observed_release_of() {
   local deployment="$1" slot="$2" releases distinct count
   releases="$(deployment_observed_releases "$deployment" "$slot")" || { printf 'none'; return 0; }
@@ -297,6 +308,11 @@ observed_release_of() {
   count="$(printf '%s\n' "$distinct" | grep -c .)"
   [[ "$count" -ne 0 ]] || { printf 'none'; return 0; }
   [[ "$count" -eq 1 ]] || { printf 'mixed'; return 0; }
+  # An identity is the commit and the sealed release together. A pod carrying
+  # only one of the two annotations produces a half-formed value here, and
+  # naming it explicitly is what stops it being compared as though it were a
+  # release: `unset` is refused by every caller, a truncated pair might not be.
+  [[ "$distinct" =~ ^[a-f0-9]{40}:[a-f0-9]{64}$ ]] || { printf 'unset'; return 0; }
   printf '%s' "$distinct"
 }
 
@@ -413,9 +429,21 @@ require_consistent_release() {
 # -- promoting a release nobody smoked. Binding the two means a candidate that
 # changed after validation no longer matches.
 smoke_evidence_for() {
-  local slot="$1" sha
-  sha="$(slot_release "$slot")" || return 1
-  printf '%s:%s' "$slot" "$sha"
+  local slot="$1" release
+  release="$(slot_release "$slot")" || return 1
+  printf '%s:%s' "$slot" "$release"
+}
+
+# The release identity recorded beside the digests, refused unless it is one.
+read_release_id() {
+  local artifacts_dir="$1" release_id
+  local file="$artifacts_dir/$NCHAT_PROD_RELEASE_ID_FILE"
+  # Checked before it is read: `$(<missing)` under `set -e` ends the caller with
+  # a shell diagnostic instead of the refusal the caller wants to report.
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  release_id="$(<"$file")"
+  [[ "$release_id" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s' "$release_id"
 }
 
 confirm() {
