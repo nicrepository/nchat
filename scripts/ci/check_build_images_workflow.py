@@ -64,6 +64,20 @@ INVENTORY_SHA_OUTPUT = "${{ inputs.sha }}"
 MATRIX_IMAGE = "${{ fromJSON(needs.inventory.outputs.images) }}"
 IMAGES_OUTPUT = "${{ steps.images.outputs.images }}"
 MATRIX_SCRIPT = "scripts/deploy/nchat-dev/image-matrix.sh"
+# A commit is 40 lowercase hex characters or it is not a commit. Anything
+# looser -- an abbreviation, a ref name -- would let the checkout resolve
+# something nobody can name again afterwards.
+SHA_FORMAT = "^[a-f0-9]{40}$"
+SHA_FORMAT_ENV = {"RELEASE_SHA": SHA}
+# The gate as the repository writes it, plus the only two variations bash treats
+# identically: the braces and the quotes around the variable are optional. This
+# is a contract checker for one controlled workflow, not a shell parser, so the
+# accepted set stays this small and this auditable. The regex on the right must
+# stay unquoted -- quoting it would make bash compare literal text instead of
+# matching, which is the same no-op the pattern exists to refuse.
+SHA_GATE = re.compile(
+    r'\[\[\s+"?\$\{?RELEASE_SHA\}?"?\s+=~\s+\^\[a-f0-9\]\{40\}\$\s+\]\]'
+)
 MAIN_GATE_SCRIPT = "scripts/deploy/nchat-prod/require-main-sha.sh"
 MAIN_GATE_CONDITION = "${{ inputs.require_main }}"
 # The commit the gate proves has to be the commit the build then checks out.
@@ -227,7 +241,48 @@ def check_inventory_job(workflow):
     matrix = steps_running(steps, MATRIX_SCRIPT)
     if len(matrix) != 1 or matrix[0].get("id") != "images":
         problems.append(f"inventory must run {MATRIX_SCRIPT} in exactly one step with id images")
-    return problems + check_main_gate(steps)
+    return problems + check_sha_validation(steps) + check_main_gate(steps)
+
+
+def executable_lines(run):
+    """The lines of a `run:` block bash would actually execute.
+
+    Blank lines and whole-line comments are dropped, so a gate that has been
+    commented out cannot go on satisfying the contract it no longer enforces.
+    """
+    for line in str(run).splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            yield stripped
+
+
+def gates_sha(step):
+    """True when the whole step is the gate: one line, and that line tests it.
+
+    Containing the pattern is not the same as applying it, and neither is
+    running it somewhere whose exit code nobody reads. A step that holds only
+    this line has nowhere left to put an `if false`, a `|| true`, or a later
+    command whose status replaces the gate's, so the step fails exactly when
+    the commit is not a full SHA. The canonical workflow already writes it as
+    that single line; anything richer is outside the contract.
+    """
+    lines = list(executable_lines(step.get("run", "")))
+    return len(lines) == 1 and SHA_GATE.fullmatch(lines[0]) is not None
+
+
+def check_sha_validation(steps):
+    """The requested commit is proved well-formed before anything uses it.
+
+    First step of the first job, so neither the checkout nor the main gate
+    ever sees a value this workflow has not shown to be a full SHA.
+    """
+    validate = [s for s in steps if gates_sha(s)]
+    if len(validate) != 1:
+        return [f"inventory must test RELEASE_SHA against {SHA_FORMAT!r} in exactly one step"]
+    problems = compare("SHA validation env", validate[0].get("env") or {}, SHA_FORMAT_ENV)
+    if steps.index(validate[0]) != 0:
+        problems.append("the requested SHA must be validated before any other inventory step")
+    return problems
 
 
 def check_main_gate(steps):

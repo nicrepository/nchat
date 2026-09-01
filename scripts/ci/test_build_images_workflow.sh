@@ -68,6 +68,27 @@ INPUT_OPS = {
     "extra-input",
 }
 OUTPUT_OPS = {"drop-sha-output", "stale-sha-output"}
+SHA_OPS = {"unvalidated-sha", "loose-sha", "late-sha-validation"}
+# Gates that keep the step, its env and its position, and stop validating.
+# Each one contains every token of the contract without applying any of it.
+NOOP_SHA_GATES = {
+    "echoed-sha-gate": 'echo "^[a-f0-9]{40}$"',
+    "echoed-sha-with-variable": 'echo "$RELEASE_SHA ^[a-f0-9]{40}$"',
+    "commented-sha-gate": '# [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]\ntrue\n',
+    "wrong-variable-sha-gate": '[[ "$OTHER_VAR" =~ ^[a-f0-9]{40}$ ]]',
+    # SR-001: a gate whose exit code nothing reads. Each of these contains the
+    # real expression, and in each one an invalid SHA still leaves the step
+    # green -- unreachable, suppressed, or overtaken by a later command.
+    "dead-code-sha-gate": (
+        'if false; then\n  [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]\nfi\ntrue\n'
+    ),
+    "suppressed-sha-gate": '(\n  [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]\n) || true\n',
+    "extra-command-sha-gate": '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]\ntrue\n',
+    "inline-suppressed-sha-gate": '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]] || true',
+    "conditional-sha-gate": 'false && [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]',
+}
+WIRING_OPS = {"drop-images-output", "detached-build"}
+DISPATCH_OPS = {"caller-builds-elsewhere", "optional-dispatch-sha"}
 GATE_OPS = {"gate-other-sha", "shallow-gate-history", "echoed-inventory"}
 JOB_OPS = {
     "checkout-head",
@@ -100,7 +121,7 @@ DAG_OPS = {
     "drop-manifest",
     "manifest-other-sha",
 }
-CALLER_OPS = DAG_OPS | {
+CALLER_OPS = DAG_OPS | DISPATCH_OPS | {
     "dispatch-without-proof",
     "caller-builds-head",
     "detached-deploy",
@@ -174,6 +195,54 @@ def mutate_inventory(workflow, operation):
         steps_using(steps, CHECKOUT)[0]["with"]["fetch-depth"] = 1
     else:
         next(s for s in steps if MATRIX in str(s.get("run", "")))["run"] = f"echo {MATRIX}"
+    return True
+
+
+def index_validating(steps):
+    return next(i for i, s in enumerate(steps) if "a-f0-9" in str(s.get("run", "")))
+
+
+def mutate_sha_validation(workflow, operation):
+    if operation not in SHA_OPS:
+        return False
+    steps = workflow["jobs"]["inventory"]["steps"]
+    index = index_validating(steps)
+    if operation == "unvalidated-sha":
+        steps.pop(index)
+    elif operation == "loose-sha":
+        steps[index]["run"] = '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{7,40}$ ]]'
+    else:
+        steps.insert(index + 2, steps.pop(index))
+    return True
+
+
+def mutate_noop_sha_gate(workflow, operation):
+    """Replace only the command of the real gate, proving it was the target."""
+    if operation not in NOOP_SHA_GATES:
+        return False
+    steps = workflow["jobs"]["inventory"]["steps"]
+    steps[index_validating(steps)]["run"] = NOOP_SHA_GATES[operation]
+    return True
+
+
+def mutate_wiring(workflow, operation):
+    if operation not in WIRING_OPS:
+        return False
+    jobs = workflow["jobs"]
+    if operation == "drop-images-output":
+        del jobs["inventory"]["outputs"]["images"]
+    else:
+        del jobs["build"]["needs"]
+    return True
+
+
+def mutate_dispatch(workflow, operation):
+    if operation not in DISPATCH_OPS:
+        return False
+    if operation == "caller-builds-elsewhere":
+        workflow["jobs"]["build"]["uses"] = "./.github/workflows/deploy-nchat-dev.yml"
+    else:
+        triggers(workflow)["workflow_dispatch"]["inputs"]["sha"]["required"] = False
     return True
 
 
@@ -292,7 +361,9 @@ def mutate_caller(workflow, operation):
 
 def main(source, destination, operation):
     workflow = yaml.safe_load(open(source, encoding="utf-8"))
-    for mutation in (mutate_inputs, mutate_outputs, mutate_inventory, mutate_jobs, mutate_build, mutate_caller):
+    for mutation in (mutate_inputs, mutate_outputs, mutate_sha_validation,
+                     mutate_noop_sha_gate, mutate_wiring,
+                     mutate_dispatch, mutate_inventory, mutate_jobs, mutate_build, mutate_caller):
         if mutation(workflow, operation):
             break
     else:
@@ -378,6 +449,41 @@ test_inventory_and_gate() {
     shallow-gate-history
   expect_builder_refused "an inventory step that only echoes the script path" \
     echoed-inventory
+  expect_builder_refused "an inventory job that stops publishing the image list" \
+    drop-images-output
+  expect_builder_refused "a build that no longer waits for the inventory gate" detached-build
+}
+
+# The requested commit is the identity of a production release, so it is proved
+# to be a commit before the workflow does anything at all with it.
+test_sha_is_validated_first() {
+  echo "the requested SHA is proved well-formed before it is used"
+  expect_builder_refused "a SHA nothing ever validates" unvalidated-sha
+  expect_builder_refused "a SHA an abbreviation would satisfy" loose-sha
+  expect_builder_refused "a SHA validated only after it has been checked out" \
+    late-sha-validation
+}
+
+# The code quality review's finding: the checker proved the pattern was present
+# in the step, never that the step applied it. Every case below keeps the step,
+# its env and its position intact, and changes only whether it validates.
+test_sha_gate_must_execute() {
+  echo "the SHA gate has to run, not merely mention the pattern"
+  expect_builder_refused "a gate that only echoes the pattern" echoed-sha-gate
+  expect_builder_refused "a gate that echoes the SHA beside the pattern" \
+    echoed-sha-with-variable
+  expect_builder_refused "a gate commented out above a bare true" commented-sha-gate
+  expect_builder_refused "a gate that validates the wrong variable" \
+    wrong-variable-sha-gate
+  expect_builder_refused "a gate parked behind an if false" dead-code-sha-gate
+  expect_builder_refused "a gate in a subshell whose failure is swallowed" \
+    suppressed-sha-gate
+  expect_builder_refused "a gate whose verdict a later command replaces" \
+    extra-command-sha-gate
+  expect_builder_refused "a gate whose failure is swallowed on its own line" \
+    inline-suppressed-sha-gate
+  expect_builder_refused "a gate reached only if an earlier command succeeds" \
+    conditional-sha-gate
 }
 
 # The regression a code review found: the checker validated the ref of every
@@ -428,6 +534,9 @@ test_caller_contract() {
   expect_caller_refused "a deploy that is no longer restricted to develop" unconditional-deploy
   expect_caller_refused "a deploy routed away from nchat-dev" deploy-elsewhere
   expect_caller_refused "pushes to main building images directly" build-main-pushes
+  expect_caller_refused "a caller that builds outside the single builder" \
+    caller-builds-elsewhere
+  expect_caller_refused "a dispatch that need not name a SHA" optional-dispatch-sha
 }
 
 # --- The reachable-from-main gate -------------------------------------------
@@ -520,6 +629,8 @@ main() {
   test_workflows_satisfy_the_contract
   test_sha_contract
   test_inventory_and_gate
+  test_sha_is_validated_first
+  test_sha_gate_must_execute
   test_build_checkout_is_mandatory
   test_build_and_digest
   test_release_dag
