@@ -2842,6 +2842,7 @@
 }
 
 .chat-msg-area__audio-playbtn,
+.chat-msg-area__audio-download,
 .chat-msg-area__audio-rate {
   display: inline-flex;
   align-items: center;
@@ -2858,10 +2859,38 @@
   cursor: pointer;
 }
 
+.chat-msg-area__audio-download,
 .chat-msg-area__audio-rate {
   background: var(--color-surface, #fff);
   color: var(--color-primary, #6d28d9);
   border: 1px solid var(--color-border, #e8e3f0);
+}
+
+/* Wide enough for "1.5x" so the row does not resize as the rate cycles. */
+.chat-msg-area__audio-rate {
+  min-width: 44px;
+}
+
+/* Download (issue #740). Icon-only to keep the player's height and density —
+   the label lives in aria-label and in the pointer tooltip — and never allowed
+   to shrink: the progress bar is the one control that gives up width first. */
+.chat-msg-area__audio-download {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0 6px;
+}
+
+/* Comfortable touch target without changing the player's height: the box the
+   finger hits extends into the surrounding gap only, never over the seek bar
+   or the rate button, so a drag on the timeline is unaffected. */
+.chat-msg-area__audio-download::after {
+  content: "";
+  position: absolute;
+  inset: -6px -4px;
+}
+
+.chat-msg-area__audio-download .material-symbols-outlined {
+  font-size: 18px;
 }
 
 .chat-msg-area__audio-playbtn:disabled,
@@ -2870,15 +2899,20 @@
   opacity: 0.6;
 }
 
+.chat-msg-area__audio-download[aria-busy="true"] {
+  opacity: 0.6;
+}
+
 .chat-msg-area__audio-playbtn:focus-visible,
+.chat-msg-area__audio-download:focus-visible,
 .chat-msg-area__audio-rate:focus-visible {
   outline: 2px solid var(--color-primary-strong, #4c1d95);
   outline-offset: 2px;
 }
 
 .chat-msg-area__audio-seek {
-  flex: 1 1 120px;
-  min-width: 80px;
+  flex: 1 1 80px;
+  min-width: 64px;
   accent-color: var(--color-primary, #6d28d9);
 }
 
@@ -2897,6 +2931,12 @@
 
 .chat-msg-area__audio-note[role="alert"] {
   color: var(--color-danger-strong, #b91c1c);
+}
+
+/* The download's own note sits beside its button in the DOM — where assistive
+   technology reads it — but always takes the last row of the control strip. */
+.chat-msg-area__audio-note--download {
+  order: 1;
 }
 
 /* ── Voice message compact presentation (issue #670) ──────────────────────────
