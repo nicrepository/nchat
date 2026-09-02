@@ -879,3 +879,96 @@
     animation: none;
   }
 }
+
+/* ── Device settings (issue #755) ───────────────────────────────────────────
+   Trigger reuses .call-presentation__control (same square icon-button as
+   mic/camera/screen-share). The panel is portalled to <body> and positioned
+   in viewport coordinates by DeviceSettingsMenu, the same approach
+   .chat-sidebar__actions-menu already uses for the sidebar row menu, and
+   restates its own palette for the same reason: outside its origin there is
+   nothing to inherit dark-surface tokens from. */
+
+.call-device-menu {
+  /* The wrapper exists only to hold the trigger + portal; it must never
+     become a flex item of its own inside .call-presentation__controls. */
+  display: contents;
+}
+
+.call-device-menu__panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 90;
+  width: 16.25rem;
+  max-width: calc(100vw - 1rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-radius: 0.65rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #241f31;
+  color: #e5e1f0;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.call-device-menu__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8125rem;
+}
+
+.call-device-menu__field select {
+  font: inherit;
+  padding: 0.375rem 0.5rem;
+  border-radius: 0.4rem;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.06);
+  color: inherit;
+  /* Without this, Chromium/Windows renders the native options popup with its
+     light-theme UA colors even though the closed control inherits our dark
+     palette (issue #755 follow-up: low-contrast option list). */
+  color-scheme: dark;
+}
+
+.call-device-menu__field select option {
+  background: #241f31;
+  color: #e5e1f0;
+}
+
+.call-device-menu__field select:disabled {
+  opacity: 0.6;
+}
+
+.call-device-menu__field select:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
+.call-device-menu__unsupported {
+  margin: 0;
+  font-size: 0.75rem;
+  color: rgba(229, 225, 240, 0.7);
+}
+
+.call-device-menu__status {
+  margin: 0;
+  min-height: 1em;
+  font-size: 0.75rem;
+  color: rgba(229, 225, 240, 0.7);
+}
+
+.call-device-menu__error {
+  margin: 0;
+  font-size: 0.75rem;
+  color: #ff9a8f;
+}
+
+@media (max-width: 420px) {
+  .call-device-menu__panel {
+    width: calc(100vw - 1rem);
+  }
+}

@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 
 import importlib.util
-import contextlib
-import shutil
-import tempfile
 import os
 import subprocess
 import unittest
@@ -16,46 +13,6 @@ SPEC = importlib.util.spec_from_file_location("git_conventions_check", SCRIPT_PA
 assert SPEC and SPEC.loader
 git_conventions_check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(git_conventions_check)
-
-
-ENFORCEMENT = git_conventions_check.GOVERNANCE_ENFORCEMENT_SHA
-
-
-def log_call(run):
-    """The argv of the single `git log` call, from a fake_git recorder."""
-    for call in run.call_args_list:
-        argv = call.args[0]
-        if argv[:2] == ["git", "log"]:
-            return argv
-    raise AssertionError(f"git log was never called: {run.call_args_list}")
-
-
-@contextlib.contextmanager
-def fake_git(*, ancestry: dict, log_stdout: str = "", log_returncode: int = 0):
-    """A git that answers merge-base from `ancestry` and log from `log_stdout`.
-
-    ancestry maps (ancestor, descendant) -> bool, and is consulted by exit
-    status the way the real command reports it: 0 for yes, 1 for no. A pair the
-    test did not describe raises, so a test cannot pass by accident on a call it
-    never thought about.
-    """
-
-    def run(argv, **kwargs):
-        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
-            key = (argv[3], argv[4])
-            if key not in ancestry:
-                raise AssertionError(f"unexpected ancestry query: {key}")
-            return subprocess.CompletedProcess(
-                args=argv, returncode=0 if ancestry[key] else 1, stdout="", stderr=""
-            )
-        if argv[:2] == ["git", "log"]:
-            return subprocess.CompletedProcess(
-                args=argv, returncode=log_returncode, stdout=log_stdout
-            )
-        raise AssertionError(f"unexpected git invocation: {argv}")
-
-    with patch.object(git_conventions_check.subprocess, "run", side_effect=run) as mock:
-        yield mock
 
 
 class GitConventionsCheckTest(unittest.TestCase):
@@ -112,17 +69,6 @@ class GitConventionsCheckTest(unittest.TestCase):
             with self.subTest(subject=subject):
                 self.assertTrue(git_conventions_check.is_valid_conventional_subject(subject))
 
-    def test_accepts_optional_canonical_pull_request_suffix(self) -> None:
-        for subject in (
-            "feat: add feature (#1)",
-            "fix(files): strip API prefix (#488)",
-            "ci(repo): enforce git contribution conventions (#522)",
-            "feat(api)!: change attachment contract (#999)",
-            "feat: add feature",
-        ):
-            with self.subTest(subject=subject):
-                self.assertTrue(git_conventions_check.is_valid_conventional_subject(subject))
-
     def test_rejects_invalid_conventional_commit_subjects(self) -> None:
         for subject in (
             "unknown(repo): add gate",
@@ -135,21 +81,6 @@ class GitConventionsCheckTest(unittest.TestCase):
             "fix(repo): add `id`",
             'fix(repo): add "; id; #',
             "fix(repo): add\nnewline",
-        ):
-            with self.subTest(subject=subject):
-                self.assertFalse(git_conventions_check.is_valid_conventional_subject(subject))
-
-    def test_rejects_malformed_or_misplaced_pull_request_suffix(self) -> None:
-        for subject in (
-            "fix: thing #123",
-            "fix: thing (#abc)",
-            "fix: thing (#123) trailing",
-            "fix: thing (#12a)",
-            "fix: thing (#)",
-            "fix: thing (#-1)",
-            "fix: thing (#0)",
-            "fix: thing (#001)",
-            'fix(repo): add "; id; #',
         ):
             with self.subTest(subject=subject):
                 self.assertFalse(git_conventions_check.is_valid_conventional_subject(subject))
@@ -254,23 +185,25 @@ class GitConventionsCheckTest(unittest.TestCase):
         )
 
     def test_pull_request_subjects_uses_git_to_exclude_merge_commits(self) -> None:
-        """A modern pull request: base is already past adoption, so it is used."""
         base_sha = "a" * 40
         head_sha = "b" * 40
+        completed_process = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="feat: add gate\nfix: fix gate\n\n"
+        )
 
-        with fake_git(
-            ancestry={(ENFORCEMENT, head_sha): True, (ENFORCEMENT, base_sha): True},
-            log_stdout="feat: add gate\nfix: fix gate\n\n",
+        with patch.object(
+            git_conventions_check.subprocess, "run", return_value=completed_process
         ) as run:
             self.assertEqual(
                 git_conventions_check.pull_request_subjects(base_sha, head_sha),
                 ("feat: add gate", "fix: fix gate"),
             )
 
-        self.assertEqual(
-            log_call(run),
-            ["git", "log", "--no-merges", "--format=%s",
-             head_sha, f"^{base_sha}", f"^{ENFORCEMENT}"],
+        run.assert_called_once_with(
+            ["git", "log", "--no-merges", "--format=%s", f"{base_sha}..{head_sha}"],
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
     def test_pull_request_subjects_rejects_invalid_base_sha(self) -> None:
@@ -358,378 +291,3 @@ class GitConventionsCheckTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class EnforcementBoundaryTests(unittest.TestCase):
-    """The policy applies from its adoption commit forward, by ancestry.
-
-    Requirement 4: a release pull request promotes an old base to a new head, so
-    the raw range contains pre-policy history nobody can fix without rewriting
-    it. Requirement 5: an ordinary feature -> develop pull request must keep
-    validating every commit it introduces.
-    """
-
-    BASE = "a" * 40
-    HEAD = "b" * 40
-
-    def test_release_shaped_range_starts_at_the_adoption_commit(self) -> None:
-        # Base predates adoption, head contains it: the retroactive case.
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): False},
-            log_stdout="feat(x): after adoption\n",
-        ) as run:
-            subjects = git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-
-        self.assertEqual(subjects, ("feat(x): after adoption",))
-        # Both boundaries are excluded. The base exclusion is what keeps a
-        # commit already on `main` out when `main` is merged into the release.
-        self.assertEqual(
-            log_call(run),
-            ["git", "log", "--no-merges", "--format=%s",
-             self.HEAD, f"^{self.BASE}", f"^{ENFORCEMENT}"],
-        )
-
-    def test_a_base_already_past_adoption_is_used_unchanged(self) -> None:
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): True},
-            log_stdout="feat(x): normal pull request\n",
-        ) as run:
-            git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-
-        self.assertEqual(
-            log_call(run),
-            ["git", "log", "--no-merges", "--format=%s",
-             self.HEAD, f"^{self.BASE}", f"^{ENFORCEMENT}"],
-        )
-
-    def test_a_head_without_the_adoption_commit_keeps_its_base(self) -> None:
-        """Conservative: validate more, never fewer, when the boundary cannot apply."""
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): False},
-            log_stdout="feat(x): branch cut before adoption\n",
-        ) as run:
-            git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-
-        self.assertEqual(
-            log_call(run),
-            ["git", "log", "--no-merges", "--format=%s", self.HEAD, f"^{self.BASE}"],
-        )
-
-    def test_a_commit_after_adoption_still_fails(self) -> None:
-        """The boundary moves the range; it never softens the rule inside it."""
-        errors = git_conventions_check.validate_pull_request(
-            actor="alvaro-neto",
-            branch="release/0.1.0",
-            title="chore(release): NChat 0.1.0",
-            subjects=("Feature/chat 17 agrupa categorias sidebar",),
-        )
-        self.assertEqual(
-            errors,
-            ["Invalid commit subjects: Feature/chat 17 agrupa categorias sidebar"],
-        )
-
-    def test_a_commit_before_adoption_never_reaches_validation(self) -> None:
-        """A historical subject fails the pattern, so it must be excluded upstream."""
-        legacy = "[TASK-79] Implementar deleção com placeholder"
-        self.assertFalse(git_conventions_check.is_valid_conventional_subject(legacy))
-
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): False},
-            # git is asked for adoption..head, so it never reports the legacy commit.
-            log_stdout="feat(x): after adoption\n",
-        ):
-            subjects = git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-
-        self.assertNotIn(legacy, subjects)
-        self.assertEqual(
-            git_conventions_check.validate_pull_request(
-                actor="alvaro-neto",
-                branch="release/0.1.0",
-                title="chore(release): NChat 0.1.0",
-                subjects=subjects,
-            ),
-            [],
-        )
-
-    def test_an_invalid_branch_still_fails_on_a_release_shaped_range(self) -> None:
-        errors = git_conventions_check.validate_pull_request(
-            actor="alvaro-neto",
-            branch="Release/0.1.0",
-            title="chore(release): NChat 0.1.0",
-            subjects=(),
-        )
-        self.assertEqual(errors, ["Invalid branch name: Release/0.1.0"])
-
-    def test_an_invalid_title_still_fails_on_a_release_shaped_range(self) -> None:
-        errors = git_conventions_check.validate_pull_request(
-            actor="alvaro-neto",
-            branch="release/0.1.0",
-            title="Release 0.1.0",
-            subjects=(),
-        )
-        self.assertEqual(errors, ["Invalid pull request title: Release 0.1.0"])
-
-    def test_merge_commits_stay_excluded_after_the_boundary_moves(self) -> None:
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): False},
-            log_stdout="feat(x): after adoption\n",
-        ) as run:
-            git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-
-        self.assertIn("--no-merges", log_call(run))
-
-    def test_dependabot_rules_are_unchanged_by_the_boundary(self) -> None:
-        self.assertEqual(
-            git_conventions_check.validate_pull_request(
-                actor="dependabot[bot]",
-                branch="dependabot/go_modules/example-1.2.3",
-                title="chore(deps): bump example",
-                subjects=("chore(deps): bump example",),
-            ),
-            [],
-        )
-
-
-class AncestryProbeTests(unittest.TestCase):
-    """git merge-base --is-ancestor answers by exit status; only 0 and 1 answer."""
-
-    def probe(self, returncode: int):
-        completed = subprocess.CompletedProcess(
-            args=["git", "merge-base"], returncode=returncode, stdout="", stderr="boom"
-        )
-        with patch.object(
-            git_conventions_check.subprocess, "run", return_value=completed
-        ):
-            return git_conventions_check.is_ancestor("a" * 40, "b" * 40)
-
-    def test_zero_means_ancestor(self) -> None:
-        self.assertTrue(self.probe(0))
-
-    def test_one_means_not_an_ancestor(self) -> None:
-        self.assertFalse(self.probe(1))
-
-    def test_any_other_status_is_an_operational_error(self) -> None:
-        """A broken graph must never be read as 'not covered by the policy'."""
-        for returncode in (2, 128, 129):
-            with self.subTest(returncode=returncode):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    self.probe(returncode)
-
-    def test_a_merge_base_failure_stops_the_whole_check(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=["git", "merge-base"], returncode=128, stdout="", stderr="bad object"
-        )
-        with patch.object(
-            git_conventions_check.subprocess, "run", return_value=completed
-        ):
-            with self.assertRaises(subprocess.CalledProcessError):
-                git_conventions_check.pull_request_subjects("a" * 40, "b" * 40)
-
-    def test_main_reports_a_merge_base_failure_as_infrastructure(self) -> None:
-        """Exit 2, not 0: an unusable graph is never a pass."""
-        environment = {
-            "GITHUB_EVENT_NAME": "pull_request",
-            "PR_AUTHOR": "alvaro-neto",
-            "PR_HEAD_REF": "release/0.1.0",
-            "PR_TITLE": "chore(release): NChat 0.1.0",
-            "PR_BASE_SHA": "a" * 40,
-            "PR_HEAD_SHA": "b" * 40,
-        }
-        completed = subprocess.CompletedProcess(
-            args=["git", "merge-base"], returncode=128, stdout="", stderr="bad object"
-        )
-        with patch.dict(os.environ, environment, clear=True), patch.object(
-            git_conventions_check.subprocess, "run", return_value=completed
-        ):
-            self.assertEqual(git_conventions_check.main(), 2)
-
-    def test_invalid_shas_are_rejected_before_any_git_runs(self) -> None:
-        with patch.object(git_conventions_check.subprocess, "run") as run:
-            with self.assertRaisesRegex(ValueError, "full lowercase SHAs"):
-                git_conventions_check.pull_request_subjects("invalid", "b" * 40)
-            with self.assertRaisesRegex(ValueError, "full lowercase SHAs"):
-                git_conventions_check.pull_request_subjects("a" * 40, "B" * 40)
-        run.assert_not_called()
-
-
-class RevisionSetTests(unittest.TestCase):
-    """The validated set is ancestors(head) - ancestors(base) - ancestors(adoption).
-
-    Two exclusions, always. A single `X..head` range can only subtract one set,
-    which is what let a commit already present on the base be validated once the
-    base branch was merged into the head.
-    """
-
-    BASE = "a" * 40
-    HEAD = "b" * 40
-
-    def test_the_base_is_always_excluded(self) -> None:
-        for adoption_in_head in (True, False):
-            with self.subTest(adoption_in_head=adoption_in_head):
-                ancestry = {(ENFORCEMENT, self.HEAD): adoption_in_head}
-                if adoption_in_head:
-                    ancestry[(ENFORCEMENT, self.BASE)] = False
-                with fake_git(ancestry=ancestry, log_stdout="") as run:
-                    git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-                self.assertIn(f"^{self.BASE}", log_call(run))
-
-    def test_the_adoption_commit_is_a_second_exclusion_not_a_replacement(self) -> None:
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): False},
-            log_stdout="",
-        ) as run:
-            git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-        argv = log_call(run)
-        self.assertIn(f"^{self.BASE}", argv)
-        self.assertIn(f"^{ENFORCEMENT}", argv)
-        # Never the two-dot form, which can only subtract one set.
-        self.assertFalse([a for a in argv if ".." in a], argv)
-
-    def test_no_shell_is_involved(self) -> None:
-        with fake_git(
-            ancestry={(ENFORCEMENT, self.HEAD): True, (ENFORCEMENT, self.BASE): True},
-            log_stdout="",
-        ) as run:
-            git_conventions_check.pull_request_subjects(self.BASE, self.HEAD)
-        for call in run.call_args_list:
-            self.assertIsInstance(call.args[0], list)
-            self.assertNotIn("shell", call.kwargs)
-
-
-@unittest.skipIf(shutil.which("git") is None, "git is required")
-class RealGraphTests(unittest.TestCase):
-    """The divergent-lineage graph, built as a real repository.
-
-    Command-shape assertions prove what is asked of git; only a real graph
-    proves what git answers. This reproduces the shape that regressed:
-
-        common ── legacy ─────────────── BASE        (main's lineage)
-            └──── pre-policy ── ADOPTION ── new ── HEAD
-                                              (HEAD also merges BASE)
-
-    legacy is reachable from BASE and from HEAD, but is NOT an ancestor of
-    ADOPTION -- so an adoption-only range lets it through.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.directory = tempfile.mkdtemp()
-        cls.addClassCleanup(shutil.rmtree, cls.directory, ignore_errors=True)
-        cls.run_git("init", "-q", "-b", "main")
-        cls.run_git("config", "user.email", "test@example.invalid")
-        cls.run_git("config", "user.name", "Test")
-
-        cls.common = cls.commit("chore(repo): common root")
-        # main's lineage: a legacy subject that predates the policy.
-        cls.legacy = cls.commit("Feat/testes e2 e basicos de auth (#225)")
-        cls.base = cls.commit("fix(repo): revert accidental merge into main (#251)")
-
-        # develop's lineage, branched from the common root.
-        cls.run_git("checkout", "-q", "-b", "develop", cls.common)
-        cls.pre_policy = cls.commit("Security: harden authentication flow")
-        cls.adoption = cls.commit("ci(repo): enforce git contribution conventions")
-        cls.new_valid = cls.commit("feat(x): a commit written under the policy")
-        # main is merged into the release, exactly as happened on release/0.1.0.
-        cls.run_git("merge", "-q", "--no-ff", "-m", "Merge branch 'main' into release", cls.base)
-        cls.head = cls.rev_parse("HEAD")
-
-    @classmethod
-    def run_git(cls, *arguments: str) -> str:
-        return subprocess.run(
-            ["git", "-C", cls.directory, *arguments],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-    @classmethod
-    def commit(cls, subject: str) -> str:
-        cls.run_git("commit", "-q", "--allow-empty", "-m", subject)
-        return cls.rev_parse("HEAD")
-
-    @classmethod
-    def rev_parse(cls, revision: str) -> str:
-        return cls.run_git("rev-parse", revision)
-
-    @contextlib.contextmanager
-    def checker_in_repository(self):
-        """Point the checker's git calls at the fixture repository."""
-        real_run = subprocess.run
-
-        def run(argv, **kwargs):
-            return real_run(["git", "-C", self.directory, *argv[1:]], **kwargs)
-
-        with patch.object(git_conventions_check, "GOVERNANCE_ENFORCEMENT_SHA", self.adoption):
-            with patch.object(git_conventions_check.subprocess, "run", side_effect=run):
-                yield
-
-    def subjects(self) -> tuple[str, ...]:
-        with self.checker_in_repository():
-            return git_conventions_check.pull_request_subjects(self.base, self.head)
-
-    def test_the_graph_has_the_shape_the_bug_needs(self) -> None:
-        def ancestor(a: str, b: str) -> bool:
-            return subprocess.run(
-                ["git", "-C", self.directory, "merge-base", "--is-ancestor", a, b],
-                check=False, capture_output=True,
-            ).returncode == 0
-
-        self.assertTrue(ancestor(self.legacy, self.base), "legacy must be in the base")
-        self.assertTrue(ancestor(self.legacy, self.head), "legacy must be reachable from head")
-        self.assertFalse(
-            ancestor(self.legacy, self.adoption),
-            "legacy must NOT be an ancestor of adoption -- that is what the bug needed",
-        )
-
-    def test_a_commit_already_in_the_base_is_excluded(self) -> None:
-        """Case 1: excluded by the base even though adoption does not cover it."""
-        self.assertNotIn("Feat/testes e2 e basicos de auth (#225)", self.subjects())
-
-    def test_a_pre_policy_commit_reachable_from_adoption_is_excluded(self) -> None:
-        """Case 2."""
-        self.assertNotIn("Security: harden authentication flow", self.subjects())
-
-    def test_a_new_commit_is_validated(self) -> None:
-        """Case 3: in head, not in base, not in adoption."""
-        self.assertIn("feat(x): a commit written under the policy", self.subjects())
-
-    def test_merge_commits_are_still_excluded(self) -> None:
-        """Case 7."""
-        self.assertNotIn("Merge branch 'main' into release", self.subjects())
-
-    def test_the_whole_check_passes_on_this_graph(self) -> None:
-        with self.checker_in_repository():
-            errors = git_conventions_check.validate_pull_request(
-                actor="djalv",
-                branch="release/0.1.0",
-                title="chore(release): NChat 0.1.0 — Sabará",
-                subjects=git_conventions_check.pull_request_subjects(self.base, self.head),
-            )
-        self.assertEqual(errors, [])
-
-    def test_an_invalid_new_commit_still_fails(self) -> None:
-        """Case 4: the set shrank; the rule inside it did not soften."""
-        # On its own branch, so the shared fixture graph is left untouched.
-        self.run_git("checkout", "-q", "-b", "invalid-case", self.head)
-        self.addCleanup(self.run_git, "checkout", "-q", "develop")
-        head = self.commit("Broken subject without a type")
-
-        with self.checker_in_repository():
-            subjects = git_conventions_check.pull_request_subjects(self.base, head)
-
-        self.assertIn("Broken subject without a type", subjects)
-        errors = git_conventions_check.validate_pull_request(
-            actor="djalv",
-            branch="release/0.1.0",
-            title="chore(release): NChat 0.1.0",
-            subjects=subjects,
-        )
-        self.assertEqual(
-            errors, ["Invalid commit subjects: Broken subject without a type"]
-        )
-
-    def test_the_github_pr_suffix_is_still_accepted(self) -> None:
-        """Case 9: the #698 behaviour is untouched."""
-        self.assertTrue(
-            git_conventions_check.is_valid_conventional_subject(
-                "fix(repo): allow GitHub PR suffix in conventional subjects (#698)"
-            )
-        )

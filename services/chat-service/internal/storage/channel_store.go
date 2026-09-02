@@ -603,7 +603,7 @@ func (s *PGXChannelStore) ListVisibleChannelAccessByUser(ctx context.Context, wo
 //
 // Owner and admin, and deliberately not the RF-74 workspace moderator — that
 // role moderates channel structure and membership, which is a different
-// predicate (domain.CanAddChannelMembers, spelled out separately in
+// predicate (domain.CanManageChannelMembers, spelled out separately in
 // member_store.go). A constant so the allowlist has one definition here, and
 // never `role != 'guest'`: an unrecognised role — a row written before a CHECK
 // was widened, a value from a future migration — must fail closed.

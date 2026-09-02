@@ -15,7 +15,8 @@ import { useLocation, useOutletContext, useParams } from "react-router";
 
 import type { ChatOutletContext } from "./ChatShell";
 import { normalizeChatTargetId } from "./chatTargetId";
-import type { DMConversation } from "./chatTypes";
+import type { DMConversation, MentionTarget } from "./chatTypes";
+import type { CodecFormat } from "./tiptapSerializer";
 import { presenceTargetKey } from "./presence";
 
 const emptyOutletContext: ChatOutletContext = { currentUserId: "", channels: [], dms: [] };
@@ -54,8 +55,8 @@ export interface ConversationTarget {
   activeDM: DMConversation | undefined;
   resolvedName: string;
   isChannel: boolean;
-  /** Set only for a channel: a DM has no channel id to give anything. */
-  channelId: string | undefined;
+  mentionTarget: MentionTarget | undefined;
+  bodyFormat: CodecFormat;
   presenceTarget: string | undefined;
   uploadTarget: { kind: "channel" | "dm"; id: string } | null;
   composerPlaceholder: string;
@@ -73,6 +74,7 @@ export function useConversationTarget(kind: "channel" | "dm"): ConversationTarge
   const activeDM = kind === "dm" ? ctx.dms.find((dm) => dm.id === targetId) : undefined;
   const resolvedName = conversationName(kind, targetId, ctx, activeDM);
   const isChannel = kind === "channel";
+  const mentionsEnabled = isChannel || activeDM?.type === "group";
 
   return {
     ctx,
@@ -81,7 +83,8 @@ export function useConversationTarget(kind: "channel" | "dm"): ConversationTarge
     activeDM,
     resolvedName,
     isChannel,
-    channelId: isChannel ? targetId : undefined,
+    mentionTarget: mentionsEnabled && targetId ? { kind, id: targetId } : undefined,
+    bodyFormat: mentionsEnabled ? "v3" : "v2",
     presenceTarget: targetId ? presenceTargetKey(kind, targetId) : undefined,
     // RF-32 (issue #458): the route's own kind and id — the very pair the
     // composer is keyed by — so an attachment can never be posted to the

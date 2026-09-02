@@ -675,9 +675,16 @@ deployed.
 ```bash
 NCHAT_PROD_RELEASE_SHA=<40-hex commit sha> \
 NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
-ARTIFACTS_DIR=./artifacts \
+NCHAT_PROD_RELEASE_MANIFEST_DIR=/secure/path/release-manifest \
 make prod-blue-green-bootstrap
 ```
+
+The sealed manifest is the only description of the release bootstrap accepts.
+It takes the image digests **and** the release identity from it, into a
+temporary directory of its own, so the images Blue runs and the identity Blue is
+annotated with cannot come from two places and disagree. There is deliberately
+no `ARTIFACTS_DIR` here: a separately-supplied set of digests would be exactly
+that second source.
 
 It validates the context, the namespace, every required Secret and the stateful
 layer **before** applying anything; then applies the shared half, runs the
@@ -692,7 +699,9 @@ The full first-production sequence:
 
 ```bash
 # 1. establish Blue
-NCHAT_PROD_RELEASE_SHA=<sha> NCHAT_PROD_TOPOLOGY_FILE=... ARTIFACTS_DIR=./artifacts \
+#    The sealed manifest carries both the images and the release identity.
+NCHAT_PROD_RELEASE_SHA=<sha> NCHAT_PROD_TOPOLOGY_FILE=... \
+  NCHAT_PROD_RELEASE_MANIFEST_DIR=/secure/path/release-manifest \
   make prod-blue-green-bootstrap
 
 # 2. confirm what the cluster now holds
@@ -728,13 +737,26 @@ it is **not** used in normal releases — see "Automated smoke".
 
 ## 5. Identifying a release
 
-Every workload of a slot is stamped with the same annotation:
+Every workload of a slot is stamped with the same two annotations:
 
 ```yaml
 metadata:
   annotations:
     nchat.io/release-sha: <commit sha>
+    nchat.io/release-id: <sha-256 of the sealed release manifest>
 ```
+
+**A commit is not a release.** Two builds of one commit do not produce the same
+images: buildx stamps provenance and an SBOM into every layer set, so the
+digests differ even though nothing in the source did. `nchat.io/release-sha`
+therefore says which code a slot is running and cannot say which _bytes_.
+
+`nchat.io/release-id` is what says that. It is the SHA-256 that seals the
+release manifest — the value in `release-manifest.sha256`, the one `sha256sum
+-c` verifies — and because the manifest carries all eleven image digests, the
+identity changes the moment any one of them does. Rebuild the same commit and
+you get a different release id, which is precisely the event a source SHA
+cannot report.
 
 Images are pinned by digest (`image@sha256:…`). Mutable tags — `latest`, `main`,
 `develop`, `stable`, `prod` — are rejected by `prod-blue-green-check`.
@@ -743,8 +765,10 @@ Images are pinned by digest (`image@sha256:…`). Mutable tags — `latest`, `ma
 make prod-blue-green-status
 ```
 
-reports each slot as `CONSISTENT <sha>`, `NOT DEPLOYED`, or `MIXED` with a
-per-workload breakdown. A slot is only promotable when it is CONSISTENT.
+reports each slot as `CONSISTENT <sha>:<release id>`, `NOT DEPLOYED`, or
+`MIXED` with a per-workload breakdown. A slot is only promotable when it is
+CONSISTENT, and workloads that agree on the commit but not on the release id are
+MIXED — that is a slot half-replaced by a rebuild.
 
 ---
 
@@ -877,6 +901,102 @@ If the cluster does not report a dimension it prints `INCONCLUSIVE` and the
 deploy stops. Verify by hand and re-run with
 `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1`.
 
+### Capacity evidence (the deploy identity is namespaced)
+
+Three of the four inputs — the nodes' allocatable capacity, and the Pods of
+every namespace — are cluster-scoped reads. `nchat-prod-deployer` holds a Role
+in `nchat-prod` and nothing cluster-scoped, so it is refused `kubectl get nodes`
+and `kubectl get pods --all-namespaces`, and under that identity the preflight
+reports `INCONCLUSIVE` on every cluster dimension.
+
+Answering from `nchat-prod` alone is not the fix. The node these workloads share
+sits at ~94% of its CPU requests and most of that belongs to other namespaces; a
+namespace-only view would report room that is not there. Nor is widening the
+Role: a capacity check is not a reason to give a deploy identity cluster-wide
+read.
+
+So collection is separated from evaluation. A context that **may** read those
+resources — a cluster administrator, or a read-only identity kept for the
+purpose — takes the snapshot; the deploy consumes it and consults the API only
+for what it is already allowed to see.
+
+```bash
+# 1. as the trusted read-only context
+make prod-capacity-evidence ARGS=/secure/path/capacity-evidence
+
+# 2. as nchat-prod-deployer, within 15 minutes
+NCHAT_PROD_CAPACITY_EVIDENCE_DIR=/secure/path/capacity-evidence \
+NCHAT_PROD_RELEASE_SHA=<40-hex> \
+NCHAT_PROD_TOPOLOGY_FILE=/secure/path/topology.env \
+ARTIFACTS_DIR=./artifacts \
+make prod-blue-green-deploy
+```
+
+The directory holds `node-allocatable.txt`, `cluster-requests.txt`,
+`cluster-pods.txt` — the same lines the live collection produces —
+`sha256sums.txt`, and a `metadata` record naming the schema, the collection
+instant in UTC, the namespace it was collected for and the context that produced
+it. It is a snapshot of other namespaces: keep it outside the repository and do
+not commit it.
+
+Leaving `NCHAT_PROD_CAPACITY_EVIDENCE_DIR` unset keeps the previous behaviour,
+which is what a rehearsal cluster or an administrator running the deploy by hand
+should use.
+
+**What the evidence is trusted on.** The checksums detect a truncated or edited
+file. They are **not** authenticity — anything that can write the directory can
+write a matching `sha256sums.txt`. The evidence is believed because of where it
+came from: a collection the operator ran, or later a controlled CI artifact
+produced by a job with its own read-only credentials. Point the deploy only at a
+directory you produced or received through such a channel. Schema, freshness and
+the namespace binding narrow the window in which a stale or foreign snapshot is
+accepted; they do not make an untrusted directory safe.
+
+The gate stops the deploy — before the migration and before any `kubectl apply`
+— when the evidence is absent, incomplete, empty, dated more than
+`NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS` (900) ago or more than 60 seconds
+in the future (the clock-skew allowance), collected for another namespace, of an
+unknown schema, does not match its checksums, or reaches the deploy through a
+symlink. `NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS` itself must be a
+non-negative decimal integer of at most 18 digits; anything else is refused as a
+misconfiguration rather than reaching the comparison.
+
+**A failed refresh withdraws what was there.** Re-collecting into a directory
+that already holds evidence invalidates it before the collection starts, and the
+new snapshot is only accepted once every file, the metadata and the checksums
+are in place. So a refresh that fails — the cluster unreachable, the read
+refused, a resource that came back empty — leaves that destination **unusable**
+rather than leaving the previous snapshot standing. This is deliberate: a
+collector that reports an error while the deploy would still read yesterday's
+picture of the cluster is a failure an operator can walk straight past. Collect
+again into the same directory and it is usable once more.
+
+**Malformed is not the same as missing.** A file the collector cannot have
+produced — a Pod line without its `phase|nodeName` delimiter, a node line
+outside its four positional fields, a request line short of its resources
+column, or a quantity that is negative, infinite, `NaN` or not a number at all —
+ends the preflight as **unusable input** (exit 3), not `INCONCLUSIVE`. Negative
+and non-finite quantities are refused wherever they appear, the candidate
+manifest and the namespace quota included: they subtract from demand or add to
+free space, so absorbing one as a zero would be a pass the cluster cannot
+honour. `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1` reaches exit 2
+and nothing else: a dimension the cluster did not report is something an
+operator can check by hand and acknowledge, a broken input is not. Sparse
+Kubernetes is still valid: a Pod the scheduler has not bound has no nodeName,
+and a container may declare no requests at all.
+
+The node line is **positional** — `<cpu> <memory> <ephemeral-storage> <pods>`,
+one space between each — and an empty position stays empty. A node that reports
+no ephemeral-storage arrives as `8 32Gi  110`, which means storage unknown and a
+ceiling of 110 pods; the two dimensions are answered separately and neither
+value moves into the other's place. Trailing positions may be omitted instead of
+left blank. `cpu` and `memory` are required; the other two, when empty, are
+dimensions the cluster did not report and come back `INCONCLUSIVE`.
+
+The candidate slot's own workloads stay a live namespaced read in both modes:
+they are what the redeploy is priced against and must describe the cluster now,
+not when the snapshot was taken.
+
 ---
 
 ## 8. Preview
@@ -904,37 +1024,6 @@ bypass for validation.
 Keycloak must list all four preview callbacks as additional valid redirect URIs
 on the production client — the two administrative hosts as much as the two chat
 ones, since the console signs in through the same provider.
-
-### The allowlist and the proxy in front of it
-
-On the expected public path the four preview hosts are **proxied by Cloudflare**,
-so the connection Traefik accepts comes from a Cloudflare edge rather than the
-operator's machine.
-
-- `NCHAT_PROD_PREVIEW_ALLOW_CIDR` is the **operator's own address or network**.
-  It is never the Cloudflare ranges. Putting them there would not restore the
-  restriction — it would turn the allowlist into a permit for every visitor
-  Cloudflare forwards, while still reading like an allowlist.
-- `preview-allowlist` therefore takes the client from `X-Forwarded-For` with
-  `ipStrategy.depth: 1`. In the expected public path, client -> Cloudflare ->
-  Traefik, depth counts from the **right** and selects the visitor address that
-  Cloudflare puts in the rightmost position. For a request delivered by
-  Cloudflare, the client cannot forge that appended position.
-  `scripts/ci/prod-blue-green-check.sh` refuses a rendered manifest whose depth
-  is absent or anything but 1.
-- Header trust is a separate property. Traefik's current
-  `forwardedHeaders.trustedIPs` includes loopback, the RFC1918 private ranges,
-  and the Cloudflare IPv4 ranges. These additional origins are part of the
-  infrastructure trust boundary. Consequently, `preview-allowlist` does not
-  protect against a requester that can reach Traefik from one of those trusted
-  private networks and control forwarded headers.
-
-If operator-only access must also be enforced against clients on those trusted
-internal networks, harden the global Traefik configuration or add a network
-control. Do not improvise that protection in this middleware, and do not change
-the global setting as part of a preview change: it is shared by other services.
-For any public path other than client -> Cloudflare -> Traefik, revalidate which
-hop `depth: 1` selects before treating the preview as restricted.
 
 To disable previews:
 
@@ -969,10 +1058,14 @@ It fails if the candidate carries more than one release, and it **never prints
 
 ```text
 Automated smoke            : PASS
-Release validated          : <sha>
+Release validated          : <sha>:<release id>
 Authenticated release smoke: REQUIRED / NOT CONFIRMED BY THIS COMMAND
 Cutover eligibility        : BLOCKED until the checklist above is recorded
 ```
+
+The release it names is the commit **and** the sealed build, because a rebuild
+of the same commit is a different release ("Identifying a release"). Copy the
+whole value into the evidence the cutover asks for.
 
 ---
 
@@ -999,9 +1092,17 @@ EICAR rejection, search, call, screen share, logout.
 ## 11. Cutover
 
 ```bash
-NCHAT_PROD_SMOKE_CONFIRMED=green:<sha> \
+NCHAT_PROD_SMOKE_CONFIRMED=green:<sha>:<release id> \
+  NCHAT_PROD_RELEASE_MANIFEST_DIR=/secure/path/release-manifest \
   make prod-blue-green-cutover ARGS="--target green"
 ```
+
+`smoke.sh` prints both values at the end of a passing run; copy them from there
+rather than assembling them by hand. `NCHAT_PROD_RELEASE_MANIFEST_DIR` is the
+directory holding the `release-manifest.json` and `release-manifest.sha256` of
+the release being promoted, and it is **required** — there is deliberately no
+mode that falls back to the commit alone, because that is the mode this gate
+exists to remove.
 
 The target is **named, never derived**. Deriving it from the current state makes
 a repeat run reverse the previous one instead of confirming it.
@@ -1010,10 +1111,20 @@ Gates, all before any mutation:
 
 1. context and namespace;
 2. the target is fully Ready;
-3. the target carries exactly one release (Ready is not enough — a deploy that
-   failed part-way leaves untouched workloads Ready on the _previous_ release);
-4. the smoke evidence matches `<slot>:<release now on that slot>`, recomputed at
-   this moment. Redeploy the candidate and the earlier evidence stops matching.
+3. the target carries exactly one release — one commit _and_ one release id.
+   Ready is not enough: a deploy that failed part-way leaves untouched workloads
+   Ready on the previous release;
+4. the supplied manifest verifies against its own seal and satisfies the release
+   contract, and the release id derived from it matches the one the slot is
+   actually running;
+5. the smoke evidence matches `<slot>:<sha>:<release id>` for that slot,
+   recomputed at this moment.
+
+Gate 4 is re-derived here rather than accepted from whoever invoked the command:
+in the pipeline the identity arrives as a job output, and an output can be stale
+or edited. Rebuild or redeploy the candidate between the smoke and the promotion
+— even from the identical commit — and gates 4 and 5 stop matching, so the
+approval no longer covers what is on the cluster and the promotion is refused.
 
 If the target is already fully active it reports a no-op and changes nothing.
 
@@ -1025,6 +1136,157 @@ once — which the release contract already requires to be safe, since both run
 against one database and one event bus.
 
 The old slot keeps running. It is the rollback.
+
+---
+
+## 11b. The same release from GitHub Actions
+
+`.github/workflows/deploy-nchat-prod.yml` runs sections 7, 9 and 11 as two jobs,
+and the boundary between those jobs is the whole point of the workflow.
+
+```text
+workflow_dispatch (sha, run_id)
+    |
+    +-- candidate job          automatable, unprotected, cannot promote
+    |     validate sha and run id, refuse a dispatch from outside main
+    |     checkout the sha, prove it is reachable from main
+    |     download the sealed release manifest of run_id
+    |     pin the eleven digests the manifest seals
+    |     derive the release id from the manifest seal
+    |     deploy.sh  -> the idle slot, no traffic, stamped sha + release id
+    |     smoke.sh   -> automated checks only
+    |
+    +== authenticated release smoke (section 10), by a person, on the previews
+    |
+    +== GitHub environment `production` approval
+    |
+    +-- cutover job            protected, minimal, the only promoter
+          re-prove the sha against main
+          re-derive the release id from the sealed manifest
+          cutover.sh --target <candidate slot>
+```
+
+Dispatch it with the release SHA and the **run id of the "Build and push
+images" run that built it**. The manifest of that run is sealed with a SHA-256
+and names its own `source_sha`, so naming a run is not the same as trusting it:
+`release-digests.sh` verifies the seal, checks the contract, and refuses unless
+the manifest seals the commit being promoted. The digests the cluster then runs
+are exactly the ones that release was sealed with — not a rebuild that would
+produce different bytes under the same tag. It reads the manifest rather than
+the `digest-*.txt` artifacts because the manifest is kept for 90 days and they
+are kept for 7.
+
+The candidate job holds no environment. Putting one there would move the
+approval in front of the automated phase, which is the phase that has nothing to
+approve yet. What it does hold is the property that makes the approval mean
+something: **no job before the protected one can change a stable Service.**
+`scripts/ci/check_deploy_prod_workflow.py` enforces that structurally — the
+candidate may not reach `cutover.sh`, `rollback.sh`, `drain-old.sh`,
+`switch_services_to_slot`, or a hand-rolled `kubectl patch service`, and the
+protected job is the only place `cutover.sh` appears at all.
+
+So a rejected approval, an approval that never comes, and a run cancelled while
+waiting are the same outcome: the protected job never starts, and the selectors
+are what they were. There is no other path to them.
+
+The evidence the cutover job passes to `cutover.sh` is
+`<candidate slot>:<dispatched sha>:<release id>`, asserted from the workflow's
+own validated values rather than read back from the cluster — reading it back
+would make the gate confirm itself. `cutover.sh` recomputes what the slot
+actually carries and refuses when the two disagree.
+
+The release id is the part that makes this hold against a rebuild. Suppose the
+candidate is deployed and smoked, and then, while the approval is pending,
+someone builds the same commit again and redeploys the slot. Every SHA in the
+picture is unchanged, so an evidence token naming only the commit would still
+match and the approval would promote bytes nobody validated. The release id is
+the seal of the manifest those bytes came from, so the second build carries a
+different one and the promotion is refused.
+
+That is also why the protected job downloads the sealed manifest again instead
+of trusting `needs.candidate.outputs.release_id`. The output says what this run
+computed earlier; the manifest is evidence. `cutover.sh` verifies the seal,
+re-derives the id from it, and requires the cluster, the manifest and the
+evidence to name one release before anything is patched.
+
+### Operator configuration — not versionable, and required
+
+The YAML declares `environment: production`. Everything that makes that
+environment a gate is repository configuration, and a workflow file cannot
+assert it. Confirm all four in **Settings → Environments → production**:
+
+| Setting                      | Required value                                                      |
+| ---------------------------- | ------------------------------------------------------------------- |
+| Environment name             | `production` — exactly, or the job matches no protection rule       |
+| Required reviewers           | at least one authorised release owner, and not the dispatcher alone |
+| Deployment branches and tags | **Selected branches** → `main` only                                 |
+| Secrets and variables        | only what the cutover alone uses — see the warning below            |
+
+Without a required reviewer the environment is decorative: the job would run
+unattended and the separation above would buy nothing. The branch rule is what
+stops a dispatch from a feature branch — which carries that branch's copy of
+this workflow, gates and all — from reaching the protected job. The candidate
+job repeats the `refs/heads/main` check itself so the refusal is visible early,
+but that check lives in a file the same attacker could edit; the environment
+rule does not.
+
+#### Where the candidate's variables have to live
+
+The candidate job reads `vars.NCHAT_PROD_TOPOLOGY_FILE` and, where the deploy
+identity cannot read Nodes, `vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR`. Both name
+paths on the runner; neither is a secret and neither is committed.
+
+**Both must be repository variables, or organisation variables made available to
+this repository. Neither may exist only in the `production` environment.**
+
+A job sees an environment's variables only if it declares that environment, and
+the candidate job deliberately declares none — declaring one would put the
+approval in front of the phase that has nothing to approve yet, which is the
+property this whole design exists to protect. So an environment-only variable
+would reach the candidate as an empty string, and the failure would not look
+like a configuration mistake: `NCHAT_PROD_TOPOLOGY_FILE` empty means
+`prepare_prod_deploy_tree` skips installing the topology and the deploy is
+refused later for carrying `REPLACE_ME_*` placeholders.
+
+The split to hold to:
+
+| Job         | Declares an environment | Where its configuration belongs                                         |
+| ----------- | ----------------------- | ----------------------------------------------------------------------- |
+| `candidate` | no, by design           | repository or organisation variables — nothing environment-scoped       |
+| `cutover`   | `production`            | the `production` environment, for anything only the promotion ever uses |
+
+Environment secrets and variables remain the right home for a credential used
+solely by the cutover: scoping them there is what keeps them out of the
+unprotected job. The rule is only that nothing the candidate needs may live
+there.
+
+### Evidence procedure — a rejected approval changes nothing
+
+Offline tests prove promotion is confined to the protected job. That a rejection
+leaves the cluster untouched is GitHub's behaviour, so it is verified once, by
+observation, on a real release cycle. **Do not run this as a drill on a release
+you intend to promote, and do not run it at all without authorisation.**
+
+```bash
+# 1. Before dispatching, record what every stable Service selects.
+make prod-blue-green-status | tee /secure/path/selectors-before.txt
+
+# 2. Dispatch the workflow and let the candidate job finish. It must end green.
+
+# 3. With the run waiting on the production environment, reject the approval
+#    (or cancel the run). The cutover job must show as skipped or cancelled,
+#    never as started.
+
+# 4. Record the selectors again.
+make prod-blue-green-status | tee /secure/path/selectors-after.txt
+
+# 5. PASS only if they are identical.
+diff /secure/path/selectors-before.txt /secure/path/selectors-after.txt
+```
+
+A non-empty diff is a failure of the whole separation, not a detail: it means
+something outside the protected job moved traffic. Stop and treat it as an
+incident before dispatching another release.
 
 ---
 
@@ -1048,7 +1310,8 @@ search       -> UNSET       ← no release-slot selector
 none of them is "mixed". Converge by naming the destination:
 
 ```bash
-NCHAT_PROD_SMOKE_CONFIRMED=green:<sha> \
+NCHAT_PROD_SMOKE_CONFIRMED=green:<sha>:<release id> \
+  NCHAT_PROD_RELEASE_MANIFEST_DIR=/secure/path/release-manifest \
   make prod-blue-green-cutover ARGS="--target green"
 # or
 make prod-blue-green-rollback ARGS="--target blue 'partial cutover'"
@@ -1177,10 +1440,12 @@ After this, rollback needs a redeploy — it is no longer instant.
 | `slot X is MIXED`                      | a deploy reached only some workloads                                       | re-run deploy for that slot; do not promote                                                                                   |
 | `slot X is not deployed`               | no workloads exist                                                         | deploy the candidate first                                                                                                    |
 | candidate Ready but cutover blocked    | release inconsistent, or evidence stale                                    | `status`, then re-smoke                                                                                                       |
-| smoke evidence rejected                | candidate changed after smoke                                              | re-run smoke, use the new `slot:sha`                                                                                          |
+| smoke evidence rejected                | candidate changed after smoke, or was rebuilt from the same commit         | re-run smoke, use the new `slot:sha:release-id`                                                                               |
 | `-> MISSING` in status                 | a stable Service was deleted                                               | re-apply the shared half                                                                                                      |
 | `-> UNSET` in status                   | a Service never got its slot selector                                      | re-apply shared, or converge with cutover                                                                                     |
 | `preflight capacity inconclusive`      | cluster did not report a dimension                                         | check by hand, then `NCHAT_PROD_ALLOW_INCONCLUSIVE_CAPACITY=1`                                                                |
+| `capacity evidence ... is unusable`    | snapshot absent, stale, incomplete or altered                              | collect it again with `make prod-capacity-evidence`; never point the deploy at a directory you did not produce or receive     |
+| `capacity preflight refused its input` | a candidate manifest or evidence file that does not parse                  | read the `[ERROR] invalid ... input: line N` above it; collect the evidence again — the override does not apply to this case  |
 | `cannot hold a second slot`            | quota or nodes genuinely too small                                         | raise quota or free capacity; do not force                                                                                    |
 | `the shared stateful layer must exist` | `stateful.sh` was never run                                                | run `make prod-stateful-apply`, then bootstrap again                                                                          |
 | PVC stuck `Pending`                    | host directory missing or wrongly owned                                    | create it as in 3b.2; do **not** delete the PV                                                                                |

@@ -32,6 +32,7 @@ import {
   type MessageBodyFormat,
   type LinkSafetyRecheck,
   type MentionCandidate,
+  type MentionTarget,
   type DMConversation,
   type FavoriteItem,
   type FavoritesPage,
@@ -1254,6 +1255,8 @@ export interface PostMessageOptions {
    */
   attachmentIds?: string[];
   idempotencyKey?: string;
+  /** DMs default to v2; group composers opt into the existing v3 codec. */
+  bodyFormat?: "v2" | "v3";
   signal?: AbortSignal;
 }
 
@@ -1428,24 +1431,32 @@ async function resolveMessageReferences(
 }
 
 export async function fetchMentionCandidates(
-  channelId: string,
+  target: MentionTarget,
   query: string,
   signal?: AbortSignal,
 ): Promise<MentionCandidate[]> {
-  const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/mentions?q=${encodeURIComponent(query)}`;
+  const segment = target.kind === "channel" ? "channels" : "dm";
+  const url = `${CHAT_BASE}/${segment}/${encodeURIComponent(target.id)}/mentions?q=${encodeURIComponent(query)}`;
   const res = await authenticatedFetch<MentionEnvelope>(url, { method: "GET", signal });
   if (!isMentionEnvelope(res)) return [];
-  // Channel-reference mentions (backend still returns them; the composer no
-  // longer offers them) are intentionally dropped here — @-mentions are for
-  // people only. The .type === "user" filter also guards against a malformed
-  // backend response placing a "channel" entry in the users array.
-  return res.data.users
-    .filter((candidate) => candidate.type === "user")
+  const users = res.data.users
+    .filter(({ type }) => type === "user")
     .map((candidate) => ({
       mentionType: "user" as const,
       id: candidate.id,
       label: candidate.label,
     }));
+  if (target.kind === "dm") return users;
+  return [
+    ...users,
+    ...res.data.channels
+      .filter(({ type }) => type === "channel")
+      .map((candidate) => ({
+        mentionType: "channel" as const,
+        id: candidate.id,
+        label: candidate.label,
+      })),
+  ];
 }
 
 export async function postDMMessage(
@@ -1459,7 +1470,7 @@ export async function postDMMessage(
       "Content-Type": "application/json",
       ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
     },
-    body: postMessageBody(bodyText, "v2", options),
+    body: postMessageBody(bodyText, options.bodyFormat ?? "v2", options),
     signal: options.signal,
   });
   return mapMessage(res.data);

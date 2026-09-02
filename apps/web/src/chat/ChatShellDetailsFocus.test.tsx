@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import CallSessionProvider from "../calls/CallSessionProvider";
 import { clearTokens, setTokens } from "../lib/authSession";
+import AppShell from "./AppShell";
 import ChatShell from "./ChatShell";
 import { fetchChannelDetails, fetchSidebarData } from "./chatApi";
 import { fetchConversationAttachments } from "./filesApi";
@@ -75,15 +76,17 @@ function renderShell() {
   return render(
     <MemoryRouter initialEntries={[`/chat/channel/${readingId}`]}>
       <Routes>
-        <Route
-          path="/chat"
-          element={
-            <CallSessionProvider>
-              <ChatShell />
-            </CallSessionProvider>
-          }
-        >
-          <Route path="channel/:channelId" element={<div>mensagens</div>} />
+        <Route element={<AppShell />}>
+          <Route
+            path="/chat"
+            element={
+              <CallSessionProvider>
+                <ChatShell />
+              </CallSessionProvider>
+            }
+          >
+            <Route path="channel/:channelId" element={<div>mensagens</div>} />
+          </Route>
         </Route>
       </Routes>
     </MemoryRouter>,

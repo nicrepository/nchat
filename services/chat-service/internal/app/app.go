@@ -282,7 +282,7 @@ func New(cfg config.Config) (*App, error) {
 			// reads channel members through it, and issue #398 writes them. Two
 			// instances would only be two paths to the same stores.
 			memberSvc = service.NewMemberService(memberStore, channelStore, workspaceStore)
-			mentionSvc = service.NewMentionService(memberSvc, permissionSvc)
+			mentionSvc = service.NewMentionService(memberSvc, permissionSvc, dmStore)
 		}
 	}
 

@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
+  OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
   createScenario,
@@ -17,6 +18,36 @@ import {
 } from "../helpers/messagingApi";
 
 test.describe("mensagens em canal", () => {
+  test("seleciona conversa e envia mensagens consecutivas sem clicar no composer", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "focus-source");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Origem foco E2E",
+      messages: [],
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    await page.getByRole("option", { name: new RegExp(OTHER_CHANNEL_NAME) }).click();
+    const composer = page.getByTestId("chat-composer-input");
+    await expect(composer).toBeFocused();
+
+    for (const [index, text] of ["uma", "duas", "três"].entries()) {
+      await page.keyboard.type(text);
+      await page.keyboard.press("Enter");
+      await expect.poll(() => scenario.requests.channelPosts.length).toBe(index + 1);
+      await expect(composer).toBeFocused();
+    }
+    expect(scenario.requests.channelPosts.map(({ body_text }) => body_text)).toEqual([
+      "uma",
+      "duas",
+      "três",
+    ]);
+  });
+
   test("encaminha uma mensagem para outro canal e preserva o indicador após reload", async ({
     page,
   }, testInfo) => {

@@ -46,29 +46,6 @@ spec:
     # ever being published open by omission.
     sourceRange:
       - REPLACE_ME_PREVIEW_ALLOW_CIDR
-    # On the expected public path, the preview hosts are proxied by Cloudflare,
-    # so Traefik accepts the connection from a Cloudflare edge, not the operator.
-    # Without an ipStrategy, IPAllowList compares sourceRange against
-    # RemoteAddr -- which would be that edge -- and the allowlist would either
-    # refuse everyone or, if the Cloudflare ranges were added to sourceRange to
-    # "fix" it, admit every visitor Cloudflare forwards. Neither is the
-    # contract: NCHAT_PROD_PREVIEW_ALLOW_CIDR names the operator's own network.
-    #
-    # depth selects the Nth address from the RIGHT of X-Forwarded-For. In the
-    # expected public chain -- client -> Cloudflare -> Traefik -- Cloudflare
-    # puts the visitor address in the rightmost position. For a request
-    # delivered by Cloudflare, the client cannot forge that appended position,
-    # and depth 1 selects it.
-    #
-    # Header trust is a separate boundary. Traefik's global
-    # forwardedHeaders.trustedIPs also includes loopback and RFC1918 networks,
-    # so this middleware does not protect against a requester that can reach
-    # Traefik from one of those trusted networks and control forwarded headers.
-    # Keep sourceRange set to the operator's network, never Cloudflare ranges.
-    # Protecting against trusted internal clients requires global Traefik
-    # hardening or an additional network control, not a workaround here.
-    ipStrategy:
-      depth: 1
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

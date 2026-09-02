@@ -345,9 +345,14 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 		testConfig(), platformlog.New("chat-service", "test"), ReadinessState{}, validator,
 		allowRouterSessionValidator{}, NewSidebarHandler(nil), NewMessageHandler(nil, nil, nil), nil, nil, nil, nil, nil,
 	)
-	path := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
+	channelPath := "/api/chat/channels/22222222-2222-2222-2222-222222222222/mentions?q=a"
+	dmPath := "/api/chat/dm/33333333-3333-3333-3333-333333333333/mentions?q=a"
 
-	for range mentionSearchRateLimit {
+	for i := range mentionSearchRateLimit {
+		path := channelPath
+		if i%2 == 1 {
+			path = dmPath
+		}
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
 		response := httptest.NewRecorder()
@@ -356,7 +361,7 @@ func TestMentionAutocompleteRouteHasIndependentRateLimit(t *testing.T) {
 			t.Fatal("autocomplete was rate-limited before its budget was exhausted")
 		}
 	}
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req := httptest.NewRequest(http.MethodGet, dmPath, nil)
 	req.Header.Set("Authorization", bearerScheme+makeRouterTestToken(t))
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, req)
@@ -378,6 +383,7 @@ func TestDMContractRoutesRequireAuthentication(t *testing.T) {
 		httptest.NewRequest(http.MethodPost, RouteDMConversations, strings.NewReader(`{"other_user_id":"55555555-5555-5555-5555-555555555555"}`)),
 		httptest.NewRequest(http.MethodPost, RouteDMGroupConversations, strings.NewReader(`{"participant_user_ids":["55555555-5555-5555-5555-555555555555","66666666-6666-6666-6666-666666666666"]}`)),
 		httptest.NewRequest(http.MethodGet, "/api/chat/dm/33333333-3333-3333-3333-333333333333/profile", nil),
+		httptest.NewRequest(http.MethodGet, "/api/chat/dm/33333333-3333-3333-3333-333333333333/mentions", nil),
 	} {
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)

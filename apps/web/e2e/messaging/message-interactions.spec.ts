@@ -38,6 +38,36 @@ async function expectPinPreview(pinsBar: Locator, bodyText: string) {
  * que as suítes existentes de DM 1:1/canal não cobrem.
  */
 test.describe("interações de mensagem — reação, favorito e pin", () => {
+  test("abre DM canonica ao clicar no nome do autor da mensagem", async ({ page }, testInfo) => {
+    const channelId = uniqueId(testInfo, "author-dm-channel");
+    const message = makeMessage({
+      id: `${channelId}-message`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: "mensagem com autor clicavel",
+    });
+    const scenario = createScenario({
+      kind: "channel",
+      targetId: channelId,
+      targetName: "canal autores",
+      messages: [message],
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${channelId}`);
+
+    await messageBubble(page, message.id)
+      .getByRole("button", { name: `Abrir conversa com ${OTHER_USER_NAME}` })
+      .click();
+
+    await expect(page).toHaveURL("/chat/dm/e2e-dm-other");
+    const directMessages = page.getByRole("region", { name: "Mensagens diretas" });
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveCount(1);
+    await expect(directMessages.getByRole("option", { name: OTHER_USER_NAME })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(scenario.requests.dmCreates).toEqual([{ otherUserId: OTHER_USER_ID }]);
+  });
   test("recebe message.created de outro participante uma única vez na DM correta", async ({
     page,
   }, testInfo) => {
@@ -177,6 +207,77 @@ test.describe("interações de mensagem — reação, favorito e pin", () => {
       { messageId: original.id, emoji: "👍", added: true },
       { messageId: original.id, emoji: "👍", added: false },
     ]);
+  });
+
+  /**
+   * Regressão #496: uma reação que já veio do servidor era recusada localmente
+   * — "Emoji não permitido para reações." — enquanto o catálogo lazy do picker
+   * ainda não tivesse sido carregado, e passava a funcionar depois. Quem chega
+   * numa conversa e clica num badge existente nunca abriu o picker, então este
+   * teste proíbe explicitamente qualquer carregamento do catálogo.
+   */
+  test("reage num badge existente fora da quick row sem carregar o catálogo", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "dm-cold-catalog");
+    // A reação já existe porque outra pessoa reagiu: o emoji chega no payload
+    // da mensagem, não de nada que este cliente tenha escolhido.
+    const original = makeMessage({
+      id: `${targetId}-msg`,
+      sender_id: OTHER_USER_ID,
+      sender_display_name: OTHER_USER_NAME,
+      body_text: "mensagem com reação de outra pessoa",
+      reactions: [
+        {
+          emoji: "🏳️‍🌈",
+          count: 1,
+          reacted_by_me: false,
+          users: [{ user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME }],
+        },
+      ],
+    });
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [original],
+    });
+    // O catálogo é um chunk separado, pedido só quando o picker abre. Se ele
+    // for pedido aqui, o cenário deixou de ser o do bug.
+    const catalogRequests: string[] = [];
+    page.on("request", (request) => {
+      if (/emojiCatalog|EmojiPicker/.test(request.url())) catalogRequests.push(request.url());
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+
+    const bubble = messageBubble(page, original.id);
+    const badge = bubble.getByRole("button", { name: "Adicionar reação 🏳️‍🌈" });
+    await expect(badge).toContainText("1");
+
+    await badge.click();
+
+    const mine = bubble.getByRole("button", { name: "Remover reação 🏳️‍🌈" });
+    await expect(mine).toBeVisible();
+    await expect(mine).toHaveAttribute("aria-pressed", "true");
+    await expect(mine).toContainText("2");
+    await expect(page.getByText("Emoji não permitido para reações.")).toHaveCount(0);
+    expect(scenario.requests.reactions).toEqual([
+      { messageId: original.id, emoji: "🏳️‍🌈", added: true },
+    ]);
+
+    // E desfaz: o mesmo badge devolve a contagem da outra pessoa. O toggle tem
+    // uma janela de 300 ms por (mensagem, emoji) contra duplo clique, então
+    // desfazer é uma segunda intenção e não a repetição da primeira.
+    await page.waitForTimeout(350);
+    await mine.click();
+    await expect(bubble.getByRole("button", { name: "Adicionar reação 🏳️‍🌈" })).toContainText("1");
+    expect(scenario.requests.reactions).toEqual([
+      { messageId: original.id, emoji: "🏳️‍🌈", added: true },
+      { messageId: original.id, emoji: "🏳️‍🌈", added: false },
+    ]);
+
+    expect(catalogRequests).toEqual([]);
   });
 
   test("escolhe um emoji no picker completo por busca e por teclado", async ({

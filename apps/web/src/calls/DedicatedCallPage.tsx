@@ -369,6 +369,14 @@ export default function DedicatedCallPage() {
         })
         .catch(() => undefined);
     },
+    devices: {
+      mediaDevices: media.mediaDevices,
+      activeDeviceId: media.activeDeviceId,
+      devicePendingKinds: media.devicePendingKinds,
+      deviceError: media.deviceError,
+      audioOutputSupported: media.audioOutputSupported,
+      onSwitch: media.switchDevice,
+    },
   };
 
   return (

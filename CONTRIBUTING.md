@@ -61,13 +61,6 @@ docs(repo): document branch strategy
   acima.
 - Titulos de PR e commit subjects de trabalho devem seguir Conventional
   Commits; merge commits de sincronizacao com a branch base sao ignorados.
-- A politica vale a partir do commit de adocao
-  `3bc74ea6c72373602024a5d9a99971a7a06b5b40`
-  (`ci(repo): enforce git contribution conventions (#522)`), e nao revalida
-  historico anterior a ele. Quando a base de uma PR e anterior a esse commit --
-  o caso de uma PR de release promovendo `develop` para uma `main` desatualizada
-  -- a validacao de subjects comeca no commit de adocao, e nao na base. O limite
-  e determinado por ancestralidade Git, nunca por data.
 - PRs fora desses padroes nao podem ser mergeadas.
 - Automacoes aprovadas podem ter formato proprio de branch, mas continuam
   sujeitas aos gates aplicaveis e a revisao humana.

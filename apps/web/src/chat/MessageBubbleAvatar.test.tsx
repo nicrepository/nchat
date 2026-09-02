@@ -150,4 +150,18 @@ describe("MessageBubble avatar", () => {
     });
     expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("Alex Souza");
   });
+
+  it("keeps the avatar decorative when the sender name opens a DM", () => {
+    const openAuthor = vi.fn();
+    renderBubble({
+      onOpenAuthorDM: openAuthor,
+      message: messageWith({ senderAvatarUrl: "/media/avatars/alex.png" }),
+    });
+
+    fireEvent.click(avatarBox());
+    expect(openAuthor).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Abrir conversa com Alex Souza" })).toBe(
+      screen.getByTestId("chat-msg-sender"),
+    );
+  });
 });

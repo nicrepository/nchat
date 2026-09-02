@@ -78,6 +78,11 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		{`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
 		  VALUES ($2, $1, 'rf21-worker', 'RF21 worker', 'public', 'active')
 		  ON CONFLICT (id) DO NOTHING`, []any{workspace, channel}},
+		// A mention is only valid for somebody who is in the channel, so the
+		// membership is part of the fixture rather than an assumption.
+		{`INSERT INTO chat.channel_members (channel_id, user_id)
+		  VALUES ($1, $2), ($1, $3) ON CONFLICT DO NOTHING`,
+			[]any{channel, author, mentioned}},
 	} {
 		if _, err := pool.Exec(ctx, seed.sql, seed.args...); err != nil {
 			t.Fatalf("seed workspace: %v", err)
@@ -883,6 +888,114 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		// makes the promotion exactly-once under two replicas.
 		if summary, err = store.ResolveDecidedMessages(ctx); err != nil || summary.Total() != 0 {
 			t.Fatalf("a second pass resolved %+v (%v)", summary, err)
+		}
+	})
+
+	// Regression: a mentioned user who was a channel member when the message was
+	// sent, but left before the scan decided the message, must NOT have their
+	// pending mention promoted. The hardened SQL revalidates membership at
+	// promotion time, and this test is the evidence that it works.
+	t.Run("a mention is not promoted when the recipient loses channel membership", func(t *testing.T) {
+		const (
+			lostMember    = "e3000000-0000-4000-8000-00000000000c"
+			lostMemberMsg = "e3000000-0000-4000-8000-00000000000d"
+		)
+		resetQueue(t)
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, lostMemberMsg); err != nil {
+			t.Fatalf("clean message: %v", err)
+		}
+
+		// Seed the user and make them a workspace + channel member.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO auth.users (id, email, display_name)
+			VALUES ($1, 'rf21-lost@e.test', 'Lost')
+			ON CONFLICT (id) DO NOTHING`, lostMember); err != nil {
+			t.Fatalf("seed lost member user: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+			VALUES ($1, $2, 'active') ON CONFLICT DO NOTHING`, workspace, lostMember); err != nil {
+			t.Fatalf("seed lost member workspace: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.channel_members (channel_id, user_id)
+			VALUES ($1, $2) ON CONFLICT DO NOTHING`, channel, lostMember); err != nil {
+			t.Fatalf("seed lost member channel: %v", err)
+		}
+
+		// A withheld message that mentions the soon-to-leave member.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.link_scans (canonical_url, status, decided_at)
+			VALUES ($1, 'safe', now())
+			ON CONFLICT (canonical_url)
+			DO UPDATE SET status = 'safe', decided_at = now(), scan_uuid = NULL`,
+			goodURL); err != nil {
+			t.Fatalf("seed verdict: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.messages
+				(id, workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, link_safety_fingerprint)
+			VALUES ($1, $2, $3, $4, 'user', 'mentioning lost member', 'v2',
+			        'pending_link_scan', $5)`,
+			lostMemberMsg, workspace, channel, author, fingerprint); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			VALUES ($1, $2, $3)`, lostMemberMsg, goodURL, fingerprint); err != nil {
+			t.Fatalf("seed association: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_pending_mentions (message_id, user_id)
+			VALUES ($1, $2)`, lostMemberMsg, lostMember); err != nil {
+			t.Fatalf("seed pending mention: %v", err)
+		}
+
+		// The member leaves the channel before the scan decides the message.
+		if _, err := pool.Exec(ctx, `
+			DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`,
+			channel, lostMember); err != nil {
+			t.Fatalf("remove channel membership: %v", err)
+		}
+
+		// Promotion resolves the message — published — but the mention must NOT
+		// reach the notification outbox.
+		summary, err := store.ResolveDecidedMessages(ctx)
+		if err != nil {
+			t.Fatalf("ResolveDecidedMessages: %v", err)
+		}
+		if summary.Published != 1 {
+			t.Fatalf("summary = %+v, want the message published", summary)
+		}
+
+		var msgStatus string
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.messages WHERE id = $1`, lostMemberMsg,
+		).Scan(&msgStatus); err != nil {
+			t.Fatalf("read message status: %v", err)
+		}
+		if msgStatus != "active" {
+			t.Fatalf("message status = %q, want active", msgStatus)
+		}
+
+		// The outbox event exists — the message was promoted — but no mention
+		// notification was emitted for the ex-member.
+		var notificationCount int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM chat.notification_outbox
+			WHERE message_id = $1 AND recipient_user_id = $2 AND kind = 'mention'`,
+			lostMemberMsg, lostMember,
+		).Scan(&notificationCount); err != nil {
+			t.Fatalf("count notifications: %v", err)
+		}
+		if notificationCount != 0 {
+			t.Fatalf("notification_outbox has %d rows for the ex-member, want 0", notificationCount)
+		}
+
+		// Clean up.
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, lostMemberMsg); err != nil {
+			t.Fatalf("clean message: %v", err)
 		}
 	})
 

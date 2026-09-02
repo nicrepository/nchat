@@ -71,6 +71,14 @@ class FakeSession implements LiveKitSpikeSession {
     async () => undefined,
   );
   readonly disconnect = vi.fn<LiveKitSpikeSession["disconnect"]>(async () => undefined);
+  readonly listMediaDevices = vi.fn<LiveKitSpikeSession["listMediaDevices"]>(async () => []);
+  readonly getActiveDevice = vi.fn<LiveKitSpikeSession["getActiveDevice"]>(() => undefined);
+  readonly switchActiveDevice = vi.fn<LiveKitSpikeSession["switchActiveDevice"]>(
+    async () => undefined,
+  );
+  readonly isAudioOutputSupported = vi.fn<LiveKitSpikeSession["isAudioOutputSupported"]>(
+    () => true,
+  );
 
   constructor(callbacks: LiveKitSpikeSessionCallbacks) {
     this.callbacks = callbacks;

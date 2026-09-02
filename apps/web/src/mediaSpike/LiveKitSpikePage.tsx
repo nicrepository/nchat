@@ -176,6 +176,10 @@ export default function LiveKitSpikePage({
       onScreenShareChanged: () => undefined,
       onLocalScreenShareChanged: () => undefined,
       onRemoteScreenShareChanged: () => undefined,
+      // This PoC page has no device picker (issue #755 lives in the real
+      // call UI — see calls/DeviceSettingsMenu.tsx).
+      onDeviceListChanged: () => undefined,
+      onActiveDeviceChanged: () => undefined,
     };
   }
 

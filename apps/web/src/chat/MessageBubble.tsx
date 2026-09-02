@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
-import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
 import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
@@ -43,7 +43,7 @@ export interface MessageBubbleProps {
   onEditForbidden: (messageId: string) => void;
   onDeleteMessage: (messageId: string) => Promise<void>;
   editDisabled?: boolean;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   /** The conversation on screen; presence is resolved within it (RF-58). */
   presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -56,6 +56,8 @@ export interface MessageBubbleProps {
   onEmojiToneChange: (tone: number) => void;
   /** The reader, so a reaction tooltip can say "Você" rather than their name. */
   currentUserId: string;
+  onOpenAuthorDM?: (message: Message) => void;
+  openingAuthorDM?: boolean;
   reactionMenuVisible: boolean;
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
@@ -83,17 +85,37 @@ function MessageMeta({
   isGrouped,
   senderPresence,
   onOpenHistory,
-}: Pick<MessageBubbleProps, "message" | "isMine" | "isGrouped"> & {
+  onOpenAuthorDM,
+  openingAuthorDM,
+}: Pick<
+  MessageBubbleProps,
+  "message" | "isMine" | "isGrouped" | "onOpenAuthorDM" | "openingAuthorDM"
+> & {
   senderPresence: PresenceState;
   onOpenHistory: () => void;
 }) {
   if (isGrouped && !message.isEdited) return null;
   const showSender = !isGrouped && !isMine;
+  const label = senderLabel(message);
   return (
     <div className="chat-msg-area__msg-meta">
-      {showSender && (
+      {showSender && onOpenAuthorDM && (
+        <button
+          type="button"
+          className="chat-msg-area__msg-sender chat-msg-area__msg-sender-action"
+          aria-label={`Abrir conversa com ${label}`}
+          aria-busy={openingAuthorDM}
+          disabled={openingAuthorDM}
+          data-testid="chat-msg-sender"
+          onClick={() => onOpenAuthorDM(message)}
+        >
+          {label}
+          {openingAuthorDM && <span className="sr-only">Abrindo conversa</span>}
+        </button>
+      )}
+      {showSender && !onOpenAuthorDM && (
         <span className="chat-msg-area__msg-sender" data-testid="chat-msg-sender">
-          {senderLabel(message)}
+          {label}
         </span>
       )}
       {/* The dot next to the avatar is decorative and lives inside an
@@ -239,11 +261,13 @@ function MessageBubbleBody({
         isGrouped={isGrouped}
         senderPresence={senderPresence}
         onOpenHistory={() => setHistoryOpen(true)}
+        onOpenAuthorDM={props.onOpenAuthorDM}
+        openingAuthorDM={props.openingAuthorDM}
       />
       <div ref={bubbleRef} className={messageBodyClassName(message)}>
         <MessageContent
           message={message}
-          channelId={props.channelId}
+          mentionTarget={props.mentionTarget}
           editing={editing.editing}
           onSaveEdit={editing.saveEdit}
           onCancelEdit={editing.cancelEdit}

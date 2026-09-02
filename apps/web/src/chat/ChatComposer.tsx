@@ -16,6 +16,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type DragEvent,
   type KeyboardEvent,
   type RefObject,
@@ -34,10 +35,12 @@ import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
 import type { CodecFormat } from "./tiptapSerializer";
-import type { Message, MessageBodyFormat } from "./chatTypes";
+import type { MentionTarget, Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
+import { NAV_DRAWER_QUERY } from "./useNavDrawer";
+import { useMediaQuery } from "./useMediaQuery";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -73,7 +76,7 @@ function uploadPercent({ loaded, total }: UploadProgress): number {
 
 export interface ChatComposerProps {
   placeholder: string;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   bodyFormat: CodecFormat;
   disabled?: boolean;
   replyPreview?: ComposerReplyPreview | null;
@@ -402,11 +405,92 @@ function ComposerAttachButton({
 }
 
 /**
- * Taking files into the composer — from the file picker, and from a drag.
+ * The bytes a paste really carries (issue #516).
  *
- * One place decides whether a file may be taken at all, so the picker and the
- * drop zone can never disagree, and ChatComposer is left with the editor and
- * the send rather than with four drag handlers.
+ * `files` is what modern browsers populate for a screenshot or a copied file;
+ * `items` is only read when it is empty, which is both the older-browser path
+ * and what keeps a clipboard that exposes the same object twice from becoming
+ * two attachments. Text, HTML and URLs are not files and never appear here —
+ * nothing is ever fetched to turn a link into one.
+ *
+ * The Set is the second half of that: one item listed twice is one *object*
+ * listed twice, so identity — not metadata — is what separates a repeated
+ * representation from two screenshots that merely look alike. Deduplicating
+ * here, before any name is generated, is what lets the naming below tell
+ * distinct files apart without ever splitting a repeated one in two.
+ */
+function clipboardFiles(data: DataTransfer | null): File[] {
+  const files = Array.from(data?.files ?? []);
+  if (files.length > 0) return Array.from(new Set(files));
+  const fromItems = Array.from(data?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  return Array.from(new Set(fromItems));
+}
+
+/** A clipboard name that says nothing: "", "image", "image.png", ".png". */
+const genericPasteName = /^(?:image)?(\.[a-z0-9+]+)?$/i;
+
+/**
+ * A pasted screenshot, under a name a reader can tell apart (issue #516).
+ *
+ * Browsers hand out a bare "image.png" placeholder — or nothing at all — for a
+ * bitmap taken from the clipboard, so every paste would otherwise queue under
+ * the same label. A file copied from the file manager arrives with its real
+ * name and is returned untouched.
+ *
+ * `ordinal` numbers the generated names within one paste, and only from the
+ * second onwards. The stamp alone resolves to the second, which two shots
+ * taken in the same second share — together with the placeholder name and,
+ * for two frames of the same screen, the very same byte count. The upload
+ * queue identifies a file by name, size and mtime, so without the ordinal the
+ * second of those would be swallowed as a duplicate of the first.
+ *
+ * The name is presentation only: the extension follows the declared MIME
+ * rather than the other way round, and neither is trusted for anything —
+ * file-service still inspects the bytes it receives.
+ */
+function pastedFile(file: File, ordinal: number): File {
+  const generic = genericPasteName.exec(file.name);
+  if (!generic) return file;
+  const extension = generic[1]?.slice(1) || file.type.split("/").pop() || "bin";
+  const stamp = new Date(file.lastModified)
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", "-")
+    .replace(/:/g, "");
+  const suffix = ordinal > 1 ? `-${ordinal}` : "";
+  return new File([file], `Screenshot-${stamp}${suffix}.${extension}`, {
+    type: file.type,
+    lastModified: file.lastModified,
+  });
+}
+
+/**
+ * One paste's files, with every screenshot named apart from the others.
+ *
+ * The ordinal counts only the names this composer generated, so a paste
+ * carrying a real file and a screenshot still yields an unsuffixed
+ * "Screenshot-…", and a file the browser named keeps its own name whatever
+ * position it arrived in.
+ */
+function pastedFiles(files: readonly File[]): File[] {
+  let generated = 0;
+  return files.map((file) => {
+    const named = pastedFile(file, generated + 1);
+    if (named !== file) generated += 1;
+    return named;
+  });
+}
+
+/**
+ * Taking files into the composer — from the file picker, from a drag, and from
+ * the clipboard.
+ *
+ * One place decides whether a file may be taken at all, so the picker, the
+ * drop zone and the paste can never disagree, and ChatComposer is left with
+ * the editor and the send rather than with four drag handlers.
  *
  * `interceptEnabled` and `acceptEnabled` are deliberately separate (issue
  * #670 code review): a voice recording must not accept a dropped file, but a
@@ -442,6 +526,16 @@ function useComposerDropZone(
       // Clearing the value is what lets the same file be chosen again after a
       // failure: without it the input reports no change and fires nothing.
       event.target.value = "";
+    },
+    // A paste is only ever intercepted when it really carries bytes and this
+    // composer could take them. Text — plain, HTML or a URL — falls through
+    // untouched to the editor, which is what keeps an ordinary Ctrl+V native.
+    onPaste: (event: ClipboardEvent<HTMLDivElement>) => {
+      if (!acceptEnabled) return;
+      const files = clipboardFiles(event.clipboardData);
+      if (files.length === 0) return;
+      event.preventDefault();
+      selectFiles(pastedFiles(files));
     },
     onDragOver: (event: DragEvent<HTMLDivElement>) => {
       if (!hasFiles(event)) return;
@@ -570,7 +664,10 @@ function ComposerBar({
         className="chat-msg-area__send-btn"
         disabled={!canSend}
         aria-label="Enviar mensagem"
-        onClick={() => void onSend()}
+        onClick={() => {
+          editor?.view.dom.focus({ preventScroll: true });
+          void onSend();
+        }}
         data-testid="chat-send-btn"
       >
         <IconSend />
@@ -629,7 +726,7 @@ function voiceOptions(
 
 export default function ChatComposer({
   placeholder,
-  channelId,
+  mentionTarget,
   bodyFormat,
   disabled,
   replyPreview,
@@ -645,6 +742,9 @@ export default function ChatComposer({
   emoji,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
+  const initialFocusOwnerRef = useRef(document.activeElement);
+  const initialFocusHandledRef = useRef(false);
+  const suppressInitialFocus = useMediaQuery(`${NAV_DRAWER_QUERY}, (pointer: coarse)`);
   // A picker left hanging over a sent message is noise. Closing on a confirmed
   // send is the only case the toolbar cannot see for itself; a change of
   // conversation needs no code at all, because ChatMessageArea keys this
@@ -708,7 +808,7 @@ export default function ChatComposer({
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder,
     disabled,
-    channelId,
+    mentionTarget,
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
@@ -730,6 +830,24 @@ export default function ChatComposer({
   const canAcceptAttachments = attachEnabled && !recording;
   const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
   const activeEditor = editor ?? null;
+
+  useEffect(() => {
+    if (initialFocusHandledRef.current || disabled || !editor) return;
+    if (suppressInitialFocus) {
+      initialFocusHandledRef.current = true;
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      if (!editor.isEditable) return;
+      if (document.activeElement !== initialFocusOwnerRef.current) {
+        initialFocusHandledRef.current = true;
+        return;
+      }
+      initialFocusHandledRef.current = true;
+      editor.view.dom.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [disabled, editor, suppressInitialFocus]);
 
   const startRecording = () => {
     // A picker left open over a recording panel is the same noise a picker
@@ -758,6 +876,7 @@ export default function ChatComposer({
       <div
         className={`chat-msg-area__composer-box${disabled ? " chat-msg-area__composer-box--disabled" : ""}${drop.active ? " chat-msg-area__composer-box--drag" : ""}`}
         onKeyDownCapture={handleKeyDownCapture}
+        onPaste={drop.onPaste}
         onDragOver={drop.onDragOver}
         onDragLeave={drop.onDragLeave}
         onDrop={drop.onDrop}

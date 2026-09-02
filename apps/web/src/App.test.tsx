@@ -30,6 +30,14 @@ describe("App", () => {
     expect(source).toContain('lazy(() => import("./chat/ChatMessageArea"))');
   });
 
+  it("keeps ProfileOverviewPage out of the initial chat bundle", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const source = readFileSync(resolve(__dirname, "App.tsx"), "utf8");
+    expect(source).not.toMatch(/^import ProfileOverviewPage/m);
+    expect(source).toContain('lazy(() => import("./profile/ProfileOverviewPage"))');
+  });
+
   it("renders the login page when user is not authenticated", async () => {
     render(<App />);
     expect(await screen.findByRole("heading", { name: /entrar no nic chat/i })).toBeInTheDocument();

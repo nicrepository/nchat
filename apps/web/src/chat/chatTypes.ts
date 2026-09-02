@@ -288,9 +288,14 @@ export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
 
 export interface MentionCandidate {
   /** "all" is synthesized client-side (see mentionExtension.tsx) — never fetched from the server. */
-  mentionType: "user" | "all";
+  mentionType: "user" | "channel" | "all";
   id: string;
   label: string;
+}
+
+export interface MentionTarget {
+  kind: "channel" | "dm";
+  id: string;
 }
 
 /**

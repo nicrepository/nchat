@@ -584,17 +584,25 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     await expect(userLink(page).locator("img")).toHaveAttribute("src", "/assets/nic-labs-icon.png");
   });
 
-  test("mantém Configurações acionável por mouse e por teclado", async ({ page }, testInfo) => {
+  test("mantém o menu da conta acionável por mouse e por teclado", async ({ page }, testInfo) => {
     await openChatWithAllThreeCategories(page, testInfo);
 
-    const settings = page.getByRole("link", { name: "Configurações" });
-    await expect(settings).toHaveAttribute("href", "/admin/users");
+    const trigger = page.getByRole("button", { name: /menu da conta/i });
 
     await userLink(page).focus();
     await page.keyboard.press("Tab");
-    await expect(settings).toBeFocused();
+    await expect(trigger).toBeFocused();
     await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/admin\/users/);
+    // ISSUE #672 — SidebarUserMenu deliberately has no "Administração" item:
+    // there is no real capability authority on the client to gate it on, so
+    // the menu stays honest about what it can actually do (Meu perfil, Sair)
+    // rather than pointing at an admin action nothing here can verify.
+    const profile = page.getByRole("menuitem", { name: "Meu perfil" });
+    await expect(profile).toHaveAttribute("href", "/profile");
+    // The menu focuses its first item on open — no extra Tab/ArrowDown needed.
+    await expect(profile).toBeFocused();
+    await profile.click();
+    await expect(page).toHaveURL(/\/profile$/);
   });
 
   test("mantém o rodapé utilizável em largura reduzida", async ({ page }, testInfo) => {
@@ -605,7 +613,7 @@ test.describe("sidebar — rodapé do usuário autenticado", () => {
     await page.setViewportSize({ width: 360, height: 720 });
     await page.getByTestId("chat-nav-toggle").click();
 
-    const settings = page.getByRole("link", { name: "Configurações" });
+    const settings = page.getByRole("button", { name: /menu da conta/i });
     await expect(settings).toBeVisible();
     // The drawer slides in over 180ms, and its `visibility` flips on the very
     // first frame — so the link is "visible" while the panel is still moving.

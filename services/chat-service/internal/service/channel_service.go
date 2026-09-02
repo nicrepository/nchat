@@ -158,9 +158,9 @@ type ChannelDetails struct {
 	OnlineCount   int
 	MemberCount   int
 	// CanManageMembers is the server's own answer to "may this caller add
-	// participants" (issues #398 and #705), derived from the membership this
-	// method already had to load. It exists so the panel can disable an action
-	// the server would refuse, and it is never the control: POST .../members re-derives the
+	// participants" (issue #398), derived from the membership this method already
+	// had to load. It exists so the panel can disable an action the server would
+	// refuse, and it is never the control: POST .../members re-derives the
 	// decision from the session on every call. A client that ignores it gets a
 	// 403, not a membership row.
 	//
@@ -200,9 +200,9 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		OnlineMembers: page.Online,
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
-		// #705 keeps the legacy JSON name for frontend compatibility. The value is
-		// add-only; removal still uses CanManageChannelMembers independently.
-		CanManageMembers: !channel.IsGeneral && domain.CanAddChannelMembers(&member),
+		// The same predicate the write path checks, evaluated on the membership
+		// already loaded above — not a second, parallel rule that could drift.
+		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
 }
 
