@@ -17,10 +17,9 @@ const MentionList = forwardRef<MentionListRef, MentionListProps>(
     const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
     useEffect(() => setSelectedIndex(0), [items]);
-    useEffect(
-      () => optionRefs.current[selectedIndex]?.scrollIntoView?.({ block: "nearest" }),
-      [selectedIndex],
-    );
+    useEffect(() => {
+      optionRefs.current[selectedIndex]?.scrollIntoView?.({ block: "nearest" });
+    }, [selectedIndex]);
 
     const select = (index: number) => {
       const item = items[index];
