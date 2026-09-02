@@ -35,6 +35,7 @@ type MemberStore interface {
 	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
+	SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error)
 	// ListOnlineChannelMemberProfiles returns the channel's member totals plus up
 	// to limit of the members in onlineUserIDs, in one round trip. The presence
 	// filter is applied before the limit, so an online member never loses a slot
@@ -670,6 +671,47 @@ func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
+	}
+	return results, nil
+}
+
+func (s *PGXMemberStore) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.dm_conversations dc
+		JOIN chat.workspaces w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.dm_members caller
+		  ON caller.conversation_id = dc.id AND caller.user_id = $3::uuid AND caller.status = 'active'
+		JOIN chat.workspace_members caller_wm
+		  ON caller_wm.workspace_id = dc.workspace_id AND caller_wm.user_id = caller.user_id AND caller_wm.status = 'active'
+		JOIN chat.dm_members candidate
+		  ON candidate.conversation_id = dc.id AND candidate.status = 'active'
+		JOIN chat.workspace_members candidate_wm
+		  ON candidate_wm.workspace_id = dc.workspace_id AND candidate_wm.user_id = candidate.user_id AND candidate_wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = candidate.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dc.id = $2::uuid
+		  AND dc.workspace_id = $1::uuid
+		  AND dc.type = 'group'
+		  AND dc.status = 'active'
+		  AND left(lower(u.display_name), length($4)) = lower($4)
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $5`, workspaceID, conversationID, callerID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search dm conversation members: %w", err)
+	}
+	defer rows.Close()
+	results := make([]domain.MentionCandidate, 0, limit)
+	for rows.Next() {
+		candidate := domain.MentionCandidate{Type: domain.MentionTypeUser}
+		if err := rows.Scan(&candidate.ID, &candidate.Label); err != nil {
+			return nil, fmt.Errorf("scan dm conversation member mention: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dm conversation member mentions: %w", err)
 	}
 	return results, nil
 }

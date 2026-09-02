@@ -622,6 +622,34 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 	checkExpectations(t, mock)
 }
 
+func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOutbox(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.dm_conversations source_dm.*source_dm\.type = 'group'.*chat\.notification_outbox.*ON CONFLICT`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(),
+			[]string{"11111111-1111-1111-1111-111111111111"},
+			[]string{},
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
+
+	msg, err := storage.NewPGXMessageStore(mock).CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", DMConversationID: "33333333-3333-3333-3333-333333333333",
+		SenderID: "user-1", BodyText: "mention", BodyFormat: domain.MessageBodyFormatV3,
+		MentionedUserIDs:    []string{"11111111-1111-1111-1111-111111111111"},
+		MentionedChannelIDs: []string{},
+	})
+	if err != nil || msg.ID != "msg-group-mention" {
+		t.Fatalf("message=%+v err=%v", msg, err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.channel_members.*NOT EXISTS \(SELECT 1 FROM invalid_mentions\)`).
@@ -718,7 +746,7 @@ func TestPGXMessageStore_ResolveMentionLabels(t *testing.T) {
 func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 	t.Run("empty IDs skip database", func(t *testing.T) {
 		labels, err := storage.NewPGXMessageStore(newMock(t)).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", nil, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", nil, nil,
 		)
 		if err != nil || len(labels) != 0 {
 			t.Fatalf("labels=%v err=%v", labels, err)
@@ -728,16 +756,33 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 	t.Run("returns only channel members and visible channels", func(t *testing.T) {
 		mock := newMock(t)
 		mock.ExpectQuery(`(?s)chat\.channel_members.*chat\.workspace_members.*auth\.users.*UNION ALL.*chat\.workspaces.*channel_visible_to_user`).
-			WithArgs("ws-1", "ch-1", "requester-1", []string{"user-1"}, []string{"ch-2"}).
+			WithArgs("ws-1", pgxmock.AnyArg(), pgxmock.AnyArg(), "requester-1", []string{"user-1"}, []string{"ch-2"}).
 			WillReturnRows(pgxmock.NewRows([]string{"kind", "id", "label"}).
 				AddRow("user", "user-1", "Ana").
 				AddRow("channel", "ch-2", "produto"))
 
 		labels, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1",
+			context.Background(), "ws-1", "ch-1", "", "requester-1",
 			[]string{"user-1"}, []string{"ch-2"},
 		)
 		if err != nil || labels["user:user-1"] != "Ana" || labels["channel:ch-2"] != "produto" {
+			t.Fatalf("labels=%v err=%v", labels, err)
+		}
+		checkExpectations(t, mock)
+	})
+
+	t.Run("returns only active group members", func(t *testing.T) {
+		mock := newMock(t)
+		mock.ExpectQuery(`(?s)chat\.dm_conversations.*source_dm\.type = 'group'.*chat\.dm_members`).
+			WithArgs("ws-1", pgxmock.AnyArg(), pgxmock.AnyArg(), "requester-1", []string{"user-1"}, []string{}).
+			WillReturnRows(pgxmock.NewRows([]string{"kind", "id", "label"}).
+				AddRow("user", "user-1", "Juliane Lino"))
+
+		labels, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
+			context.Background(), "ws-1", "", "group-1", "requester-1",
+			[]string{"user-1"}, []string{},
+		)
+		if err != nil || labels["user:user-1"] != "Juliane Lino" {
 			t.Fatalf("labels=%v err=%v", labels, err)
 		}
 		checkExpectations(t, mock)
@@ -747,7 +792,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 		mock := newMock(t)
 		mock.ExpectQuery(`SELECT 'user'`).WillReturnError(errors.New("db unavailable"))
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected query error")
@@ -760,7 +805,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 			pgxmock.NewRows([]string{"kind", "id", "label"}).AddRow("user", "user-1", nil),
 		)
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected scan error")
@@ -775,7 +820,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 				RowError(0, errors.New("stream failed")),
 		)
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected iteration error")

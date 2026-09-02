@@ -1068,12 +1068,21 @@ func (h *MessageHandler) UpdateWorkspaceUploadLimit(w http.ResponseWriter, r *ht
 
 // SearchMentions handles GET /api/chat/channels/{channelID}/mentions?q=prefix.
 func (h *MessageHandler) SearchMentions(w http.ResponseWriter, r *http.Request) {
+	h.searchMentions(w, r, "channel", r.PathValue("channelID"), "channel_id")
+}
+
+// SearchDMMentions handles group-only autocomplete. Direct DMs deliberately
+// receive the same non-enumerating miss as an inaccessible conversation.
+func (h *MessageHandler) SearchDMMentions(w http.ResponseWriter, r *http.Request) {
+	h.searchMentions(w, r, "dm", r.PathValue("conversationID"), "conversation_id")
+}
+
+func (h *MessageHandler) searchMentions(w http.ResponseWriter, r *http.Request, targetType, targetID, targetField string) {
 	if !h.checkMentionDeps(w) {
 		return
 	}
 
-	channelID := r.PathValue("channelID")
-	if !validateTargetID(w, channelID, "channel_id") {
+	if !validateTargetID(w, targetID, targetField) {
 		return
 	}
 
@@ -1090,7 +1099,8 @@ func (h *MessageHandler) SearchMentions(w http.ResponseWriter, r *http.Request) 
 
 	out, err := h.mentions.SearchMentions(r.Context(), service.SearchMentionsInput{
 		WorkspaceID: wsID,
-		ChannelID:   channelID,
+		TargetType:  targetType,
+		TargetID:    targetID,
 		CallerID:    userID,
 		Query:       r.URL.Query().Get("q"),
 	})
