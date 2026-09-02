@@ -29,6 +29,10 @@ func (s *MemberService) SearchChannelMembers(ctx context.Context, workspaceID, c
 	return s.members.SearchChannelMembers(ctx, workspaceID, channelID, prefix, limit)
 }
 
+func (s *MemberService) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	return s.members.SearchDMConversationMembers(ctx, workspaceID, conversationID, callerID, prefix, limit)
+}
+
 // JoinWorkspace adds userID to workspaceID with the given role. If the user is
 // already a member, the existing membership record is returned without error.
 func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {

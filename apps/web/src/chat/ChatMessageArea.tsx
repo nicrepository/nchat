@@ -35,7 +35,14 @@ import "./ChatMessageArea.css";
 import ActiveDirectCallBar, { type ActiveDirectCallBarProps } from "../calls/ActiveDirectCallBar";
 import ActiveResourceCallBar from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
-import type { Channel, DMConversation, DMCounterpart, Message, PinnedItem } from "./chatTypes";
+import type {
+  Channel,
+  DMConversation,
+  DMCounterpart,
+  MentionTarget,
+  Message,
+  PinnedItem,
+} from "./chatTypes";
 import { fetchAllowedReactionEmojis, getOrCreateDirectDM } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
@@ -523,7 +530,7 @@ interface MessageListProps {
   onEditForbidden: MessageBubbleProps["onEditForbidden"];
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   editDisabledIds: Set<string>;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   /**
    * Whether a system message in this timeline says "canal", "grupo" or
    * "conversa" (issue #527). The kind comes from the conversation record, never
@@ -563,7 +570,7 @@ function MessageList({
   onEditForbidden,
   onDeleteMessage,
   editDisabledIds,
-  channelId,
+  mentionTarget,
   systemScope,
   presenceTarget,
   onTogglePin,
@@ -802,7 +809,7 @@ function MessageList({
             onEditForbidden={onEditForbidden}
             onDeleteMessage={onDeleteMessage}
             editDisabled={editDisabledIds.has(item.message.id)}
-            channelId={channelId}
+            mentionTarget={mentionTarget}
             presenceTarget={presenceTarget}
             onTogglePin={onTogglePin}
             isPinned={pinnedIds?.has(item.message.id) ?? false}
@@ -1035,6 +1042,7 @@ interface ConversationTimelineProps {
   targetId: string;
   name: string;
   detailsKind: ConversationDetailsKind | null;
+  mentionTarget?: MentionTarget;
   state: MessagesState;
   currentUserId: string;
   actions: TimelineActions;
@@ -1059,6 +1067,7 @@ function ConversationTimeline({
   targetId,
   name,
   detailsKind,
+  mentionTarget,
   state,
   currentUserId,
   actions,
@@ -1098,7 +1107,7 @@ function ConversationTimeline({
       onEditForbidden={actions.onEditForbidden}
       onDeleteMessage={actions.onDeleteMessage}
       editDisabledIds={editDisabledIds}
-      channelId={channelId}
+      mentionTarget={mentionTarget}
       presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
       onTogglePin={actions.onTogglePin}
       pinnedIds={pinnedIds}
@@ -1343,6 +1352,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   } = useMessages({
     kind,
     targetId,
+    bodyFormat: target.bodyFormat,
     currentUserId: ctx.currentUserId,
     focusMessageId,
     onOwnReactionConfirmed: rememberReaction,
@@ -1708,6 +1718,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           targetId={targetId}
           name={resolvedName}
           detailsKind={detailsKind}
+          mentionTarget={target.mentionTarget}
           state={state}
           currentUserId={ctx.currentUserId}
           actions={timelineActions}
@@ -1740,8 +1751,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
       */}
         <ChatComposer
           key={`${kind}:${targetId}`}
-          channelId={target.channelId}
-          bodyFormat={target.isChannel ? "v3" : "v2"}
+          mentionTarget={target.mentionTarget}
+          bodyFormat={target.bodyFormat}
           placeholder={target.composerPlaceholder}
           disabled={state.status !== "ready"}
           replyPreview={replyPreview}

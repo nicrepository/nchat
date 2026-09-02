@@ -37,6 +37,31 @@ func TestPGXMemberStore_SearchChannelMembers_ScopesWorkspaceChannelAndActiveMemb
 	}
 }
 
+func TestPGXMemberStore_SearchDMConversationMembers_ScopesActiveGroupAndMemberships(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations.*w\.status = 'active'.*caller\.status = 'active'.*caller_wm\.status = 'active'.*candidate\.status = 'active'.*candidate_wm\.status = 'active'.*u\.status = 'active'.*u\.deleted_at IS NULL.*dc\.type = 'group'.*ORDER BY lower\(u\.display_name\), u\.id`).
+		WithArgs("ws-1", "group-1", "caller-1", "ju", 20).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).
+			AddRow("user-2", "Juliane Lino"))
+
+	got, err := storage.NewPGXMemberStore(mock).SearchDMConversationMembers(
+		context.Background(), "ws-1", "group-1", "caller-1", "ju", 20,
+	)
+	if err != nil {
+		t.Fatalf("SearchDMConversationMembers: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "user-2" || got[0].Label != "Juliane Lino" {
+		t.Fatalf("unexpected candidates: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestPGXMemberStore_ListChannelMemberProfilesByIDs_ScopesToChannelMembership(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {

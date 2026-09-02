@@ -132,6 +132,23 @@ func TestLinkSafetyStatesQueryIsSenderScoped(t *testing.T) {
 	}
 }
 
+func TestPendingMentionPromotionRevalidatesRecipientTargetAccess(t *testing.T) {
+	for _, predicate := range []string{
+		"mention_workspace.status = 'active'",
+		"mention_member.status = 'active'",
+		"mention_recipient.status = 'active'",
+		"mention_recipient.deleted_at IS NULL",
+		"JOIN chat.channel_members mention_channel_member",
+		"JOIN chat.dm_members mention_dm_member",
+		"mention_dm.type = 'group'",
+		"mention_dm_member.status = 'active'",
+	} {
+		if !strings.Contains(resolvePendingMessagesQuery, predicate) {
+			t.Fatalf("pending mention promotion is missing %q", predicate)
+		}
+	}
+}
+
 // The admission locks the rows it charges for in this exact order. Two sends
 // naming the same URLs in different orders must therefore produce the same
 // sequence, and a URL repeated in one body must be locked once — a second lock

@@ -1720,6 +1720,7 @@ function reducer(state: MessagesState, action: Action): MessagesState {
 interface UseMessagesOptions {
   kind: "channel" | "dm";
   targetId: string;
+  bodyFormat?: "v2" | "v3";
   currentUserId: string;
   /** Direct-navigation target resolved through the authorized single-message GET. */
   focusMessageId?: string;
@@ -1796,6 +1797,7 @@ export interface UseMessagesResult {
 export function useMessages({
   kind,
   targetId,
+  bodyFormat = kind === "channel" ? "v3" : "v2",
   currentUserId,
   focusMessageId,
   onOwnReactionConfirmed,
@@ -2153,6 +2155,7 @@ export function useMessages({
       try {
         const signature = JSON.stringify({
           target: sendKey,
+          bodyFormat,
           body,
           parentMessageId,
           referencedMessageId,
@@ -2166,6 +2169,7 @@ export function useMessages({
           referencedMessageId,
           attachmentIds,
           idempotencyKey: pendingSendIdentityRef.current.key,
+          ...(kind === "dm" ? { bodyFormat } : {}),
         };
         const sendFn =
           kind === "channel"
@@ -2186,7 +2190,7 @@ export function useMessages({
         throw err;
       }
     },
-    [kind, sanitizeTombstonedMessage, targetId],
+    [bodyFormat, kind, sanitizeTombstonedMessage, targetId],
   );
 
   // Handle incoming message.created WS events.

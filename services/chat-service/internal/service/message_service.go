@@ -472,7 +472,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		return domain.Message{}, err
 	}
 
-	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, senderID, body, bodyFormat)
+	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, "", senderID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -592,19 +592,22 @@ type outgoingMentions struct {
 // against what the *sender* may see in this target, so naming a private channel
 // or a user they cannot reach is refused here rather than leaking a label.
 func (s *MessageService) resolveOutgoingMentions(
-	ctx context.Context, workspaceID, channelID, senderID, body string,
+	ctx context.Context, workspaceID, channelID, dmConversationID, senderID, body string,
 	bodyFormat domain.MessageBodyFormat,
 ) (outgoingMentions, error) {
 	mentions := outgoingMentions{Body: body}
 	if bodyFormat != domain.MessageBodyFormatV3 {
 		return mentions, nil
 	}
+	if dmConversationID != "" && hasMentionKind(body, "all") {
+		return outgoingMentions{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+	}
 	mentions.UserIDs, mentions.ChannelIDs = extractMentionIDs(body)
 	if len(mentions.UserIDs)+len(mentions.ChannelIDs) == 0 {
 		return mentions, nil
 	}
 	labels, err := s.messages.ResolveAuthorizedMentionLabels(
-		ctx, workspaceID, channelID, senderID, mentions.UserIDs, mentions.ChannelIDs,
+		ctx, workspaceID, channelID, dmConversationID, senderID, mentions.UserIDs, mentions.ChannelIDs,
 	)
 	if err != nil {
 		return outgoingMentions{}, fmt.Errorf("resolve authorized mention labels: %w", err)
@@ -1031,7 +1034,8 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	// SQL-enforce DM visibility: workspace active + workspace member active +
 	// DM conversation active + active DM membership. Returns ErrNotFound for all
 	// invisible targets (non-enumerating).
-	if _, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, senderID); err != nil {
+	conversation, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, senderID)
+	if err != nil {
 		return domain.Message{}, err
 	}
 	// RF-21, on the same terms as the channel path: after authorization, before
@@ -1046,6 +1050,17 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	if err != nil {
 		return domain.Message{}, err
 	}
+
+	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, "", conversationID, senderID, body, bodyFormat)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	// Direct DMs keep their existing codec and cannot gain mention semantics by
+	// manually posting a v3 token. Group membership is the only DM authority.
+	if conversation.Type != domain.DMConversationTypeGroup && len(mentions.UserIDs)+len(mentions.ChannelIDs) > 0 {
+		return domain.Message{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+	}
+	body = mentions.Body
 
 	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
 		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
@@ -1068,6 +1083,8 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ParentMessageID:        parentID,
 		ForwardedFromMessageID: forwardedID,
 		ReferencedMessageID:    referencedID,
+		MentionedUserIDs:       mentions.UserIDs,
+		MentionedChannelIDs:    mentions.ChannelIDs,
 		AttachmentIDs:          attachmentIDs,
 		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
 	}, links, body, replayInput, "create dm message")
@@ -1188,7 +1205,7 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	if !editable {
 		return domain.Message{}, domain.ErrURLCheckPending
 	}
-	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, editorID, body, bodyFormat)
+	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, current.DMConversationID, editorID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -1247,16 +1264,19 @@ func (s *MessageService) DeleteMessage(ctx context.Context, input DeleteMessageI
 	return deleted, nil
 }
 
-func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {
-	if bodyFormat != domain.MessageBodyFormatV3 || channelID == "" {
+func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, dmConversationID, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {
+	if bodyFormat != domain.MessageBodyFormatV3 {
 		return body, nil
+	}
+	if dmConversationID != "" && hasMentionKind(body, "all") {
+		return "", fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
 	}
 	userIDs, channelIDs := extractMentionIDs(body)
 	if len(userIDs)+len(channelIDs) == 0 {
 		return body, nil
 	}
 	labels, err := s.messages.ResolveAuthorizedMentionLabels(
-		ctx, workspaceID, channelID, requesterID, userIDs, channelIDs,
+		ctx, workspaceID, channelID, dmConversationID, requesterID, userIDs, channelIDs,
 	)
 	if err != nil {
 		return "", fmt.Errorf("resolve authorized mention labels: %w", err)

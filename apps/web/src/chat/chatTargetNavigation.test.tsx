@@ -565,7 +565,7 @@ describe("composer drafts never cross conversation targets", () => {
     });
     await waitFor(() =>
       expect(api.fetchMentionCandidates).toHaveBeenCalledWith(
-        secretChannelId,
+        { kind: "channel", id: secretChannelId },
         expect.anything(),
         expect.anything(),
       ),
