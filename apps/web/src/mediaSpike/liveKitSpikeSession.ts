@@ -3,6 +3,7 @@ import {
   Room,
   RoomEvent,
   Track,
+  supportsAudioOutputSelection,
   type LocalTrackPublication,
   type Participant,
   type RemoteParticipant,
@@ -23,6 +24,32 @@ export class SpikeMediaError extends Error {
   constructor(kind: SpikeMediaErrorKind) {
     super(kind);
     this.name = "SpikeMediaError";
+    this.kind = kind;
+  }
+}
+
+// Reuses the browser's own MediaDeviceKind union (audioinput/videoinput/
+// audiooutput) rather than a parallel one — it is exactly the set
+// Room.getLocalDevices/switchActiveDevice/RoomEvent.ActiveDeviceChanged
+// already use (issue #755).
+export type CallDeviceKind = MediaDeviceKind;
+
+export interface CallMediaDevice {
+  deviceId: string;
+  kind: CallDeviceKind;
+  label: string;
+}
+
+export type SpikeDeviceErrorKind = "denied" | "not_found" | "unavailable";
+
+export class SpikeDeviceError extends Error {
+  readonly deviceKind: CallDeviceKind;
+  readonly kind: SpikeDeviceErrorKind;
+
+  constructor(deviceKind: CallDeviceKind, kind: SpikeDeviceErrorKind) {
+    super(`${deviceKind}_${kind}`);
+    this.name = "SpikeDeviceError";
+    this.deviceKind = deviceKind;
     this.kind = kind;
   }
 }
@@ -99,6 +126,17 @@ export interface LiveKitSpikeSessionCallbacks {
     element: HTMLMediaElement,
     active: boolean,
   ): void;
+  // Device list changed (hot-plug: headset/webcam connected or removed) —
+  // never fired for a mic/camera on/off toggle. The consumer should
+  // re-enumerate; this never by itself implies the active device changed
+  // (see onActiveDeviceChanged below).
+  onDeviceListChanged(): void;
+  // The SDK's own confirmed active device for `kind` — fired after a
+  // successful switchActiveDevice() AND whenever the SDK itself falls back
+  // to another device because the previously active one disappeared. This
+  // is the single source of truth for "what device is really applied";
+  // never inferred locally from the deviceId a caller merely requested.
+  onActiveDeviceChanged(kind: CallDeviceKind, deviceId: string): void;
 }
 
 export interface LiveKitSpikeSession {
@@ -110,6 +148,23 @@ export interface LiveKitSpikeSession {
   setMicrophoneEnabled(enabled: boolean): Promise<void>;
   setScreenShareEnabled(enabled: boolean): Promise<void>;
   disconnect(): Promise<void>;
+  // Enumerates devices of one kind. Never requests permission by itself —
+  // labels are empty until mic/camera permission was already granted
+  // through the normal enable flow, and the caller renders a fallback name
+  // for that case (issue #755: never capture media just to open the
+  // selector).
+  listMediaDevices(kind: CallDeviceKind): Promise<CallMediaDevice[]>;
+  // The SDK-confirmed active device for `kind`, or undefined before any
+  // capture/switch has established one.
+  getActiveDevice(kind: CallDeviceKind): string | undefined;
+  // Switches the device LiveKit uses for `kind`. Never captures a new
+  // device when the corresponding track is currently disabled/unpublished —
+  // it only updates the preferred-device option for the next capture, so
+  // selecting another mic/camera while it is off can never turn it on.
+  switchActiveDevice(kind: CallDeviceKind, deviceId: string): Promise<void>;
+  // Real browser feature detection for `audiooutput` selection (setSinkId
+  // support) — never assumed true.
+  isAudioOutputSupported(): boolean;
 }
 
 export type LiveKitSpikeSessionFactory = (
@@ -158,7 +213,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .on(RoomEvent.TrackMuted, this.onTrackMuted)
       .on(RoomEvent.TrackUnmuted, this.onTrackUnmuted)
       .on(RoomEvent.ActiveSpeakersChanged, this.onActiveSpeakersChanged)
-      .on(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished);
+      .on(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished)
+      .on(RoomEvent.MediaDevicesChanged, this.onDeviceListChanged)
+      .on(RoomEvent.ActiveDeviceChanged, this.onActiveDeviceChanged);
   }
 
   async connect(serverUrl: string, token: string): Promise<void> {
@@ -275,6 +332,36 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       this.removeLocalScreenShare();
     }
     this.callbacks.onScreenShareChanged(enabled);
+  }
+
+  async listMediaDevices(kind: CallDeviceKind): Promise<CallMediaDevice[]> {
+    if (this.disposed) return [];
+    let devices: MediaDeviceInfo[];
+    try {
+      devices = await Room.getLocalDevices(kind, false);
+    } catch (error) {
+      throw deviceError(kind, error);
+    }
+    if (this.disposed) return [];
+    return devices.map((device) => ({ deviceId: device.deviceId, kind, label: device.label }));
+  }
+
+  getActiveDevice(kind: CallDeviceKind): string | undefined {
+    if (this.disposed) return undefined;
+    return this.room.getActiveDevice(kind);
+  }
+
+  async switchActiveDevice(kind: CallDeviceKind, deviceId: string): Promise<void> {
+    if (this.disposed) return;
+    try {
+      await this.room.switchActiveDevice(kind, deviceId);
+    } catch (error) {
+      throw deviceError(kind, error);
+    }
+  }
+
+  isAudioOutputSupported(): boolean {
+    return supportsAudioOutputSelection();
   }
 
   disconnect(): Promise<void> {
@@ -408,6 +495,14 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       this.removeLocalScreenShare();
       this.callbacks.onScreenShareChanged(false);
     }
+  };
+
+  private readonly onDeviceListChanged = (): void => {
+    if (!this.disposed) this.callbacks.onDeviceListChanged();
+  };
+
+  private readonly onActiveDeviceChanged = (kind: CallDeviceKind, deviceId: string): void => {
+    if (!this.disposed) this.callbacks.onActiveDeviceChanged(kind, deviceId);
   };
 
   private readonly onTrackMuted = (
@@ -549,7 +644,9 @@ class LiveKitSpikeSessionImpl implements LiveKitSpikeSession {
       .off(RoomEvent.TrackMuted, this.onTrackMuted)
       .off(RoomEvent.TrackUnmuted, this.onTrackUnmuted)
       .off(RoomEvent.ActiveSpeakersChanged, this.onActiveSpeakersChanged)
-      .off(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished);
+      .off(RoomEvent.LocalTrackUnpublished, this.onLocalTrackUnpublished)
+      .off(RoomEvent.MediaDevicesChanged, this.onDeviceListChanged)
+      .off(RoomEvent.ActiveDeviceChanged, this.onActiveDeviceChanged);
   }
 
   private removeRemoteTrack(track: RemoteTrack): void {
@@ -670,4 +767,15 @@ export const createLiveKitSpikeSession: LiveKitSpikeSessionFactory = (callbacks)
 function mediaError(device: "camera" | "microphone", error: unknown): SpikeMediaError {
   const denied = MediaDeviceFailure.getFailure(error) === MediaDeviceFailure.PermissionDenied;
   return new SpikeMediaError(`${device}_${denied ? "denied" : "unavailable"}`);
+}
+
+function deviceError(kind: CallDeviceKind, error: unknown): SpikeDeviceError {
+  const failure = MediaDeviceFailure.getFailure(error);
+  const mapped: SpikeDeviceErrorKind =
+    failure === MediaDeviceFailure.PermissionDenied
+      ? "denied"
+      : failure === MediaDeviceFailure.NotFound
+        ? "not_found"
+        : "unavailable";
+  return new SpikeDeviceError(kind, mapped);
 }

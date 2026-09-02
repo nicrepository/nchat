@@ -477,10 +477,10 @@ type MessageStore interface {
 	// or "channel:<uuid>", scoped to workspaceID.
 	ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error)
 
-	// ResolveAuthorizedMentionLabels returns labels only for references that are
-	// valid in sourceChannelID for requesterID. CreateMessage repeats this check
-	// atomically as the final authorization backstop.
-	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
+	// ResolveAuthorizedMentionLabels returns labels only for references valid in
+	// the source channel or group conversation for requesterID. CreateMessage
+	// repeats this check atomically as the final authorization backstop.
+	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, sourceDMConversationID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
 
 	// ListChannelMessages returns a paginated set of messages for a channel.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
@@ -796,7 +796,7 @@ var createMessageQuery = `
 		invalid_mentions AS (
 			SELECT 1
 			FROM user_mentions um
-			WHERE $2::uuid IS NULL OR NOT EXISTS (
+			WHERE NOT EXISTS (
 				SELECT 1
 				FROM chat.channels source_channel
 				JOIN chat.channel_members cm
@@ -809,14 +809,35 @@ var createMessageQuery = `
 				  ON mentioned_user.id = um.user_id
 				 AND mentioned_user.status = 'active'
 				 AND mentioned_user.deleted_at IS NULL
-				WHERE source_channel.id = $2::uuid
+				WHERE $2::uuid IS NOT NULL
+				  AND source_channel.id = $2::uuid
 				  AND source_channel.workspace_id = $1::uuid
 				  AND source_channel.status = 'active'
+				UNION ALL
+				SELECT 1
+				FROM chat.dm_conversations source_dm
+				JOIN chat.dm_members mentioned_dm
+				  ON mentioned_dm.conversation_id = source_dm.id
+				 AND mentioned_dm.user_id = um.user_id
+				 AND mentioned_dm.status = 'active'
+				JOIN chat.workspace_members mentioned_member
+				  ON mentioned_member.workspace_id = source_dm.workspace_id
+				 AND mentioned_member.user_id = um.user_id
+				 AND mentioned_member.status = 'active'
+				JOIN auth.users mentioned_user
+				  ON mentioned_user.id = um.user_id
+				 AND mentioned_user.status = 'active'
+				 AND mentioned_user.deleted_at IS NULL
+				WHERE $3::uuid IS NOT NULL
+				  AND source_dm.id = $3::uuid
+				  AND source_dm.workspace_id = $1::uuid
+				  AND source_dm.type = 'group'
+				  AND source_dm.status = 'active'
 			)
 			UNION ALL
 			SELECT 1
 			FROM channel_mentions mentioned
-			WHERE NOT EXISTS (
+			WHERE $2::uuid IS NULL OR NOT EXISTS (
 				SELECT 1
 				FROM chat.channels c
 				JOIN chat.workspaces w
@@ -1706,14 +1727,14 @@ func (s *PGXMessageStore) ResolveMentionLabels(ctx context.Context, workspaceID 
 	return scanMentionLabels(rows, labels)
 }
 
-func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error) {
+func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, sourceDMConversationID, requesterID string, userIDs, channelIDs []string) (map[string]string, error) {
 	labels := make(map[string]string, len(userIDs)+len(channelIDs))
 	if len(userIDs)+len(channelIDs) == 0 {
 		return labels, nil
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT 'user', u.id::text, u.display_name
-		FROM unnest($4::text[]) AS ids(id)
+		FROM unnest($5::text[]) AS ids(id)
 		JOIN chat.channels source_channel
 		  ON source_channel.id = $2::uuid
 		 AND source_channel.workspace_id = $1::uuid
@@ -1727,8 +1748,24 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		JOIN auth.users u
 		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
 		UNION ALL
-		SELECT 'channel', c.id::text, c.display_name
+		SELECT 'user', u.id::text, u.display_name
 		FROM unnest($5::text[]) AS ids(id)
+		JOIN chat.dm_conversations source_dm
+		  ON source_dm.id = $3::uuid
+		 AND source_dm.workspace_id = $1::uuid
+		 AND source_dm.type = 'group'
+		 AND source_dm.status = 'active'
+		JOIN chat.dm_members dm
+		  ON dm.conversation_id = source_dm.id AND dm.user_id = ids.id::uuid AND dm.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = source_dm.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		UNION ALL
+		SELECT 'channel', c.id::text, c.display_name
+		FROM unnest($6::text[]) AS ids(id)
 		JOIN chat.channels c
 		  ON c.id = ids.id::uuid
 		 AND c.workspace_id = $1::uuid
@@ -1737,10 +1774,11 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		  ON w.id = c.workspace_id AND w.status = 'active'
 		JOIN chat.workspace_members requester
 		  ON requester.workspace_id = c.workspace_id
-		 AND requester.user_id = $3::uuid
+		 AND requester.user_id = $4::uuid
 		 AND requester.status = 'active'
-		WHERE chat.channel_visible_to_user(c.id, $3::uuid)`,
-		workspaceID, sourceChannelID, requesterID, userIDs, channelIDs,
+		WHERE $2::uuid IS NOT NULL
+		  AND chat.channel_visible_to_user(c.id, $4::uuid)`,
+		workspaceID, nullableUUID(sourceChannelID), nullableUUID(sourceDMConversationID), requesterID, userIDs, channelIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve authorized mention labels: %w", err)

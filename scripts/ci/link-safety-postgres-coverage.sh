@@ -82,6 +82,9 @@ case "$MODULE" in
       TestNotificationOutboxPromotionKeepsTheOriginalInstantPostgreSQL
       TestNotificationOutboxPromotionRetryCreatesNoDuplicatePostgreSQL
       TestNotificationOutboxPromotionIsAtomicPostgreSQL
+      TestNotificationOutboxPromotesToPublicChannelReaderPostgreSQL
+      TestNotificationOutboxPromotesDirectConversationPostgreSQL
+      TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
     )

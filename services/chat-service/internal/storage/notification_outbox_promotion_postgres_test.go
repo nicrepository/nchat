@@ -59,12 +59,32 @@ func readParked(t *testing.T, pool *pgxpool.Pool, messageID string) []parkedRow 
 	return out
 }
 
-// seedWithheldReply creates a DM reply that is withheld pending a link scan. The
-// parent is written by notifyPeer, so the withheld message reaches two people by
-// two different rules — a reply for the author it answers, a direct message for
-// everybody else still in the conversation. One classification would be
-// indistinguishable from a bug; two are not.
-func seedWithheldReply(t *testing.T, pool *pgxpool.Pool, store *storage.PGXMessageStore) domain.Message {
+// withheldTarget says where the withheld reply is written and who wrote the
+// message it answers. The target is what selects the branch of the promotion's
+// access check, so every scenario in this file is one of these.
+type withheldTarget struct {
+	channelID      string
+	conversationID string
+	parentSender   string
+	idempotencyKey string
+}
+
+// groupConversation is the default scenario: a group DM whose withheld message
+// reaches two people by two different rules — a reply for the author it answers,
+// a direct message for everybody else still in the conversation. One
+// classification would be indistinguishable from a bug; two are not.
+func groupConversation() withheldTarget {
+	return withheldTarget{
+		conversationID: notifyConversation,
+		parentSender:   notifyPeer,
+		idempotencyKey: "notify-741-withheld",
+	}
+}
+
+// seedWithheldReply creates a reply that is withheld pending a link scan.
+func seedWithheldReply(
+	t *testing.T, pool *pgxpool.Pool, store *storage.PGXMessageStore, target withheldTarget,
+) domain.Message {
 	t.Helper()
 	ctx := t.Context()
 	if err := store.EnsureLinkScans(ctx, []string{notifyScannedURL}); err != nil {
@@ -72,14 +92,16 @@ func seedWithheldReply(t *testing.T, pool *pgxpool.Pool, store *storage.PGXMessa
 	}
 	parent := mustCreate(t, store, storage.CreateMessageInput{
 		WorkspaceID:      notifyWorkspace,
-		DMConversationID: notifyConversation,
-		SenderID:         notifyPeer,
+		ChannelID:        target.channelID,
+		DMConversationID: target.conversationID,
+		SenderID:         target.parentSender,
 		BodyText:         "the message being answered",
 		BodyFormat:       domain.MessageBodyFormatV3,
 	})
 	withheld := mustCreate(t, store, storage.CreateMessageInput{
 		WorkspaceID:           notifyWorkspace,
-		DMConversationID:      notifyConversation,
+		ChannelID:             target.channelID,
+		DMConversationID:      target.conversationID,
 		SenderID:              notifyAuthor,
 		BodyText:              "answering with " + notifyScannedURL,
 		BodyFormat:            domain.MessageBodyFormatV3,
@@ -87,13 +109,28 @@ func seedWithheldReply(t *testing.T, pool *pgxpool.Pool, store *storage.PGXMessa
 		Status:                domain.MessageStatusPendingLinkScan,
 		LinkScanURLs:          []string{notifyScannedURL},
 		LinkSafetyFingerprint: notifyFingerprint,
-		IdempotencyKey:        "notify-741-withheld",
+		IdempotencyKey:        target.idempotencyKey,
 	})
 	if withheld.Status != domain.MessageStatusPendingLinkScan {
 		t.Fatalf("status = %q, want the message withheld", withheld.Status)
 	}
 	assertRowCount(t, readOutbox(t, pool, withheld.ID), 0)
 	return withheld
+}
+
+// promote clears the scan and runs the promotion, returning what it released.
+func promote(t *testing.T, pool *pgxpool.Pool, store *storage.PGXMessageStore, messageID string) []outboxRow {
+	t.Helper()
+	clearTheScan(t, store)
+	summary, err := store.ResolveDecidedMessages(t.Context())
+	if err != nil {
+		t.Fatalf("ResolveDecidedMessages: %v", err)
+	}
+	if summary.Published != 1 {
+		t.Fatalf("summary = %+v, want the one withheld message published", summary)
+	}
+	assertField(t, "message status", readMessageStatus(t, pool, messageID), "active")
+	return readOutbox(t, pool, messageID)
 }
 
 // clearTheScan drives the real worker path to a safe verdict.
@@ -142,7 +179,7 @@ func readMessageStatus(t *testing.T, pool *pgxpool.Pool, messageID string) strin
 // given, and tells nobody in the meantime.
 func TestNotificationOutboxParksClassifiedRecipientsPostgreSQL(t *testing.T) {
 	pool := seedNotificationFixture(t)
-	withheld := seedWithheldReply(t, pool, storage.NewPGXMessageStore(pool))
+	withheld := seedWithheldReply(t, pool, storage.NewPGXMessageStore(pool), groupConversation())
 
 	parked := readParked(t, pool, withheld.ID)
 	if len(parked) != 2 {
@@ -167,7 +204,7 @@ func TestNotificationOutboxParksClassifiedRecipientsPostgreSQL(t *testing.T) {
 func TestNotificationOutboxPromotedFromLinkScanPostgreSQL(t *testing.T) {
 	pool := seedNotificationFixture(t)
 	store := storage.NewPGXMessageStore(pool)
-	withheld := seedWithheldReply(t, pool, store)
+	withheld := seedWithheldReply(t, pool, store, groupConversation())
 	clearTheScan(t, store)
 
 	summary, err := store.ResolveDecidedMessages(t.Context())
@@ -208,7 +245,7 @@ func assertPromotedContract(t *testing.T, rows []outboxRow, messageID string) {
 func TestNotificationOutboxPromotionKeepsTheOriginalInstantPostgreSQL(t *testing.T) {
 	pool := seedNotificationFixture(t)
 	store := storage.NewPGXMessageStore(pool)
-	withheld := seedWithheldReply(t, pool, store)
+	withheld := seedWithheldReply(t, pool, store, groupConversation())
 	clearTheScan(t, store)
 	if _, err := store.ResolveDecidedMessages(t.Context()); err != nil {
 		t.Fatalf("ResolveDecidedMessages: %v", err)
@@ -233,7 +270,7 @@ func TestNotificationOutboxPromotionKeepsTheOriginalInstantPostgreSQL(t *testing
 func TestNotificationOutboxPromotionRetryCreatesNoDuplicatePostgreSQL(t *testing.T) {
 	pool := seedNotificationFixture(t)
 	store := storage.NewPGXMessageStore(pool)
-	withheld := seedWithheldReply(t, pool, store)
+	withheld := seedWithheldReply(t, pool, store, groupConversation())
 	clearTheScan(t, store)
 	ctx := t.Context()
 
@@ -264,7 +301,7 @@ func TestNotificationOutboxPromotionRetryCreatesNoDuplicatePostgreSQL(t *testing
 func TestNotificationOutboxPromotionIsAtomicPostgreSQL(t *testing.T) {
 	pool := seedNotificationFixture(t)
 	store := storage.NewPGXMessageStore(pool)
-	withheld := seedWithheldReply(t, pool, store)
+	withheld := seedWithheldReply(t, pool, store, groupConversation())
 	clearTheScan(t, store)
 	ctx := t.Context()
 
@@ -294,4 +331,102 @@ func TestNotificationOutboxPromotionIsAtomicPostgreSQL(t *testing.T) {
 	assertField(t, "message status after rollback",
 		readMessageStatus(t, pool, withheld.ID), string(domain.MessageStatusPendingLinkScan))
 	assertRowCount(t, readOutbox(t, pool, withheld.ID), 0)
+}
+
+// ── who the promotion may still reach ───────────────────────────────────────
+//
+// The promotion re-reads access at the moment it releases a notification,
+// because membership can change while a scan runs. What "access" means is
+// chat.channel_visible_to_user for a channel and current membership for a
+// conversation — the same authorities every read path uses. These three cover
+// the cases where a narrower rule would silently drop a real notification, or a
+// wider one would leak.
+
+// publicChannel writes the withheld reply in a public channel and has it answer
+// notifyOutsider, who is an active workspace member with no chat.channel_members
+// row at all.
+//
+// A public channel is visible to them, so the notification is theirs. Requiring
+// an explicit membership row would drop it — and would drop every reply and
+// channel notification to everybody who simply reads a public channel without
+// having joined it, which is most people.
+func publicChannel() withheldTarget {
+	return withheldTarget{
+		channelID:      notifyChannel,
+		parentSender:   notifyOutsider,
+		idempotencyKey: "notify-741-withheld-public",
+	}
+}
+
+func TestNotificationOutboxPromotesToPublicChannelReaderPostgreSQL(t *testing.T) {
+	pool := seedNotificationFixture(t)
+	store := storage.NewPGXMessageStore(pool)
+
+	assertNoChannelMembership(t, pool, notifyChannel, notifyOutsider)
+	withheld := seedWithheldReply(t, pool, store, publicChannel())
+
+	rows := promote(t, pool, store, withheld.ID)
+	assertRowCount(t, rows, 1)
+	assertField(t, "recipient", rows[0].Recipient, notifyOutsider)
+	assertMessageEventContract(t, rows[0], withheld.ID,
+		notificationevent.EventTypeReply, notificationevent.PriorityHigh)
+}
+
+func assertNoChannelMembership(t *testing.T, pool *pgxpool.Pool, channelID, userID string) {
+	t.Helper()
+	var member bool
+	if err := pool.QueryRow(t.Context(), `
+		SELECT EXISTS (
+			SELECT 1 FROM chat.channel_members WHERE channel_id = $1::uuid AND user_id = $2::uuid
+		)`, channelID, userID).Scan(&member); err != nil {
+		t.Fatalf("read channel membership: %v", err)
+	}
+	if member {
+		t.Fatal("this scenario needs a recipient with no explicit channel membership")
+	}
+}
+
+// directConversation is a one-to-one DM. A message withheld there has to release
+// its notification like any other; restricting the promotion to group
+// conversations would strand every one-to-one notification permanently.
+func directConversation() withheldTarget {
+	return withheldTarget{
+		conversationID: notifyDirectConv,
+		parentSender:   notifyPeer,
+		idempotencyKey: "notify-741-withheld-direct",
+	}
+}
+
+func TestNotificationOutboxPromotesDirectConversationPostgreSQL(t *testing.T) {
+	pool := seedNotificationFixture(t)
+	store := storage.NewPGXMessageStore(pool)
+	withheld := seedWithheldReply(t, pool, store, directConversation())
+
+	rows := promote(t, pool, store, withheld.ID)
+	// Two people are in a one-to-one conversation and one of them is the sender,
+	// so the single recipient is reached as the author of the answered message.
+	assertRowCount(t, rows, 1)
+	assertField(t, "recipient", rows[0].Recipient, notifyPeer)
+	assertMessageEventContract(t, rows[0], withheld.ID,
+		notificationevent.EventTypeReply, notificationevent.PriorityHigh)
+}
+
+// Leaving the conversation while the scan runs ends the notification. The
+// message is still published — it was never the message that was in question —
+// but nobody is told about activity they can no longer reach.
+func TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL(t *testing.T) {
+	pool := seedNotificationFixture(t)
+	store := storage.NewPGXMessageStore(pool)
+	withheld := seedWithheldReply(t, pool, store, groupConversation())
+
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE chat.dm_members SET status = 'left', left_at = now()
+		WHERE conversation_id = $1::uuid AND user_id = $2::uuid`,
+		notifyConversation, notifyThird); err != nil {
+		t.Fatalf("mark member as left: %v", err)
+	}
+
+	rows := promote(t, pool, store, withheld.ID)
+	assertRowCount(t, rows, 1)
+	assertField(t, "recipient", rows[0].Recipient, notifyPeer)
 }

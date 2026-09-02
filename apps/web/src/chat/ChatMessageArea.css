@@ -299,18 +299,20 @@
 }
 
 .chat-msg-area__msg-avatar {
-  width: 30px;
-  height: 30px;
+  width: 39px;
+  height: 39px;
   border-radius: 50%;
   background: linear-gradient(135deg, #7b43e8, #b485f4);
   color: #fff;
-  font-size: 10.5px;
+  font-size: 13.5px;
   font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  align-self: flex-end;
+  /* Anchors to the top of the name+content block (issue #495), not the
+     bottom — flex-end left it trailing below multi-line messages. */
+  align-self: flex-start;
   /* Anchors the presence dot (RF-58); the avatar's own box is unchanged. */
   position: relative;
 }
@@ -345,12 +347,6 @@
   flex-direction: row-reverse;
 }
 
-.chat-msg-area__msg-sender {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: var(--color-ink, #16121f);
-}
-
 .chat-msg-area__msg-sender-action {
   padding: 0;
   border: 0;
@@ -358,6 +354,16 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+/* Declared after -action so its font-size/font-weight win the cascade over
+   -action's `font: inherit` reset (same specificity, both classes coexist on
+   the group/channel sender button) — keeping it visually equal to the plain
+   DM sender span (issue #495 follow-up). */
+.chat-msg-area__msg-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
 }
 
 .chat-msg-area__msg-sender-action:hover,
@@ -2238,7 +2244,9 @@
 
 .mention-list,
 .mention-list__empty {
-  min-width: 220px;
+  box-sizing: border-box;
+  width: min(360px, calc(100vw - 16px));
+  min-width: min(220px, calc(100vw - 16px));
   max-height: 240px;
   overflow-y: auto;
   padding: 6px;
@@ -2251,6 +2259,15 @@
 .mention-list__empty {
   color: var(--color-muted, #7c7390);
   font-size: 13px;
+}
+
+.mention-list__heading {
+  padding: 6px 10px 3px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .mention-list__item {
@@ -2271,9 +2288,26 @@
   background: var(--color-surface-2, #faf8fd);
 }
 
+.mention-list__item:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: -2px;
+}
+
 .mention-list__sigil {
   color: var(--color-primary, #0e7490);
   font-weight: 700;
+}
+
+.mention-list__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-list__selected {
+  margin-left: auto;
+  font-size: 16px;
 }
 
 /* ── ComposerToolbar ─────────────────────────────────────────────────────────── */

@@ -43,6 +43,13 @@ const (
 	notifyOrphanDM = "74100000-0000-4000-8000-000000000009"
 	// Every workspace must carry exactly one active public general channel.
 	notifySecondGeneral = "74100000-0000-4000-8000-000000000010"
+	// An active workspace member who is NOT an explicit member of notifyChannel.
+	// A public channel is visible to them all the same, which is the whole point
+	// of chat.channel_visible_to_user being the authority.
+	notifyOutsider = "74100000-0000-4000-8000-000000000011"
+	// A one-to-one conversation, so the DM rules are exercised somewhere other
+	// than a group.
+	notifyDirectConv = "74100000-0000-4000-8000-000000000012"
 
 	notifyScannedURL  = "https://notify-741.example/article"
 	notifyFingerprint = "fp-notify-741"
@@ -62,10 +69,11 @@ func seedNotificationFixture(t *testing.T) *pgxpool.Pool {
 	}
 
 	exec(`INSERT INTO auth.users (id, email, display_name) VALUES
-		($1, 'notify-741-author@e.test', 'Author'),
-		($2, 'notify-741-peer@e.test',   'Peer'),
-		($3, 'notify-741-third@e.test',  'Third')
-		ON CONFLICT (id) DO NOTHING`, notifyAuthor, notifyPeer, notifyThird)
+		($1, 'notify-741-author@e.test',   'Author'),
+		($2, 'notify-741-peer@e.test',     'Peer'),
+		($3, 'notify-741-third@e.test',    'Third'),
+		($4, 'notify-741-outsider@e.test', 'Outsider')
+		ON CONFLICT (id) DO NOTHING`, notifyAuthor, notifyPeer, notifyThird, notifyOutsider)
 	// The workspace and its general channel are written together: the invariant
 	// that every workspace has one is enforced by a deferred constraint trigger,
 	// so a workspace committed on its own is refused.
@@ -79,29 +87,33 @@ func seedNotificationFixture(t *testing.T) *pgxpool.Pool {
 		VALUES ($2, $1, 'geral', 'Geral', 'public', true, 'active')
 		ON CONFLICT (id) DO NOTHING`, notifySecondWS, notifySecondGeneral)
 	exec(`INSERT INTO chat.workspace_members (workspace_id, user_id, status) VALUES
-		($1, $3, 'active'), ($1, $4, 'active'), ($1, $5, 'active'),
+		($1, $3, 'active'), ($1, $4, 'active'), ($1, $5, 'active'), ($1, $6, 'active'),
 		($2, $3, 'active'), ($2, $4, 'active')
-		ON CONFLICT DO NOTHING`, notifyWorkspace, notifySecondWS, notifyAuthor, notifyPeer, notifyThird)
+		ON CONFLICT DO NOTHING`, notifyWorkspace, notifySecondWS,
+		notifyAuthor, notifyPeer, notifyThird, notifyOutsider)
 	exec(`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
 		VALUES ($2, $1, 'notify-741', 'Notify 741', 'public', 'active')
 		ON CONFLICT (id) DO NOTHING`, notifyWorkspace, notifyChannel)
 	exec(`INSERT INTO chat.channel_members (channel_id, user_id) VALUES
 		($1, $2), ($1, $3), ($1, $4)
 		ON CONFLICT DO NOTHING`, notifyChannel, notifyAuthor, notifyPeer, notifyThird)
-	exec(`INSERT INTO chat.dm_conversations (id, workspace_id, type, status, created_by, title)
-		VALUES ($2, $1, 'group', 'active', $3, 'Notify 741'),
-		       ($5, $4, 'group', 'active', $3, 'Notify 741 elsewhere'),
-		       ($6, $1, 'group', 'active', $3, 'Notify 741 orphan')
+	exec(`INSERT INTO chat.dm_conversations
+			(id, workspace_id, type, status, created_by, title, direct_pair_key)
+		VALUES ($2, $1, 'group',  'active', $3, 'Notify 741', NULL),
+		       ($5, $4, 'group',  'active', $3, 'Notify 741 elsewhere', NULL),
+		       ($6, $1, 'group',  'active', $3, 'Notify 741 orphan', NULL),
+		       ($7, $1, 'direct', 'active', $3, NULL, 'notify-741-direct-pair')
 		ON CONFLICT (id) DO NOTHING`,
 		notifyWorkspace, notifyConversation, notifyAuthor,
-		notifySecondWS, notifySecondConv, notifyOrphanDM)
+		notifySecondWS, notifySecondConv, notifyOrphanDM, notifyDirectConv)
 	exec(`INSERT INTO chat.dm_members (conversation_id, user_id, status) VALUES
 		($1, $4, 'active'), ($1, $5, 'active'), ($1, $6, 'active'),
 		($2, $4, 'active'), ($2, $5, 'active'),
-		($3, $4, 'active'), ($3, $7, 'active')
+		($3, $4, 'active'), ($3, $7, 'active'),
+		($8, $4, 'active'), ($8, $5, 'active')
 		ON CONFLICT DO NOTHING`,
 		notifyConversation, notifySecondConv, notifyOrphanDM,
-		notifyAuthor, notifyPeer, notifyThird, notifyPhantom)
+		notifyAuthor, notifyPeer, notifyThird, notifyPhantom, notifyDirectConv)
 
 	t.Cleanup(func() { cleanupNotificationFixture(t, pool) })
 	return pool
@@ -117,13 +129,16 @@ func cleanupNotificationFixture(t *testing.T, pool *pgxpool.Pool) {
 	for _, statement := range []string{
 		`DELETE FROM chat.messages WHERE workspace_id = '` + notifyWorkspace + `'`,
 		`DELETE FROM chat.conversation_read_state WHERE workspace_id = '` + notifyWorkspace + `'`,
-		`DELETE FROM chat.dm_conversations WHERE id IN ('` + notifyConversation + `', '` + notifyOrphanDM + `')`,
+		`DELETE FROM chat.dm_conversations WHERE id IN ('` + notifyConversation + `', '` +
+			notifyOrphanDM + `', '` + notifyDirectConv + `')`,
 		`DELETE FROM chat.channels WHERE id = '` + notifyChannel + `'`,
 		`DELETE FROM chat.link_scans WHERE canonical_url = '` + notifyScannedURL + `'`,
 		`DELETE FROM chat.workspace_members WHERE workspace_id = '` + notifyWorkspace + `'
-		   AND user_id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` + notifyThird + `')`,
+		   AND user_id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` + notifyThird +
+			`', '` + notifyOutsider + `')`,
 		`DELETE FROM chat.workspaces WHERE id = '` + notifySecondWS + `'`,
-		`DELETE FROM auth.users WHERE id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` + notifyThird + `')`,
+		`DELETE FROM auth.users WHERE id IN ('` + notifyAuthor + `', '` + notifyPeer + `', '` +
+			notifyThird + `', '` + notifyOutsider + `')`,
 	} {
 		if _, err := pool.Exec(ctx, statement); err != nil {
 			t.Logf("cleanup: %v", err)

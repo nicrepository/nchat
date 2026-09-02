@@ -293,7 +293,7 @@ describe("ChatComposer mentions", () => {
     });
     render(
       <ChatComposer
-        channelId="22222222-2222-2222-2222-222222222222"
+        mentionTarget={{ kind: "channel", id: "22222222-2222-2222-2222-222222222222" }}
         bodyFormat="v3"
         placeholder="Mensagem..."
         onSend={onSend}
@@ -306,7 +306,7 @@ describe("ChatComposer mentions", () => {
     fireEvent.mouseDown(await screen.findByRole("option", { name: /Ana/ }));
 
     expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
-      "22222222-2222-2222-2222-222222222222",
+      { kind: "channel", id: "22222222-2222-2222-2222-222222222222" },
       "an",
       expect.any(AbortSignal),
     );
@@ -323,7 +323,7 @@ describe("ChatComposer mentions", () => {
     ]);
     render(
       <ChatComposer
-        channelId="22222222-2222-2222-2222-222222222222"
+        mentionTarget={{ kind: "channel", id: "22222222-2222-2222-2222-222222222222" }}
         bodyFormat="v3"
         placeholder="Mensagem..."
         onSend={vi.fn().mockResolvedValue({ status: "sent" })}
@@ -337,6 +337,80 @@ describe("ChatComposer mentions", () => {
     fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
 
     await waitFor(() => expect(screen.queryByRole("option", { name: /anuncios/ })).toBeNull());
+  });
+
+  it("opens on a bare @ and fetches the initial channel page", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "user-1", label: "Caio" },
+    ]);
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "channel", id: "channel-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    expect(await screen.findByRole("option", { name: /Caio/ })).toBeInTheDocument();
+    expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
+      { kind: "channel", id: "channel-1" },
+      "",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("enables the same v3 mention round-trip for a group", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      {
+        mentionType: "user",
+        id: "33333333-3333-3333-3333-333333333333",
+        label: "Juliane Lino",
+      },
+    ]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@ju", { skipClick: true });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /Juliane Lino/ }));
+
+    const stored = await send(onSend);
+    expect(stored).toContain("@[Juliane Lino](mention:user:33333333-3333-3333-3333-333333333333)");
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v3" />);
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@Juliane Lino");
+  });
+
+  it("keeps direct DMs on v2 without mention autocomplete", async () => {
+    mockFetchMentionCandidates.mockClear();
+    render(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={vi.fn().mockResolvedValue({ status: "sent" })}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    expect(screen.queryByRole("listbox", { name: "Sugestões de menção" })).toBeNull();
+    expect(mockFetchMentionCandidates).not.toHaveBeenCalled();
   });
 });
 

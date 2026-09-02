@@ -113,6 +113,8 @@ type fakeMessageStore struct {
 	listDMCalls            int
 	resolveMentionCalls    int
 	resolveAuthorizedCalls int
+	authorizedChannelID    string
+	authorizedDMID         string
 }
 
 // LookupForwardReplay defaults to "no earlier forward", so every test that does
@@ -573,8 +575,10 @@ func (f *fakeMessageStore) ResolveMentionLabels(_ context.Context, _ string, _, 
 	return f.mentionLabels, f.resolveMentionErr
 }
 
-func (f *fakeMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, _, _ string, _, _ []string) (map[string]string, error) {
+func (f *fakeMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, channelID, dmID, _ string, _, _ []string) (map[string]string, error) {
 	f.resolveAuthorizedCalls++
+	f.authorizedChannelID = channelID
+	f.authorizedDMID = dmID
 	if f.authorizedMentionLabels == nil {
 		return f.mentionLabels, f.resolveAuthorizedErr
 	}
@@ -828,6 +832,21 @@ func TestMessageService_CreateChannelMessage_DoesNotInterpretMentionSyntaxBefore
 	}
 }
 
+func TestMessageService_CreateChannelMessage_PreservesAllMention(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-all"}}
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if err != nil || msgs.lastCreateInput.BodyText != body || msgs.resolveAuthorizedCalls != 0 {
+		t.Fatalf("body=%q resolveCalls=%d err=%v", msgs.lastCreateInput.BodyText, msgs.resolveAuthorizedCalls, err)
+	}
+}
+
 func TestMessageService_CreateChannelMessage_DefaultsMissingBodyFormatToV1(t *testing.T) {
 	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
 	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-legacy"}}
@@ -1024,6 +1043,111 @@ func TestMessageService_CreateDMMessage_ActiveParticipantSucceeds(t *testing.T) 
 	}
 	if in.DMConversationID != "dm-1" {
 		t.Fatalf("DMConversationID must be set, got %q", in.DMConversationID)
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupCanonicalizesAuthorizedMention(t *testing.T) {
+	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{
+		createdMessage:          domain.Message{ID: "msg-group", DMConversationID: "group-1"},
+		authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Juliane Lino"},
+	}
+	body := `@[Spoofed](mention:user:` + mentionedUserID + `)`
+
+	_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs).
+		CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+			WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+			BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if err != nil {
+		t.Fatalf("CreateDMMessage: %v", err)
+	}
+	if msgs.authorizedChannelID != "" || msgs.authorizedDMID != "group-1" {
+		t.Fatalf("authorization target channel=%q dm=%q", msgs.authorizedChannelID, msgs.authorizedDMID)
+	}
+	if got := msgs.lastCreateInput.MentionedUserIDs; len(got) != 1 || got[0] != mentionedUserID {
+		t.Fatalf("mentioned users: %#v", got)
+	}
+	wantBody := `@[Juliane Lino](mention:user:` + mentionedUserID + `)`
+	if msgs.lastCreateInput.BodyText != wantBody {
+		t.Fatalf("body=%q want=%q", msgs.lastCreateInput.BodyText, wantBody)
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupRejectsForgedAndRevokedMentions(t *testing.T) {
+	const mentionedUserID = "99999999-9999-9999-9999-999999999999"
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	body := `@[Outsider](mention:user:` + mentionedUserID + `)`
+
+	t.Run("forged outsider", func(t *testing.T) {
+		msgs := &fakeMessageStore{authorizedMentionLabels: map[string]string{}}
+		_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs).
+			CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+				WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+				BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+			})
+		if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+			t.Fatalf("expected preflight rejection, err=%v createCalls=%d", err, msgs.createCalls)
+		}
+	})
+
+	t.Run("removed after autocomplete", func(t *testing.T) {
+		msgs := &fakeMessageStore{
+			authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Former Member"},
+			createErr:               domain.ErrNotFound,
+		}
+		_, err := service.NewMessageService(&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs).
+			CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+				WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+				BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+			})
+		if !errors.Is(err, domain.ErrNotFound) || msgs.createCalls != 1 {
+			t.Fatalf("expected atomic rejection, err=%v createCalls=%d", err, msgs.createCalls)
+		}
+	})
+}
+
+func TestMessageService_CreateDMMessage_DirectRejectsManualV3Mention(t *testing.T) {
+	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
+	msgs := &fakeMessageStore{
+		authorizedMentionLabels: map[string]string{"user:" + mentionedUserID: "Other Person"},
+	}
+	_, err := service.NewMessageService(
+		&fakeChannelStore{},
+		&fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")},
+		msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "dm-1", SenderID: user1,
+		BodyText:   `@[Other Person](mention:user:` + mentionedUserID + `)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("expected direct mention rejection, err=%v createCalls=%d", err, msgs.createCalls)
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupRejectsAllMention(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{}
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   `@[all](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("expected group @all rejection, err=%v createCalls=%d", err, msgs.createCalls)
 	}
 }
 
