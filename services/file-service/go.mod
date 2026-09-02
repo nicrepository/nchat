@@ -12,7 +12,7 @@ require (
 	github.com/tetratelabs/wazero v1.12.0
 	github.com/valkey-io/valkey-go v1.0.75
 	github.com/xuri/excelize/v2 v2.11.0
-	golang.org/x/net v0.57.0
+	golang.org/x/net v0.58.0
 )
 
 require (
