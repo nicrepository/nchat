@@ -347,12 +347,6 @@
   flex-direction: row-reverse;
 }
 
-.chat-msg-area__msg-sender {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: var(--color-ink, #16121f);
-}
-
 .chat-msg-area__msg-sender-action {
   padding: 0;
   border: 0;
@@ -360,6 +354,16 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+/* Declared after -action so its font-size/font-weight win the cascade over
+   -action's `font: inherit` reset (same specificity, both classes coexist on
+   the group/channel sender button) — keeping it visually equal to the plain
+   DM sender span (issue #495 follow-up). */
+.chat-msg-area__msg-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
 }
 
 .chat-msg-area__msg-sender-action:hover,
