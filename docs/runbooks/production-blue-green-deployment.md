@@ -1288,6 +1288,209 @@ A non-empty diff is a failure of the whole separation, not a detail: it means
 something outside the protected job moved traffic. Stop and treat it as an
 incident before dispatching another release.
 
+### The runner refuses everything else — the pre-job guard
+
+`runs-on: [self-hosted, linux, x64, nchat-prod-deploy]` is routing. The label is
+public, this repository is public, and any workflow committed to any branch can
+ask for it. A job that reaches its first step on that runner is already running
+as `nchat-prod-runner`, the one identity on `srv-apps-01` that can read the
+least-privilege production kubeconfig. The workflow's own `refs/heads/main`
+check lives in a file that same author could edit, so it is defence in depth,
+not the boundary.
+
+The boundary is host-side and outside the repository's reach:
+`scripts/deploy/nchat-prod/runner-job-guard.sh`, installed as a root-owned copy
+and wired to `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner executes it before
+the first step of every job it accepts, and a non-zero exit ends the job there.
+
+It authorises one context, by exact comparison, and refuses everything else —
+including a variable the runner did not set:
+
+| Variable              | Only accepted value                                                           |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `GITHUB_REPOSITORY`   | `nicrepository/nchat`                                                         |
+| `GITHUB_WORKFLOW_REF` | `nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main` |
+| `GITHUB_REF`          | `refs/heads/main`                                                             |
+| `GITHUB_EVENT_NAME`   | `workflow_dispatch`                                                           |
+
+So a pull request, a dispatch from `develop`, another workflow file, another
+event, a fork, and an empty environment are all the same outcome: no step runs.
+The refusal names the variable that disagreed and never its value, because the
+value is a string an untrusted workflow chose and the line is read out of a
+system log.
+
+**The copy must not live where the runner can write.** The checkout, `_work`
+and `/home/nchat-prod-runner` are all rewritable by the job the guard exists to
+judge; pointing the hook at any of them would let a job disable its own gate.
+
+#### Installing it
+
+Run on `srv-apps-01`, from a checkout of the reviewed commit, after merge.
+
+```bash
+# 1. a root-owned directory outside anything the runner can write
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/nchat-prod
+
+# 2. the guard itself, read-and-execute only
+sudo install -o root -g root -m 0555 \
+  scripts/deploy/nchat-prod/runner-job-guard.sh \
+  /usr/local/libexec/nchat-prod/runner-job-guard.sh
+
+# 3. the installation gates. Every one of them refuses by exiting non-zero,
+#    and PASS is printed only after the condition has actually been proved.
+sudo bash <<'VERIFY'
+set -euo pipefail
+SOURCE=scripts/deploy/nchat-prod/runner-job-guard.sh
+GUARD_DIR=/usr/local/libexec/nchat-prod
+GUARD="$GUARD_DIR/runner-job-guard.sh"
+
+fail() {
+  echo "FAIL: $1" >&2
+  exit 1
+}
+
+# byte for byte the reviewed file, not merely two hashes printed side by side
+cmp --silent "$SOURCE" "$GUARD" ||
+  fail 'the installed guard differs from the reviewed guard'
+
+# a real file, owned by root, in a directory owned by root
+[ -f "$GUARD" ] && [ ! -L "$GUARD" ] || fail 'the installed guard is not a regular file'
+[ "$(stat -c '%U:%G' "$GUARD")" = root:root ] || fail 'the installed guard is not root:root'
+[ "$(stat -c '%U:%G' "$GUARD_DIR")" = root:root ] || fail "$GUARD_DIR is not root:root"
+
+# Asked as the runner itself, because that is the identity that must be
+# refused, and asked as the positive question `test ! -w`: not writable is the
+# only answer that returns 0, so a writable path and a runuser that could not
+# answer at all -- unknown user, no privilege, no runuser -- are both failures.
+runuser -u nchat-prod-runner -- test '!' -w "$GUARD" ||
+  fail 'could not prove that nchat-prod-runner cannot rewrite its own guard'
+runuser -u nchat-prod-runner -- test '!' -w "$GUARD_DIR" ||
+  fail 'could not prove that nchat-prod-runner cannot replace its own guard'
+
+echo "PASS: $GUARD is the reviewed file, root-owned, and not writable by nchat-prod-runner"
+VERIFY
+
+# 4. its own drop-in. 10-kubernetes.conf is not touched.
+sudo tee /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf >/dev/null <<'CONF'
+[Service]
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/libexec/nchat-prod/runner-job-guard.sh
+CONF
+sudo chmod 0644 /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf
+
+# 5. reload, and restart only the production runner
+sudo systemctl daemon-reload
+sudo systemctl restart actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+
+# 6. the service gates, on the exact unit and nothing else. Non-zero on any
+#    failure, and no value is printed -- only the name it was matched against.
+sudo bash <<'VERIFY'
+set -euo pipefail
+GUARD=/usr/local/libexec/nchat-prod/runner-job-guard.sh
+UNIT=actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+UNIT_DIR="/etc/systemd/system/$UNIT.d"
+
+fail() {
+  echo "FAIL: $1" >&2
+  exit 1
+}
+
+grep -qxF "Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=$GUARD" "$UNIT_DIR/20-job-guard.conf" ||
+  fail '20-job-guard.conf does not point the hook at the installed guard'
+[ -f "$UNIT_DIR/10-kubernetes.conf" ] || fail '10-kubernetes.conf is no longer there'
+systemctl is-active --quiet "$UNIT" || fail "$UNIT is not active"
+systemctl show -p Environment --value "$UNIT" | tr ' ' '\n' |
+  grep -qxF "ACTIONS_RUNNER_HOOK_JOB_STARTED=$GUARD" ||
+  fail "$UNIT is not carrying the hook"
+
+echo "PASS: $UNIT is active and runs the guard before every job"
+VERIFY
+```
+
+Always the full unit name, never a wildcard: `srv-apps-01` also runs the
+nchat-dev, GitLab and other runners, and none of them is in scope here. Nothing
+above reads or prints the kubeconfig, and no other unit's drop-ins, permissions
+or Kubernetes RBAC are modified.
+
+#### Proving it refuses — negative evidence
+
+`deploy-nchat-prod.yml` already exists on `develop` and is `workflow_dispatch`,
+so the refusal can be observed without inventing a workflow for it.
+
+Dispatch **Deploy nchat-prod** from the `develop` ref with syntactically valid
+inputs — a real 40-hex SHA on `main` and a real "Build and push images" run id —
+so that nothing but the guard can be what refused it.
+
+PASS requires all three:
+
+- the `candidate` job ends failed with **no step executed** — the run page
+  shows the job's steps never started, so "Validate the release request" did not
+  run and nothing was checked out;
+- the host log carries the refusal and names only the variable:
+
+  ```bash
+  sudo journalctl -u actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service \
+    --since '-15 min' | grep 'runner job guard'
+  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not the authorised production deploy context.
+  ```
+
+- `make prod-blue-green-status` is unchanged.
+
+A run that reached its first step and was stopped by the workflow's own
+`refs/heads/main` check is a **fail** of this procedure, not a pass: the hook is
+the gate being evidenced, and that check is the layer behind it.
+
+#### Proving it allows — positive evidence
+
+Before the guard's commit reaches `main`, the offline suite is the evidence:
+
+```bash
+make prod-runner-guard-test
+```
+
+It drives the guard through the authorised context and thirty-odd refusals —
+absent, empty, look-alike, and metacharacter-carrying values among them — and
+runs in `pnpm run ci`.
+
+Once this commit is on `main`, the first legitimate dispatch from `main` is the
+live positive: the `candidate` job starts its steps normally. The guard has no
+opinion beyond that point; the release SHA, the sealed manifest, the candidate
+and the approved cutover remain the gates described above.
+
+#### Rollback
+
+```bash
+# Keep the evidence first, if a refusal is what is being investigated. An
+# empty file is a legitimate answer -- there may have been no refusal -- so
+# only grep's "no match" (exit 1) is accepted; a journalctl that could not
+# read the log, a grep error, or a tee that could not write all fail the
+# collection instead of leaving an empty file that looks like evidence.
+sudo bash <<'EVIDENCE'
+set -uo pipefail
+EVIDENCE_FILE=/secure/path/job-guard-denials.txt
+UNIT=actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+
+journalctl -u "$UNIT" --since '-1 day' |
+  { grep 'runner job guard' || [ "$?" -eq 1 ]; } |
+  tee "$EVIDENCE_FILE" >/dev/null || {
+  echo 'FAIL: the denial evidence could not be collected' >&2
+  exit 1
+}
+
+echo "PASS: refusals up to now are in $EVIDENCE_FILE (empty if there were none)"
+EVIDENCE
+
+sudo rm -f /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf
+sudo systemctl daemon-reload
+sudo systemctl restart actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+```
+
+That is the whole rollback: one file, one unit. `10-kubernetes.conf`, the
+kubeconfig, the `nchat-prod-deployer` RBAC and every other runner are untouched
+by both directions, and the guard reads four environment variables and writes
+nothing — there is no state, no cluster object and no data it can leave behind.
+Removing it restores exactly the exposure this section exists to close, so treat
+a rollback as an open security finding, not a fix.
+
 ---
 
 ## 12. Mixed state
