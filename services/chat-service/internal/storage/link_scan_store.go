@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
@@ -740,7 +741,7 @@ func (s *PGXMessageStore) recordMaliciousLinkVerdict(
 // promotion exactly-once. Two replicas may both evaluate the rule; only one
 // UPDATE finds the row still pending, and only that one gets a RETURNING row to
 // publish from. The other publishes nothing.
-const resolvePendingMessagesQuery = `
+var resolvePendingMessagesQuery = `
 	WITH candidate AS (
 		SELECT m.id,
 		       m.link_safety_fingerprint AS fingerprint,
@@ -796,7 +797,7 @@ const resolvePendingMessagesQuery = `
 		   AND m.status = 'pending_link_scan'
 		   AND COALESCE(m.link_safety_fingerprint, '') = COALESCE(candidate.fingerprint, '')
 		   AND (candidate.blocked OR candidate.all_terminal)
-		RETURNING m.id, m.workspace_id, m.sender_id,
+		RETURNING m.id, m.workspace_id, m.sender_id, m.created_at,
 		          NOT candidate.blocked AS published,
 		          candidate.has_inconclusive,
 		          COALESCE(m.channel_id::text, '') AS channel_id,
@@ -832,23 +833,39 @@ const resolvePendingMessagesQuery = `
 		RETURNING message_id
 	),
 	notified AS (
-		-- RF-21 delays mention notifications rather than dropping them: a withheld
+		-- RF-21 delays notifications rather than dropping them: a withheld
 		-- message must produce no side effect aimed at anyone else, so its
-		-- mentions were parked at creation and are released here, in the same
+		-- recipients were parked at creation and are released here, in the same
 		-- transaction that makes the message publishable. A blocked message never
 		-- reaches this step.
 		--
 		-- An inconclusive message does, and that is deliberate: it was published,
-		-- so its mentions are as real as any other message's. A notification names
-		-- a message, it does not fetch a URL, so nothing downstream of here gains
-		-- an authority the message itself does not have.
+		-- so its notifications are as real as any other message's. A notification
+		-- names a message, it does not fetch a URL, so nothing downstream of here
+		-- gains an authority the message itself does not have.
+		--
+		-- The parked row carries the classification it was created with (issue
+		-- #741), so a message that reached somebody as a reply is released as a
+		-- reply rather than relabelled a mention on its way out.
+		--
+		-- occurred_at is the message's own created_at, not the promotion's: the
+		-- event is the message being sent, and a scan that took a minute must not
+		-- make it look like it happened a minute later.
+		--
+		-- ON CONFLICT names no arbiter, for the same reason CreateMessage's does
+		-- not: two unique indexes express the same grain during the expand window
+		-- migration 000042 opens, and naming one would turn a conflict on the other
+		-- into an error instead of the replay it is.
 		INSERT INTO chat.notification_outbox
-			(workspace_id, message_id, recipient_user_id, kind, status)
-		SELECT promoted.workspace_id, promoted.id, mention.user_id, 'mention', 'pending'
+			(workspace_id, message_id, recipient_user_id, kind, status,
+			 source_type, occurred_at, priority, origin, dedupe_key)
+		SELECT promoted.workspace_id, promoted.id, mention.user_id, mention.kind, 'pending',
+		       'message', promoted.created_at, mention.priority, 'live',
+		       ` + notificationevent.MessageDedupeKeySQL("promoted.id", "mention.kind") + `
 		FROM promoted
 		JOIN chat.message_pending_mentions mention ON mention.message_id = promoted.id
 		WHERE promoted.published
-		ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
+		ON CONFLICT DO NOTHING
 		RETURNING message_id
 	)
 	SELECT id::text, published, has_inconclusive FROM promoted`
