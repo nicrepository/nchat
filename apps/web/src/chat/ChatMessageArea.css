@@ -299,18 +299,20 @@
 }
 
 .chat-msg-area__msg-avatar {
-  width: 30px;
-  height: 30px;
+  width: 39px;
+  height: 39px;
   border-radius: 50%;
   background: linear-gradient(135deg, #7b43e8, #b485f4);
   color: #fff;
-  font-size: 10.5px;
+  font-size: 13.5px;
   font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  align-self: flex-end;
+  /* Anchors to the top of the name+content block (issue #495), not the
+     bottom — flex-end left it trailing below multi-line messages. */
+  align-self: flex-start;
   /* Anchors the presence dot (RF-58); the avatar's own box is unchanged. */
   position: relative;
 }
