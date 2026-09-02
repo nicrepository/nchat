@@ -162,7 +162,7 @@ function makeSession(overrides: Partial<MockSession> & { id: string }): MockSess
   };
 }
 
-/** GET/DELETE /api/auth/me/sessions[/:id], per sessionsApi.ts's contract. */
+/** GET/DELETE /api/auth/me/sessions[/:id], including the standard HTTP envelope. */
 async function mockSessionsApi(page: Page, initial: MockSession[]) {
   let sessions = [...initial];
 
@@ -172,7 +172,9 @@ async function mockSessionsApi(page: Page, initial: MockSession[]) {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ data: sessions, pagination: { limit: 50 } }),
+        body: JSON.stringify({
+          data: { data: sessions, pagination: { limit: 50, next_cursor: null } },
+        }),
       });
       return;
     }
@@ -401,6 +403,64 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(page.getByTestId("session-row")).toHaveCount(1);
     await expect(page.getByText("Sessão atual")).toBeVisible();
     await expect(page.getByRole("button", { name: "Revogar todas as outras" })).toHaveCount(0);
+  });
+
+  test("sessions: renders the retry response after refreshing an expired access token", async ({
+    page,
+  }) => {
+    const sequence: string[] = [];
+    const currentSession = makeSession({
+      id: "session-current",
+      current: true,
+      user_agent: "Firefox after refresh",
+    });
+
+    await page.route("**/api/auth/refresh", async (route) => {
+      if (!sequence.includes("refresh 200")) sequence.push("refresh 200");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          access_token: "refreshed-e2e-at",
+          token_type: "Bearer",
+          expires_in: 900,
+        }),
+      });
+    });
+    await page.route("**/api/auth/me/sessions", async (route) => {
+      const authorization = route.request().headers().authorization;
+      if (authorization !== "Bearer refreshed-e2e-at") {
+        expect(authorization).toBe("Bearer e2e-at");
+        if (!sequence.includes("sessions 401")) sequence.push("sessions 401");
+        await route.fulfill({
+          status: 401,
+          contentType: "application/json",
+          body: JSON.stringify({
+            error: { code: "token_expired", message: "Token expired" },
+          }),
+        });
+        return;
+      }
+
+      if (!sequence.includes("sessions 200")) sequence.push("sessions 200");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            data: [currentSession],
+            pagination: { limit: 50, next_cursor: null },
+          },
+        }),
+      });
+    });
+
+    await page.goto("/profile/sessions");
+
+    await expect(sessionRow(page, "Firefox after refresh")).toBeVisible();
+    await expect(page.getByText("Sessão atual")).toBeVisible();
+    await expect(page.getByText("Não foi possível carregar suas sessões.")).toHaveCount(0);
+    expect(sequence).toEqual(["sessions 401", "refresh 200", "sessions 200"]);
   });
 
   test("a session removed concurrently converges after an idempotent 404 revoke", async ({

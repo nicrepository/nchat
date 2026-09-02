@@ -8,21 +8,29 @@
  * page's boundary.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import "./SessionsSettingsPage.css";
+import { getSessionGeneration, onAuthChange } from "../lib/authSession";
 import { listSessions, revokeAllOtherSessions, revokeSession, type Session } from "./sessionsApi";
 import RevokeSessionDialog from "./RevokeSessionDialog";
 import SessionRow from "./SessionRow";
 
 type LoadState =
-  | { status: "loading" }
-  | { status: "error" }
-  | { status: "ready"; sessions: Session[] };
-type ConfirmState = { target: "single"; sessionId: string } | { target: "others" } | null;
+  | { status: "loading"; generation: number }
+  | { status: "error"; generation: number }
+  | { status: "ready"; generation: number; sessions: Session[] };
+type ConfirmState =
+  | { target: "single"; sessionId: string; generation: number }
+  | { target: "others"; generation: number }
+  | null;
 
 export default function SessionsSettingsPage() {
-  const [state, setState] = useState<LoadState>({ status: "loading" });
+  const sessionGeneration = useSyncExternalStore(onAuthChange, getSessionGeneration);
+  const [state, setState] = useState<LoadState>({
+    status: "loading",
+    generation: sessionGeneration,
+  });
   const [confirm, setConfirm] = useState<ConfirmState>(null);
   const mountedRef = useRef(true);
   const loadControllerRef = useRef<AbortController | null>(null);
@@ -35,19 +43,30 @@ export default function SessionsSettingsPage() {
   }, []);
 
   const load = useCallback(() => {
+    const generation = sessionGeneration;
     loadControllerRef.current?.abort();
     const controller = new AbortController();
     loadControllerRef.current = controller;
     listSessions(controller.signal)
       .then((sessions) => {
-        if (controller.signal.aborted || !mountedRef.current) return;
-        setState({ status: "ready", sessions });
+        if (
+          controller.signal.aborted ||
+          !mountedRef.current ||
+          getSessionGeneration() !== generation
+        )
+          return;
+        setState({ status: "ready", generation, sessions });
       })
       .catch(() => {
-        if (controller.signal.aborted || !mountedRef.current) return;
-        setState({ status: "error" });
+        if (
+          controller.signal.aborted ||
+          !mountedRef.current ||
+          getSessionGeneration() !== generation
+        )
+          return;
+        setState({ status: "error", generation });
       });
-  }, []);
+  }, [sessionGeneration]);
 
   useEffect(() => {
     load();
@@ -55,24 +74,30 @@ export default function SessionsSettingsPage() {
   }, [load]);
 
   function retry() {
-    setState({ status: "loading" });
+    setState({ status: "loading", generation: sessionGeneration });
     load();
   }
 
   async function handleConfirm() {
-    if (!confirm) return;
+    if (!confirm || confirm.generation !== getSessionGeneration()) return;
+    const generation = confirm.generation;
     if (confirm.target === "single") {
       await revokeSession(confirm.sessionId);
     } else {
       await revokeAllOtherSessions();
     }
-    if (mountedRef.current) {
-      setState({ status: "loading" });
+    if (mountedRef.current && getSessionGeneration() === generation) {
+      setState({ status: "loading", generation });
       load();
     }
   }
 
-  if (state.status === "loading") {
+  const visibleState: LoadState =
+    state.generation === sessionGeneration
+      ? state
+      : { status: "loading", generation: sessionGeneration };
+
+  if (visibleState.status === "loading") {
     return (
       <div className="sessions-settings" role="status" aria-label="Carregando sessões">
         <span className="sessions-settings__loading" />
@@ -80,7 +105,7 @@ export default function SessionsSettingsPage() {
     );
   }
 
-  if (state.status === "error") {
+  if (visibleState.status === "error") {
     return (
       <div className="sessions-settings sessions-settings__error">
         <p>Não foi possível carregar suas sessões.</p>
@@ -91,8 +116,9 @@ export default function SessionsSettingsPage() {
     );
   }
 
-  const { sessions } = state;
+  const { sessions } = visibleState;
   const hasOtherSessions = sessions.some((s) => !s.current);
+  const visibleConfirm = confirm?.generation === sessionGeneration ? confirm : null;
 
   return (
     <div className="sessions-settings">
@@ -102,7 +128,7 @@ export default function SessionsSettingsPage() {
           <button
             type="button"
             className="sessions-settings__revoke-all"
-            onClick={() => setConfirm({ target: "others" })}
+            onClick={() => setConfirm({ target: "others", generation: getSessionGeneration() })}
           >
             Revogar todas as outras
           </button>
@@ -117,13 +143,15 @@ export default function SessionsSettingsPage() {
           <SessionRow
             key={session.id}
             session={session}
-            onRevoke={(id) => setConfirm({ target: "single", sessionId: id })}
+            onRevoke={(id) =>
+              setConfirm({ target: "single", sessionId: id, generation: getSessionGeneration() })
+            }
           />
         ))}
       </ul>
-      {confirm && (
+      {visibleConfirm && (
         <RevokeSessionDialog
-          target={confirm.target}
+          target={visibleConfirm.target}
           onClose={() => setConfirm(null)}
           onConfirm={handleConfirm}
         />

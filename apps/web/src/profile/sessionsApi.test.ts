@@ -12,32 +12,33 @@ import {
 vi.mock("../lib/authClient");
 
 describe("sessionsApi", () => {
-  it("listSessions maps the envelope into Session[]", async () => {
+  it("listSessions maps the real HTTP envelope into Session[]", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-      data: [
-        {
-          id: "s1",
-          device_id: null,
-          created_at: "2026-08-01T00:00:00Z",
-          last_seen_at: "2026-08-27T00:00:00Z",
-          idle_expires_at: "2026-08-27T01:00:00Z",
-          absolute_expires_at: null,
-          revoked_at: null,
-          ip_address: "187.10.x.x",
-          user_agent: "Mozilla/5.0 (X11; Linux x86_64) Firefox",
-          current: true,
-        },
-      ],
-      pagination: { limit: 50 },
+      data: {
+        data: [
+          {
+            id: "session-current",
+            device_id: null,
+            created_at: "2026-08-31T11:53:47Z",
+            last_seen_at: "2026-08-31T17:08:49Z",
+            idle_expires_at: "2026-09-01T05:08:49Z",
+            absolute_expires_at: "2026-09-30T11:53:47Z",
+            revoked_at: null,
+            user_agent: "test-agent",
+            current: true,
+          },
+        ],
+        pagination: { limit: 50, next_cursor: null },
+      },
     });
     const sessions = await listSessions();
     expect(sessions).toEqual([
       {
-        id: "s1",
-        createdAt: "2026-08-01T00:00:00Z",
-        lastSeenAt: "2026-08-27T00:00:00Z",
-        ipAddress: "187.10.x.x",
-        userAgent: "Mozilla/5.0 (X11; Linux x86_64) Firefox",
+        id: "session-current",
+        createdAt: "2026-08-31T11:53:47Z",
+        lastSeenAt: "2026-08-31T17:08:49Z",
+        ipAddress: "",
+        userAgent: "test-agent",
         current: true,
         revokedAt: undefined,
       },
@@ -50,19 +51,21 @@ describe("sessionsApi", () => {
 
   it("listSessions falls back to empty strings when ip_address/user_agent are absent", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-      data: [
-        {
-          id: "s2",
-          device_id: null,
-          created_at: "2026-08-01T00:00:00Z",
-          last_seen_at: "2026-08-27T00:00:00Z",
-          idle_expires_at: "2026-08-27T01:00:00Z",
-          absolute_expires_at: null,
-          revoked_at: "2026-08-20T00:00:00Z",
-          current: false,
-        },
-      ],
-      pagination: { limit: 50 },
+      data: {
+        data: [
+          {
+            id: "s2",
+            device_id: null,
+            created_at: "2026-08-01T00:00:00Z",
+            last_seen_at: "2026-08-27T00:00:00Z",
+            idle_expires_at: "2026-08-27T01:00:00Z",
+            absolute_expires_at: null,
+            revoked_at: "2026-08-20T00:00:00Z",
+            current: false,
+          },
+        ],
+        pagination: { limit: 50, next_cursor: null },
+      },
     });
     const sessions = await listSessions();
     expect(sessions).toEqual([
