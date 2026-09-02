@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
-import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
 import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
@@ -43,7 +43,7 @@ export interface MessageBubbleProps {
   onEditForbidden: (messageId: string) => void;
   onDeleteMessage: (messageId: string) => Promise<void>;
   editDisabled?: boolean;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   /** The conversation on screen; presence is resolved within it (RF-58). */
   presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -267,7 +267,7 @@ function MessageBubbleBody({
       <div ref={bubbleRef} className={messageBodyClassName(message)}>
         <MessageContent
           message={message}
-          channelId={props.channelId}
+          mentionTarget={props.mentionTarget}
           editing={editing.editing}
           onSaveEdit={editing.saveEdit}
           onCancelEdit={editing.cancelEdit}

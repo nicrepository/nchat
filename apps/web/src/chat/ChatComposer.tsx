@@ -35,7 +35,7 @@ import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
 import type { CodecFormat } from "./tiptapSerializer";
-import type { Message, MessageBodyFormat } from "./chatTypes";
+import type { MentionTarget, Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
@@ -76,7 +76,7 @@ function uploadPercent({ loaded, total }: UploadProgress): number {
 
 export interface ChatComposerProps {
   placeholder: string;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   bodyFormat: CodecFormat;
   disabled?: boolean;
   replyPreview?: ComposerReplyPreview | null;
@@ -726,7 +726,7 @@ function voiceOptions(
 
 export default function ChatComposer({
   placeholder,
-  channelId,
+  mentionTarget,
   bodyFormat,
   disabled,
   replyPreview,
@@ -808,7 +808,7 @@ export default function ChatComposer({
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder,
     disabled,
-    channelId,
+    mentionTarget,
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.

@@ -221,6 +221,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("GET "+RouteChannelMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchMentions)),
 	))
+	mux.Handle("GET "+RouteDMMentions, authMiddleware(
+		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchDMMentions)),
+	))
 	// Channel creation (RF-01). Registered only when wired, exactly like the DM
 	// routes, so a build without the handler answers 404 rather than a misleading
 	// 503 on a route that does not exist.

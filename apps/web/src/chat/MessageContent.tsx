@@ -11,7 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { linkSafetyAllowsAnchors } from "./chatTypes";
-import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import InlineMessageEditor from "./InlineMessageEditor";
 import MessageAttachments from "./MessageAttachments";
 import RichTextRenderer from "./RichTextRenderer";
@@ -374,14 +374,14 @@ function MessageContextBlocks({
  */
 function MessageBodyContent({
   message,
-  channelId,
+  mentionTarget,
   editing,
   onSaveEdit,
   onCancelEdit,
   onEditForbidden,
 }: Pick<
   MessageContentProps,
-  "message" | "channelId" | "editing" | "onSaveEdit" | "onCancelEdit" | "onEditForbidden"
+  "message" | "mentionTarget" | "editing" | "onSaveEdit" | "onCancelEdit" | "onEditForbidden"
 >) {
   if (message.isRemoved) return "Mensagem removida.";
   if (message.linkSafetyState === "malicious") {
@@ -391,7 +391,7 @@ function MessageBodyContent({
     return (
       <InlineMessageEditor
         message={message}
-        channelId={channelId}
+        mentionTarget={mentionTarget}
         onSave={onSaveEdit}
         onCancel={onCancelEdit}
         onForbidden={onEditForbidden}
@@ -419,7 +419,7 @@ function MessageBodyContent({
 
 export interface MessageContentProps {
   message: Message;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   editing: boolean;
   onSaveEdit: (body: string, format: CodecFormat) => Promise<Message>;
   onCancelEdit: () => void;

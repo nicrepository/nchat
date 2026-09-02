@@ -141,7 +141,7 @@ func (s *integMessageStore) ResolveMentionLabels(_ context.Context, _ string, _,
 	return map[string]string{}, nil
 }
 
-func (s *integMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, _, _ string, _, _ []string) (map[string]string, error) {
+func (s *integMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, _, _, _ string, _, _ []string) (map[string]string, error) {
 	return map[string]string{}, nil
 }
 
