@@ -1,0 +1,139 @@
+name: Build nchat images
+
+# CICD-05: the single builder for every nchat image, dev and production alike.
+#
+# It is called with the commit to build, never with a branch: the caller names a
+# full SHA, this workflow proves it, checks it out by that SHA and pushes the
+# eleven images once. What identifies the result is the OCI digest of each
+# image; the `:<sha>` tag is an auxiliary convenience and never an identity.
+#
+# `require_main` is what separates a production build from a development one.
+# When it is set the requested commit must be provably reachable from main
+# before anything is built, so a dispatch cannot promote an arbitrary SHA.
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Full 40-character lowercase commit SHA to build.
+        required: true
+        type: string
+      require_main:
+        description: Prove the SHA is reachable from main before building.
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      sha:
+        description: The commit the eleven images were actually built from.
+        # Emitted by the job that proved it, so a caller can only ever name the
+        # commit this run validated and checked out.
+        value: ${{ jobs.inventory.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Reads the canonical inventory and, for a production build, refuses a commit
+  # that main cannot reach. Nothing is pushed from here, so it holds no registry
+  # permission: the gate runs before the job that does.
+  inventory:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.images.outputs.images }}
+      sha: ${{ inputs.sha }}
+    steps:
+      - name: Validate release SHA
+        env:
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      # Full history only when the ancestry of main has to be walked. The string
+      # forms are deliberate: `0` is falsy to the expression evaluator.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: ${{ inputs.require_main && '0' || '1' }}
+          persist-credentials: false
+      - name: Require a SHA reachable from main
+        if: ${{ inputs.require_main }}
+        env:
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: scripts/deploy/nchat-prod/require-main-sha.sh "$RELEASE_SHA"
+      - id: images
+        run: scripts/deploy/nchat-dev/image-matrix.sh >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: inventory
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.inventory.outputs.images) }}
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      # docker/setup-buildx-action v3.11.1
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      # docker/login-action v3.3.0
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select build
+        id: build
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          case "$IMAGE" in
+            web) dockerfile=Dockerfile.web; build_args= ;;
+            admin-web) dockerfile=Dockerfile.admin-web; build_args= ;;
+            migrations) dockerfile=Dockerfile.migrations; build_args= ;;
+            document-converter) dockerfile=Dockerfile.document-converter; build_args= ;;
+            *) dockerfile=Dockerfile.service; build_args="SERVICE=$IMAGE" ;;
+          esac
+          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          echo "build_args=$build_args" >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        id: push
+        # docker/build-push-action v6.18.0
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          file: ${{ steps.build.outputs.dockerfile }}
+          build-args: ${{ steps.build.outputs.build_args }}
+          push: true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=nchat-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=nchat-${{ matrix.image }}
+          tags: ghcr.io/nicrepository/nchat/${{ matrix.image }}:${{ inputs.sha }}
+      # The digest comes from this push and is refused unless it is one, so a
+      # blank or malformed output fails the build instead of reaching the
+      # manifest as an image nobody can resolve.
+      - name: Record digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf '%s' "$DIGEST" >"digest-$IMAGE.txt"
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: digest-${{ matrix.image }}
+          path: digest-${{ matrix.image }}.txt
+          retention-days: 7

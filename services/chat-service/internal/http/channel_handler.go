@@ -290,10 +290,9 @@ type channelDetailsResponse struct {
 	MemberCount       int                        `json:"member_count"`
 	OnlineMemberCount int                        `json:"online_member_count"`
 	OnlineMembers     []channelDetailsMemberJSON `json:"online_members"`
-	// CanManageMembers is the legacy #398 name kept by hotfix #705. Its value is
-	// the add-members capability only; it is a hint for the UI and never a
-	// control. The add-members route re-derives the same decision from the
-	// session on every call. It is
+	// CanManageMembers lets the panel disable an action the server would refuse
+	// (issue #398). It is a hint for the UI and never a control: the add-members
+	// route re-derives the same decision from the session on every call. It is
 	// always sent, so a client that predates it reads absent-as-false and hides
 	// the action — the safe direction — rather than enabling it by default.
 	CanManageMembers bool `json:"can_manage_members"`

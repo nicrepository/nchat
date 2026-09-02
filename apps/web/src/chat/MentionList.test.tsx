@@ -39,4 +39,46 @@ describe("MentionList", () => {
     expect(ref.current?.onKeyDown({ key: "Escape" } as KeyboardEvent)).toBe(true);
     expect(ref.current?.onKeyDown({ key: "Enter" } as KeyboardEvent)).toBe(false);
   });
+
+  it("announces loading and error states", () => {
+    const { rerender } = render(<MentionList items={[]} command={vi.fn()} loadState="loading" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando sugestões");
+
+    rerender(<MentionList items={[]} command={vi.fn()} loadState="error" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Não foi possível carregar sugestões");
+  });
+
+  it("groups people, channels and special options with a non-color selected marker", () => {
+    render(
+      <MentionList
+        items={[items[0], { mentionType: "channel", id: "channel-1", label: "geral" }, items[1]]}
+        command={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Pessoas")).toBeInTheDocument();
+    expect(screen.getByText("Canais")).toBeInTheDocument();
+    expect(screen.getByText("Especial")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Ana/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("check")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("option", { name: /geral/ })).toHaveTextContent("#geral");
+  });
+
+  it("does not crash on unmount when scrollIntoView returns a non-function value (issue #773)", () => {
+    // Element.prototype.scrollIntoView is global to the whole suite, so it
+    // must be restored even if an assertion below throws — never rely on a
+    // plain last-line reassignment for that.
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn(() => null);
+    Element.prototype.scrollIntoView = scrollIntoView as unknown as typeof originalScrollIntoView;
+
+    try {
+      const { unmount } = render(<MentionList items={items} command={vi.fn()} />);
+
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(() => unmount()).not.toThrow();
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
 });

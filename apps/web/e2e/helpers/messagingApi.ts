@@ -72,6 +72,25 @@ export interface DMCandidateFixture {
   displayName: string;
 }
 
+/**
+ * One attachment of a message, in chat-service's own snake_case (issue #740).
+ *
+ * Deliberately the wire shape and not the client's ChannelAttachment: a spec
+ * that seeds a voice message must seed exactly what the server sends, including
+ * `audio_kind`, which is the only thing that makes the timeline draw a voice
+ * bubble instead of a file row.
+ */
+export interface RawMessageAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  status: "pending_scan" | "clean" | "rejected";
+  preview_status?: string;
+  audio_kind?: "voice";
+  duration_ms?: number;
+}
+
 interface RawMessage {
   id: string;
   sender_id: string;
@@ -102,6 +121,8 @@ interface RawMessage {
   event_payload?: Record<string, string>;
   quoted?: RawQuote;
   reference?: RawReference;
+  /** RF-32 attachments, as the server embeds them in the message. */
+  attachments?: RawMessageAttachment[];
 }
 
 interface RawReference {
@@ -156,11 +177,13 @@ export interface MessagingScenario {
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     }>;
     dmPosts: Array<{
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     }>;
     forwards: Array<{
       destinationChannelId: string;
@@ -182,6 +205,15 @@ export interface MessagingScenario {
     reactions: Array<{ messageId: string; emoji: string; added: boolean }>;
     dmCreates: Array<{ otherUserId: string }>;
     groupCreates: Array<{ participantUserIds: string[]; title: string }>;
+    /** Issue #516: what the composer actually uploaded, in order. */
+    attachmentUploads: Array<{ targetId: string; filename: string; purpose: string }>;
+    /**
+     * Issue #740: attachment ids whose *content* was requested, in order.
+     * Every byte of every attachment — a download or an inline player — comes
+     * through this one authenticated route, so this list is also how a spec
+     * proves that merely rendering a timeline requested nothing.
+     */
+    attachmentContentFetches: string[];
   };
   forwardedByIdempotencyKey: Map<
     string,
@@ -341,6 +373,7 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     is_forwarded: overrides.is_forwarded ?? false,
     quoted: overrides.quoted,
     reference: overrides.reference,
+    attachments: overrides.attachments,
     // Issue #527: the structured conversation event, on system messages only.
     // The database pairs these with kind='system', so a user message never
     // carries them and neither does a fixture built without them.
@@ -456,6 +489,8 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
       reactions: [],
       dmCreates: [],
       groupCreates: [],
+      attachmentUploads: [],
+      attachmentContentFetches: [],
     },
     forwardedByIdempotencyKey: new Map(),
     sidebarChannels,
@@ -1079,7 +1114,34 @@ async function installChannelDetailsMocks(
     });
   });
 
+  // GET /api/files/attachments/{id}/content — the one route that serves bytes.
+  // The real service authenticates, re-checks the caller's access to the
+  // conversation and refuses anything the malware scan has not approved; the
+  // Go tests own those decisions. What a spec can only observe here is the
+  // cross-layer contract: which id the browser asked for, and when.
+  await page.route("**/api/files/attachments/*/content", async (route) => {
+    const attachmentId = pathSegmentAfter(route.request().url(), "attachments");
+    if (!attachmentId) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.requests.attachmentContentFetches.push(attachmentId);
+    await route.fulfill({
+      status: 200,
+      headers: {
+        "Content-Type": "audio/wav",
+        "Content-Disposition": 'attachment; filename="voice-message.wav"',
+        "X-Content-Type-Options": "nosniff",
+      },
+      body: silentWav(),
+    });
+  });
+
   await page.route("**/api/files/dm/*/attachments**", async (route) => {
+    if (route.request().method() === "POST") {
+      await acceptAttachmentUpload(route, scenario, "dm");
+      return;
+    }
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;
@@ -1099,6 +1161,10 @@ async function installChannelDetailsMocks(
   });
 
   await page.route("**/api/files/channels/*/attachments**", async (route) => {
+    if (route.request().method() === "POST") {
+      await acceptAttachmentUpload(route, scenario, "channels");
+      return;
+    }
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;
@@ -1114,6 +1180,69 @@ async function installChannelDetailsMocks(
       contentType: "application/json",
       body: JSON.stringify({ data: { attachments } }),
     });
+  });
+}
+
+/**
+ * Real, tiny PCM audio for the content route.
+ *
+ * Not a placeholder string: a spec that asserts a recording keeps *playing*
+ * while it is downloaded needs bytes the browser can actually decode, and
+ * uncompressed WAV is the one format that needs no codec to be present.
+ */
+function silentWav(seconds = 5): Buffer {
+  const sampleRate = 8000;
+  const samples = sampleRate * seconds;
+  const wav = Buffer.alloc(44 + samples * 2);
+  wav.write("RIFF", 0);
+  wav.writeUInt32LE(36 + samples * 2, 4);
+  wav.write("WAVE", 8);
+  wav.write("fmt ", 12);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20); // PCM
+  wav.writeUInt16LE(1, 22); // mono
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(samples * 2, 40);
+  return wav;
+}
+
+/**
+ * POST /api/files/{collection}/{id}/attachments — a draft upload (issue #516).
+ *
+ * The multipart part's own filename is recorded rather than derived: it is the
+ * name a pasted screenshot was given on the way out, and the only place a spec
+ * can observe it as the server would.
+ */
+async function acceptAttachmentUpload(
+  route: Route,
+  scenario: MessagingScenario,
+  collection: string,
+): Promise<void> {
+  const request = route.request();
+  // latin1: the part headers are ASCII and sit ahead of the binary body, which
+  // utf-8 decoding would otherwise mangle before the filename is read.
+  const body = request.postDataBuffer()?.toString("latin1") ?? "";
+  const filename = /filename="([^"]*)"/.exec(body)?.[1] ?? "";
+  const purpose = /name="purpose"\r?\n\r?\n([^\r\n]*)/.exec(body)?.[1] ?? "";
+  const targetId = pathSegmentAfter(request.url(), collection) ?? "";
+  scenario.requests.attachmentUploads.push({ targetId, filename, purpose });
+  await route.fulfill({
+    status: 201,
+    contentType: "application/json",
+    body: JSON.stringify({
+      data: {
+        id: `upload-${scenario.requests.attachmentUploads.length}`,
+        filename,
+        contentType: "image/png",
+        size: body.length,
+        status: "pending_scan",
+        createdAt: "2026-07-15T12:03:00.000Z",
+      },
+    }),
   });
 }
 
@@ -1901,13 +2030,21 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
       await route.fulfill({ status: 404 });
       return;
     }
-    const conversationId = `e2e-dm-with-${otherUserId}`;
-    if (!scenario.sidebarDMs.some((dm) => dm.id === conversationId)) {
+    const existingDirect = scenario.sidebarDMs.find(
+      (dm) => dm.type === "direct" && dm.counterpart?.user_id === otherUserId,
+    );
+    const conversationId = existingDirect?.id ?? `e2e-dm-with-${otherUserId}`;
+    const created = !existingDirect;
+    if (created) {
       scenario.sidebarDMs.push({
         id: conversationId,
         type: "direct",
         name: candidate.displayName,
         unread_count: 0,
+        counterpart: {
+          user_id: otherUserId,
+          display_name: candidate.displayName,
+        },
       });
     }
     if (!scenario.messagesByTarget.has(targetKey("dm", conversationId))) {
@@ -1916,7 +2053,7 @@ async function installConversationMocks(page: Page, scenario: MessagingScenario)
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ data: { conversation_id: conversationId, created: true } }),
+      body: JSON.stringify({ data: { conversation_id: conversationId, created } }),
     });
   });
 
@@ -2255,6 +2392,7 @@ async function handleTargetMessagesRoute(
       body_format?: RawMessage["body_format"];
       parent_message_id?: string;
       referenced_message_id?: string;
+      attachment_ids?: string[];
     };
     const requests =
       routeKind === "channel" ? scenario.requests.channelPosts : scenario.requests.dmPosts;
@@ -2262,6 +2400,7 @@ async function handleTargetMessagesRoute(
       body_text: body.body_text,
       parent_message_id: body.parent_message_id,
       referenced_message_id: body.referenced_message_id,
+      attachment_ids: body.attachment_ids,
     });
 
     const parent = messages.find((message) => message.id === body.parent_message_id);

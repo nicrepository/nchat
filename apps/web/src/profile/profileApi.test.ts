@@ -5,10 +5,7 @@ import {
   AvatarUploadError,
   fetchMyProfile,
   removeAvatar,
-  updateDisplayName,
-  UpdateDisplayNameError,
-  updateProfileFields,
-  UpdateProfileFieldsError,
+  updateProfile,
   uploadAvatar,
 } from "./profileApi";
 
@@ -144,6 +141,37 @@ describe("fetchMyProfile", () => {
     }
   });
 
+  it("drops a malformed URL that new URL() cannot parse at all", async () => {
+    mockAuthFetch.mockResolvedValue({
+      data: { id: "u1", display_name: "Ana", avatar_url: "http://[not-valid-host" },
+    });
+    expect((await fetchMyProfile()).avatarUrl).toBeUndefined();
+  });
+
+  it("drops every avatar URL when window.location.origin is the opaque-origin sentinel 'null'", async () => {
+    // A sandboxed iframe (or a file:// document) reports "null" as its
+    // origin — the same value a browser really produces, not a test-only
+    // fabrication. sameOriginAvatarUrl must treat that as "no safe origin
+    // to compare against" and drop the URL rather than risk a same-origin
+    // check that can never be satisfied honestly.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, origin: "null" },
+    });
+    try {
+      mockAuthFetch.mockResolvedValue({
+        data: { id: "u1", display_name: "Ana", avatar_url: "/api/auth/avatars/x.png" },
+      });
+      expect((await fetchMyProfile()).avatarUrl).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
   it("accepts an absolute same-origin URL unchanged", async () => {
     mockAuthFetch.mockResolvedValue({
       data: {
@@ -156,130 +184,75 @@ describe("fetchMyProfile", () => {
   });
 });
 
-describe("updateDisplayName", () => {
-  it("sends a PATCH with only display_name and returns the persisted profile", async () => {
-    mockAuthFetch.mockResolvedValue({
-      data: { id: "u1", display_name: "Ana Lima", avatar_url: "/api/auth/avatars/x.png" },
-    });
-
-    const profile = await updateDisplayName("Ana Lima");
-
-    expect(profile).toEqual({
-      id: "u1",
-      displayName: "Ana Lima",
-      avatarUrl: "/api/auth/avatars/x.png",
-      jobTitle: "",
-      bio: "",
-      timezone: "",
-      customStatus: "",
-    });
-    const [calledUrl, init] = mockAuthFetch.mock.calls[0];
-    expect(calledUrl).toContain("/me");
-    expect(calledUrl).not.toContain("/me/avatar");
-    expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ display_name: "Ana Lima" });
-    // The client never sends an id, user_id or any other field — identity is
-    // the session's, and nothing else is editable through this call.
-    expect(Object.keys(JSON.parse(init.body as string))).toEqual(["display_name"]);
-  });
-
-  it("forwards an abort signal to the transport", async () => {
-    mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: "Ana" } });
-    const controller = new AbortController();
-    await updateDisplayName("Ana", controller.signal);
-    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
-  });
-
-  it("maps 400 to an invalid reason", async () => {
-    mockAuthFetch.mockRejectedValue(new ApiRequestError(400, "bad_request", "bad"));
-    await expect(updateDisplayName("")).rejects.toMatchObject({
-      name: "UpdateDisplayNameError",
-      reason: "invalid",
-    });
-  });
-
-  it("maps 403 to forbidden", async () => {
-    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "no"));
-    await expect(updateDisplayName("Ana")).rejects.toMatchObject({ reason: "forbidden" });
-  });
-
-  it("maps an unknown failure to a generic reason", async () => {
-    mockAuthFetch.mockRejectedValue(new Error("boom"));
-    await expect(updateDisplayName("Ana")).rejects.toBeInstanceOf(UpdateDisplayNameError);
-  });
-});
-
-describe("updateProfileFields", () => {
-  const emptyFields = { jobTitle: "", bio: "", timezone: "", customStatus: "" };
-
-  it("sends a PATCH with only the four fields (no display_name) and returns the persisted profile", async () => {
-    mockAuthFetch.mockResolvedValue({
+describe("updateProfile", () => {
+  it("sends all five fields in one PATCH and maps the response", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
       data: {
         id: "u1",
-        display_name: "Ana Lima",
-        job_title: "Engenheira",
-        bio: "Focada em backend.",
+        display_name: "Ana",
+        job_title: "Eng",
+        bio: "bio",
         timezone: "America/Sao_Paulo",
-        custom_status: "Em reunião",
+        custom_status: "🚀 Focada",
       },
     });
-
-    const profile = await updateProfileFields({
-      jobTitle: "Engenheira",
-      bio: "Focada em backend.",
+    const result = await updateProfile({
+      displayName: "Ana",
+      jobTitle: "Eng",
+      bio: "bio",
       timezone: "America/Sao_Paulo",
-      customStatus: "Em reunião",
+      customStatus: "🚀 Focada",
     });
-
-    expect(profile).toEqual({
-      id: "u1",
-      displayName: "Ana Lima",
-      avatarUrl: undefined,
-      jobTitle: "Engenheira",
-      bio: "Focada em backend.",
-      timezone: "America/Sao_Paulo",
-      customStatus: "Em reunião",
-    });
-    const [calledUrl, init] = mockAuthFetch.mock.calls[0];
-    expect(calledUrl).toContain("/me");
-    expect(init.method).toBe("PATCH");
-    const sentBody = JSON.parse(init.body as string);
-    expect(sentBody).toEqual({
-      job_title: "Engenheira",
-      bio: "Focada em backend.",
-      timezone: "America/Sao_Paulo",
-      custom_status: "Em reunião",
-    });
-    // display_name is never sent by this call — PATCH /auth/me treats an
-    // absent field as "leave it alone," so there is nothing to preserve.
-    expect(sentBody).not.toHaveProperty("display_name");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/me"),
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: "Ana",
+          job_title: "Eng",
+          bio: "bio",
+          timezone: "America/Sao_Paulo",
+          custom_status: "🚀 Focada",
+        }),
+      }),
+    );
+    expect(result.displayName).toBe("Ana");
   });
 
-  it("forwards an abort signal to the transport", async () => {
-    mockAuthFetch.mockResolvedValue({ data: { id: "u1", display_name: "Ana" } });
-    const controller = new AbortController();
-    await updateProfileFields(emptyFields, controller.signal);
-    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
-  });
+  it("omits untouched fields so a stale dialog cannot clobber a concurrent edit", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: "u1", display_name: "Nome mais novo" } });
 
-  it("maps 400 to an invalid reason", async () => {
-    mockAuthFetch.mockRejectedValue(new ApiRequestError(400, "bad_request", "bad"));
-    await expect(updateProfileFields(emptyFields)).rejects.toMatchObject({
-      name: "UpdateProfileFieldsError",
-      reason: "invalid",
+    await updateProfile({ bio: "Bio atualizada" });
+
+    expect(JSON.parse(mockAuthFetch.mock.calls[0][1].body as string)).toEqual({
+      bio: "Bio atualizada",
     });
   });
 
-  it("maps 403 to forbidden", async () => {
-    mockAuthFetch.mockRejectedValue(new ApiRequestError(403, "forbidden", "no"));
-    await expect(updateProfileFields(emptyFields)).rejects.toMatchObject({
-      reason: "forbidden",
-    });
+  it("maps a 400 to an invalid UpdateProfileError", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(400, "bad", "bad"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "invalid" });
   });
 
-  it("maps an unknown failure to a generic reason", async () => {
-    mockAuthFetch.mockRejectedValue(new Error("boom"));
-    await expect(updateProfileFields(emptyFields)).rejects.toBeInstanceOf(UpdateProfileFieldsError);
+  it("maps a 403 to forbidden", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "no"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "forbidden" });
+  });
+
+  it("maps an unrecognized status and a non-ApiRequestError both to 'unknown'", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(500, "server_error", "boom"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "unknown" });
+
+    mockAuthFetch.mockRejectedValueOnce(new TypeError("network down"));
+    await expect(
+      updateProfile({ displayName: "x", jobTitle: "", bio: "", timezone: "", customStatus: "" }),
+    ).rejects.toMatchObject({ reason: "unknown" });
   });
 });
 

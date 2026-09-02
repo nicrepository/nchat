@@ -56,10 +56,16 @@ describe("mentionExtension", () => {
     await expect(
       suggestion.items({
         query: "a".repeat(80),
-        editor: { storage: { mentionChannelContext: { channelId: "channel-1" } } },
+        editor: {
+          storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+        },
       }),
     ).resolves.toEqual([]);
-    expect(mocks.fetch).toHaveBeenCalledWith("channel-1", "a".repeat(64), expect.any(AbortSignal));
+    expect(mocks.fetch).toHaveBeenCalledWith(
+      { kind: "channel", id: "channel-1" },
+      "a".repeat(64),
+      expect.any(AbortSignal),
+    );
   });
 
   it("renders labels with id fallback", () => {
@@ -158,7 +164,9 @@ describe("mentionExtension", () => {
     try {
       mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Joao" }]);
       const suggestion = options().suggestion;
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       // Simulate a fast typing burst: "j", "jo", "joa", "joao".
       const pending = [
@@ -172,7 +180,11 @@ describe("mentionExtension", () => {
       await vi.advanceTimersByTimeAsync(150);
 
       expect(mocks.fetch).toHaveBeenCalledTimes(1);
-      expect(mocks.fetch).toHaveBeenCalledWith("channel-1", "joao", expect.any(AbortSignal));
+      expect(mocks.fetch).toHaveBeenCalledWith(
+        { kind: "channel", id: "channel-1" },
+        "joao",
+        expect.any(AbortSignal),
+      );
       await Promise.all(pending);
     } finally {
       vi.useRealTimers();
@@ -183,13 +195,15 @@ describe("mentionExtension", () => {
     vi.useFakeTimers();
     try {
       let capturedSignal: AbortSignal | undefined;
-      mocks.fetch.mockImplementation((_channelId: string, _query: string, signal?: AbortSignal) => {
+      mocks.fetch.mockImplementation((_target: unknown, _query: string, signal?: AbortSignal) => {
         capturedSignal = signal;
         return new Promise(() => {});
       });
       const suggestion = options().suggestion;
       const lifecycle = suggestion.render();
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       const pending = suggestion.items({ query: "a", editor });
       await vi.advanceTimersByTimeAsync(150);
@@ -209,7 +223,9 @@ describe("mentionExtension", () => {
     try {
       const suggestion = options().suggestion;
       const lifecycle = suggestion.render();
-      const channelA = { storage: { mentionChannelContext: { channelId: "channel-A" } } };
+      const channelA = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-A" } } },
+      };
 
       // User types "@x" in channel A, scheduling a debounced fetch...
       const pendingA = suggestion.items({ query: "x", editor: channelA });
@@ -226,19 +242,21 @@ describe("mentionExtension", () => {
     }
   });
 
-  it("prepends a synthetic @all candidate when the query matches", async () => {
+  it("appends a synthetic @all candidate when the channel query matches", async () => {
     vi.useFakeTimers();
     try {
       mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
       const suggestion = options().suggestion;
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       const pending = suggestion.items({ query: "al", editor });
       await vi.advanceTimersByTimeAsync(150);
 
       await expect(pending).resolves.toEqual([
-        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
         { mentionType: "user", id: "user-1", label: "Ana" },
+        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
       ]);
     } finally {
       vi.useRealTimers();
@@ -250,7 +268,9 @@ describe("mentionExtension", () => {
     try {
       mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
       const suggestion = options().suggestion;
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       const pending = suggestion.items({ query: "ana", editor });
       await vi.advanceTimersByTimeAsync(150);
@@ -261,12 +281,60 @@ describe("mentionExtension", () => {
     }
   });
 
+  it("does not invent @all for groups", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+      const suggestion = options().suggestion;
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "dm", id: "group-1" } } },
+      };
+
+      const pending = suggestion.items({ query: "", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores an aborted response even when the transport resolves it late", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolveFirst!: (items: unknown[]) => void;
+      mocks.fetch
+        .mockReturnValueOnce(new Promise((resolve) => (resolveFirst = resolve)))
+        .mockResolvedValueOnce([{ mentionType: "user", id: "new", label: "Caio" }]);
+      const suggestion = options().suggestion;
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
+
+      const first = suggestion.items({ query: "c", editor });
+      await vi.advanceTimersByTimeAsync(150);
+      const latest = suggestion.items({ query: "ca", editor });
+      resolveFirst([{ mentionType: "user", id: "old", label: "Carlos" }]);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(Promise.all([first, latest])).resolves.toEqual([
+        [{ mentionType: "user", id: "new", label: "Caio" }],
+        [{ mentionType: "user", id: "new", label: "Caio" }],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("offers @all with an empty query, matching normal candidate-list behavior", async () => {
     vi.useFakeTimers();
     try {
       mocks.fetch.mockResolvedValue([]);
       const suggestion = options().suggestion;
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       const pending = suggestion.items({ query: "", editor });
       await vi.advanceTimersByTimeAsync(150);
@@ -284,7 +352,9 @@ describe("mentionExtension", () => {
     try {
       mocks.fetch.mockResolvedValue([]);
       const suggestion = options().suggestion;
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       const pending = suggestion.items({ query: "AL", editor });
       await vi.advanceTimersByTimeAsync(150);
@@ -303,7 +373,9 @@ describe("mentionExtension", () => {
       mocks.fetch.mockResolvedValue([]);
       const suggestion = options().suggestion;
       const lifecycle = suggestion.render();
-      const editor = { storage: { mentionChannelContext: { channelId: "channel-1" } } };
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "channel", id: "channel-1" } } },
+      };
 
       suggestion.items({ query: "a", editor });
       lifecycle.onExit();

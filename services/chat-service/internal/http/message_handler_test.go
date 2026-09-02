@@ -1231,12 +1231,31 @@ func TestMessageHandler_SearchMentions_ReturnsAuthorizedCandidates(t *testing.T)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if mentions.lastInput.WorkspaceID != testWorkspaceID || mentions.lastInput.ChannelID != testChannelID || mentions.lastInput.CallerID != msgTestUserID || mentions.lastInput.Query != "al" {
+	if mentions.lastInput.WorkspaceID != testWorkspaceID || mentions.lastInput.TargetType != "channel" || mentions.lastInput.TargetID != testChannelID || mentions.lastInput.CallerID != msgTestUserID || mentions.lastInput.Query != "al" {
 		t.Fatalf("unexpected service input: %+v", mentions.lastInput)
 	}
 	body := decodeBody(t, rec)["data"].(map[string]any)
 	if len(body["users"].([]any)) != 1 || len(body["channels"].([]any)) != 1 {
 		t.Fatalf("unexpected candidates: %v", body)
+	}
+}
+
+func TestMessageHandler_SearchDMMentions_UsesGroupTarget(t *testing.T) {
+	mentions := &fakeMentionProvider{out: service.SearchMentionsOutput{
+		Users: []domain.MentionCandidate{{Type: domain.MentionTypeUser, ID: msgTestUserID, Label: "Alice"}},
+	}}
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, mentions)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/33333333-3333-3333-3333-333333333333/mentions", nil)
+	r.SetPathValue("conversationID", "33333333-3333-3333-3333-333333333333")
+
+	h.SearchDMMentions(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if mentions.lastInput.TargetType != "dm" || mentions.lastInput.TargetID != "33333333-3333-3333-3333-333333333333" {
+		t.Fatalf("unexpected service input: %+v", mentions.lastInput)
 	}
 }
 

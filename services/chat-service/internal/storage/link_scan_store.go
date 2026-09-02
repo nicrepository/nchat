@@ -841,13 +841,49 @@ const resolvePendingMessagesQuery = `
 		-- An inconclusive message does, and that is deliberate: it was published,
 		-- so its mentions are as real as any other message's. A notification names
 		-- a message, it does not fetch a URL, so nothing downstream of here gains
-		-- an authority the message itself does not have.
+		-- an authority the message itself does not have. Recipient membership is
+		-- revalidated here because it may have changed while the scan was pending.
 		INSERT INTO chat.notification_outbox
 			(workspace_id, message_id, recipient_user_id, kind, status)
 		SELECT promoted.workspace_id, promoted.id, mention.user_id, 'mention', 'pending'
 		FROM promoted
 		JOIN chat.message_pending_mentions mention ON mention.message_id = promoted.id
+		JOIN chat.workspaces mention_workspace
+		  ON mention_workspace.id = promoted.workspace_id AND mention_workspace.status = 'active'
+		JOIN chat.workspace_members mention_member
+		  ON mention_member.workspace_id = promoted.workspace_id
+		 AND mention_member.user_id = mention.user_id
+		 AND mention_member.status = 'active'
+		JOIN auth.users mention_recipient
+		  ON mention_recipient.id = mention.user_id
+		 AND mention_recipient.status = 'active'
+		 AND mention_recipient.deleted_at IS NULL
 		WHERE promoted.published
+		  AND (
+		    (promoted.channel_id <> '' AND EXISTS (
+		      SELECT 1
+		      FROM chat.channels mention_channel
+		      JOIN chat.channel_members mention_channel_member
+		        ON mention_channel_member.channel_id = mention_channel.id
+		       AND mention_channel_member.user_id = mention.user_id
+		      WHERE mention_channel.id = promoted.channel_id::uuid
+		        AND mention_channel.workspace_id = promoted.workspace_id
+		        AND mention_channel.status = 'active'
+		    ))
+		    OR
+		    (promoted.conversation_id <> '' AND EXISTS (
+		      SELECT 1
+		      FROM chat.dm_conversations mention_dm
+		      JOIN chat.dm_members mention_dm_member
+		        ON mention_dm_member.conversation_id = mention_dm.id
+		       AND mention_dm_member.user_id = mention.user_id
+		       AND mention_dm_member.status = 'active'
+		      WHERE mention_dm.id = promoted.conversation_id::uuid
+		        AND mention_dm.workspace_id = promoted.workspace_id
+		        AND mention_dm.type = 'group'
+		        AND mention_dm.status = 'active'
+		    ))
+		  )
 		ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
 		RETURNING message_id
 	)

@@ -1,7 +1,7 @@
 import Mention from "@tiptap/extension-mention";
 import { ReactRenderer } from "@tiptap/react";
 import { fetchMentionCandidates } from "./chatApi";
-import type { MentionCandidate } from "./chatTypes";
+import type { MentionCandidate, MentionTarget } from "./chatTypes";
 import { ALL_MENTION_ID } from "./richTextMarkers";
 import MentionList from "./MentionList";
 import type { MentionListRef } from "./MentionList";
@@ -16,13 +16,18 @@ const viewportMargin = 8;
 const mentionFetchDebounceMs = 150;
 
 // Synthetic — never fetched from the server, unlike every other candidate.
-// Prepended client-side so @all is discoverable the same way a person is:
+// Added client-side so @all is discoverable the same way a person is:
 // typing "@" and narrowing by name.
 const ALL_CANDIDATE: MentionCandidate = { mentionType: "all", id: ALL_MENTION_ID, label: "all" };
 
-function withAllCandidate(query: string, candidates: MentionCandidate[]): MentionCandidate[] {
+function withAllCandidate(
+  target: MentionTarget,
+  query: string,
+  candidates: MentionCandidate[],
+): MentionCandidate[] {
+  if (target.kind !== "channel") return candidates;
   const matches = ALL_CANDIDATE.label.startsWith(query.toLowerCase());
-  return matches ? [ALL_CANDIDATE, ...candidates] : candidates;
+  return matches ? [...candidates, ALL_CANDIDATE] : candidates;
 }
 
 function positionPopup(element: HTMLElement, clientRect?: (() => DOMRect | null) | null) {
@@ -50,6 +55,7 @@ export function createMentionExtension() {
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingResolvers: Array<(candidates: MentionCandidate[]) => void> = [];
   let activeAbort: AbortController | undefined;
+  let loadState: "loading" | "ready" | "error" = "ready";
 
   function flushPending(candidates: MentionCandidate[]) {
     const resolvers = pendingResolvers;
@@ -66,6 +72,7 @@ export function createMentionExtension() {
     // HTTP request if it's already in flight (e.g. channel switched mid-fetch).
     activeAbort?.abort();
     activeAbort = undefined;
+    loadState = "ready";
     // Every caller must eventually settle — TipTap's suggestion plugin awaits
     // items() as part of its own async state-update cycle, so leaving a
     // resolver unresolved (e.g. when the popup exits mid-debounce) would
@@ -78,10 +85,13 @@ export function createMentionExtension() {
   // result, so a normal typing burst (e.g. "joao") issues one request
   // instead of one per keystroke.
   function debouncedFetchMentionCandidates(
-    channelId: string,
+    target: MentionTarget,
     query: string,
   ): Promise<MentionCandidate[]> {
+    loadState = "loading";
     if (debounceTimer !== undefined) clearTimeout(debounceTimer);
+    activeAbort?.abort();
+    activeAbort = undefined;
     return new Promise((resolve) => {
       pendingResolvers.push(resolve);
       debounceTimer = setTimeout(() => {
@@ -89,11 +99,19 @@ export function createMentionExtension() {
         activeAbort?.abort();
         const controller = new AbortController();
         activeAbort = controller;
-        fetchMentionCandidates(channelId, query, controller.signal)
-          .then((candidates) => flushPending(withAllCandidate(query, candidates)))
+        fetchMentionCandidates(target, query, controller.signal)
+          .then((candidates) => {
+            if (activeAbort === controller) {
+              loadState = "ready";
+              flushPending(withAllCandidate(target, query, candidates));
+            }
+          })
           .catch((err: unknown) => {
             if (err instanceof Error && err.name === "AbortError") return;
-            flushPending([]);
+            if (activeAbort === controller) {
+              loadState = "error";
+              flushPending([]);
+            }
           });
       }, mentionFetchDebounceMs);
     });
@@ -127,22 +145,25 @@ export function createMentionExtension() {
     suggestion: {
       char: "@",
       items: ({ query, editor }) => {
-        const channelId = editor.storage.mentionChannelContext?.channelId as string | undefined;
-        return channelId ? debouncedFetchMentionCandidates(channelId, query.slice(0, 64)) : [];
+        const target = editor.storage.mentionTargetContext?.target as MentionTarget | undefined;
+        return target ? debouncedFetchMentionCandidates(target, query.slice(0, 64)) : [];
       },
       render: () => {
         let component: ReactRenderer<MentionListRef> | null = null;
 
         return {
           onStart: (props) => {
-            component = new ReactRenderer(MentionList, { props, editor: props.editor });
+            component = new ReactRenderer(MentionList, {
+              props: { ...props, loadState },
+              editor: props.editor,
+            });
             const element = component.element as HTMLElement;
             element.classList.add("mention-popup");
             document.body.appendChild(element);
             positionPopup(element, props.clientRect);
           },
           onUpdate: (props) => {
-            component?.updateProps(props);
+            component?.updateProps({ ...props, loadState });
             if (component) positionPopup(component.element as HTMLElement, props.clientRect);
           },
           onKeyDown: ({ event }) => {

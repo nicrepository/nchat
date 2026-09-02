@@ -69,6 +69,7 @@ const (
 	RouteChannelReferences        = "/api/chat/channels/{channelID}/message-references"
 	RouteChannelSecuritySnapshots = "/api/chat/channels/{channelID}/message-security-snapshots"
 	RouteChannelMentions          = "/api/chat/channels/{channelID}/mentions"
+	RouteDMMentions               = "/api/chat/dm/{conversationID}/mentions"
 	RouteDMMessages               = "/api/chat/dm/{conversationID}/messages"
 	RouteDMMessage                = "/api/chat/dm/{conversationID}/messages/{messageID}"
 	RouteDMReferences             = "/api/chat/dm/{conversationID}/message-references"

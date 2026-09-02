@@ -29,6 +29,10 @@ func (s *MemberService) SearchChannelMembers(ctx context.Context, workspaceID, c
 	return s.members.SearchChannelMembers(ctx, workspaceID, channelID, prefix, limit)
 }
 
+func (s *MemberService) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	return s.members.SearchDMConversationMembers(ctx, workspaceID, conversationID, callerID, prefix, limit)
+}
+
 // JoinWorkspace adds userID to workspaceID with the given role. If the user is
 // already a member, the existing membership record is returned without error.
 func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {
@@ -133,9 +137,12 @@ type AddChannelMembersInput struct {
 
 // AddChannelMembers adds active workspace members to an existing channel.
 //
-// Authorization is domain.CanAddChannelMembers. A plain member must also pass
-// normal channel visibility; owner, admin and moderator retain the existing
-// administrative add path without being granted channel membership or reads.
+// Authorization is domain.CanManageChannelMembers — active workspace owner or
+// admin — the same authority that already removes a member from a channel and
+// that docs/runbooks/task-chat-channel-join-leave.md calls the "manager-add
+// flow". It is deliberately checked before the channel is even looked up, so a
+// caller with no management rights cannot use the response to learn whether a
+// channel UUID exists.
 //
 // The channel is then loaded workspace-scoped and active-only, which is what
 // refuses an archived channel, a channel from another tenant and one that never
@@ -147,11 +154,17 @@ type AddChannelMembersInput struct {
 // parsing, the de-duplication, the batch cap — exists to refuse a malformed or
 // oversized request cheaply, never to decide who is eligible.
 func (s *MemberService) AddChannelMembers(ctx context.Context, input AddChannelMembersInput) (storage.AddMembersResult, error) {
+	// Active membership first, then the capability — deliberately not
+	// requireWorkspaceManager, which would apply CanManageWorkspace here and
+	// leave CanManageChannelMembers as decoration. The seam only means anything
+	// if it is the single predicate this endpoint actually consults: widening it
+	// for RF-74 must widen this route, and a second owner/admin gate above it
+	// would silently prevent that.
 	member, err := requireActiveWorkspaceMember(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID)
 	if err != nil {
 		return storage.AddMembersResult{}, err
 	}
-	if !domain.CanAddChannelMembers(&member) {
+	if !domain.CanManageChannelMembers(&member) {
 		return storage.AddMembersResult{}, domain.ErrForbidden
 	}
 
@@ -160,9 +173,15 @@ func (s *MemberService) AddChannelMembers(ctx context.Context, input AddChannelM
 		return storage.AddMembersResult{}, err
 	}
 
-	channel, err := s.getAddableChannel(ctx, input.WorkspaceID, input.ChannelID, member)
+	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, input.WorkspaceID, input.ChannelID)
 	if err != nil {
-		return storage.AddMembersResult{}, err
+		if errors.Is(err, domain.ErrNotFound) {
+			return storage.AddMembersResult{}, domain.ErrNotFound
+		}
+		return storage.AddMembersResult{}, fmt.Errorf("get channel: %w", err)
+	}
+	if channel.IsGeneral {
+		return storage.AddMembersResult{}, fmt.Errorf("%w: every active member already belongs to geral", domain.ErrInvalidInput)
 	}
 
 	// The actor is handed to the store so the transaction re-derives their
@@ -193,7 +212,11 @@ type SearchChannelMemberCandidatesInput struct {
 // SearchChannelMemberCandidates returns workspace members eligible to be added
 // to a channel, with current members already excluded by the store.
 //
-// Authorization and channel resolution are identical to AddChannelMembers.
+// The authorization is the same gate the write uses — domain.CanManageChannelMembers
+// — and it is checked before the channel is looked up, so a caller with no
+// management rights cannot use the response to learn whether a channel ID
+// exists. That is deliberate: this endpoint reveals which people are *not* in a
+// channel, which is a fact about a private channel's composition.
 //
 // The exclusion of current members happens in SQL, not here. The panel's member
 // preview is presence-filtered and capped, so it was never a complete
@@ -206,17 +229,21 @@ func (s *MemberService) SearchChannelMemberCandidates(
 	if err != nil {
 		return nil, err
 	}
-	if !domain.CanAddChannelMembers(&member) {
+	if !domain.CanManageChannelMembers(&member) {
 		return nil, domain.ErrForbidden
 	}
+
 	query, limit, err := normalizeCandidateSearch(input.Query, input.Limit)
 	if err != nil {
 		return nil, err
 	}
 
-	channel, err := s.getAddableChannel(ctx, input.WorkspaceID, input.ChannelID, member)
+	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, input.WorkspaceID, input.ChannelID)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("get channel: %w", err)
 	}
 
 	candidates, err := s.members.SearchChannelMemberCandidates(
@@ -226,32 +253,6 @@ func (s *MemberService) SearchChannelMemberCandidates(
 		return nil, fmt.Errorf("search channel member candidates: %w", err)
 	}
 	return candidates, nil
-}
-
-// getAddableChannel is the shared #705 policy for add and candidate search.
-// Administrative roles keep their existing private-channel management scope;
-// a plain member resolves through normal visibility and therefore cannot use a
-// guessed private-channel UUID as an oracle.
-func (s *MemberService) getAddableChannel(
-	ctx context.Context, workspaceID, channelID string, member domain.WorkspaceMember,
-) (domain.Channel, error) {
-	var channel domain.Channel
-	var err error
-	if domain.CanManageChannelMembers(&member) {
-		channel, err = s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
-	} else {
-		channel, err = s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, member.UserID)
-	}
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.Channel{}, domain.ErrNotFound
-		}
-		return domain.Channel{}, fmt.Errorf("get channel: %w", err)
-	}
-	if channel.IsGeneral {
-		return domain.Channel{}, fmt.Errorf("%w: every active member already belongs to geral", domain.ErrInvalidInput)
-	}
-	return channel, nil
 }
 
 // normalizeCandidateSearch applies the same query bounds and limit clamping the
@@ -334,9 +335,10 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 
 // RemoveMemberFromChannel removes targetUserID from channelID in workspaceID.
 //
-// Authorization remains domain.CanManageChannelMembers. Issue #705 deliberately
-// uses a separate CanAddChannelMembers capability so plain members never reach
-// this removal path.
+// Authorization is domain.CanManageChannelMembers — the same predicate the add
+// path uses, rather than a second inline role list that could drift from it.
+// Adding and removing the same row are the same authority, so RF-74 widening
+// the add to the workspace moderator widens the removal with it.
 // Returns ErrForbidden when removing from #geral or when caller lacks permission.
 func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) error {
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)

@@ -13,6 +13,14 @@
 #   context              the current kube context
 #   patch-fails          newline-separated Service names whose patch fails
 #   patch-log            appended to on every successful patch
+#   namespace            the one namespace this identity may read
+#   services-list-result how `get services` answers: absent or "success" for the
+#                        ordinary case, else not-found | forbidden | api-error
+#   context-fails        "1" makes `config current-context` fail, as an
+#                        unreachable API does
+#   deny-cluster-wide    "1" refuses `get nodes` and `get pods --all-namespaces`,
+#                        as the namespaced production deploy identity is refused
+#   cluster-wide-log     every attempt at either, refused or not
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
@@ -20,16 +28,80 @@ STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
 prev=""
 read_state() { [[ -f "$STATE/$1" ]] && cat "$STATE/$1" || printf ''; }
 
+# The value of the -n flag, wherever it sits in the argument list.
+namespace_arg() {
+  local arg previous=""
+  for arg in "$@"; do
+    [[ "$previous" == "-n" ]] && printf '%s' "$arg"
+    previous="$arg"
+  done
+}
+
 # kubectl config current-context
+#
+# context-fails stands for an API the client cannot reach: kubectl exits
+# non-zero and prints nothing, which is what a caller reading it through a
+# command substitution has to notice on its own.
 if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
+  if [[ "$(read_state context-fails)" == "1" ]]; then
+    echo "error: current-context is not set" >&2
+    exit 1
+  fi
   read_state context
   exit 0
 fi
 
 # kubectl get namespace <name>
-if [[ "${1:-}" == "get" && "${2:-}" == "namespace" ]]; then
-  [[ "$(read_state namespace)" == "${3:-}" ]] || exit 1
-  echo "namespace/${3:-} found"
+#
+# The production deployer has no cluster-scoped permission at all, so this fake
+# refuses it the way the API does and records the attempt. A script that goes
+# back to reading `namespaces` fails every case here instead of only failing in
+# production, against the one identity nobody runs the tests as.
+if [[ "${1:-}" == "get" && ("${2:-}" == "namespace" || "${2:-}" == "namespaces") ]]; then
+  printf '%s\n' "$*" >>"$STATE/cluster-scoped-log"
+  echo 'Error from server (Forbidden): namespaces is forbidden' >&2
+  exit 1
+fi
+
+# The three ways the namespaced Services listing can fail, each answered the way
+# the API answers it.
+#
+# They are separate states, not one "it failed" flag, because the suite claims
+# to cover them separately: an absent namespace, a namespaced read this identity
+# is not authorised for, and the API being unreachable are three different
+# operational situations, and a fixture that cannot tell them apart cannot show
+# that the gate refuses all three. The production gate reads none of these
+# messages -- it decides on the exit status alone -- so they exist for the test
+# to assert on, never for a script to parse.
+#
+# An unrecognised value is an error too: a typo in a fixture must not quietly
+# become a passing read.
+services_list_error() {
+  local result="$1" namespace="$2"
+  case "$result" in
+    not-found) echo "Error from server (NotFound): namespaces \"$namespace\" not found" >&2 ;;
+    forbidden) echo "Error from server (Forbidden): services is forbidden: User cannot list resource \"services\" in API group \"\" in the namespace \"$namespace\"" >&2 ;;
+    api-error) echo "Unable to connect to the server: dial tcp: i/o timeout" >&2 ;;
+    *) echo "fake: unknown services-list-result '$result'" >&2 ;;
+  esac
+  exit 1
+}
+
+# kubectl get services -n <namespace>
+#
+# The namespaced read the scripts use as their namespace gate. It answers for
+# exactly one namespace -- the one in the `namespace` state file, standing for
+# the single RoleBinding the deployer holds -- so any other namespace is
+# refused, the way the API refuses it, rather than answered with an empty list.
+# That refusal is the fixture's own configuration and needs no injected failure,
+# which is what keeps "the namespace is wrong" a separate claim from the three
+# results below.
+if [[ "${1:-}" == "get" && "${2:-}" == "services" ]]; then
+  requested="$(namespace_arg "$@")"
+  result="$(read_state services-list-result)"
+  [[ -z "$result" || "$result" == "success" ]] || services_list_error "$result" "$requested"
+  [[ "$(read_state namespace)" == "$requested" ]] || services_list_error forbidden "$requested"
+  echo "No resources found in $requested namespace."
   exit 0
 fi
 
@@ -107,13 +179,23 @@ fi
 # Capacity inputs. A fixture that sets none of these leaves the preflight with
 # nothing to read, which is INCONCLUSIVE — the fail-safe answer under test.
 if [[ "${1:-}" == "get" && "${2:-}" == "resourcequota" ]]; then
+  # A quota key that contains a dot is answered only in its escaped form, which
+  # is the one real kubectl resolves.
+  #
+  # kubectl re-parses a bracketed key as a field path, so status.hard['requests.cpu']
+  # asks for hard.requests.cpu -- a nested object no ResourceQuota has -- and the
+  # command succeeds with empty output. Matching the unescaped key here would
+  # have answered a query production gets nothing back from, which is how three
+  # of the four dimensions reached the evaluator as "not declared" while every
+  # fixture said they were fine. An unrecognised key falls through to the empty
+  # default, exactly as kubectl leaves it.
   case "$*" in
-    *"hard"*"requests.cpu"*) read_state quota/hard-cpu ;;
-    *"used"*"requests.cpu"*) read_state quota/used-cpu ;;
-    *"hard"*"requests.memory"*) read_state quota/hard-memory ;;
-    *"used"*"requests.memory"*) read_state quota/used-memory ;;
-    *"hard"*"ephemeral-storage"*) read_state quota/hard-storage ;;
-    *"used"*"ephemeral-storage"*) read_state quota/used-storage ;;
+    *"hard"*'requests\.cpu'*) read_state quota/hard-cpu ;;
+    *"used"*'requests\.cpu'*) read_state quota/used-cpu ;;
+    *"hard"*'requests\.memory'*) read_state quota/hard-memory ;;
+    *"used"*'requests\.memory'*) read_state quota/used-memory ;;
+    *"hard"*'requests\.ephemeral-storage'*) read_state quota/hard-storage ;;
+    *"used"*'requests\.ephemeral-storage'*) read_state quota/used-storage ;;
     *"hard"*"pods"*) read_state quota/hard-pods ;;
     *"used"*"pods"*) read_state quota/used-pods ;;
     *) printf '' ;;
@@ -126,22 +208,126 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployments" ]]; then
   exit 0
 fi
 
+# The Pod/container request query, checked for the structure production depends
+# on before it is answered.
+#
+# Matching on "resources.requests" alone was enough to hand the correct fixture
+# to the query that caused the incident: one that opened the container range
+# first and then asked for `{$.status.phase}` and `{$.spec.nodeName}` inside it,
+# where jsonpath resolves `$` as the container and answers with nothing. A fake
+# that answers by topic rather than by shape cannot fail on that, so the suite
+# agreed with a gate that was returning BAD INPUT in production.
+#
+# These are substring checks, not a jsonpath parser -- what has to be protected
+# is one query with one shape. Three properties, and nothing beyond them:
+# the Pod's own fields are read before the container range, they are not read
+# again inside it, and both container lists are ranged with all three requests.
+CONTAINERS_RANGE='{range .spec.containers[*]}'
+INIT_CONTAINERS_RANGE='{range .spec.initContainers[*]}'
+
+query_requires() {
+  [[ "$1" == *"$2"* ]] ||
+    { echo "fake: the capacity request query $3" >&2; return 1; }
+}
+
+query_refuses() {
+  [[ "$1" != *"$2"* ]] ||
+    { echo "fake: the capacity request query $3" >&2; return 1; }
+}
+
+# Both container lists are ranged, and each reads all three requests. A query
+# that drops initContainers collects less than the kubelet reserves.
+check_container_requests() {
+  local containers="$1" init="$2" resource
+  for resource in cpu memory ephemeral-storage; do
+    query_requires "$containers" ".resources.requests.$resource" \
+      "does not read the $resource request of its containers" || return 1
+    query_requires "$init" ".resources.requests.$resource" \
+      "does not read the $resource request of its initContainers" || return 1
+  done
+}
+
+# The Pod's phase and node are read at Pod level and nowhere else. Reading them
+# after the container range has opened is the incident itself, whether they are
+# written `{.status.phase}` or `{$.status.phase}`.
+check_pod_requests_query() {
+  local query="$1" pod ranges field
+  query_requires "$query" "$CONTAINERS_RANGE" "does not range over the Pod's containers" || return 1
+  query_requires "$query" "$INIT_CONTAINERS_RANGE" "does not range over the Pod's initContainers" || return 1
+  pod="${query%%"$CONTAINERS_RANGE"*}"
+  ranges="${query#"$pod"}"
+  for field in .status.phase .spec.nodeName; do
+    query_requires "$pod" "$field" "does not read $field from the Pod before its containers" || return 1
+    query_refuses "$ranges" "$field" "reads $field from inside a container range, where jsonpath has no Pod to read it from" || return 1
+  done
+  check_container_requests "${ranges%%"$INIT_CONTAINERS_RANGE"*}" \
+    "${ranges#*"$INIT_CONTAINERS_RANGE"}"
+}
+
+# Reads that reach beyond nchat-prod: the Nodes, and Pods in every namespace.
+#
+# Every attempt is recorded in cluster-wide-log whether or not it is refused, so
+# a test can assert that a run made none. `deny-cluster-wide` then makes this
+# fake behave like the production deploy identity, which holds a namespaced Role
+# and is refused both -- the identity the capacity gate has to work under, and
+# the one nobody can run the suite as.
+#
+# Separate from cluster-scoped-log, which stays reserved for the `namespaces`
+# resource the namespace gate must never ask for.
+cluster_wide_read() {
+  printf '%s\n' "$*" >>"$STATE/cluster-wide-log"
+  if [[ "$(read_state deny-cluster-wide)" == "1" ]]; then
+    echo "Error from server (Forbidden): $2 is forbidden: User \"system:serviceaccount:nchat-prod:nchat-prod-deployer\" cannot list resource \"$2\" at the cluster scope" >&2
+    exit 1
+  fi
+}
+
 if [[ "${1:-}" == "get" && "${2:-}" == "nodes" ]]; then
+  cluster_wide_read "$@"
   read_state node-allocatable
   exit 0
 fi
 
-if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
-  # Two shapes: per-container request lines, and one line per Pod for slots.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"--all-namespaces"* ]]; then
+  cluster_wide_read "$@"
+  # Two shapes, told apart by the one token only the request template carries.
+  #
+  # Both jsonpaths open with "<phase>|", so a pattern on that matched the
+  # request query as well and answered it with the one-field-per-Pod slots file.
+  # Nothing noticed until the parser started refusing a line of the wrong shape:
+  # a request line short of its resources column read as a container that
+  # reserves nothing, which is the direction that hides commitment.
+  #
+  # cluster-pods holds the request query's answer in the shape kubectl produces:
+  # one line per Pod, its containers ';'-terminated after the Pod's own phase and
+  # node. The collector expands those into one line per container; jsonpath
+  # cannot, because it has no reference back to the Pod from inside a container
+  # loop.
+  #
+  # A query that looks like the request query and does not have its shape is
+  # refused outright: answering it with the right fixture is what let the
+  # incident's own jsonpath pass the suite.
   case "$*" in
-    *"status.phase}|"*) read_state cluster-pod-slots ;;
-    *) read_state cluster-pods ;;
+    *"resources.requests"*)
+      check_pod_requests_query "$*" || exit 65
+      read_state cluster-pods
+      ;;
+    *) read_state cluster-pod-slots ;;
   esac
+  exit 0
+fi
+
+# Any other Pod listing is namespaced diagnostics; the scripts only ever print it.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
+  echo "(fake namespaced pod listing)"
   exit 0
 fi
 
 # Secrets: present when the fixture created the marker file.
 if [[ "${1:-}" == "get" && "${2:-}" == "secret" ]]; then
+  # Recorded so a flow can assert it read none: the deploy identity is not
+  # allowed to read Secrets, and nothing here may start.
+  printf '%s\n' "$*" >>"$STATE/secret-read-log"
   [[ -f "$STATE/secrets/${3:-}" ]] || exit 1
   echo "secret/${3:-} found"
   exit 0
@@ -172,6 +358,14 @@ fi
 
 if [[ "${1:-}" == "apply" ]]; then
   printf '%s\n' "$*" >>"$STATE/apply-log"
+  # Keep what was applied, not just that something was. The manifests are
+  # rendered into a temporary tree the caller deletes on exit, so a test that
+  # wants to assert what a deploy actually produced -- the release annotations,
+  # for instance -- has no other way to see it after the command returns.
+  if [[ "${2:-}" == "-f" && -f "${3:-}" ]]; then
+    mkdir -p "$STATE/applied"
+    cp "$3" "$STATE/applied/$(basename "$3")"
+  fi
   # Applying the migration manifest brings its Job into existence, so the wait
   # that follows has something to observe.
   if [[ "$*" == *migrations.yaml* && -n "$(read_state pending-job-name)" ]]; then

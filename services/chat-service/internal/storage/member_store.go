@@ -27,14 +27,15 @@ type MemberStore interface {
 	AddChannelMember(ctx context.Context, channelID, userID string, role domain.ChannelRole) (domain.ChannelMember, error)
 	// AddChannelMembers adds every user in userIDs to channelID, or none (issue
 	// #398). callerID is the authenticated actor: the transaction re-establishes
-	// their add capability and channel scope itself rather than trusting the
-	// service's earlier check, so a role revoked in between persists nothing.
-	// Eligibility of the targets is decided by the same statement that writes. Returns
+	// their owner/admin membership itself rather than trusting the service's
+	// earlier check, so a role revoked in between persists nothing. Eligibility
+	// of the targets is decided by the same statement that writes. Returns
 	// domain.ErrForbidden — without naming anyone — for a revoked actor or an
 	// ineligible target.
 	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
+	SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error)
 	// ListOnlineChannelMemberProfiles returns the channel's member totals plus up
 	// to limit of the members in onlineUserIDs, in one round trip. The presence
 	// filter is applied before the limit, so an online member never loses a slot
@@ -318,7 +319,8 @@ func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID str
 // member is joined to automatically. #geral is where a workspace's traffic
 // lives; auto-joining a guest to it would mean "restricted to the channels it
 // was explicitly added to" started with the busiest channel in the workspace
-// already granted. Manual add is a separate flow and refuses #geral.
+// already granted. A guest reaches #geral the same way it reaches any other
+// channel: somebody with domain.CanManageChannelMembers adds it.
 //
 // The role is not passed in and not read separately: the insert selects it from
 // the membership row inside the caller's transaction, so the decision cannot be
@@ -516,11 +518,11 @@ func (s *PGXMemberStore) AddChannelMembers(
 	// memberships. Locking the row also serialises this against a concurrent
 	// role change rather than merely observing it.
 	//
-	// This is the SQL statement of domain.CanAddChannelMembers plus #705's
-	// channel rule: managers retain administrative add scope, while a plain
-	// member must still be able to read the channel. The service's decision is
-	// deliberately not passed down as a boolean, because a boolean computed a
-	// moment ago is exactly the thing this query exists to distrust.
+	// The role list is the SQL statement of domain.CanManageChannelMembers,
+	// which RF-74 widened from owner/admin to include the workspace moderator.
+	// The two must agree; the service's decision is deliberately not passed down
+	// as a boolean, because a boolean computed a moment ago is exactly the thing
+	// this query exists to distrust.
 	//
 	// FOR SHARE rather than FOR UPDATE, matching managerAuthorizedWorkspace in
 	// channel_category_store.go: demoting a role, suspending a membership and
@@ -539,21 +541,11 @@ func (s *PGXMemberStore) AddChannelMembers(
 		JOIN chat.workspaces w
 		  ON w.id = wm.workspace_id AND w.status = 'active'
 		JOIN chat.channels c
-		  ON c.id = $2::uuid
-		 AND c.workspace_id = wm.workspace_id
-		 AND c.status = 'active'
-		 AND c.is_general = false
+		  ON c.id = $2::uuid AND c.workspace_id = wm.workspace_id AND c.status = 'active'
 		WHERE wm.workspace_id = $1::uuid
 		  AND wm.user_id = $3::uuid
 		  AND wm.status = 'active'
-		  AND wm.role IN ('owner', 'admin', 'moderator', 'member')
-		  AND (
-		        wm.role IN ('owner', 'admin', 'moderator')
-		        OR (
-		            wm.role = 'member'
-		            AND chat.channel_visible_to_user(c.id, wm.user_id)
-		        )
-		      )
+		  AND wm.role IN ('owner', 'admin', 'moderator')
 		FOR SHARE OF wm`,
 		workspaceID, channelID, callerID,
 	).Scan(&actorAuthorized)
@@ -679,6 +671,47 @@ func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
+	}
+	return results, nil
+}
+
+func (s *PGXMemberStore) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.dm_conversations dc
+		JOIN chat.workspaces w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.dm_members caller
+		  ON caller.conversation_id = dc.id AND caller.user_id = $3::uuid AND caller.status = 'active'
+		JOIN chat.workspace_members caller_wm
+		  ON caller_wm.workspace_id = dc.workspace_id AND caller_wm.user_id = caller.user_id AND caller_wm.status = 'active'
+		JOIN chat.dm_members candidate
+		  ON candidate.conversation_id = dc.id AND candidate.status = 'active'
+		JOIN chat.workspace_members candidate_wm
+		  ON candidate_wm.workspace_id = dc.workspace_id AND candidate_wm.user_id = candidate.user_id AND candidate_wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = candidate.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dc.id = $2::uuid
+		  AND dc.workspace_id = $1::uuid
+		  AND dc.type = 'group'
+		  AND dc.status = 'active'
+		  AND left(lower(u.display_name), length($4)) = lower($4)
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $5`, workspaceID, conversationID, callerID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search dm conversation members: %w", err)
+	}
+	defer rows.Close()
+	results := make([]domain.MentionCandidate, 0, limit)
+	for rows.Next() {
+		candidate := domain.MentionCandidate{Type: domain.MentionTypeUser}
+		if err := rows.Scan(&candidate.ID, &candidate.Label); err != nil {
+			return nil, fmt.Errorf("scan dm conversation member mention: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dm conversation member mentions: %w", err)
 	}
 	return results, nil
 }
@@ -922,7 +955,7 @@ func (s *PGXMemberStore) SearchDMCandidates(ctx context.Context, workspaceID, ca
 // Everything else mirrors SearchDMCandidates so the two searches cannot drift
 // about who counts as an eligible person: the workspace must be active, the
 // membership active, the account active and not deleted, and the caller must
-// still satisfy the complete #705 add policy (the EXISTS below).
+// still hold an active membership in the same workspace (the EXISTS below).
 // The caller is also excluded from their own results.
 //
 // Ordering is the same deterministic (lower(display_name), id) the rest of the
@@ -943,23 +976,10 @@ func (s *PGXMemberStore) SearchChannelMemberCandidates(
 		  AND left(lower(u.display_name), length($4)) = lower($4)
 		  AND EXISTS (
 		      SELECT 1
-		      FROM chat.channels actor_channel
-		      JOIN chat.workspace_members actor
-		        ON actor.workspace_id = actor_channel.workspace_id
-		       AND actor.user_id = $3::uuid
-		       AND actor.status = 'active'
-		      WHERE actor_channel.id = $2::uuid
-		        AND actor_channel.workspace_id = $1::uuid
-		        AND actor_channel.status = 'active'
-		        AND actor_channel.is_general = false
-		        AND actor.role IN ('owner', 'admin', 'moderator', 'member')
-		        AND (
-		              actor.role IN ('owner', 'admin', 'moderator')
-		              OR (
-		                  actor.role = 'member'
-		                  AND chat.channel_visible_to_user(actor_channel.id, actor.user_id)
-		              )
-		            )
+		      FROM chat.workspace_members caller
+		      WHERE caller.workspace_id = wm.workspace_id
+		        AND caller.user_id = $3::uuid
+		        AND caller.status = 'active'
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1

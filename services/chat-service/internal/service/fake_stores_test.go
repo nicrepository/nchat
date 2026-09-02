@@ -230,6 +230,8 @@ type fakeMemberStore struct {
 	getCMCalls        int
 	mentionCandidates []domain.MentionCandidate
 	mentionErr        error
+	mentionQuery      string
+	mentionLimit      int
 	dmCandidates      []domain.DMCandidate
 	dmCandidateErr    error
 	dmCandidateQuery  string
@@ -289,7 +291,13 @@ type memberProfileCall struct {
 	limit         int
 }
 
-func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, _ string, _ int) ([]domain.MentionCandidate, error) {
+func (f *fakeMemberStore) SearchChannelMembers(_ context.Context, _, _, query string, limit int) ([]domain.MentionCandidate, error) {
+	f.mentionQuery, f.mentionLimit = query, limit
+	return f.mentionCandidates, f.mentionErr
+}
+
+func (f *fakeMemberStore) SearchDMConversationMembers(_ context.Context, _, _, _, query string, limit int) ([]domain.MentionCandidate, error) {
+	f.mentionQuery, f.mentionLimit = query, limit
 	return f.mentionCandidates, f.mentionErr
 }
 
@@ -487,9 +495,10 @@ func (f *fakeMemberStore) AddChannelMembers(
 	// Models the transactional re-check the real store performs: the actor must
 	// still hold the capability at write time, so a test that revokes the role
 	// between the service check and here sees the write refused. It asks the
-	// same add-specific domain predicate the store's SQL role list restates.
+	// same domain predicate the store's SQL role list restates, so the two
+	// cannot drift as RF-74 widened that list.
 	actor, ok := f.workspaceMembers[wmKey(workspaceID, callerID)]
-	if !ok || !domain.CanAddChannelMembers(&actor) {
+	if !ok || !domain.CanManageChannelMembers(&actor) {
 		return storage.AddMembersResult{}, domain.ErrForbidden
 	}
 	for _, userID := range userIDs {

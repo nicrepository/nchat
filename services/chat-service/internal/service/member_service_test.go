@@ -561,8 +561,10 @@ func TestMemberService_RemoveMemberFromChannel_GuestRoleDenied(t *testing.T) {
 	}
 }
 
-// Removal deliberately remains on the pre-#705 management predicate. The route
-// must consult that predicate and never inherit CanAddChannelMembers.
+// Adding and removing the same channel_members row are the same authority, so
+// the moderator RF-74 created reaches both. The assertion is against
+// domain.CanManageChannelMembers itself, not a second role list: the route must
+// consult the named predicate and nothing stricter above it.
 func TestMemberService_RemoveMemberFromChannel_FollowsCanManageChannelMembers(t *testing.T) {
 	for _, role := range []domain.WorkspaceRole{
 		domain.WorkspaceRoleOwner, domain.WorkspaceRoleAdmin, domain.WorkspaceRoleModerator,

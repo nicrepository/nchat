@@ -158,56 +158,6 @@ function mapAvatarError(error: unknown): AvatarUploadError {
   return new AvatarUploadError("unknown", "Não foi possível atualizar o avatar.");
 }
 
-export type UpdateDisplayNameErrorReason = "invalid" | "forbidden" | "unknown";
-
-export class UpdateDisplayNameError extends Error {
-  readonly reason: UpdateDisplayNameErrorReason;
-  constructor(reason: UpdateDisplayNameErrorReason, message: string) {
-    super(message);
-    this.name = "UpdateDisplayNameError";
-    this.reason = reason;
-  }
-}
-
-/**
- * Updates the authenticated user's display name and returns the profile as
- * persisted by the server — never the optimistic input. The body carries only
- * display_name; identity comes from the session via authenticatedFetch, never
- * from a client-supplied id.
- *
- * PATCH /auth/me treats an absent field as "leave it alone," so this call
- * never touches job_title/bio/timezone/custom_status even though it does not
- * mention them.
- */
-export async function updateDisplayName(
-  displayName: string,
-  signal?: AbortSignal,
-): Promise<SelfProfile> {
-  try {
-    const res = await authenticatedFetch<SelfProfileResponse>(`${AUTH_BASE}/me`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ display_name: displayName }),
-      signal,
-    });
-    return selfProfileFromResponse(res);
-  } catch (error) {
-    throw mapUpdateDisplayNameError(error);
-  }
-}
-
-function mapUpdateDisplayNameError(error: unknown): UpdateDisplayNameError {
-  if (error instanceof ApiRequestError) {
-    switch (error.status) {
-      case 400:
-        return new UpdateDisplayNameError("invalid", "Nome inválido.");
-      case 403:
-        return new UpdateDisplayNameError("forbidden", "Conta indisponível para esta ação.");
-    }
-  }
-  return new UpdateDisplayNameError("unknown", "Não foi possível atualizar o nome.");
-}
-
 function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
   return {
     id: res.data.id,
@@ -220,36 +170,31 @@ function selfProfileFromResponse(res: SelfProfileResponse): SelfProfile {
   };
 }
 
-export type UpdateProfileFieldsErrorReason = "invalid" | "forbidden" | "unknown";
+export interface UpdateProfileInput {
+  displayName?: string;
+  jobTitle?: string;
+  bio?: string;
+  timezone?: string;
+  customStatus?: string;
+}
 
-export class UpdateProfileFieldsError extends Error {
-  readonly reason: UpdateProfileFieldsErrorReason;
-  constructor(reason: UpdateProfileFieldsErrorReason, message: string) {
+export type UpdateProfileErrorReason = "invalid" | "forbidden" | "unknown";
+
+export class UpdateProfileError extends Error {
+  readonly reason: UpdateProfileErrorReason;
+  constructor(reason: UpdateProfileErrorReason, message: string) {
     super(message);
-    this.name = "UpdateProfileFieldsError";
+    this.name = "UpdateProfileError";
     this.reason = reason;
   }
 }
 
-/** The "Detalhes do perfil" form always submits all four together — see
- * ProfilePage's onSaveDetails — so this takes a plain object rather than four
- * positional parameters, matching that grouping. */
-export interface ProfileFieldsInput {
-  jobTitle: string;
-  bio: string;
-  timezone: string;
-  customStatus: string;
-}
-
 /**
- * Updates job_title, bio, timezone and custom_status, and returns the profile
- * as persisted. Does not send display_name at all: PATCH /auth/me treats an
- * absent field as "leave it alone," so there is nothing to preserve here —
- * unlike a design that would need to resend the current display name to
- * avoid clobbering it.
+ * Saves only the fields the caller changed. JSON.stringify omits the undefined
+ * values below, preserving PATCH /auth/me's "absent means unchanged" contract.
  */
-export async function updateProfileFields(
-  fields: ProfileFieldsInput,
+export async function updateProfile(
+  fields: UpdateProfileInput,
   signal?: AbortSignal,
 ): Promise<SelfProfile> {
   try {
@@ -257,6 +202,7 @@ export async function updateProfileFields(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        display_name: fields.displayName,
         job_title: fields.jobTitle,
         bio: fields.bio,
         timezone: fields.timezone,
@@ -266,18 +212,18 @@ export async function updateProfileFields(
     });
     return selfProfileFromResponse(res);
   } catch (error) {
-    throw mapUpdateProfileFieldsError(error);
+    throw mapUpdateProfileError(error);
   }
 }
 
-function mapUpdateProfileFieldsError(error: unknown): UpdateProfileFieldsError {
+function mapUpdateProfileError(error: unknown): UpdateProfileError {
   if (error instanceof ApiRequestError) {
     switch (error.status) {
       case 400:
-        return new UpdateProfileFieldsError("invalid", "Dados inválidos.");
+        return new UpdateProfileError("invalid", "Dados inválidos.");
       case 403:
-        return new UpdateProfileFieldsError("forbidden", "Conta indisponível para esta ação.");
+        return new UpdateProfileError("forbidden", "Conta indisponível para esta ação.");
     }
   }
-  return new UpdateProfileFieldsError("unknown", "Não foi possível atualizar o perfil.");
+  return new UpdateProfileError("unknown", "Não foi possível atualizar o perfil.");
 }

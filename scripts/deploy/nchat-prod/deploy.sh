@@ -17,6 +17,10 @@ source "$ROOT_DIR/scripts/deploy/nchat-dev/lib.sh"
 
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-$ROOT_DIR/artifacts}"
 RELEASE_SHA="${NCHAT_PROD_RELEASE_SHA:-}"
+# Read from the artifacts directory rather than the environment: it is written
+# there by release-digests.sh from the manifest seal, so the identity stamped on
+# the workloads is the one the digests were actually taken from.
+RELEASE_ID=""
 TOPOLOGY_FILE="${NCHAT_PROD_TOPOLOGY_FILE:-}"
 TEMPORARY_ROOT="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nchat-prod-deploy.XXXXXX")"
 trap 'rm -rf "$TEMPORARY_ROOT"' EXIT
@@ -29,7 +33,12 @@ render_candidate() {
   # Stamps every workload of the slot with one release identity, so a deploy
   # that reached only some of them is visible in status instead of being hidden
   # behind whichever service happened to update.
-  (cd "$overlay" && kustomize edit set annotation "nchat.io/release-sha:$RELEASE_SHA")
+  # Both halves of the identity. The SHA says which commit; the release id says
+  # which build of it, because two builds of one commit do not produce the same
+  # image digests and only the second question distinguishes them.
+  (cd "$overlay" && kustomize edit set annotation \
+    "$NCHAT_PROD_RELEASE_SHA_ANNOTATION:$RELEASE_SHA" \
+    "$NCHAT_PROD_RELEASE_ID_ANNOTATION:$RELEASE_ID")
   # validate_rendered_placeholders is nchat-dev's: it refuses a manifest still
   # carrying sha-placeholder, a mutable tag, or an unresolved REPLACE_ME_*
   # token. Production reuses it rather than growing a second, less-tested rule.
@@ -71,6 +80,8 @@ main() {
   command -v kustomize >/dev/null || prod_fail "kustomize is required"
   validate_commit_sha "$RELEASE_SHA" ||
     prod_fail "NCHAT_PROD_RELEASE_SHA must be the release's full 40-character commit SHA"
+  RELEASE_ID="$(read_release_id "$ARTIFACTS_DIR")" ||
+    prod_fail "no release identity in $ARTIFACTS_DIR/$NCHAT_PROD_RELEASE_ID_FILE; pin the digests with release-digests.sh first"
   require_context
   require_namespace
   mapping="$(collect_service_slots)"
@@ -78,6 +89,7 @@ main() {
   candidate="$(opposite_slot "$active")"
   print_context_banner "$mapping"
   echo "release sha   : $RELEASE_SHA"
+  echo "release id    : $RELEASE_ID"
   echo "active slot   : $active"
   echo "candidate slot: $candidate"
   confirm "Deploy the release into slot '$candidate' with no traffic"

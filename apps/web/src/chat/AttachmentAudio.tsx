@@ -15,13 +15,24 @@
 
 import { useState } from "react";
 
-import AudioPlayer from "./AudioPlayer";
+import AudioPlayer, { type AudioDownloadAction } from "./AudioPlayer";
 import { canPlayAudioInline, isAudioAttachment } from "./attachmentAudioRules";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentContent } from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";
 
-export default function AttachmentAudio({ attachment }: { attachment: ChannelAttachment }) {
+export default function AttachmentAudio({
+  attachment,
+  download,
+}: {
+  attachment: ChannelAttachment;
+  /**
+   * Passed straight through to the player, which decides where the control
+   * sits. Only the voice bubble supplies one (issue #740): an ordinary audio
+   * file's row already carries its own Baixar action.
+   */
+  download?: AudioDownloadAction;
+}) {
   const [armed, setArmed] = useState(false);
   const eligible = canPlayAudioInline(attachment) && armed;
   const { url, failed } = useAttachmentBlobUrl(attachment.id, eligible, fetchAttachmentContent);
@@ -44,6 +55,7 @@ export default function AttachmentAudio({ attachment }: { attachment: ChannelAtt
       failed={failed}
       onRequestLoad={() => setArmed(true)}
       durationHint={attachment.durationMs ? attachment.durationMs / 1000 : undefined}
+      download={download}
       testIdPrefix={`chat-audio-${attachment.id}`}
     />
   );

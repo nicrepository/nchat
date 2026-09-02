@@ -8,7 +8,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { MemoryRouter, Outlet, Route, Routes, useNavigate } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes, useLocation, useNavigate } from "react-router";
 
 import { ApiRequestError } from "../lib/api";
 
@@ -23,9 +23,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import { flushResizeObservers, observedElements } from "../setupTests";
 import ChatMessageArea from "./ChatMessageArea";
+import { isCatalogedEmoji, loadEmojiCatalog, resetEmojiCatalogCache } from "./emoji/emojiCatalog";
 import { avatarColorFor } from "./messageDisplay";
 import type { Message, MessagePage } from "./chatTypes";
 import type {
+  WSClientErrorEvent,
   WSMessageCreatedEvent,
   WSMessageUpdatedEvent,
   WSReactionUpdatedEvent,
@@ -79,6 +81,7 @@ const {
   mockFetchGroupDetails,
   mockFetchDirectProfile,
   mockFetchChannelAttachments,
+  mockGetOrCreateDirectDM,
   wsMockState,
 } = vi.hoisted(() => ({
   mockFetchChannelMessages:
@@ -143,10 +146,18 @@ const {
   mockFetchGroupDetails: vi.fn(),
   mockFetchDirectProfile: vi.fn(),
   mockFetchChannelAttachments: vi.fn(),
+  mockGetOrCreateDirectDM:
+    vi.fn<
+      (
+        otherUserId: string,
+        signal?: AbortSignal,
+      ) => Promise<{ conversationId: string; created: boolean }>
+    >(),
   wsMockState: {
     capturedWSMessageCreated: null as ((event: WSMessageCreatedEvent) => void) | null,
     capturedWSMessageUpdated: null as ((event: WSMessageUpdatedEvent) => void) | null,
     capturedReactionUpdated: null as ((event: WSReactionUpdatedEvent) => void) | null,
+    capturedReactionError: null as ((event: WSClientErrorEvent) => void) | null,
     capturedSubscribed: null as ((event: WSSubscribedEvent) => void) | null,
     capturedOnTypingUpdated: null as ((event: WSTypingUpdatedEvent) => void) | null,
     toggleReaction: vi.fn(() => true),
@@ -216,6 +227,8 @@ vi.mock("./chatApi", () => ({
     mockFetchGroupDetails(conversationId, signal),
   fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
     mockFetchDirectProfile(conversationId, signal),
+  getOrCreateDirectDM: (otherUserId: string, signal?: AbortSignal) =>
+    mockGetOrCreateDirectDM(otherUserId, signal),
 }));
 
 // file-service lives behind its own client; the panel's files section is mocked
@@ -241,18 +254,21 @@ vi.mock("./useChatWebSocket", () => ({
       onMessageCreated,
       onMessageUpdated,
       onReactionUpdated,
+      onReactionError,
       onSubscribed,
       onTypingUpdated,
     }: {
       onMessageCreated: (event: WSMessageCreatedEvent) => void;
       onMessageUpdated?: (event: WSMessageUpdatedEvent) => void;
       onReactionUpdated?: (event: WSReactionUpdatedEvent) => void;
+      onReactionError?: (event: WSClientErrorEvent) => void;
       onSubscribed?: (event: WSSubscribedEvent) => void;
       onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
     }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
@@ -480,14 +496,23 @@ beforeEach(() => {
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
+  wsMockState.capturedReactionError = null;
   wsMockState.capturedSubscribed = null;
   wsMockState.capturedOnTypingUpdated = null;
   vi.clearAllMocks();
   vi.mocked(useChatWebSocket).mockImplementation(
-    ({ onMessageCreated, onMessageUpdated, onReactionUpdated, onSubscribed, onTypingUpdated }) => {
+    ({
+      onMessageCreated,
+      onMessageUpdated,
+      onReactionUpdated,
+      onReactionError,
+      onSubscribed,
+      onTypingUpdated,
+    }) => {
       wsMockState.capturedWSMessageCreated = onMessageCreated;
       wsMockState.capturedWSMessageUpdated = onMessageUpdated ?? null;
       wsMockState.capturedReactionUpdated = onReactionUpdated ?? null;
+      wsMockState.capturedReactionError = onReactionError ?? null;
       wsMockState.capturedSubscribed = onSubscribed ?? null;
       wsMockState.capturedOnTypingUpdated = onTypingUpdated ?? null;
       return {
@@ -532,6 +557,7 @@ beforeEach(() => {
   mockFetchDirectProfile.mockImplementation((conversationId: string) =>
     Promise.resolve(directProfileFor(conversationId)),
   );
+  mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-created", created: true });
   mockForwardChannelMessage.mockResolvedValue(makeMessage({ id: "forwarded", isForwarded: true }));
   // jsdom does not implement scrollIntoView; mock it so the branch is reachable.
   window.Element.prototype.scrollIntoView = vi.fn();
@@ -2562,6 +2588,64 @@ describe("ChatMessageArea — message list", () => {
     expect(screen.getByRole("button", { name: "Mais reações" })).toBeVisible();
   });
 
+  // The badge's emoji is not a value this client picked: it came back on the
+  // message the server sent, and the server validates it again on the toggle.
+  // The lazy catalog is a picker's index, so whether it happens to be in memory
+  // must not decide whether an existing reaction can be joined (issue #496).
+  it("allows toggling an existing server reaction before the lazy catalog has loaded", async () => {
+    resetEmojiCatalogCache();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🏳️‍🌈", count: 1, reactedByMe: false, users: [] }],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const badge = await screen.findByRole("button", { name: "Adicionar reação 🏳️‍🌈" });
+    // The reproduction depends on this: nothing has loaded the chunk, so the
+    // catalog cannot answer for an emoji outside the server's quick row.
+    expect(isCatalogedEmoji("🏳️‍🌈")).toBe(false);
+    await userEvent.click(badge);
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "🏳️‍🌈");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
+  it("toggles the same existing reaction once the catalog is loaded", async () => {
+    resetEmojiCatalogCache();
+    await loadEmojiCatalog();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          id: "m1",
+          reactions: [{ emoji: "🏳️‍🌈", count: 2, reactedByMe: true, users: [] }],
+        }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Remover reação 🏳️‍🌈" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "🏳️‍🌈");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
+  it("toggles a quick reaction before the lazy catalog has loaded", async () => {
+    resetEmojiCatalogCache();
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+
+    expect(isCatalogedEmoji("👍")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+    expect(screen.queryByText("Emoji não permitido para reações.")).toBeNull();
+  });
+
   // A use is what the reader chose *here* and the server confirmed, so the
   // reaction has to start as a local toggle: an event with no intent behind it
   // came from somewhere else and does not shape this client's history (#496).
@@ -3073,21 +3157,38 @@ describe("ChatMessageArea — message list", () => {
     expect(badge).toHaveAccessibleDescription("👍: Você e Bruna");
   });
 
-  it("rejects a reaction whose bytes do not match the server allowlist", async () => {
-    mockFetchChannelMessages.mockResolvedValue(
-      messagePage([
-        makeMessage({
-          id: "m1",
-          reactions: [{ emoji: "❤", count: 1, reactedByMe: false, users: [] }],
-        }),
-      ]),
+  // Whether a reaction may exist is the server's decision, and nothing this
+  // client draws can pre-empt it: the toggle below is as legitimate as one gets
+  // — the server's own quick row — and the server still refuses it. What the
+  // reader must not be left with is the reaction they never got: the optimistic
+  // badge goes away again and the refusal is read.
+  it("rolls the optimistic reaction back when the server refuses the toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    fireEvent.mouseEnter(await screen.findByTestId("chat-msg-bubble"));
+    expect(screen.queryByRole("button", { name: /reação 👍/ })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Reagir rapidamente com 👍" }));
+    expect(wsMockState.toggleReaction).toHaveBeenCalledWith("m1", "👍");
+
+    // Drawn before any confirmation: that is the whole point of the optimism,
+    // and the whole reason a refusal has to undo it.
+    const optimistic = await screen.findByRole("button", { name: "Remover reação 👍" });
+    expect(optimistic).toHaveAttribute("aria-pressed", "true");
+    expect(optimistic).toHaveTextContent("1");
+
+    act(() =>
+      wsMockState.capturedReactionError?.({
+        type: "error",
+        operation: "reaction",
+        code: "invalid_emoji",
+      }),
     );
-    renderChannelArea();
 
-    await userEvent.click(await screen.findByRole("button", { name: "Adicionar reação ❤" }));
-
-    expect(wsMockState.toggleReaction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent(/emoji não permitido/i);
+    // The reaction only ever existed locally, so back to confirmed state is back
+    // to no badge at all — not a badge showing zero.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /reação 👍/ })).toBeNull());
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível atualizar a reação.");
   });
 
   it("renders N reactions and toggles an existing pill without opening the grid", async () => {
@@ -4420,6 +4521,100 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
 // ── Stale response guard ──────────────────────────────────────────────────────
 
 describe("ChatMessageArea — stale response guard", () => {
+  it("focuses the new composer only after the switched conversation finishes loading", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)));
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    const channel1Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel1Input).toHaveFocus());
+
+    const switchButton = screen.getByRole("button", { name: "Ir para canal 2" });
+    await user.click(switchButton);
+
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    expect(channel2Input).not.toBe(channel1Input);
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    expect(switchButton).toHaveFocus();
+
+    const focus = vi.spyOn(channel2Input, "focus");
+    await act(async () => resolveChannel2(emptyPage));
+
+    await waitFor(() => expect(channel2Input).toHaveFocus());
+    expect(focus).toHaveBeenCalledOnce();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it("allows only the final composer to autofocus during a rapid conversation switch", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    let resolveChannel3!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel3 = resolve)));
+
+    function ThreeChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <button onClick={() => navigate("/chat/channel/canal-3")}>Ir para canal 3</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <ThreeChannelTest />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("chat-composer-input")).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    const channel2Focus = vi.spyOn(channel2Input, "focus");
+
+    const channel3Button = screen.getByRole("button", { name: "Ir para canal 3" });
+    await user.click(channel3Button);
+    const channel3Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel3Input).toHaveAttribute("aria-disabled", "true"));
+    const channel3Focus = vi.spyOn(channel3Input, "focus");
+
+    await act(async () => resolveChannel2(emptyPage));
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Button).toHaveFocus();
+
+    await act(async () => resolveChannel3(emptyPage));
+    await waitFor(() => expect(channel3Input).toHaveFocus());
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Focus).toHaveBeenCalledOnce();
+  });
+
   it("response for old target does not render when target changes", async () => {
     const user = userEvent.setup();
 
@@ -4453,6 +4648,9 @@ describe("ChatMessageArea — stale response guard", () => {
 
     // Switch to canal-2 while canal-1 is still loading.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
 
     // Now let canal-1's stale request resolve.
     resolveChannel1!(messagePage([makeMessage({ bodyText: "Mensagem do canal 1" })]));
@@ -4594,11 +4792,15 @@ describe("ChatMessageArea — stale response guard", () => {
     // Navigate to canal-2 while the POST for canal-1 is still in-flight. The
     // composer is keyed by target, so canal-1's draft is destroyed with it.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
 
     // Resolve the stale POST for canal-1 — should return { status: "stale" }.
     await act(async () => {
       resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
     });
+
+    expect(currentInput).toHaveFocus();
 
     // Canal-1's draft must never surface in canal-2 — neither in the composer
     // nor in the timeline — and the stale completion must not touch either.
@@ -5124,6 +5326,10 @@ function ParentWithContext({ ctx }: { ctx: ChatOutletContext }) {
   );
 }
 
+function CurrentPath() {
+  return <span data-testid="current-path">{useLocation().pathname}</span>;
+}
+
 // ── Message alignment ─────────────────────────────────────────────────────────
 
 describe("ChatMessageArea — message alignment", () => {
@@ -5224,6 +5430,434 @@ describe("ChatMessageArea — sender display", () => {
     await waitFor(() => {
       expect(screen.getByTestId("chat-msg-sender")).toHaveTextContent("abcdef12");
     });
+  });
+
+  it("renders another sender name as an accessible DM action", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    expect(sender).toHaveAttribute("type", "button");
+    sender.focus();
+    expect(sender).toHaveFocus();
+  });
+
+  it("opens the canonical DM from the sender id, refreshes sidebar, and navigates", async () => {
+    const refreshConversations = vi.fn();
+    mockGetOrCreateDirectDM.mockResolvedValue({
+      conversationId: "dm/with space",
+      created: false,
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <CurrentPath />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    );
+
+    await waitFor(() => expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("other-456", expect.any(AbortSignal));
+    await waitFor(() => expect(refreshConversations).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent(
+      "/chat/dm/dm%2Fwith%20space",
+    );
+  });
+
+  it("keyboard activation opens a DM", async () => {
+    const user = userEvent.setup();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+    sender.focus();
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith("other-456", expect.any(AbortSignal)),
+    );
+  });
+
+  it("coalesces rapid repeated opens per recipient and communicates pending state", async () => {
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const sender = await screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+    fireEvent.click(sender);
+    fireEvent.click(sender);
+
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+    expect(sender).toHaveAttribute("aria-busy", "true");
+    expect(sender).toBeDisabled();
+
+    resolveOpen({ conversationId: "dm-456", created: true });
+    await waitFor(() => expect(sender).not.toBeDisabled());
+  });
+
+  it("allows independent pending opens for different recipients", async () => {
+    mockGetOrCreateDirectDM.mockImplementation(() => new Promise(() => {}));
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "msg-fernanda", senderId: "user-1", senderDisplayName: "Fernanda" }),
+        makeMessage({ id: "msg-marcos", senderId: "user-2", senderDisplayName: "Marcos" }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const fernanda = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    const marcos = screen.getByRole("button", { name: "Abrir conversa com Marcos" });
+    fireEvent.click(fernanda);
+    fireEvent.click(marcos);
+
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(2);
+    expect(fernanda).toBeDisabled();
+    expect(marcos).toBeDisabled();
+  });
+
+  it("invalidates a pending author DM open when the reused area changes channel", async () => {
+    const refreshConversations = vi.fn();
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    let capturedSignal: AbortSignal | undefined;
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        resolveOpen = resolve;
+      });
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function SwitchChannel() {
+      const switchChannel = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => switchChannel("/chat/channel/B")}>
+            Trocar canal
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/A"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <SwitchChannel />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    const area = await screen.findByTestId("chat-message-area");
+    fireEvent.click(screen.getByRole("button", { name: "Abrir conversa com Fernanda" }));
+    fireEvent.click(screen.getByRole("button", { name: "Trocar canal" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-path")).toHaveTextContent("/chat/channel/B"),
+    );
+    expect(screen.getByTestId("chat-message-area")).toBe(area);
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-from-A", created: true });
+    });
+    expect(refreshConversations).not.toHaveBeenCalled();
+    expect(screen.getByTestId("current-path")).toHaveTextContent("/chat/channel/B");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps a new open registered when the invalidated operation settles late", async () => {
+    const refreshConversations = vi.fn();
+    const resolvers: Array<(value: { conversationId: string; created: boolean }) => void> = [];
+    const signals: AbortSignal[] = [];
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      if (signal) signals.push(signal);
+      return new Promise((resolve) => resolvers.push(resolve));
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function SwitchChannel() {
+      const switchChannel = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => switchChannel("/chat/channel/B")}>
+            Trocar canal
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/A"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <SwitchChannel />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    fireEvent.click(screen.getByRole("button", { name: "Trocar canal" }));
+    await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+
+    const senderInB = await screen.findByRole("button", {
+      name: "Abrir conversa com Fernanda",
+    });
+    fireEvent.click(senderInB);
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(2);
+    expect(senderInB).toBeDisabled();
+
+    await act(async () => {
+      resolvers[0]({ conversationId: "dm-from-A", created: true });
+    });
+    expect(senderInB).toBeDisabled();
+    expect(refreshConversations).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolvers[1]({ conversationId: "dm-from-B", created: true });
+    });
+    await waitFor(() => expect(refreshConversations).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent("/chat/dm/dm-from-B");
+  });
+
+  it("aborts a pending author DM open and skips refresh/navigation after unmount", async () => {
+    const refreshConversations = vi.fn();
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    let capturedSignal: AbortSignal | undefined;
+    mockGetOrCreateDirectDM.mockImplementation((_otherUserId, signal) => {
+      capturedSignal = signal;
+      return new Promise((resolve) => {
+        resolveOpen = resolve;
+      });
+    });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    function LeaveConversation() {
+      const navigateAway = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigateAway("/else")}>
+            Sair da conversa
+          </button>
+          <CurrentPath />
+        </>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <LeaveConversation />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+          <Route path="/else" element={<CurrentPath />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sair da conversa" }));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent("/else");
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-after-unmount", created: true });
+    });
+    expect(refreshConversations).not.toHaveBeenCalled();
+    expect(screen.getByTestId("current-path")).toHaveTextContent("/else");
+  });
+
+  it("keeps the current conversation usable after a generic open failure", async () => {
+    mockGetOrCreateDirectDM.mockRejectedValue(new ApiRequestError(403, "forbidden", "Forbidden"));
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "Fernanda",
+          bodyText: "mensagem atual",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("abrir a conversa");
+    expect(screen.getByText("mensagem atual")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Abrir conversa com Fernanda" })).toBeEnabled();
+  });
+
+  it("renders another sender name as a DM action in group DMs", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/group-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "group-1", type: "group", name: "Grupo", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not add the issue #445 author action inside an open 1:1 DM", async () => {
+    mockFetchDMMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/direct-1"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [
+                    {
+                      id: "direct-1",
+                      type: "1:1",
+                      name: "Fernanda",
+                      participants: [],
+                      counterpart: { userId: "other-456", displayName: "Fernanda" },
+                    },
+                  ],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("chat-msg-sender")).toHaveTextContent("Fernanda");
+    expect(
+      screen.queryByRole("button", { name: "Abrir conversa com Fernanda" }),
+    ).not.toBeInTheDocument();
   });
 
   it("own message does not show sender span", async () => {

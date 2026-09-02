@@ -105,6 +105,7 @@ const {
   mockFavoriteMessage,
   mockUnfavoriteMessage,
   mockPostChannelMessage,
+  mockPostDMMessage,
   mockEditMessage,
   mockDeleteMessage,
 } = vi.hoisted(() => ({
@@ -112,6 +113,8 @@ const {
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockPostChannelMessage:
     vi.fn<(id: string, body: string, parentMessageId?: string) => Promise<Message>>(),
+  mockPostDMMessage:
+    vi.fn<(id: string, body: string, options?: { bodyFormat?: "v2" | "v3" }) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
   mockReconcileMessageLinkSafety: vi.fn<
@@ -182,7 +185,8 @@ vi.mock("./chatApi", async (importOriginal) => ({
     mockResolveDMMessageReferences(id, messageIds, signal),
   postChannelMessage: (id: string, body: string, parentMessageId?: string) =>
     mockPostChannelMessage(id, body, parentMessageId),
-  postDMMessage: vi.fn(),
+  postDMMessage: (id: string, body: string, options?: { bodyFormat?: "v2" | "v3" }) =>
+    mockPostDMMessage(id, body, options),
   favoriteMessage: (id: string) => mockFavoriteMessage(id),
   unfavoriteMessage: (id: string) => mockUnfavoriteMessage(id),
   editMessage: (id: string, body: string, bodyFormat: number) =>
@@ -358,6 +362,47 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   clearTokens();
+});
+
+describe("useMessages — DM body format", () => {
+  it("posts group messages as v3", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockPostDMMessage.mockResolvedValue(makeMessage({ id: "group-message", bodyFormat: "v3" }));
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "dm",
+        targetId: "group-1",
+        currentUserId: "user-me",
+        bodyFormat: "v3",
+      }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.sendMessage("@[Ana](mention:user:user-1)"));
+
+    expect(mockPostDMMessage).toHaveBeenCalledWith(
+      "group-1",
+      "@[Ana](mention:user:user-1)",
+      expect.objectContaining({ bodyFormat: "v3" }),
+    );
+  });
+
+  it("keeps direct messages on v2 by default", async () => {
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockPostDMMessage.mockResolvedValue(makeMessage({ id: "direct-message", bodyFormat: "v2" }));
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.sendMessage("olá"));
+
+    expect(mockPostDMMessage).toHaveBeenCalledWith(
+      "dm-1",
+      "olá",
+      expect.objectContaining({ bodyFormat: "v2" }),
+    );
+  });
 });
 
 // ── WS integration tests ──────────────────────────────────────────────────────
