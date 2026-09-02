@@ -63,4 +63,22 @@ describe("MentionList", () => {
     expect(screen.getByText("check")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByRole("option", { name: /geral/ })).toHaveTextContent("#geral");
   });
+
+  it("does not crash on unmount when scrollIntoView returns a non-function value (issue #773)", () => {
+    // Element.prototype.scrollIntoView is global to the whole suite, so it
+    // must be restored even if an assertion below throws — never rely on a
+    // plain last-line reassignment for that.
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn(() => null);
+    Element.prototype.scrollIntoView = scrollIntoView as unknown as typeof originalScrollIntoView;
+
+    try {
+      const { unmount } = render(<MentionList items={items} command={vi.fn()} />);
+
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(() => unmount()).not.toThrow();
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
 });
