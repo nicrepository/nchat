@@ -287,40 +287,106 @@ describe("useChatEditor — useEffect guard", () => {
 // ── bodyFormat switch (CHAT-378) ──────────────────────────────────────────────
 
 type FormatProps = { bodyFormat: "v2" | "v3" };
+type TargetProps = FormatProps & {
+  mentionTarget?: { kind: "channel" | "dm"; id: string };
+};
 
 describe("useChatEditor — bodyFormat switch on the same mounted composer", () => {
   it("v2 → v3 rebuilds the editor and applies the mention channel", async () => {
     const { result, rerender } = renderHook(
-      (props: FormatProps) => useChatEditor({ ...defaults, ...props, channelId: "chan-1" }),
+      (props: FormatProps) =>
+        useChatEditor({
+          ...defaults,
+          ...props,
+          mentionTarget: { kind: "channel", id: "chan-1" },
+        }),
       { initialProps: { bodyFormat: "v2" } as FormatProps },
     );
     await waitForEditor(result);
     const v2Editor = result.current.editor;
-    expect(v2Editor!.storage.mentionChannelContext).toBeUndefined();
+    expect(v2Editor!.storage.mentionTargetContext).toBeUndefined();
 
     // Route change DM → channel: bodyFormat flips one render before useEditor
     // swaps the instance, so the effect must not assume the v3 command exists.
     rerender({ bodyFormat: "v3" });
 
     await waitFor(() =>
-      expect(result.current.editor?.storage.mentionChannelContext?.channelId).toBe("chan-1"),
+      expect(result.current.editor?.storage.mentionTargetContext?.target).toEqual({
+        kind: "channel",
+        id: "chan-1",
+      }),
     );
   });
 
   it("v3 → v2 rebuilds the editor without the mention extension", async () => {
     const { result, rerender } = renderHook(
-      (props: FormatProps) => useChatEditor({ ...defaults, ...props, channelId: "chan-1" }),
+      (props: FormatProps) =>
+        useChatEditor({
+          ...defaults,
+          ...props,
+          mentionTarget: { kind: "channel", id: "chan-1" },
+        }),
       { initialProps: { bodyFormat: "v2" } as FormatProps },
     );
     rerender({ bodyFormat: "v3" });
     await waitFor(() =>
-      expect(result.current.editor?.storage.mentionChannelContext?.channelId).toBe("chan-1"),
+      expect(result.current.editor?.storage.mentionTargetContext?.target).toEqual({
+        kind: "channel",
+        id: "chan-1",
+      }),
     );
 
     rerender({ bodyFormat: "v2" });
 
     await waitFor(() =>
-      expect(result.current.editor?.storage.mentionChannelContext).toBeUndefined(),
+      expect(result.current.editor?.storage.mentionTargetContext).toBeUndefined(),
+    );
+  });
+
+  it("updates channel and group targets, disables direct, then restores channel mentions", async () => {
+    const { result, rerender } = renderHook(
+      (props: TargetProps) => useChatEditor({ ...defaults, ...props }),
+      {
+        initialProps: {
+          bodyFormat: "v3",
+          mentionTarget: { kind: "channel", id: "channel-a" },
+        } as TargetProps,
+      },
+    );
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionTargetContext?.target).toEqual({
+        kind: "channel",
+        id: "channel-a",
+      }),
+    );
+    const v3Editor = result.current.editor;
+
+    rerender({ bodyFormat: "v3", mentionTarget: { kind: "channel", id: "channel-b" } });
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionTargetContext?.target.id).toBe("channel-b"),
+    );
+    expect(result.current.editor).toBe(v3Editor);
+
+    rerender({ bodyFormat: "v3", mentionTarget: { kind: "dm", id: "group-1" } });
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionTargetContext?.target).toEqual({
+        kind: "dm",
+        id: "group-1",
+      }),
+    );
+    expect(result.current.editor).toBe(v3Editor);
+
+    rerender({ bodyFormat: "v2", mentionTarget: undefined });
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionTargetContext).toBeUndefined(),
+    );
+
+    rerender({ bodyFormat: "v3", mentionTarget: { kind: "channel", id: "channel-a" } });
+    await waitFor(() =>
+      expect(result.current.editor?.storage.mentionTargetContext?.target).toEqual({
+        kind: "channel",
+        id: "channel-a",
+      }),
     );
   });
 });

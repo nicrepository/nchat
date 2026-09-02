@@ -39,4 +39,28 @@ describe("MentionList", () => {
     expect(ref.current?.onKeyDown({ key: "Escape" } as KeyboardEvent)).toBe(true);
     expect(ref.current?.onKeyDown({ key: "Enter" } as KeyboardEvent)).toBe(false);
   });
+
+  it("announces loading and error states", () => {
+    const { rerender } = render(<MentionList items={[]} command={vi.fn()} loadState="loading" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Carregando sugestões");
+
+    rerender(<MentionList items={[]} command={vi.fn()} loadState="error" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Não foi possível carregar sugestões");
+  });
+
+  it("groups people, channels and special options with a non-color selected marker", () => {
+    render(
+      <MentionList
+        items={[items[0], { mentionType: "channel", id: "channel-1", label: "geral" }, items[1]]}
+        command={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Pessoas")).toBeInTheDocument();
+    expect(screen.getByText("Canais")).toBeInTheDocument();
+    expect(screen.getByText("Especial")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Ana/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("check")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("option", { name: /geral/ })).toHaveTextContent("#geral");
+  });
 });

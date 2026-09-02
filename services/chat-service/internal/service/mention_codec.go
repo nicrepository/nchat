@@ -41,7 +41,7 @@ func mentionTokens(body string) []mentionToken {
 		contentEnd := contentStart + close
 		end := contentEnd + 1
 		parts := strings.Split(body[contentStart:contentEnd], ":")
-		if len(parts) != 3 || parts[0] != "mention" || (parts[1] != "user" && parts[1] != "channel") {
+		if len(parts) != 3 || parts[0] != "mention" || (parts[1] != "user" && parts[1] != "channel" && parts[1] != "all") {
 			continue
 		}
 		id, err := uuid.Parse(parts[2])
@@ -52,6 +52,15 @@ func mentionTokens(body string) []mentionToken {
 		start = end - 1
 	}
 	return tokens
+}
+
+func hasMentionKind(body, kind string) bool {
+	for _, token := range mentionTokens(body) {
+		if token.kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func escapedAt(body string, index int) bool {
