@@ -389,6 +389,104 @@
   margin-top: 18px;
 }
 
+/* ── Section collapse + unread-only controls (issue #779) ────────────────────
+   The label row now holds three things: the collapse button (which owns the
+   heading text), the unread conversation count, and the "show unread when
+   collapsed" switch. All three are siblings — never nested buttons. */
+
+.chat-sidebar__section-heading {
+  margin: 0;
+  min-width: 0;
+}
+
+.chat-sidebar__section-collapse {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.chat-sidebar__section-collapse:hover {
+  color: var(--cs-sidebar-text);
+}
+
+.chat-sidebar__section-collapse:focus-visible,
+.chat-sidebar__section-unread-toggle:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+.chat-sidebar__section-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.chat-sidebar__section-chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.chat-sidebar__section-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.chat-sidebar__section-unread-count {
+  min-width: 1rem;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--cs-sidebar-muted);
+}
+
+.chat-sidebar__section-unread-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--cs-sidebar-muted);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.chat-sidebar__section-unread-toggle:hover {
+  background: var(--cs-sidebar-hover);
+  color: var(--cs-sidebar-text);
+}
+
+/* State communicated by more than color: the icon itself is filled/stroked
+   the same either way, but aria-checked plus this stronger tint together with
+   the accessible name are what actually say "on". */
+.chat-sidebar__section-unread-toggle--on {
+  color: var(--cs-primary-soft);
+}
+
+.chat-sidebar__section-unread-icon {
+  width: 14px;
+  height: 14px;
+}
+
 /* ── Collapsible Categories (RF-17) ─────────────────────────────────────────── */
 
 .chat-sidebar__categories-list {
