@@ -166,6 +166,8 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // create request fingerprint
 			pgxmock.AnyArg(), // initial link safety state
 			pgxmock.AnyArg(), // aggregate attachment byte limit
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
 		).
 		WillReturnRows(rows)
 }
@@ -232,6 +234,8 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
+					pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+					pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
 				).
 				WillReturnError(dbErr)
 
@@ -578,7 +582,9 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(),  // mention_all_group_members (issue #776)
+					pgxmock.AnyArg()). // max_group_all_mention_recipients (issue #776 SR-002)
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -602,6 +608,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"22222222-2222-2222-2222-222222222222"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -622,6 +630,46 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 	checkExpectations(t, mock)
 }
 
+// SEC-776-01, pinned against the statement that actually runs rather than a
+// hand-copied mirror of it: the eligible-recipient CTE carries a LIMIT of one
+// past the bound, and the bound decision itself is an OFFSET/LIMIT existence
+// test over that already-capped set — never an aggregate over the roster.
+//
+// A regex over the real SQL is the right instrument here because the property
+// is a property of the query text: a CTE with LIMIT n cannot yield more than n
+// rows whatever the planner decides, so this holds independently of statistics,
+// version or configuration. The EXPLAIN in
+// message_all_mention_group_postgres_test.go covers the complementary
+// pre-flight path on a live planner.
+func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)eligible_all_mention_recipients AS \(.*`+
+		`LIMIT \$22::int \+ 1.*`+
+		`invalid_all_mention_fanout AS \(\s*SELECT 1\s*FROM eligible_all_mention_recipients\s*OFFSET \$22::int\s*LIMIT 1.*`+
+		`all_mention_recipients AS \(.*FROM eligible_all_mention_recipients`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			true,                                // mention_all_group_members
+			domain.MaxGroupAllMentionRecipients, // the bound, never a literal in SQL
+		).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-bounded", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
+
+	if _, err := storage.NewPGXMessageStore(mock).CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", DMConversationID: "33333333-3333-3333-3333-333333333333",
+		SenderID: "user-1", BodyText: "@all", BodyFormat: domain.MessageBodyFormatV3,
+		MentionAllGroupMembers: true,
+	}); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOutbox(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
@@ -634,6 +682,8 @@ func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOu
 			[]string{},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			false,            // mention_all_group_members: not set by this input (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -660,6 +710,8 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			[]string{"99999999-9999-9999-9999-999999999999"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
