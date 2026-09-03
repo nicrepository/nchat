@@ -281,7 +281,7 @@ describe("mentionExtension", () => {
     }
   });
 
-  it("does not invent @all for groups", async () => {
+  it("appends a synthetic @all candidate for a group DM query match (issue #776)", async () => {
     vi.useFakeTimers();
     try {
       mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
@@ -290,7 +290,28 @@ describe("mentionExtension", () => {
         storage: { mentionTargetContext: { target: { kind: "dm", id: "group-1" } } },
       };
 
-      const pending = suggestion.items({ query: "", editor });
+      const pending = suggestion.items({ query: "al", editor });
+      await vi.advanceTimersByTimeAsync(150);
+
+      await expect(pending).resolves.toEqual([
+        { mentionType: "user", id: "user-1", label: "Ana" },
+        { mentionType: "all", id: "00000000-0000-0000-0000-000000000000", label: "all" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not offer @all for a group DM once the query no longer matches it", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.fetch.mockResolvedValue([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+      const suggestion = options().suggestion;
+      const editor = {
+        storage: { mentionTargetContext: { target: { kind: "dm", id: "group-1" } } },
+      };
+
+      const pending = suggestion.items({ query: "ana", editor });
       await vi.advanceTimersByTimeAsync(150);
 
       await expect(pending).resolves.toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);

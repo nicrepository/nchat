@@ -395,6 +395,89 @@ describe("ChatComposer mentions", () => {
     expect(container.querySelector(".rtr-mention")).toHaveTextContent("@Juliane Lino");
   });
 
+  it("offers @all for a group and selects it by mouse (issue #776)", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "33333333-3333-3333-3333-333333333333", label: "Juliane Lino" },
+    ]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@all", { skipClick: true });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: "all" }));
+
+    expect(input.querySelector(".chat-mention")).toHaveTextContent("@all");
+    const stored = await send(onSend);
+    expect(stored).toBe(`@[all](mention:all:${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)})`);
+
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v3" />);
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@all");
+  });
+
+  it("selects @all by Enter and does not crash on unmount (regression #773)", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    const { unmount } = render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@all", { skipClick: true });
+    await screen.findByRole("option", { name: "all" });
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(input.querySelector(".chat-mention")).toHaveTextContent("@all"));
+    expect(() => unmount()).not.toThrow();
+  });
+
+  it("does not offer channel references in a group's autocomplete", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "user-1", label: "Ana" },
+    ]);
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    await screen.findByRole("option", { name: /Ana/ });
+    expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
+      { kind: "dm", id: "group-1" },
+      "",
+      expect.any(AbortSignal),
+    );
+    // The server-side "dm" mentions search never returns channel candidates
+    // (mention_service.go), and this list has none to filter — the assertion
+    // is that @all (client-synthesized) and the fetched user are the only
+    // options, with no "#" channel row.
+    expect(screen.queryByText("#")).toBeNull();
+  });
+
   it("keeps direct DMs on v2 without mention autocomplete", async () => {
     mockFetchMentionCandidates.mockClear();
     render(
