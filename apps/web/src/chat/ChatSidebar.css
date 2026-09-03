@@ -397,6 +397,12 @@
 .chat-sidebar__section-heading {
   margin: 0;
   min-width: 0;
+  /* `h2` gets explicit font-size/font-weight from the browser's own
+     stylesheet, which inheriting alone cannot override — this is what let the
+     heading render at the browser's default size/weight instead of the
+     sidebar's. letter-spacing, text-transform and color remain inherited from
+     `.chat-sidebar__section-label` as before. */
+  font: inherit;
 }
 
 .chat-sidebar__section-collapse {
