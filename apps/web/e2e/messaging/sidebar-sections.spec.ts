@@ -873,6 +873,10 @@ test.describe("sidebar — seções recolhíveis e filtro de não lidas", () => 
 
     // Expandida + unread ligado: a opção não filtra nada.
     await toggle.click();
+    // O clique realmente alternou o estado — se o toggle voltar a ser no-op
+    // (por exemplo, workspaceId vazio no fixture), o teste falha aqui, no
+    // ponto exato da causa, em vez de mais adiante numa asserção de conteúdo.
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
     await expect(optionsIn(page, "Canais")).toHaveCount(2);
 
     // Recolhida + unread ligado: só o canal com não lidas aparece.
