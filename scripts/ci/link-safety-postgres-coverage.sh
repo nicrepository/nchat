@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Coverage for the RF-21 Link Safety tests that need a real PostgreSQL.
+# Coverage for the chat/file tests that need a real PostgreSQL.
+#
+# Originally the RF-21 Link Safety suite, now also issue #741's notification
+# outbox suite: both prove properties only a database can hold — atomicity across
+# one statement, and a unique index deciding what counts as the same event.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -49,6 +53,40 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      TestNotificationOutboxCommitsWithMessagePostgreSQL
+      TestNotificationOutboxRowContractPostgreSQL
+      TestNotificationOutboxStoresNoMessageBodyPostgreSQL
+      TestNotificationOutboxRetryCreatesNoDuplicatePostgreSQL
+      TestNotificationOutboxDedupeIndexRefusesDuplicatesPostgreSQL
+      TestNotificationOutboxRollsBackWithMessagePostgreSQL
+      TestNotificationOutboxFailureTakesTheMessageWithItPostgreSQL
+      TestNotificationOutboxConcurrentCreateStaysSinglePostgreSQL
+      TestNotificationOutboxSurvivesRestartPostgreSQL
+      TestNotificationOutboxIsolatedByWorkspacePostgreSQL
+      TestNotificationOutboxClassifiesEachRecipientOncePostgreSQL
+      TestNotificationOutboxNotifiesTheAnsweredAuthorPostgreSQL
+      TestNotificationOutboxDoesNotFanOutChannelMessagesPostgreSQL
+      TestNotificationOutboxSkipsRecipientsWhoLostAccessPostgreSQL
+      TestNotificationOutboxWalksToDeliveredPostgreSQL
+      TestNotificationOutboxSuppressionIsTerminalPostgreSQL
+      TestNotificationOutboxTriggerRefusesDirectTerminalEscapePostgreSQL
+      TestNotificationOutboxTriggerRefusesSkippedStepsPostgreSQL
+      TestNotificationOutboxConcurrentTransitionHasOneWinnerPostgreSQL
+      TestNotificationOutboxSuppressedReasonIsBoundedPostgreSQL
+      TestNotificationOutboxSuppressedReasonPairingPostgreSQL
+      TestNotificationOutboxRefusesUndeclaredValuesPostgreSQL
+      TestNotificationOutboxStoresHistoricalOriginsPostgreSQL
+      TestNotificationOutboxLeavesUnreadIndependentPostgreSQL
+      TestNotificationOutboxParksClassifiedRecipientsPostgreSQL
+      TestNotificationOutboxPromotedFromLinkScanPostgreSQL
+      TestNotificationOutboxPromotionKeepsTheOriginalInstantPostgreSQL
+      TestNotificationOutboxPromotionRetryCreatesNoDuplicatePostgreSQL
+      TestNotificationOutboxPromotionIsAtomicPostgreSQL
+      TestNotificationOutboxPromotesToPublicChannelReaderPostgreSQL
+      TestNotificationOutboxPromotesDirectConversationPostgreSQL
+      TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
+      TestNotificationOutboxMigrationRoundTripPostgreSQL
+      TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
     )
     ;;
   services/file-service)
