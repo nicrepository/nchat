@@ -1143,9 +1143,14 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	// bound decision can act on, so the database stops looking at 51 and an
 	// enormous group costs no more to judge than a barely-oversized one. The
 	// value that comes back saturates there and is never the group's real size.
+	//
+	// senderID is passed because the count must exclude them: #741's
+	// notification_recipients notifies nobody of their own message, so counting
+	// the author here would refuse a group of the author plus exactly the bound
+	// in others — a send whose @all reaches exactly the bound.
 	if mentions.AllMention {
 		eligible, err := s.messages.CountEligibleAllMentionRecipientsUpTo(
-			ctx, workspaceID, conversationID, domain.MaxGroupAllMentionRecipients+1,
+			ctx, workspaceID, conversationID, senderID, domain.MaxGroupAllMentionRecipients+1,
 		)
 		if err != nil {
 			return domain.Message{}, fmt.Errorf("count eligible all-mention recipients: %w", err)

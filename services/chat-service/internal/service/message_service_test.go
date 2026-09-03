@@ -67,6 +67,7 @@ type fakeMessageStore struct {
 	eligibleAllMentionRecipientsErr error
 	countEligibleCalls              int
 	lastCountEligibleDMID           string
+	lastCountEligibleSender         string
 	lastCountEligibleLimit          int
 	editedMessage                   domain.Message
 	editErr                         error
@@ -643,9 +644,10 @@ func (f *fakeMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, 
 // CountEligibleAllMentionRecipientsUpTo saturates like the real store does, so
 // a test setting eligibleAllMentionRecipients to a number far above the bound
 // still sees what production would see: the ceiling, never the true size.
-func (f *fakeMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, dmConversationID string, limit int) (int, error) {
+func (f *fakeMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, dmConversationID, senderID string, limit int) (int, error) {
 	f.countEligibleCalls++
 	f.lastCountEligibleDMID = dmConversationID
+	f.lastCountEligibleSender = senderID
 	f.lastCountEligibleLimit = limit
 	if f.eligibleAllMentionRecipientsErr != nil {
 		return 0, f.eligibleAllMentionRecipientsErr

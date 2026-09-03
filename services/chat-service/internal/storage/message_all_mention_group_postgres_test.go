@@ -199,7 +199,33 @@ func TestPGXMessageStore_AllMentionGroupRecipientsPostgreSQL(t *testing.T) {
 		return got
 	}
 
-	t.Run("@all notifies active authorized members only, sender included", func(t *testing.T) {
+	// classifiedRecipients is every notification row a message produced, as
+	// "recipient|kind|priority". It exists for the #776 × #741 intersection:
+	// the questions that matter once both features are in are which
+	// classification a recipient ended up with and how many rows they got, not
+	// merely whether a mention exists.
+	classifiedRecipients := func(t *testing.T, messageID string) []string {
+		t.Helper()
+		rows, err := pool.Query(ctx,
+			`SELECT recipient_user_id::text || '|' || kind || '|' || priority
+			 FROM chat.notification_outbox
+			 WHERE message_id = $1 ORDER BY recipient_user_id`, messageID)
+		if err != nil {
+			t.Fatalf("query notification_outbox: %v", err)
+		}
+		defer rows.Close()
+		var got []string
+		for rows.Next() {
+			var row string
+			if err := rows.Scan(&row); err != nil {
+				t.Fatalf("scan classified recipient: %v", err)
+			}
+			got = append(got, row)
+		}
+		return got
+	}
+
+	t.Run("@all mentions active authorized members only, never the author", func(t *testing.T) {
 		msg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
 			WorkspaceID: workspace, DMConversationID: group, SenderID: sender,
 			Kind:                   domain.MessageKindUser,
@@ -211,9 +237,55 @@ func TestPGXMessageStore_AllMentionGroupRecipientsPostgreSQL(t *testing.T) {
 			t.Fatalf("CreateMessage: %v", err)
 		}
 		got := mentionRecipients(t, msg.ID)
-		want := []string{sender, active1, active2}
+		want := []string{active1, active2}
 		if !sameSet(got, want) {
 			t.Fatalf("recipients = %v, want %v (no removed member, no suspended workspace member, no other group's member, no cross-workspace member, no deleted account)", got, want)
+		}
+	})
+
+	// The #776 × #741 intersection, stated as one assertion over every row the
+	// send produced.
+	//
+	// This group holds, besides the author: two fully eligible members, one
+	// whose workspace membership is suspended, one whose account is deleted,
+	// and one who belongs to another workspace entirely. All five are active
+	// dm_members, so #741's direct_message rule reaches all five; #776's @all
+	// reaches only the two eligible ones.
+	//
+	// What must come out is one row per recipient, never two, with the
+	// strongest classification winning: the eligible pair are notified as
+	// mention/high because @all named them, and the three the @all policy
+	// excludes are still notified — as direct_message/normal, exactly as they
+	// would be for any ordinary message in this conversation. Being ineligible
+	// for @all removes the mention, not the conversation.
+	t.Run("@all classifies eligible members as mention and leaves everyone else on direct_message", func(t *testing.T) {
+		msg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
+			WorkspaceID: workspace, DMConversationID: group, SenderID: sender,
+			Kind:                   domain.MessageKindUser,
+			BodyText:               `@[all](mention:all:00000000-0000-0000-0000-000000000000)`,
+			BodyFormat:             domain.MessageBodyFormatV3,
+			MentionAllGroupMembers: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateMessage: %v", err)
+		}
+		got := classifiedRecipients(t, msg.ID)
+		want := []string{
+			active1 + "|mention|high",
+			active2 + "|mention|high",
+			suspendedWS + "|direct_message|normal",
+			deletedUser + "|direct_message|normal",
+			foreignMember + "|direct_message|normal",
+		}
+		if !sameSet(got, want) {
+			t.Fatalf("rows = %v, want %v — one row per recipient, mention winning over direct_message, and no @all-ineligible member upgraded to mention",
+				got, want)
+		}
+		// The author is in none of them: #741 notifies nobody of their own message.
+		for _, row := range got {
+			if strings.HasPrefix(row, sender+"|") {
+				t.Fatalf("the author must not be notified of their own @all: %v", got)
+			}
 		}
 	})
 
@@ -230,10 +302,19 @@ func TestPGXMessageStore_AllMentionGroupRecipientsPostgreSQL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateMessage: %v", err)
 		}
-		got := mentionRecipients(t, msg.ID)
-		want := []string{sender, active1, active2}
+		// active1 is reached three ways at once — by @all, by name, and by being
+		// in the conversation — and must come out as exactly one row, carrying
+		// the strongest of the three classifications.
+		got := classifiedRecipients(t, msg.ID)
+		want := []string{
+			active1 + "|mention|high",
+			active2 + "|mention|high",
+			suspendedWS + "|direct_message|normal",
+			deletedUser + "|direct_message|normal",
+			foreignMember + "|direct_message|normal",
+		}
 		if !sameSet(got, want) {
-			t.Fatalf("recipients = %v, want %v (deduplicated)", got, want)
+			t.Fatalf("rows = %v, want %v (deduplicated to one row per recipient)", got, want)
 		}
 	})
 
@@ -255,7 +336,7 @@ func TestPGXMessageStore_AllMentionGroupRecipientsPostgreSQL(t *testing.T) {
 			t.Fatalf("expected ErrCreateReplay on retry, got %v", err)
 		}
 		got := mentionRecipients(t, first.ID)
-		want := []string{sender, active1, active2}
+		want := []string{active1, active2}
 		if !sameSet(got, want) {
 			t.Fatalf("recipients after retry = %v, want %v (no duplicates)", got, want)
 		}
@@ -486,9 +567,12 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 
 	allMentionBody := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
 
-	t.Run("A: exactly the bound (50 eligible, sender included) is accepted", func(t *testing.T) {
+	// The bound counts the people an @all notifies, and #741 notifies nobody of
+	// their own message, so "exactly the bound" is the author plus that many
+	// others — all of whom are notified — not the author counted among them.
+	t.Run("A: exactly the bound (50 notified members, author excluded) is accepted", func(t *testing.T) {
 		workspaceID, senderID, groupID := newFixture(t)
-		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients-1) // + sender = 50
+		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients) // author + 50 notified
 		msg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
 			WorkspaceID: workspaceID, DMConversationID: groupID, SenderID: senderID,
 			Kind:                   domain.MessageKindUser,
@@ -504,9 +588,9 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 		}
 	})
 
-	t.Run("B: one over the bound (51 eligible) is rejected with zero fan-out", func(t *testing.T) {
+	t.Run("B: one over the bound (51 notified members) is rejected with zero fan-out", func(t *testing.T) {
 		workspaceID, senderID, groupID := newFixture(t)
-		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients) // + sender = 51
+		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients+1) // author + 51 notified
 		before := countMessages(t, workspaceID)
 		_, err := store.CreateMessage(ctx, storage.CreateMessageInput{
 			WorkspaceID: workspaceID, DMConversationID: groupID, SenderID: senderID,
@@ -529,11 +613,11 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 		}
 	})
 
-	t.Run("C: 51 raw members but only 50 eligible (one deleted account) is accepted", func(t *testing.T) {
+	t.Run("C: more raw members than the bound but only 50 eligible (one deleted account) is accepted", func(t *testing.T) {
 		workspaceID, senderID, groupID := newFixture(t)
-		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients-1) // + sender = 50 eligible
-		// A 51st member, present in the raw roster but not in the count: an
-		// active dm_member whose account is deleted.
+		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients) // author + 50 eligible
+		// One more member, present in the raw roster but not in the @all count:
+		// an active dm_member whose account is deleted.
 		deleted := uuid.NewString()
 		for _, s := range []struct {
 			sql  string
@@ -551,8 +635,11 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM chat.dm_members WHERE conversation_id = $1 AND status = 'active'`, groupID).Scan(&rawMembers); err != nil {
 			t.Fatalf("count raw members: %v", err)
 		}
-		if rawMembers != domain.MaxGroupAllMentionRecipients+1 {
-			t.Fatalf("raw active dm_members = %d, want %d (fixture bug)", rawMembers, domain.MaxGroupAllMentionRecipients+1)
+		// author + 50 eligible + 1 deleted account: more raw members than the
+		// bound, and more than the bound even after removing the author, so only
+		// the eligibility filter can be what brings it back under.
+		if rawMembers != domain.MaxGroupAllMentionRecipients+2 {
+			t.Fatalf("raw active dm_members = %d, want %d (fixture bug)", rawMembers, domain.MaxGroupAllMentionRecipients+2)
 		}
 
 		msg, err := store.CreateMessage(ctx, storage.CreateMessageInput{
@@ -612,11 +699,11 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 	// answers with the ceiling it was given, never the roster's real size, so
 	// the work it costs is bounded by that ceiling rather than by the group.
 	t.Run("E: the pre-flight count saturates at the ceiling it is given", func(t *testing.T) {
-		workspaceID, _, groupID := newFixture(t)
+		workspaceID, senderID, groupID := newFixture(t)
 		addEligibleMembers(t, workspaceID, groupID, domain.MaxGroupAllMentionRecipients*3)
 
 		ceiling := domain.MaxGroupAllMentionRecipients + 1
-		got, err := store.CountEligibleAllMentionRecipientsUpTo(ctx, workspaceID, groupID, ceiling)
+		got, err := store.CountEligibleAllMentionRecipientsUpTo(ctx, workspaceID, groupID, senderID, ceiling)
 		if err != nil {
 			t.Fatalf("CountEligibleAllMentionRecipientsUpTo: %v", err)
 		}
@@ -627,11 +714,14 @@ func TestPGXMessageStore_AllMentionGroupFanoutBoundPostgreSQL(t *testing.T) {
 
 		// And under the ceiling it is still exact, which is what makes the
 		// comparison against the bound meaningful rather than merely safe.
-		smallWorkspace, _, smallGroup := newFixture(t)
-		addEligibleMembers(t, smallWorkspace, smallGroup, 2) // + sender = 3
-		exact, err := store.CountEligibleAllMentionRecipientsUpTo(ctx, smallWorkspace, smallGroup, ceiling)
-		if err != nil || exact != 3 {
-			t.Fatalf("count = %d err=%v, want exactly 3 below the ceiling", exact, err)
+		// Exactly the members other than the author: #741 notifies nobody of
+		// their own message, so the author is not one of the recipients the
+		// bound is about.
+		smallWorkspace, smallSender, smallGroup := newFixture(t)
+		addEligibleMembers(t, smallWorkspace, smallGroup, 2) // sender + 2, of whom 2 are notified
+		exact, err := store.CountEligibleAllMentionRecipientsUpTo(ctx, smallWorkspace, smallGroup, smallSender, ceiling)
+		if err != nil || exact != 2 {
+			t.Fatalf("count = %d err=%v, want exactly 2 (the members other than the author)", exact, err)
 		}
 	})
 

@@ -145,7 +145,7 @@ func (s *integMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _,
 	return map[string]string{}, nil
 }
 
-func (s *integMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, _ string, _ int) (int, error) {
+func (s *integMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, _, _ string, _ int) (int, error) {
 	return 0, nil
 }
 
