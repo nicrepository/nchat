@@ -39,13 +39,14 @@ while IFS= read -r module; do
     exit 1
   fi
 
-  # The RF-21 Link Safety tests only run against a real PostgreSQL, so the run
+  # The RF-21 Link Safety tests, issue #741's notification outbox suite and issue
+  # #742's worker claim suite only run against a real PostgreSQL, so the run
   # above skips them and the code they exercise counts as uncovered. When a
   # database is offered they are measured separately and merged in, and the same
   # threshold then applies to the whole. See the helper for why this DSN is not
   # exported into the run above.
   case "$module" in
-    services/chat-service | services/file-service)
+    services/chat-service | services/file-service | services/notification-service)
       if [ -n "${LINK_SAFETY_TEST_DATABASE_URL:-}" ]; then
         postgres_profile="$COVERAGE_DIR/${safe_module}.postgres.out"
         merged_profile="$COVERAGE_DIR/${safe_module}.merged.out"

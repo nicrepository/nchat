@@ -253,6 +253,18 @@
 
 /* ── Message list ────────────────────────────────────────────────────────────── */
 
+/*
+  #492: positioning wrapper for the scroll container, so the floating
+  "Ir para o final" button can be pinned near the bottom of the visible
+  viewport (position: absolute) without scrolling away with the list.
+*/
+.chat-msg-area__list-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 .chat-msg-area__list {
   flex: 1;
   overflow-y: auto;
@@ -261,8 +273,81 @@
   flex-direction: column;
   gap: 4px;
   min-height: 0;
-  /* Smooth scroll when new messages arrive */
-  scroll-behavior: smooth;
+  /*
+    #492: no blanket smooth scroll — every scroll-behavior::"smooth" | "auto"
+    is now explicit in JS at the call site (ChatMessageArea.tsx), because a
+    blanket rule here would make ordinary scrollTop assignments (prepend
+    compensation, instant positioning) animate too, which is exactly the
+    "auto-scroll on open" bug this issue fixes.
+  */
+}
+
+/* ── New-messages separator (#492) ───────────────────────────────────────────── */
+
+.chat-msg-area__new-messages-divider {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-primary, #6d28d9);
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 10px 0;
+}
+
+.chat-msg-area__new-messages-divider::before,
+.chat-msg-area__new-messages-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-primary-tint-strong, #e6d7f7);
+}
+
+/* ── Go-to-bottom button (#492) ──────────────────────────────────────────────── */
+
+.chat-msg-area__scroll-bottom-btn {
+  position: absolute;
+  right: 20px;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 9999px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.12));
+  cursor: pointer;
+}
+
+.chat-msg-area__scroll-bottom-btn:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+.chat-msg-area__scroll-bottom-btn:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__scroll-bottom-badge {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The scroll itself is already forced instant in JS (prefersReducedMotion()
+     in ChatMessageArea.tsx) — this only removes the button's own hover/focus
+     transition, matching every other reduced-motion block in this file. */
+  .chat-msg-area__scroll-bottom-btn {
+    transition: none;
+  }
 }
 
 /* ── Day divider ─────────────────────────────────────────────────────────────── */

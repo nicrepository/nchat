@@ -75,6 +75,20 @@ import {
   initialsFrom,
   senderLabel,
 } from "./messageDisplay";
+import {
+  findFirstUnreadBoundary,
+  formatPendingCount,
+  goToBottomAccessibleName,
+  isEligibleUnreadMessage,
+  isNearBottom,
+  MAX_BOUNDARY_SEARCH_PAGES,
+  type ViewportPhase,
+} from "./chatViewportState";
+import {
+  loadViewportAnchor,
+  saveViewportAnchor,
+  type ViewportAnchor,
+} from "./chatViewportPersistence";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -498,15 +512,72 @@ function EmptyState({ kind, name }: EmptyStateProps) {
 }
 
 /**
- * Scrolls the timeline to its newest message.
+ * Scrolls the timeline to its newest message with an explicit behavior —
+ * never a default, so every call site states whether this is an instant
+ * positioning (open, restore, first-unread) or an animated one (explicit user
+ * action / own-send). #492: smooth scrolling must never happen just because a
+ * conversation opened.
  *
  * The capability check is for jsdom, which implements no layout and therefore no
  * scrollIntoView; a test asserting on message order must not fail on it.
  */
-function scrollToBottom(bottomRef: RefObject<HTMLDivElement | null>): void {
+function scrollToBottom(
+  bottomRef: RefObject<HTMLDivElement | null>,
+  behavior: ScrollBehavior,
+): void {
   if (typeof bottomRef.current?.scrollIntoView === "function") {
-    bottomRef.current.scrollIntoView({ behavior: "smooth" });
+    bottomRef.current.scrollIntoView({ behavior });
   }
+}
+
+/** #492: reduced motion always wins over an explicit animated scroll. */
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+/** The behavior an explicit user-triggered scroll (button, own-send) should use. */
+function explicitScrollBehavior(): ScrollBehavior {
+  return prefersReducedMotion() ? "auto" : "smooth";
+}
+
+/**
+ * The floating "Ir para o final" action (#492). A real <button>, reachable
+ * and Enter/Space-operable for free — no bespoke keyboard handling needed.
+ * The accessible name alone carries the pending count so a screen reader
+ * announces it as part of the control's name rather than as a live region
+ * that would fire on every increment.
+ */
+function ScrollToBottomButton({
+  visible,
+  pendingCount,
+  onClick,
+}: {
+  visible: boolean;
+  pendingCount: number;
+  onClick: () => void;
+}) {
+  if (!visible) return null;
+  return (
+    <button
+      type="button"
+      className="chat-msg-area__scroll-bottom-btn"
+      aria-label={goToBottomAccessibleName(pendingCount)}
+      title="Ir para o final"
+      onClick={onClick}
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        arrow_downward
+      </span>
+      {pendingCount > 0 && (
+        <span className="chat-msg-area__scroll-bottom-badge" aria-hidden="true">
+          {formatPendingCount(pendingCount)}
+        </span>
+      )}
+    </button>
+  );
 }
 
 interface MessageListProps {
@@ -548,6 +619,16 @@ interface MessageListProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId?: string;
+  /** #492: `${kind}:${targetId}` — keys the per-conversation viewport anchor. */
+  conversationKey: string;
+  /** #492: the sidebar's unread_count for this target as of opening it. */
+  unreadCountAtOpen: number;
+  /** #492: the anchor this conversation was left at, if any (own in-memory cache, then sessionStorage). */
+  initialAnchor: ViewportAnchor | null;
+  /** #492: called on unmount (leaving the conversation) with the current anchor. */
+  onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
+  /** #492: called once the bottom sentinel confirms the real tail was reached. */
+  onReachedBottom: () => void;
 }
 
 function MessageList({
@@ -579,11 +660,21 @@ function MessageList({
   emojiUsage,
   onEmojiToneChange,
   focusMessageId,
+  conversationKey,
+  unreadCountAtOpen,
+  initialAnchor,
+  onCaptureAnchor,
+  onReachedBottom,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef(new Map<string, HTMLDivElement>());
+  // #492: the "Novas mensagens" separator sits just above the first unread
+  // message in the DOM — scrolling the message itself to the viewport's top
+  // edge would push the separator off-screen above it, so AT_FIRST_UNREAD
+  // positioning targets this instead.
+  const unreadDividerRef = useRef<HTMLDivElement>(null);
   const highlightTimerRef = useRef<number | null>(null);
   const hoverCloseTimerRef = useRef<number | null>(null);
   const [openPickerMessageId, setOpenPickerMessageId] = useState<string | null>(null);
@@ -652,24 +743,151 @@ function MessageList({
   // Track previous scrollHeight for prepend scroll-delta restoration.
   const prevScrollHeightRef = useRef(0);
 
-  // isNearBottomRef tracks whether the user is scrolled near the bottom of the
-  // list. Updated on every scroll event. Used to decide whether a WS-received
-  // message should auto-scroll the view or preserve the user's current position
-  // (e.g. when reading history).
+  // #492 viewport state machine. MessageList remounts on every conversation
+  // switch (ConversationTimeline renders LoadingSkeleton while useMessages'
+  // status cycles through "loading"), so every ref/state below starts fresh
+  // per conversation — no per-target reset logic is needed here, and any
+  // in-flight resolution work is torn down for free by unmount.
+  //
+  // Everything the resolution/badge logic below touches during render is
+  // useState, never useRef: this codebase's lint config (react-hooks/refs,
+  // react-hooks/set-state-in-effect) forbids both reading/writing a ref during
+  // render and calling a state setter synchronously inside an effect body —
+  // so "adjust state during render" (see HeaderAvatar's doc comment above for
+  // the same technique) is the only compliant way to derive state from
+  // already-available props like messages/hasMore/initialAnchor. Refs stay
+  // reserved for values touched exclusively inside effects or the async
+  // scroll/IntersectionObserver callbacks below, where touching them is fine.
+  const [phase, setPhase] = useState<ViewportPhase>("RESTORING_POSITION");
+  // phaseRef mirrors `phase` (kept in sync by the effect below) for the two
+  // async callbacks (scroll handler, bottom sentinel) that would otherwise
+  // close over a stale value — never read/written anywhere else.
+  const phaseRef = useRef<ViewportPhase>(phase);
+  useLayoutEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [firstUnreadMessageId, setFirstUnreadMessageId] = useState<string | null>(null);
+  const [resolved, setResolved] = useState(false);
+  const [scrollTarget, setScrollTarget] = useState<{ messageId: string | null } | undefined>(
+    undefined,
+  );
+  const [searchAttempts, setSearchAttempts] = useState(0);
+  const [searchedForLength, setSearchedForLength] = useState(-1);
+  const [countedMessages, setCountedMessages] = useState(messages);
+  const [scrollAnimationRequest, setScrollAnimationRequest] = useState(0);
+  const reachedBottomFiredRef = useRef(false);
+  const currentAnchorRef = useRef<{ messageId: string; offsetPx: number } | null>(null);
+  const conversationKeyRef = useRef(conversationKey);
+  const onCaptureAnchorRef = useRef(onCaptureAnchor);
+  const onReachedBottomRef = useRef(onReachedBottom);
+  useLayoutEffect(() => {
+    conversationKeyRef.current = conversationKey;
+    onCaptureAnchorRef.current = onCaptureAnchor;
+    onReachedBottomRef.current = onReachedBottom;
+  });
+
+  // isNearBottomRef mirrors `phase === "AT_BOTTOM"` for synchronous reads
+  // inside the scroll handler, which can't rely on React state having
+  // committed yet within the same event.
   //
   // Threshold: user is "near bottom" when the distance from the bottom edge of
   // the scroll container to the actual bottom is ≤ 150 px (roughly one message).
-  // Starts true because the initial ready view is rendered at the latest messages.
   const isNearBottomRef = useRef(true);
+
+  /**
+   * The topmost visible message and its offset from the container's top edge
+   * — the anchor #492 restores a history position from. jsdom reports every
+   * box as zero-sized, so this deterministically resolves to the first loaded
+   * message there; a real browser resolves it to whatever message is actually
+   * scrolled to the top of the viewport.
+   */
+  function computeTopmostVisible(
+    container: HTMLDivElement,
+    refs: Map<string, HTMLDivElement>,
+  ): { messageId: string; offsetPx: number } | null {
+    const containerTop = container.getBoundingClientRect().top;
+    let best: { messageId: string; offsetPx: number } | null = null;
+    for (const [id, el] of refs) {
+      const offsetPx = el.getBoundingClientRect().top - containerTop;
+      if (offsetPx >= -4 && (!best || offsetPx < best.offsetPx)) {
+        best = { messageId: id, offsetPx };
+      }
+    }
+    return best;
+  }
 
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
+    // ponytail: recomputes the anchor on every scroll event rather than
+    // throttling via rAF — fine at MVP message-list sizes; add throttling if
+    // profiling ever shows this loop hot.
     const onScroll = () => {
-      isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 150;
+      const nearBottom = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
+      isNearBottomRef.current = nearBottom;
+      // Only the bottom sentinel ends SCROLLING_TO_BOTTOM — a near-bottom
+      // scroll position reached mid-animation is not yet a confirmed arrival
+      // (a media resize could still be in flight).
+      if (phaseRef.current !== "SCROLLING_TO_BOTTOM") {
+        if (nearBottom) {
+          if (phaseRef.current !== "AT_BOTTOM") setPhase("AT_BOTTOM");
+        } else if (phaseRef.current === "AT_BOTTOM") {
+          setPhase("READING_HISTORY");
+        }
+      }
+      const topmost = computeTopmostVisible(el, messageRefs.current);
+      if (topmost) currentAnchorRef.current = topmost;
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
+  }, [setPhase]);
+
+  // Bottom sentinel: the same node scrollToBottom() targets also tells us,
+  // authoritatively, when the real tail is on screen — surviving remeasure
+  // from late-loading media instead of trusting a scrollIntoView call's mere
+  // return. This is also the single place mark-read is triggered from (#492
+  // G): never from opening the route, only from confirmed arrival.
+  useEffect(() => {
+    const sentinel = bottomRef.current;
+    // Capability check: some test environments (and, historically, older
+    // browsers) have no IntersectionObserver — degrade to "never confirmed",
+    // matching this file's existing scrollIntoView capability check.
+    if (!sentinel || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const atBottom = Boolean(entries[0]?.isIntersecting);
+        if (atBottom) {
+          isNearBottomRef.current = true;
+          setPhase("AT_BOTTOM");
+          setPendingCount(0);
+          if (!reachedBottomFiredRef.current) {
+            reachedBottomFiredRef.current = true;
+            onReachedBottomRef.current();
+          }
+        } else {
+          reachedBottomFiredRef.current = false;
+        }
+      },
+      { threshold: 1 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [setPhase]);
+
+  // Captures the anchor exactly once, when this conversation is actually left
+  // — the unmount that already happens on every target switch (#492 item 4:
+  // "capturar posição final antes de trocar de conversa").
+  useEffect(() => {
+    return () => {
+      const anchor = currentAnchorRef.current;
+      onCaptureAnchorRef.current(conversationKeyRef.current, {
+        atBottom: phaseRef.current === "AT_BOTTOM",
+        anchorMessageId: phaseRef.current === "AT_BOTTOM" ? null : (anchor?.messageId ?? null),
+        anchorOffsetPx: anchor?.offsetPx ?? 0,
+        savedAt: Date.now(),
+      });
+    };
   }, []);
 
   useEffect(() => {
@@ -679,11 +897,163 @@ function MessageList({
     };
   }, []);
 
-  // Scroll management driven by lastMutation — explicit and race-condition-free.
+  /**
+   * Resolves where this conversation opens (#492 case A/B/C), once, before
+   * anything else moves the viewport. Priority: an explicit deep link
+   * (focusMessageId, owned by the quote-jump effect above) > a saved history
+   * anchor > the first unread message > the bottom.
+   *
+   * Computed during render — not in an effect — because it is a pure
+   * function of already-available props (messages/hasMore/initialAnchor/
+   * unreadCountAtOpen/focusMessageId), and conditionally updating state while
+   * rendering is React's documented pattern for exactly this (see
+   * HeaderAvatar's doc comment above for the same technique against the same
+   * set-state-in-effect lint rule this codebase enforces). The two effects
+   * right after this block perform the only genuine side effects — fetching
+   * another page, and the instant DOM scroll — and neither calls a state
+   * setter.
+   *
+   * A saved anchor or an unread boundary not in the currently loaded window
+   * triggers a bounded backward search (existing loadMore/beforeCursor
+   * pagination, reused rather than a new endpoint — see chatViewportState.ts):
+   * `searchedForLength` guarantees searchAttempts is bumped at most once per
+   * distinct messages.length, so an incidental extra render never
+   * double-fetches; capped at MAX_BOUNDARY_SEARCH_PAGES, exhausting it while
+   * more history remains falls back to the bottom rather than guessing a
+   * wrong boundary.
+   */
+  if (!resolved && messages.length > 0) {
+    if (focusMessageId) {
+      // The existing quote-jump effect owns positioning for a deep link.
+      setResolved(true);
+      if (phase !== "READING_HISTORY") setPhase("READING_HISTORY");
+    } else {
+      let handled = false;
+      let needsMoreHistory = false;
+      if (initialAnchor && !initialAnchor.atBottom && initialAnchor.anchorMessageId) {
+        const anchorId = initialAnchor.anchorMessageId;
+        if (messages.some((message) => message.id === anchorId)) {
+          setResolved(true);
+          setScrollTarget({ messageId: anchorId });
+          if (phase !== "READING_HISTORY") setPhase("READING_HISTORY");
+          handled = true;
+        } else if (hasMore && searchAttempts < MAX_BOUNDARY_SEARCH_PAGES) {
+          needsMoreHistory = true;
+          handled = true;
+        }
+        // else: anchor message no longer exists and the search is exhausted
+        // — fall through to the unread/bottom fallback below (#492 item 9: a
+        // safe fallback, never an infinite search or a crash).
+      }
+      if (!handled && unreadCountAtOpen > 0) {
+        const boundary = findFirstUnreadBoundary(messages, currentUserId, unreadCountAtOpen);
+        if (boundary) {
+          setResolved(true);
+          setScrollTarget({ messageId: boundary.messageId });
+          if (firstUnreadMessageId !== boundary.messageId) {
+            setFirstUnreadMessageId(boundary.messageId);
+          }
+          if (phase !== "AT_FIRST_UNREAD") setPhase("AT_FIRST_UNREAD");
+          handled = true;
+        } else if (hasMore && searchAttempts < MAX_BOUNDARY_SEARCH_PAGES) {
+          needsMoreHistory = true;
+          handled = true;
+        } else if (!hasMore) {
+          // Whole history loaded and still short of unreadCountAtOpen (a
+          // stale count/race) — anchor at the oldest loaded message rather
+          // than guessing further.
+          const oldest = messages[0];
+          setResolved(true);
+          setScrollTarget({ messageId: oldest.id });
+          if (firstUnreadMessageId !== oldest.id) setFirstUnreadMessageId(oldest.id);
+          if (phase !== "AT_FIRST_UNREAD") setPhase("AT_FIRST_UNREAD");
+          handled = true;
+        }
+        // else: search cap reached while more history remains — never render
+        // a guessed/wrong boundary; fall through to the bottom below.
+      }
+      if (!handled) {
+        setResolved(true);
+        setScrollTarget({ messageId: null });
+        if (phase !== "AT_BOTTOM") setPhase("AT_BOTTOM");
+      } else if (needsMoreHistory && searchedForLength !== messages.length) {
+        setSearchedForLength(messages.length);
+        setSearchAttempts((n) => n + 1);
+      }
+    }
+  }
+
+  // Fetches the next page for the bounded search above — a plain
+  // external-system call, no setState of its own. Fires exactly once per
+  // searchAttempts bump (searchedForLength above already guarantees at most
+  // one bump per distinct messages.length).
+  useEffect(() => {
+    if (searchAttempts > 0) onLoadMoreRef.current();
+  }, [searchAttempts]);
+
+  // Performs the actual instant positioning once resolution picked a target
+  // — a plain DOM operation, no setState of its own.
+  useLayoutEffect(() => {
+    if (!scrollTarget) return;
+    if (scrollTarget.messageId === null) {
+      scrollToBottom(bottomRef, "auto");
+    } else if (scrollTarget.messageId === firstUnreadMessageId && unreadDividerRef.current) {
+      // Land on the separator, not the message: the message sits right below
+      // it, so scrolling to the message alone would push the separator (and
+      // its "Novas mensagens" label) off-screen above the viewport.
+      unreadDividerRef.current.scrollIntoView({ behavior: "auto", block: "start" });
+    } else {
+      messageRefs.current
+        .get(scrollTarget.messageId)
+        ?.scrollIntoView({ behavior: "auto", block: "start" });
+    }
+  }, [scrollTarget, firstUnreadMessageId]);
+
+  // Real event handler (button onClick) — calling setState here is completely
+  // ordinary, not an effect.
+  const startScrollToBottom = useCallback(() => {
+    setPhase("SCROLLING_TO_BOTTOM");
+    scrollToBottom(bottomRef, explicitScrollBehavior());
+  }, [setPhase]);
+
+  // Consumes an own-send's animated-scroll request (set during render below)
+  // — a plain DOM operation, no setState of its own, so the mutation effect
+  // further down never has to call startScrollToBottom() itself.
+  useEffect(() => {
+    if (scrollAnimationRequest > 0) scrollToBottom(bottomRef, explicitScrollBehavior());
+  }, [scrollAnimationRequest]);
+
+  // #492: reacts to a new message array — grows the pending-count badge for
+  // an eligible (active, non-own) WS message received while not AT_BOTTOM,
+  // and starts the animated return-to-bottom for an own send (#492 item 21).
+  // Detected during render by comparing the messages array's identity to the
+  // previous render's — the reducer always produces a new array on a real
+  // mutation, so this fires exactly once per message even across repeated
+  // "ws_append"/"append" values. Kept out of an effect for the same
+  // set-state-in-effect reason as the resolution block above.
+  if (countedMessages !== messages) {
+    setCountedMessages(messages);
+    if (resolved && lastMutation === "ws_append" && phase !== "AT_BOTTOM") {
+      const latest = messages[messages.length - 1];
+      if (latest && isEligibleUnreadMessage(latest, currentUserId)) {
+        setPendingCount((count) => count + 1);
+      }
+    }
+    if (resolved && lastMutation === "append") {
+      if (phase !== "SCROLLING_TO_BOTTOM") setPhase("SCROLLING_TO_BOTTOM");
+      setScrollAnimationRequest((n) => n + 1);
+    }
+  }
+
+  // Scroll management for mutations that happen AFTER initial resolution.
   // "prepend"    → restore position via scrollHeight delta (older messages added above).
-  // "initial" | "append" → scroll to bottom unconditionally.
-  // "ws_append"  → scroll to bottom only when the user is already near the bottom;
-  //                otherwise preserve position so reading history is not interrupted.
+  // "append"     → an own-sent message: explicit "return to the present" (#492
+  //                item 21), routed through the same SCROLLING_TO_BOTTOM the
+  //                button uses so it also only completes once the bottom
+  //                sentinel confirms arrival.
+  // "ws_append"  → auto-scroll only while already AT_BOTTOM; otherwise the
+  //                viewport is never pulled, and the pending-count badge grows
+  //                for an eligible (active, non-own) message.
   // "none"       → no action (intermediate transition).
   //
   // prevScrollHeightRef is captured ONLY on stable mutations ("initial", "append",
@@ -698,11 +1068,12 @@ function MessageList({
     if (lastMutation === "prepend") {
       // Shift scrollTop by the amount the container grew so the user's view is stable.
       el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
-    } else if (lastMutation === "initial" || lastMutation === "append") {
-      scrollToBottom(bottomRef);
-    } else if (lastMutation === "ws_append" && isNearBottomRef.current) {
-      // Only auto-scroll on WS messages when user is already near the bottom.
-      scrollToBottom(bottomRef);
+    } else if (resolved && lastMutation === "ws_append" && phase === "AT_BOTTOM") {
+      scrollToBottom(bottomRef, "auto");
+      // Not-at-bottom growth of the pending-count badge, and an own-send's
+      // animated return to bottom ("append"), are both handled during render
+      // above (set-state-in-effect) — this branch only ever needs the DOM
+      // follow for ws_append while already at the tail.
     }
 
     // Only snapshot scrollHeight in a stable state — not during "none" transitions
@@ -710,7 +1081,7 @@ function MessageList({
     if (lastMutation !== "none") {
       prevScrollHeightRef.current = el.scrollHeight;
     }
-  }, [messages, lastMutation]);
+  }, [messages, lastMutation, resolved, phase]);
 
   // IntersectionObserver: fire loadMore when the top sentinel enters the viewport.
   //
@@ -740,8 +1111,12 @@ function MessageList({
   }, [hasMore]);
 
   // Group messages by day for dividers; track same-sender/same-minute for visual grouping.
+  // #492: an "unread-divider" is inserted immediately before firstUnreadMessageId,
+  // once resolution lands AT_FIRST_UNREAD — never persisted, never a message.
   const withDividers: Array<
-    { type: "divider"; label: string } | { type: "msg"; message: Message; isGrouped: boolean }
+    | { type: "divider"; label: string }
+    | { type: "unread-divider" }
+    | { type: "msg"; message: Message; isGrouped: boolean }
   > = [];
   let lastDay = "";
   let lastSenderId = "";
@@ -754,6 +1129,9 @@ function MessageList({
       lastSenderId = "";
       lastMinute = "";
     }
+    if (msg.id === firstUnreadMessageId) {
+      withDividers.push({ type: "unread-divider" });
+    }
     const minute = formatTime(msg.createdAt);
     const isGrouped = msg.senderId === lastSenderId && minute === lastMinute;
     withDividers.push({ type: "msg", message: msg, isGrouped });
@@ -761,80 +1139,104 @@ function MessageList({
     lastMinute = minute;
   }
 
+  const scrollButtonVisible =
+    phase === "READING_HISTORY" || phase === "AT_FIRST_UNREAD" || phase === "SCROLLING_TO_BOTTOM";
+
   return (
-    <div
-      ref={listRef}
-      className="chat-msg-area__list"
-      role="log"
-      aria-live="polite"
-      aria-label="Mensagens"
-    >
-      <div ref={topSentinelRef} aria-hidden="true" />
-      {loadingMore && (
-        <div
-          className="chat-msg-area__load-more"
-          role="status"
-          aria-label="Carregando mensagens anteriores"
-          data-testid="load-more-indicator"
-        />
-      )}
-      {withDividers.map((item, i) =>
-        item.type === "divider" ? (
-          <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
-            {item.label}
-          </div>
-        ) : item.message.kind === "system" ? (
-          // A conversation event is not something a person said, so it never
-          // becomes a MessageBubble: no bubble, no avatar, and none of the
-          // message actions — editing "Fulano saiu do grupo" is not a thing
-          // (issue #527).
-          <ConversationSystemMessage
-            key={item.message.id}
-            message={item.message}
-            scope={systemScope}
+    <div className="chat-msg-area__list-wrap">
+      <div
+        ref={listRef}
+        className="chat-msg-area__list"
+        role="log"
+        aria-live="polite"
+        aria-label="Mensagens"
+      >
+        <div ref={topSentinelRef} aria-hidden="true" />
+        {loadingMore && (
+          <div
+            className="chat-msg-area__load-more"
+            role="status"
+            aria-label="Carregando mensagens anteriores"
+            data-testid="load-more-indicator"
           />
-        ) : (
-          <MessageBubble
-            key={item.message.id}
-            message={item.message}
-            isMine={!!currentUserId && item.message.senderId === currentUserId}
-            isGrouped={item.isGrouped}
-            onToggleReaction={onToggleReaction}
-            onReplyMessage={onReplyMessage}
-            onReferenceMessage={onReferenceMessage}
-            onForwardMessage={onForwardMessage}
-            onToggleFavorite={onToggleFavorite}
-            onReconcileLinkSafety={onReconcileLinkSafety}
-            onEditMessage={onEditMessage}
-            onEditForbidden={onEditForbidden}
-            onDeleteMessage={onDeleteMessage}
-            editDisabled={editDisabledIds.has(item.message.id)}
-            mentionTarget={mentionTarget}
-            presenceTarget={presenceTarget}
-            onTogglePin={onTogglePin}
-            isPinned={pinnedIds?.has(item.message.id) ?? false}
-            recentReactionEmojis={recentReactionEmojis}
-            emojiUsage={emojiUsage}
-            onEmojiToneChange={onEmojiToneChange}
-            currentUserId={currentUserId}
-            reactionMenuVisible={hoveredMessageId === item.message.id}
-            onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
-            pickerOpen={openPickerMessageId === item.message.id}
-            onPickerOpenChange={handlePickerOpenChange}
-            quoteAuthorLabel={
-              item.message.quoted ? quoteAuthorLabel(item.message.quoted, messagesById) : undefined
-            }
-            canJumpToQuote={item.message.quoted ? messagesById.has(item.message.quoted.id) : false}
-            onQuoteJump={handleQuoteJump}
-            onReferenceJump={onReferenceJump}
-            onOpenAuthorDM={onOpenAuthorDM}
-            openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
-            isHighlighted={highlightedMessageId === item.message.id}
-            setMessageRef={setMessageRef}
-          />
-        ),
-      )}
-      <div ref={bottomRef} />
+        )}
+        {withDividers.map((item, i) =>
+          item.type === "divider" ? (
+            <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
+              {item.label}
+            </div>
+          ) : item.type === "unread-divider" ? (
+            <div
+              key="unread-divider"
+              ref={unreadDividerRef}
+              className="chat-msg-area__new-messages-divider"
+              role="separator"
+              aria-label="Novas mensagens"
+            >
+              Novas mensagens
+            </div>
+          ) : item.message.kind === "system" ? (
+            // A conversation event is not something a person said, so it never
+            // becomes a MessageBubble: no bubble, no avatar, and none of the
+            // message actions — editing "Fulano saiu do grupo" is not a thing
+            // (issue #527).
+            <ConversationSystemMessage
+              key={item.message.id}
+              message={item.message}
+              scope={systemScope}
+            />
+          ) : (
+            <MessageBubble
+              key={item.message.id}
+              message={item.message}
+              isMine={!!currentUserId && item.message.senderId === currentUserId}
+              isGrouped={item.isGrouped}
+              onToggleReaction={onToggleReaction}
+              onReplyMessage={onReplyMessage}
+              onReferenceMessage={onReferenceMessage}
+              onForwardMessage={onForwardMessage}
+              onToggleFavorite={onToggleFavorite}
+              onReconcileLinkSafety={onReconcileLinkSafety}
+              onEditMessage={onEditMessage}
+              onEditForbidden={onEditForbidden}
+              onDeleteMessage={onDeleteMessage}
+              editDisabled={editDisabledIds.has(item.message.id)}
+              mentionTarget={mentionTarget}
+              presenceTarget={presenceTarget}
+              onTogglePin={onTogglePin}
+              isPinned={pinnedIds?.has(item.message.id) ?? false}
+              recentReactionEmojis={recentReactionEmojis}
+              emojiUsage={emojiUsage}
+              onEmojiToneChange={onEmojiToneChange}
+              currentUserId={currentUserId}
+              reactionMenuVisible={hoveredMessageId === item.message.id}
+              onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
+              pickerOpen={openPickerMessageId === item.message.id}
+              onPickerOpenChange={handlePickerOpenChange}
+              quoteAuthorLabel={
+                item.message.quoted
+                  ? quoteAuthorLabel(item.message.quoted, messagesById)
+                  : undefined
+              }
+              canJumpToQuote={
+                item.message.quoted ? messagesById.has(item.message.quoted.id) : false
+              }
+              onQuoteJump={handleQuoteJump}
+              onReferenceJump={onReferenceJump}
+              onOpenAuthorDM={onOpenAuthorDM}
+              openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
+              isHighlighted={highlightedMessageId === item.message.id}
+              setMessageRef={setMessageRef}
+            />
+          ),
+        )}
+        <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
+      </div>
+      <ScrollToBottomButton
+        visible={scrollButtonVisible}
+        pendingCount={pendingCount}
+        onClick={startScrollToBottom}
+      />
     </div>
   );
 }
@@ -1052,6 +1454,12 @@ interface ConversationTimelineProps {
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
   focusMessageId: string;
+  /** #492: see MessageListProps. */
+  conversationKey: string;
+  unreadCountAtOpen: number;
+  initialAnchor: ViewportAnchor | null;
+  onCaptureAnchor: (key: string, anchor: ViewportAnchor) => void;
+  onReachedBottom: () => void;
 }
 
 /**
@@ -1077,6 +1485,11 @@ function ConversationTimeline({
   emojiUsage,
   onEmojiToneChange,
   focusMessageId,
+  conversationKey,
+  unreadCountAtOpen,
+  initialAnchor,
+  onCaptureAnchor,
+  onReachedBottom,
 }: ConversationTimelineProps) {
   if (state.status === "loading") return <LoadingSkeleton />;
   if (state.status === "error") return <ErrorState onRetry={actions.onRetry} />;
@@ -1115,6 +1528,11 @@ function ConversationTimeline({
       emojiUsage={emojiUsage}
       onEmojiToneChange={onEmojiToneChange}
       focusMessageId={focusMessageId}
+      conversationKey={conversationKey}
+      unreadCountAtOpen={unreadCountAtOpen}
+      initialAnchor={initialAnchor}
+      onCaptureAnchor={onCaptureAnchor}
+      onReachedBottom={onReachedBottom}
     />
   );
 }
@@ -1294,6 +1712,44 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const openingAuthorDMRef = useRef(new Map<string, AbortController>());
   const authorDMMountedRef = useRef(true);
   const authorDMGenerationRef = useRef(0);
+  // #492: per-conversation viewport anchor, kept for the life of this SPA tab.
+  // Owned here rather than in MessageList, which unmounts on every conversation
+  // switch (ConversationTimeline swaps it for LoadingSkeleton while useMessages
+  // is "loading") — this component does not, so it is where anchors survive.
+  //
+  // A Map held in useState (its setter never called) rather than useRef:
+  // react-hooks/refs forbids reading a ref's .current during render — even a
+  // ref object merely passed down as a prop and read in the receiving
+  // component — and MessageList's render-time resolution genuinely needs this
+  // value synchronously. A plain object identity that happens to be stable
+  // across renders (never reassigned, only mutated via .set()) is not a ref
+  // and carries none of that rule's tearing concerns: nothing here ever
+  // depends on React noticing a mutation to it.
+  const [viewportAnchors] = useState(() => new Map<string, ViewportAnchor>());
+  const conversationKey = targetId ? `${kind}:${targetId}` : "";
+  const unreadCountAtOpen = useMemo(() => {
+    if (!targetId) return 0;
+    const list = kind === "channel" ? ctx.channels : ctx.dms;
+    return list.find((item) => item.id === targetId)?.unreadCount ?? 0;
+  }, [kind, targetId, ctx.channels, ctx.dms]);
+  // Plain function calls, safe during render.
+  const initialAnchor =
+    (conversationKey ? viewportAnchors.get(conversationKey) : undefined) ??
+    (conversationKey && ctx.currentUserId
+      ? loadViewportAnchor(ctx.currentUserId, kind, targetId)
+      : null) ??
+    null;
+  const handleReachedBottom = useCallback(() => {
+    if (!targetId) return;
+    ctx.markRead?.({ kind, targetId });
+  }, [ctx, kind, targetId]);
+  const handleCaptureAnchor = useCallback(
+    (key: string, anchor: ViewportAnchor) => {
+      viewportAnchors.set(key, anchor);
+      if (ctx.currentUserId) saveViewportAnchor(ctx.currentUserId, kind, targetId, anchor);
+    },
+    [viewportAnchors, ctx.currentUserId, kind, targetId],
+  );
   const recentReactionEmojis = useMemo(
     () => quickReactionEmojis(emojiUsage, allowedReactionEmojis),
     [allowedReactionEmojis, emojiUsage],
@@ -1728,6 +2184,11 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           emojiUsage={emojiUsage}
           onEmojiToneChange={changeEmojiTone}
           focusMessageId={focusMessageId}
+          conversationKey={conversationKey}
+          unreadCountAtOpen={unreadCountAtOpen}
+          initialAnchor={initialAnchor}
+          onCaptureAnchor={handleCaptureAnchor}
+          onReachedBottom={handleReachedBottom}
         />
 
         <ConversationNotices

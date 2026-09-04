@@ -40,6 +40,11 @@ const (
 	migrationDown42 = "000042_notification_outbox_event_contract.down.sql"
 	migrationUp43   = "000043_validate_notification_outbox_event_contract.up.sql"
 	migrationDown43 = "000043_validate_notification_outbox_event_contract.down.sql"
+	// Issue #742 adds the claim protocol's own state to the same table, so it
+	// belongs to the same round trip: a rollback that stopped at 000043 would
+	// leave columns behind that 000042's down cannot remove.
+	migrationUp44   = "000044_notification_outbox_worker_claim.up.sql"
+	migrationDown44 = "000044_notification_outbox_worker_claim.down.sql"
 
 	// The constraints 000042 adds NOT VALID and 000043 validates. Their state is
 	// the whole difference between the two migrations, so it is what the
@@ -55,6 +60,7 @@ const (
 	outboxTransitionFunction     = "enforce_notification_outbox_transition"
 	outboxDedupeIndex            = "notification_outbox_dedupe_uq"
 	outboxOpenIndex              = "idx_notification_outbox_open"
+	outboxClaimableIndex         = "idx_notification_outbox_claimable"
 	outboxLegacyPendingIndex     = "idx_notification_outbox_pending"
 	outboxLegacyUniqueConstraint = "notification_outbox_message_recipient_unique"
 )
@@ -156,11 +162,17 @@ func migrationsRoot(t *testing.T) string {
 	return filepath.Join(filepath.Dir(currentFile), "..", "..", "..", "..", "migrations")
 }
 
+// migrationsUnderTest are the outbox migrations this file applies by hand. Every
+// other up migration is baseline.
+var migrationsUnderTest = map[string]struct{}{
+	migrationUp42: {}, migrationUp43: {}, migrationUp44: {},
+}
+
 // baselineMigrations lists every up migration the canonical runner applies
-// before this issue's two, in the order it applies them: scripts/db/migrate.sh
+// before the ones under test, in the order it applies them: scripts/db/migrate.sh
 // collects them with `find "$MIGRATIONS_DIR" -name "*.up.sql" | sort`, which is
-// this glob and this sort. The two files under test are excluded so the
-// database arrives at exactly the state that precedes them.
+// this glob and this sort. The files under test are excluded so the database
+// arrives at exactly the state that precedes them.
 func baselineMigrations(t *testing.T) []string {
 	t.Helper()
 	paths, err := filepath.Glob(filepath.Join(migrationsRoot(t), "*", "*.up.sql"))
@@ -170,13 +182,14 @@ func baselineMigrations(t *testing.T) []string {
 	sort.Strings(paths)
 	baseline := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if base := filepath.Base(path); base == migrationUp42 || base == migrationUp43 {
+		if _, underTest := migrationsUnderTest[filepath.Base(path)]; underTest {
 			continue
 		}
 		baseline = append(baseline, path)
 	}
-	if len(baseline) != len(paths)-2 {
-		t.Fatalf("expected both migrations under test to be excluded, kept %d of %d", len(baseline), len(paths))
+	if len(baseline) != len(paths)-len(migrationsUnderTest) {
+		t.Fatalf("expected every migration under test to be excluded, kept %d of %d",
+			len(baseline), len(paths))
 	}
 	return baseline
 }
@@ -488,6 +501,30 @@ func assertPreexistingSchemaIntact(t *testing.T, conn *pgx.Conn, notificationID 
 		"the message the notifications name must survive")
 }
 
+// assertClaimContract describes what 000044 adds: the three columns the claim
+// protocol writes, and the partial index its claim query is ordered to match.
+//
+// present is what makes the same function serve both halves of the round trip.
+func assertClaimContract(t *testing.T, conn *pgx.Conn, present bool) {
+	t.Helper()
+	for _, column := range []string{"attempts", "next_attempt_at", "last_error"} {
+		assertBool(t, hasColumn(t, conn, "chat", "notification_outbox", column), present,
+			"column "+column+" belongs to 000044")
+	}
+	assertBool(t, hasIndex(t, conn, outboxClaimableIndex), present,
+		"the claim index belongs to 000044")
+	// The bound on last_error is the security control, not a formatting choice:
+	// unbounded, it is where a provider's error body would end up.
+	if present {
+		assertBool(t, queryBool(t, conn, `
+			SELECT character_maximum_length = 64
+			FROM information_schema.columns
+			WHERE table_schema = 'chat' AND table_name = 'notification_outbox'
+			  AND column_name = 'last_error'`), true,
+			"last_error must stay too small to hold a provider payload")
+	}
+}
+
 // ── the round trip ──────────────────────────────────────────────────────────
 
 // The migrations are applied, reverted and applied again, in the order the
@@ -501,9 +538,21 @@ func TestNotificationOutboxMigrationRoundTripPostgreSQL(t *testing.T) {
 	applyMigration(t, conn, migrationUp42)
 	applyMigration(t, conn, migrationUp43)
 	assertCurrentContract(t, conn, true)
+	assertClaimContract(t, conn, false)
+
+	applyMigration(t, conn, migrationUp44)
+	assertCurrentContract(t, conn, true)
+	assertClaimContract(t, conn, true)
 
 	notificationID := seedCompatibleRows(t, conn)
 	assertEnforcementWorks(t, conn, notificationID)
+
+	// 000044's down takes away only the claim state; the event contract beneath
+	// it must be untouched, which is what makes the two migrations independently
+	// revertible.
+	applyMigration(t, conn, migrationDown44)
+	assertClaimContract(t, conn, false)
+	assertCurrentContract(t, conn, true)
 
 	// 000043 owns nothing but the validation of 000042's constraints, so its down
 	// must leave every object 000042 created standing.
@@ -519,7 +568,9 @@ func TestNotificationOutboxMigrationRoundTripPostgreSQL(t *testing.T) {
 	// exists", which is the failure mode a text-matching test cannot see.
 	applyMigration(t, conn, migrationUp42)
 	applyMigration(t, conn, migrationUp43)
+	applyMigration(t, conn, migrationUp44)
 	assertCurrentContract(t, conn, true)
+	assertClaimContract(t, conn, true)
 	assertReUpAcceptsWork(t, conn)
 }
 
