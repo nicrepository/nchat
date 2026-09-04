@@ -13,6 +13,7 @@ import {
   emitMessageCreated,
   installMessagingMocks,
   makeMessage,
+  messagesFor,
   uniqueId,
 } from "../helpers/messagingApi";
 
@@ -861,8 +862,19 @@ test.describe("sidebar — seções recolhíveis e filtro de não lidas", () => 
       display_name: "Canal Com Não Lidas",
       type: "public",
       can_write: true,
-      unread_count: 3,
+      unread_count: 1,
     });
+    // #492: the badge only clears once the real bottom is reached, not just
+    // from opening the route — one short message from someone else is what
+    // lets the channel land AT_BOTTOM immediately and send the receipt.
+    messagesFor(scenario, "channel", unreadChannelId).push(
+      makeMessage({
+        id: `${unreadChannelId}-msg`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: "mensagem não lida",
+      }),
+    );
     await page.reload();
     await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
 
@@ -886,7 +898,9 @@ test.describe("sidebar — seções recolhíveis e filtro de não lidas", () => 
     await expect(optionsIn(page, "Canais")).toHaveText([/Canal Com Não Lidas/]);
 
     // Abrir a conversa não lida funciona normalmente e ela some da seção
-    // recolhida assim que fica lida — sem navegação nem remontagem indevida.
+    // recolhida assim que fica lida (#492: ao alcançar o final real da
+    // conversa, não apenas por abrir a rota) — sem navegação nem remontagem
+    // indevida.
     await optionsIn(page, "Canais").first().click();
     await expect(page).toHaveURL(new RegExp(`/chat/channel/${unreadChannelId}$`));
     await expect(section(page, "Canais").getByRole("option")).toHaveCount(0);
