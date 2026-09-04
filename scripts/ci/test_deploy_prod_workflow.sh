@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Behaviour tests for the candidate-only production deploy workflow (CICD-05).
+# Behaviour tests for the production deploy workflow (CICD-05, CICD-07).
 #
 # Two things are proved here, both offline and neither against a cluster.
 #
 # First, the workflow contract: the checker is driven with copies of the real
-# workflow that each break one invariant -- a promotion added, a second job
-# added, the stable-selector proof removed, a gate marked continue-on-error --
-# and every one of them must be refused. A checker that only ever sees a correct
-# workflow proves nothing about what it would catch, so a benign mutation is
-# driven through it too.
+# workflow that each break one invariant -- a promotion added to the candidate
+# job, a third job added, the stable-selector proof removed, the cutover job's
+# approval gate removed, a gate marked continue-on-error -- and every one of
+# them must be refused. A checker that only ever sees a correct workflow proves
+# nothing about what it would catch, so a benign mutation is driven through it
+# too. The positive half is asserted separately and directly: the cutover job's
+# wiring is read out of the committed workflow and compared, so the suite says
+# what the file must contain and not only what it must not.
 #
 # Second, the release binding: release-digests.sh is driven with a manifest
 # whose seal is broken, one that seals a different commit, and one missing an
@@ -85,7 +88,7 @@ expect_workflow_accepted() {
 test_real_workflow_satisfies_the_contract() {
   echo "the committed workflow"
   if python3 "$CHECKER" "$WORKFLOW"; then
-    pass "the production deploy workflow satisfies the candidate-only contract"
+    pass "the production deploy workflow satisfies its contract"
     return
   fi
   fail "the committed production deploy workflow does not satisfy its own contract"
@@ -131,10 +134,44 @@ DEPLOY = 7
 SMOKE = 8
 VERIFY = 9
 IDENTITY = 10
+# Step positions in the cutover job, named for the same reason.
+SNAPSHOT = 3
+REVALIDATE = 4
+PROMOTE = 5
+AFTER_RECORD = 6
+CONVERGED = 7
+STILL_RUNNING = 8
+UNRESTRICTED_ALWAYS = "${{ always() }}"
+# Conditions that read as "the promotion was reached" and are not. Naming any
+# status function stops Actions inserting the implicit success(), so each of
+# these runs the step on a run that promoted nothing: a step skipped after an
+# earlier failure reports `skipped`, which is neither the empty string nor a
+# value !cancelled() excludes.
+CONCLUSION_NOT_EMPTY = "${{ !cancelled() && steps.promote.conclusion != '' }}"
+CONCLUSION_NOT_SKIPPED = "${{ !cancelled() && steps.promote.conclusion != 'skipped' }}"
+NOT_CANCELLED_ONLY = "${{ !cancelled() }}"
+SUCCESS_ONLY = "${{ !cancelled() && steps.promote.conclusion == 'success' }}"
+NO_CANCEL_GUARD = (
+    "${{ steps.promote.conclusion == 'success'"
+    " || steps.promote.conclusion == 'failure' }}"
+)
+MIGRATION = "scripts/deploy/nchat-prod/migrations.sh"
 
 
 def steps(workflow, job="candidate"):
     return workflow["jobs"][job]["steps"]
+
+
+def cutover_steps(workflow):
+    return steps(workflow, "cutover")
+
+
+def cutover_job(workflow):
+    return workflow["jobs"]["cutover"]
+
+
+def add_cutover_run(workflow, command):
+    cutover_steps(workflow).append({"name": "Added", "run": command})
 
 
 def slot_step(workflow):
@@ -157,6 +194,10 @@ def add_action(workflow):
 
 def move(workflow, source, destination):
     steps(workflow).insert(destination, steps(workflow).pop(source))
+
+
+def move_cutover(workflow, source, destination):
+    cutover_steps(workflow).insert(destination, cutover_steps(workflow).pop(source))
 
 
 def edit_run(step, old, new=""):
@@ -184,7 +225,7 @@ def drop_line(run, target):
 
 
 def add_job(workflow, name, command):
-    """A second operational job, however it is spelled."""
+    """A third operational job, however it is spelled."""
     workflow["jobs"][name] = {
         "needs": "candidate",
         "runs-on": workflow["jobs"]["candidate"]["runs-on"],
@@ -211,13 +252,15 @@ PROMOTION_SURFACE = {
     "extra-action": lambda w: add_action(w),
 }
 
-# A second job is the shape this task exists to keep out: the cutover phase
-# arriving early, under whatever name. The contract names one job, so none of
-# these has to be recognised as a promotion to be refused.
-SECOND_JOB = {
-    "cutover-job": lambda w: add_job(w, "cutover", f'{CUTOVER} --target green'),
+# The candidate job stays the candidate job. A third job is refused whatever it
+# is called, the cutover job cannot be replaced by a naked promotion, and none
+# of the wiring that separates the two halves may migrate onto the candidate:
+# an `environment:` there would attach the approval to the phase with nothing to
+# approve and pull that environment's secrets into an unprotected deploy.
+THIRD_JOB = {
+    "cutover-job-replaced": lambda w: add_job(w, "cutover", f'{CUTOVER} --target green'),
     "renamed-cutover-job": lambda w: add_job(w, "promote", f'{CUTOVER} --target green'),
-    "harmless-second-job": lambda w: add_job(w, "notify", "echo done"),
+    "harmless-third-job": lambda w: add_job(w, "notify", "echo done"),
     "candidate-environment": lambda w: w["jobs"]["candidate"].__setitem__(
         "environment", "production"),
     "candidate-environment-mapping": lambda w: w["jobs"]["candidate"].__setitem__(
@@ -226,8 +269,241 @@ SECOND_JOB = {
     "conditional-job": lambda w: w["jobs"]["candidate"].__setitem__("if", "always()"),
     "job-write-permission": lambda w: w["jobs"]["candidate"]["permissions"].__setitem__(
         "packages", "write"),
-    "outputs-restored": lambda w: w["jobs"]["candidate"].__setitem__(
-        "outputs", {"slot": "${{ steps.slot.outputs.slot }}"}),
+    # The candidate's outputs are the one channel between the two halves. A
+    # third is a second channel and has to be reviewed as one; dropping the
+    # release id would leave the promotion identified by a slot name alone.
+    "extra-output": lambda w: w["jobs"]["candidate"]["outputs"].__setitem__(
+        "active", "${{ steps.slot.outputs.active }}"),
+    "release-id-output-removed": lambda w: w["jobs"]["candidate"]["outputs"].pop("release_id"),
+    "slot-output-removed": lambda w: w["jobs"]["candidate"]["outputs"].pop("slot"),
+    "outputs-removed": lambda w: w["jobs"]["candidate"].pop("outputs"),
+    "output-slot-hardcoded": lambda w: w["jobs"]["candidate"]["outputs"].__setitem__(
+        "slot", "green"),
+}
+
+# The cutover job's own wiring: what holds it behind a human, what it depends
+# on, where it runs and what it is allowed to do.
+CUTOVER_WIRING = {
+    "cutover-job-removed": lambda w: w["jobs"].pop("cutover"),
+    "environment-removed": lambda w: cutover_job(w).pop("environment"),
+    # The mapping form carries keys nobody reviewed here, and an environment
+    # under another name is a different set of approval rules entirely.
+    "environment-mapping": lambda w: cutover_job(w).__setitem__(
+        "environment", {"name": "production"}),
+    "environment-renamed": lambda w: cutover_job(w).__setitem__("environment", "staging"),
+    # Without `needs`, the promotion runs beside the deploy instead of after it,
+    # and `needs.candidate.outputs` resolves to nothing.
+    "needs-removed": lambda w: cutover_job(w).pop("needs"),
+    "needs-rewired": lambda w: cutover_job(w).__setitem__("needs", "build"),
+    "cutover-conditional": lambda w: cutover_job(w).__setitem__("if", "always()"),
+    "cutover-off-runner": lambda w: cutover_job(w).__setitem__("runs-on", "ubuntu-latest"),
+    "cutover-write-permission": lambda w: cutover_job(w)["permissions"].__setitem__(
+        "contents", "write"),
+    "cutover-id-token": lambda w: cutover_job(w)["permissions"].__setitem__(
+        "id-token", "write"),
+    "cutover-no-timeout": lambda w: cutover_job(w).pop("timeout-minutes"),
+    "cutover-timeout-changed": lambda w: cutover_job(w).__setitem__("timeout-minutes", 240),
+    "cutover-outputs": lambda w: cutover_job(w).__setitem__(
+        "outputs", {"slot": "${{ needs.candidate.outputs.slot }}"}),
+}
+
+# The executable surface of the cutover job. One mutation, one promotion, and
+# nothing beside it: a rollback, a drain, a migration or a second hand-written
+# selector patch is refused for not being a step the contract has.
+CUTOVER_SURFACE = {
+    "cutover-rollback": lambda w: add_cutover_run(w, f'{ROLLBACK} --target blue "auto"'),
+    "cutover-drain": lambda w: add_cutover_run(w, f'{DRAIN} --target blue'),
+    "cutover-migration": lambda w: add_cutover_run(w, f'{MIGRATION} --release "$RELEASE"'),
+    "cutover-second-patch": lambda w: add_cutover_run(w, PATCH_SELECTOR),
+    "cutover-switch-helper": lambda w: add_cutover_run(
+        w,
+        "source scripts/deploy/nchat-prod/lib.sh; "
+        'switch_services_to_slot "$CANDIDATE_SLOT"'),
+    "cutover-dns": lambda w: add_cutover_run(
+        w, 'curl -X PATCH https://api.cloudflare.com/client/v4/zones/z/dns_records/r'),
+    "cutover-echo": lambda w: add_cutover_run(w, "echo done"),
+}
+
+# The promotion itself: the script, its explicit target, and the gates either
+# side of it. None of them may be removed, softened, reordered or rewired.
+PROMOTION = {
+    "promotion-removed": lambda w: cutover_steps(w).pop(PROMOTE),
+    "promotion-replaced": lambda w: cutover_steps(w)[PROMOTE].__setitem__("run", "true"),
+    "promotion-soft": lambda w: cutover_steps(w)[PROMOTE].__setitem__(
+        "continue-on-error", True),
+    "promotion-conditional": lambda w: cutover_steps(w)[PROMOTE].__setitem__(
+        "if", "always()"),
+    "promotion-tolerated": lambda w: edit_run(
+        cutover_steps(w)[PROMOTE],
+        'scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT"',
+        'scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT" || true'),
+    # A target derived from the cluster is the retry-becomes-reversal bug: a
+    # second run after a partial failure would send production back.
+    "target-derived": lambda w: edit_run(
+        cutover_steps(w)[PROMOTE],
+        'scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT"',
+        'scripts/deploy/nchat-prod/cutover.sh --target '
+        '"$(opposite_slot "$(resolve_active_slot "$(collect_service_slots)")")"'),
+    "target-hardcoded": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "CANDIDATE_SLOT", "green"),
+    "target-from-input": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "CANDIDATE_SLOT", "${{ inputs.slot }}"),
+    "assume-yes-removed": lambda w: cutover_steps(w)[PROMOTE]["env"].pop(
+        "NCHAT_PROD_ASSUME_YES"),
+    # The manifest is what the promotion re-derives the release identity from.
+    # Pointed elsewhere, the identity gate has nothing real to verify against.
+    "manifest-dir-removed": lambda w: cutover_steps(w)[PROMOTE]["env"].pop(
+        "NCHAT_PROD_RELEASE_MANIFEST_DIR"),
+    "manifest-dir-elsewhere": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_RELEASE_MANIFEST_DIR", "/tmp/manifest"),
+}
+
+# The evidence handed to cutover.sh must name the slot AND the release the
+# candidate job actually built. Every weaker spelling is a promotion nobody's
+# authenticated smoke covers.
+EVIDENCE = {
+    "evidence-removed": lambda w: cutover_steps(w)[PROMOTE]["env"].pop(
+        "NCHAT_PROD_SMOKE_CONFIRMED"),
+    "evidence-true": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED", "true"),
+    "evidence-empty": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED", ""),
+    "evidence-slot-only": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED", "${{ needs.candidate.outputs.slot }}"),
+    "evidence-release-only": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED",
+        "${{ inputs.sha }}:${{ needs.candidate.outputs.release_id }}"),
+    "evidence-sha-only": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED",
+        "${{ needs.candidate.outputs.slot }}:${{ inputs.sha }}"),
+    "evidence-hardcoded": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED", "green:deadbeef:cafe"),
+    "evidence-from-input": lambda w: cutover_steps(w)[PROMOTE]["env"].__setitem__(
+        "NCHAT_PROD_SMOKE_CONFIRMED", "${{ inputs.evidence }}"),
+}
+
+# What the run has to read from the cluster before it patches anything, and
+# prove about it afterwards. The approval names a candidate:release; between
+# the approval and this moment the slot may have been redeployed, rebuilt or
+# degraded, and the two proofs are what make that a refusal instead of a
+# promotion nobody validated.
+CUTOVER_EVIDENCE = {
+    "before-snapshot-removed": lambda w: cutover_steps(w).pop(SNAPSHOT),
+    "before-snapshot-not-written": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT], 'printf \'%s\\n\' "$mapping" >"$SELECTORS_BEFORE"'),
+    # The preflight classification, which is what makes an unexpected selector,
+    # an unset one or an absent Service a refusal before any patch.
+    "preflight-removed": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'require_promotable_selectors "$mapping" "$TARGET_SLOT"'),
+    "preflight-tolerated": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'require_promotable_selectors "$mapping" "$TARGET_SLOT"',
+        'require_promotable_selectors "$mapping" "$TARGET_SLOT" || true'),
+    # The defect this contract must never crystallise again: a falsifiable
+    # check whose exit status is swallowed by the `echo` it sits inside, so the
+    # step prints an error and still succeeds.
+    "preflight-inside-echo": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'require_promotable_selectors "$mapping" "$TARGET_SLOT"',
+        'echo "checked=$(resolve_active_slot "$mapping")"'),
+    "preflight-target-hardcoded": lambda w: cutover_steps(w)[SNAPSHOT]["env"].__setitem__(
+        "TARGET_SLOT", "green"),
+    # Reading the rollback target back from the selectors names the target
+    # itself once the namespace has converged -- the one slot a rollback can
+    # never go to.
+    "rollback-from-selectors": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'rollback_target="$(opposite_slot "$TARGET_SLOT")"',
+        'rollback_target="$(resolve_active_slot "$mapping")"'),
+    "rollback-hardcoded": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'rollback_target="$(opposite_slot "$TARGET_SLOT")"',
+        'rollback_target=blue'),
+    "rollback-is-target": lambda w: edit_run(
+        cutover_steps(w)[SNAPSHOT],
+        'rollback_target="$(opposite_slot "$TARGET_SLOT")"',
+        'rollback_target="$TARGET_SLOT"'),
+    "revalidation-removed": lambda w: cutover_steps(w).pop(REVALIDATE),
+    "revalidation-soft": lambda w: cutover_steps(w)[REVALIDATE].__setitem__(
+        "continue-on-error", True),
+    "revalidation-tolerated": lambda w: edit_run(
+        cutover_steps(w)[REVALIDATE],
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"',
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE" || true'),
+    "revalidation-after-promotion": lambda w: move_cutover(w, REVALIDATE, PROMOTE),
+    "revalidation-sha-only": lambda w: cutover_steps(w)[REVALIDATE]["env"].__setitem__(
+        "EXPECTED_RELEASE", "${{ inputs.sha }}"),
+    "converged-removed": lambda w: cutover_steps(w).pop(CONVERGED),
+    "converged-soft": lambda w: cutover_steps(w)[CONVERGED].__setitem__(
+        "continue-on-error", True),
+    "converged-tolerated": lambda w: edit_run(
+        cutover_steps(w)[CONVERGED],
+        'all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$CANDIDATE_SLOT"',
+        'all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$CANDIDATE_SLOT" || true'),
+    # Reading the selectors and not comparing them is evidence of nothing, and
+    # a comparison against the active slot passes on a promotion that did not
+    # happen.
+    "converged-not-compared": lambda w: edit_run(
+        cutover_steps(w)[CONVERGED],
+        'all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$CANDIDATE_SLOT"'),
+    "converged-against-active": lambda w: edit_run(
+        cutover_steps(w)[CONVERGED],
+        'all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$CANDIDATE_SLOT"',
+        'all_services_on_slot "$(cat "$SELECTORS_AFTER")" '
+        '"$(resolve_active_slot "$(cat "$SELECTORS_AFTER")")"'),
+    # A judgement that survives its own subject: made unconditional, it would
+    # run after a promotion that failed and report on a state nobody promoted.
+    "converged-unconditional": lambda w: cutover_steps(w)[CONVERGED].__setitem__(
+        "if", UNRESTRICTED_ALWAYS),
+    # The record of what the cutover left behind. Removing it, or making it
+    # conditional on success, loses the after-state of exactly the run whose
+    # after-state matters most.
+    "after-record-removed": lambda w: cutover_steps(w).pop(AFTER_RECORD),
+    "after-record-only-on-success": lambda w: cutover_steps(w)[AFTER_RECORD].pop("if"),
+    # `always()` unrestricted queries production even when the run failed long
+    # before it reached the promotion, and it runs on a cancelled job too.
+    "after-record-always": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", UNRESTRICTED_ALWAYS),
+    "after-record-soft": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "continue-on-error", True),
+    # The defect this round exists for: `skipped` is not the empty string, so a
+    # run that failed before the promotion satisfies this and reads production
+    # anyway.
+    "after-record-conclusion-nonempty": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", CONCLUSION_NOT_EMPTY),
+    # Excluding one bad conclusion by name leaves every other one -- including
+    # the states a run that never reached the promotion can be in.
+    "after-record-not-skipped": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", CONCLUSION_NOT_SKIPPED),
+    "after-record-not-cancelled-only": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", NOT_CANCELLED_ONLY),
+    # Half the allowlist: the after-state of a part-way cutover is the one this
+    # step exists to record, and this spelling is exactly the one that loses it.
+    "after-record-success-only": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", SUCCESS_ONLY),
+    "after-record-no-cancel-guard": lambda w: cutover_steps(w)[AFTER_RECORD].__setitem__(
+        "if", NO_CANCEL_GUARD),
+    # A recording step that also judges would fail the run a second time on a
+    # partial cutover, and would be skipped as a whole if it were ever softened.
+    "after-record-asserts": lambda w: edit_run(
+        cutover_steps(w)[AFTER_RECORD],
+        'cat "$SELECTORS_AFTER"',
+        'cat "$SELECTORS_AFTER"\nall_services_on_slot "$(cat "$SELECTORS_AFTER")" green'),
+    # Without the id there is nothing for the recording step's condition to name.
+    "promote-id-removed": lambda w: cutover_steps(w)[PROMOTE].pop("id"),
+    "converged-before-promotion": lambda w: move_cutover(w, CONVERGED, PROMOTE),
+    "still-running-removed": lambda w: cutover_steps(w).pop(STILL_RUNNING),
+    "still-running-tolerated": lambda w: edit_run(
+        cutover_steps(w)[STILL_RUNNING],
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"',
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE" || true'),
+    "still-running-before-promotion": lambda w: move_cutover(w, STILL_RUNNING, PROMOTE),
+    # The report may not claim a promotion the proofs have not established.
+    "report-before-proofs": lambda w: move_cutover(w, STILL_RUNNING + 1, CONVERGED),
+    # The commit the promotion checks out is proved reachable from main again,
+    # because an approval can arrive after main has been rewritten.
+    "main-gate-removed": lambda w: cutover_steps(w).pop(1),
 }
 
 # The release this workflow is supposed to perform, and in what order.
@@ -460,7 +736,12 @@ def rename_and_recomment(workflow):
 
 MUTATIONS = {
     **PROMOTION_SURFACE,
-    **SECOND_JOB,
+    **THIRD_JOB,
+    **CUTOVER_WIRING,
+    **CUTOVER_SURFACE,
+    **PROMOTION,
+    **EVIDENCE,
+    **CUTOVER_EVIDENCE,
     **CANDIDATE_RELEASE,
     **SELECTOR_INVARIANT,
     **SLOT_DERIVATION,
@@ -523,35 +804,214 @@ test_the_workflow_cannot_promote() {
     "$(mutate echo-hello harmless-echo)"
 }
 
-# The shape this task exists to keep out. Cutover is a later, separate step, so
-# a second job here is refused whatever it is called -- and refused for being a
-# second job, not for looking like a promotion, which is what makes the name
-# irrelevant.
-test_there_is_exactly_one_job() {
-  echo "one job, and no promotion phase"
-  expect_workflow_refused "a cutover job added back" \
-    "$(mutate cutover-job cutover-job)"
-  expect_workflow_refused "the same job under another name" \
+# Exactly two jobs, and the candidate stays the candidate. A third is refused
+# whatever it is called -- refused for being a third job, not for looking like a
+# promotion, which is what makes the name irrelevant -- and none of the wiring
+# that gates the cutover may migrate onto the deploy that precedes it.
+test_there_are_exactly_two_jobs() {
+  echo "two jobs, and the deploy is not one of the promoting ones"
+  expect_workflow_refused "the cutover job replaced by a naked promotion" \
+    "$(mutate cutover-replaced cutover-job-replaced)"
+  expect_workflow_refused "a second promotion under another name" \
     "$(mutate renamed-cutover renamed-cutover-job)"
-  expect_workflow_refused "a second job that only reports" \
-    "$(mutate second-job harmless-second-job)"
-  # An environment here would attach an approval to the phase that has nothing
-  # to approve yet, and pull that environment's secrets into an unprotected
-  # deploy. Both spellings of the key are refused.
+  expect_workflow_refused "a third job that only reports" \
+    "$(mutate third-job harmless-third-job)"
+  # An environment here would attach the approval to the phase that has nothing
+  # to approve, and pull that environment's secrets into an unprotected deploy.
+  # Both spellings of the key are refused.
   expect_workflow_refused "the deploy put behind the production environment" \
     "$(mutate environment candidate-environment)"
   expect_workflow_refused "the same environment declared as a mapping" \
     "$(mutate environment-mapping candidate-environment-mapping)"
-  expect_workflow_refused "the job made to depend on another" \
+  expect_workflow_refused "the deploy made to depend on another job" \
     "$(mutate job-needs candidate-needs)"
-  expect_workflow_refused "the job made conditional, so a failed gate can be stepped over" \
+  expect_workflow_refused "the deploy made conditional, so a failed gate can be stepped over" \
     "$(mutate conditional-job conditional-job)"
-  expect_workflow_refused "the job holding a write permission" \
+  expect_workflow_refused "the deploy holding a write permission" \
     "$(mutate job-write job-write-permission)"
-  # Outputs exist to feed a consumer. Re-declaring them is the first half of
-  # adding one back, and it has to be reviewed as that.
-  expect_workflow_refused "job outputs wired up for a consumer that does not exist" \
-    "$(mutate outputs outputs-restored)"
+}
+
+# The one channel between the two halves of a release. The cutover promotes
+# exactly what these outputs name, so a third output is a second channel, and a
+# missing one leaves the promotion identified by less than a release.
+test_the_candidate_hands_over_exactly_the_release() {
+  echo "the candidate's outputs"
+  expect_workflow_refused "an extra output the contract does not know about" \
+    "$(mutate extra-output extra-output)"
+  expect_workflow_refused "a handover that names the slot but not the build" \
+    "$(mutate no-release-id release-id-output-removed)"
+  expect_workflow_refused "a handover that names the build but not the slot" \
+    "$(mutate no-slot-output slot-output-removed)"
+  expect_workflow_refused "a candidate that hands over nothing at all" \
+    "$(mutate no-outputs outputs-removed)"
+  expect_workflow_refused "a slot handed over as a literal" \
+    "$(mutate literal-slot output-slot-hardcoded)"
+}
+
+# What holds the promotion behind a human, and behind the deploy that produced
+# the candidate. The approval rules live on the GitHub Environment; what this
+# contract holds is that the job is attached to that environment at all, that
+# it runs after the candidate, on the production runner, and with no permission
+# beyond the two reads it needs.
+test_the_cutover_is_gated() {
+  echo "the cutover job's gates"
+  expect_workflow_refused "a workflow with no cutover job at all" \
+    "$(mutate no-cutover cutover-job-removed)"
+  expect_workflow_refused "a promotion with no environment to approve it" \
+    "$(mutate no-environment environment-removed)"
+  expect_workflow_refused "the environment declared as a mapping" \
+    "$(mutate env-mapping environment-mapping)"
+  expect_workflow_refused "an environment whose approval rules are somebody else's" \
+    "$(mutate env-renamed environment-renamed)"
+  expect_workflow_refused "a promotion that does not wait for the deploy" \
+    "$(mutate no-needs needs-removed)"
+  expect_workflow_refused "a promotion wired to depend on some other job" \
+    "$(mutate rewired-needs needs-rewired)"
+  expect_workflow_refused "a promotion made conditional" \
+    "$(mutate cutover-if cutover-conditional)"
+  expect_workflow_refused "a promotion moved off the production runner" \
+    "$(mutate cutover-runner cutover-off-runner)"
+  expect_workflow_refused "a promotion granted write access to the repository" \
+    "$(mutate cutover-write cutover-write-permission)"
+  expect_workflow_refused "a promotion granted an OIDC identity nobody reviewed" \
+    "$(mutate cutover-oidc cutover-id-token)"
+  expect_workflow_refused "a promotion with no time limit" \
+    "$(mutate cutover-untimed cutover-no-timeout)"
+  expect_workflow_refused "a promotion allowed to hold the concurrency group for hours" \
+    "$(mutate cutover-long cutover-timeout-changed)"
+  expect_workflow_refused "cutover outputs wired for a consumer that does not exist" \
+    "$(mutate cutover-outputs cutover-outputs)"
+}
+
+# One mutation and nothing beside it. CICD-08 and the observation window are
+# separate, later decisions, and a migration or a DNS change is not part of a
+# Blue/Green cutover at all -- none of them has to be recognised to be refused.
+test_the_cutover_does_one_thing() {
+  echo "the cutover job's executable surface is closed"
+  expect_workflow_refused "an automatic rollback bolted onto the promotion" \
+    "$(mutate auto-rollback cutover-rollback)"
+  expect_workflow_refused "the old slot drained in the same run" \
+    "$(mutate auto-drain cutover-drain)"
+  expect_workflow_refused "a migration run at promotion time" \
+    "$(mutate cutover-migrate cutover-migration)"
+  expect_workflow_refused "a second, hand-written selector patch" \
+    "$(mutate cutover-patch cutover-second-patch)"
+  expect_workflow_refused "the selector helper called directly beside cutover.sh" \
+    "$(mutate cutover-switch cutover-switch-helper)"
+  expect_workflow_refused "a DNS record changed as part of the cutover" \
+    "$(mutate cutover-dns cutover-dns)"
+  expect_workflow_refused "an added step that does something harmless" \
+    "$(mutate cutover-echo cutover-echo)"
+}
+
+# cutover.sh is the whole mutation, and its target is named rather than derived.
+# Deriving it from the cluster is the retry-becomes-reversal bug: after a
+# partial failure a second run would read the other slot as active and send
+# production back to the release it had just left.
+test_the_promotion_names_its_target() {
+  echo "the promotion"
+  expect_workflow_refused "a run that never promotes" \
+    "$(mutate no-promotion promotion-removed)"
+  expect_workflow_refused "a promotion replaced by a command that does nothing" \
+    "$(mutate promotion-true promotion-replaced)"
+  expect_workflow_refused "a promotion marked continue-on-error" \
+    "$(mutate soft-promotion promotion-soft)"
+  expect_workflow_refused "a promotion made conditional" \
+    "$(mutate conditional-promotion promotion-conditional)"
+  expect_workflow_refused "a failed promotion swallowed by || true" \
+    "$(mutate tolerated-promotion promotion-tolerated)"
+  expect_workflow_refused "a target derived from whatever is active, so a retry reverses" \
+    "$(mutate derived-target target-derived)"
+  expect_workflow_refused "a target written as a literal" \
+    "$(mutate literal-target target-hardcoded)"
+  expect_workflow_refused "a target taken from a workflow input" \
+    "$(mutate input-target target-from-input)"
+  expect_workflow_refused "a promotion that would stop for an interactive prompt" \
+    "$(mutate no-assume-yes assume-yes-removed)"
+  expect_workflow_refused "a promotion with no sealed manifest to identify the release" \
+    "$(mutate no-manifest manifest-dir-removed)"
+  expect_workflow_refused "a manifest read from somewhere this run did not download" \
+    "$(mutate other-manifest manifest-dir-elsewhere)"
+}
+
+# The evidence cutover.sh checks. It has to name the slot AND the release on it:
+# a token naming only the slot still matches a candidate that was redeployed
+# after the authenticated smoke, which is the promotion this gate exists to
+# refuse.
+test_the_evidence_names_slot_and_release() {
+  echo "the smoke evidence"
+  expect_workflow_refused "a promotion with no recorded evidence at all" \
+    "$(mutate no-evidence evidence-removed)"
+  expect_workflow_refused "evidence reduced to a boolean" \
+    "$(mutate true-evidence evidence-true)"
+  expect_workflow_refused "empty evidence" \
+    "$(mutate empty-evidence evidence-empty)"
+  expect_workflow_refused "evidence naming only the slot" \
+    "$(mutate slot-evidence evidence-slot-only)"
+  expect_workflow_refused "evidence naming only the release" \
+    "$(mutate release-evidence evidence-release-only)"
+  expect_workflow_refused "evidence naming the commit but not the build" \
+    "$(mutate sha-evidence evidence-sha-only)"
+  expect_workflow_refused "evidence written as a literal" \
+    "$(mutate hardcoded-evidence evidence-hardcoded)"
+  expect_workflow_refused "evidence supplied by whoever dispatched the run" \
+    "$(mutate input-evidence evidence-from-input)"
+}
+
+# The cluster is read again before anything is patched, and twice more after.
+# An approval can arrive hours after the smoke, and a candidate that was
+# redeployed, rebuilt or degraded in the meantime is exactly as Ready and as
+# consistent as the one that was validated.
+test_the_cutover_proves_the_state_it_changes() {
+  echo "before, and after"
+  expect_workflow_refused "a promotion that takes no snapshot of what it is changing" \
+    "$(mutate no-before before-snapshot-removed)"
+  expect_workflow_refused "a snapshot that is read and never written down" \
+    "$(mutate unwritten-before before-snapshot-not-written)"
+  expect_workflow_refused "a preflight that never classifies the selectors" \
+    "$(mutate no-preflight preflight-removed)"
+  expect_workflow_refused "a preflight swallowed by || true" \
+    "$(mutate tolerated-preflight preflight-tolerated)"
+  # The defect this file exists to keep out for good: a falsifiable check whose
+  # exit status is hidden inside the echo it is written in.
+  expect_workflow_refused "a preflight whose exit status is masked by an echo" \
+    "$(mutate masked-preflight preflight-inside-echo)"
+  expect_workflow_refused "a preflight classifying against a hardcoded slot" \
+    "$(mutate literal-preflight preflight-target-hardcoded)"
+  expect_workflow_refused "a promotion that never rechecks what the slot is running" \
+    "$(mutate no-revalidation revalidation-removed)"
+  expect_workflow_refused "a recheck marked continue-on-error" \
+    "$(mutate soft-revalidation revalidation-soft)"
+  expect_workflow_refused "a recheck swallowed by || true" \
+    "$(mutate tolerated-revalidation revalidation-tolerated)"
+  expect_workflow_refused "a recheck that happens after the traffic has moved" \
+    "$(mutate late-revalidation revalidation-after-promotion)"
+  expect_workflow_refused "a recheck against the commit alone, which a rebuild satisfies" \
+    "$(mutate sha-revalidation revalidation-sha-only)"
+  expect_workflow_refused "a promotion that never proves the Services converged" \
+    "$(mutate no-converged converged-removed)"
+  expect_workflow_refused "a convergence proof marked continue-on-error" \
+    "$(mutate soft-converged converged-soft)"
+  expect_workflow_refused "a partial convergence swallowed by || true" \
+    "$(mutate tolerated-converged converged-tolerated)"
+  expect_workflow_refused "selectors read after the cutover and never compared" \
+    "$(mutate uncompared-converged converged-not-compared)"
+  expect_workflow_refused "a convergence proved against whatever is active, not the target" \
+    "$(mutate active-converged converged-against-active)"
+  expect_workflow_refused "a convergence proved before the traffic moves" \
+    "$(mutate early-converged converged-before-promotion)"
+  expect_workflow_refused "a run that never rechecks the release after promoting it" \
+    "$(mutate no-still-running still-running-removed)"
+  expect_workflow_refused "that recheck swallowed by || true" \
+    "$(mutate tolerated-still-running still-running-tolerated)"
+  expect_workflow_refused "that recheck moved in front of the promotion" \
+    "$(mutate early-still-running still-running-before-promotion)"
+  expect_workflow_refused "a convergence proof that survives a failed promotion" \
+    "$(mutate unconditional-converged converged-unconditional)"
+  expect_workflow_refused "a promotion reported before either proof has passed" \
+    "$(mutate early-cutover-report report-before-proofs)"
+  expect_workflow_refused "a promotion of a commit main is no longer proved to reach" \
+    "$(mutate no-main-gate main-gate-removed)"
 }
 
 # The order is a property of the release, not a detail of the file: digests are
@@ -822,6 +1282,146 @@ test_the_root_surface_is_closed() {
     "$(mutate no-name name-removed)"
 }
 
+# The after-state of a cutover that stopped part-way is the evidence an operator
+# needs most, and it is produced by exactly the run in which an asserting step
+# never executes. So the recording and the judgement are two steps: one runs
+# whenever the promotion was reached, the other is ordinary and stays skipped
+# when the promotion failed. Neither may collapse into the other.
+test_the_after_state_is_recorded_even_when_the_cutover_fails() {
+  echo "the after-state is recorded on failure too"
+  expect_workflow_refused "a run that records nothing after a failed promotion" \
+    "$(mutate no-after-record after-record-removed)"
+  expect_workflow_refused "a recording that only happens when the promotion succeeded" \
+    "$(mutate success-only-record after-record-only-on-success)"
+  # always() would query production on a run that failed long before the
+  # promotion, and on a cancelled one.
+  expect_workflow_refused "a recording condition widened to always()" \
+    "$(mutate always-record after-record-always)"
+  expect_workflow_refused "a recording marked continue-on-error" \
+    "$(mutate soft-record after-record-soft)"
+  expect_workflow_refused "a recording that also judges what it recorded" \
+    "$(mutate judging-record after-record-asserts)"
+  expect_workflow_refused "a promotion with no id for the recording to depend on" \
+    "$(mutate no-promote-id promote-id-removed)"
+}
+
+# The condition on that recording, as a policy rather than as a string. Naming
+# any status function stops Actions inserting the implicit success(), so every
+# spelling looser than an explicit allowlist runs the step on a run that
+# promoted nothing -- `skipped` is what a step reports when an earlier one
+# failed, and it is neither empty nor cancelled.
+test_the_recording_runs_only_when_the_promotion_actually_ran() {
+  echo "the recording's condition is an allowlist"
+  expect_workflow_refused "a condition satisfied by a skipped promotion (conclusion != '')" \
+    "$(mutate nonempty-conclusion after-record-conclusion-nonempty)"
+  expect_workflow_refused "a condition that only excludes 'skipped' by name" \
+    "$(mutate not-skipped after-record-not-skipped)"
+  expect_workflow_refused "a condition that only excludes cancellation" \
+    "$(mutate not-cancelled-only after-record-not-cancelled-only)"
+  # Half the allowlist loses the after-state of a part-way cutover, which is
+  # the run this step exists for.
+  expect_workflow_refused "a condition that records only after a successful promotion" \
+    "$(mutate success-only after-record-success-only)"
+  expect_workflow_refused "an allowlist that would still read the cluster on a cancelled run" \
+    "$(mutate no-cancel-guard after-record-no-cancel-guard)"
+}
+
+# The rollback target is opposite_slot(target), derived from the slot that was
+# authorised. Read back from the selectors it names the target itself once the
+# namespace has converged -- the one slot a rollback can never go to.
+test_the_rollback_target_is_the_opposite_of_the_target() {
+  echo "the rollback target"
+  expect_workflow_refused "a rollback target read back from the live selectors" \
+    "$(mutate selector-rollback rollback-from-selectors)"
+  expect_workflow_refused "a rollback target written as a literal" \
+    "$(mutate literal-rollback rollback-hardcoded)"
+  expect_workflow_refused "a rollback target that is the promoted slot itself" \
+    "$(mutate self-rollback rollback-is-target)"
+}
+
+# The positive half, asserted against the committed file rather than inferred
+# from a checker that accepted it. Every refusal above says what the workflow
+# must not be; these say what it is, so a contract and a workflow that drifted
+# together into something harmless-but-wrong would still be caught here.
+workflow_fact() {
+  python3 - "$WORKFLOW" "$1" <<'PYTHON'
+import sys
+
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    workflow = yaml.safe_load(handle)
+job = workflow["jobs"]["cutover"]
+steps = job["steps"]
+promotion = next(step for step in steps if "cutover.sh" in str(step.get("run", "")))
+facts = {
+    "jobs": ",".join(workflow["jobs"]),
+    "needs": job["needs"],
+    "environment": job["environment"],
+    "runner": ",".join(job["runs-on"]),
+    "permissions": ",".join(f"{k}={v}" for k, v in sorted(job["permissions"].items())),
+    "outputs": ",".join(f"{k}={v}" for k, v in workflow["jobs"]["candidate"]["outputs"].items()),
+    "promotion": promotion["run"].strip(),
+    "evidence": promotion["env"]["NCHAT_PROD_SMOKE_CONFIRMED"],
+    "promotions": str(sum("cutover.sh" in str(step.get("run", "")) for step in steps)),
+    "before": str(any("SELECTORS_BEFORE" in step.get("env", {}) for step in steps)),
+    "after": str(any("SELECTORS_AFTER" in step.get("env", {}) for step in steps)),
+    # The recording of the after-state is the only step either job may make
+    # conditional, and its condition ties it to the promotion having run.
+    "conditional_steps": ",".join(step["name"] for step in steps if "if" in step),
+    "after_condition": next(step["if"] for step in steps if "if" in step),
+    # Nothing may be softened: a continue-on-error anywhere turns a gate into a
+    # warning.
+    "soft_steps": ",".join(step["name"] for step in steps if "continue-on-error" in step),
+    "rollback_target": next(
+        line.split("=", 1)[1].strip()
+        for step in steps
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip().startswith("rollback_target=")
+    ),
+}
+print(facts[sys.argv[2]])
+PYTHON
+}
+
+test_the_committed_cutover_is_wired_as_designed() {
+  echo "the committed cutover job"
+  assert_equals "the workflow is the candidate deploy and the cutover, in that order" \
+    "candidate,cutover" "$(workflow_fact jobs)"
+  assert_equals "the cutover runs only after the candidate deploy" \
+    "candidate" "$(workflow_fact needs)"
+  assert_equals "the cutover is attached to the production environment" \
+    "production" "$(workflow_fact environment)"
+  assert_equals "the cutover runs on the production runner" \
+    "self-hosted,linux,x64,nchat-prod-deploy" "$(workflow_fact runner)"
+  assert_equals "the cutover holds two read permissions and nothing else" \
+    "actions=read,contents=read" "$(workflow_fact permissions)"
+  assert_equals "the candidate hands over the slot and the sealed build" \
+    'slot=${{ steps.slot.outputs.slot }},release_id=${{ steps.release.outputs.release_id }}' \
+    "$(workflow_fact outputs)"
+  # The mutation is cutover.sh, once, with the target named on the command line.
+  assert_equals "the promotion is cutover.sh with an explicit target" \
+    'scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT"' \
+    "$(workflow_fact promotion)"
+  assert_equals "there is exactly one promotion in the job" "1" "$(workflow_fact promotions)"
+  assert_equals "the evidence names the slot and the release the candidate built" \
+    '${{ needs.candidate.outputs.slot }}:${{ inputs.sha }}:${{ needs.candidate.outputs.release_id }}' \
+    "$(workflow_fact evidence)"
+  assert_equals "a selector snapshot is taken before the cutover" "True" "$(workflow_fact before)"
+  assert_equals "a selector snapshot is taken after the cutover" "True" "$(workflow_fact after)"
+  # The rollback target comes from the authorised target, not from the cluster.
+  assert_equals "the rollback target is the opposite of the promoted slot" \
+    '"$(opposite_slot "$TARGET_SLOT")"' "$(workflow_fact rollback_target)"
+  assert_equals "exactly one step is conditional, and it is the after-state recording" \
+    "Record the stable Services after the cutover" "$(workflow_fact conditional_steps)"
+  # An allowlist of the two conclusions that mean the promotion actually ran.
+  assert_equals "the recording is tied to the promotion having run" \
+    "\${{ !cancelled() && (steps.promote.conclusion == 'success' || steps.promote.conclusion == 'failure') }}" \
+    "$(workflow_fact after_condition)"
+  assert_equals "no step in the cutover job is marked continue-on-error" \
+    "" "$(workflow_fact soft_steps)"
+}
+
 test_documentation_is_not_execution() {
   echo "documentation is not execution"
   expect_workflow_accepted "a reworded comment and a renamed step" \
@@ -1055,8 +1655,18 @@ main() {
   JOB_MUTATOR="$WORK_DIR/job-mutator.py"
   write_job_mutator
   test_real_workflow_satisfies_the_contract
+  test_the_committed_cutover_is_wired_as_designed
   test_the_workflow_cannot_promote
-  test_there_is_exactly_one_job
+  test_there_are_exactly_two_jobs
+  test_the_candidate_hands_over_exactly_the_release
+  test_the_cutover_is_gated
+  test_the_cutover_does_one_thing
+  test_the_promotion_names_its_target
+  test_the_evidence_names_slot_and_release
+  test_the_cutover_proves_the_state_it_changes
+  test_the_after_state_is_recorded_even_when_the_cutover_fails
+  test_the_recording_runs_only_when_the_promotion_actually_ran
+  test_the_rollback_target_is_the_opposite_of_the_target
   test_the_candidate_performs_the_release
   test_the_stable_selector_invariant_is_proved
   test_the_candidate_slot_comes_from_the_cluster
