@@ -132,12 +132,18 @@ chamada a `Evaluate` responderia diferente. Nenhuma mudanca e pulada e nenhuma e
 inventada no meio. Na pratica e o fim da sequencia de trabalho atual quando
 dentro, e o inicio da proxima janela quando fora.
 
-A busca e limitada a oito dias (hoje + sete). O schedule se repete semanalmente,
-entao um limite que exista e encontrado dentro dessa janela; passar disso seria
-repetir a mesma semana para sempre. A resolucao de cada data tambem caminha sobre
-as transicoes da zona com um teto pequeno — a sondagem cobre tres dias e nenhuma
-zona da base IANA muda de offset mais de duas vezes nesse intervalo. Nenhum dos
-dois loops e ilimitado, nem com dado de timezone malformado.
+A busca e limitada a quinze datas civis a partir da avaliada: o resto do dia
+atual, um ciclo semanal completo e um segundo ciclo. O segundo nao e folga — uma
+zona pode **remover uma data civil** do calendario (Pacific/Apia removeu
+2011-12-30 quando Samoa mudou de lado da linha internacional da data), e a
+ocorrencia que cair nessa data simplesmente nao acontece, empurrando a proxima
+para uma semana depois. Um terceiro ciclo exigiria duas datas removidas com
+exatamente sete dias de diferenca, coisa que nunca ocorreu na base IANA.
+
+A resolucao de cada data tambem caminha sobre as transicoes da zona com um teto
+pequeno — a sondagem cobre tres dias e nenhuma zona da base IANA muda de offset
+mais de duas vezes nesse intervalo. Nenhum dos dois loops e ilimitado, nem com
+dado de timezone malformado.
 
 Zero (`IsZero`) significa "nao calculavel": sem schedule, ou schedule sem nenhum
 intervalo em dia nenhum. Um schedule vazio e aceito e **nao** e o mesmo que

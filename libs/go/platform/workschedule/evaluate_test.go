@@ -617,3 +617,84 @@ func TestEvaluateDoesNotAnnounceMidnightBetweenTouchingDays(t *testing.T) {
 	}
 	assertTransitionIsReal(t, schedule, officeInstant(t, wallClock{7, 23, 0}), evaluation)
 }
+
+// A zone may remove a civil date from its calendar. Pacific/Apia removed
+// 2011-12-30 when Samoa crossed the International Date Line: the local clock
+// went from Thursday the 29th straight to Saturday the 31st, and that Friday
+// never existed there.
+//
+// A Friday-only schedule therefore skips a week, and the search has to survive
+// it. It is the reason the horizon is two weekly cycles rather than one: asked
+// on the Thursday, the next occurrence is eight civil dates away; asked on the
+// previous Friday, fourteen. One cycle misses both, and a one-day margin on it
+// covers the Thursday and still misses the Friday.
+func TestEvaluateAcrossACivilDateTheZoneRemoved(t *testing.T) {
+	const zone = "Pacific/Apia"
+	block := workschedule.Interval{Start: workschedule.At(9, 0), End: workschedule.At(17, 0)}
+	schedule := mustSchedule(t, zone, workschedule.Days{time.Friday: {block}})
+
+	// Friday 2011-12-30 does not exist in this zone; the next one that does is
+	// 2012-01-06.
+	nextFriday := localTime(t, zone, 2012, time.January, 6, 9, 0)
+
+	tests := []dstCase{
+		{
+			// The review's case: the skipped Friday is the very next civil date.
+			name:    "the day before the calendar jumps",
+			instant: localTime(t, zone, 2011, time.December, 29, 8, 0),
+			want:    workschedule.StateOutsideWorkHours,
+			next:    nextFriday,
+		},
+		{
+			// The harder one: the next occurrence is a full second cycle away,
+			// because the first cycle's Friday is the date that was removed.
+			name:    "the previous Friday, after that day's block",
+			instant: localTime(t, zone, 2011, time.December, 23, 18, 0),
+			want:    workschedule.StateOutsideWorkHours,
+			next:    nextFriday,
+		},
+		{
+			name:    "the Saturday the calendar lands on",
+			instant: localTime(t, zone, 2011, time.December, 31, 12, 0),
+			want:    workschedule.StateOutsideWorkHours,
+			next:    nextFriday,
+		},
+		{
+			name:     "the next Friday that exists",
+			instant:  nextFriday,
+			want:     workschedule.StateWithinWorkHours,
+			interval: block,
+			next:     localTime(t, zone, 2012, time.January, 6, 17, 0),
+		},
+	}
+	runDSTCases(t, schedule, tests)
+
+	// No window is invented for the date nobody lived. The whole stretch the
+	// removed Friday would have covered reads as outside work hours.
+	for hour := range 24 {
+		removed := time.Date(2011, time.December, 30, hour, 0, 0, 0, time.UTC)
+		if state := schedule.Evaluate(removed).State; state != workschedule.StateOutsideWorkHours {
+			t.Fatalf("%s: State = %q, want outside_work_hours on a date the zone removed",
+				removed, state)
+		}
+	}
+}
+
+// The neighbouring weekday is untouched: Saturday still happens, two civil dates
+// after the Thursday, even though the date between them was removed.
+func TestEvaluateFindsTheWeekdayAfterARemovedCivilDate(t *testing.T) {
+	const zone = "Pacific/Apia"
+	block := workschedule.Interval{Start: workschedule.At(9, 0), End: workschedule.At(17, 0)}
+	schedule := mustSchedule(t, zone, workschedule.Days{time.Saturday: {block}})
+
+	instant := localTime(t, zone, 2011, time.December, 29, 8, 0)
+	evaluation := schedule.Evaluate(instant)
+
+	if evaluation.State != workschedule.StateOutsideWorkHours {
+		t.Fatalf("State = %q, want outside_work_hours", evaluation.State)
+	}
+	if want := localTime(t, zone, 2011, time.December, 31, 9, 0); !evaluation.NextTransition.Equal(want) {
+		t.Fatalf("NextTransition = %s, want %s", evaluation.NextTransition, want)
+	}
+	assertTransitionIsReal(t, schedule, instant, evaluation)
+}

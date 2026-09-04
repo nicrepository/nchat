@@ -50,17 +50,30 @@ type Evaluation struct {
 	NextTransition time.Time
 }
 
-// searchHorizonDays bounds the forward search for the next state change.
+// searchHorizonDays bounds the forward search for the next state change. It is
+// a count of civil dates, starting at the evaluated one, so the walk visits
+// offsets 0 to searchHorizonDays-1:
 //
-// A schedule repeats weekly, so a stretch of work that exists at all begins
-// within today plus seven days — seven covers every other weekday, and the
-// eighth day is today's own weekday coming round again, which is what a
-// schedule whose only block already ended today needs. Past that there is
-// provably nothing to find, so the bound is not a heuristic: it is the point at
-// which continuing would repeat the same week forever. A schedule with no
-// intervals at all is the case it actually stops, and it stops after eight
-// cheap iterations rather than never.
-const searchHorizonDays = 8
+//	 1  the rest of the evaluated date
+//	 7  one full weekly cycle, in which every weekday occurs exactly once
+//	 7  a second cycle
+//	--
+//	15
+//
+// The second cycle is not padding. A schedule repeats weekly, so an occurrence
+// does exist within the first one — but a zone may drop a civil date from its
+// calendar altogether, and an occurrence landing on that date simply never
+// happens. Pacific/Apia removed 2011-12-30 when Samoa crossed the International
+// Date Line, so a Friday-only schedule evaluated on Friday the 23rd has its next
+// occurrence on day 14 rather than day 7. One extra day would cover being asked
+// on the Thursday and no more, which is why the bound is a whole second cycle.
+//
+// It is a bound and not a margin: needing a third cycle would take two civil
+// dates removed exactly a week apart, and no zone in the IANA database has ever
+// removed more than one. Past it there is provably nothing to find, so the walk
+// stops instead of repeating the same weeks forever — which is what a schedule
+// with no intervals at all does, in fifteen cheap iterations rather than never.
+const searchHorizonDays = 15
 
 // Evaluate answers whether instant falls inside working hours, and when that
 // answer next changes.
