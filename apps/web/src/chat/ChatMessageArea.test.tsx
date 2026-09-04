@@ -3022,14 +3022,19 @@ describe("ChatMessageArea — message list", () => {
   it("stops observing the picker once it is closed", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelArea();
+    await screen.findAllByTestId("chat-msg-bubble");
+    // Baseline includes MessageList's own #788 tail-lock observer (the
+    // timeline content wrapper), which mounts with the message list itself
+    // and is unrelated to the picker.
+    const baseline = observedElements().length;
 
     await openFullReactionPicker();
-    expect(observedElements()).toHaveLength(1);
+    expect(observedElements()).toHaveLength(baseline + 1);
 
     fireEvent.keyDown(document, { key: "Escape" });
 
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
-    expect(observedElements()).toHaveLength(0);
+    expect(observedElements()).toHaveLength(baseline);
   });
 
   it("closes the reaction picker when its anchor leaves the viewport", async () => {
@@ -6208,7 +6213,8 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     // The separator sits immediately before the first unread message ("Não
     // lida 1", the earliest of the last 2 eligible messages) — not before the
     // already-read one.
-    const listItems = Array.from(screen.getByRole("log").children);
+    const listContent = screen.getByRole("log").querySelector(".chat-msg-area__list-content")!;
+    const listItems = Array.from(listContent.children);
     const separatorIndex = listItems.indexOf(separator);
     const firstUnreadIndex = listItems.findIndex((el) => el.textContent?.includes("Não lida 1"));
     expect(separatorIndex).toBeGreaterThan(-1);
@@ -6493,6 +6499,178 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
     });
 
     expect(screen.queryByText("Lenta")).not.toBeInTheDocument();
+  });
+
+  // #788: an async reflow (an attachment/document/media preview finishing its
+  // layout well after the initial positioning) must not strand the viewport
+  // away from the real bottom, nor invent a false reading-history position —
+  // but it also must never override a genuine reading-history position. The
+  // regression is reproduced generically via the content wrapper's own
+  // ResizeObserver (flushResizeObservers, from setupTests) — never coupled to
+  // any specific attachment component.
+  describe("tail-lock across async reflow (#788)", () => {
+    const anchorKey = "nchat.chat.viewport.v1:me-123:channel:geral";
+
+    it("re-pins to the real bottom when content grows asynchronously after opening at the bottom", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+      );
+      renderWithContext("geral", {
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Última mensagem");
+
+      // Content grew (scrollHeight increased) but scrollTop is stale — the
+      // geometry an attachment finishing its layout leaves behind.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 400 });
+
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(600);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not pull the viewport back when the user scrolled up but stayed inside the near-bottom threshold", async () => {
+      // The phase alone cannot gate the tail-lock: #492's scroll handler
+      // assigns AT_BOTTOM anywhere within BOTTOM_THRESHOLD_PX (150) of the
+      // end, so a deliberate small scroll up leaves the phase AT_BOTTOM while
+      // the viewport is no longer at the real tail. A reflow must respect
+      // that intent instead of yanking the reader down.
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Real tail is scrollTop 600; the user scrolls up 100px — still within
+      // the 150px near-bottom threshold, so the phase stays AT_BOTTOM.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 500 });
+      fireEvent.scroll(list);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+
+      // Historical content grows underneath them.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(500);
+    });
+
+    it("does not pull the viewport back to the bottom when the user is reading history and content resizes", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      scrollAwayFromBottom(list);
+      await screen.findByRole("button", { name: "Ir para o final da conversa" });
+      const scrollTopBefore = list.scrollTop;
+
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(scrollTopBefore);
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    });
+
+    it("does not pull a restored reading-history position back to the bottom when content resizes", async () => {
+      sessionStorage.setItem(
+        anchorKey,
+        JSON.stringify({
+          atBottom: false,
+          anchorMessageId: "m1",
+          anchorOffsetPx: 0,
+          savedAt: Date.now(),
+        }),
+      );
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([
+          makeMessage({ id: "m1", bodyText: "Antiga" }),
+          makeMessage({ id: "m2", bodyText: "Mais recente" }),
+        ]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Antiga");
+
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
+
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(0);
+      expect(
+        await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    });
+
+    it("re-pins to the real bottom during an in-flight 'Ir para o final' animation if content grows mid-flight", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      scrollAwayFromBottom(list); // scrollHeight=1000, clientHeight=400, scrollTop=0
+      const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+      await userEvent.click(button); // phase -> SCROLLING_TO_BOTTOM
+
+      // Content grows mid-animation — a direct scrollTop write, not a second
+      // scrollIntoView, so it can't race the click's own in-flight animation.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(1200);
+      // Still visible until the bottom sentinel actually confirms arrival —
+      // unchanged #492 semantics (scrollTop alone is never "arrival").
+      expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+
+      fireBottomSentinel(true);
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    it("never persists a false reading-history anchor after a reflow while at the bottom", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+      );
+      const { unmount } = renderWithContext("geral", {
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      });
+      await screen.findByText("Última mensagem");
+
+      act(() => flushResizeObservers());
+      unmount();
+
+      const raw = sessionStorage.getItem(anchorKey);
+      expect(raw).not.toBeNull();
+      expect(JSON.parse(raw!)).toMatchObject({ atBottom: true, anchorMessageId: null });
+    });
   });
 });
 
