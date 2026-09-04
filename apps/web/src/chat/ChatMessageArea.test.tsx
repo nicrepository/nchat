@@ -6643,7 +6643,9 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
       expect(list.scrollTop).toBe(1200);
       // Still visible until the bottom sentinel actually confirms arrival —
       // unchanged #492 semantics (scrollTop alone is never "arrival").
-      expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
 
       fireBottomSentinel(true);
       await waitFor(() =>
