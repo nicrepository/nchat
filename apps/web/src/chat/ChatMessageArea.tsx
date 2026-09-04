@@ -82,6 +82,7 @@ import {
   isEligibleUnreadMessage,
   isNearBottom,
   MAX_BOUNDARY_SEARCH_PAGES,
+  TAIL_EPSILON_PX,
   type ViewportPhase,
 } from "./chatViewportState";
 import {
@@ -667,6 +668,8 @@ function MessageList({
   onReachedBottom,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  // #788: the timeline content wrapper — see the ResizeObserver effect below.
+  const contentRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const messageRefs = useRef(new Map<string, HTMLDivElement>());
@@ -795,6 +798,21 @@ function MessageList({
   // the scroll container to the actual bottom is ≤ 150 px (roughly one message).
   const isNearBottomRef = useRef(true);
 
+  // #788: whether the last real scroll left the viewport at the REAL tail,
+  // not merely within isNearBottomRef's 150px courtesy threshold. The phase
+  // cannot answer this: the scroll handler below assigns AT_BOTTOM anywhere
+  // inside that threshold, so a deliberate small scroll up keeps the phase
+  // AT_BOTTOM while the reader is no longer at the end.
+  //
+  // Only the scroll handler writes it, which is exactly what makes it usable
+  // from the ResizeObserver: a pure content resize fires no scroll event, so
+  // by the time the reflow is observed this still holds the position the
+  // reader chose *before* the layout moved under them.
+  //
+  // Starts true: a conversation that resolves to the bottom is positioned at
+  // the tail before any scroll event can report it.
+  const atRealTailRef = useRef(true);
+
   /**
    * The topmost visible message and its offset from the container's top edge
    * — the anchor #492 restores a history position from. jsdom reports every
@@ -826,6 +844,12 @@ function MessageList({
     const onScroll = () => {
       const nearBottom = isNearBottom(el.scrollHeight, el.scrollTop, el.clientHeight);
       isNearBottomRef.current = nearBottom;
+      atRealTailRef.current = isNearBottom(
+        el.scrollHeight,
+        el.scrollTop,
+        el.clientHeight,
+        TAIL_EPSILON_PX,
+      );
       // Only the bottom sentinel ends SCROLLING_TO_BOTTOM — a near-bottom
       // scroll position reached mid-animation is not yet a confirmed arrival
       // (a media resize could still be in flight).
@@ -874,6 +898,50 @@ function MessageList({
     observer.observe(sentinel);
     return () => observer.disconnect();
   }, [setPhase]);
+
+  // #788 tail-lock: keeps the viewport pinned to the real bottom through an
+  // async reflow (an attachment/media preview finishing its layout well after
+  // the initial positioning) — for ANY variable-height content, never an
+  // attachment-specific special case.
+  //
+  // Observes contentRef, not listRef: listRef's clientHeight is fixed by CSS
+  // and never changes when a message grows, so only the content wrapper's own
+  // box height tracks what would otherwise show up as listRef.scrollHeight.
+  //
+  // Two ways in, and the phase alone is not enough for either:
+  //
+  // - SCROLLING_TO_BOTTOM: the reader explicitly asked for the end (button or
+  //   own-send), so a resize re-pins unconditionally — mid-flight is exactly
+  //   when a late-loading preview would otherwise strand the animation short.
+  // - AT_BOTTOM: re-pins ONLY if the last real scroll left the viewport at the
+  //   true tail. #492's scroll handler assigns AT_BOTTOM anywhere within 150px
+  //   of the end, so without atRealTailRef a reader who deliberately scrolled
+  //   up a little — and stayed inside that threshold — would be yanked back
+  //   down by an unrelated image finishing its layout.
+  //
+  // The correction is a direct scrollTop assignment, never scrollIntoView:
+  // during SCROLLING_TO_BOTTOM there is already an in-flight scrollIntoView
+  // animation, and a second scrollIntoView call races that animation instead
+  // of cleanly overriding it — a plain scrollTop write always wins.
+  //
+  // While READING_HISTORY/AT_FIRST_UNREAD/RESTORING_POSITION this is a no-op:
+  // a reading position is never overridden by a layout shift alone.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      const el = listRef.current;
+      if (!el) return;
+      const holdsTail =
+        phaseRef.current === "SCROLLING_TO_BOTTOM" ||
+        (phaseRef.current === "AT_BOTTOM" && atRealTailRef.current);
+      if (holdsTail) {
+        el.scrollTop = el.scrollHeight - el.clientHeight;
+      }
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
 
   // Captures the anchor exactly once, when this conversation is actually left
   // — the unmount that already happens on every target switch (#492 item 4:
@@ -1151,86 +1219,89 @@ function MessageList({
         aria-live="polite"
         aria-label="Mensagens"
       >
-        <div ref={topSentinelRef} aria-hidden="true" />
-        {loadingMore && (
-          <div
-            className="chat-msg-area__load-more"
-            role="status"
-            aria-label="Carregando mensagens anteriores"
-            data-testid="load-more-indicator"
-          />
-        )}
-        {withDividers.map((item, i) =>
-          item.type === "divider" ? (
-            <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
-              {item.label}
-            </div>
-          ) : item.type === "unread-divider" ? (
+        {/* #788: the ResizeObserver target — see the tail-lock effect above. */}
+        <div ref={contentRef} className="chat-msg-area__list-content">
+          <div ref={topSentinelRef} aria-hidden="true" />
+          {loadingMore && (
             <div
-              key="unread-divider"
-              ref={unreadDividerRef}
-              className="chat-msg-area__new-messages-divider"
-              role="separator"
-              aria-label="Novas mensagens"
-            >
-              Novas mensagens
-            </div>
-          ) : item.message.kind === "system" ? (
-            // A conversation event is not something a person said, so it never
-            // becomes a MessageBubble: no bubble, no avatar, and none of the
-            // message actions — editing "Fulano saiu do grupo" is not a thing
-            // (issue #527).
-            <ConversationSystemMessage
-              key={item.message.id}
-              message={item.message}
-              scope={systemScope}
+              className="chat-msg-area__load-more"
+              role="status"
+              aria-label="Carregando mensagens anteriores"
+              data-testid="load-more-indicator"
             />
-          ) : (
-            <MessageBubble
-              key={item.message.id}
-              message={item.message}
-              isMine={!!currentUserId && item.message.senderId === currentUserId}
-              isGrouped={item.isGrouped}
-              onToggleReaction={onToggleReaction}
-              onReplyMessage={onReplyMessage}
-              onReferenceMessage={onReferenceMessage}
-              onForwardMessage={onForwardMessage}
-              onToggleFavorite={onToggleFavorite}
-              onReconcileLinkSafety={onReconcileLinkSafety}
-              onEditMessage={onEditMessage}
-              onEditForbidden={onEditForbidden}
-              onDeleteMessage={onDeleteMessage}
-              editDisabled={editDisabledIds.has(item.message.id)}
-              mentionTarget={mentionTarget}
-              presenceTarget={presenceTarget}
-              onTogglePin={onTogglePin}
-              isPinned={pinnedIds?.has(item.message.id) ?? false}
-              recentReactionEmojis={recentReactionEmojis}
-              emojiUsage={emojiUsage}
-              onEmojiToneChange={onEmojiToneChange}
-              currentUserId={currentUserId}
-              reactionMenuVisible={hoveredMessageId === item.message.id}
-              onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
-              pickerOpen={openPickerMessageId === item.message.id}
-              onPickerOpenChange={handlePickerOpenChange}
-              quoteAuthorLabel={
-                item.message.quoted
-                  ? quoteAuthorLabel(item.message.quoted, messagesById)
-                  : undefined
-              }
-              canJumpToQuote={
-                item.message.quoted ? messagesById.has(item.message.quoted.id) : false
-              }
-              onQuoteJump={handleQuoteJump}
-              onReferenceJump={onReferenceJump}
-              onOpenAuthorDM={onOpenAuthorDM}
-              openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
-              isHighlighted={highlightedMessageId === item.message.id}
-              setMessageRef={setMessageRef}
-            />
-          ),
-        )}
-        <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
+          )}
+          {withDividers.map((item, i) =>
+            item.type === "divider" ? (
+              <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
+                {item.label}
+              </div>
+            ) : item.type === "unread-divider" ? (
+              <div
+                key="unread-divider"
+                ref={unreadDividerRef}
+                className="chat-msg-area__new-messages-divider"
+                role="separator"
+                aria-label="Novas mensagens"
+              >
+                Novas mensagens
+              </div>
+            ) : item.message.kind === "system" ? (
+              // A conversation event is not something a person said, so it never
+              // becomes a MessageBubble: no bubble, no avatar, and none of the
+              // message actions — editing "Fulano saiu do grupo" is not a thing
+              // (issue #527).
+              <ConversationSystemMessage
+                key={item.message.id}
+                message={item.message}
+                scope={systemScope}
+              />
+            ) : (
+              <MessageBubble
+                key={item.message.id}
+                message={item.message}
+                isMine={!!currentUserId && item.message.senderId === currentUserId}
+                isGrouped={item.isGrouped}
+                onToggleReaction={onToggleReaction}
+                onReplyMessage={onReplyMessage}
+                onReferenceMessage={onReferenceMessage}
+                onForwardMessage={onForwardMessage}
+                onToggleFavorite={onToggleFavorite}
+                onReconcileLinkSafety={onReconcileLinkSafety}
+                onEditMessage={onEditMessage}
+                onEditForbidden={onEditForbidden}
+                onDeleteMessage={onDeleteMessage}
+                editDisabled={editDisabledIds.has(item.message.id)}
+                mentionTarget={mentionTarget}
+                presenceTarget={presenceTarget}
+                onTogglePin={onTogglePin}
+                isPinned={pinnedIds?.has(item.message.id) ?? false}
+                recentReactionEmojis={recentReactionEmojis}
+                emojiUsage={emojiUsage}
+                onEmojiToneChange={onEmojiToneChange}
+                currentUserId={currentUserId}
+                reactionMenuVisible={hoveredMessageId === item.message.id}
+                onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
+                pickerOpen={openPickerMessageId === item.message.id}
+                onPickerOpenChange={handlePickerOpenChange}
+                quoteAuthorLabel={
+                  item.message.quoted
+                    ? quoteAuthorLabel(item.message.quoted, messagesById)
+                    : undefined
+                }
+                canJumpToQuote={
+                  item.message.quoted ? messagesById.has(item.message.quoted.id) : false
+                }
+                onQuoteJump={handleQuoteJump}
+                onReferenceJump={onReferenceJump}
+                onOpenAuthorDM={onOpenAuthorDM}
+                openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
+                isHighlighted={highlightedMessageId === item.message.id}
+                setMessageRef={setMessageRef}
+              />
+            ),
+          )}
+          <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
+        </div>
       </div>
       <ScrollToBottomButton
         visible={scrollButtonVisible}

@@ -133,8 +133,11 @@ test.describe("chat scroll navigation (#492)", () => {
     // Simulate a media element finishing its load mid-animation: grow the
     // last message's height well after the click, the way an image would
     // once it has dimensions. The operation must not have already ended.
+    // Grown inside that message's own bubble — never as a new trailing node
+    // after the bottom sentinel, which no real attachment could ever be:
+    // an attachment always grows a message that already sits before it.
     await page.waitForTimeout(50);
-    await list.evaluate((el) => {
+    await page.locator(`[data-message-id="${targetId}-msg-39"]`).evaluate((el) => {
       const filler = document.createElement("div");
       filler.style.height = "600px";
       filler.setAttribute("data-testid", "layout-shift-filler");
@@ -146,5 +149,59 @@ test.describe("chat scroll navigation (#492)", () => {
     // returned.
     await expect(button).toBeHidden({ timeout: 5000 });
     await expect(page.getByTestId("layout-shift-filler")).toBeInViewport();
+  });
+
+  // #788: a follow-up to #492 — a conversation resolved to the bottom on
+  // initial open must stay pinned to the real tail through a later async
+  // reflow (an attachment/document/media preview finishing its layout), not
+  // merely during an explicit "go to bottom" animation (the case above).
+  test("stays at the real tail when historical content grows asynchronously after opening at the bottom", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "scroll-initial-reflow");
+    const messages = Array.from({ length: 60 }, (_, i) =>
+      makeMessage({
+        id: `${targetId}-msg-${i}`,
+        sender_id: i % 7 === 0 ? OTHER_USER_ID : CURRENT_USER_ID,
+        sender_display_name: i % 7 === 0 ? OTHER_USER_NAME : undefined,
+        body_text: `Mensagem ${i}`,
+        created_at: `2026-07-15T09:${String(i % 60).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal com reflow assíncrono",
+      messages,
+    });
+    // unread_count stays 0 (createScenario's default) and no viewport anchor
+    // is seeded — resolution has no unread/history to land on, so it targets
+    // the bottom.
+    await installMessagingMocks(page, scenario);
+
+    await page.goto(`/chat/channel/${targetId}`);
+
+    // Initial resolution lands on the real tail.
+    await expect(page.getByText("Mensagem 59")).toBeInViewport();
+    const bottomSentinel = page.getByTestId("chat-bottom-sentinel");
+    await expect(bottomSentinel).toBeInViewport();
+
+    // A historical message's attachment/document/media preview finishes
+    // loading and grows well after the initial positioning — simulated
+    // generically, on an ordinary message bubble, never coupled to any
+    // specific attachment component's internals.
+    await page.waitForTimeout(50);
+    await page.locator(`[data-message-id="${targetId}-msg-10"]`).evaluate((el) => {
+      const filler = document.createElement("div");
+      filler.style.height = "800px";
+      filler.setAttribute("data-testid", "reflow-filler");
+      el.appendChild(filler);
+    });
+
+    // The real bottom is regained without any user action, and the reflow
+    // alone never surfaces "Ir para o final".
+    await expect(bottomSentinel).toBeInViewport();
+    await expect(page.getByText("Mensagem 59")).toBeInViewport();
+    await expect(page.getByRole("button", { name: /Ir para o final da conversa/ })).toBeHidden();
   });
 });
