@@ -5117,10 +5117,15 @@ describe("ChatMessageArea — infinite scroll", () => {
     // Wait for both fetches to complete (initial + one loadMore triggered by auto-fire).
     await waitFor(() => expect(screen.getByText("Antiga")).toBeInTheDocument());
 
-    // The observer was created once (when hasMore became true) and observe() fired once.
-    // After prepend, hasMore=false → effect re-runs with !hasMore → returns early, no new observer.
-    expect(observeCallCount).toBe(1);
-    // Exactly two fetches: initial load + one loadMore.
+    // The top (loadMore) sentinel's observer was created once (when hasMore
+    // became true) and observe() fired once; after prepend, hasMore=false →
+    // effect re-runs with !hasMore → returns early, no new observer. The
+    // bottom (#492) sentinel mounts exactly once regardless of hasMore and
+    // contributes its own single observe() call — it does not loop either,
+    // since its effect has no hasMore/messages dependency to re-run on.
+    expect(observeCallCount).toBe(2);
+    // Exactly two fetches: initial load + one loadMore. The bottom sentinel's
+    // auto-fire never triggers a fetch of its own.
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
@@ -6079,6 +6084,415 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
 
     // scrollIntoView SHOULD be called — user is near the bottom.
     await waitFor(() => expect(scrollMock).toHaveBeenCalledTimes(1));
+  });
+});
+
+// ── #492: scroll navigation & read-state separation ──────────────────────────
+//
+// bottomSentinelCallback() locates the IntersectionObserver instance observing
+// the bottom sentinel (data-testid="chat-bottom-sentinel") specifically, so
+// these tests never depend on construction order relative to the top
+// (loadMore) sentinel, which infinite-scroll's own MockIO already owns.
+
+describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
+  interface IOInstance {
+    element: Element;
+    callback: IntersectionObserverCallback;
+  }
+  let ioInstances: IOInstance[] = [];
+  let capturedOnMessageCreatedForBadge: ((evt: WSMessageCreatedEvent) => void) | null = null;
+
+  beforeEach(() => {
+    ioInstances = [];
+    capturedOnMessageCreatedForBadge = null;
+    class MultiMockIO {
+      #callback: IntersectionObserverCallback;
+      constructor(cb: IntersectionObserverCallback) {
+        this.#callback = cb;
+      }
+      observe = vi.fn((el: Element) => {
+        ioInstances.push({ element: el, callback: this.#callback });
+      });
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    vi.stubGlobal("IntersectionObserver", MultiMockIO);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function bottomSentinelCallback(): IntersectionObserverCallback {
+    const sentinel = screen.getByTestId("chat-bottom-sentinel");
+    const instance = ioInstances.find((i) => i.element === sentinel);
+    if (!instance) throw new Error("bottom sentinel IntersectionObserver not registered yet");
+    return instance.callback;
+  }
+
+  function fireBottomSentinel(isIntersecting: boolean) {
+    act(() => {
+      bottomSentinelCallback()([{ isIntersecting } as IntersectionObserverEntry], {
+        disconnect: vi.fn(),
+      } as unknown as IntersectionObserver);
+    });
+  }
+
+  function scrollAwayFromBottom(list: HTMLElement) {
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
+    fireEvent.scroll(list);
+  }
+
+  function scrollBackToBottom(list: HTMLElement) {
+    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 900 });
+    fireEvent.scroll(list);
+  }
+
+  function renderWithContext(
+    channelId: string,
+    ctx: Partial<ChatOutletContext> & { currentUserId: string },
+  ) {
+    return render(
+      <MemoryRouter initialEntries={[`/chat/channel/${channelId}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ channels: [], dms: [], ...ctx }} />}
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("opens directly at the bottom, without smooth scroll, when there is no unread", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+    );
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+    });
+
+    await waitFor(() => expect(screen.getByText("Última mensagem")).toBeInTheDocument());
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("opens directly at the first unread message with a 'Novas mensagens' separator when unreadCount > 0", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m3", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+    });
+
+    await waitFor(() => expect(screen.getByText("Não lida 1")).toBeInTheDocument());
+
+    const separator = screen.getByRole("separator", { name: "Novas mensagens" });
+    expect(separator).toBeInTheDocument();
+    // The separator sits immediately before the first unread message ("Não
+    // lida 1", the earliest of the last 2 eligible messages) — not before the
+    // already-read one.
+    const listItems = Array.from(screen.getByRole("log").children);
+    const separatorIndex = listItems.indexOf(separator);
+    const firstUnreadIndex = listItems.findIndex((el) => el.textContent?.includes("Não lida 1"));
+    expect(separatorIndex).toBeGreaterThan(-1);
+    expect(separatorIndex).toBeLessThan(firstUnreadIndex);
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("does not call mark-read just from opening a conversation with unread", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+    const markRead = vi.fn();
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      markRead,
+    });
+
+    await screen.findByText("Não lida 1");
+    expect(markRead).not.toHaveBeenCalled();
+  });
+
+  it("calls markRead once the bottom sentinel confirms the real tail was reached", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "other-1", bodyText: "Última" })]),
+    );
+    const markRead = vi.fn();
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 1 }],
+      markRead,
+    });
+
+    await screen.findByText("Última");
+    expect(markRead).not.toHaveBeenCalled();
+
+    fireBottomSentinel(true);
+
+    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" });
+  });
+
+  it("shows the go-to-bottom button once the user scrolls away from the bottom threshold", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    await screen.findByText("Msg");
+
+    expect(
+      screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+    ).not.toBeInTheDocument();
+
+    scrollAwayFromBottom(screen.getByRole("log"));
+
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the go-to-bottom button once the user manually scrolls back within the threshold", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    scrollBackToBottom(list);
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the go-to-bottom button visible after restoring a history position left on a previous visit", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", bodyText: "Antiga" }),
+        makeMessage({ id: "m2", bodyText: "Mais antiga ainda" }),
+      ]),
+    );
+
+    const { unmount } = renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Antiga");
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    unmount();
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    await screen.findByText("Antiga");
+
+    // Returning to a conversation left mid-history must not silently default
+    // to the bottom — the button stays visible because the restored phase is
+    // not AT_BOTTOM.
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not end SCROLLING_TO_BOTTOM (hide the button) until the bottom sentinel actually confirms arrival", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    await userEvent.click(button);
+
+    // A layout shift (e.g. an image finishing its load) can bounce the
+    // sentinel through a non-intersecting state before the real arrival —
+    // the button must survive that instead of disappearing early.
+    fireBottomSentinel(false);
+    expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+
+    fireBottomSentinel(true);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("uses instant positioning, never smooth, when prefers-reduced-motion is set", async () => {
+    const matchMediaMock = vi.fn().mockReturnValue({
+      matches: true,
+      media: "(prefers-reduced-motion: reduce)",
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    vi.stubGlobal("matchMedia", matchMediaMock);
+
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+    await userEvent.click(button);
+
+    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("names the button with the pending count once new messages arrive while reading history", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Nova enquanto lia" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-1",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText("Nova enquanto lia")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back safely when the saved anchor message no longer exists", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Única mensagem" })]),
+    );
+
+    // Simulate a stale sessionStorage anchor pointing at a message that is no
+    // longer part of the loaded window (deleted, or from before retention).
+    sessionStorage.setItem(
+      "nchat.chat.viewport.v1:me-123:channel:geral",
+      JSON.stringify({
+        atBottom: false,
+        anchorMessageId: "long-gone",
+        anchorOffsetPx: 40,
+        savedAt: Date.now(),
+      }),
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+
+    // Must not hang or crash — falls back to a defined state (bottom, since
+    // there is no unread either) instead of an infinite search.
+    await screen.findByText("Única mensagem");
+    expect(screen.getByTestId("chat-message-area")).toBeInTheDocument();
+  });
+
+  it("ignores a stale resolution from a conversation left mid-search after a rapid switch", async () => {
+    mockFetchChannelMessages.mockImplementation((channelId: string) => {
+      if (channelId === "slow") {
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve(messagePage([makeMessage({ id: "slow-1", bodyText: "Lenta" })])),
+            50,
+          ),
+        );
+      }
+      return Promise.resolve(messagePage([makeMessage({ id: "fast-1", bodyText: "Rápida" })]));
+    });
+
+    function SwitchButton() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate("/chat/channel/fast")}>
+          trocar
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/slow"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <div>
+                  <SwitchButton />
+                  <ChatMessageArea kind="channel" />
+                </div>
+              }
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // Switch away before the slow fetch resolves — must not crash when it
+    // eventually does, and must never render the stale conversation's data.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await userEvent.click(screen.getByRole("button", { name: "trocar" }));
+    await screen.findByText("Rápida");
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+
+    expect(screen.queryByText("Lenta")).not.toBeInTheDocument();
   });
 });
 
