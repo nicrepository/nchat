@@ -29,6 +29,12 @@ type Config struct {
 	SMTPBackoffSeconds    int
 	SMTPWorkerEnabled     bool
 	SMTPWorkerPollSeconds int
+
+	// NotificationWorker is the outbox worker's own block (issue #742). Nested
+	// rather than flattened: it is a second worker with a second lifetime, and
+	// nine more SMTP-prefixed-looking fields would say nothing about which
+	// belongs to which.
+	NotificationWorker NotificationWorkerConfig
 }
 
 func Load() Config {
@@ -54,6 +60,8 @@ func Load() Config {
 		SMTPBackoffSeconds:    platformconfig.GetInt("SMTP_BACKOFF_SECONDS", 60),
 		SMTPWorkerEnabled:     platformconfig.GetBool("SMTP_WORKER_ENABLED", false),
 		SMTPWorkerPollSeconds: platformconfig.GetInt("SMTP_WORKER_POLL_SECONDS", 10),
+
+		NotificationWorker: loadNotificationWorker(),
 	}
 }
 
