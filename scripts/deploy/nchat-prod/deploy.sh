@@ -22,6 +22,9 @@ RELEASE_SHA="${NCHAT_PROD_RELEASE_SHA:-}"
 # the workloads is the one the digests were actually taken from.
 RELEASE_ID=""
 TOPOLOGY_FILE="${NCHAT_PROD_TOPOLOGY_FILE:-}"
+# The slot the caller has already decided on, if there is one. Empty for the
+# manual flow, which derives it here as it always has.
+CANDIDATE_SLOT="${NCHAT_PROD_CANDIDATE_SLOT:-}"
 TEMPORARY_ROOT="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nchat-prod-deploy.XXXXXX")"
 trap 'rm -rf "$TEMPORARY_ROOT"' EXIT
 
@@ -75,6 +78,33 @@ wait_for_candidate() {
   done
 }
 
+# The slot this deploy will build, and the proof that it is still the right one.
+#
+# A caller that has already resolved the candidate passes it in. The pipeline
+# does: it resolves the slot from its own reading of the stable Services -- the
+# same reading its before/after selector comparison is proved against -- and
+# smokes and reports that slot afterwards. Re-deriving it here would turn one
+# decision into two, and a cutover landing between the two readings would leave
+# the pipeline validating one slot while this script built the other.
+#
+# So a requested slot is revalidated, never replaced. If the cluster no longer
+# agrees it is the idle one, the deploy stops -- before the migration, before
+# the apply, with every stable Service untouched. Choosing the other slot
+# instead is precisely the silent switch this exists to prevent.
+#
+# With nothing requested the canonical derivation stands, so the manual
+# deploy.sh in the runbook behaves exactly as it did.
+resolve_candidate_slot() {
+  local active="$1" requested="$CANDIDATE_SLOT" expected
+  expected="$(opposite_slot "$active")"
+  [[ -n "$requested" ]] || { printf '%s' "$expected"; return 0; }
+  is_valid_slot "$requested" ||
+    prod_fail "NCHAT_PROD_CANDIDATE_SLOT must be blue or green, got '$requested'"
+  [[ "$requested" == "$expected" ]] ||
+    prod_fail "the stable Services moved after the candidate was chosen: '$requested' was requested, but the idle slot is now '$expected'. Nothing was deployed and no migration was run."
+  printf '%s' "$requested"
+}
+
 main() {
   local mapping active candidate
   command -v kustomize >/dev/null || prod_fail "kustomize is required"
@@ -86,7 +116,8 @@ main() {
   require_namespace
   mapping="$(collect_service_slots)"
   active="$(resolve_active_slot "$mapping")"
-  candidate="$(opposite_slot "$active")"
+  # Before the banner, before the confirmation, and before every mutation.
+  candidate="$(resolve_candidate_slot "$active")"
   print_context_banner "$mapping"
   echo "release sha   : $RELEASE_SHA"
   echo "release id    : $RELEASE_ID"

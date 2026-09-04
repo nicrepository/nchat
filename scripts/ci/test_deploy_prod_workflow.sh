@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Behaviour tests for the candidate/cutover separation (CICD-06).
+# Behaviour tests for the candidate-only production deploy workflow (CICD-05).
 #
 # Two things are proved here, both offline and neither against a cluster.
 #
 # First, the workflow contract: the checker is driven with copies of the real
-# workflow that each break one invariant -- the environment removed, the
-# dependency broken, a promotion moved into the candidate, a gate marked
-# continue-on-error -- and every one of them must be refused. A checker that
-# only ever sees a correct workflow proves nothing about what it would catch.
+# workflow that each break one invariant -- a promotion added, a second job
+# added, the stable-selector proof removed, a gate marked continue-on-error --
+# and every one of them must be refused. A checker that only ever sees a correct
+# workflow proves nothing about what it would catch, so a benign mutation is
+# driven through it too.
 #
 # Second, the release binding: release-digests.sh is driven with a manifest
 # whose seal is broken, one that seals a different commit, and one missing an
@@ -15,10 +16,11 @@
 # that pins digests from an unproven manifest is exactly the failure the sealed
 # manifest exists to prevent.
 #
-# What is deliberately NOT tested here is a rejected environment approval, which
-# GitHub decides remotely. The runbook carries the evidence procedure for it;
-# what stands in for it offline is the confinement check, which proves there is
-# nothing outside the protected job that a rejection would have to stop.
+# What is deliberately NOT tested here is the cluster half: that the deploy
+# leaves the stable Services alone is proved at run time by the workflow's own
+# before/after comparison, and the scripts it calls are covered by
+# test_prod_blue_green_scripts.sh. What this file proves is that the comparison
+# cannot be removed, softened or reordered out of the way.
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -83,14 +85,12 @@ expect_workflow_accepted() {
 test_real_workflow_satisfies_the_contract() {
   echo "the committed workflow"
   if python3 "$CHECKER" "$WORKFLOW"; then
-    pass "the production deploy workflow satisfies the candidate/cutover contract"
+    pass "the production deploy workflow satisfies the candidate-only contract"
     return
   fi
   fail "the committed production deploy workflow does not satisfy its own contract"
 }
 
-# The approval is only worth something if the job it gates is the only way to
-# promote, and if nothing can start that job early.
 # A copy of the real workflow with exactly one thing changed, applied to the
 # parsed YAML rather than to its text: the contract is about structure, and a
 # sed expression that silently matched nothing would leave the workflow intact
@@ -118,23 +118,28 @@ import yaml
 
 PINNED_ACTION = "some/action@1111111111111111111111111111111111111111"
 CUTOVER = "scripts/deploy/nchat-prod/cutover.sh"
+ROLLBACK = "scripts/deploy/nchat-prod/rollback.sh"
+DRAIN = "scripts/deploy/nchat-prod/drain-old.sh"
 PATCH_SELECTOR = (
     "kubectl patch svc chat-service --type=json "
     '-p \'[{"op":"replace","path":"/spec/selector/nchat.io~1release-slot"}]\''
 )
+# Step positions in the candidate job. Named rather than repeated, so a step
+# added to the contract moves them in one place instead of silently retargeting
+# half the mutations at their neighbours.
+DEPLOY = 7
+SMOKE = 8
+VERIFY = 9
+IDENTITY = 10
 
 
-def steps(workflow, job):
+def steps(workflow, job="candidate"):
     return workflow["jobs"][job]["steps"]
 
 
-def outputs(workflow):
-    return workflow["jobs"]["candidate"]["outputs"]
-
-
-def promotion_env(workflow):
-    """The env of the one step that promotes, where the wiring is asserted."""
-    return steps(workflow, "cutover")[4]["env"]
+def slot_step(workflow):
+    """The step that snapshots the selectors and derives the candidate slot."""
+    return steps(workflow)[6]
 
 
 def dispatch_inputs(workflow):
@@ -142,71 +147,234 @@ def dispatch_inputs(workflow):
     return workflow["on" if "on" in workflow else True]["workflow_dispatch"]["inputs"]
 
 
-def add_run(workflow, job, command):
-    steps(workflow, job).append({"name": "Added", "run": command})
+def add_run(workflow, command):
+    steps(workflow).append({"name": "Added", "run": command})
 
 
-def add_action(workflow, job):
-    steps(workflow, job).append({"name": "Added", "uses": PINNED_ACTION})
+def add_action(workflow):
+    steps(workflow).append({"name": "Added", "uses": PINNED_ACTION})
 
 
-def move(workflow, job, source, destination):
-    steps(workflow, job).insert(destination, steps(workflow, job).pop(source))
+def move(workflow, source, destination):
+    steps(workflow).insert(destination, steps(workflow).pop(source))
 
 
-# Ways the candidate could reach a promotion, and ways its executable surface
+def edit_run(step, old, new=""):
+    """Replace one line of a step's `run:`, and prove the line was there.
+
+    A mutation that matched nothing would leave the fixture identical to the
+    real workflow, the checker would accept it, and the suite would report that
+    acceptance as a passing refusal -- a negative test proving nothing. So the
+    target must be present exactly once, and the text must actually change.
+    """
+    before = step["run"]
+    if before.count(old) != 1:
+        raise SystemExit(f"mutation target appears {before.count(old)} times: {old!r}")
+    after = before.replace(old, new) if new else drop_line(before, old)
+    if after == before:
+        raise SystemExit(f"mutation changed nothing: {old!r}")
+    step["run"] = after
+
+
+def drop_line(run, target):
+    """Remove the single line holding `target`, leaving every other line."""
+    return "".join(
+        line for line in run.splitlines(keepends=True) if target not in line
+    )
+
+
+def add_job(workflow, name, command):
+    """A second operational job, however it is spelled."""
+    workflow["jobs"][name] = {
+        "needs": "candidate",
+        "runs-on": workflow["jobs"]["candidate"]["runs-on"],
+        "permissions": {"contents": "read"},
+        "steps": [{"name": "Added", "run": command}],
+    }
+
+
+# Ways this workflow could reach a promotion, and ways its executable surface
 # could grow. None of these needs to be recognised as dangerous by the checker;
-# they are refused because the contract lists no such step.
-CANDIDATE_SURFACE = {
-    "wrapped-cutover": lambda w: add_run(w, "candidate", f'bash {CUTOVER} --target "$CANDIDATE_SLOT"'),
-    "env-wrapped-cutover": lambda w: add_run(w, "candidate", f'env bash {CUTOVER} --target "$CANDIDATE_SLOT"'),
-    "hand-written-patch": lambda w: add_run(w, "candidate", PATCH_SELECTOR),
-    "harmless-echo": lambda w: add_run(w, "candidate", "echo hello"),
-    "extra-action-candidate": lambda w: add_action(w, "candidate"),
+# they are refused because the contract lists no such step and no such job.
+PROMOTION_SURFACE = {
+    "wrapped-cutover": lambda w: add_run(w, f'bash {CUTOVER} --target "$CANDIDATE_SLOT"'),
+    "env-wrapped-cutover": lambda w: add_run(w, f'env bash {CUTOVER} --target "$CANDIDATE_SLOT"'),
+    "rollback-script": lambda w: add_run(w, f'{ROLLBACK} --target "$CANDIDATE_SLOT"'),
+    "drain-old-script": lambda w: add_run(w, f'{DRAIN} --target "$CANDIDATE_SLOT"'),
+    "switch-helper": lambda w: add_run(
+        w,
+        "source scripts/deploy/nchat-prod/lib.sh; "
+        'switch_services_to_slot "$CANDIDATE_SLOT"',
+    ),
+    "hand-written-patch": lambda w: add_run(w, PATCH_SELECTOR),
+    "harmless-echo": lambda w: add_run(w, "echo hello"),
+    "extra-action": lambda w: add_action(w),
 }
 
-# The release the candidate is supposed to perform, and in what order.
-CANDIDATE_RELEASE = {
-    "deploy-replaced": lambda w: steps(w, "candidate")[7].__setitem__("run", "true"),
-    "deploy-removed": lambda w: steps(w, "candidate").pop(7),
-    "smoke-removed": lambda w: steps(w, "candidate").pop(8),
-    "smoke-before-deploy": lambda w: move(w, "candidate", 8, 7),
-    "soft-smoke": lambda w: steps(w, "candidate")[8].__setitem__("continue-on-error", True),
-    "conditional-smoke": lambda w: steps(w, "candidate")[8].__setitem__("if", "always()"),
-}
-
-# The slot and release identity the promotion must act on.
-WIRING = {
-    "slot-output-removed": lambda w: outputs(w).pop("slot"),
-    "slot-output-rewired": lambda w: outputs(w).__setitem__("slot", "${{ steps.release.outputs.slot }}"),
-    "release-id-output-rewired": lambda w: outputs(w).__setitem__(
-        "release_id", "${{ steps.slot.outputs.release_id }}"),
-    "slot-hardcoded-green": lambda w: promotion_env(w).__setitem__("CANDIDATE_SLOT", "green"),
-    "slot-hardcoded-blue": lambda w: promotion_env(w).__setitem__("CANDIDATE_SLOT", "blue"),
-    "slot-from-input": lambda w: promotion_env(w).__setitem__("CANDIDATE_SLOT", "${{ inputs.slot }}"),
-    "evidence-hardcoded": lambda w: promotion_env(w).__setitem__(
-        "NCHAT_PROD_SMOKE_CONFIRMED", "green:abc:deadbeef"),
-    "evidence-drops-release-id": lambda w: promotion_env(w).__setitem__(
-        "NCHAT_PROD_SMOKE_CONFIRMED", "${{ needs.candidate.outputs.slot }}:${{ inputs.sha }}"),
-    "manifest-dir-removed": lambda w: promotion_env(w).pop("NCHAT_PROD_RELEASE_MANIFEST_DIR"),
-}
-
-# What makes the protected job protected, and what keeps it small.
-PROTECTION = {
-    "harmless-true": lambda w: add_run(w, "cutover", "true"),
-    "extra-action-cutover": lambda w: add_action(w, "cutover"),
-    "cutover-write-permission": lambda w: w["jobs"]["cutover"]["permissions"].__setitem__(
+# A second job is the shape this task exists to keep out: the cutover phase
+# arriving early, under whatever name. The contract names one job, so none of
+# these has to be recognised as a promotion to be refused.
+SECOND_JOB = {
+    "cutover-job": lambda w: add_job(w, "cutover", f'{CUTOVER} --target green'),
+    "renamed-cutover-job": lambda w: add_job(w, "promote", f'{CUTOVER} --target green'),
+    "harmless-second-job": lambda w: add_job(w, "notify", "echo done"),
+    "candidate-environment": lambda w: w["jobs"]["candidate"].__setitem__(
+        "environment", "production"),
+    "candidate-environment-mapping": lambda w: w["jobs"]["candidate"].__setitem__(
+        "environment", {"name": "production"}),
+    "candidate-needs": lambda w: w["jobs"]["candidate"].__setitem__("needs", "build"),
+    "conditional-job": lambda w: w["jobs"]["candidate"].__setitem__("if", "always()"),
+    "job-write-permission": lambda w: w["jobs"]["candidate"]["permissions"].__setitem__(
         "packages", "write"),
-    "no-environment": lambda w: w["jobs"]["cutover"].pop("environment"),
-    "other-environment": lambda w: w["jobs"]["cutover"].__setitem__("environment", "staging"),
-    "no-needs": lambda w: w["jobs"]["cutover"].pop("needs"),
-    "conditional-cutover": lambda w: w["jobs"]["cutover"].__setitem__("if", "always()"),
-    "candidate-environment": lambda w: w["jobs"]["candidate"].__setitem__("environment", "production"),
+    "outputs-restored": lambda w: w["jobs"]["candidate"].__setitem__(
+        "outputs", {"slot": "${{ steps.slot.outputs.slot }}"}),
+}
+
+# The release this workflow is supposed to perform, and in what order.
+CANDIDATE_RELEASE = {
+    "deploy-replaced": lambda w: steps(w)[DEPLOY].__setitem__("run", "true"),
+    "deploy-removed": lambda w: steps(w).pop(DEPLOY),
+    "smoke-removed": lambda w: steps(w).pop(SMOKE),
+    "smoke-before-deploy": lambda w: move(w, SMOKE, DEPLOY),
+    "soft-smoke": lambda w: steps(w)[SMOKE].__setitem__("continue-on-error", True),
+    "conditional-smoke": lambda w: steps(w)[SMOKE].__setitem__("if", "always()"),
+    "soft-deploy": lambda w: steps(w)[DEPLOY].__setitem__("continue-on-error", True),
+}
+
+# The stable-selector invariant: the snapshot, the comparison, and the fact that
+# neither can be softened into something that reports a difference as a pass.
+SELECTOR_INVARIANT = {
+    "verification-removed": lambda w: steps(w).pop(VERIFY),
+    "verification-before-deploy": lambda w: move(w, VERIFY, DEPLOY),
+    "soft-verification": lambda w: steps(w)[VERIFY].__setitem__("continue-on-error", True),
+    "conditional-verification": lambda w: steps(w)[VERIFY].__setitem__("if", "always()"),
+    "tolerated-difference": lambda w: edit_run(
+        steps(w)[VERIFY],
+        'diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER"',
+        'diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER" || true'),
+    # A comparison against a file nobody wrote is a comparison that always
+    # passes -- and the two steps must name one file for it to mean anything.
+    "verification-reads-elsewhere": lambda w: steps(w)[VERIFY]["env"].__setitem__(
+        "SELECTORS_BEFORE", "${{ runner.temp }}/other.txt"),
+    "snapshot-writes-elsewhere": lambda w: slot_step(w)["env"].__setitem__(
+        "SELECTORS_BEFORE", "${{ runner.temp }}/other.txt"),
+    # Exactly one line goes: the write that persists the snapshot. The source
+    # of lib.sh, the collect_service_slots reading, the active slot, the
+    # candidate slot and both outputs all stay, so what fails is the missing
+    # snapshot and nothing else.
+    "snapshot-removed": lambda w: edit_run(
+        slot_step(w), 'printf \'%s\\n\' "$mapping" >"$SELECTORS_BEFORE"'),
+    # Repairing a moved selector destroys the only record that it moved. The
+    # step detects; it must never correct.
+    "self-healing-verification": lambda w: edit_run(
+        steps(w)[VERIFY],
+        'diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER"',
+        'diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER" ||'
+        ' switch_services_to_slot "$ACTIVE_SLOT"'),
+}
+
+# The candidate must be running the release this run built, observed from the
+# cluster. The smoke proves the slot agrees with itself, which a concurrent
+# redeploy of that slot satisfies just as well -- only the identity separates
+# the two releases.
+RELEASE_IDENTITY = {
+    "identity-removed": lambda w: steps(w).pop(IDENTITY),
+    "identity-replaced": lambda w: steps(w)[IDENTITY].__setitem__("run", "true"),
+    "identity-soft": lambda w: steps(w)[IDENTITY].__setitem__("continue-on-error", True),
+    "identity-conditional": lambda w: steps(w)[IDENTITY].__setitem__("if", "always()"),
+    "identity-tolerated": lambda w: edit_run(
+        steps(w)[IDENTITY],
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"',
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE" || true'),
+    # The comparison itself, gone: the state is read and then not checked.
+    "identity-not-compared": lambda w: edit_run(
+        steps(w)[IDENTITY],
+        'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"',
+        'slot_release_state "$CANDIDATE_SLOT"'),
+    # Half an identity is not a weaker check, it is a different one: two builds
+    # of one commit share the SHA, and a rebuild would pass as the release that
+    # was deployed.
+    "identity-sha-only": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "EXPECTED_RELEASE", "${{ inputs.sha }}"),
+    "identity-id-only": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "EXPECTED_RELEASE", "${{ steps.release.outputs.release_id }}"),
+    "identity-sha-rewired": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "EXPECTED_RELEASE",
+        "${{ steps.slot.outputs.slot }}:${{ steps.release.outputs.release_id }}"),
+    "identity-id-rewired": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "EXPECTED_RELEASE", "${{ inputs.sha }}:${{ steps.slot.outputs.slot }}"),
+    "identity-expected-hardcoded": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "EXPECTED_RELEASE", "deadbeef:cafe"),
+    "identity-slot-hardcoded": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "CANDIDATE_SLOT", "green"),
+    "identity-slot-from-input": lambda w: steps(w)[IDENTITY]["env"].__setitem__(
+        "CANDIDATE_SLOT", "${{ inputs.slot }}"),
+    # Order is the contract: an identity read before the deploy describes the
+    # slot's previous release, and would pass on a deploy that never happened.
+    "identity-before-deploy": lambda w: move(w, IDENTITY, DEPLOY),
+    # The report may not claim a release the gate has not proved.
+    "report-before-identity": lambda w: move(w, IDENTITY + 1, IDENTITY),
+}
+
+# The candidate slot comes from the cluster, never from an input and never from
+# a literal. A hardcoded slot deploys over whatever happens to be in it.
+SLOT_DERIVATION = {
+    "slot-hardcoded-green": lambda w: steps(w)[SMOKE]["env"].__setitem__(
+        "CANDIDATE_SLOT", "green"),
+    "slot-hardcoded-blue": lambda w: steps(w)[SMOKE]["env"].__setitem__(
+        "CANDIDATE_SLOT", "blue"),
+    "slot-from-input": lambda w: steps(w)[SMOKE]["env"].__setitem__(
+        "CANDIDATE_SLOT", "${{ inputs.slot }}"),
+    "slot-not-opposite": lambda w: edit_run(
+        slot_step(w),
+        'echo "slot=$(opposite_slot "$active")" >>"$GITHUB_OUTPUT"',
+        'echo "slot=$active" >>"$GITHUB_OUTPUT"'),
+}
+
+# The deploy must build the slot the snapshot step resolved. Dropping the
+# binding puts deploy.sh back to deriving its own candidate from a second
+# reading of the cluster, which is the divergence the env exists to close.
+CANDIDATE_BINDING = {
+    "deploy-slot-unbound": lambda w: steps(w)[DEPLOY]["env"].pop("NCHAT_PROD_CANDIDATE_SLOT"),
+    "deploy-slot-hardcoded": lambda w: steps(w)[DEPLOY]["env"].__setitem__(
+        "NCHAT_PROD_CANDIDATE_SLOT", "green"),
+    "deploy-slot-from-input": lambda w: steps(w)[DEPLOY]["env"].__setitem__(
+        "NCHAT_PROD_CANDIDATE_SLOT", "${{ inputs.slot }}"),
+    # The deploy and the smoke must name one slot. A binding wired to the
+    # active slot instead would deploy over the slot serving production.
+    "deploy-slot-is-active": lambda w: steps(w)[DEPLOY]["env"].__setitem__(
+        "NCHAT_PROD_CANDIDATE_SLOT", "${{ steps.slot.outputs.active }}"),
+}
+
+# A job with no time limit holds the concurrency group for as long as it hangs;
+# a job with a minute fails healthy releases. Both directions are the contract.
+TIMEOUT = {
+    "timeout-removed": lambda w: w["jobs"]["candidate"].pop("timeout-minutes"),
+    "timeout-null": lambda w: w["jobs"]["candidate"].__setitem__("timeout-minutes", None),
+    "timeout-one": lambda w: w["jobs"]["candidate"].__setitem__("timeout-minutes", 1),
+    "timeout-44": lambda w: w["jobs"]["candidate"].__setitem__("timeout-minutes", 44),
+    "timeout-46": lambda w: w["jobs"]["candidate"].__setitem__("timeout-minutes", 46),
+    # Actions rejects a quoted timeout at parse time, so a contract that took
+    # it would be green on a workflow nobody can run.
+    "timeout-quoted": lambda w: w["jobs"]["candidate"].__setitem__("timeout-minutes", "45"),
+}
+
+# The input declarations, closed. `default` is the one that matters: it turns a
+# required gate into a value the dispatcher can leave alone, so a release could
+# start without anyone naming a commit or a build.
+INPUT_KEYS = {
+    "sha-default": lambda w: dispatch_inputs(w)["sha"].__setitem__("default", "deadbeef"),
+    "run-id-default": lambda w: dispatch_inputs(w)["run_id"].__setitem__("default", "1"),
+    "sha-deprecated": lambda w: dispatch_inputs(w)["sha"].__setitem__(
+        "deprecationMessage", "use the other one"),
+    "run-id-options": lambda w: dispatch_inputs(w)["run_id"].__setitem__("options", ["1"]),
+    "sha-extra-key": lambda w: dispatch_inputs(w)["sha"].__setitem__("force", True),
+    "run-id-extra-key": lambda w: dispatch_inputs(w)["run_id"].__setitem__("force", True),
 }
 
 # How the workflow can be started, and by what.
 TRIGGERS = {
-    "mutable-action": lambda w: steps(w, "candidate")[1].__setitem__("uses", "actions/checkout@v4"),
+    "mutable-action": lambda w: steps(w)[1].__setitem__("uses", "actions/checkout@v4"),
     "pull-request-target": lambda w: dispatch_siblings(w).__setitem__("pull_request_target", None),
     "on-push": lambda w: dispatch_siblings(w).__setitem__("push", {"branches": ["main"]}),
 }
@@ -227,8 +395,9 @@ INPUT_SCHEMA = {
         "force", {"description": "skip gates", "required": False, "type": "boolean"}),
 }
 
-# Serialisation of production releases. A run holding a deployed candidate while
-# it waits for approval must not be cancelled, nor overtaken by a second one.
+# Serialisation of production deploys. A run applying migrations or waiting on a
+# rollout is holding a half-built candidate, and must not be cancelled out from
+# under itself nor overtaken by a second run into the same slot.
 CONCURRENCY = {
     "concurrency-removed": lambda w: w.pop("concurrency"),
     "concurrency-null": lambda w: w.__setitem__("concurrency", None),
@@ -284,16 +453,21 @@ def dispatch_declaration(workflow):
 
 
 def rename_and_recomment(workflow):
-    candidate = steps(workflow, "candidate")
+    candidate = steps(workflow)
     candidate[0]["run"] = candidate[0]["run"].replace("# A dispatch", "# EDITED dispatch")
     candidate[6]["name"] = "Renamed step"
 
 
 MUTATIONS = {
-    **CANDIDATE_SURFACE,
+    **PROMOTION_SURFACE,
+    **SECOND_JOB,
     **CANDIDATE_RELEASE,
-    **WIRING,
-    **PROTECTION,
+    **SELECTOR_INVARIANT,
+    **SLOT_DERIVATION,
+    **RELEASE_IDENTITY,
+    **CANDIDATE_BINDING,
+    **TIMEOUT,
+    **INPUT_KEYS,
     **TRIGGERS,
     **INPUT_SCHEMA,
     **INPUT_SHAPE,
@@ -326,16 +500,22 @@ PYTHON
 # allowlist rather than a search for dangerous commands: none of these has to be
 # recognised as a promotion. There is no step in the contract that runs one, and
 # no spare position for another, so every spelling fails for the same reason.
-test_the_candidate_cannot_promote() {
-  echo "the candidate's executable surface is closed"
+test_the_workflow_cannot_promote() {
+  echo "the workflow's executable surface is closed"
   expect_workflow_refused "a promotion invoked through bash" \
     "$(mutate wrapped-cutover wrapped-cutover)"
   expect_workflow_refused "a promotion invoked through env bash" \
     "$(mutate env-wrapped env-wrapped-cutover)"
+  expect_workflow_refused "a rollback script reachable from the deploy" \
+    "$(mutate rollback rollback-script)"
+  expect_workflow_refused "the old slot drained from the deploy" \
+    "$(mutate drain-old drain-old-script)"
+  expect_workflow_refused "the selector helper called directly" \
+    "$(mutate switch-helper switch-helper)"
   expect_workflow_refused "a selector patched by hand with kubectl" \
     "$(mutate hand-patch hand-written-patch)"
   expect_workflow_refused "an added action, pinned by full SHA" \
-    "$(mutate extra-action extra-action-candidate)"
+    "$(mutate extra-action extra-action)"
   # Nothing about `echo hello` is dangerous. It is refused because the
   # executable surface is meant to stay small enough to audit, and that is what
   # makes the dangerous cases above impossible to smuggle in.
@@ -343,26 +523,47 @@ test_the_candidate_cannot_promote() {
     "$(mutate echo-hello harmless-echo)"
 }
 
-test_the_protected_job_stays_closed() {
-  echo "the protected job's executable surface is closed"
-  expect_workflow_refused "an added command in the cutover" \
-    "$(mutate cutover-true harmless-true)"
-  expect_workflow_refused "an added action in the cutover, pinned by full SHA" \
-    "$(mutate cutover-action extra-action-cutover)"
-  expect_workflow_refused "a cutover job holding write permission" \
-    "$(mutate cutover-write cutover-write-permission)"
+# The shape this task exists to keep out. Cutover is a later, separate step, so
+# a second job here is refused whatever it is called -- and refused for being a
+# second job, not for looking like a promotion, which is what makes the name
+# irrelevant.
+test_there_is_exactly_one_job() {
+  echo "one job, and no promotion phase"
+  expect_workflow_refused "a cutover job added back" \
+    "$(mutate cutover-job cutover-job)"
+  expect_workflow_refused "the same job under another name" \
+    "$(mutate renamed-cutover renamed-cutover-job)"
+  expect_workflow_refused "a second job that only reports" \
+    "$(mutate second-job harmless-second-job)"
+  # An environment here would attach an approval to the phase that has nothing
+  # to approve yet, and pull that environment's secrets into an unprotected
+  # deploy. Both spellings of the key are refused.
+  expect_workflow_refused "the deploy put behind the production environment" \
+    "$(mutate environment candidate-environment)"
+  expect_workflow_refused "the same environment declared as a mapping" \
+    "$(mutate environment-mapping candidate-environment-mapping)"
+  expect_workflow_refused "the job made to depend on another" \
+    "$(mutate job-needs candidate-needs)"
+  expect_workflow_refused "the job made conditional, so a failed gate can be stepped over" \
+    "$(mutate conditional-job conditional-job)"
+  expect_workflow_refused "the job holding a write permission" \
+    "$(mutate job-write job-write-permission)"
+  # Outputs exist to feed a consumer. Re-declaring them is the first half of
+  # adding one back, and it has to be reviewed as that.
+  expect_workflow_refused "job outputs wired up for a consumer that does not exist" \
+    "$(mutate outputs outputs-restored)"
 }
 
 # The order is a property of the release, not a detail of the file: digests are
 # bound before anything is deployed, and the deploy finishes before the smoke
 # that is supposed to be validating it.
 test_the_candidate_performs_the_release() {
-  echo "candidate -> deploy -> smoke"
+  echo "deploy -> smoke"
   expect_workflow_refused "a deploy replaced by a command that does nothing" \
     "$(mutate deploy-true deploy-replaced)"
-  expect_workflow_refused "a candidate that never deploys" \
+  expect_workflow_refused "a run that never deploys" \
     "$(mutate no-deploy deploy-removed)"
-  expect_workflow_refused "a candidate that never smokes" \
+  expect_workflow_refused "a run that never smokes" \
     "$(mutate no-smoke smoke-removed)"
   expect_workflow_refused "a smoke that runs before the deploy it validates" \
     "$(mutate early-smoke smoke-before-deploy)"
@@ -370,44 +571,144 @@ test_the_candidate_performs_the_release() {
     "$(mutate soft-smoke soft-smoke)"
   expect_workflow_refused "an automated smoke made conditional" \
     "$(mutate conditional-smoke conditional-smoke)"
+  expect_workflow_refused "a deploy marked continue-on-error" \
+    "$(mutate soft-deploy soft-deploy)"
 }
 
-# The promotion must act on the slot and the release the candidate actually
-# produced. A literal slot would promote whatever happens to be in it.
-test_the_promotion_is_wired_to_the_candidate() {
-  echo "slot and release identity wiring"
-  expect_workflow_refused "a candidate that publishes no slot" \
-    "$(mutate no-slot-output slot-output-removed)"
-  expect_workflow_refused "a slot output taken from another step" \
-    "$(mutate rewired-slot slot-output-rewired)"
-  expect_workflow_refused "a release identity taken from another step" \
-    "$(mutate rewired-release-id release-id-output-rewired)"
-  expect_workflow_refused "a cutover promoting a hardcoded green" \
+# The evidence the whole task turns on: the stable Services select after the run
+# exactly what they selected before it. The proof is only worth something if it
+# cannot be removed, reordered before the deploy it is watching, softened into a
+# pass, pointed at a file nobody wrote, or turned into a repair.
+test_the_stable_selector_invariant_is_proved() {
+  echo "stable selectors before == after"
+  expect_workflow_refused "a run that never re-reads the stable Services" \
+    "$(mutate no-verify verification-removed)"
+  expect_workflow_refused "the comparison moved in front of the deploy" \
+    "$(mutate early-verify verification-before-deploy)"
+  expect_workflow_refused "the comparison marked continue-on-error" \
+    "$(mutate soft-verify soft-verification)"
+  expect_workflow_refused "the comparison made conditional" \
+    "$(mutate conditional-verify conditional-verification)"
+  expect_workflow_refused "a difference swallowed by || true" \
+    "$(mutate tolerated-diff tolerated-difference)"
+  expect_workflow_refused "a comparison against a snapshot nobody wrote" \
+    "$(mutate verify-elsewhere verification-reads-elsewhere)"
+  expect_workflow_refused "a snapshot written where the comparison will not look" \
+    "$(mutate snapshot-elsewhere snapshot-writes-elsewhere)"
+  expect_workflow_refused "a run that takes no snapshot at all" \
+    "$(mutate no-snapshot snapshot-removed)"
+  # The step exists to detect that something moved production traffic. A step
+  # that puts the selector back destroys the only record of it happening.
+  expect_workflow_refused "a comparison that repairs the selector instead of failing" \
+    "$(mutate self-healing self-healing-verification)"
+}
+
+# The candidate slot is opposite_slot(active), read from the cluster. A literal
+# or an input would deploy over whatever happens to be serving.
+# The smoke proves the candidate slot agrees with itself. It does not prove the
+# slot is running the release this run built -- a concurrent redeploy of that
+# same slot leaves the stable selectors untouched and produces a slot that is
+# equally Ready and equally CONSISTENT. Only comparing the observed identity to
+# the requested one separates the two, so that comparison cannot be removed,
+# softened, half-declared or reordered out of the way.
+test_the_candidate_carries_the_requested_release() {
+  echo "the candidate is running the release this run built"
+  expect_workflow_refused "a run that never checks what the candidate is running" \
+    "$(mutate no-identity identity-removed)"
+  expect_workflow_refused "an identity check replaced by a command that does nothing" \
+    "$(mutate identity-true identity-replaced)"
+  expect_workflow_refused "an identity check marked continue-on-error" \
+    "$(mutate soft-identity identity-soft)"
+  expect_workflow_refused "an identity check made conditional" \
+    "$(mutate conditional-identity identity-conditional)"
+  expect_workflow_refused "a mismatch swallowed by || true" \
+    "$(mutate tolerated-identity identity-tolerated)"
+  expect_workflow_refused "the cluster read kept but the comparison dropped" \
+    "$(mutate uncompared-identity identity-not-compared)"
+  # Two builds of one commit share the SHA and differ only in the seal, so a
+  # commit-only comparison would pass a rebuild nobody deployed.
+  expect_workflow_refused "an expected release naming only the commit" \
+    "$(mutate sha-only-identity identity-sha-only)"
+  expect_workflow_refused "an expected release naming only the build" \
+    "$(mutate id-only-identity identity-id-only)"
+  expect_workflow_refused "a commit half taken from another step" \
+    "$(mutate rewired-sha identity-sha-rewired)"
+  expect_workflow_refused "a build half taken from another step" \
+    "$(mutate rewired-id identity-id-rewired)"
+  expect_workflow_refused "an expected release written as a literal" \
+    "$(mutate hardcoded-identity identity-expected-hardcoded)"
+  expect_workflow_refused "an identity read from a hardcoded slot" \
+    "$(mutate identity-green identity-slot-hardcoded)"
+  expect_workflow_refused "an identity read from a slot named by an input" \
+    "$(mutate identity-input identity-slot-from-input)"
+  expect_workflow_refused "an identity read before the deploy it describes" \
+    "$(mutate early-identity identity-before-deploy)"
+  expect_workflow_refused "a report published before the identity is proved" \
+    "$(mutate early-report report-before-identity)"
+}
+
+# One decision, not two. The workflow resolves the candidate from the same
+# reading its selector proof is built on and hands that slot to deploy.sh; the
+# smoke and the report name the same one. Without the binding, deploy.sh reads
+# the cluster again and can build a different slot from the one being smoked.
+test_the_deploy_builds_the_resolved_candidate() {
+  echo "one candidate identity, from snapshot to evidence"
+  expect_workflow_refused "a deploy left to resolve its own candidate" \
+    "$(mutate unbound deploy-slot-unbound)"
+  expect_workflow_refused "a deploy pinned to a hardcoded slot" \
+    "$(mutate bound-green deploy-slot-hardcoded)"
+  expect_workflow_refused "a deploy taking its slot from a workflow input" \
+    "$(mutate bound-input deploy-slot-from-input)"
+  expect_workflow_refused "a deploy pointed at the slot serving production" \
+    "$(mutate bound-active deploy-slot-is-active)"
+}
+
+# A job with no limit holds the concurrency group for as long as it hangs, and
+# the group is what serialises production releases.
+test_the_job_is_time_limited() {
+  echo "the deploy's time limit"
+  expect_workflow_refused "a job with no time limit at all" \
+    "$(mutate no-timeout timeout-removed)"
+  expect_workflow_refused "a null time limit" \
+    "$(mutate null-timeout timeout-null)"
+  expect_workflow_refused "a limit too short to complete a healthy release" \
+    "$(mutate one-minute timeout-one)"
+  expect_workflow_refused "a limit one minute under the contract" \
+    "$(mutate timeout-44 timeout-44)"
+  expect_workflow_refused "a limit one minute over the contract" \
+    "$(mutate timeout-46 timeout-46)"
+  expect_workflow_refused "a quoted limit Actions would reject at parse time" \
+    "$(mutate quoted-timeout timeout-quoted)"
+}
+
+# The inputs are gates. A `default` turns one into a value the dispatcher can
+# leave alone, so a release could start without anyone naming a commit.
+test_the_input_declarations_are_closed() {
+  echo "input declarations carry nothing extra"
+  expect_workflow_refused "a commit with a default nobody has to override" \
+    "$(mutate default-sha sha-default)"
+  expect_workflow_refused "a build run with a default nobody has to override" \
+    "$(mutate default-run-id run-id-default)"
+  expect_workflow_refused "a commit carrying a deprecation message" \
+    "$(mutate deprecated-sha sha-deprecated)"
+  expect_workflow_refused "a build run narrowed by an options list" \
+    "$(mutate options-run-id run-id-options)"
+  expect_workflow_refused "an unreviewed key on the commit input" \
+    "$(mutate extra-key-sha sha-extra-key)"
+  expect_workflow_refused "an unreviewed key on the build run input" \
+    "$(mutate extra-key-run-id run-id-extra-key)"
+}
+
+test_the_candidate_slot_comes_from_the_cluster() {
+  echo "the candidate slot"
+  expect_workflow_refused "a smoke pointed at a hardcoded green" \
     "$(mutate hardcoded-green slot-hardcoded-green)"
-  expect_workflow_refused "a cutover promoting a hardcoded blue" \
+  expect_workflow_refused "a smoke pointed at a hardcoded blue" \
     "$(mutate hardcoded-blue slot-hardcoded-blue)"
-  expect_workflow_refused "a cutover taking its slot from a workflow input" \
+  expect_workflow_refused "a slot taken from a workflow input" \
     "$(mutate slot-input slot-from-input)"
-  expect_workflow_refused "evidence with a hardcoded release identity" \
-    "$(mutate hardcoded-evidence evidence-hardcoded)"
-  expect_workflow_refused "evidence that names only the commit" \
-    "$(mutate sha-only-evidence evidence-drops-release-id)"
-  expect_workflow_refused "a cutover with no manifest to re-derive the identity from" \
-    "$(mutate no-manifest-dir manifest-dir-removed)"
-}
-
-test_the_protected_job_is_protected() {
-  echo "the protected cutover job"
-  expect_workflow_refused "a cutover job with no environment" \
-    "$(mutate no-environment no-environment)"
-  expect_workflow_refused "a cutover job gated on some other environment" \
-    "$(mutate other-environment other-environment)"
-  expect_workflow_refused "a cutover that does not wait for the candidate" \
-    "$(mutate no-needs no-needs)"
-  expect_workflow_refused "a cutover made conditional, so a failed gate can be stepped over" \
-    "$(mutate conditional-cutover conditional-cutover)"
-  expect_workflow_refused "a candidate put behind the production environment" \
-    "$(mutate candidate-environment candidate-environment)"
+  expect_workflow_refused "a candidate that is the active slot itself" \
+    "$(mutate slot-active slot-not-opposite)"
 }
 
 test_untrusted_input_and_mutable_actions() {
@@ -456,8 +757,8 @@ test_the_dispatch_schema_is_a_contract() {
 # The discriminating case. An allowlist compared too literally would fail on a
 # reworded comment, and a contract nobody can edit safely gets bypassed instead
 # of maintained. Comments and step names are not execution and must stay free.
-# A production release is serialised on purpose. Without it, a second run can
-# redeploy the slot a waiting candidate already owns: the later gates still fail
+# A production deploy is serialised on purpose. Without it, a second run can
+# redeploy the slot the first one is still building: the later gates still fail
 # closed, but the operator is watching a run that has quietly stopped describing
 # the cluster.
 test_releases_are_serialised() {
@@ -754,11 +1055,15 @@ main() {
   JOB_MUTATOR="$WORK_DIR/job-mutator.py"
   write_job_mutator
   test_real_workflow_satisfies_the_contract
-  test_the_candidate_cannot_promote
-  test_the_protected_job_stays_closed
+  test_the_workflow_cannot_promote
+  test_there_is_exactly_one_job
   test_the_candidate_performs_the_release
-  test_the_promotion_is_wired_to_the_candidate
-  test_the_protected_job_is_protected
+  test_the_stable_selector_invariant_is_proved
+  test_the_candidate_slot_comes_from_the_cluster
+  test_the_candidate_carries_the_requested_release
+  test_the_deploy_builds_the_resolved_candidate
+  test_the_job_is_time_limited
+  test_the_input_declarations_are_closed
   test_untrusted_input_and_mutable_actions
   test_the_dispatch_schema_is_a_contract
   test_inputs_must_be_mappings
