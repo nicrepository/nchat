@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""The production deploy workflow must keep candidate and cutover apart (CICD-06).
+"""The production deploy workflow must stay candidate-only (CICD-05).
 
-The guarantee this file exists to hold is one sentence: while the `production`
-environment has not released the protected job, no execution path in the
-workflow changes a stable Service selector.
+The guarantee this file exists to hold is one sentence: no execution path in
+the workflow changes a stable Service selector.
 
 An earlier version of this checker tried to prove that by reading the shell in
 each `run:` and looking for dangerous commands. That is the wrong shape for the
@@ -14,11 +13,17 @@ happened to think of, and anything unrecognised is read as harmless. That is
 fail-open, and it is not fixable by adding more patterns.
 
 So the direction is inverted. This workflow is small, it is security-critical,
-and it should stay both: every step it is allowed to contain is written out
-below, and the workflow must match that contract exactly -- same steps, same
+and it should stay both: every job and step it is allowed to contain is written
+out below, and the workflow must match that contract exactly -- same steps, same
 order, same commands, same wiring. Nothing has to be recognised as dangerous,
-because nothing unlisted is permitted at all. `bash cutover.sh` in the candidate
-is refused for the same reason `echo hello` is: no such step is in the contract.
+because nothing unlisted is permitted at all. `bash cutover.sh` is refused for
+the same reason `echo hello` is: no such step is in the contract. A second job
+-- called `cutover`, `promote`, or anything else -- is refused for the same
+reason: the contract names exactly one.
+
+Promotion is deliberately outside this workflow, not disabled inside it. There
+is no `if: false` job to re-enable and no input that selects a promoting path,
+because a gate that is one edit away from being open is not a boundary.
 
 Two consequences worth stating. The contract is the executable surface, so a
 comment inside a `run:` is normalised away and may be edited freely, while a
@@ -48,47 +53,65 @@ import yaml
 ROOT_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 
 CANDIDATE = "candidate"
-CUTOVER = "cutover"
 TRIGGERS = {"workflow_dispatch"}
 # The dispatch form is part of the contract, not decoration. An operator drives
 # this workflow by hand, and both values are gates: the commit is proved against
-# main, and the run id is what binds the promotion to a sealed manifest. An
-# input that went missing, became optional, or changed type would leave CI green
-# while the only way to release was broken or quietly weakened -- an optional
-# `sha` defaults to the empty string, which the first validation step would then
-# be refusing instead of a mistake anyone meant to make.
+# main, and the run id is what binds the deploy to a sealed manifest. An input
+# that went missing, became optional, or changed type would leave CI green while
+# the only way to deploy was broken or quietly weakened -- an optional `sha`
+# defaults to the empty string, which the first validation step would then be
+# refusing instead of a mistake anyone meant to make.
 #
-# The set is exact. A third input is a new lever on a production promotion and
-# must be reviewed as one, not absorbed silently.
+# The set is exact, and that is also what keeps a bypass out: a third input is a
+# new lever on a production deploy -- a slot to target, a gate to force -- and
+# must be reviewed as one rather than absorbed silently.
 DISPATCH_INPUTS = ("sha", "run_id")
-# Serialising production releases is structural, not a nicety. A candidate can
-# sit waiting for its approval for a long time, and a second run in the meantime
-# would redeploy the same slot underneath it. The later gates would refuse the
-# promotion -- the release identity would no longer match -- but "fails closed"
-# and "behaves predictably" are different properties, and an operator watching a
-# run that is quietly no longer describing the cluster is owed the second one.
+# Serialising production deploys is structural, not a nicety. A run applying
+# migrations or waiting on a rollout is holding a half-built candidate, and a
+# second run in the meantime would redeploy that slot underneath it. The later
+# gates still fail closed, but "fails closed" and "behaves predictably" are
+# different properties, and an operator watching a run that is quietly no longer
+# describing the cluster is owed the second one.
 #
 # cancel-in-progress must be false, and false as a boolean: the string "false"
 # is truthy to the expression evaluator, so a quoted one would cancel exactly
-# the run that is holding a deployed candidate.
+# the run that is holding a half-built candidate.
 CONCURRENCY = {"group": "nchat-prod-deploy", "cancel-in-progress": False}
 # `description` is prose and free to reword; these two decide behaviour.
 INPUT_CONTRACT = {"required": True, "type": "string"}
+# And nothing else may be declared. `default` is the one that matters: it turns
+# a required gate into a value the dispatcher can leave alone, so a release
+# could be started without anyone naming a commit or a build. `options` and
+# `deprecationMessage` are refused for the same reason `run-name` is -- they
+# are behaviour nobody reviewed here. `description` stays free in content.
+INPUT_KEYS = {"required", "type", "description"}
+# Long enough for a rollout of ten workloads plus migrations, short enough that
+# a wedged deploy does not hold the concurrency group all day. Both directions
+# are the contract: a minute would fail healthy releases, and no limit at all
+# would let a hung apply sit on the group indefinitely.
+TIMEOUT_MINUTES = 45
 WORKFLOW_PERMISSIONS = {"contents": "read"}
-ENVIRONMENT = "production"
 RUNNER = ["self-hosted", "linux", "x64", "nchat-prod-deploy"]
 
 CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
 DOWNLOAD = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 SHA = "${{ inputs.sha }}"
 RUN_ID = "${{ inputs.run_id }}"
-# The slot and the release identity travel from the candidate to the promotion
-# as job outputs. Comparing these strings exactly is what stops a hardcoded
+# The slot the smoke and the report are wired to, and the release identity the
+# report names. Comparing these strings exactly is what stops a hardcoded
 # `green`, a second workflow input, or another step's output standing in.
 SLOT_OUTPUT = "${{ steps.slot.outputs.slot }}"
+ACTIVE_OUTPUT = "${{ steps.slot.outputs.active }}"
 RELEASE_ID_OUTPUT = "${{ steps.release.outputs.release_id }}"
-NEEDS_SLOT = "${{ needs.candidate.outputs.slot }}"
-NEEDS_RELEASE_ID = "${{ needs.candidate.outputs.release_id }}"
+# The release this run built, as one string: the dispatched commit and the seal
+# of the manifest its digests came from. Compared exactly, so dropping either
+# half -- a commit with no build, a build with no commit -- is a violation, and
+# so is standing a literal or another step's output in for one of them.
+EXPECTED_RELEASE = f"{SHA}:{RELEASE_ID_OUTPUT}"
+# The snapshot the stable-selector invariant is proved against. Both steps must
+# name the same file, or the comparison is between a reading and nothing.
+SELECTORS_BEFORE = "${{ runner.temp }}/stable-selectors-before.txt"
+SELECTORS_AFTER = "${{ runner.temp }}/stable-selectors-after.txt"
 
 CHECKOUT_STEP = {
     "uses": CHECKOUT,
@@ -109,24 +132,25 @@ DOWNLOAD_STEP = {
     },
 }
 
-JOB_OUTPUTS = {
-    CANDIDATE: {"slot": SLOT_OUTPUT, "release_id": RELEASE_ID_OUTPUT},
-    CUTOVER: None,
-}
-JOB_PERMISSIONS = {
-    CANDIDATE: {"actions": "read", "contents": "read"},
-    CUTOVER: {"actions": "read", "contents": "read"},
-}
-JOB_NEEDS = {CANDIDATE: set(), CUTOVER: {CANDIDATE}}
-# The candidate must not declare one: an environment there would put the
-# approval in front of the phase that has nothing to approve yet.
-JOB_ENVIRONMENT = {CANDIDATE: None, CUTOVER: ENVIRONMENT}
+# Nothing consumes them: there is no second job for them to travel to, and a
+# declared output on a workflow whose only job is the last one is wiring for a
+# consumer that would have to be added first -- in a diff this contract makes
+# visible.
+JOB_OUTPUTS = {CANDIDATE: None}
+JOB_PERMISSIONS = {CANDIDATE: {"actions": "read", "contents": "read"}}
 
-# The order is the contract too. Read down the candidate: prove the request,
-# check out the proved commit, prove it is reachable from main, fetch the sealed
-# manifest, pin the digests it seals, derive the release identity, learn which
-# slot is idle, deploy into it, smoke it. Digest binding precedes the deploy,
-# the deploy precedes the smoke, and the slot exists before either needs it.
+# The order is the contract too. Read down the job: prove the request, check out
+# the proved commit, prove it is reachable from main, fetch the sealed manifest,
+# pin the digests it seals, derive the release identity, snapshot the stable
+# Services and learn which slot is idle, deploy into the other one, smoke it,
+# prove the stable Services still select what the snapshot recorded, and prove
+# the candidate is running the release this run built.
+#
+# Every dependency in that sentence is an ordering the contract holds by
+# position: digests are bound before anything is deployed, the snapshot is taken
+# before the deploy that must not disturb it, the deploy finishes before the
+# smoke that validates it, and both invariants are read after all of it. The
+# report is last, so no success is published before either has passed.
 EXPECTED_STEPS = {
     CANDIDATE: [
         {
@@ -149,18 +173,31 @@ EXPECTED_STEPS = {
             "id": "release",
             "run": ['echo "release_id=$(cat artifacts/release-id.txt)" >>"$GITHUB_OUTPUT"'],
         },
+        # One read of the cluster feeding both the snapshot and the slot
+        # decision. Written as one step because they must describe the same
+        # instant: a separate reader could snapshot a state no deploy was ever
+        # planned from, and the invariant would then prove nothing.
         {
             "id": "slot",
+            "env": {"SELECTORS_BEFORE": SELECTORS_BEFORE},
             "run": [
                 "set -euo pipefail",
                 "source scripts/deploy/nchat-prod/lib.sh",
-                'slot="$(opposite_slot "$(resolve_active_slot "$(collect_service_slots)")")"',
-                'echo "slot=$slot" >>"$GITHUB_OUTPUT"',
+                'mapping="$(collect_service_slots)"',
+                'printf \'%s\\n\' "$mapping" >"$SELECTORS_BEFORE"',
+                'active="$(resolve_active_slot "$mapping")"',
+                'echo "active=$active" >>"$GITHUB_OUTPUT"',
+                'echo "slot=$(opposite_slot "$active")" >>"$GITHUB_OUTPUT"',
+                'echo "stable Service selectors before the deploy:"',
+                'cat "$SELECTORS_BEFORE"',
             ],
         },
         {
             "env": {
                 "ARTIFACTS_DIR": "${{ github.workspace }}/artifacts",
+                # Compared exactly: the deploy must build the slot the snapshot
+                # step resolved, not one it derives for itself.
+                "NCHAT_PROD_CANDIDATE_SLOT": SLOT_OUTPUT,
                 "NCHAT_PROD_RELEASE_SHA": SHA,
                 "NCHAT_PROD_TOPOLOGY_FILE": "${{ vars.NCHAT_PROD_TOPOLOGY_FILE }}",
                 "NCHAT_PROD_CAPACITY_EVIDENCE_DIR": "${{ vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR }}",
@@ -172,43 +209,54 @@ EXPECTED_STEPS = {
             "env": {"CANDIDATE_SLOT": SLOT_OUTPUT},
             "run": ['scripts/deploy/nchat-prod/smoke.sh --target "$CANDIDATE_SLOT"'],
         },
+        # `diff` is the assertion. Under `set -e` a difference ends the step,
+        # which is the whole behaviour: this step detects that something moved a
+        # stable Service, and it must never be the thing that puts one back.
+        {
+            "env": {
+                "SELECTORS_BEFORE": SELECTORS_BEFORE,
+                "SELECTORS_AFTER": SELECTORS_AFTER,
+            },
+            "run": [
+                "set -euo pipefail",
+                "source scripts/deploy/nchat-prod/lib.sh",
+                'collect_service_slots >"$SELECTORS_AFTER"',
+                'echo "stable Service selectors after the deploy:"',
+                'cat "$SELECTORS_AFTER"',
+                'diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER"',
+                'echo "The stable Services select exactly what they selected before this run."',
+            ],
+        },
+        # The second invariant, independent of the first: the selectors prove
+        # traffic did not move, this proves the candidate was not replaced.
+        # `require_slot_release_identity` reads the cluster and refuses every state
+        # that is not exactly the expected release, so there is no spelling of
+        # this step that passes on a slot carrying something else.
         {
             "env": {
                 "CANDIDATE_SLOT": SLOT_OUTPUT,
-                "RELEASE_SHA": SHA,
-                "RELEASE_ID": RELEASE_ID_OUTPUT,
+                "EXPECTED_RELEASE": EXPECTED_RELEASE,
             },
-            "run": [
-                'echo "Candidate slot $CANDIDATE_SLOT carries release $RELEASE_SHA ($RELEASE_ID) and no production traffic."',
-                'echo "Complete the authenticated release smoke printed above against the slot\'s"',
-                'echo "preview hosts, record it in the release ticket, then approve the"',
-                "echo \"'production' environment to release the cutover job.\"",
-            ],
-        },
-    ],
-    CUTOVER: [
-        {
-            "env": {"RELEASE_SHA": SHA},
             "run": [
                 "set -euo pipefail",
-                '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]',
-                '[[ "$GITHUB_REF" == "refs/heads/main" ]]',
+                "source scripts/deploy/nchat-prod/lib.sh",
+                'require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"',
+                "echo",
+                'echo "Slot $CANDIDATE_SLOT is running exactly $EXPECTED_RELEASE."',
             ],
         },
-        CHECKOUT_STEP,
-        MAIN_GATE_STEP,
-        DOWNLOAD_STEP,
         {
             "env": {
-                "CANDIDATE_SLOT": NEEDS_SLOT,
-                # Slot, commit and sealed release together. cutover.sh compares
-                # all three against the cluster and re-derives the identity from
-                # the manifest, so a rebuild of the same commit stops matching.
-                "NCHAT_PROD_SMOKE_CONFIRMED": f"{NEEDS_SLOT}:{SHA}:{NEEDS_RELEASE_ID}",
-                "NCHAT_PROD_RELEASE_MANIFEST_DIR": "${{ github.workspace }}/release-manifest",
-                "NCHAT_PROD_ASSUME_YES": "1",
+                "ACTIVE_SLOT": ACTIVE_OUTPUT,
+                "CANDIDATE_SLOT": SLOT_OUTPUT,
+                "EXPECTED_RELEASE": EXPECTED_RELEASE,
             },
-            "run": ['scripts/deploy/nchat-prod/cutover.sh --target "$CANDIDATE_SLOT"'],
+            "run": [
+                'echo "Active slot   : $ACTIVE_SLOT, still serving every stable Service."',
+                'echo "Candidate slot: $CANDIDATE_SLOT, verified against the cluster as running $EXPECTED_RELEASE, carrying no production traffic."',
+                'echo "This workflow does not promote. Cutover is a separate, later step;"',
+                'echo "see section 11 of docs/runbooks/production-blue-green-deployment.md."',
+            ],
         },
     ],
 }
@@ -218,10 +266,14 @@ EXPECTED_STEPS = {
 # `if` and `continue-on-error` would let a failed gate be stepped over, `shell`
 # and `working-directory` change what a command means.
 STEP_KEYS = {"name", "id", "uses", "with", "env", "run"}
+# `needs` and `environment` are absent on purpose, and their absence is a rule
+# rather than an omission. There is nothing for the one job to depend on, and an
+# `environment:` here would both attach an approval to the phase that has
+# nothing to approve yet and pull that environment's secrets into an
+# unprotected deploy. Both belong to the separate cutover step, in its own file
+# and its own review.
 JOB_KEYS = {
     "name",
-    "needs",
-    "environment",
     "runs-on",
     "permissions",
     "timeout-minutes",
@@ -266,21 +318,6 @@ def triggers_of(workflow):
     return set(on or ())
 
 
-def needs_of(job):
-    needs = job.get("needs", [])
-    if isinstance(needs, str):
-        return {needs}
-    return set(needs)
-
-
-def environment_of(job):
-    """`environment: production` and `environment: {name: production}` are one."""
-    environment = job.get("environment")
-    if isinstance(environment, dict):
-        return environment.get("name")
-    return environment
-
-
 def dispatch_inputs_of(workflow):
     """Whatever is declared under `workflow_dispatch.inputs`, unexamined.
 
@@ -298,10 +335,13 @@ def dispatch_inputs_of(workflow):
 
 
 def check_input(name, spec):
-    """One input's declaration. `description` is prose and stays free."""
+    """One input's declaration, closed. `description` is prose and stays free."""
     if not isinstance(spec, dict):
         return [f"workflow_dispatch input {name} must be a mapping, got {spec!r}"]
     problems = []
+    unexpected = sorted(set(spec) - INPUT_KEYS)
+    if unexpected:
+        problems.append(f"workflow_dispatch input {name} must not declare {unexpected}")
     for key, value in INPUT_CONTRACT.items():
         if spec.get(key) != value:
             problems.append(
@@ -369,6 +409,9 @@ def check_triggers(workflow):
 
 def check_workflow(workflow):
     problems = []
+    # Exactly one job. A second one is refused whatever it is called and
+    # whatever it does, which is what keeps a promotion out of this file: it
+    # cannot be added under a name the contract failed to anticipate.
     if set(workflow.get("jobs", {})) != set(EXPECTED_STEPS):
         problems.append(
             f"the workflow must define exactly the jobs {sorted(EXPECTED_STEPS)}, "
@@ -380,24 +423,42 @@ def check_workflow(workflow):
 
 
 def check_job_shape(name, job):
-    """The job's own settings, and no key that could re-open a closed gate."""
+    """The job's own settings, and no key that could re-open a closed gate.
+
+    `needs:`, `environment:`, `if:` and `strategy:` are all refused by the same
+    comparison that refuses a key GitHub has not shipped yet: none of them is in
+    JOB_KEYS, and nothing outside it is permitted.
+    """
     problems = []
     unexpected = sorted(set(job) - JOB_KEYS)
     if unexpected:
         problems.append(f"{name} job must not declare {unexpected}")
-    if needs_of(job) != JOB_NEEDS[name]:
-        problems.append(f"{name} job must depend on exactly {sorted(JOB_NEEDS[name])}")
-    if environment_of(job) != JOB_ENVIRONMENT[name]:
-        problems.append(f"{name} job environment must be {JOB_ENVIRONMENT[name]!r}")
     if job.get("permissions") != JOB_PERMISSIONS[name]:
         problems.append(f"{name} job must run with exactly {JOB_PERMISSIONS[name]}")
     if job.get("runs-on") != RUNNER:
         problems.append(f"{name} job must run on {RUNNER}")
+    problems += check_timeout(name, job)
     return problems
 
 
+def check_timeout(name, job):
+    """Exactly 45, and an integer.
+
+    The type is checked before the value, and `bool` is excluded from it. YAML's
+    `"45"` is a string Actions rejects at parse time, so a contract that
+    compared it loosely would be green on a workflow nobody can run; and
+    `True == 1` in Python, so a bare equality would read `timeout-minutes: true`
+    as a one-minute limit. Only then is the value compared.
+    """
+    timeout = job.get("timeout-minutes")
+    if isinstance(timeout, int) and not isinstance(timeout, bool):
+        if timeout == TIMEOUT_MINUTES:
+            return []
+    return [f"{name} job must declare timeout-minutes: {TIMEOUT_MINUTES}, got {timeout!r}"]
+
+
 def check_job_outputs(name, job):
-    """The wiring the promotion depends on, compared as exact expressions."""
+    """No outputs at all: there is no second job for them to travel to."""
     if job.get("outputs") != JOB_OUTPUTS[name]:
         return [f"{name} job outputs must be exactly {JOB_OUTPUTS[name]!r}, got {job.get('outputs')!r}"]
     return []
@@ -417,9 +478,10 @@ def check_step(name, index, step, expected):
 def check_steps(name, job):
     """Same steps, same order, nothing extra.
 
-    This is where a wrapper, a hand-written selector patch and a stray `echo`
-    are all refused, without any of them having to be recognised: they are not
-    the step the contract has at that position, and there is no position spare.
+    This is where a wrapper around cutover.sh, a call to rollback.sh or
+    drain-old.sh, a hand-written selector patch and a stray `echo` are all
+    refused, without any of them having to be recognised: they are not the step
+    the contract has at that position, and there is no position spare.
     """
     steps = job.get("steps") or []
     expected = EXPECTED_STEPS[name]

@@ -71,7 +71,7 @@ help:
 	@echo "  make prod-blue-green-query-test Run manifest reader unit tests (CI-safe)"
 	@echo "  make prod-capacity-test      Run capacity preflight fixtures (CI-safe)"
 	@echo "  make prod-release-manifest-test Run release manifest tests (CI-safe)"
-	@echo "  make prod-deploy-workflow-test Run candidate/cutover separation tests (CI-safe)"
+	@echo "  make prod-deploy-workflow-test Run candidate-only deploy workflow tests (CI-safe)"
 	@echo "  make prod-runner-guard-test  Run production runner pre-job guard tests (CI-safe)"
 	@echo "  make prod-capacity-evidence  Collect cluster capacity evidence: ARGS=\"<output-dir>\""
 	@echo "  make prod-blue-green-status  Show the production release slots (requires cluster)"
@@ -361,9 +361,10 @@ prod-capacity-test:
 prod-release-manifest-test:
 	pnpm prod:release-manifest:test
 
-# Proves the production deploy workflow keeps every way of moving traffic
-# inside the environment-protected cutover job. Offline: parses the workflow
-# and drives the release binding, touches no cluster.
+# Proves the production deploy workflow is candidate-only: no job, step or
+# input in it can move production traffic, and the stable Service selectors it
+# records before the deploy are proved unchanged after. Offline: parses the
+# workflow and drives the release binding, touches no cluster.
 prod-deploy-workflow-test:
 	pnpm prod:deploy-workflow:test
 

@@ -421,6 +421,38 @@ require_consistent_release() {
   prod_fail "slot $slot is $state; deploy the release again before promoting it"
 }
 
+# Binds what a slot is actually running to the release the caller asked for.
+#
+# slot_release_state answers what the slot carries. That is a statement about
+# the slot alone: a concurrent redeploy of the same slot produces a state that
+# is equally CONSISTENT and equally Ready, and nothing in "consistent" tells the
+# two releases apart. Comparing the observed identity to a named one is what
+# turns "this slot agrees with itself" into "this slot is running the release
+# this run built".
+#
+# The identity is the commit and the sealed build together, so a rebuild of the
+# same commit fails here as surely as a different commit does.
+#
+# Every state that is not exactly the expected release stops the caller, the
+# non-CONSISTENT ones included: NOT_DEPLOYED, ROLLING_OUT and MIXED are answers
+# about a slot that cannot be reported as carrying any release at all, and a
+# cluster that cannot be read produces one of them rather than a match.
+#
+# Named for the slot it reads. cutover.sh carries its own, older
+# require_release_identity, which answers a different question -- does the
+# sealed manifest being promoted match the id the slot reports -- and takes one
+# argument rather than two. That script sources this file and then defines its
+# own, so a shared name would leave which of the two ran depending on the order
+# of a `source` line, with two incompatible signatures under one global symbol.
+require_slot_release_identity() {
+  local slot="$1" expected="$2" state
+  state="$(slot_release_state "$slot")" ||
+    prod_fail "cannot read the release identity of slot $slot"
+  [[ "$state" == "CONSISTENT $expected" ]] ||
+    prod_fail "slot $slot carries '$state', expected 'CONSISTENT $expected'"
+  printf '%s' "$expected"
+}
+
 # The evidence a smoke run produces and a cutover checks: the slot AND the exact
 # release that was validated on it.
 #
