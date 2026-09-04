@@ -308,6 +308,33 @@ const messagePage = (messages: Message[]): MessagePage => ({ messages, nextCurso
 
 // Channel-details payload keyed by channel, so a test that switches channels can
 // assert the panel followed the switch rather than kept the first channel's data.
+/**
+ * jsdom performs no layout, so a test has to define the scroll container's
+ * geometry by hand — and doing that in the same step as the scroll event makes
+ * a simulated reader indistinguishable from an async reflow.
+ *
+ * #788: ChatMessageArea reads a reader's intent only from a scroll event whose
+ * scrollHeight is unchanged since the previous one, because an event that also
+ * grew the timeline describes a layout that shifted underneath a stationary
+ * viewport, not a person. So a simulated scroll settles the geometry first,
+ * the way a browser settles it at layout time before anyone can scroll.
+ */
+function settleListLayout(list: HTMLElement, scrollHeight: number, clientHeight: number) {
+  Object.defineProperty(list, "scrollHeight", { configurable: true, value: scrollHeight });
+  Object.defineProperty(list, "clientHeight", { configurable: true, value: clientHeight });
+  fireEvent.scroll(list);
+}
+
+/** The reader's own scroll: only scrollTop moves, exactly as in a browser. */
+function userScrollTo(list: HTMLElement, scrollTop: number) {
+  Object.defineProperty(list, "scrollTop", {
+    configurable: true,
+    writable: true,
+    value: scrollTop,
+  });
+  fireEvent.scroll(list);
+}
+
 function groupDetailsFor(conversationId: string) {
   return {
     id: conversationId,
@@ -6021,10 +6048,8 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
 
     // Simulate user scrolled far up: scrollHeight=1000, clientHeight=400, scrollTop=0
     // → distance from bottom = 1000 - 0 - 400 = 600 > 150 → not near bottom.
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
 
     // Clear any scrollIntoView calls from the initial load.
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -6063,10 +6088,8 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
     const list = screen.getByRole("log");
     // Simulate near-bottom scroll: scrollHeight=500, clientHeight=400, scrollTop=99
     // → distance from bottom = 500 - 99 - 400 = 1 ≤ 150 → near bottom.
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 500 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 99 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 500, 400);
+    userScrollTo(list, 99);
 
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     scrollMock.mockClear();
@@ -6144,17 +6167,13 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
   }
 
   function scrollAwayFromBottom(list: HTMLElement) {
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
   }
 
   function scrollBackToBottom(list: HTMLElement) {
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 900 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 900);
   }
 
   function renderWithContext(
@@ -6553,10 +6572,8 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
 
       // Real tail is scrollTop 600; the user scrolls up 100px — still within
       // the 150px near-bottom threshold, so the phase stays AT_BOTTOM.
-      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
-      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 500 });
-      fireEvent.scroll(list);
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 500);
       expect(
         screen.queryByRole("button", { name: "Ir para o final da conversa" }),
       ).not.toBeInTheDocument();
@@ -6566,6 +6583,87 @@ describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
       act(() => flushResizeObservers());
 
       expect(list.scrollTop).toBe(500);
+    });
+
+    it("keeps following the tail when a scroll event carries a scrollHeight an async reflow already moved", async () => {
+      // #788 root cause, in miniature. The tail-lock corrects a reflow with a
+      // direct scrollTop write; the scroll event that write produces is
+      // delivered a frame later, and a second reflow can land in between. The
+      // handler then sees a distance-from-the-tail that belongs to the new
+      // layout, not to anything the reader did. Treating it as intent is what
+      // disarmed the tail-lock permanently — after that, every later reflow
+      // went uncorrected (measured in DEV: 2051px from the tail).
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Settled, and genuinely at the real tail.
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 600);
+
+      // The timeline grew before this scroll event was delivered.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      fireEvent.scroll(list);
+
+      // A layout shift alone never becomes READING_HISTORY...
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+      // ...and the tail-lock is still armed for the reflow that follows.
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1200);
+    });
+
+    it("stops following the tail on the reader's first real scroll once the layout has stabilised", async () => {
+      // #788: the scrollHeight gate must not be a one-way street. It exists to
+      // stop a reflow from being mistaken for intent — but the moment the
+      // layout settles, an ordinary scroll has to count again, or the reader
+      // would be pinned to the tail forever after any attachment loads.
+      //
+      // The whole sequence in one test, because it is the composition that
+      // matters: ignoring the contaminated event (covered above) and honouring
+      // a later real one (covered elsewhere) are each true in isolation while
+      // the gate could still be stuck between them.
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Following the tail, settled at the real bottom.
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 600);
+
+      // A reflow, and a scroll event delivered against the grown scrollHeight:
+      // ignored as intent, so the tail-lock re-pins to the new tail.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      fireEvent.scroll(list);
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1200);
+
+      // The pin's own scroll event, now with a stable scrollHeight: still the
+      // real tail, so the intent is simply re-affirmed.
+      fireEvent.scroll(list);
+
+      // The layout has stabilised and the reader scrolls up ~100px — an
+      // ordinary event, stable scrollHeight. It stays inside the 150px
+      // courtesy threshold, so the phase remains AT_BOTTOM and no button
+      // appears: the phase alone could never express what just happened.
+      userScrollTo(list, 1100);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+
+      // Another reflow must respect that: no pull back to the tail.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 2200 });
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1100);
     });
 
     it("does not pull the viewport back to the bottom when the user is reading history and content resizes", async () => {
