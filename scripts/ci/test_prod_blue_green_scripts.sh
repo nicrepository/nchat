@@ -844,6 +844,7 @@ TOPO
 release_run() {
   local state="$1"; shift
   FAKE_STATE_DIR="$state" NCHAT_PROD_ASSUME_YES=1 \
+    NCHAT_PROD_CANDIDATE_SLOT="${CANDIDATE_SLOT:-}" \
     NCHAT_PROD_RELEASE_SHA="${RELEASE_SHA:-$RELEASE_A}" \
     NCHAT_PROD_CAPACITY_EVIDENCE_DIR="${EVIDENCE:-}" \
     NCHAT_PROD_RELEASE_MANIFEST_DIR="${MANIFEST_DIR:-$MANIFEST_A}" \
@@ -1278,7 +1279,231 @@ assert_all_on "$state" blue
 [[ ! -s "$state/patch-log" ]] || fail "deploy patched a Service; promotion is cutover's job"
 pass
 
+echo
+echo "--- the requested candidate slot ---"
 
+# The pipeline resolves the candidate from its own reading of the stable
+# Services -- the reading its before/after selector proof is built on -- and
+# hands that slot over. Deriving it again here would make two decisions out of
+# one: a cutover landing between the two readings would leave the pipeline
+# smoking and reporting one slot while this script built the other.
+#
+# So the request is revalidated, never replaced, and the revalidation happens
+# before every mutation.
+
+# deploy.sh with a slot requested, scoped to this one call.
+#
+# Not `CANDIDATE_SLOT=green status=0; release_run ...`: that is two assignments
+# rather than a prefixed command, so the value outlives the case and the next
+# one inherits it. An env prefix on a function call is restored afterwards, so
+# each case below starts from nothing requested.
+deploy_requesting() {
+  local slot="$1" state="$2"
+  CANDIDATE_SLOT="$slot" release_run "$state" "$SCRIPTS/deploy.sh"
+}
+
+begin "a requested candidate that is still the idle slot is the one deployed"
+state="$(new_state blue "blue green")"
+status=0; deploy_requesting green "$state" || status=$?
+expect_exit 0 "$status"
+grep -q "candidate.yaml" "$state/apply-log" || fail "did not apply the candidate"
+grep -q -- "-green" "$state/rollout-log" || fail "did not roll out the requested slot"
+grep -q -- "-blue" "$state/rollout-log" && fail "rolled out the slot serving production"
+assert_all_on "$state" blue
+pass
+
+# The divergence case: the request was made against a cluster where Blue was
+# active, and by the time the deploy runs the stable Services select Green. The
+# idle slot is now Blue, so the request no longer describes the cluster.
+begin "a requested candidate the cluster no longer agrees with stops the deploy"
+state="$(new_state green "blue green")"
+status=0; deploy_requesting green "$state" || status=$?
+expect_exit 1 "$status"
+grep -q "stable Services moved" "$WORK/err.txt" || fail "did not report the divergence"
+pass
+
+# Where the refusal lands matters as much as that it happens. Everything below
+# is downstream of the gate, and none of it may have run.
+begin "the divergence stops the deploy before the migration"
+state="$(new_state green "blue green")"
+status=0; deploy_requesting green "$state" || status=$?
+expect_exit 1 "$status"
+[[ ! -f "$state/wait-log" ]] || fail "ran a migration for a candidate it then refused"
+pass
+
+begin "the divergence stops the deploy before the candidate is applied"
+state="$(new_state green "blue green")"
+status=0; deploy_requesting green "$state" || status=$?
+expect_exit 1 "$status"
+[[ ! -f "$state/apply-log" ]] || fail "applied a candidate the cluster no longer agreed with"
+[[ ! -f "$state/rollout-log" ]] || fail "waited on a candidate that was never applied"
+[[ ! -s "$state/patch-log" ]] || fail "touched a stable Service while refusing"
+pass
+
+# The failure this gate exists for. Silently deploying Blue instead -- the slot
+# the cluster now calls idle -- would leave the pipeline smoking Green, and the
+# release would be validated on a slot nobody deployed.
+begin "a divergent request never falls back to the other slot"
+state="$(new_state green "blue green")"
+status=0; deploy_requesting green "$state" || status=$?
+expect_exit 1 "$status"
+[[ ! -f "$state/rollout-log" ]] || fail "deployed some slot after refusing the requested one"
+pass
+
+# The active slot can never be its own opposite, so asking for it is always a
+# divergence -- and the one that would deploy over live production.
+begin "the slot serving production is never accepted as a candidate"
+state="$(new_state blue "blue green")"
+status=0; deploy_requesting blue "$state" || status=$?
+expect_exit 1 "$status"
+[[ ! -f "$state/apply-log" ]] || fail "deployed over the slot carrying production traffic"
+pass
+
+begin "a requested slot that is not a slot at all is refused"
+state="$(new_state blue "blue green")"
+status=0; deploy_requesting production "$state" || status=$?
+expect_exit 1 "$status"
+[[ ! -f "$state/apply-log" ]] || fail "deployed something for an unrecognised slot"
+pass
+
+# The manual flow of the runbook passes nothing, and must keep deriving the
+# candidate exactly as it always has.
+begin "with no slot requested the canonical derivation still stands"
+state="$(new_state blue "blue green")"
+status=0; release_run "$state" "$SCRIPTS/deploy.sh" || status=$?
+expect_exit 0 "$status"
+grep -q -- "-green" "$state/rollout-log" || fail "did not derive Green as the idle slot"
+grep -q "candidate slot: green" "$WORK/out.txt" || fail "did not report the derived candidate"
+pass
+
+
+
+echo
+echo "--- the candidate carries the requested release ---"
+
+# The gate the production deploy workflow runs after its smoke.
+#
+# The smoke proves a slot agrees with itself. It cannot prove the slot is
+# running the release the run built: a concurrent redeploy of that same slot
+# leaves the stable selectors untouched and produces a slot that is equally
+# Ready and equally CONSISTENT. Only comparing the observed identity to the
+# requested one separates the two, and that is what this exercises -- the real
+# helper, against the fake cluster, exactly as the workflow calls it.
+identity_run() {
+  local state="$1" slot="$2" expected="$3"
+  FAKE_STATE_DIR="$state" bash -c '
+    set -Eeuo pipefail
+    source "$1/lib.sh"
+    require_slot_release_identity "$2" "$3"
+  ' _ "$SCRIPTS" "$slot" "$expected" >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
+# Two scripts once defined a require_release_identity: lib.sh for a slot, and
+# cutover.sh for the sealed manifest it is promoting. cutover.sh sources lib.sh
+# and then defines its own, so which one ran depended on the order of a `source`
+# line, and the two took different arguments. Nothing failed, because the local
+# definition happened to come last -- which is the kind of correctness that
+# stops being true the moment someone moves a line.
+#
+# Generalised rather than pinned to those two names, but only over the shape
+# that is actually a hazard: a name lib.sh defines and a script that sources
+# lib.sh defines again. Each entrypoint having its own main() or run_migrations()
+# is not that -- those scripts are executed, never sourced into one another.
+begin "no script redefines a function it inherits from lib.sh"
+shared="$(sed -n 's/^\([a-z_][a-z0-9_]*\)() {$/\1/p' "$SCRIPTS/lib.sh" | LC_ALL=C sort -u)"
+shadowed=""
+for script in "$SCRIPTS"/*.sh; do
+  [[ "$(basename "$script")" == lib.sh ]] && continue
+  grep -q 'source .*lib\.sh' "$script" || continue
+  for name in $(sed -n 's/^\([a-z_][a-z0-9_]*\)() {$/\1/p' "$script"); do
+    grep -qxF "$name" <<<"$shared" && shadowed+="$(basename "$script"):$name "
+  done
+done
+[[ -z "$shadowed" ]] || fail "redefines a lib.sh function: $shadowed"
+pass
+
+begin "cutover keeps its own release identity helper after sourcing lib.sh"
+# The shared helper takes a slot and an expected identity; cutover's takes one
+# id and reads the sealed manifest. Sourcing lib.sh must not change which of
+# them cutover resolves, so the local one is asserted by its own behaviour:
+# with no manifest directory it refuses and says so.
+FAKE_STATE_DIR="$(new_state blue "blue green")" \
+  NCHAT_PROD_RELEASE_MANIFEST_DIR="" bash -c '
+    set -uo pipefail
+    source "$1/lib.sh"
+    # shellcheck disable=SC1090
+    source <(sed -n "/^require_release_identity() {/,/^}/p" "$1/cutover.sh")
+    require_release_identity deadbeef
+  ' _ "$SCRIPTS" >"$WORK/out.txt" 2>"$WORK/err.txt" && status=0 || status=$?
+expect_exit 1 "$status"
+grep -q "NCHAT_PROD_RELEASE_MANIFEST_DIR must name the directory" "$WORK/err.txt" ||
+  fail "sourcing lib.sh displaced cutover's own helper"
+pass
+
+begin "the requested release is what the candidate is running"
+state="$(new_state blue "blue green")"
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A")" || status=$?
+expect_exit 0 "$status"
+pass
+
+# The redeploy this gate exists for: a different commit, deployed cleanly, so
+# the slot is Ready and internally consistent and the smoke would pass.
+begin "a candidate running another commit is refused"
+state="$(new_state blue "blue green")"
+for service in "${SERVICES[@]}"; do
+  set_release "$state" "$service" green "$RELEASE_B"
+done
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A")" || status=$?
+expect_exit 1 "$status"
+grep -q "expected 'CONSISTENT $RELEASE_A" "$WORK/err.txt" || fail "did not name the expected release"
+pass
+
+# The half a commit cannot answer: the slot is running RELEASE_A sealed as
+# RELEASE_ID_A, and what is expected is the same commit built again -- different
+# image bytes, so a different seal, and RELEASE_ID_A_REBUILT is that seal.
+#
+# The commit is identical on both sides on purpose. Pairing RELEASE_A with some
+# other commit's seal would be refused for the SHA as much as for the id, and
+# would prove nothing a SHA-only comparison does not already catch. Only a
+# genuine rebuild isolates the half that the commit cannot see.
+begin "a rebuild of the same commit is refused"
+[[ "$RELEASE_ID_A" != "$RELEASE_ID_A_REBUILT" ]] ||
+  fail "the rebuild fixture seals the same id as the original build"
+state="$(new_state blue "blue green")"
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A_REBUILT")" || status=$?
+expect_exit 1 "$status"
+grep -q "$RELEASE_A:$RELEASE_ID_A_REBUILT" "$WORK/err.txt" ||
+  fail "did not name the rebuild's identity as the expected one"
+pass
+
+begin "a candidate still rolling out is refused"
+state="$(new_state blue "blue green")"
+set_rollout "$state" chat-service-green 2 2 2 0 2 2 0
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A")" || status=$?
+expect_exit 1 "$status"
+grep -q "ROLLING_OUT" "$WORK/err.txt" || fail "did not report the slot as rolling out"
+pass
+
+begin "a candidate whose workloads disagree is refused"
+state="$(new_state blue "blue green")"
+set_workload_release "$state" chat-service-green "$RELEASE_B"
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A")" || status=$?
+expect_exit 1 "$status"
+grep -q "MIXED" "$WORK/err.txt" || fail "did not report the slot as mixed"
+pass
+
+begin "a candidate that was never deployed is refused"
+state="$(new_state blue "blue")"
+status=0
+identity_run "$state" green "$(identity "$RELEASE_A" "$RELEASE_ID_A")" || status=$?
+expect_exit 1 "$status"
+grep -q "NOT_DEPLOYED" "$WORK/err.txt" || fail "did not report the slot as undeployed"
+pass
 
 echo
 echo "--- namespace gate ---"
