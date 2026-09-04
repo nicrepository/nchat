@@ -949,4 +949,74 @@ test.describe("sidebar — seções recolhíveis e filtro de não lidas", () => 
     // Mensagens diretas continua mostrando sua conversa normalmente.
     await expect(optionsIn(page, "Mensagens diretas")).toHaveCount(1);
   });
+
+  /*
+   * ISSUE #787 — o refinamento visual do mesmo controle. A semântica da #779
+   * não muda: o que se verifica aqui é que a chave continua acionável por
+   * teclado, que o estado alterna na semântica e na classe modificadora, que a
+   * dica de hover não substitui o nome acessível e que o contador zero deixou
+   * de ser desenhado.
+   *
+   * A posição do polegar é deliberadamente CSS e não é medida aqui: depender de
+   * coordenadas atrás de uma transition testaria o motor de layout do
+   * navegador, não a aplicação, e varia com o timing da CI.
+   */
+  test("apresenta a preferência como chave visual, com dica e sem contador zero", async ({
+    page,
+  }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    await expect(page.getByRole("heading", { name: "Canais" })).toBeVisible();
+
+    const toggle = unreadSwitch(page, "Canais");
+    const ON = /chat-sidebar__section-unread-toggle--on/;
+
+    // Sem não lidas em nenhuma seção do cenário: nenhum "0" no cabeçalho.
+    await expect(page.locator(".chat-sidebar__section-unread-count")).toHaveCount(0);
+
+    // A dica de hover é o title do próprio botão, e nunca substitui o nome
+    // acessível — que continua dizendo de qual seção esta chave é.
+    await expect(toggle).toHaveAttribute(
+      "title",
+      "Exibir não lidas quando a seção estiver recolhida",
+    );
+    await expect(toggle).toHaveAccessibleName(
+      "Mostrar mensagens não lidas quando Canais estiver recolhida",
+    );
+
+    // Desligada: a semântica e a classe modificadora concordam. O polegar é
+    // desenhado à esquerda pelo CSS; aqui basta saber que o estado é o "off".
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await expect(toggle).not.toHaveClass(ON);
+
+    // A chave continua acionável pelo teclado, nos dois sentidos.
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
+    await expect(toggle).toHaveClass(ON);
+
+    await page.keyboard.press(" ");
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await expect(toggle).not.toHaveClass(ON);
+
+    // Uma não lida chegando em tempo real acende o contador — que some de novo
+    // quando a conversa é lida. A fonte do número continua sendo o estado
+    // canônico; a #787 só decidiu quando ele é desenhado.
+    const target = scenario.sidebarChannels[0];
+    await emitMessageCreated(page, scenario, {
+      kind: "channel",
+      targetId: target.id,
+      message: makeMessage({
+        id: `${target.id}-787`,
+        sender_id: OTHER_USER_ID,
+        sender_display_name: OTHER_USER_NAME,
+        body_text: "chegou agora",
+        created_at: "2026-08-20T10:00:00Z",
+        updated_at: "2026-08-20T10:00:00Z",
+      }),
+    });
+    await expect(section(page, "Canais").getByLabel("1 conversa não lida")).toHaveText("1");
+
+    await optionsIn(page, "Canais").filter({ hasText: target.display_name }).click();
+    await expect(page.locator(".chat-sidebar__section-unread-count")).toHaveCount(0);
+  });
 });

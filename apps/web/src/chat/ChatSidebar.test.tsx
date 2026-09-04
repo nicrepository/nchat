@@ -2694,6 +2694,113 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(screen.getByLabelText("2 conversas não lidas")).toHaveTextContent("2");
   });
 
+  // ── Issue #787 — header refinements ────────────────────────────────────────
+  // A visual pass over the #779 controls. The source of the count, the realtime
+  // updates and the preference behind the switch are all unchanged; what
+  // changes is that a zero is not drawn and the switch is a switch.
+
+  it("renders no count at all for a section with nothing unread", () => {
+    renderState([channel("a"), channel("b")], []);
+
+    // Not a "0" anywhere in the header, and not an element holding one either:
+    // the count must not reserve width for a section that has nothing to say.
+    const header = within(section("Canais"));
+    expect(header.queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+    expect(document.querySelectorAll(".chat-sidebar__section-unread-count")).toHaveLength(0);
+  });
+
+  it("renders the count from one unread conversation upwards, in the singular and the plural", () => {
+    const { unmount } = renderState([channel("a", { unreadCount: 4 }), channel("b")], []);
+    expect(within(section("Canais")).getByLabelText("1 conversa não lida")).toHaveTextContent("1");
+    unmount();
+
+    renderState([channel("a", { unreadCount: 4 }), channel("b", { unreadCount: 1 })], []);
+    expect(within(section("Canais")).getByLabelText("2 conversas não lidas")).toHaveTextContent(
+      "2",
+    );
+  });
+
+  it("keeps each section's count independent, showing none for the sections that are quiet", () => {
+    renderState([channel("a", { unreadCount: 2 })], [dm("d", "1:1"), dm("g", "group")]);
+
+    expect(within(section("Canais")).getByLabelText("1 conversa não lida")).toBeInTheDocument();
+    expect(
+      within(section("Mensagens diretas")).queryByLabelText(/conversas? não lidas?$/),
+    ).toBeNull();
+    expect(within(section("Grupos")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+  });
+
+  it("appears and disappears from the header as unread arrives and is cleared", () => {
+    const read = channel("a");
+    const unread = channel("a", { unreadCount: 3 });
+
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar state={readyState([read], [])} retry={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+
+    // The same update path the realtime events already use: new canonical state.
+    rerender(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar state={readyState([unread], [])} retry={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(within(section("Canais")).getByLabelText("1 conversa não lida")).toHaveTextContent("1");
+
+    rerender(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatSidebar state={readyState([read], [])} retry={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
+  });
+
+  it("draws the unread-only control as a switch whose thumb moves, not by colour alone", async () => {
+    const user = userEvent.setup();
+    renderState([channel("a", { unreadCount: 1 })], []);
+
+    const toggle = unreadSwitch("Canais");
+    // The semantics of issue #779 are untouched.
+    expect(toggle).toHaveAttribute("role", "switch");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle).toHaveAccessibleName(
+      "Mostrar mensagens não lidas quando Canais estiver recolhida",
+    );
+
+    // The visual is a rail with a thumb, and the "on" class is what moves it.
+    expect(toggle.querySelector(".chat-sidebar__section-unread-track")).not.toBeNull();
+    expect(toggle.querySelector(".chat-sidebar__section-unread-thumb")).not.toBeNull();
+    expect(toggle.className).not.toContain("chat-sidebar__section-unread-toggle--on");
+
+    await user.click(toggle);
+    expect(unreadSwitch("Canais")).toHaveAttribute("aria-checked", "true");
+    expect(unreadSwitch("Canais").className).toContain("chat-sidebar__section-unread-toggle--on");
+  });
+
+  it("hints at the switch on hover without letting the hint become its name", () => {
+    renderState([channel("a")], []);
+
+    for (const title of ["Canais", "Mensagens diretas", "Grupos"]) {
+      const toggle = unreadSwitch(title);
+      // The hover affordance is the browser's own tooltip — one attribute, no
+      // element of ours inside the sidebar's scrollport.
+      expect(toggle).toHaveAttribute("title", "Exibir não lidas quando a seção estiver recolhida");
+      // The generic hint must never displace the name that says *which*
+      // section this switch belongs to.
+      expect(toggle).toHaveAttribute(
+        "aria-label",
+        `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
+      );
+      expect(toggle).toHaveAccessibleName(
+        `Mostrar mensagens não lidas quando ${title} estiver recolhida`,
+      );
+      expect(toggle).toHaveAttribute("role", "switch");
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+    }
+  });
+
   it("keeps the three sections' collapse and unread-only state fully independent", async () => {
     const user = userEvent.setup();
     renderState(
@@ -2829,7 +2936,10 @@ describe("ChatSidebar — collapsible sections with unread filter", () => {
     expect(
       within(section("Canais")).queryByText("Nenhum canal disponível."),
     ).not.toBeInTheDocument();
-    expect(within(section("Canais")).getByLabelText("0 conversas não lidas")).toBeInTheDocument();
+    // The header is still there — its switch proves it — but since issue #787
+    // an empty section shows no count at all rather than a literal "0".
+    expect(unreadSwitch("Canais")).toBeInTheDocument();
+    expect(within(section("Canais")).queryByLabelText(/conversas? não lidas?$/)).toBeNull();
   });
 
   it("persists per (user, workspace) and restores across a remount", () => {

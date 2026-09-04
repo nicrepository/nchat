@@ -138,25 +138,6 @@ function IconSearch() {
   );
 }
 
-/** The "show unread when collapsed" toggle's icon (issue #779). Decorative — the switch's accessible name comes from its aria-label. */
-function IconEye() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="chat-sidebar__section-unread-icon"
-      aria-hidden="true"
-    >
-      <path d="M1.5 12S5 5 12 5s10.5 7 10.5 7-3.5 7-10.5 7S1.5 12 1.5 12Z" />
-      <circle cx="12" cy="12" r="3" />
-    </svg>
-  );
-}
-
 function IconChevronDown() {
   return (
     <svg
@@ -306,6 +287,17 @@ interface SectionProps {
  * exactly the section title; the count and the switch sit beside it and do
  * not change that name.
  *
+ * Issue #787 refines the two of them without touching the state behind either.
+ * The count is rendered only when there is something to count — a literal "0"
+ * beside every quiet section was noise, and an element that is absent also
+ * stops reserving width in the header. The switch keeps its role, its
+ * aria-checked and its handler and changes only how it is drawn: a rail with a
+ * thumb that physically moves, so on/off is legible without relying on colour.
+ * Its hover hint is a plain `title`: the browser already draws that, outside
+ * the sidebar's scrollport, so it cannot be clipped by the nav or widen it.
+ * `aria-label` stays the accessible name — it is the part that says *which*
+ * section this switch belongs to, which a generic hint must never replace.
+ *
  * The listbox lives inside each list component rather than here so that an
  * empty section renders its message *instead of* an options container — an
  * empty `role="listbox"` with a paragraph inside is not a valid one.
@@ -342,21 +334,26 @@ function Section({
           </button>
         </h2>
         <span className="chat-sidebar__section-controls">
-          <span
-            className="chat-sidebar__section-unread-count"
-            aria-label={unreadConversationCountLabel(badgeCount)}
-          >
-            {badgeCount}
-          </span>
+          {badgeCount > 0 ? (
+            <span
+              className="chat-sidebar__section-unread-count"
+              aria-label={unreadConversationCountLabel(badgeCount)}
+            >
+              {badgeCount}
+            </span>
+          ) : null}
           <button
             type="button"
             role="switch"
             aria-checked={showUnreadOnly}
             aria-label={`Mostrar mensagens não lidas quando ${title} estiver recolhida`}
+            title="Exibir não lidas quando a seção estiver recolhida"
             className={`chat-sidebar__section-unread-toggle${showUnreadOnly ? " chat-sidebar__section-unread-toggle--on" : ""}`}
             onClick={onToggleShowUnreadOnly}
           >
-            <IconEye />
+            <span className="chat-sidebar__section-unread-track" aria-hidden="true">
+              <span className="chat-sidebar__section-unread-thumb" />
+            </span>
           </button>
         </span>
       </div>
