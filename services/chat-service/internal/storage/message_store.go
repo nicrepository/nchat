@@ -84,6 +84,27 @@ type CreateMessageInput struct {
 	ReferencedMessageID    string
 	MentionedUserIDs       []string
 	MentionedChannelIDs    []string
+	// MentionAllGroupMembers is issue #776's @all in a group DM. It is never
+	// set for a channel — channel @all is unchanged, still purely textual —
+	// and the service sets it only after re-deriving that the DM target really
+	// is an active group and the body really carries an "all" token.
+	//
+	// It is deliberately not a recipient list: trusting an id list the service
+	// computed ahead of the write is exactly the TOCTOU a membership change
+	// between fetch and send would exploit. Instead this is a flag CreateMessage
+	// resolves itself, in the same statement as the insert, by reading
+	// chat.dm_members directly under that statement's own read-committed
+	// snapshot — so a member removed (or added) by a change that *committed*
+	// before this statement began is correctly reflected either way. That is
+	// not the same claim as serializing against a change strictly concurrent
+	// with this statement's own execution: this CTE takes no row lock on
+	// dm_members/workspace_members, so a removal committing mid-statement is
+	// ordinary read-committed visibility, not a guarantee this design makes or
+	// needs — #776's requirement is "the source of truth at the authoritative
+	// moment wins" against a membership change that already happened, which a
+	// pre-computed list would miss entirely; it is not a request for
+	// serializable isolation against a write racing the send itself.
+	MentionAllGroupMembers bool
 	// AttachmentIDs are candidate files.attachments ids, already parsed as
 	// canonical UUIDs, deduplicated and bounded by the service. They are
 	// candidates only: CreateMessage re-validates every one of them against the
@@ -482,6 +503,27 @@ type MessageStore interface {
 	// repeats this check atomically as the final authorization backstop.
 	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, sourceDMConversationID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
 
+	// CountEligibleAllMentionRecipientsUpTo reports how many members a group
+	// DM's @all currently resolves to (issue #776, SR-002) — active dm_members,
+	// with active workspace membership, on an active and non-deleted account,
+	// exactly the predicate CreateMessage's own eligible_all_mention_recipients
+	// CTE applies.
+	//
+	// senderID is excluded from the count, because notification_recipients
+	// excludes it from the notifications (issue #741): the bound counts the
+	// people an @all actually reaches, not the roster it was written in.
+	//
+	// The count saturates at limit and stops reading membership there, so
+	// deciding a bound never costs more than limit rows however large the group
+	// is (SEC-776-01). It exists so a caller can refuse an over-bound @all with
+	// a specific error before ever attempting the write; it is advisory, and
+	// CreateMessage re-decides the same rule inside its own statement. That
+	// re-decision is what catches a membership change committed between this
+	// call and the write; a change committing strictly concurrently with the
+	// write itself is ordinary read-committed visibility, not something either
+	// side serializes against.
+	CountEligibleAllMentionRecipientsUpTo(ctx context.Context, workspaceID, dmConversationID, senderID string, limit int) (int, error)
+
 	// ListChannelMessages returns a paginated set of messages for a channel.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
 	// active channel, and private-channel membership are all required.
@@ -852,6 +894,118 @@ var createMessageQuery = `
 				  AND chat.channel_visible_to_user(c.id, $4::uuid)
 			)
 		),
+		-- issue #776: @all in a group DM. Recipients are never taken from the
+		-- service layer's own list — that would trust a set computed before this
+		-- statement ran, so a change that already committed by the time the send
+		-- reaches the database (a member removed, or added, before this request
+		-- was even issued) would be missed entirely. Instead this CTE reads
+		-- chat.dm_members itself, inside the same statement as the INSERT, under
+		-- that statement's own read-committed snapshot — which is what makes a
+		-- membership change that committed *before* this statement began always
+		-- visible here, regardless of what the client's autocomplete or composer
+		-- last saw.
+		--
+		-- This is not a claim of serializable isolation against a write racing
+		-- this exact statement's own execution: dm_members/workspace_members are
+		-- read here with no row lock (no FOR UPDATE/FOR SHARE), so a removal that
+		-- commits strictly concurrently with this INSERT is ordinary Postgres
+		-- read-committed visibility, not something this design serializes
+		-- against. #776's requirement is "the source of truth beats a value the
+		-- client is holding," not "this send blocks on every in-flight
+		-- membership write" — locking dm_members here would be a real behavior
+		-- and performance change with no stated requirement driving it, so none
+		-- was added speculatively.
+		--
+		-- $21 is the one bit the service contributes: whether the body carries an
+		-- "all" token in a target the service already confirmed is a group. The
+		-- dc.type = 'group' condition re-asserts that authoritatively rather than
+		-- trusting the flag alone — a DM cannot actually change type, but the
+		-- guard costs nothing and keeps this CTE correct on its own terms. This
+		-- reads $1/$3 (the request's own target parameters) rather than
+		-- inserted.workspace_id/inserted.dm_conversation_id deliberately: it must
+		-- be computable *before* the INSERT below runs, so the INSERT's own WHERE
+		-- clause can refuse to write a message at all when the fan-out is over
+		-- the SR-002 bound (see invalid_all_mention_fanout).
+		-- When $21 is false the WHERE eliminates every row, so a channel send (or
+		-- any DM send without @all) reaches this CTE and produces nothing —
+		-- byte-for-byte the same mention_outbox/pending_mentions rows as before
+		-- this feature existed.
+		--
+		-- SEC-776-01: the LIMIT is the whole point of this CTE's shape. Reading
+		-- one row past the bound is everything either decision needs — at most
+		-- $22 rows means "send it, and these are exactly the recipients", one
+		-- more means "refuse", and neither answer improves by walking the rest of
+		-- a 50,000-member roster. So the database stops at $22 + 1 rows, and an
+		-- oversized group costs the same as a group of 51.
+		--
+		-- No DISTINCT: chat.dm_members is keyed (conversation_id, user_id) and
+		-- both joins below are on primary keys, so an eligible member already
+		-- yields exactly one row. Dropping it is what lets the LIMIT stop early
+		-- rather than forcing a dedupe across the whole roster first.
+		eligible_all_mention_recipients AS (
+			SELECT dm.user_id
+			FROM chat.dm_conversations dc
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id
+			 AND dm.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = dc.workspace_id
+			 AND wm.user_id = dm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u
+			  ON u.id = dm.user_id
+			 AND u.status = 'active'
+			 AND u.deleted_at IS NULL
+			WHERE $21::boolean
+			  AND $3::uuid IS NOT NULL
+			  AND dc.id = $3::uuid
+			  AND dc.workspace_id = $1::uuid
+			  AND dc.type = 'group'
+			  AND dc.status = 'active'
+			  -- The sender is not a recipient of their own message (#741's rule,
+			  -- applied in notification_recipients below). Excluding them here too
+			  -- is what keeps the bound counting the same set that is actually
+			  -- notified: without it a group of the author plus exactly $22 others
+			  -- would count $22 + 1 and be refused, while the notifications it
+			  -- would have produced number exactly $22.
+			  AND dm.user_id <> $4::uuid
+			LIMIT $22::int + 1
+		),
+		-- issue #776 SR-002: a broadcast is either sent to everyone it resolves to
+		-- or sent to no one — never truncated to an arbitrary first-N subset,
+		-- which would silently misinform an author about who actually saw an
+		-- @all they wrote for a larger audience. Gating the INSERT's own WHERE
+		-- clause on this is what makes "too large" a whole-message refusal (zero
+		-- rows: no message, no outbox, no partial fan-out) rather than a value
+		-- decided after the row already exists.
+		--
+		-- It asks the one question that decides the bound — "is there a row past
+		-- the limit?" — as an existence test over the already-capped CTE above,
+		-- not as a count over the roster. OFFSET $22 skips the rows a legal @all
+		-- may have; anything still standing is the $22+1'th eligible recipient
+		-- and refuses the message. Which row that is does not matter and is not
+		-- ordered: only whether one exists.
+		--
+		-- $22 is domain.MaxGroupAllMentionRecipients, passed as a parameter
+		-- rather than inlined so the Go constant stays the only place the limit
+		-- is spelled out — the "+ 1" above derives from it rather than repeating
+		-- a second literal.
+		invalid_all_mention_fanout AS (
+			SELECT 1
+			FROM eligible_all_mention_recipients
+			OFFSET $22::int
+			LIMIT 1
+		),
+		-- The recipients an accepted @all actually notifies. Reading from the
+		-- capped CTE (never a second pass over membership) and refusing to yield
+		-- anything at all once the bound is broken, so the "all or nobody" rule
+		-- holds here on its own terms rather than only as a consequence of the
+		-- INSERT below writing no row.
+		all_mention_recipients AS (
+			SELECT user_id
+			FROM eligible_all_mention_recipients
+			WHERE NOT EXISTS (SELECT 1 FROM invalid_all_mention_fanout)
+		),
 		inserted AS (
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
@@ -890,6 +1044,7 @@ var createMessageQuery = `
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 			  AND NOT EXISTS (SELECT 1 FROM invalid_mentions)
 			  AND NOT EXISTS (SELECT 1 FROM invalid_attachments)
+			  AND NOT EXISTS (SELECT 1 FROM invalid_all_mention_fanout)
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
@@ -930,6 +1085,23 @@ var createMessageQuery = `
 				SELECT um.user_id AS recipient_id,
 				       'mention'::text AS kind, 'high'::text AS priority, 1 AS rank
 				FROM user_mentions um
+				UNION ALL
+				-- @all in a group DM (issue #776), which is a mention and is
+				-- classified as one: the author named this conversation's members
+				-- deliberately, and being named collectively is still being named.
+				-- It shares rank 1 with the individual mentions above because it
+				-- carries the same weight — a member reached by @all and by an
+				-- individual mention is one recipient with one classification, which
+				-- the DISTINCT ON below settles either way since both rows agree.
+				--
+				-- The recipient set is already bounded and already filtered:
+				-- all_mention_recipients yields nothing at all once the fan-out
+				-- exceeds the #776 bound, and the INSERT above refuses the message
+				-- in that case, so this branch cannot become an unbounded fan-out
+				-- and cannot be the route by which a member the @all policy
+				-- excludes is notified as a mention.
+				SELECT amr.user_id, 'mention', 'high', 1
+				FROM all_mention_recipients amr
 				UNION ALL
 				-- The author of the message being answered, but only while they can
 				-- still reach the place it was answered in. A notification names a
@@ -1098,10 +1270,15 @@ func normalizeCreateMessageInput(input CreateMessageInput) CreateMessageInput {
 }
 
 // createMessageArgs is the bind order of createMessageQuery, fixed and stated
-// once. The query numbers its parameters up to $20 and reads several of them
+// once. The query numbers its parameters up to $22 and reads several of them
 // from more than one CTE, so the order is a contract between two things that sit
 // hundreds of lines apart; keeping it beside neither of them, in a function that
 // does nothing else, is what makes it checkable at a glance.
+//
+// $21 and $22 are issue #776's: whether this body carries an @all the service
+// already authorized for a group DM, and the bound that @all's fan-out may not
+// exceed. They are last because they were added last; the query reads them only
+// from the eligible_all_mention_recipients and invalid_all_mention_fanout CTEs.
 func createMessageArgs(input CreateMessageInput) []any {
 	return []any{
 		input.WorkspaceID,
@@ -1124,6 +1301,8 @@ func createMessageArgs(input CreateMessageInput) []any {
 		input.RequestFingerprint,
 		string(input.LinkSafetyState),
 		input.MaxAttachmentBytes,
+		input.MentionAllGroupMembers,
+		domain.MaxGroupAllMentionRecipients,
 	}
 }
 
@@ -1785,6 +1964,70 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 	}
 	defer rows.Close()
 	return scanMentionLabels(rows, labels)
+}
+
+// CountEligibleAllMentionRecipientsUpTo mirrors CreateMessage's own
+// eligible_all_mention_recipients predicate exactly, as a single set-based
+// count — no row is ever fetched to Go, and no member profile is read.
+//
+// The result SATURATES at limit: the LIMIT sits inside the subquery that reads
+// membership, below the aggregate, so the database stops after limit matching
+// rows and never walks the rest of an arbitrarily large roster. A caller
+// asking with limit = MaxGroupAllMentionRecipients+1 therefore learns
+// "0..50 exactly" or "at least 51", which is all a bound decision needs, and
+// the answer costs the same for a 51-member group and a 50,000-member one.
+//
+// Because it saturates it is never the group's real size and must not be
+// rendered as one; it exists only to be compared against the bound.
+//
+// senderID is excluded, matching notification_recipients' rule that nobody is
+// notified of their own message (issue #741). It is a parameter rather than an
+// omission because the bound must count the recipients that are actually
+// notified: counting the author would refuse a group of the author plus exactly
+// MaxGroupAllMentionRecipients others, whose @all notifies exactly that many.
+//
+// dmConversationID must name an active group DM or the count is 0, which the
+// caller reads as "no recipients," not as an error: a 1:1 or missing target
+// has no business calling this at all, and CreateMessage's own authorization
+// is what actually decides accessibility.
+func (s *PGXMessageStore) CountEligibleAllMentionRecipientsUpTo(ctx context.Context, workspaceID, dmConversationID, senderID string, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("count eligible all-mention recipients: %w: limit must be positive", domain.ErrInvalidInput)
+	}
+	var count int
+	// No DISTINCT: chat.dm_members is keyed (conversation_id, user_id) and both
+	// joins below are on primary keys, so one eligible member yields exactly one
+	// row already. Dropping it is what lets LIMIT stop early instead of forcing
+	// a dedupe over the whole roster first.
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM (
+			SELECT 1
+			FROM chat.dm_conversations dc
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id
+			 AND dm.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = dc.workspace_id
+			 AND wm.user_id = dm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u
+			  ON u.id = dm.user_id
+			 AND u.status = 'active'
+			 AND u.deleted_at IS NULL
+			WHERE dc.id = $2::uuid
+			  AND dc.workspace_id = $1::uuid
+			  AND dc.type = 'group'
+			  AND dc.status = 'active'
+			  AND dm.user_id <> $3::uuid
+			LIMIT $4::int
+		) eligible_limited`,
+		workspaceID, dmConversationID, senderID, limit,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count eligible all-mention recipients: %w", err)
+	}
+	return count, nil
 }
 
 func scanMentionLabels(rows pgx.Rows, labels map[string]string) (map[string]string, error) {

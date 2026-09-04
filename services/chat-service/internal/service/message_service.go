@@ -472,7 +472,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		return domain.Message{}, err
 	}
 
-	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, "", senderID, body, bodyFormat)
+	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, channelID, "", false, senderID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -582,6 +582,51 @@ type outgoingMentions struct {
 	Body       string
 	UserIDs    []string
 	ChannelIDs []string
+	// AllMention is set when the body carries an "all" token in a group DM
+	// (issue #776) — the one case where @all must expand into real recipients.
+	// It is never set for a channel: channel @all keeps its existing, purely
+	// textual behavior, so this field is the entire delta between the two.
+	AllMention bool
+}
+
+// canonicalAllMentionLabel is the only label a canonical "all" token may ever
+// render with. It is forced onto every valid token below regardless of what
+// the client sent, the same unconditional overwrite rewriteMentionLabels
+// already applies to every resolved user/channel label — a client's claimed
+// label has never been trusted here, "all" is not an exception.
+const canonicalAllMentionLabel = "all"
+
+// canonicalizeAllMentionTokens is the group-DM authoritative gate against a
+// forged "all" token (issue #776, SR-001).
+//
+// The codec's grammar accepts any UUID as an "all" token's id — @[Ana](mention:all:<uuid>)
+// parses just as validly as the canonical @[all](mention:all:00000000-0000-0000-0000-000000000000)
+// — but only the reserved nil UUID actually names the group-wide broadcast;
+// nothing else does. Two things follow:
+//
+//   - an "all" token whose id is not that sentinel names nothing this build
+//     recognizes and is refused outright, the same way an unauthorized
+//     user/channel id already is by validateMentionRefs;
+//   - every token whose id *is* the sentinel has its label forced to "all" via
+//     the very same rewriteMentionLabels every other mention already goes
+//     through, so a client cannot dress the group-wide broadcast up as an
+//     ordinary mention of somebody named "Ana": whatever a forger writes for
+//     the label is discarded, not merely validated.
+//
+// Only called on the authoritative group-DM send/edit path — never for a
+// channel, where "all" stays exactly the purely textual token it always was,
+// and never for a 1:1 DM, which rejects "all" before this is reached.
+func canonicalizeAllMentionTokens(body string) (string, error) {
+	ids := allMentionTokenIDs(body)
+	if len(ids) == 0 {
+		return body, nil
+	}
+	for _, id := range ids {
+		if id != uuid.Nil.String() {
+			return "", fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+		}
+	}
+	return rewriteMentionLabels(body, map[string]string{"all:" + uuid.Nil.String(): canonicalAllMentionLabel}), nil
 }
 
 // resolveOutgoingMentions authorizes the mentions in a body and rewrites their
@@ -591,16 +636,37 @@ type outgoingMentions struct {
 // — no query, no rewrite. The authorization is the point: a mention is resolved
 // against what the *sender* may see in this target, so naming a private channel
 // or a user they cannot reach is refused here rather than leaking a label.
+//
+// isGroupDM is meaningless (and ignored) for a channel body, where
+// dmConversationID is always empty; for a DM it is the caller's own freshly
+// re-derived DMConversation.Type, never the client's say-so. @all reaches a
+// 1:1 DM the same way it always has — rejected outright — and reaches a group
+// DM only by setting outgoingMentions.AllMention, never by joining UserIDs:
+// the actual recipient set is resolved from chat.dm_members inside the same
+// statement that inserts the message (storage.CreateMessage), under that
+// statement's own database snapshot — not from anything computed here, and
+// not a promise that the send blocks on a concurrent membership write; see
+// the CreateMessageInput.MentionAllGroupMembers doc for the precise claim.
 func (s *MessageService) resolveOutgoingMentions(
-	ctx context.Context, workspaceID, channelID, dmConversationID, senderID, body string,
+	ctx context.Context, workspaceID, channelID, dmConversationID string, isGroupDM bool, senderID, body string,
 	bodyFormat domain.MessageBodyFormat,
 ) (outgoingMentions, error) {
 	mentions := outgoingMentions{Body: body}
 	if bodyFormat != domain.MessageBodyFormatV3 {
 		return mentions, nil
 	}
-	if dmConversationID != "" && hasMentionKind(body, "all") {
+	hasAllMention := hasMentionKind(body, "all")
+	if dmConversationID != "" && hasAllMention && !isGroupDM {
 		return outgoingMentions{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+	}
+	mentions.AllMention = dmConversationID != "" && isGroupDM && hasAllMention
+	if mentions.AllMention {
+		canonicalBody, err := canonicalizeAllMentionTokens(body)
+		if err != nil {
+			return outgoingMentions{}, err
+		}
+		body = canonicalBody
+		mentions.Body = body
 	}
 	mentions.UserIDs, mentions.ChannelIDs = extractMentionIDs(body)
 	if len(mentions.UserIDs)+len(mentions.ChannelIDs) == 0 {
@@ -1051,16 +1117,48 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		return domain.Message{}, err
 	}
 
-	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, "", conversationID, senderID, body, bodyFormat)
+	isGroupDM := conversation.Type == domain.DMConversationTypeGroup
+	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, "", conversationID, isGroupDM, senderID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
 	// Direct DMs keep their existing codec and cannot gain mention semantics by
 	// manually posting a v3 token. Group membership is the only DM authority.
-	if conversation.Type != domain.DMConversationTypeGroup && len(mentions.UserIDs)+len(mentions.ChannelIDs) > 0 {
+	if !isGroupDM && len(mentions.UserIDs)+len(mentions.ChannelIDs) > 0 {
 		return domain.Message{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
 	}
 	body = mentions.Body
+
+	// SR-002: refuse an over-bound @all before spending any more work on this
+	// send — reference validation, and the write itself. This is a friendly,
+	// specific pre-flight; it is not the authority. CreateMessage re-applies
+	// the identical, equally early-stopped rule atomically inside the same
+	// statement as the INSERT (invalid_all_mention_fanout), which is what
+	// actually decides whether the message is written — a group that grows past
+	// the bound in the gap between this check and that statement is caught
+	// there, not here.
+	//
+	// The count is asked for with a ceiling of one past the bound (SEC-776-01):
+	// "50 or fewer, and how many" and "more than 50" are the only two answers a
+	// bound decision can act on, so the database stops looking at 51 and an
+	// enormous group costs no more to judge than a barely-oversized one. The
+	// value that comes back saturates there and is never the group's real size.
+	//
+	// senderID is passed because the count must exclude them: #741's
+	// notification_recipients notifies nobody of their own message, so counting
+	// the author here would refuse a group of the author plus exactly the bound
+	// in others — a send whose @all reaches exactly the bound.
+	if mentions.AllMention {
+		eligible, err := s.messages.CountEligibleAllMentionRecipientsUpTo(
+			ctx, workspaceID, conversationID, senderID, domain.MaxGroupAllMentionRecipients+1,
+		)
+		if err != nil {
+			return domain.Message{}, fmt.Errorf("count eligible all-mention recipients: %w", err)
+		}
+		if eligible > domain.MaxGroupAllMentionRecipients {
+			return domain.Message{}, domain.ErrGroupAllMentionRecipientsExceeded
+		}
+	}
 
 	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
 		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
@@ -1085,6 +1183,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		ReferencedMessageID:    referencedID,
 		MentionedUserIDs:       mentions.UserIDs,
 		MentionedChannelIDs:    mentions.ChannelIDs,
+		MentionAllGroupMembers: mentions.AllMention,
 		AttachmentIDs:          attachmentIDs,
 		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
 	}, links, body, replayInput, "create dm message")
@@ -1205,7 +1304,25 @@ func (s *MessageService) EditMessage(ctx context.Context, input EditMessageInput
 	if !editable {
 		return domain.Message{}, domain.ErrURLCheckPending
 	}
-	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, current.DMConversationID, editorID, body, bodyFormat)
+	isGroupDM := false
+	// A 1:1 DM is always body_format v2 (createDMMessage's own default), and
+	// resolveAndRewriteMentions is a no-op below v3, so the extra round trip
+	// only ever runs for the v3 bodies it can actually affect: channel edits
+	// (where DMConversationID is empty and this is skipped) and group DM
+	// edits. Gating on bodyFormat here, not just DMConversationID, is what
+	// keeps a plain-text 1:1 edit exactly as cheap as it was before #776.
+	if current.DMConversationID != "" && bodyFormat == domain.MessageBodyFormatV3 {
+		// Re-derived now, not carried from creation: a group can only ever
+		// become another group or be archived, never change into a 1:1, but
+		// re-reading it here (rather than trusting a stale assumption) keeps
+		// this the same authority resolveOutgoingMentions uses on send.
+		conversation, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, current.DMConversationID, editorID)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		isGroupDM = conversation.Type == domain.DMConversationTypeGroup
+	}
+	body, err = s.resolveAndRewriteMentions(ctx, workspaceID, current.ChannelID, current.DMConversationID, isGroupDM, editorID, body, bodyFormat)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -1264,12 +1381,30 @@ func (s *MessageService) DeleteMessage(ctx context.Context, input DeleteMessageI
 	return deleted, nil
 }
 
-func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, dmConversationID, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {
+// isGroupDM carries the same meaning as resolveOutgoingMentions': ignored for
+// a channel body, and otherwise the editor's own freshly re-derived
+// DMConversation.Type — never the client's say-so. Editing never grows a new
+// recipient list (EditMessageInput carries no MentionedUserIDs at all, and
+// never has), so a group DM's @all never triggers a new fan-out here — but its
+// id and label are still re-validated and re-canonicalized by
+// canonicalizeAllMentionTokens on every edit, exactly as they are on create:
+// an edit is the one path that could otherwise turn a validly created
+// @[all](mention:all:<nil-uuid>) into a forged @[Ana](mention:all:<nil-uuid>)
+// after the fact, and this is what keeps that closed.
+func (s *MessageService) resolveAndRewriteMentions(ctx context.Context, workspaceID, channelID, dmConversationID string, isGroupDM bool, requesterID, body string, bodyFormat domain.MessageBodyFormat) (string, error) {
 	if bodyFormat != domain.MessageBodyFormatV3 {
 		return body, nil
 	}
-	if dmConversationID != "" && hasMentionKind(body, "all") {
+	hasAllMention := hasMentionKind(body, "all")
+	if dmConversationID != "" && !isGroupDM && hasAllMention {
 		return "", fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+	}
+	if dmConversationID != "" && isGroupDM && hasAllMention {
+		canonicalBody, err := canonicalizeAllMentionTokens(body)
+		if err != nil {
+			return "", err
+		}
+		body = canonicalBody
 	}
 	userIDs, channelIDs := extractMentionIDs(body)
 	if len(userIDs)+len(channelIDs) == 0 {

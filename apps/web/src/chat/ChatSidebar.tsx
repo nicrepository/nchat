@@ -21,6 +21,7 @@ import PresenceDot from "./PresenceDot";
 import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
+import { useSidebarSectionPreferences } from "./sidebarSectionPreferences";
 import type { SidebarState } from "./useChatSidebar";
 
 /**
@@ -133,6 +134,25 @@ function IconSearch() {
     >
       <circle cx="11" cy="11" r="8" />
       <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+}
+
+/** The "show unread when collapsed" toggle's icon (issue #779). Decorative — the switch's accessible name comes from its aria-label. */
+function IconEye() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="chat-sidebar__section-unread-icon"
+      aria-hidden="true"
+    >
+      <path d="M1.5 12S5 5 12 5s10.5 7 10.5 7-3.5 7-10.5 7S1.5 12 1.5 12Z" />
+      <circle cx="12" cy="12" r="3" />
     </svg>
   );
 }
@@ -255,31 +275,91 @@ function ErrorState({ onRetry }: ErrorStateProps) {
 
 // ── Section shell ─────────────────────────────────────────────────────────────
 
+/** Plural-aware Portuguese count phrase, screen-reader text for the header count (issue #779). */
+function unreadConversationCountLabel(count: number): string {
+  return `${count} conversa${count === 1 ? "" : "s"} não lida${count === 1 ? "" : "s"}`;
+}
+
 interface SectionProps {
-  /** Stable id; the heading owns it and each list is labelled by it. */
+  /** Stable id; the collapse button owns it and each list is labelled by it. */
   labelId: string;
   title: string;
   /** Only the first section sits flush against the CTA above it. */
   spaced?: boolean;
+  /** Independent per-section state (issue #779): expanded/collapsed and "show unread only" preference. */
+  collapsed: boolean;
+  onToggleCollapse: () => void;
+  showUnreadOnly: boolean;
+  onToggleShowUnreadOnly: () => void;
+  /** Conversations with unread in this section, never a sum of message counts. */
+  badgeCount: number;
   children: React.ReactNode;
 }
 
 /**
- * One sidebar category: a real heading plus its list.
+ * One sidebar category: a real heading plus its list (issue #396), now with
+ * two independent controls per section (issue #779) — collapse/expand and
+ * "show unread conversations when collapsed".
+ *
+ * The two controls are siblings, never nested buttons. The collapse button is
+ * the only element inside the `<h2>`, so the heading's accessible name stays
+ * exactly the section title; the count and the switch sit beside it and do
+ * not change that name.
  *
  * The listbox lives inside each list component rather than here so that an
  * empty section renders its message *instead of* an options container — an
  * empty `role="listbox"` with a paragraph inside is not a valid one.
  */
-function Section({ labelId, title, spaced, children }: SectionProps) {
+function Section({
+  labelId,
+  title,
+  spaced,
+  collapsed,
+  onToggleCollapse,
+  showUnreadOnly,
+  onToggleShowUnreadOnly,
+  badgeCount,
+  children,
+}: SectionProps) {
   return (
     <section className="chat-sidebar__section" aria-labelledby={labelId}>
-      <h2
-        id={labelId}
+      <div
         className={`chat-sidebar__section-label${spaced ? " chat-sidebar__section-label--mt" : ""}`}
       >
-        {title}
-      </h2>
+        <h2 id={labelId} className="chat-sidebar__section-heading">
+          <button
+            type="button"
+            className="chat-sidebar__section-collapse"
+            aria-expanded={!collapsed}
+            onClick={onToggleCollapse}
+          >
+            <span
+              className={`chat-sidebar__section-chevron${collapsed ? " chat-sidebar__section-chevron--collapsed" : ""}`}
+            >
+              <IconChevronDown />
+            </span>
+            {title}
+          </button>
+        </h2>
+        <span className="chat-sidebar__section-controls">
+          <span
+            className="chat-sidebar__section-unread-count"
+            aria-label={unreadConversationCountLabel(badgeCount)}
+          >
+            {badgeCount}
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showUnreadOnly}
+            aria-label={`Mostrar mensagens não lidas quando ${title} estiver recolhida`}
+            className={`chat-sidebar__section-unread-toggle${showUnreadOnly ? " chat-sidebar__section-unread-toggle--on" : ""}`}
+            onClick={onToggleShowUnreadOnly}
+          >
+            <IconEye />
+          </button>
+        </span>
+      </div>
       {children}
     </section>
   );
@@ -725,6 +805,15 @@ interface ChannelsByCategoryProps {
   actions: RowActionsProps;
   collapsed: Record<string, boolean>;
   onToggleCategory: (key: string) => void;
+  /**
+   * The section-level unread filter (issue #779) already dropped every read
+   * channel from `grouped`; a category that lost every channel that way is
+   * skipped instead of rendering a header over an empty, misleading list —
+   * distinct from a category that is genuinely empty, which keeps its usual
+   * "Nenhum canal disponível" message. The channel category collapse state
+   * itself (RF-17 / issue #688) is untouched either way.
+   */
+  hideEmptyGroups?: boolean;
 }
 
 /**
@@ -743,11 +832,14 @@ function ChannelsByCategory({
   actions,
   collapsed,
   onToggleCategory,
+  hideEmptyGroups,
 }: ChannelsByCategoryProps) {
   if (grouped.length <= 1 && grouped[0]?.category.kind === "uncategorized") {
+    const channels = grouped[0]?.channels ?? [];
+    if (hideEmptyGroups && channels.length === 0) return null;
     return (
       <ChannelList
-        channels={grouped[0]?.channels ?? []}
+        channels={channels}
         activeChannelId={activeChannelId}
         onSelect={onSelect}
         labelId={CHANNELS_LABEL_ID}
@@ -755,9 +847,12 @@ function ChannelsByCategory({
       />
     );
   }
+  const visibleGroups = hideEmptyGroups
+    ? grouped.filter(({ channels: categoryChannels }) => categoryChannels.length > 0)
+    : grouped;
   return (
     <div className="chat-sidebar__categories-list">
-      {grouped.map(({ category, channels: categoryChannels }) => {
+      {visibleGroups.map(({ category, channels: categoryChannels }) => {
         const categoryKey = category.id ?? "uncategorized";
         const headerId = `chat-sidebar-category-${categoryKey}`;
         const isCollapsed = Boolean(collapsed[categoryKey]);
@@ -939,6 +1034,21 @@ export default function ChatSidebar({
     }));
   };
 
+  // Independent collapse/"show unread" state for the three sections (issue
+  // #779), scoped to (user, workspace) — presentation only, so it lives here
+  // rather than in useChatSidebar or a shared context. See
+  // useSidebarSectionPreferences for how it stays correct on the first ready
+  // render and drops any stale value when the user or workspace changes,
+  // without ever calling setState during this render.
+  const {
+    prefs: sectionPrefs,
+    toggleCollapsed: toggleSectionCollapsed,
+    toggleShowUnreadOnly: toggleSectionShowUnreadOnly,
+  } = useSidebarSectionPreferences(
+    state.status === "ready" ? state.currentUserId : undefined,
+    state.status === "ready" ? state.workspaceId : undefined,
+  );
+
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
   // One line for every row action that can fail without a dialog of its own:
@@ -1019,6 +1129,52 @@ export default function ChatSidebar({
     const { directs, groups } = partitionDMs(dms ?? []);
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
   }, [dms]);
+
+  // Issue #779 — each section's "recolhida + mostrar não lidas" view: the
+  // already-sorted list, filtered to conversations with unread. Filtering
+  // after sorting rather than introducing a second order, and derived from
+  // the same canonical arrays as the header count and the badges, so there is
+  // never a second source of truth for what counts as unread.
+  const groupedChannelsByCategoryUnreadOnly = useMemo(
+    () =>
+      groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => ({
+        category,
+        channels: categoryChannels.filter((ch) => hasUnread(ch.unreadCount)),
+      })),
+    [groupedChannelsByCategory],
+  );
+  const unreadChannelsCount = (channels ?? []).filter((ch) => hasUnread(ch.unreadCount)).length;
+  const unreadDirects = orderedDirects.filter((dm) => hasUnread(dm.unreadCount));
+  const unreadGroups = orderedGroups.filter((dm) => hasUnread(dm.unreadCount));
+
+  // Issue #779, code review — the section's visual state, computed once so
+  // each list renders exactly once instead of twice with complementary
+  // conditions. `showUnreadOnly` is purely the configuration (collapsed AND
+  // the preference is on); it deliberately never looks at `unreadCount`, so
+  // it cannot be confused with whether there happens to be anything to show.
+  // `sectionVisible` is the one place configuration and data mix: expanded is
+  // always visible, and a collapsed section in unread-only mode is visible
+  // only once there is at least one unread conversation — which is what keeps
+  // a genuinely-zero collapsed section from rendering an incorrect "Nenhum…"
+  // empty state instead of just its header.
+  const channelsShowUnreadOnly =
+    sectionPrefs.channels.collapsed && sectionPrefs.channels.showUnreadOnly;
+  const channelsSectionVisible =
+    !sectionPrefs.channels.collapsed || (channelsShowUnreadOnly && unreadChannelsCount > 0);
+  const visibleChannelGroups = channelsShowUnreadOnly
+    ? groupedChannelsByCategoryUnreadOnly
+    : groupedChannelsByCategory;
+
+  const directsShowUnreadOnly =
+    sectionPrefs.directs.collapsed && sectionPrefs.directs.showUnreadOnly;
+  const directsSectionVisible =
+    !sectionPrefs.directs.collapsed || (directsShowUnreadOnly && unreadDirects.length > 0);
+  const visibleDirects = directsShowUnreadOnly ? unreadDirects : orderedDirects;
+
+  const groupsShowUnreadOnly = sectionPrefs.groups.collapsed && sectionPrefs.groups.showUnreadOnly;
+  const groupsSectionVisible =
+    !sectionPrefs.groups.collapsed || (groupsShowUnreadOnly && unreadGroups.length > 0);
+  const visibleGroups = groupsShowUnreadOnly ? unreadGroups : orderedGroups;
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -1169,37 +1325,70 @@ export default function ChatSidebar({
 
         {state.status === "ready" && (
           <>
-            <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <ChannelsByCategory
-                grouped={groupedChannelsByCategory}
-                activeChannelId={activeChannelId}
-                onSelect={handleChannelSelect}
-                actions={rowActions}
-                collapsed={collapsedCategories}
-                onToggleCategory={toggleCategory}
-              />
+            <Section
+              labelId={CHANNELS_LABEL_ID}
+              title="Canais"
+              collapsed={sectionPrefs.channels.collapsed}
+              onToggleCollapse={() => toggleSectionCollapsed("channels")}
+              showUnreadOnly={sectionPrefs.channels.showUnreadOnly}
+              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("channels")}
+              badgeCount={unreadChannelsCount}
+            >
+              {channelsSectionVisible && (
+                <ChannelsByCategory
+                  grouped={visibleChannelGroups}
+                  activeChannelId={activeChannelId}
+                  onSelect={handleChannelSelect}
+                  actions={rowActions}
+                  collapsed={collapsedCategories}
+                  onToggleCategory={toggleCategory}
+                  hideEmptyGroups={channelsShowUnreadOnly}
+                />
+              )}
             </Section>
 
-            <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
-              <DMList
-                dms={orderedDirects}
-                activeDMId={activeDMId}
-                onSelect={handleDMSelect}
-                labelId={DIRECTS_LABEL_ID}
-                emptyMessage="Nenhuma mensagem direta."
-                actions={rowActions}
-              />
+            <Section
+              labelId={DIRECTS_LABEL_ID}
+              title="Mensagens diretas"
+              spaced
+              collapsed={sectionPrefs.directs.collapsed}
+              onToggleCollapse={() => toggleSectionCollapsed("directs")}
+              showUnreadOnly={sectionPrefs.directs.showUnreadOnly}
+              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("directs")}
+              badgeCount={unreadDirects.length}
+            >
+              {directsSectionVisible && (
+                <DMList
+                  dms={visibleDirects}
+                  activeDMId={activeDMId}
+                  onSelect={handleDMSelect}
+                  labelId={DIRECTS_LABEL_ID}
+                  emptyMessage="Nenhuma mensagem direta."
+                  actions={rowActions}
+                />
+              )}
             </Section>
 
-            <Section labelId={GROUPS_LABEL_ID} title="Grupos" spaced>
-              <DMList
-                dms={orderedGroups}
-                activeDMId={activeDMId}
-                onSelect={handleDMSelect}
-                labelId={GROUPS_LABEL_ID}
-                emptyMessage="Nenhum grupo."
-                actions={rowActions}
-              />
+            <Section
+              labelId={GROUPS_LABEL_ID}
+              title="Grupos"
+              spaced
+              collapsed={sectionPrefs.groups.collapsed}
+              onToggleCollapse={() => toggleSectionCollapsed("groups")}
+              showUnreadOnly={sectionPrefs.groups.showUnreadOnly}
+              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("groups")}
+              badgeCount={unreadGroups.length}
+            >
+              {groupsSectionVisible && (
+                <DMList
+                  dms={visibleGroups}
+                  activeDMId={activeDMId}
+                  onSelect={handleDMSelect}
+                  labelId={GROUPS_LABEL_ID}
+                  emptyMessage="Nenhum grupo."
+                  actions={rowActions}
+                />
+              )}
             </Section>
           </>
         )}

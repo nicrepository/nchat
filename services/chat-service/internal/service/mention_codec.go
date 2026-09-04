@@ -63,6 +63,22 @@ func hasMentionKind(body, kind string) bool {
 	return false
 }
 
+// allMentionTokenIDs returns the id carried by every "all"-kind token in body,
+// in order, duplicates included. The codec only ever produces a single
+// canonical id for "all" (the reserved nil UUID — see ALL_MENTION_ID
+// client-side); this is what lets a caller tell that canonical form apart
+// from a structurally valid but forged token naming an arbitrary id
+// (issue #776, SR-001).
+func allMentionTokenIDs(body string) []string {
+	var ids []string
+	for _, token := range mentionTokens(body) {
+		if token.kind == "all" {
+			ids = append(ids, token.id)
+		}
+	}
+	return ids
+}
+
 func escapedAt(body string, index int) bool {
 	slashes := 0
 	for i := index - 1; i >= 0 && body[i] == '\\'; i-- {
