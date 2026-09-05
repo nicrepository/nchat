@@ -186,6 +186,34 @@ all_services_on_slot() {
   [[ "$slots" == "$target" ]]
 }
 
+# The preflight of a promotion to an explicit, already-authorised target.
+#
+# `resolve_active_slot` is the wrong question here and answering it is a bug: it
+# refuses every mixed reading, and a mixed reading of blue and green is the
+# normal shape of a cutover to this same target that stopped part-way. Refusing
+# it would make the documented retry -- `--target <the same slot>` -- impossible
+# through the one path that is supposed to converge it, while a namespace
+# holding `purple`, an unset selector or a Service that is not there would be
+# just as "mixed" and needs to fail.
+#
+# So the mapping is classified against the target instead of being resolved into
+# an active slot. Every stable Service must select the target or its opposite;
+# anything else is a state this cannot describe, and it fails before any
+# mutation. The target itself is never derived from what is found -- it is the
+# caller's, it stays the caller's, and a retry converges rather than reversing.
+require_promotable_selectors() {
+  local mapping="$1" target="$2" other service slot
+  is_valid_slot "$target" ||
+    prod_fail "the promotion target must be one of ${NCHAT_PROD_SLOTS[*]}, got '$target'"
+  other="$(opposite_slot "$target")"
+  while read -r service slot; do
+    if [[ "$slot" != "$target" && "$slot" != "$other" ]]; then
+      printf '%s\n' "$mapping" >&2
+      prod_fail "service/$service selects '$slot', which is neither $target nor $other; cutover blocked"
+    fi
+  done <<<"$mapping"
+}
+
 # Everything Kubernetes reports about a rollout, as one pipe-separated record:
 #   generation|observedGeneration|replicas|updated|ready|available|unavailable
 deployment_rollout_state() {

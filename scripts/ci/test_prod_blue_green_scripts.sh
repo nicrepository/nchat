@@ -254,6 +254,31 @@ assert_all_on() {
   done
 }
 
+# The same, for a namespace one Service was deliberately corrupted in: the rest
+# must be untouched, which is what "nothing was patched" has to mean when the
+# fixture itself is not uniform.
+assert_all_on_except() {
+  local state="$1" expected="$2" skip="$3" service actual
+  for service in "${SERVICES[@]}"; do
+    [[ "$service" == "$skip" ]] && continue
+    actual="$(slot_of "$state" "$service")"
+    [[ "$actual" == "$expected" ]] || { fail "service/$service is '$actual', expected '$expected'"; return; }
+  done
+}
+
+# The cutover job's final judgement, on its own: every stable Service read back
+# and required to select exactly the target. Anything short of that -- a
+# leftover slot, an unset selector, an absent Service, a namespace uniform on
+# the wrong slot -- is the same refusal.
+converged_on() {
+  local state="$1" target="$2"
+  FAKE_STATE_DIR="$state" bash -c '
+    set -Eeuo pipefail
+    source "$1/lib.sh"
+    all_services_on_slot "$(collect_service_slots)" "$2"
+  ' _ "$SCRIPTS" "$target" >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
 run() {
   local state="$1"; shift
   FAKE_STATE_DIR="$state" NCHAT_PROD_ASSUME_YES=1 NCHAT_PROD_SMOKE_CONFIRMED="${SMOKE:-}" \
@@ -642,6 +667,279 @@ state="$(new_state blue "blue")"
 SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0; run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
 expect_exit 1 "$status"
 assert_all_on "$state" blue
+pass
+
+# --- the mapping cutover.sh actually mutates from ---------------------------
+#
+# cutover.sh reads the cluster for itself, and that reading -- not whatever a
+# caller validated earlier -- is what decides the mutation. A namespace holding
+# a value that is neither slot, a Service whose selector was cleared, or a
+# Service that has been deleted is not a state anything here can describe, and
+# `all_services_on_slot` answers false for all three exactly as it does for an
+# ordinary pending promotion. So without a classification of this reading, each
+# of them fell straight through to switch_services_to_slot.
+#
+# Driven against cutover.sh directly rather than through the workflow harness,
+# because the property is cutover.sh's own: it must refuse these whoever calls
+# it, including an operator running it by hand per section 11.
+assert_no_patches() {
+  [[ ! -s "$1/patch-log" ]] ||
+    fail "cutover.sh patched $(wc -l <"$1/patch-log" | tr -d ' ') Services before refusing"
+}
+
+# The preflight the workflow runs before the approval, on its own reading.
+preflight_ok() {
+  FAKE_STATE_DIR="$1" bash -c '
+    set -Eeuo pipefail
+    source "$1/lib.sh"
+    require_promotable_selectors "$(collect_service_slots)" "$2"
+  ' _ "$SCRIPTS" "$2" >/dev/null 2>&1
+}
+
+begin "cutover.sh refuses a selector that is neither slot, and patches nothing"
+state="$(new_state blue "blue green")"
+printf 'purple' >"$state/services/chat-service"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+assert_no_patches "$state"
+assert_all_on_except "$state" blue chat-service
+grep -q "purple" "$WORK/err.txt" || fail "did not name the unexpected selector"
+pass
+
+begin "cutover.sh refuses a Service carrying no release-slot key, and patches nothing"
+state="$(new_state blue "blue green")"
+: >"$state/services/chat-service"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+assert_no_patches "$state"
+grep -q "UNSET" "$WORK/err.txt" || fail "did not name the unset selector"
+pass
+
+begin "cutover.sh refuses an absent stable Service, and patches nothing"
+state="$(new_state blue "blue green")"
+rm -f "$state/services/media-service"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+assert_no_patches "$state"
+grep -q "MISSING" "$WORK/err.txt" || fail "did not name the absent Service"
+pass
+
+# The race itself. The workflow's preflight passes on the state as it is, the
+# namespace then changes, and cutover.sh must refuse on its own reading rather
+# than on the one that was approved. This is the case a preflight alone cannot
+# cover, whatever it checks.
+begin "a namespace that goes bad between the preflight and cutover.sh is refused by cutover.sh"
+state="$(new_state blue "blue green")"
+preflight_ok "$state" green || fail "the preflight refused a namespace that is entirely blue"
+printf 'purple' >"$state/services/chat-service"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 1 "$status"
+assert_no_patches "$state"
+grep -q "purple" "$WORK/err.txt" || fail "cutover.sh trusted the earlier reading"
+pass
+
+# ...and the classification must not over-refuse: a blue/green split is the
+# shape a part-way cutover leaves, and it still converges to the same target.
+begin "cutover.sh still accepts a blue/green split and converges it to the same target"
+state="$(new_state blue "blue green")"
+printf 'green' >"$state/services/chat-service"
+preflight_ok "$state" green || fail "the preflight refused a legitimate blue/green split"
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" status=0
+run "$state" "$SCRIPTS/cutover.sh" --target green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+pass
+
+echo
+echo "--- the cutover job, end to end (CICD-07) ---"
+#
+# The workflow's own sequence, run against the fake cluster: read the selectors,
+# classify them against the authorised target, promote, record what the
+# promotion left behind, and only then judge it. Asserting that the YAML
+# mentions these calls proves nothing about what they do together -- a check
+# whose exit status was swallowed by the echo it sat inside satisfied every
+# textual assertion while failing open -- so the sequence is executed here.
+#
+# It is a harness, not a second implementation: it calls exactly the functions
+# the job's steps call, in the job's order, and its exit status is the job's.
+write_cutover_job() {
+  cat >"$CUTOVER_JOB" <<'HARNESS'
+#!/usr/bin/env bash
+# The cutover job's steps, in order. Kept to the calls the workflow makes:
+# collect_service_slots, require_promotable_selectors, opposite_slot,
+# cutover.sh, collect_service_slots again, all_services_on_slot.
+set -Eeuo pipefail
+SCRIPTS="$1"
+TARGET="$2"
+EVIDENCE="$3"
+# shellcheck source=scripts/deploy/nchat-prod/lib.sh
+source "$SCRIPTS/lib.sh"
+
+# Step: read and classify the stable Services before the cutover.
+mapping="$(collect_service_slots)"
+printf '%s\n' "$mapping" >"$EVIDENCE/before.txt"
+require_promotable_selectors "$mapping" "$TARGET"
+rollback_target="$(opposite_slot "$TARGET")"
+echo "rollback_target=$rollback_target"
+
+# Step: the promotion. Its status is kept, never masked.
+promoted=0
+"$SCRIPTS/cutover.sh" --target "$TARGET" || promoted=$?
+
+# Step: record the after-state. Read-only, and it runs whether the promotion
+# succeeded or failed -- a cutover that stopped part-way is the run whose
+# after-state matters most.
+collect_service_slots >"$EVIDENCE/after.txt"
+
+# Step: judge it. Skipped when the promotion failed, so no success is claimed
+# for one, and the promotion's own status is what the job exits with.
+[[ "$promoted" -eq 0 ]] || exit "$promoted"
+all_services_on_slot "$(cat "$EVIDENCE/after.txt")" "$TARGET"
+echo "converged on $TARGET"
+HARNESS
+}
+
+CUTOVER_JOB="$WORK/cutover-job.sh"
+EVIDENCE_DIR="$WORK/evidence"
+write_cutover_job
+
+# Runs the harness the way the job runs, with a fresh evidence directory so a
+# previous case's snapshots cannot be mistaken for this one's.
+cutover_job() {
+  local state="$1" target="$2"
+  rm -rf "$EVIDENCE_DIR"
+  mkdir -p "$EVIDENCE_DIR"
+  FAKE_STATE_DIR="$state" NCHAT_PROD_ASSUME_YES=1 \
+    NCHAT_PROD_SMOKE_CONFIRMED="${SMOKE:-}" \
+    NCHAT_PROD_RELEASE_MANIFEST_DIR="${MANIFEST_DIR:-$MANIFEST_A}" \
+    bash "$CUTOVER_JOB" "$SCRIPTS" "$target" "$EVIDENCE_DIR" \
+    >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
+# Evidence is only evidence if it was actually written.
+assert_snapshot() {
+  local which="$1"
+  [[ -s "$EVIDENCE_DIR/$which.txt" ]] || fail "the $which snapshot was not recorded"
+}
+
+assert_no_mutation() {
+  [[ ! -s "$1/patch-log" ]] || fail "a Service was patched before the preflight refused"
+}
+
+approved_green() { SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A"; }
+
+# 1. The ordinary release: every Service on the opposite slot, promotion runs,
+#    the namespace converges on the target.
+begin "the cutover job promotes a candidate the whole namespace is not yet on"
+state="$(new_state blue "blue green")"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+assert_snapshot before
+assert_snapshot after
+grep -q "converged on green" "$WORK/out.txt" || fail "did not report convergence"
+pass
+
+# 2. Already converged. The target is the authority, so this is a no-op rather
+#    than a reversal, and the rollback target is still the opposite slot -- not
+#    the slot the selectors are on, which is the target itself.
+begin "a namespace already on the target is a no-op, and the rollback target is still the other slot"
+state="$(new_state green "blue green")"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+grep -q "rollback_target=blue" "$WORK/out.txt" ||
+  fail "named the promoted slot as its own rollback target"
+grep -q "nothing to move" "$WORK/out.txt" || fail "did not report a no-op"
+pass
+
+# 3. The state a cutover that stopped part-way leaves: a legitimate blue/green
+#    split. It must converge to the SAME target, never invert to the opposite of
+#    whatever now looks active.
+begin "a blue/green split is a retry to the same target, not a reversal"
+state="$(new_state blue "blue green")"
+printf 'green' >"$state/services/chat-service"
+printf 'green' >"$state/services/file-service"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+grep -q "rollback_target=blue" "$WORK/out.txt" || fail "recomputed the rollback target from the split"
+pass
+
+# 4. A selector that is neither slot. This is the state resolve_active_slot
+#    would have reported through a masked exit status, leaving the run green.
+begin "a selector that is neither slot fails before any mutation"
+state="$(new_state blue "blue green")"
+printf 'purple' >"$state/services/chat-service"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 1 "$status"
+assert_all_on_except "$state" blue chat-service
+assert_no_mutation "$state"
+grep -q "purple" "$WORK/err.txt" || fail "did not name the unexpected selector"
+[[ -f "$EVIDENCE_DIR/after.txt" ]] && fail "promoted past an unclassifiable namespace"
+pass
+
+# 5. The two ways a Service can carry no slot at all. Neither is a blue/green
+#    split and neither may be converged past.
+begin "a Service with no release-slot key fails before any mutation"
+state="$(new_state blue "blue green")"
+: >"$state/services/chat-service"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 1 "$status"
+assert_no_mutation "$state"
+grep -q "UNSET" "$WORK/err.txt" || fail "did not name the unset selector"
+pass
+
+begin "a stable Service that is not there fails before any mutation"
+state="$(new_state blue "blue green")"
+rm -f "$state/services/media-service"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 1 "$status"
+assert_no_mutation "$state"
+grep -q "MISSING" "$WORK/err.txt" || fail "did not name the absent Service"
+pass
+
+# 6. The finding this ordering exists for: the promotion stops part-way, and the
+#    after-state -- the evidence an operator needs most -- is still recorded,
+#    while the job still fails.
+begin "a part-way cutover still records the after-state and still fails"
+state="$(new_state blue "blue green")"
+printf 'file-service\n' >"$state/patch-fails"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 1 "$status"
+assert_snapshot before
+assert_snapshot after
+grep -q ' green$' "$EVIDENCE_DIR/after.txt" || fail "the after-state hides the Services that moved"
+grep -q ' blue$' "$EVIDENCE_DIR/after.txt" || fail "the after-state hides the Services that did not"
+grep -q "converged on green" "$WORK/out.txt" && fail "claimed convergence after a failed promotion"
+pass
+
+# ...and the documented retry finishes it, to the same target.
+begin "the retry after a part-way cutover converges to the same target"
+rm -f "$state/patch-fails"
+approved_green; status=0; cutover_job "$state" green || status=$?
+expect_exit 0 "$status"
+assert_all_on "$state" green
+pass
+
+# 7 and 8. The final judgement, on states the promotion is not what produced:
+#    a namespace still split, and one uniform on the wrong slot. Both fail, and
+#    the second is the one agreement alone would have called a success.
+begin "a namespace still split when it is judged fails the convergence proof"
+state="$(new_state blue "blue green")"
+printf 'green' >"$state/services/chat-service"
+status=0; converged_on "$state" green || status=$?
+expect_exit 1 "$status"
+pass
+
+begin "a namespace converged on the opposite slot fails the proof for the target"
+state="$(new_state blue "blue green")"
+status=0; converged_on "$state" green || status=$?
+expect_exit 1 "$status"
 pass
 
 echo
