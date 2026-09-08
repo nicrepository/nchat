@@ -1140,15 +1140,19 @@ The old slot keeps running. It is the rollback.
 
 ---
 
-## 11b. The candidate half from GitHub Actions
+## 11b. The release from GitHub Actions
 
-`.github/workflows/deploy-nchat-prod.yml` runs sections 6, 7 and 9 — and
-nothing after them. **It is candidate-only. It does not cut over.**
+`.github/workflows/deploy-nchat-prod.yml` runs sections 6, 7 and 9 in its
+`candidate` job, and section 11 in a separate `cutover` job that starts only
+after a reviewer approves the run in the `production` GitHub Environment.
+**The candidate job cannot promote**; the cutover job is the only automation in
+this repository that changes a stable Service selector, and it does it by
+calling the same `cutover.sh` section 11 does.
 
 ```text
 workflow_dispatch (sha, run_id)
     |
-    +-- candidate job          the only job; it cannot promote
+    +-- candidate job          it cannot promote
           validate sha and run id, refuse a dispatch from outside main
           checkout the sha, prove it is reachable from main
           download the sealed release manifest of run_id
@@ -1171,16 +1175,111 @@ workflow_dispatch (sha, run_id)
                 v
           release evidence / workflow success
     |
-    +== nothing further. The candidate is Ready and carries no traffic.
+    +== the candidate is Ready and carries no traffic. The run stops here
+    |   until a reviewer approves it.
+    |
+    +-- cutover job            environment: production, needs: candidate
+          [required reviewer approves the run]
+          checkout the sha, prove main can still reach it
+          download the sealed release manifest of run_id again
+          read every stable Service selector                 -> BEFORE
+            classify against the target: every Service must select
+            the target or its opposite, else FAIL before any patch
+            rollback target = opposite_slot(target)
+          revalidate: the candidate slot still carries exactly
+            <sha>:<release id>, read from the cluster
+          cutover.sh --target <candidate>   the one mutation
+          record every stable Service                        -> AFTER
+            read-only, and recorded whether the promotion passed or failed
+          [promotion failed] -> job FAILED, AFTER kept, nothing judged
+          require every Service to select the target
+          re-read the release the promoted slot is running
+                |
+                v
+          promotion evidence / workflow success
 ```
 
-Promotion is **outside** this workflow, not disabled inside it. There is no
-`cutover` job, no job with another name that promotes, no `if: false` to flip
-and no input that selects a promoting path — a gate one edit away from being
-open is not a boundary. Until the cutover step exists as its own reviewed
-surface, production traffic moves only through the operator procedure in
-section 11, and the authenticated smoke of section 10 is what has to be
-recorded before anyone runs it.
+Promotion is **not** disabled anywhere: there is no `if: false` to flip and no
+input that selects a promoting path, because a gate one edit away from being
+open is not a boundary. What holds it shut is the approval on the `production`
+environment, which is configured on the environment and not in this repository.
+
+**Approving the run is the authenticated smoke.** The workflow cannot perform
+section 10 — no shell against an in-cluster Service can sign in through
+Keycloak — and does not claim to. What the approval records is that a human
+performed and reviewed that checklist for the exact `candidate:release` the run
+reports, and authorised that candidate for promotion. Approving without having
+done it is the one failure nothing here can catch, which is why the run prints
+the release identity before the gate and the cutover job prints it again after.
+
+The cutover job re-reads the cluster before it patches anything, and that is
+not redundancy: an approval can arrive hours after the smoke, and a candidate
+redeployed, rebuilt or degraded in the meantime is exactly as Ready and as
+consistent as the one that was validated. Only the release identity separates
+them, so it is compared against `<sha>:<release id>` before the promotion and
+again after it. The evidence handed to `cutover.sh` is `<slot>:<sha>:<release
+id>` — which `cutover.sh` then recomputes from the cluster for itself, so a
+token this job assembled is checked rather than believed.
+
+The preflight **classifies the selectors against the target** rather than
+resolving them into an active slot, and the difference matters. A namespace
+split between blue and green is the ordinary shape of a cutover to this same
+target that stopped part-way, and converging it is exactly what a retry with the
+same `--target` is for; refusing every mixed reading would close the one path
+that finishes it. So a blue/green split **continues**, to the same target. What
+fails, before anything is patched, is a reading this cannot describe: a Service
+selecting a value that is neither slot, one carrying no `nchat.io/release-slot`
+key, or one that is not there at all.
+
+**The workflow's preflight does not replace the gate inside `cutover.sh`, and
+is not allowed to.** It runs before the approval, so what it proves is a fact
+about the namespace at that moment; the approval can arrive hours later.
+`cutover.sh` reads the cluster for itself and runs the same
+`require_promotable_selectors` against **that** reading — the one its own
+mutation is decided from — before it patches anything. Both checks are the same
+primitive and neither is decorative: the preflight is what fails a run early and
+before a reviewer is asked to approve it, and the check inside `cutover.sh` is
+what holds when the namespace changes after the preflight passed. That second
+one also holds for an operator running `cutover.sh` by hand per section 11,
+where no preflight ran at all.
+
+**The target is never recalculated.** It is the slot the candidate job built and
+the reviewer approved, and a retry converges on it rather than inverting to the
+opposite of whatever now looks active — the bug that would send production back
+to the release it had just left.
+
+**The rollback target is `opposite_slot(target)`**, derived from the authorised
+target and never read back from the selectors. Reading it back would name the
+target itself once the namespace has converged, which is the one slot a rollback
+can never go to. The job prints it and does nothing with it: `rollback.sh`,
+`drain-old.sh` and the observation window are outside this workflow, and no
+rollback is ever automatic.
+
+**The after-state is recorded even when the promotion fails.** A cutover that
+stops part-way is the run whose after-state matters most and the run an
+asserting step would never reach, so recording and judging are two steps: the
+recording is read-only, repairs nothing, and runs when the promotion actually
+ran; the judgement is an ordinary step that stays skipped when the promotion
+failed, so no success is ever claimed for one. The job's status is the
+promotion's. Finishing a half-converged namespace from there is `cutover.sh
+--target <the same slot>` run by an operator who has looked at that recording
+(section 12).
+
+"When the promotion actually ran" is an allowlist of two conclusions, and it has
+to be spelled as one:
+
+| The `promote` step ended            | after-state recorded |
+| ----------------------------------- | -------------------- |
+| `success`                           | yes                  |
+| `failure`                           | yes                  |
+| `skipped` (a step before it failed) | no                   |
+| the run was cancelled               | no                   |
+
+Naming any status function in an `if:` stops Actions inserting the implicit
+`success()`, so anything looser runs the step on a run that promoted nothing.
+`steps.promote.conclusion != ''` is the specific trap: a skipped step reports
+`skipped`, which is not the empty string, so that spelling sends a run that
+never reached the promotion to query production anyway.
 
 Dispatch it with the release SHA and the **run id of the "Build and push
 images" run that built it**. The manifest of that run is sealed with a SHA-256
@@ -1196,9 +1295,11 @@ The candidate slot is `opposite_slot(active)`, read from the cluster. Neither
 slot name appears in the workflow and no input names one, so a mixed or unknown
 selector state fails the run instead of being guessed past.
 
-The job declares **no environment**. An approval here would gate the phase that
-has nothing to approve yet, and declaring an environment would also pull that
-environment's secrets into an unprotected deploy. Its two variables —
+The **candidate job** declares no environment, and the cutover job declares
+`production`. An approval on the candidate would gate the phase that has nothing
+to approve yet, and declaring an environment there would also pull that
+environment's secrets into an unprotected deploy. The candidate's two
+variables —
 `vars.NCHAT_PROD_TOPOLOGY_FILE` and, where the deploy identity cannot read
 Nodes, `vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR` — must therefore be **repository
 or organisation variables**, never environment-scoped. Both name paths on the
@@ -1207,6 +1308,13 @@ variable would arrive as an empty string, and the failure would not look like a
 configuration mistake: an empty `NCHAT_PROD_TOPOLOGY_FILE` means
 `prepare_prod_deploy_tree` skips installing the topology, and the deploy is
 refused later for carrying `REPLACE_ME_*` placeholders.
+
+Both jobs run on the production runner and hold the same two read permissions,
+`actions: read` (the sealed manifest of the named build run) and
+`contents: read`. Neither holds a write of any kind, and the cutover job
+downloads the manifest again into its own workspace rather than receiving an
+identity through a job output: a string that travelled through an output is a
+string a step could have edited, and the seal is what the promotion verifies.
 
 The `refs/heads/main` check in the first step is defence in depth, not the
 boundary. A dispatch carries the workflow file of the ref it was started from,
@@ -1218,13 +1326,21 @@ guard below is what actually confines this to `main`.
 `scripts/ci/check_deploy_prod_workflow.py` enforces the shape structurally, and
 as a closed allowlist rather than a search for dangerous commands: every job,
 step, command, env binding and ordering the file may contain is written out
-there, and anything else is refused for not being in the contract. So
-`cutover.sh` is refused for the same reason `echo hello` is, however it is
-spelled — `bash cutover.sh`, `env bash cutover.sh`, a wrapper, a hand-written
-`kubectl patch service`, `switch_services_to_slot`, `rollback.sh`,
-`drain-old.sh` — and a second job is refused whatever it is called.
+there, and anything else is refused for not being in the contract. So a
+promotion added to the `candidate` job is refused for the same reason
+`echo hello` is, however it is spelled — `bash cutover.sh`,
+`env bash cutover.sh`, a wrapper, a hand-written `kubectl patch service`,
+`switch_services_to_slot` — and a third job is refused whatever it is called.
 
-The job's last three steps are the evidence, produced on every run:
+The contract also holds the separation itself, in both directions: only the
+`cutover` job may run `cutover.sh`, it may run it only at its one contracted
+position, only that job may declare `environment:` and `needs:`, and only the
+`production` environment satisfies it. `rollback.sh`, `drain-old.sh`, a
+migration and a DNS call are refused in either job for not being contracted
+steps. Neither job may declare `if:`, `continue-on-error:` on a gate, a write
+permission, or a runner other than the production one.
+
+The candidate job's last three steps are the evidence, produced on every run:
 
 | Evidence                   | Where it comes from                                           |
 | -------------------------- | ------------------------------------------------------------- |
@@ -1263,6 +1379,28 @@ consistent, so only the identity separates the two releases.
 changed underneath the run; putting a selector back, or accepting whatever the
 slot happens to carry, would destroy the only record of it happening. Treat a
 failure at either as an incident, not as a deploy that needs retrying.
+
+The cutover job produces its own evidence, on both sides of the one mutation:
+
+| Evidence                   | Where it comes from                                                                                              |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| approval                   | the required reviewer on the `production` environment                                                            |
+| stable selectors, before   | `collect_service_slots`, before anything is patched                                                              |
+| preflight result           | `require_promotable_selectors` against the target; unclassifiable fails here                                     |
+| decisive classification    | `require_promotable_selectors` again inside `cutover.sh`, on the reading its own mutation is decided from        |
+| rollback target            | `opposite_slot(target)`, from the authorised target                                                              |
+| approved release           | `<sha>:<release id>`, from the dispatch and the candidate job                                                    |
+| candidate still carries it | `require_slot_release_identity`, read from the cluster                                                           |
+| the promotion              | `cutover.sh --target <candidate>`, its own gates all fail-closed                                                 |
+| stable selectors, after    | `collect_service_slots` again, recorded on a failed promotion too, and not at all when the promotion was skipped |
+| convergence result         | `all_services_on_slot` against the named target — total or FAIL                                                  |
+| promoted release, after    | `require_slot_release_identity` again, once traffic has moved                                                    |
+
+Convergence and release identity are independent there too. A Service that is
+missing, carries no `nchat.io/release-slot` key, kept the previous slot or holds
+some other value all fail the convergence proof; and a slot that degraded or was
+redeployed during the patches would pass it and still fail the identity read
+that follows.
 
 ### The runner refuses everything else — the pre-job guard
 
@@ -1430,8 +1568,8 @@ runs in `pnpm run ci`.
 Once this commit is on `main`, the first legitimate dispatch from `main` is the
 live positive: the `candidate` job starts its steps normally. The guard has no
 opinion beyond that point; the release SHA, the sealed manifest and the
-candidate's own gates remain as described above, and cutover stays outside the
-workflow entirely.
+candidate's own gates remain as described above, and the cutover job still
+starts only once a reviewer approves the run.
 
 #### Rollback
 

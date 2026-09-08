@@ -17,6 +17,14 @@ export type ViewportPhase =
 /** Matches the pre-existing ws_append near-bottom threshold this file already used. */
 export const BOTTOM_THRESHOLD_PX = 150;
 
+/**
+ * #788: "at the real tail", as opposed to BOTTOM_THRESHOLD_PX's 150px
+ * courtesy threshold. Sub-pixel layout rounding makes an exact
+ * scrollHeight - scrollTop - clientHeight === 0 comparison unreliable, so the
+ * real tail gets its own (tiny) tolerance rather than an equality check.
+ */
+export const TAIL_EPSILON_PX = 2;
+
 // ponytail: bounded backward search instead of a real read-cursor endpoint.
 // Upgrade path: a #687 boundary/cursor endpoint removes the need to search.
 export const MAX_BOUNDARY_SEARCH_PAGES = 10;

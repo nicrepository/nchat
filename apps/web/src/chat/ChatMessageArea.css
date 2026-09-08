@@ -269,9 +269,6 @@
   flex: 1;
   overflow-y: auto;
   padding: 20px clamp(12px, 2vw, 24px);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
   min-height: 0;
   /*
     #492: no blanket smooth scroll — every scroll-behavior::"smooth" | "auto"
@@ -280,6 +277,17 @@
     compensation, instant positioning) animate too, which is exactly the
     "auto-scroll on open" bug this issue fixes.
   */
+}
+
+/*
+  #788: the timeline content itself, not the scroll container — its box
+  height is what tracks listRef.scrollHeight, so this is what the tail-lock
+  ResizeObserver watches to notice an async attachment/media reflow.
+*/
+.chat-msg-area__list-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 /* ── New-messages separator (#492) ───────────────────────────────────────────── */
