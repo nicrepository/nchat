@@ -17,3 +17,14 @@ spec:
                 secretKeyRef:
                   name: nchat-postgres-runtime
                   key: DATABASE_URL
+            # This overlay replaces envFrom with the ConfigMap alone, so every
+            # secret a service needs is named here explicitly. Issue #745 gives
+            # notification-service its first authenticated routes, and without
+            # this the access token could not be verified and the push
+            # subscription API would refuse to mount at all.
+            - name: AUTH_JWT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-secrets
+                  key: AUTH_JWT_HMAC_SECRET
+                  optional: true

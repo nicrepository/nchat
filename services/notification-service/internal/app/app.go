@@ -12,6 +12,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 	httpapi "github.com/nicrepository/nchat/services/notification-service/internal/http"
+	"github.com/nicrepository/nchat/services/notification-service/internal/service"
 	"github.com/nicrepository/nchat/services/notification-service/internal/storage"
 	"github.com/nicrepository/nchat/services/notification-service/internal/worker"
 )
@@ -51,6 +52,14 @@ var (
 	}
 	startNotificationWorker = func(ctx context.Context, w backgroundWorker) {
 		w.Start(ctx)
+	}
+
+	// newTokenValidator builds the access-token validator the push subscription
+	// routes authenticate with (issue #745). A variable so a test can watch the
+	// wiring refuse an unusable configuration without owning a real secret.
+	newTokenValidator = func(cfg config.Config) (*httpapi.TokenValidator, error) {
+		return httpapi.NewTokenValidator(
+			cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience)
 	}
 )
 
@@ -260,10 +269,13 @@ func New(cfg config.Config) *App {
 	application.startNotificationWorker(cfg, pool, obsMetrics, logger)
 
 	application.Config = cfg
-	application.Handler = httpapi.NewRouter(cfg, logger,
+	options := []httpapi.Option{
 		httpapi.WithMetrics(obsMetrics),
 		httpapi.WithSMTPWorkerProbe(application.SMTPWorkerRunning),
-		httpapi.WithNotificationWorkerProbe(application.NotificationWorkerRunning))
+		httpapi.WithNotificationWorkerProbe(application.NotificationWorkerRunning),
+	}
+	application.Handler = httpapi.NewRouter(cfg, logger,
+		append(options, pushSubscriptionOptions(cfg, pool, logger)...)...)
 	application.TracingShutdown = shutdown
 	return application
 }
@@ -438,4 +450,37 @@ func (a *App) launchWorker(
 		start(ctx, w)
 	}()
 	return handle
+}
+
+// pushSubscriptionOptions mounts the Web Push subscription routes, or mounts
+// nothing and says why (issue #745).
+//
+// Both dependencies are hard requirements rather than degraded modes. Without a
+// database there is no session to validate a caller against and no table to
+// write; without a usable signing secret every token would be unverifiable. In
+// either case this returns no option at all, so the router never registers the
+// routes and a request for them is answered by the catch-all: 404. A surface
+// that answered anything else would be one authorising writes it could not
+// attribute to anybody.
+//
+// The refusal is in the log, not in the status code. An operator sees the reason
+// here; a client sees a route this build does not serve.
+func pushSubscriptionOptions(cfg config.Config, pool storage.Pool, logger *slog.Logger) []httpapi.Option {
+	if pool == nil {
+		logger.Warn("push subscription api disabled", "reason", "database_not_configured")
+		return nil
+	}
+	validator, err := newTokenValidator(cfg)
+	if err != nil {
+		// The reason is the category, never the configuration: naming the field
+		// that was short or missing would put a fact about the signing secret in
+		// a log line.
+		logger.Warn("push subscription api disabled", "reason", "access_token_validation_unavailable")
+		return nil
+	}
+	handler := httpapi.NewPushSubscriptionHandler(
+		service.NewPushSubscriptions(storage.NewPGXPushSubscriptionStore(pool)))
+	logger.Info("push subscription api enabled")
+	return []httpapi.Option{httpapi.WithPushSubscriptions(
+		validator, storage.NewPGXPrincipalResolver(pool), handler)}
 }

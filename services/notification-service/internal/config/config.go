@@ -1,10 +1,21 @@
 package config
 
-import platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+import (
+	"strings"
+
+	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+)
 
 const (
 	serviceName = "notification-service"
 	defaultPort = 8084
+
+	// The access-token contract auth-service issues, shared verbatim with every
+	// other service that validates one. Defaults here and nowhere else, so a
+	// notification-service that authenticates a token chat-service would refuse
+	// is not something a missing environment variable can produce.
+	defaultJWTIssuer   = "nchat-auth"
+	defaultJWTAudience = "nchat-api"
 )
 
 type Config struct {
@@ -16,6 +27,13 @@ type Config struct {
 	DBConnectTimeoutSeconds  int
 	AuthEmailOutboxEncKey    string
 	AuthPublicWebBaseURL     string
+
+	// The access token this service validates on its authenticated routes
+	// (issue #745). An empty secret leaves those routes mounted but refusing
+	// every request, which is the state an operator can see.
+	AuthJWTHMACSecret string
+	AuthJWTIssuer     string
+	AuthJWTAudience   string
 
 	SMTPHost              string
 	SMTPPort              int
@@ -47,6 +65,9 @@ func Load() Config {
 		DBConnectTimeoutSeconds:  platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
 		AuthEmailOutboxEncKey:    platformconfig.GetString("AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY", ""),
 		AuthPublicWebBaseURL:     platformconfig.GetString("AUTH_PUBLIC_WEB_BASE_URL", ""),
+		AuthJWTHMACSecret:        platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:            strings.TrimSpace(platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer)),
+		AuthJWTAudience:          strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
 
 		SMTPHost:              platformconfig.GetString("SMTP_HOST", ""),
 		SMTPPort:              platformconfig.GetInt("SMTP_PORT", 587),

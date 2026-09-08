@@ -2,10 +2,11 @@
 # Coverage for the chat/file tests that need a real PostgreSQL.
 #
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
-# outbox suite and issue #742's worker claim suite: all three prove properties
-# only a database can hold — atomicity across one statement, a unique index
-# deciding what counts as the same event, and FOR UPDATE SKIP LOCKED handing two
-# concurrent workers disjoint rows.
+# outbox suite, issue #742's worker claim suite and issue #745's push
+# subscription suite: all of them prove properties only a database can hold —
+# atomicity across one statement, a unique index deciding what counts as the same
+# event or the same subscription, an ON CONFLICT that refuses to move ownership,
+# and FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -122,6 +123,46 @@ case "$MODULE" in
       TestNotificationSuppressionStampsNoAvailabilityPostgreSQL
       TestNotificationFutureRetryStaysUnclaimedPostgreSQL
       TestMuteResolutionPostgreSQL
+      # Issue #745. The push subscription contract: two unique indexes deciding
+      # identity and endpoint ownership under concurrency, the generation that
+      # keeps a late delivery answer off the endpoint that replaced the one it
+      # describes, the lifecycle CHECK, and the authorisation query against the
+      # real auth and chat schemas.
+      TestPushSubscriptionRegistersPostgreSQL
+      TestPushSubscriptionRetryIsIdempotentPostgreSQL
+      TestPushSubscriptionReRegistersTheSameDevicePostgreSQL
+      TestPushSubscriptionKeepsSeveralDevicesPostgreSQL
+      TestPushSubscriptionEndpointCannotChangeOwnerPostgreSQL
+      TestPushSubscriptionEndpointIsIsolatedAcrossWorkspacesPostgreSQL
+      TestPushSubscriptionIsUnreachableByAnotherUserPostgreSQL
+      TestPushSubscriptionConcurrentRegistrationStaysSinglePostgreSQL
+      TestPushSubscriptionConcurrentEndpointClaimHasOneWinnerPostgreSQL
+      TestPushSubscriptionConcurrentDisableAndRegisterStaysCoherentPostgreSQL
+      TestPushSubscriptionSuccessResetsFailuresPostgreSQL
+      TestPushSubscriptionGoneStatusesInvalidatePostgreSQL
+      TestPushSubscriptionTransientFailuresDoNotInvalidatePostgreSQL
+      TestPushSubscriptionInvalidationIsPerSubscriptionPostgreSQL
+      TestPushSubscriptionLateResultsCannotReviveOrRewritePostgreSQL
+      TestPushSubscriptionDisableRetainsTheRowPostgreSQL
+      TestPushSubscriptionDisablePreservesAProviderVerdictPostgreSQL
+      TestPushSubscriptionReRegistrationRevivesARetiredRowPostgreSQL
+      TestPushSubscriptionHasNoDeviceCeilingPostgreSQL
+      TestPushSubscriptionStartsAtAValidGenerationPostgreSQL
+      TestPushSubscriptionIdenticalRetryKeepsTheGenerationPostgreSQL
+      TestPushSubscriptionRotationAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionReactivationAfterDisableAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionReactivationAfterRetirementAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionStaleResultCannotTouchANewGenerationPostgreSQL
+      TestPushSubscriptionCurrentGenerationStillAppliesPostgreSQL
+      TestPushSubscriptionRotationClearsSuccessHistoryPostgreSQL
+      TestPushSubscriptionIdenticalRetryKeepsSuccessHistoryPostgreSQL
+      TestPushSubscriptionSchemaRefusesIncoherentRowsPostgreSQL
+      TestPushSubscriptionSchemaCarriesItsIndexesPostgreSQL
+      TestPushSubscriptionMigrationRoundTripPostgreSQL
+      TestPushPrincipalResolvesFromTheSessionPostgreSQL
+      TestPushPrincipalRefusesAMismatchedSessionPostgreSQL
+      TestPushPrincipalRefusesARetiredSessionPostgreSQL
+      TestPushPrincipalRefusesALostMembershipPostgreSQL
     )
     ;;
   services/file-service)
