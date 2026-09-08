@@ -1025,6 +1025,37 @@ Keycloak must list all four preview callbacks as additional valid redirect URIs
 on the production client — the two administrative hosts as much as the two chat
 ones, since the console signs in through the same provider.
 
+### The allowlist and the proxy in front of it
+
+On the expected public path the four preview hosts are **proxied by Cloudflare**,
+so the connection Traefik accepts comes from a Cloudflare edge rather than the
+operator's machine.
+
+- `NCHAT_PROD_PREVIEW_ALLOW_CIDR` is the **operator's own address or network**.
+  It is never the Cloudflare ranges. Putting them there would not restore the
+  restriction — it would turn the allowlist into a permit for every visitor
+  Cloudflare forwards, while still reading like an allowlist.
+- `preview-allowlist` therefore takes the client from `X-Forwarded-For` with
+  `ipStrategy.depth: 1`. In the expected public path, client -> Cloudflare ->
+  Traefik, depth counts from the **right** and selects the visitor address that
+  Cloudflare puts in the rightmost position. For a request delivered by
+  Cloudflare, the client cannot forge that appended position.
+  `scripts/ci/prod-blue-green-check.sh` refuses a rendered manifest whose depth
+  is absent or anything but 1.
+- Header trust is a separate property. Traefik's current
+  `forwardedHeaders.trustedIPs` includes loopback, the RFC1918 private ranges,
+  and the Cloudflare IPv4 ranges. These additional origins are part of the
+  infrastructure trust boundary. Consequently, `preview-allowlist` does not
+  protect against a requester that can reach Traefik from one of those trusted
+  private networks and control forwarded headers.
+
+If operator-only access must also be enforced against clients on those trusted
+internal networks, harden the global Traefik configuration or add a network
+control. Do not improvise that protection in this middleware, and do not change
+the global setting as part of a preview change: it is shared by other services.
+For any public path other than client -> Cloudflare -> Traefik, revalidate which
+hop `depth: 1` selects before treating the preview as restricted.
+
 To disable previews:
 
 ```bash
@@ -1121,10 +1152,11 @@ Gates, all before any mutation:
    recomputed at this moment.
 
 Gate 4 is re-derived here rather than accepted from whoever invoked the command:
-in the pipeline the identity arrives as a job output, and an output can be stale
-or edited. Rebuild or redeploy the candidate between the smoke and the promotion
-— even from the identical commit — and gates 4 and 5 stop matching, so the
-approval no longer covers what is on the cluster and the promotion is refused.
+an identity that is typed, pasted or carried over from an earlier step can be
+stale or edited, and only the manifest is evidence. Rebuild or redeploy the
+candidate between the smoke and the promotion — even from the identical commit
+— and gates 4 and 5 stop matching, so the smoke no longer covers what is on the
+cluster and the promotion is refused.
 
 If the target is already fully active it reports a no-op and changes nothing.
 
@@ -1139,154 +1171,471 @@ The old slot keeps running. It is the rollback.
 
 ---
 
-## 11b. The same release from GitHub Actions
+## 11b. The release from GitHub Actions
 
-`.github/workflows/deploy-nchat-prod.yml` runs sections 7, 9 and 11 as two jobs,
-and the boundary between those jobs is the whole point of the workflow.
+`.github/workflows/deploy-nchat-prod.yml` runs sections 6, 7 and 9 in its
+`candidate` job, and section 11 in a separate `cutover` job that starts only
+after a reviewer approves the run in the `production` GitHub Environment.
+**The candidate job cannot promote**; the cutover job is the only automation in
+this repository that changes a stable Service selector, and it does it by
+calling the same `cutover.sh` section 11 does.
 
 ```text
 workflow_dispatch (sha, run_id)
     |
-    +-- candidate job          automatable, unprotected, cannot promote
-    |     validate sha and run id, refuse a dispatch from outside main
-    |     checkout the sha, prove it is reachable from main
-    |     download the sealed release manifest of run_id
-    |     pin the eleven digests the manifest seals
-    |     derive the release id from the manifest seal
-    |     deploy.sh  -> the idle slot, no traffic, stamped sha + release id
-    |     smoke.sh   -> automated checks only
+    +-- candidate job          it cannot promote
+          validate sha and run id, refuse a dispatch from outside main
+          checkout the sha, prove it is reachable from main
+          download the sealed release manifest of run_id
+          pin the eleven digests the manifest seals
+          derive the release id from the manifest seal
+          snapshot every stable Service selector, resolve active,
+            take the candidate as its opposite
+          deploy.sh  -> the idle slot, no traffic, stamped sha + release id
+          smoke.sh   -> automated checks only
+                |
+                v
+          stable selector invariant
+            re-read the stable Services, diff against the snapshot
+                |
+                v
+          candidate release identity revalidation
+            read the slot's release from the cluster, require it to equal
+            the dispatched sha and the sealed release id
+                |
+                v
+          release evidence / workflow success
     |
-    +== authenticated release smoke (section 10), by a person, on the previews
+    +== the candidate is Ready and carries no traffic. The run stops here
+    |   until a reviewer approves it.
     |
-    +== GitHub environment `production` approval
-    |
-    +-- cutover job            protected, minimal, the only promoter
-          re-prove the sha against main
-          re-derive the release id from the sealed manifest
-          cutover.sh --target <candidate slot>
+    +-- cutover job            environment: production, needs: candidate
+          [required reviewer approves the run]
+          checkout the sha, prove main can still reach it
+          download the sealed release manifest of run_id again
+          read every stable Service selector                 -> BEFORE
+            classify against the target: every Service must select
+            the target or its opposite, else FAIL before any patch
+            rollback target = opposite_slot(target)
+          revalidate: the candidate slot still carries exactly
+            <sha>:<release id>, read from the cluster
+          cutover.sh --target <candidate>   the one mutation
+          record every stable Service                        -> AFTER
+            read-only, and recorded whether the promotion passed or failed
+          [promotion failed] -> job FAILED, AFTER kept, nothing judged
+          require every Service to select the target
+          re-read the release the promoted slot is running
+                |
+                v
+          promotion evidence / workflow success
 ```
+
+Promotion is **not** disabled anywhere: there is no `if: false` to flip and no
+input that selects a promoting path, because a gate one edit away from being
+open is not a boundary. What holds it shut is the approval on the `production`
+environment, which is configured on the environment and not in this repository.
+
+**Approving the run is the authenticated smoke.** The workflow cannot perform
+section 10 — no shell against an in-cluster Service can sign in through
+Keycloak — and does not claim to. What the approval records is that a human
+performed and reviewed that checklist for the exact `candidate:release` the run
+reports, and authorised that candidate for promotion. Approving without having
+done it is the one failure nothing here can catch, which is why the run prints
+the release identity before the gate and the cutover job prints it again after.
+
+The cutover job re-reads the cluster before it patches anything, and that is
+not redundancy: an approval can arrive hours after the smoke, and a candidate
+redeployed, rebuilt or degraded in the meantime is exactly as Ready and as
+consistent as the one that was validated. Only the release identity separates
+them, so it is compared against `<sha>:<release id>` before the promotion and
+again after it. The evidence handed to `cutover.sh` is `<slot>:<sha>:<release
+id>` — which `cutover.sh` then recomputes from the cluster for itself, so a
+token this job assembled is checked rather than believed.
+
+The preflight **classifies the selectors against the target** rather than
+resolving them into an active slot, and the difference matters. A namespace
+split between blue and green is the ordinary shape of a cutover to this same
+target that stopped part-way, and converging it is exactly what a retry with the
+same `--target` is for; refusing every mixed reading would close the one path
+that finishes it. So a blue/green split **continues**, to the same target. What
+fails, before anything is patched, is a reading this cannot describe: a Service
+selecting a value that is neither slot, one carrying no `nchat.io/release-slot`
+key, or one that is not there at all.
+
+**The workflow's preflight does not replace the gate inside `cutover.sh`, and
+is not allowed to.** It runs before the approval, so what it proves is a fact
+about the namespace at that moment; the approval can arrive hours later.
+`cutover.sh` reads the cluster for itself and runs the same
+`require_promotable_selectors` against **that** reading — the one its own
+mutation is decided from — before it patches anything. Both checks are the same
+primitive and neither is decorative: the preflight is what fails a run early and
+before a reviewer is asked to approve it, and the check inside `cutover.sh` is
+what holds when the namespace changes after the preflight passed. That second
+one also holds for an operator running `cutover.sh` by hand per section 11,
+where no preflight ran at all.
+
+**The target is never recalculated.** It is the slot the candidate job built and
+the reviewer approved, and a retry converges on it rather than inverting to the
+opposite of whatever now looks active — the bug that would send production back
+to the release it had just left.
+
+**The rollback target is `opposite_slot(target)`**, derived from the authorised
+target and never read back from the selectors. Reading it back would name the
+target itself once the namespace has converged, which is the one slot a rollback
+can never go to. The job prints it and does nothing with it: `rollback.sh`,
+`drain-old.sh` and the observation window are outside this workflow, and no
+rollback is ever automatic.
+
+**The after-state is recorded even when the promotion fails.** A cutover that
+stops part-way is the run whose after-state matters most and the run an
+asserting step would never reach, so recording and judging are two steps: the
+recording is read-only, repairs nothing, and runs when the promotion actually
+ran; the judgement is an ordinary step that stays skipped when the promotion
+failed, so no success is ever claimed for one. The job's status is the
+promotion's. Finishing a half-converged namespace from there is `cutover.sh
+--target <the same slot>` run by an operator who has looked at that recording
+(section 12).
+
+"When the promotion actually ran" is an allowlist of two conclusions, and it has
+to be spelled as one:
+
+| The `promote` step ended            | after-state recorded |
+| ----------------------------------- | -------------------- |
+| `success`                           | yes                  |
+| `failure`                           | yes                  |
+| `skipped` (a step before it failed) | no                   |
+| the run was cancelled               | no                   |
+
+Naming any status function in an `if:` stops Actions inserting the implicit
+`success()`, so anything looser runs the step on a run that promoted nothing.
+`steps.promote.conclusion != ''` is the specific trap: a skipped step reports
+`skipped`, which is not the empty string, so that spelling sends a run that
+never reached the promotion to query production anyway.
 
 Dispatch it with the release SHA and the **run id of the "Build and push
 images" run that built it**. The manifest of that run is sealed with a SHA-256
 and names its own `source_sha`, so naming a run is not the same as trusting it:
 `release-digests.sh` verifies the seal, checks the contract, and refuses unless
-the manifest seals the commit being promoted. The digests the cluster then runs
+the manifest seals the commit being deployed. The digests the cluster then runs
 are exactly the ones that release was sealed with — not a rebuild that would
 produce different bytes under the same tag. It reads the manifest rather than
 the `digest-*.txt` artifacts because the manifest is kept for 90 days and they
 are kept for 7.
 
-The candidate job holds no environment. Putting one there would move the
-approval in front of the automated phase, which is the phase that has nothing to
-approve yet. What it does hold is the property that makes the approval mean
-something: **no job before the protected one can change a stable Service.**
-`scripts/ci/check_deploy_prod_workflow.py` enforces that structurally — the
-candidate may not reach `cutover.sh`, `rollback.sh`, `drain-old.sh`,
-`switch_services_to_slot`, or a hand-rolled `kubectl patch service`, and the
-protected job is the only place `cutover.sh` appears at all.
+The candidate slot is `opposite_slot(active)`, read from the cluster. Neither
+slot name appears in the workflow and no input names one, so a mixed or unknown
+selector state fails the run instead of being guessed past.
 
-So a rejected approval, an approval that never comes, and a run cancelled while
-waiting are the same outcome: the protected job never starts, and the selectors
-are what they were. There is no other path to them.
-
-The evidence the cutover job passes to `cutover.sh` is
-`<candidate slot>:<dispatched sha>:<release id>`, asserted from the workflow's
-own validated values rather than read back from the cluster — reading it back
-would make the gate confirm itself. `cutover.sh` recomputes what the slot
-actually carries and refuses when the two disagree.
-
-The release id is the part that makes this hold against a rebuild. Suppose the
-candidate is deployed and smoked, and then, while the approval is pending,
-someone builds the same commit again and redeploys the slot. Every SHA in the
-picture is unchanged, so an evidence token naming only the commit would still
-match and the approval would promote bytes nobody validated. The release id is
-the seal of the manifest those bytes came from, so the second build carries a
-different one and the promotion is refused.
-
-That is also why the protected job downloads the sealed manifest again instead
-of trusting `needs.candidate.outputs.release_id`. The output says what this run
-computed earlier; the manifest is evidence. `cutover.sh` verifies the seal,
-re-derives the id from it, and requires the cluster, the manifest and the
-evidence to name one release before anything is patched.
-
-### Operator configuration — not versionable, and required
-
-The YAML declares `environment: production`. Everything that makes that
-environment a gate is repository configuration, and a workflow file cannot
-assert it. Confirm all four in **Settings → Environments → production**:
-
-| Setting                      | Required value                                                      |
-| ---------------------------- | ------------------------------------------------------------------- |
-| Environment name             | `production` — exactly, or the job matches no protection rule       |
-| Required reviewers           | at least one authorised release owner, and not the dispatcher alone |
-| Deployment branches and tags | **Selected branches** → `main` only                                 |
-| Secrets and variables        | only what the cutover alone uses — see the warning below            |
-
-Without a required reviewer the environment is decorative: the job would run
-unattended and the separation above would buy nothing. The branch rule is what
-stops a dispatch from a feature branch — which carries that branch's copy of
-this workflow, gates and all — from reaching the protected job. The candidate
-job repeats the `refs/heads/main` check itself so the refusal is visible early,
-but that check lives in a file the same attacker could edit; the environment
-rule does not.
-
-#### Where the candidate's variables have to live
-
-The candidate job reads `vars.NCHAT_PROD_TOPOLOGY_FILE` and, where the deploy
-identity cannot read Nodes, `vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR`. Both name
-paths on the runner; neither is a secret and neither is committed.
-
-**Both must be repository variables, or organisation variables made available to
-this repository. Neither may exist only in the `production` environment.**
-
-A job sees an environment's variables only if it declares that environment, and
-the candidate job deliberately declares none — declaring one would put the
-approval in front of the phase that has nothing to approve yet, which is the
-property this whole design exists to protect. So an environment-only variable
-would reach the candidate as an empty string, and the failure would not look
-like a configuration mistake: `NCHAT_PROD_TOPOLOGY_FILE` empty means
-`prepare_prod_deploy_tree` skips installing the topology and the deploy is
+The **candidate job** declares no environment, and the cutover job declares
+`production`. An approval on the candidate would gate the phase that has nothing
+to approve yet, and declaring an environment there would also pull that
+environment's secrets into an unprotected deploy. The candidate's two
+variables —
+`vars.NCHAT_PROD_TOPOLOGY_FILE` and, where the deploy identity cannot read
+Nodes, `vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR` — must therefore be **repository
+or organisation variables**, never environment-scoped. Both name paths on the
+runner; neither is a secret and neither is committed. An environment-only
+variable would arrive as an empty string, and the failure would not look like a
+configuration mistake: an empty `NCHAT_PROD_TOPOLOGY_FILE` means
+`prepare_prod_deploy_tree` skips installing the topology, and the deploy is
 refused later for carrying `REPLACE_ME_*` placeholders.
 
-The split to hold to:
+Both jobs run on the production runner and hold the same two read permissions,
+`actions: read` (the sealed manifest of the named build run) and
+`contents: read`. Neither holds a write of any kind, and the cutover job
+downloads the manifest again into its own workspace rather than receiving an
+identity through a job output: a string that travelled through an output is a
+string a step could have edited, and the seal is what the promotion verifies.
 
-| Job         | Declares an environment | Where its configuration belongs                                         |
-| ----------- | ----------------------- | ----------------------------------------------------------------------- |
-| `candidate` | no, by design           | repository or organisation variables — nothing environment-scoped       |
-| `cutover`   | `production`            | the `production` environment, for anything only the promotion ever uses |
+The `refs/heads/main` check in the first step is defence in depth, not the
+boundary. A dispatch carries the workflow file of the ref it was started from,
+so a feature branch would run its own copy of that check; the runner's pre-job
+guard below is what actually confines this to `main`.
 
-Environment secrets and variables remain the right home for a credential used
-solely by the cutover: scoping them there is what keeps them out of the
-unprotected job. The rule is only that nothing the candidate needs may live
-there.
+### What the workflow proves, and how it is enforced
 
-### Evidence procedure — a rejected approval changes nothing
+`scripts/ci/check_deploy_prod_workflow.py` enforces the shape structurally, and
+as a closed allowlist rather than a search for dangerous commands: every job,
+step, command, env binding and ordering the file may contain is written out
+there, and anything else is refused for not being in the contract. So a
+promotion added to the `candidate` job is refused for the same reason
+`echo hello` is, however it is spelled — `bash cutover.sh`,
+`env bash cutover.sh`, a wrapper, a hand-written `kubectl patch service`,
+`switch_services_to_slot` — and a third job is refused whatever it is called.
 
-Offline tests prove promotion is confined to the protected job. That a rejection
-leaves the cluster untouched is GitHub's behaviour, so it is verified once, by
-observation, on a real release cycle. **Do not run this as a drill on a release
-you intend to promote, and do not run it at all without authorisation.**
+The contract also holds the separation itself, in both directions: only the
+`cutover` job may run `cutover.sh`, it may run it only at its one contracted
+position, only that job may declare `environment:` and `needs:`, and only the
+`production` environment satisfies it. `rollback.sh`, `drain-old.sh`, a
+migration and a DNS call are refused in either job for not being contracted
+steps. Neither job may declare `if:`, `continue-on-error:` on a gate, a write
+permission, or a runner other than the production one.
+
+The candidate job's last three steps are the evidence, produced on every run:
+
+| Evidence                   | Where it comes from                                           |
+| -------------------------- | ------------------------------------------------------------- |
+| stable selectors, before   | `collect_service_slots`, in the same step that picks the slot |
+| active slot                | `resolve_active_slot` of that same reading                    |
+| candidate slot             | `opposite_slot(active)`                                       |
+| migrations, rollout        | `deploy.sh`, each fail-closed                                 |
+| automated smoke            | `smoke.sh` — isolation, one consistent release, readiness     |
+| stable selectors, after    | `collect_service_slots` again                                 |
+| selector invariant result  | `diff` of the two readings; any difference fails the run      |
+| expected release SHA       | the dispatched `sha`, proved reachable from `main`            |
+| expected sealed release id | the SHA-256 the release manifest was sealed with              |
+| observed candidate release | `slot_release_state` of the candidate, read from the cluster  |
+| identity comparison result | observed must equal `CONSISTENT <sha>:<release id>`           |
+
+Both selector readings come from the same function, so that comparison is
+between two canonical forms and not two renderings. The snapshot is taken in the
+step that resolves the slot, from that one reading, so the evidence describes
+the state the deploy decision was actually made from.
+
+**A green smoke is not the end of the run.** Two gates follow it, and either can
+still fail:
+
+- the **selector invariant** fails if any stable Service selects something other
+  than what the snapshot recorded — something moved production traffic;
+- the **identity revalidation** fails if the candidate is not running the exact
+  release this run built — the slot was redeployed or rebuilt underneath the
+  run. A rebuild of the same commit seals a different manifest, so it is caught
+  here even though every SHA in the picture is unchanged.
+
+The two are independent: a concurrent redeploy of the candidate leaves the
+selectors untouched and produces a slot that is equally Ready and equally
+consistent, so only the identity separates the two releases.
+
+**A difference is never repaired.** These steps exist to detect that something
+changed underneath the run; putting a selector back, or accepting whatever the
+slot happens to carry, would destroy the only record of it happening. Treat a
+failure at either as an incident, not as a deploy that needs retrying.
+
+The cutover job produces its own evidence, on both sides of the one mutation:
+
+| Evidence                   | Where it comes from                                                                                              |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| approval                   | the required reviewer on the `production` environment                                                            |
+| stable selectors, before   | `collect_service_slots`, before anything is patched                                                              |
+| preflight result           | `require_promotable_selectors` against the target; unclassifiable fails here                                     |
+| decisive classification    | `require_promotable_selectors` again inside `cutover.sh`, on the reading its own mutation is decided from        |
+| rollback target            | `opposite_slot(target)`, from the authorised target                                                              |
+| approved release           | `<sha>:<release id>`, from the dispatch and the candidate job                                                    |
+| candidate still carries it | `require_slot_release_identity`, read from the cluster                                                           |
+| the promotion              | `cutover.sh --target <candidate>`, its own gates all fail-closed                                                 |
+| stable selectors, after    | `collect_service_slots` again, recorded on a failed promotion too, and not at all when the promotion was skipped |
+| convergence result         | `all_services_on_slot` against the named target — total or FAIL                                                  |
+| promoted release, after    | `require_slot_release_identity` again, once traffic has moved                                                    |
+
+Convergence and release identity are independent there too. A Service that is
+missing, carries no `nchat.io/release-slot` key, kept the previous slot or holds
+some other value all fail the convergence proof; and a slot that degraded or was
+redeployed during the patches would pass it and still fail the identity read
+that follows.
+
+### The runner refuses everything else — the pre-job guard
+
+`runs-on: [self-hosted, linux, x64, nchat-prod-deploy]` is routing. The label is
+public, this repository is public, and any workflow committed to any branch can
+ask for it. A job that reaches its first step on that runner is already running
+as `nchat-prod-runner`, the one identity on `srv-apps-01` that can read the
+least-privilege production kubeconfig. The workflow's own `refs/heads/main`
+check lives in a file that same author could edit, so it is defence in depth,
+not the boundary.
+
+The boundary is host-side and outside the repository's reach:
+`scripts/deploy/nchat-prod/runner-job-guard.sh`, installed as a root-owned copy
+and wired to `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner executes it before
+the first step of every job it accepts, and a non-zero exit ends the job there.
+
+It authorises one context, by exact comparison, and refuses everything else —
+including a variable the runner did not set:
+
+| Variable              | Only accepted value                                                           |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `GITHUB_REPOSITORY`   | `nicrepository/nchat`                                                         |
+| `GITHUB_WORKFLOW_REF` | `nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main` |
+| `GITHUB_REF`          | `refs/heads/main`                                                             |
+| `GITHUB_EVENT_NAME`   | `workflow_dispatch`                                                           |
+
+So a pull request, a dispatch from `develop`, another workflow file, another
+event, a fork, and an empty environment are all the same outcome: no step runs.
+The refusal names the variable that disagreed and never its value, because the
+value is a string an untrusted workflow chose and the line is read out of a
+system log.
+
+**The copy must not live where the runner can write.** The checkout, `_work`
+and `/home/nchat-prod-runner` are all rewritable by the job the guard exists to
+judge; pointing the hook at any of them would let a job disable its own gate.
+
+#### Installing it
+
+Run on `srv-apps-01`, from a checkout of the reviewed commit, after merge.
 
 ```bash
-# 1. Before dispatching, record what every stable Service selects.
-make prod-blue-green-status | tee /secure/path/selectors-before.txt
+# 1. a root-owned directory outside anything the runner can write
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/nchat-prod
 
-# 2. Dispatch the workflow and let the candidate job finish. It must end green.
+# 2. the guard itself, read-and-execute only
+sudo install -o root -g root -m 0555 \
+  scripts/deploy/nchat-prod/runner-job-guard.sh \
+  /usr/local/libexec/nchat-prod/runner-job-guard.sh
 
-# 3. With the run waiting on the production environment, reject the approval
-#    (or cancel the run). The cutover job must show as skipped or cancelled,
-#    never as started.
+# 3. the installation gates. Every one of them refuses by exiting non-zero,
+#    and PASS is printed only after the condition has actually been proved.
+sudo bash <<'VERIFY'
+set -euo pipefail
+SOURCE=scripts/deploy/nchat-prod/runner-job-guard.sh
+GUARD_DIR=/usr/local/libexec/nchat-prod
+GUARD="$GUARD_DIR/runner-job-guard.sh"
 
-# 4. Record the selectors again.
-make prod-blue-green-status | tee /secure/path/selectors-after.txt
+fail() {
+  echo "FAIL: $1" >&2
+  exit 1
+}
 
-# 5. PASS only if they are identical.
-diff /secure/path/selectors-before.txt /secure/path/selectors-after.txt
+# byte for byte the reviewed file, not merely two hashes printed side by side
+cmp --silent "$SOURCE" "$GUARD" ||
+  fail 'the installed guard differs from the reviewed guard'
+
+# a real file, owned by root, in a directory owned by root
+[ -f "$GUARD" ] && [ ! -L "$GUARD" ] || fail 'the installed guard is not a regular file'
+[ "$(stat -c '%U:%G' "$GUARD")" = root:root ] || fail 'the installed guard is not root:root'
+[ "$(stat -c '%U:%G' "$GUARD_DIR")" = root:root ] || fail "$GUARD_DIR is not root:root"
+
+# Asked as the runner itself, because that is the identity that must be
+# refused, and asked as the positive question `test ! -w`: not writable is the
+# only answer that returns 0, so a writable path and a runuser that could not
+# answer at all -- unknown user, no privilege, no runuser -- are both failures.
+runuser -u nchat-prod-runner -- test '!' -w "$GUARD" ||
+  fail 'could not prove that nchat-prod-runner cannot rewrite its own guard'
+runuser -u nchat-prod-runner -- test '!' -w "$GUARD_DIR" ||
+  fail 'could not prove that nchat-prod-runner cannot replace its own guard'
+
+echo "PASS: $GUARD is the reviewed file, root-owned, and not writable by nchat-prod-runner"
+VERIFY
+
+# 4. its own drop-in. 10-kubernetes.conf is not touched.
+sudo tee /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf >/dev/null <<'CONF'
+[Service]
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/libexec/nchat-prod/runner-job-guard.sh
+CONF
+sudo chmod 0644 /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf
+
+# 5. reload, and restart only the production runner
+sudo systemctl daemon-reload
+sudo systemctl restart actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+
+# 6. the service gates, on the exact unit and nothing else. Non-zero on any
+#    failure, and no value is printed -- only the name it was matched against.
+sudo bash <<'VERIFY'
+set -euo pipefail
+GUARD=/usr/local/libexec/nchat-prod/runner-job-guard.sh
+UNIT=actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+UNIT_DIR="/etc/systemd/system/$UNIT.d"
+
+fail() {
+  echo "FAIL: $1" >&2
+  exit 1
+}
+
+grep -qxF "Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=$GUARD" "$UNIT_DIR/20-job-guard.conf" ||
+  fail '20-job-guard.conf does not point the hook at the installed guard'
+[ -f "$UNIT_DIR/10-kubernetes.conf" ] || fail '10-kubernetes.conf is no longer there'
+systemctl is-active --quiet "$UNIT" || fail "$UNIT is not active"
+systemctl show -p Environment --value "$UNIT" | tr ' ' '\n' |
+  grep -qxF "ACTIONS_RUNNER_HOOK_JOB_STARTED=$GUARD" ||
+  fail "$UNIT is not carrying the hook"
+
+echo "PASS: $UNIT is active and runs the guard before every job"
+VERIFY
 ```
 
-A non-empty diff is a failure of the whole separation, not a detail: it means
-something outside the protected job moved traffic. Stop and treat it as an
-incident before dispatching another release.
+Always the full unit name, never a wildcard: `srv-apps-01` also runs the
+nchat-dev, GitLab and other runners, and none of them is in scope here. Nothing
+above reads or prints the kubeconfig, and no other unit's drop-ins, permissions
+or Kubernetes RBAC are modified.
+
+#### Proving it refuses — negative evidence
+
+`deploy-nchat-prod.yml` already exists on `develop` and is `workflow_dispatch`,
+so the refusal can be observed without inventing a workflow for it.
+
+Dispatch **Deploy nchat-prod** from the `develop` ref with syntactically valid
+inputs — a real 40-hex SHA on `main` and a real "Build and push images" run id —
+so that nothing but the guard can be what refused it.
+
+PASS requires all three:
+
+- the `candidate` job ends failed with **no step executed** — the run page
+  shows the job's steps never started, so "Validate the release request" did not
+  run and nothing was checked out;
+- the host log carries the refusal and names only the variable:
+
+  ```bash
+  sudo journalctl -u actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service \
+    --since '-15 min' | grep 'runner job guard'
+  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not the authorised production deploy context.
+  ```
+
+- `make prod-blue-green-status` is unchanged.
+
+A run that reached its first step and was stopped by the workflow's own
+`refs/heads/main` check is a **fail** of this procedure, not a pass: the hook is
+the gate being evidenced, and that check is the layer behind it.
+
+#### Proving it allows — positive evidence
+
+Before the guard's commit reaches `main`, the offline suite is the evidence:
+
+```bash
+make prod-runner-guard-test
+```
+
+It drives the guard through the authorised context and thirty-odd refusals —
+absent, empty, look-alike, and metacharacter-carrying values among them — and
+runs in `pnpm run ci`.
+
+Once this commit is on `main`, the first legitimate dispatch from `main` is the
+live positive: the `candidate` job starts its steps normally. The guard has no
+opinion beyond that point; the release SHA, the sealed manifest and the
+candidate's own gates remain as described above, and the cutover job still
+starts only once a reviewer approves the run.
+
+#### Rollback
+
+```bash
+# Keep the evidence first, if a refusal is what is being investigated. An
+# empty file is a legitimate answer -- there may have been no refusal -- so
+# only grep's "no match" (exit 1) is accepted; a journalctl that could not
+# read the log, a grep error, or a tee that could not write all fail the
+# collection instead of leaving an empty file that looks like evidence.
+sudo bash <<'EVIDENCE'
+set -uo pipefail
+EVIDENCE_FILE=/secure/path/job-guard-denials.txt
+UNIT=actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+
+journalctl -u "$UNIT" --since '-1 day' |
+  { grep 'runner job guard' || [ "$?" -eq 1 ]; } |
+  tee "$EVIDENCE_FILE" >/dev/null || {
+  echo 'FAIL: the denial evidence could not be collected' >&2
+  exit 1
+}
+
+echo "PASS: refusals up to now are in $EVIDENCE_FILE (empty if there were none)"
+EVIDENCE
+
+sudo rm -f /etc/systemd/system/actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service.d/20-job-guard.conf
+sudo systemctl daemon-reload
+sudo systemctl restart actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service
+```
+
+That is the whole rollback: one file, one unit. `10-kubernetes.conf`, the
+kubeconfig, the `nchat-prod-deployer` RBAC and every other runner are untouched
+by both directions, and the guard reads four environment variables and writes
+nothing — there is no state, no cluster object and no data it can leave behind.
+Removing it restores exactly the exposure this section exists to close, so treat
+a rollback as an open security finding, not a fix.
 
 ---
 

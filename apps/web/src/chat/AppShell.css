@@ -12,13 +12,21 @@
  * Three thresholds, stated here and reused by the chat stylesheets rather than
  * restated with numbers of their own:
  *
- *   >= 1280px           wide      nav column (240px) │ conversation │ details
- *                                 column (320px). The conversation keeps at
- *                                 least 720px with everything open.
- *   1024px – 1279.98px  compact   nav column (200px) │ conversation. Details
+ *   >= 1280px           wide      nav column (clamp(240px, 18vw, 288px)) │
+ *                                 conversation │ details column (320px). The nav
+ *                                 is fluid rather than fixed (issue #787): 240px
+ *                                 at 1280px, ~259px at 1440px, and capped at
+ *                                 288px from 1600px up, so a wide screen spends
+ *                                 its extra pixels on the conversation list
+ *                                 without ever eating the conversation when the
+ *                                 details column is also open.
+ *   1024px – 1279.98px  compact   nav column (240px) │ conversation. Details
  *                                 covers the conversation instead of splitting
  *                                 it, which is what stops two side columns from
- *                                 squeezing the messages.
+ *                                 squeezing the messages — and because there is
+ *                                 no second side column here, the nav keeps the
+ *                                 same 240px floor as the wide mode instead of
+ *                                 narrowing to 200px (issue #787).
  *   768px – 1023.98px   tablet    nav is a drawer over the conversation; details
  *                                 still covers the conversation. One reading
  *                                 surface at a time, no three-column layout
@@ -87,8 +95,10 @@ body.chat-root-locked {
   /* Shadow */
   --shadow-md: 0 4px 16px rgba(22, 18, 31, 0.06);
 
-  /* Column widths, so the tracks and the elements in them cannot disagree. */
-  --chat-nav-w: 240px;
+  /* Column widths, so the tracks and the elements in them cannot disagree.
+     The nav is the one fluid track: `clamp` is the whole responsive rule for it,
+     which is why no media query below restates a wide-mode nav width. */
+  --chat-nav-w: clamp(240px, 18vw, 288px);
   --chat-details-w: 320px;
 }
 
@@ -187,7 +197,10 @@ body.chat-root-locked {
 
 @media (max-width: 1279.98px) {
   .chat-app {
-    --chat-nav-w: 200px;
+    /* Not narrower than wide mode's floor: the details panel covers the
+       conversation here rather than taking a column from it, so there is no
+       third track to buy room for (issue #787). */
+    --chat-nav-w: 240px;
     grid-template-columns: var(--chat-nav-w) minmax(0, 1fr);
     grid-template-areas: "nav main";
   }

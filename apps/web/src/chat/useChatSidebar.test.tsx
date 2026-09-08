@@ -404,7 +404,12 @@ describe("useChatSidebar realtime unread", () => {
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 1 });
   });
 
-  it("clears a conversation's badge on opening it and leaves other badges untouched", async () => {
+  // #492: opening a conversation's route is navigation, not a read receipt —
+  // the badge (and its mention flag) survive until something explicitly
+  // marks it read. The route still suppresses *further* increments for the
+  // conversation currently open, which is a separate, still-active rule
+  // (countsAsUnread's activeTarget check, independent of target_opened).
+  it("does not clear a conversation's badge on opening it, but still suppresses new unread while it stays open", async () => {
     const { Wrapper, navigateRef } = navigableWrapper("/chat");
     const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
@@ -430,13 +435,15 @@ describe("useChatSidebar realtime unread", () => {
     }
 
     act(() => navigateRef.current(`/chat/channel/${channelA}`));
-    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
-
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
     if (result.current.state.status === "ready") {
-      const opened = result.current.state.channels.find((c) => c.id === channelA);
-      expect(opened?.unreadCount).toBe(0);
-      expect(opened?.hasMentionUnread).toBeFalsy();
+      expect(result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread).toBe(
+        true,
+      );
     }
+
+    act(() => websocket.onMessageCreated?.(messageCreated("while-open", channelA)));
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
     expect(unreadCounts(result.current.state).channelB).toBe(1);
   });
 });
@@ -882,13 +889,14 @@ describe("useChatSidebar native browser notification", () => {
     const { onNavigate } = mockShowBrowserMessageNotification.mock.calls[0][0];
     act(() => onNavigate(`/chat/channel/${channelA}`));
 
-    // Real navigation happened: the route change clears the badge exactly as
-    // it does for an in-app open (see "clears a conversation's badge on
-    // opening it" above).
-    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
-    // refreshSidebar() fired: a fresh fetch beyond the one triggered by the
-    // message event's own state update.
-    expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBeforeClick);
+    // Real navigation happened, but that alone is not a read receipt (#492) —
+    // the badge survives. What this proves is that refreshSidebar() fired: a
+    // fresh fetch beyond the one triggered by the message event's own state
+    // update.
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBeforeClick),
+    );
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
 
     // vi.restoreAllMocks() (afterEach, below) does not clear a plain
     // mockReturnValue on a vi.fn(), so leaving `shown: true` here would leak
@@ -2063,8 +2071,11 @@ describe("useChatSidebar — badge persistence", () => {
     await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(1));
   });
 
-  it("marks the opened conversation read without blocking the local badge clear", async () => {
-    mockMarkConversationRead.mockRejectedValueOnce(new Error("offline"));
+  // #492: opening a conversation's route is a navigation event, not a read
+  // receipt. Marking read now happens only once ChatMessageArea has evidence
+  // the user reached the real bottom, via the same markRead() below — never
+  // automatically from the route alone.
+  it("does not mark a conversation read just because its route opened", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
       workspaceId,
@@ -2076,8 +2087,9 @@ describe("useChatSidebar — badge persistence", () => {
       wrapper: wrapper(`/chat/channel/${channelA}`),
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
-    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA));
-    expect(unreadCounts(result.current.state).channelA).toBe(0);
+
+    expect(mockMarkConversationRead).not.toHaveBeenCalled();
+    expect(unreadCounts(result.current.state).channelA).toBe(3);
   });
 
   afterEach(() => {
@@ -2145,7 +2157,10 @@ describe("useChatSidebar — badge persistence", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("to-be-read", channelA)));
     expect(unreadCounts(result.current.state).channelA).toBe(1);
 
+    // #492: opening the route no longer marks it read — mark it explicitly,
+    // the same way ChatMessageArea will once it confirms the real bottom.
     act(() => navigateRef.current(`/chat/channel/${channelA}`));
+    act(() => result.current.markRead({ kind: "channel", targetId: channelA }));
     await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
     unmount();
 

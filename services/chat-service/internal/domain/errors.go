@@ -143,4 +143,13 @@ var (
 	// belonging to another workspace. It says which rule was broken but never
 	// which IDs exist, so it cannot be used to enumerate another workspace.
 	ErrInvalidChannelCategoryOrder = fmt.Errorf("%w: order must list every category of the workspace exactly once", ErrInvalidInput)
+	// ErrGroupAllMentionRecipientsExceeded reports that a group DM's @all would
+	// notify more than MaxGroupAllMentionRecipients eligible members (issue
+	// #776, SR-002). Wraps ErrInvalidInput so the existing generic 400 mapping
+	// applies with no new HTTP case, matching ErrTooManyMembersRequested's
+	// pattern. The message states only the public bound, never the group's
+	// actual size, its member names/ids, or which of them were counted — a
+	// caller learns "too many," not "who."
+	ErrGroupAllMentionRecipientsExceeded = fmt.Errorf(
+		"%w: @all in a group is limited to %d recipients", ErrInvalidInput, MaxGroupAllMentionRecipients)
 )

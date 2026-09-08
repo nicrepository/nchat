@@ -1653,6 +1653,11 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
       body: JSON.stringify({
         data: {
           current_user_id: CURRENT_USER_ID,
+          // Same id the simulated realtime events already carry as
+          // workspace_id — the real contract always includes this object
+          // (chatApi.ts reads sidebar.workspace?.id), so a mock that omits it
+          // is not exercising the real shape.
+          workspace: { id: "e2e-workspace", name: "E2E Workspace", slug: "e2e-workspace" },
           channels: scenario.sidebarChannels,
           dm_conversations: scenario.sidebarDMs,
         },

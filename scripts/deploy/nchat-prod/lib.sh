@@ -186,6 +186,34 @@ all_services_on_slot() {
   [[ "$slots" == "$target" ]]
 }
 
+# The preflight of a promotion to an explicit, already-authorised target.
+#
+# `resolve_active_slot` is the wrong question here and answering it is a bug: it
+# refuses every mixed reading, and a mixed reading of blue and green is the
+# normal shape of a cutover to this same target that stopped part-way. Refusing
+# it would make the documented retry -- `--target <the same slot>` -- impossible
+# through the one path that is supposed to converge it, while a namespace
+# holding `purple`, an unset selector or a Service that is not there would be
+# just as "mixed" and needs to fail.
+#
+# So the mapping is classified against the target instead of being resolved into
+# an active slot. Every stable Service must select the target or its opposite;
+# anything else is a state this cannot describe, and it fails before any
+# mutation. The target itself is never derived from what is found -- it is the
+# caller's, it stays the caller's, and a retry converges rather than reversing.
+require_promotable_selectors() {
+  local mapping="$1" target="$2" other service slot
+  is_valid_slot "$target" ||
+    prod_fail "the promotion target must be one of ${NCHAT_PROD_SLOTS[*]}, got '$target'"
+  other="$(opposite_slot "$target")"
+  while read -r service slot; do
+    if [[ "$slot" != "$target" && "$slot" != "$other" ]]; then
+      printf '%s\n' "$mapping" >&2
+      prod_fail "service/$service selects '$slot', which is neither $target nor $other; cutover blocked"
+    fi
+  done <<<"$mapping"
+}
+
 # Everything Kubernetes reports about a rollout, as one pipe-separated record:
 #   generation|observedGeneration|replicas|updated|ready|available|unavailable
 deployment_rollout_state() {
@@ -419,6 +447,38 @@ require_consistent_release() {
   echo "slot $slot does not carry one release:" >&2
   slot_workload_releases "$slot" | awk '{ printf "  %-22s %s  %s\n", $1, $2, $3 }' >&2
   prod_fail "slot $slot is $state; deploy the release again before promoting it"
+}
+
+# Binds what a slot is actually running to the release the caller asked for.
+#
+# slot_release_state answers what the slot carries. That is a statement about
+# the slot alone: a concurrent redeploy of the same slot produces a state that
+# is equally CONSISTENT and equally Ready, and nothing in "consistent" tells the
+# two releases apart. Comparing the observed identity to a named one is what
+# turns "this slot agrees with itself" into "this slot is running the release
+# this run built".
+#
+# The identity is the commit and the sealed build together, so a rebuild of the
+# same commit fails here as surely as a different commit does.
+#
+# Every state that is not exactly the expected release stops the caller, the
+# non-CONSISTENT ones included: NOT_DEPLOYED, ROLLING_OUT and MIXED are answers
+# about a slot that cannot be reported as carrying any release at all, and a
+# cluster that cannot be read produces one of them rather than a match.
+#
+# Named for the slot it reads. cutover.sh carries its own, older
+# require_release_identity, which answers a different question -- does the
+# sealed manifest being promoted match the id the slot reports -- and takes one
+# argument rather than two. That script sources this file and then defines its
+# own, so a shared name would leave which of the two ran depending on the order
+# of a `source` line, with two incompatible signatures under one global symbol.
+require_slot_release_identity() {
+  local slot="$1" expected="$2" state
+  state="$(slot_release_state "$slot")" ||
+    prod_fail "cannot read the release identity of slot $slot"
+  [[ "$state" == "CONSISTENT $expected" ]] ||
+    prod_fail "slot $slot carries '$state', expected 'CONSISTENT $expected'"
+  printf '%s' "$expected"
 }
 
 # The evidence a smoke run produces and a cutover checks: the slot AND the exact

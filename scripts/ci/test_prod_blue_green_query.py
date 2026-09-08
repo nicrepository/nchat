@@ -93,6 +93,8 @@ metadata:
   namespace: nchat-prod
 spec:
   ipAllowList:
+    ipStrategy:
+      depth: 1
     sourceRange:
     - 198.51.100.0/24
     - 203.0.113.0/24
@@ -311,6 +313,17 @@ class FieldQueryTests(unittest.TestCase):
             query.document_field(document(MIDDLEWARE), "source-range"),
             "198.51.100.0/24 203.0.113.0/24",
         )
+
+    def test_ip_strategy_depth(self):
+        self.assertEqual(
+            query.document_field(document(MIDDLEWARE), "ip-strategy-depth"), "1"
+        )
+
+    def test_absent_ip_strategy_is_empty_not_a_default(self):
+        # An allowlist with no ipStrategy matches RemoteAddr, which behind a
+        # proxy is the proxy. The reader must say "absent", never "1".
+        text = MIDDLEWARE.replace("    ipStrategy:\n      depth: 1\n", "")
+        self.assertEqual(query.document_field(document(text), "ip-strategy-depth"), "")
 
     def test_data_field(self):
         self.assertEqual(

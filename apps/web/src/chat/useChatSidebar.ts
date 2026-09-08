@@ -643,19 +643,6 @@ export function useChatSidebar() {
     },
   });
 
-  useEffect(() => {
-    if (state.status === "ready" && openedTargetKind && openedTargetId) {
-      dispatch({
-        type: "target_opened",
-        target: { kind: openedTargetKind, targetId: openedTargetId },
-      });
-      void Promise.resolve(markConversationRead(openedTargetKind, openedTargetId)).catch(() => {
-        // Local UI remains responsive while a later refresh reconciles with
-        // the server. A failed read receipt must never break chat navigation.
-      });
-    }
-  }, [openedTargetKind, openedTargetId, state.status]);
-
   const setPinned = useCallback(
     async (target: WSSubscriptionTarget, pinned: boolean) => {
       if (state.status !== "ready") return;
