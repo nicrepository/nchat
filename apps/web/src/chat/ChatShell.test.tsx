@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { clearTokens, setTokens } from "../lib/authSession";
 import { issueCallToken, issueResourceCallToken } from "./callApi";
-import { fetchSidebarData, leaveConversation } from "./chatApi";
+import { fetchSidebarData, leaveConversation, markConversationRead } from "./chatApi";
 import AppShell, { ROOT_LOCK_CLASS } from "./AppShell";
 import ChatShell, { type ChatOutletContext } from "./ChatShell";
 import CallSessionProvider from "../calls/CallSessionProvider";
@@ -16,7 +16,12 @@ import { useCallMedia } from "./useCallMedia";
 
 vi.mock("./chatApi", async () => {
   const actual = await vi.importActual<typeof import("./chatApi")>("./chatApi");
-  return { ...actual, fetchSidebarData: vi.fn(), leaveConversation: vi.fn() };
+  return {
+    ...actual,
+    fetchSidebarData: vi.fn(),
+    leaveConversation: vi.fn(),
+    markConversationRead: vi.fn(),
+  };
 });
 // A stub, because what is under test here is which target the shell hands the
 // panel — not what the panel then renders for it. The real one fetches.
@@ -1626,6 +1631,71 @@ describe("ChatShell — leaving the conversation on screen", () => {
 
     await waitFor(() => expect(screen.getByText("vazio")).toBeInTheDocument());
     expect(leaveConversation).toHaveBeenCalledWith("channel", readingId);
+  });
+});
+
+// #492: ChatMessageArea needs the same markRead useChatSidebar already hands
+// the sidebar's own "Marcar como lida" menu action, so it can call it once it
+// has evidence the user reached the real bottom — not a second read-state
+// mechanism, the same one, reached through ChatShell's own outlet context.
+describe("ChatShell — forwards markRead through its own outlet context", () => {
+  const readingId = "00000000-0000-4000-8000-0000000005e1";
+
+  function renderShellAt(path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route
+              path="/chat"
+              element={
+                <CallSessionProvider>
+                  <ChatShell />
+                </CallSessionProvider>
+              }
+            >
+              <Route path="channel/:channelId" element={<MarkReadProbe />} />
+            </Route>
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function MarkReadProbe() {
+    const ctx = useOutletContext<ChatOutletContext>();
+    return (
+      <button
+        type="button"
+        onClick={() => ctx.markRead?.({ kind: "channel", targetId: readingId })}
+      >
+        Marcar como lida
+      </button>
+    );
+  }
+
+  it("hands the real useChatSidebar markRead down, not a second implementation", async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchSidebarData).mockResolvedValue({
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        {
+          id: readingId,
+          name: "Plataforma",
+          type: "public" as const,
+          canWrite: true,
+          unreadCount: 5,
+        },
+      ],
+      dms: [],
+      categories: [],
+    });
+
+    renderShellAt(`/chat/channel/${readingId}`);
+    await user.click(await screen.findByRole("button", { name: "Marcar como lida" }));
+
+    await waitFor(() => expect(markConversationRead).toHaveBeenCalledWith("channel", readingId));
   });
 });
 

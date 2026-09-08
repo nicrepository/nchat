@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Coverage for the RF-21 Link Safety tests that need a real PostgreSQL.
+# Coverage for the chat/file tests that need a real PostgreSQL.
+#
+# Originally the RF-21 Link Safety suite, now also issue #741's notification
+# outbox suite and issue #742's worker claim suite: all three prove properties
+# only a database can hold — atomicity across one statement, a unique index
+# deciding what counts as the same event, and FOR UPDATE SKIP LOCKED handing two
+# concurrent workers disjoint rows.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -49,6 +55,72 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      TestNotificationOutboxCommitsWithMessagePostgreSQL
+      TestNotificationOutboxRowContractPostgreSQL
+      TestNotificationOutboxStoresNoMessageBodyPostgreSQL
+      TestNotificationOutboxRetryCreatesNoDuplicatePostgreSQL
+      TestNotificationOutboxDedupeIndexRefusesDuplicatesPostgreSQL
+      TestNotificationOutboxRollsBackWithMessagePostgreSQL
+      TestNotificationOutboxFailureTakesTheMessageWithItPostgreSQL
+      TestNotificationOutboxConcurrentCreateStaysSinglePostgreSQL
+      TestNotificationOutboxSurvivesRestartPostgreSQL
+      TestNotificationOutboxIsolatedByWorkspacePostgreSQL
+      TestNotificationOutboxClassifiesEachRecipientOncePostgreSQL
+      TestNotificationOutboxNotifiesTheAnsweredAuthorPostgreSQL
+      TestNotificationOutboxDoesNotFanOutChannelMessagesPostgreSQL
+      TestNotificationOutboxSkipsRecipientsWhoLostAccessPostgreSQL
+      TestNotificationOutboxWalksToDeliveredPostgreSQL
+      TestNotificationOutboxSuppressionIsTerminalPostgreSQL
+      TestNotificationOutboxTriggerRefusesDirectTerminalEscapePostgreSQL
+      TestNotificationOutboxTriggerRefusesSkippedStepsPostgreSQL
+      TestNotificationOutboxConcurrentTransitionHasOneWinnerPostgreSQL
+      TestNotificationOutboxSuppressedReasonIsBoundedPostgreSQL
+      TestNotificationOutboxSuppressedReasonPairingPostgreSQL
+      TestNotificationOutboxRefusesUndeclaredValuesPostgreSQL
+      TestNotificationOutboxStoresHistoricalOriginsPostgreSQL
+      TestNotificationOutboxLeavesUnreadIndependentPostgreSQL
+      TestNotificationOutboxParksClassifiedRecipientsPostgreSQL
+      TestNotificationOutboxPromotedFromLinkScanPostgreSQL
+      TestNotificationOutboxPromotionKeepsTheOriginalInstantPostgreSQL
+      TestNotificationOutboxPromotionRetryCreatesNoDuplicatePostgreSQL
+      TestNotificationOutboxPromotionIsAtomicPostgreSQL
+      TestNotificationOutboxPromotesToPublicChannelReaderPostgreSQL
+      TestNotificationOutboxPromotesDirectConversationPostgreSQL
+      TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
+      TestNotificationOutboxMigrationRoundTripPostgreSQL
+      TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
+    )
+    ;;
+  services/notification-service)
+    # Issue #742. Its own variable for the same reason the other two have theirs:
+    # the DSN is exported for this invocation only, so a plain `go test ./...`
+    # keeps skipping every opt-in suite.
+    dsn_var="NOTIFICATION_TEST_DATABASE_URL"
+    package="./internal/storage"
+    tests=(
+      TestNotificationClaimIsExclusivePostgreSQL
+      TestNotificationClaimDistributesDisjointWorkPostgreSQL
+      TestNotificationClaimRespectsTheBatchSizePostgreSQL
+      TestNotificationClaimOrderIsDeterministicPostgreSQL
+      TestNotificationLeaseProtectsAClaimPostgreSQL
+      TestNotificationExpiredLeaseIsRecoveredPostgreSQL
+      TestNotificationBacklogSurvivesAWorkerRestartPostgreSQL
+      TestNotificationClaimSkipsSuppressedAndTerminalEventsPostgreSQL
+      TestNotificationClaimStopsAtTheAttemptCeilingPostgreSQL
+      TestNotificationExhaustedClaimsAreRetiredPostgreSQL
+      TestNotificationExhaustedReaperSparesALiveClaimPostgreSQL
+      TestNotificationOutcomesAreCompareAndSetPostgreSQL
+      TestNotificationRetryScheduleIsPersistedPostgreSQL
+      TestNotificationLastErrorCannotHoldAPayloadPostgreSQL
+      TestNotificationClaimReturnsReferencesOnlyPostgreSQL
+      TestNotificationBacklogCountsOpenWorkPostgreSQL
+      TestNotificationEvaluationIsExclusivePostgreSQL
+      TestNotificationStaleClaimCannotFinalisePostgreSQL
+      TestNotificationDueRetryIsNotStarvedByNewWorkPostgreSQL
+      TestNotificationDueRetryOutranksFreshlyEvaluatedHistoryPostgreSQL
+      TestNotificationEvaluationStampsAvailabilityPostgreSQL
+      TestNotificationSuppressionStampsNoAvailabilityPostgreSQL
+      TestNotificationFutureRetryStaysUnclaimedPostgreSQL
     )
     ;;
   services/file-service)

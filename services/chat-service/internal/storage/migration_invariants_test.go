@@ -997,3 +997,92 @@ func TestChatMigration_KeepsWorkspaceScopedConversationIndexes(t *testing.T) {
 		}
 	}
 }
+
+// Issue #741. The notification outbox stops being mention-only, and the
+// properties that make it a durable event log rather than a queue of hints are
+// asserted on the migration text: they are what every later reader depends on.
+func TestChatMigration_NotificationOutboxEventContract(t *testing.T) {
+	up := readChatMigration(t, "000042_notification_outbox_event_contract.up.sql")
+	for _, expected := range []string{
+		// The event vocabulary the domain package declares.
+		"'direct_message', 'mention', 'reply', 'channel_message', 'reaction', 'call'",
+		// suppressed must be representable, and separately from failed.
+		"'pending', 'eligible', 'suppressed', 'processing', 'sent', 'retrying', 'failed'",
+		// A suppression and its reason arrive together or not at all, and the
+		// reason is bounded so the column cannot be used to carry content.
+		"(status = 'suppressed') = (suppressed_reason IS NOT NULL)",
+		"char_length(suppressed_reason) BETWEEN 1 AND 200",
+		// Terminal states are terminal because the database says so, not because
+		// the Go constant is named that way.
+		"CREATE FUNCTION chat.enforce_notification_outbox_transition()",
+		"BEFORE UPDATE OF status ON chat.notification_outbox",
+		// The historical/import/replay marker.
+		"CHECK (origin IN ('live', 'import', 'replay', 'resync'))",
+		// Idempotency is the database's decision, qualified by tenant.
+		"CREATE UNIQUE INDEX notification_outbox_dedupe_uq",
+		"ON chat.notification_outbox (workspace_id, recipient_user_id, dedupe_key)",
+		// The parked notifications of a withheld message keep their kind.
+		"ALTER TABLE chat.message_pending_mentions",
+		// Widening a CHECK is a declared operation under Blue/Green.
+		"nchat:blue-green contract-phase",
+		// Retention is documented rather than implemented.
+		"Retention (documented, not implemented)",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("notification outbox migration missing %q", expected)
+		}
+	}
+	// One index over the non-terminal states, not one per state.
+	if !strings.Contains(up, "WHERE status IN ('pending', 'eligible', 'retrying')") {
+		t.Error("the worker index must cover every non-terminal state")
+	}
+	if strings.Count(up, "CREATE INDEX") != 1 {
+		t.Errorf("expected exactly one non-unique index, got %d", strings.Count(up, "CREATE INDEX"))
+	}
+	// The legacy UNIQUE constraint is retained: the previous release names it in
+	// its own ON CONFLICT, so dropping it here would break that slot.
+	if strings.Contains(up, "DROP CONSTRAINT notification_outbox_message_recipient_unique") {
+		t.Error("the legacy unique constraint must survive the expand release")
+	}
+
+	down := readChatMigration(t, "000042_notification_outbox_event_contract.down.sql")
+	for _, expected := range []string{
+		"DROP COLUMN IF EXISTS dedupe_key",
+		"DROP COLUMN IF EXISTS suppressed_reason",
+		"CHECK (kind IN ('mention'))",
+		"DROP TRIGGER IF EXISTS notification_outbox_enforce_transition",
+		"DROP FUNCTION IF EXISTS chat.enforce_notification_outbox_transition()",
+		"CHECK (status IN ('pending', 'processing', 'sent', 'failed'))",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("notification outbox down migration missing %q", expected)
+		}
+	}
+}
+
+// Every constraint 000042 leaves NOT VALID is validated by 000043. A constraint
+// that stayed NOT VALID would enforce new rows but let the planner ignore it,
+// and nothing would ever say so.
+func TestChatMigration_NotificationOutboxConstraintsAreValidated(t *testing.T) {
+	up := readChatMigration(t, "000042_notification_outbox_event_contract.up.sql")
+	validate := readChatMigration(t, "000043_validate_notification_outbox_event_contract.up.sql")
+	for _, constraint := range []string{
+		"notification_outbox_kind_check",
+		"notification_outbox_status_check",
+		"notification_outbox_source_type_check",
+		"notification_outbox_priority_check",
+		"notification_outbox_origin_check",
+		"notification_outbox_suppressed_reason_check",
+		"notification_outbox_dedupe_key_check",
+	} {
+		if !strings.Contains(up, constraint) {
+			t.Errorf("000042 does not define %s", constraint)
+		}
+		if !strings.Contains(validate, "VALIDATE CONSTRAINT "+constraint) {
+			t.Errorf("000043 does not validate %s", constraint)
+		}
+	}
+	if !strings.Contains(readChatMigration(t, "000043_validate_notification_outbox_event_contract.down.sql"), "NOT VALID") {
+		t.Error("the validate migration must be reversible to NOT VALID")
+	}
+}

@@ -132,19 +132,51 @@ func TestLinkSafetyStatesQueryIsSenderScoped(t *testing.T) {
 	}
 }
 
+// A notification parked while a scan ran is released only to a recipient who
+// still has legitimate access to the target. Membership can change during the
+// wait, so every part of the answer is re-read at promotion time rather than
+// trusted from creation.
 func TestPendingMentionPromotionRevalidatesRecipientTargetAccess(t *testing.T) {
 	for _, predicate := range []string{
+		// The tenant, the membership and the account, in that order.
 		"mention_workspace.status = 'active'",
 		"mention_member.status = 'active'",
 		"mention_recipient.status = 'active'",
 		"mention_recipient.deleted_at IS NULL",
-		"JOIN chat.channel_members mention_channel_member",
+		// The channel branch asks the project's one authority on channel
+		// visibility, which is what makes the answer the same one every other
+		// read path gives.
+		"chat.channel_visible_to_user(mention_channel.id, mention.user_id)",
+		"mention_channel.workspace_id = promoted.workspace_id",
+		"mention_channel.status = 'active'",
+		// The DM branch reads current membership of the current conversation.
 		"JOIN chat.dm_members mention_dm_member",
-		"mention_dm.type = 'group'",
 		"mention_dm_member.status = 'active'",
+		"mention_dm.workspace_id = promoted.workspace_id",
+		"mention_dm.status = 'active'",
 	} {
 		if !strings.Contains(resolvePendingMessagesQuery, predicate) {
-			t.Fatalf("pending mention promotion is missing %q", predicate)
+			t.Fatalf("pending notification promotion is missing %q", predicate)
+		}
+	}
+}
+
+// Two predicates that must not come back. Both described the promotion before
+// it carried anything but mentions, and both would now silently drop real
+// notifications — which is the kind of regression nothing else would report.
+func TestPendingNotificationPromotionDoesNotNarrowTargetAccess(t *testing.T) {
+	for predicate, why := range map[string]string{
+		// A reply or a DM notification reaches somebody who need not be an
+		// explicit channel member at all; requiring the row would drop every one
+		// of those in a public channel, and would contradict
+		// chat.channel_visible_to_user for the mentions it did release.
+		"JOIN chat.channel_members mention_channel_member": "channel visibility is chat.channel_visible_to_user's answer",
+		// A message withheld in a one-to-one DM has to release its notification
+		// too; restricting the branch to group conversations would strand it.
+		"mention_dm.type = 'group'": "a one-to-one conversation notifies its members like any other",
+	} {
+		if strings.Contains(resolvePendingMessagesQuery, predicate) {
+			t.Fatalf("pending notification promotion must not require %q: %s", predicate, why)
 		}
 	}
 }

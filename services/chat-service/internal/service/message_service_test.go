@@ -59,29 +59,39 @@ type fakeMessageStore struct {
 	resolveMentionErr       error
 	authorizedMentionLabels map[string]string
 	resolveAuthorizedErr    error
-	editedMessage           domain.Message
-	editErr                 error
-	deletedMessage          domain.Message
-	deleteChanged           bool
-	deleteErr               error
-	editHistory             []domain.MessageEditHistory
-	linkSafetyStates        []domain.MessageLinkSafetyState
-	admissionResult         string
-	admittedWorkspace       string
-	admittedCapacity        storage.LinkScanCapacity
-	linkSafetyErr           error
-	linkSafetyWorkspace     string
-	linkSafetySender        string
-	linkSafetyIDs           []string
-	historyErr              error
-	forwardedMessage        domain.Message
-	forwardReplayed         bool
-	forwardErr              error
-	forwardSnapshot         storage.ForwardSnapshot
-	snapshotErr             error
-	replayMessage           domain.Message
-	replayErr               error
-	createReplayMessage     domain.Message
+	// eligibleAllMentionRecipients and eligibleAllMentionRecipientsErr control
+	// CountEligibleAllMentionRecipients (issue #776, SR-002). countEligibleCalls
+	// and lastCountEligibleDMID let a test assert it was (or wasn't) called, and
+	// with which conversation.
+	eligibleAllMentionRecipients    int
+	eligibleAllMentionRecipientsErr error
+	countEligibleCalls              int
+	lastCountEligibleDMID           string
+	lastCountEligibleSender         string
+	lastCountEligibleLimit          int
+	editedMessage                   domain.Message
+	editErr                         error
+	deletedMessage                  domain.Message
+	deleteChanged                   bool
+	deleteErr                       error
+	editHistory                     []domain.MessageEditHistory
+	linkSafetyStates                []domain.MessageLinkSafetyState
+	admissionResult                 string
+	admittedWorkspace               string
+	admittedCapacity                storage.LinkScanCapacity
+	linkSafetyErr                   error
+	linkSafetyWorkspace             string
+	linkSafetySender                string
+	linkSafetyIDs                   []string
+	historyErr                      error
+	forwardedMessage                domain.Message
+	forwardReplayed                 bool
+	forwardErr                      error
+	forwardSnapshot                 storage.ForwardSnapshot
+	snapshotErr                     error
+	replayMessage                   domain.Message
+	replayErr                       error
+	createReplayMessage             domain.Message
 	// createReplayOnRetry is what the *second* lookup finds: the concurrent case,
 	// where the first lookup misses and the insert then collides.
 	createReplayOnRetry domain.Message
@@ -419,6 +429,52 @@ func TestMessageService_EditMessage_RemovesExistingMention(t *testing.T) {
 	}
 }
 
+// issue #776: a group message already carrying @all (validly sent under the
+// new rule) must stay editable — re-derives the conversation's type from
+// s.dms, exactly as CreateDMMessage does, rather than trusting anything about
+// the message being edited.
+func TestMessageService_EditMessage_GroupPreservesAllMention(t *testing.T) {
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000) edited`
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+		ID: "msg-1", WorkspaceID: "ws-1", DMConversationID: "group-1", SenderID: user1,
+		Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+	}}}
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+
+	message, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, store,
+	).EditMessage(context.Background(), service.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+		Body: body, BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if message.BodyText != body {
+		t.Fatalf("edited body = %q, want preserved %q", message.BodyText, body)
+	}
+}
+
+func TestMessageService_EditMessage_DirectRejectsAllMention(t *testing.T) {
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+		ID: "msg-1", WorkspaceID: "ws-1", DMConversationID: "dm-1", SenderID: user1,
+		Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+	}}}
+
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")}, store,
+	).EditMessage(context.Background(), service.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+		Body: `@[all](mention:all:00000000-0000-0000-0000-000000000000)`, BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput, got %v", err)
+	}
+}
+
 func TestMessageService_EditMessage_RejectsUnauthorizedMention(t *testing.T) {
 	const mentionedUserID = "99999999-9999-9999-9999-999999999999"
 	store := &fakeMessageStore{
@@ -583,6 +639,23 @@ func (f *fakeMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _, 
 		return f.mentionLabels, f.resolveAuthorizedErr
 	}
 	return f.authorizedMentionLabels, f.resolveAuthorizedErr
+}
+
+// CountEligibleAllMentionRecipientsUpTo saturates like the real store does, so
+// a test setting eligibleAllMentionRecipients to a number far above the bound
+// still sees what production would see: the ceiling, never the true size.
+func (f *fakeMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, dmConversationID, senderID string, limit int) (int, error) {
+	f.countEligibleCalls++
+	f.lastCountEligibleDMID = dmConversationID
+	f.lastCountEligibleSender = senderID
+	f.lastCountEligibleLimit = limit
+	if f.eligibleAllMentionRecipientsErr != nil {
+		return 0, f.eligibleAllMentionRecipientsErr
+	}
+	if f.eligibleAllMentionRecipients > limit {
+		return limit, nil
+	}
+	return f.eligibleAllMentionRecipients, nil
 }
 
 func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {
@@ -1133,21 +1206,535 @@ func TestMessageService_CreateDMMessage_DirectRejectsManualV3Mention(t *testing.
 	}
 }
 
-func TestMessageService_CreateDMMessage_GroupRejectsAllMention(t *testing.T) {
+// issue #776: @all in a group DM is allowed, preserved verbatim (like a
+// channel's), and never resolved through ResolveAuthorizedMentionLabels — the
+// "all" token carries no id the sender chose, so there is nothing to
+// authorize. The actual recipient expansion is delegated to storage via
+// MentionAllGroupMembers, resolved from live membership in the same statement
+// as the INSERT — never from a list this layer could compute ahead of time.
+func TestMessageService_CreateDMMessage_GroupAllowsAllMention(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-all-group"}}
+	got, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   body,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil || got.ID != "msg-all-group" {
+		t.Fatalf("CreateDMMessage: got=%+v err=%v", got, err)
+	}
+	if msgs.createCalls != 1 || msgs.resolveAuthorizedCalls != 0 {
+		t.Fatalf("createCalls=%d resolveAuthorizedCalls=%d", msgs.createCalls, msgs.resolveAuthorizedCalls)
+	}
+	if msgs.lastCreateInput.BodyText != body {
+		t.Fatalf("body = %q, want preserved %q", msgs.lastCreateInput.BodyText, body)
+	}
+	if !msgs.lastCreateInput.MentionAllGroupMembers {
+		t.Fatalf("expected MentionAllGroupMembers to be set for a group @all send")
+	}
+	if len(msgs.lastCreateInput.MentionedUserIDs) != 0 {
+		t.Fatalf("all is not a user id: MentionedUserIDs=%#v", msgs.lastCreateInput.MentionedUserIDs)
+	}
+}
+
+func TestMessageService_CreateDMMessage_DirectRejectsAllMention(t *testing.T) {
+	msgs := &fakeMessageStore{}
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: activeDMConversation("ws-1", "dm-1")}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "dm-1", SenderID: user1,
+		BodyText:   `@[all](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("expected 1:1 @all rejection, err=%v createCalls=%d", err, msgs.createCalls)
+	}
+	// A 1:1 send never even asks how many recipients @all would reach: the
+	// send is refused before resolveOutgoingMentions could ever set
+	// mentions.AllMention, so the SR-002 pre-flight is never reached.
+	if msgs.countEligibleCalls != 0 {
+		t.Fatalf("expected no eligibility count for a rejected 1:1 send, got %d calls", msgs.countEligibleCalls)
+	}
+}
+
+// ---- SR-002: bounded @all fan-out ------------------------------------------
+//
+// eligibleAllMentionRecipients on the fake stands in for
+// CountEligibleAllMentionRecipients's real, set-based COUNT — these tests
+// exercise the service's own gating logic (call it, compare against
+// domain.MaxGroupAllMentionRecipients, refuse before persistMessage), not the
+// SQL predicate itself, which is proven separately in
+// message_all_mention_group_postgres_test.go against real PostgreSQL.
+
+// sr002GroupConversation is the fixture group-1 the SR-002 tests below send
+// @all into. Named apart from group_details_service_test.go's own
+// groupConversation() helper, which fixes a different conversation id
+// ("conv-1") for an unrelated panel.
+func sr002GroupConversation() domain.DMConversation {
+	return domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupAllMentionRecipientBounds(t *testing.T) {
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	tests := []struct {
+		name      string
+		eligible  int
+		wantAllow bool
+	}{
+		{name: "zero eligible recipients", eligible: 0, wantAllow: true},
+		{name: "one eligible recipient", eligible: 1, wantAllow: true},
+		{name: "exactly the bound", eligible: domain.MaxGroupAllMentionRecipients, wantAllow: true},
+		{name: "one over the bound", eligible: domain.MaxGroupAllMentionRecipients + 1, wantAllow: false},
+		// Far over the bound decides identically, and — because the fake
+		// saturates exactly like the store's LIMIT does — through the same
+		// ceiling value, never a number this large (SEC-776-01).
+		{name: "far over the bound", eligible: domain.MaxGroupAllMentionRecipients * 1000, wantAllow: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := &fakeMessageStore{
+				createdMessage:               domain.Message{ID: "msg-bound"},
+				eligibleAllMentionRecipients: tc.eligible,
+			}
+			_, err := service.NewMessageService(
+				&fakeChannelStore{}, &fakeDMStore{visibleConversation: sr002GroupConversation()}, msgs,
+			).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+				WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+				BodyText:   body,
+				BodyFormat: domain.MessageBodyFormatV3,
+			})
+			if msgs.countEligibleCalls != 1 || msgs.lastCountEligibleDMID != "group-1" {
+				t.Fatalf("expected exactly one eligibility count against group-1, calls=%d dmID=%q",
+					msgs.countEligibleCalls, msgs.lastCountEligibleDMID)
+			}
+			// SEC-776-01: the ceiling asked for is one past the bound, so the
+			// database never has to look further than the row that decides it.
+			if msgs.lastCountEligibleLimit != domain.MaxGroupAllMentionRecipients+1 {
+				t.Fatalf("counted up to %d, want %d — the bound decision must never read past one row over the limit",
+					msgs.lastCountEligibleLimit, domain.MaxGroupAllMentionRecipients+1)
+			}
+			if tc.wantAllow {
+				if err != nil || msgs.createCalls != 1 {
+					t.Fatalf("eligible=%d: expected allow, err=%v createCalls=%d", tc.eligible, err, msgs.createCalls)
+				}
+				return
+			}
+			if !errors.Is(err, domain.ErrGroupAllMentionRecipientsExceeded) || msgs.createCalls != 0 {
+				t.Fatalf("eligible=%d: expected ErrGroupAllMentionRecipientsExceeded with no write, err=%v createCalls=%d",
+					tc.eligible, err, msgs.createCalls)
+			}
+			// No partial fan-out: a rejected @all must never reach persistMessage,
+			// so nothing was ever handed to storage to (mis)write in the first
+			// place — not a subset of 50, not any recipient at all.
+			if msgs.lastCreateInput.MentionAllGroupMembers {
+				t.Fatalf("eligible=%d: MentionAllGroupMembers must never be set on a rejected send", tc.eligible)
+			}
+		})
+	}
+}
+
+// Individual mentions alongside @all, and multiple @all tokens, must not
+// change how many times or with what the eligibility count is asked —
+// CountEligibleAllMentionRecipients derives the count from live group
+// membership alone, never from MentionedUserIDs or how many "all" tokens
+// were written, so neither can inflate or duplicate it.
+func TestMessageService_CreateDMMessage_GroupAllMentionCountIgnoresIndividualMentionsAndDuplicateTokens(t *testing.T) {
+	const mentionedUserID = "11111111-1111-1111-1111-111111111111"
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "all plus an individual mention of someone already covered",
+			body: `@[all](mention:all:00000000-0000-0000-0000-000000000000) ` +
+				`@[Ana](mention:user:` + mentionedUserID + `)`,
+		},
+		{
+			name: "two all tokens in the same message",
+			body: `@[all](mention:all:00000000-0000-0000-0000-000000000000) ping ` +
+				`@[all](mention:all:00000000-0000-0000-0000-000000000000)`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := &fakeMessageStore{
+				createdMessage:               domain.Message{ID: "msg-dedupe"},
+				eligibleAllMentionRecipients: domain.MaxGroupAllMentionRecipients,
+				authorizedMentionLabels:      map[string]string{"user:" + mentionedUserID: "Ana"},
+			}
+			_, err := service.NewMessageService(
+				&fakeChannelStore{}, &fakeDMStore{visibleConversation: sr002GroupConversation()}, msgs,
+			).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+				WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+				BodyText:   tc.body,
+				BodyFormat: domain.MessageBodyFormatV3,
+			})
+			if err != nil || msgs.createCalls != 1 {
+				t.Fatalf("expected allow at exactly the bound, err=%v createCalls=%d", err, msgs.createCalls)
+			}
+			if msgs.countEligibleCalls != 1 {
+				t.Fatalf("expected exactly one eligibility count regardless of token/mention count, got %d",
+					msgs.countEligibleCalls)
+			}
+		})
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupForgedAllTokenNeverReachesEligibilityCount(t *testing.T) {
+	msgs := &fakeMessageStore{eligibleAllMentionRecipients: 1}
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: sr002GroupConversation()}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   `@[Ana](mention:all:11111111-1111-1111-1111-111111111111)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("expected forged all-id rejection, err=%v createCalls=%d", err, msgs.createCalls)
+	}
+	// SR-001's canonicalization runs, and fails, before SR-002's count is ever
+	// asked for — a forged token never earns a look at group size.
+	if msgs.countEligibleCalls != 0 {
+		t.Fatalf("expected no eligibility count for a forged token, got %d calls", msgs.countEligibleCalls)
+	}
+}
+
+func TestMessageService_CreateChannelMessage_AllMentionNeverCountsEligibility(t *testing.T) {
+	channels := &fakeChannelStore{visibleChannel: publicActiveChannel("ws-1", "ch-1")}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-channel-all"}}
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	_, err := service.NewMessageService(channels, &fakeDMStore{}, msgs).
+		CreateChannelMessage(context.Background(), service.CreateChannelMessageInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", SenderID: user1,
+			BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+		})
+	if err != nil {
+		t.Fatalf("CreateChannelMessage: %v", err)
+	}
+	// Channel @all stays exactly as it was before #776: never expanded, never
+	// bounded, never even asked about — SR-002 is a group-DM-only contract.
+	if msgs.countEligibleCalls != 0 {
+		t.Fatalf("expected no eligibility count for a channel send, got %d calls", msgs.countEligibleCalls)
+	}
+	if msgs.lastCreateInput.MentionAllGroupMembers {
+		t.Fatalf("channel send must never set MentionAllGroupMembers")
+	}
+}
+
+// ---- SEC-776-02: the negative matrix, written with @all in the body --------
+//
+// Every case below is a send whose body carries the canonical @all token, so
+// what they prove is specifically that the new path — canonicalization,
+// authorization, bound, storage — inherits the conversation's existing
+// security policy rather than opening a parallel one. A generic "message to an
+// invisible target is refused" test cannot prove that: it never exercises
+// canonicalizeAllMentionTokens, never sets MentionAllGroupMembers, and never
+// reaches the eligibility count.
+//
+// The shared expectation in all of them is threefold: the same
+// non-enumerating domain.ErrNotFound the conversation itself produces, no
+// message written, and — the part that matters most for this finding — no
+// eligibility count issued. An unauthorized caller must not be able to make
+// the server measure a group they cannot see.
+func TestMessageService_CreateDMMessage_AllMentionNegativeMatrix(t *testing.T) {
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	tests := []struct {
+		name string
+		// dms is the DM store as the scenario leaves it. Every one of these
+		// resolves through the same GetVisibleConversationByID predicate
+		// (workspace active + workspace member active + conversation active +
+		// active dm_members row), which is why they are indistinguishable.
+		dms    *fakeDMStore
+		sender string
+	}{
+		{
+			name:   "non-member of an existing group",
+			dms:    &fakeDMStore{getVisibleErr: domain.ErrNotFound},
+			sender: user2,
+		},
+		{
+			name:   "group in another workspace",
+			dms:    &fakeDMStore{getVisibleErr: domain.ErrNotFound},
+			sender: user1,
+		},
+		{
+			name:   "sender removed from the group before the send",
+			dms:    &fakeDMStore{getVisibleErr: domain.ErrNotFound},
+			sender: user1,
+		},
+		{
+			name:   "conversation that does not exist",
+			dms:    &fakeDMStore{getVisibleErr: domain.ErrNotFound},
+			sender: user1,
+		},
+		{
+			name:   "conversation that exists but is archived/inaccessible",
+			dms:    &fakeDMStore{getVisibleErr: domain.ErrNotFound},
+			sender: user1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs := &fakeMessageStore{
+				createdMessage: domain.Message{ID: "must-not-be-created"},
+				// Deliberately over the bound: if authorization ever fell through
+				// to the bound check, the caller would get the SR-002 error
+				// instead of the non-enumerating one, and that difference would
+				// itself disclose that the group exists and how big it is.
+				eligibleAllMentionRecipients: domain.MaxGroupAllMentionRecipients + 1,
+			}
+			_, err := service.NewMessageService(&fakeChannelStore{}, tc.dms, msgs).
+				CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+					WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: tc.sender,
+					BodyText:   body,
+					BodyFormat: domain.MessageBodyFormatV3,
+				})
+			if !errors.Is(err, domain.ErrNotFound) {
+				t.Fatalf("expected the conversation's own non-enumerating ErrNotFound, got %v", err)
+			}
+			if errors.Is(err, domain.ErrGroupAllMentionRecipientsExceeded) {
+				t.Fatalf("the bound error must never reach an unauthorized caller: it would disclose the group")
+			}
+			if msgs.createCalls != 0 {
+				t.Fatalf("expected no write, createCalls=%d", msgs.createCalls)
+			}
+			if msgs.countEligibleCalls != 0 {
+				t.Fatalf("expected no eligibility count for an unauthorized target, got %d calls — an unauthorized caller must not be able to make the server measure a group",
+					msgs.countEligibleCalls)
+			}
+		})
+	}
+}
+
+// The comparison the finding actually asks for: an authorized member of an
+// oversized group is told the bound was exceeded, and every unauthorized actor
+// is told exactly what they were told before @all existed. The two answers are
+// reachable only from opposite sides of the authorization boundary, so the
+// specific error can never be used to probe for a group's existence or size.
+func TestMessageService_CreateDMMessage_AllMentionBoundErrorIsPostAuthorizationOnly(t *testing.T) {
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	overBound := domain.MaxGroupAllMentionRecipients + 1
+
+	authorized := &fakeMessageStore{eligibleAllMentionRecipients: overBound}
+	_, authorizedErr := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: sr002GroupConversation()}, authorized,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+	})
+
+	unauthorized := &fakeMessageStore{eligibleAllMentionRecipients: overBound}
+	_, unauthorizedErr := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{getVisibleErr: domain.ErrNotFound}, unauthorized,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user2,
+		BodyText: body, BodyFormat: domain.MessageBodyFormatV3,
+	})
+
+	if !errors.Is(authorizedErr, domain.ErrGroupAllMentionRecipientsExceeded) {
+		t.Fatalf("an authorized member of an oversized group must be told why, got %v", authorizedErr)
+	}
+	if !errors.Is(unauthorizedErr, domain.ErrNotFound) ||
+		errors.Is(unauthorizedErr, domain.ErrGroupAllMentionRecipientsExceeded) {
+		t.Fatalf("an outsider must get the same non-enumerating answer as before, got %v", unauthorizedErr)
+	}
+	if unauthorized.countEligibleCalls != 0 || authorized.countEligibleCalls != 1 {
+		t.Fatalf("the group is measured only for someone allowed to send to it: authorized=%d unauthorized=%d",
+			authorized.countEligibleCalls, unauthorized.countEligibleCalls)
+	}
+}
+
+// ---- SR-001: forged "all" token canonicalization -------------------------
+//
+// The codec's grammar accepts any UUID and any label on an "all" token — only
+// the service layer knows that just one id is canonical. These tests are the
+// evidence that a structurally valid but forged token can neither disguise a
+// group-wide broadcast as an ordinary mention (forged label) nor sneak past
+// as some other unrecognized reference (forged id), and that this holds for
+// a body constructed directly here, exactly as it would for one a compromised
+// or custom client fabricated by hand — nothing about this path goes through
+// the TipTap editor or any client-side synthesis.
+
+func TestMessageService_CreateDMMessage_GroupRejectsForgedAllMentionID(t *testing.T) {
 	conversation := domain.DMConversation{
 		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
 		Status: domain.DMConversationStatusActive,
 	}
 	msgs := &fakeMessageStore{}
+	// The exact shape named in the finding: a label that reads as an ordinary
+	// person, wrapped around mentionType=all with an arbitrary (non-sentinel)
+	// id. It must produce no message and, in particular, no broadcast.
 	_, err := service.NewMessageService(
 		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
 	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
 		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
-		BodyText:   `@[all](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyText:   `@[Ana](mention:all:11111111-1111-1111-1111-111111111111)`,
 		BodyFormat: domain.MessageBodyFormatV3,
 	})
 	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
-		t.Fatalf("expected group @all rejection, err=%v createCalls=%d", err, msgs.createCalls)
+		t.Fatalf("expected forged all-id rejection with no broadcast, err=%v createCalls=%d", err, msgs.createCalls)
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupCanonicalizesForgedAllMentionLabel(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-forged-label"}}
+	// Correct (sentinel) id, forged label — the disguise this finding is about:
+	// visually "@Ana" while the token still resolves the way "all" does.
+	got, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   `@[Ana](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil || got.ID != "msg-forged-label" {
+		t.Fatalf("CreateDMMessage: got=%+v err=%v", got, err)
+	}
+	want := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	if msgs.lastCreateInput.BodyText != want {
+		t.Fatalf("body = %q, want canonicalized %q — the forged label must never survive to storage/rendering", msgs.lastCreateInput.BodyText, want)
+	}
+	if !msgs.lastCreateInput.MentionAllGroupMembers {
+		t.Fatalf("expected MentionAllGroupMembers to still be set: the broadcast is real, just no longer disguised")
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupCanonicalizesEmptyAllMentionLabel(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-empty-label"}}
+	got, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   `@[](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil || got.ID != "msg-empty-label" {
+		t.Fatalf("CreateDMMessage: got=%+v err=%v", got, err)
+	}
+	want := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	if msgs.lastCreateInput.BodyText != want {
+		t.Fatalf("body = %q, want canonicalized %q", msgs.lastCreateInput.BodyText, want)
+	}
+}
+
+// SR-003 negative matrix item 10: two "all" tokens in one body. Both canonical
+// is accepted and produces a single expansion (deduplication itself is a
+// storage-layer fact, proven in the real-PostgreSQL suite; this proves the
+// service layer's canonicalization doesn't choke on, or otherwise mistreat, a
+// repeated token). One of the two being forged still rejects the whole
+// message — canonicalizeAllMentionTokens requires every "all" token to carry
+// the sentinel id, not just the first one found.
+func TestMessageService_CreateDMMessage_GroupTwoCanonicalAllTokensAccepted(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{createdMessage: domain.Message{ID: "msg-two-all"}}
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000) ping ` +
+		`@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	got, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   body,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil || got.ID != "msg-two-all" {
+		t.Fatalf("CreateDMMessage: got=%+v err=%v", got, err)
+	}
+	if msgs.lastCreateInput.BodyText != body {
+		t.Fatalf("body = %q, want unchanged %q (both tokens already canonical)", msgs.lastCreateInput.BodyText, body)
+	}
+	if !msgs.lastCreateInput.MentionAllGroupMembers {
+		t.Fatalf("expected MentionAllGroupMembers set — the storage layer's UNION is what dedupes the double expansion, not a count here")
+	}
+}
+
+func TestMessageService_CreateDMMessage_GroupRejectsWhenOneOfTwoAllTokensIsForged(t *testing.T) {
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+	msgs := &fakeMessageStore{}
+	body := `@[all](mention:all:00000000-0000-0000-0000-000000000000) ping ` +
+		`@[Ana](mention:all:11111111-1111-1111-1111-111111111111)`
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, msgs,
+	).CreateDMMessage(context.Background(), service.CreateDMMessageInput{
+		WorkspaceID: "ws-1", ConversationID: "group-1", SenderID: user1,
+		BodyText:   body,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) || msgs.createCalls != 0 {
+		t.Fatalf("expected rejection with no broadcast when any all-token is forged, err=%v createCalls=%d", err, msgs.createCalls)
+	}
+}
+
+func TestMessageService_EditMessage_GroupRejectsForgedAllMentionID(t *testing.T) {
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+		ID: "msg-1", WorkspaceID: "ws-1", DMConversationID: "group-1", SenderID: user1,
+		Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+	}}}
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+
+	// A message validly created with the canonical @all must not become an
+	// exploit through an edit that keeps the sentinel id but not the label —
+	// nor through one that swaps in an arbitrary id.
+	_, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, store,
+	).EditMessage(context.Background(), service.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+		Body:       `@[Ana](mention:all:11111111-1111-1111-1111-111111111111)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("expected ErrInvalidInput for a forged all-id on edit, got %v", err)
+	}
+}
+
+func TestMessageService_EditMessage_GroupCanonicalizesForgedAllMentionLabel(t *testing.T) {
+	store := &fakeMessageStore{messagesByKey: map[string]domain.Message{"ws-1:msg-1": {
+		ID: "msg-1", WorkspaceID: "ws-1", DMConversationID: "group-1", SenderID: user1,
+		Kind: domain.MessageKindUser, Status: domain.MessageStatusActive,
+	}}}
+	conversation := domain.DMConversation{
+		ID: "group-1", WorkspaceID: "ws-1", Type: domain.DMConversationTypeGroup,
+		Status: domain.DMConversationStatusActive,
+	}
+
+	message, err := service.NewMessageService(
+		&fakeChannelStore{}, &fakeDMStore{visibleConversation: conversation}, store,
+	).EditMessage(context.Background(), service.EditMessageInput{
+		WorkspaceID: "ws-1", MessageID: "msg-1", EditorID: user1,
+		Body:       `@[Ana](mention:all:00000000-0000-0000-0000-000000000000)`,
+		BodyFormat: domain.MessageBodyFormatV3,
+	})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	want := `@[all](mention:all:00000000-0000-0000-0000-000000000000)`
+	if message.BodyText != want {
+		t.Fatalf("edited body = %q, want canonicalized %q", message.BodyText, want)
 	}
 }
 

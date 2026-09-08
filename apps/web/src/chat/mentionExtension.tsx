@@ -20,12 +20,19 @@ const mentionFetchDebounceMs = 150;
 // typing "@" and narrowing by name.
 const ALL_CANDIDATE: MentionCandidate = { mentionType: "all", id: ALL_MENTION_ID, label: "all" };
 
+/**
+ * @all is offered for a channel and for a "dm" target, but a "dm" target only
+ * ever reaches here for a group: useConversationTarget sets mentionTarget (and
+ * therefore ever calls setMentionTarget with a "dm" kind) only when the active
+ * DM's type is "group" — a 1:1 DM stays on the v2 editor with no mention
+ * extension at all, so this function is never asked about one.
+ */
 function withAllCandidate(
   target: MentionTarget,
   query: string,
   candidates: MentionCandidate[],
 ): MentionCandidate[] {
-  if (target.kind !== "channel") return candidates;
+  if (target.kind !== "channel" && target.kind !== "dm") return candidates;
   const matches = ALL_CANDIDATE.label.startsWith(query.toLowerCase());
   return matches ? [...candidates, ALL_CANDIDATE] : candidates;
 }

@@ -389,6 +389,146 @@
   margin-top: 18px;
 }
 
+/* ── Section collapse + unread-only controls (issue #779, refined in #787) ───
+   The label row holds the collapse button (which owns the heading text), the
+   unread conversation count — present only when it is greater than zero — and
+   the "show unread when collapsed" switch. All of them are siblings, never
+   nested buttons. */
+
+.chat-sidebar__section-heading {
+  margin: 0;
+  min-width: 0;
+  /* `h2` gets explicit font-size/font-weight from the browser's own
+     stylesheet, which inheriting alone cannot override — this is what let the
+     heading render at the browser's default size/weight instead of the
+     sidebar's. letter-spacing, text-transform and color remain inherited from
+     `.chat-sidebar__section-label` as before. */
+  font: inherit;
+}
+
+.chat-sidebar__section-collapse {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.chat-sidebar__section-collapse:hover {
+  color: var(--cs-sidebar-text);
+}
+
+.chat-sidebar__section-collapse:focus-visible,
+.chat-sidebar__section-unread-toggle:focus-visible {
+  outline: 2px solid var(--cs-primary-soft);
+  outline-offset: 2px;
+}
+
+.chat-sidebar__section-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.chat-sidebar__section-chevron--collapsed {
+  transform: rotate(-90deg);
+}
+
+.chat-sidebar__section-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* Only rendered when it is greater than zero (issue #787), so the reserved
+   width below applies to a real count and never to an empty column. */
+.chat-sidebar__section-unread-count {
+  min-width: 1rem;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--cs-sidebar-muted);
+}
+
+/* ── The "show unread when collapsed" switch (issue #787) ────────────────────
+   Drawn as a rail and a thumb rather than an eye icon. The hit target is the
+   button, which stays comfortably larger than the rail it contains — the rail
+   is 26×14, the target is 34×24, so pointer, touch and keyboard all aim at the
+   same generous box. The hover hint is the button's own `title`, so there is no
+   positioned box here to clip against the nav's scrollport or widen it. */
+.chat-sidebar__section-unread-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 24px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--cs-sidebar-muted);
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.chat-sidebar__section-unread-toggle:hover {
+  background: var(--cs-sidebar-hover);
+}
+
+.chat-sidebar__section-unread-track {
+  display: inline-flex;
+  align-items: center;
+  width: 26px;
+  height: 14px;
+  padding: 2px;
+  border-radius: 999px;
+  background: var(--cs-sidebar-hover);
+  box-shadow: inset 0 0 0 1px var(--cs-sidebar-divider);
+  transition: background 0.12s;
+}
+
+.chat-sidebar__section-unread-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--cs-sidebar-muted);
+  transition:
+    transform 0.12s ease,
+    background 0.12s;
+}
+
+/* State never communicated by colour alone: the primary rail is the tint, but
+   it is the thumb's travel to the far side — plus role="switch"/aria-checked
+   and the accessible name — that actually say "on". */
+.chat-sidebar__section-unread-toggle--on .chat-sidebar__section-unread-track {
+  background: var(--cs-primary);
+  box-shadow: inset 0 0 0 1px var(--cs-primary-soft);
+}
+
+.chat-sidebar__section-unread-toggle--on .chat-sidebar__section-unread-thumb {
+  background: #fff;
+  transform: translateX(12px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-sidebar__section-unread-track,
+  .chat-sidebar__section-unread-thumb {
+    transition: none;
+  }
+}
+
 /* ── Collapsible Categories (RF-17) ─────────────────────────────────────────── */
 
 .chat-sidebar__categories-list {

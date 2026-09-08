@@ -224,6 +224,28 @@ async function expectNoRootScroll(page: Page, label: string) {
   return geometry;
 }
 
+/**
+ * The sidebar's rendered width, and the width left over for the conversation.
+ *
+ * Issue #787 made the nav track fluid (`clamp(240px, 18vw, 288px)`), so the
+ * expected value is a range rather than a number: `vw` resolves against the
+ * viewport and lands on fractions at most sizes. Measuring the main column at
+ * the same time is what keeps the guard honest — a nav that grew at the
+ * conversation's expense would still satisfy a width assertion on its own.
+ */
+async function readColumnWidths(page: Page) {
+  return page.evaluate(() => {
+    const width = (selector: string) => {
+      const element = document.querySelector(selector);
+      return element ? element.getBoundingClientRect().width : null;
+    };
+    return {
+      sidebar: width('[data-testid="chat-sidebar"]'),
+      main: width(".chat-app__main"),
+    };
+  });
+}
+
 /** The sidebar's scrollport — the container long conversation lists belong in. */
 async function readSidebarNav(page: Page) {
   return page.evaluate(() => {
@@ -873,6 +895,56 @@ test.describe("layout responsivo", () => {
       await expectNoHorizontalScroll(page);
       await expectNoConversationScroll(page, "detalhes fechados");
       await expectNoRootScroll(page, "detalhes fechados");
+    });
+  }
+
+  /*
+   * ISSUE #787 — the nav column is fluid above 1280px and no longer narrows to
+   * 200px between 1024px and 1280px.
+   *
+   * Ranges, not exact numbers: 18vw is fractional at most of these widths, and
+   * an assertion on a single pixel would fail on rounding rather than on
+   * layout. The bounds below are what the issue actually promises.
+   */
+  for (const { viewport, sidebar, minMain } of [
+    { viewport: { width: 1920, height: 1080 }, sidebar: [286, 288] as const, minMain: 1200 },
+    { viewport: { width: 1440, height: 900 }, sidebar: [255, 264] as const, minMain: 900 },
+    { viewport: { width: 1280, height: 720 }, sidebar: [239, 241] as const, minMain: 700 },
+    { viewport: { width: 1100, height: 800 }, sidebar: [239, 241] as const, minMain: 700 },
+    { viewport: { width: 1024, height: 768 }, sidebar: [239, 241] as const, minMain: 600 },
+  ]) {
+    test(`${viewport.width}: a coluna de navegação mede ${sidebar[0]}–${sidebar[1]}px sem espremer a conversa`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(viewport);
+      await openChannel(page, testInfo);
+
+      const closed = await readColumnWidths(page);
+      expect(closed.sidebar, `${viewport.width}: largura da sidebar`).toBeGreaterThanOrEqual(
+        sidebar[0],
+      );
+      expect(closed.sidebar, `${viewport.width}: largura da sidebar`).toBeLessThanOrEqual(
+        sidebar[1],
+      );
+      expect(closed.main, `${viewport.width}: largura da conversa`).toBeGreaterThanOrEqual(minMain);
+
+      // O título de seção mais longo cabe em uma linha em qualquer um desses
+      // tamanhos — é ele que a largura da coluna tem de acomodar.
+      const heading = page.getByRole("heading", { name: "Mensagens diretas" });
+      const box = (await heading.boundingBox())!;
+      expect(
+        box.height,
+        `${viewport.width}: "Mensagens diretas" quebrou em duas linhas`,
+      ).toBeLessThan(26);
+
+      // Com os detalhes abertos a sidebar não muda, e a conversa continua
+      // utilizável: acima de 1280px ela divide a linha com o painel, abaixo o
+      // painel a cobre — em nenhum dos casos a navegação cresce por cima dela.
+      await detailsToggle(page).click();
+      await expect(page.getByTestId("chat-conversation-details")).toBeVisible();
+      const open = await readColumnWidths(page);
+      expect(open.sidebar, `${viewport.width}: sidebar com detalhes abertos`).toBe(closed.sidebar);
+      await expectNoHorizontalScroll(page);
     });
   }
 });

@@ -40,7 +40,37 @@ func readinessChecks(cfg config.Config, options routerOptions) []health.Checker 
 		health.NewStaticChecker("config-loaded", true, health.CheckPass, ""),
 		smtpWorkerCheck(cfg),
 		smtpWorkerLivenessCheck(cfg, options.smtpWorkerProbe),
+		notificationWorkerCheck(cfg),
+		notificationWorkerLivenessCheck(cfg, options.notificationWorkerProbe),
 	}
+}
+
+// notificationWorkerCheck reports a configuration the outbox worker cannot run
+// on — most usefully a lease too short to cover one batch of deliveries, which
+// is the setting that would otherwise let two workers deliver one notification.
+func notificationWorkerCheck(cfg config.Config) health.Checker {
+	if !cfg.NotificationWorker.Enabled {
+		return health.NewStaticChecker("notification-worker-config", true, health.CheckPass, "")
+	}
+	if ready, reason := cfg.NotificationWorkerReady(); !ready {
+		return health.NewStaticChecker("notification-worker-config", true, health.CheckFail, reason)
+	}
+	return health.NewStaticChecker("notification-worker-config", true, health.CheckPass, "")
+}
+
+// notificationWorkerLivenessCheck answers "is the outbox worker actually
+// running", which the configuration check cannot: a worker with no delivery
+// channel, or one that stopped, leaves the pod Ready with nothing draining the
+// backlog.
+func notificationWorkerLivenessCheck(cfg config.Config, probe func() bool) health.Checker {
+	if !cfg.NotificationWorker.Enabled || probe == nil {
+		return health.NewStaticChecker("notification-worker-running", true, health.CheckPass, "")
+	}
+	if !probe() {
+		return health.NewStaticChecker("notification-worker-running", true, health.CheckFail,
+			"notification worker is enabled but not running")
+	}
+	return health.NewStaticChecker("notification-worker-running", true, health.CheckPass, "")
 }
 
 // smtpWorkerLivenessCheck answers "is the worker actually running", which the
