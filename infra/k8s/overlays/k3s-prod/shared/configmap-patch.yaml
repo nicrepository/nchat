@@ -30,10 +30,12 @@ data:
   # see their own messages and nobody else's — and the failure would look like
   # a realtime bug rather than a missing key.
   VALKEY_WS_BROADCAST_ENABLED: "true"
-  # chat-service sends 1 call.sync + 12 subscribe messages right after open
-  # (issue #455); raising only the burst absorbs that spike while the sustained
-  # rate stays at the code default.
-  WS_INBOUND_BURST: "60"
+  # Production WebSocket limits. The bootstrap sends an initial burst of
+  # control messages and users with many active conversations can sustain a
+  # higher legitimate control-message rate. Keep rate limiting enabled while
+  # providing operational headroom validated for production.
+  WS_INBOUND_MESSAGES_PER_MINUTE: "800"
+  WS_INBOUND_BURST: "200"
 
   # --- attachments ------------------------------------------------------
   # Uploads are a production feature, so the flag is on. With it off the routes
