@@ -40,6 +40,37 @@ const SUBSCRIPTION_RETRY_BASE_DELAY_MS = 250;
 const SUBSCRIPTION_RETRY_MAX_DELAY_MS = 2_000;
 const MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS = 3;
 
+/**
+ * The central delivery decision for one event (issue #744), produced by
+ * chat-service with `libs/go/platform/notificationpolicy` and consumed — never
+ * recomputed — by this client.
+ *
+ * Absent only on a legacy payload, from a chat-service that predates the
+ * contract, during rollout compatibility; an explicit `deny` is a different
+ * thing entirely. When present, each channel decision is authoritative on its
+ * own and none of them implies another.
+ */
+export interface WSNotificationPolicy {
+  policy_version: number;
+  /**
+   * Authorises the interruptive in-app surface — the toast — and nothing else.
+   * Not the sidebar, the badge or the unread count: suppressing an alert may
+   * never hide the message itself.
+   */
+  in_app: "allow" | "deny";
+  /** Authorises the local chime, and nothing else. */
+  sound: "allow" | "deny";
+  /** Authorises the OS-level notification surface, and nothing else. */
+  web_push: "allow" | "deny";
+  /** Present only on a suppression, in the policy's own closed vocabulary. */
+  reasons?: string[];
+  /** The class every recipient of this event shares. */
+  sound_class: "general" | "direct";
+  /** The recipients this message names, as the server's mention codec read it. */
+  named_user_ids?: string[];
+  names_everyone?: boolean;
+}
+
 export interface WSMessagePayload {
   id: string;
   workspace_id: string;
@@ -65,6 +96,8 @@ export interface WSMessagePayload {
    * the client that reads it.
    */
   link_safety_state?: unknown;
+  /** The central delivery decision. See WSNotificationPolicy. */
+  notification_policy?: WSNotificationPolicy;
   is_removed: boolean;
   created_at: string;
   updated_at: string;

@@ -57,6 +57,17 @@ func (f *fakeOutbox) seedPending(id string) *fakeRow {
 	return f.seed(id, notificationevent.StatePending)
 }
 
+// seedPendingMuted adds a pending event whose recipient has muted the
+// conversation it happened in — the state the outbox projection resolves from
+// chat.conversation_notification_prefs (issue #744).
+func (f *fakeOutbox) seedPendingMuted(id string) *fakeRow {
+	row := f.seedPending(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row.event.Muted = true
+	return row
+}
+
 // seedEligible adds an event a policy has already approved.
 //
 // It carries an availability instant, because every claimable row does: that is
@@ -82,8 +93,12 @@ func (f *fakeOutbox) seed(id string, state notificationevent.State) *fakeRow {
 			Priority:    "high",
 			SourceType:  "message",
 			SourceID:    "msg-" + id,
-			DedupeKey:   "message:msg-" + id + ":mention",
-			OccurredAt:  f.now(),
+			// Every row the producers write carries an origin, and the column
+			// defaults to 'live'. A fixture without one would be a row the
+			// policy is right to refuse, which is not what these tests are for.
+			Origin:     "live",
+			DedupeKey:  "message:msg-" + id + ":mention",
+			OccurredAt: f.now(),
 		},
 		state: state,
 	}

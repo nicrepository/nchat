@@ -48,7 +48,12 @@ type NotificationEvent struct {
 	Priority    string
 	SourceType  string
 	SourceID    string
-	DedupeKey   string
+	// Origin is where the event came from: live, import, replay or resync. It is
+	// read because the policy engine refuses to alert for anything that did not
+	// just happen, and a timestamp cannot substitute for it — an import writes
+	// old occurred_at values and a replay writes new ones.
+	Origin    string
+	DedupeKey string
 	// Attempts is how many times this event has been claimed, counting the
 	// claim that produced this struct. It is therefore also the *identity of
 	// that claim*, and every finalisation carries it back as a predicate.
@@ -61,6 +66,17 @@ type NotificationEvent struct {
 	// only condition checked, and the two claims were indistinguishable.
 	Attempts   int
 	OccurredAt time.Time
+	// Muted is this recipient's own mute preference for the conversation the
+	// event happened in, resolved by the projection below rather than by a
+	// lookup per row (issue #744).
+	//
+	// It is a resolved fact and not a decision: what a mute *does* is decided by
+	// libs/go/platform/notificationpolicy, which is the only place that may
+	// suppress. False means "no preference row reaches this event", which is
+	// exactly what chat.conversation_notification_prefs encodes as not muted —
+	// unmuting deletes the row rather than writing false, so absence is the
+	// product's own default and not a guess made here.
+	Muted bool
 }
 
 // NotificationOutboxStore is every persistent operation the notification worker
@@ -89,12 +105,71 @@ func NewPGXNotificationOutboxStore(pool Pool) *PGXNotificationOutboxStore {
 	return &PGXNotificationOutboxStore{pool: pool}
 }
 
+// mutedProjection resolves the recipient's own mute preference for the
+// conversation the event happened in (issue #744).
+//
+// # Why it is part of the projection
+//
+// The policy engine reads Preferences.Muted, and the only server-side authority
+// for it is chat.conversation_notification_prefs — the same table the sidebar's
+// ListMuted reads and the mute endpoint writes. No table, column, cache or
+// configuration is added here: this is a read of the source of truth that
+// already exists.
+//
+// It is a correlated subquery inside the batch read rather than a lookup the
+// worker performs per event, and that is the whole point. A per-row resolution
+// would be one query per notification — the N+1 the issue forbids — while here
+// a batch of BatchSize events costs exactly the one statement it already cost.
+//
+// # Why the join goes through chat.messages
+//
+// An outbox row names its source (message_id) and not its conversation, so the
+// conversation is the message's: channel_id XOR dm_conversation_id, the
+// invariant 000004 enforces. Each side is matched against the preference column
+// of its own kind, so a preference can only ever match the kind of target it was
+// written for.
+//
+// # Scoping, which is the security-relevant part
+//
+// Three predicates, and all three are required:
+//
+//   - p.user_id = o.recipient_user_id, so one member muting a conversation can
+//     never silence it for another. The table is keyed by user for exactly this
+//     reason;
+//   - p.workspace_id = o.workspace_id, so a preference row cannot reach an event
+//     in another tenant. The prefs table has separate foreign keys to workspaces
+//     and to the target rather than a composite one, so a row naming a workspace
+//     that does not own the target is insertable — this predicate is what makes
+//     it unusable;
+//   - m.workspace_id = o.workspace_id, so the conversation the preference is
+//     matched against is one this event's tenant owns.
+//
+// Every identifier compared here comes from the persisted row or from the
+// message it names. Nothing a client asserted takes part.
+//
+// Membership is deliberately not re-checked. The write path already established
+// it — NotificationPrefStore.Mute admits only a conversation the user could see
+// — and re-applying visibility on read would make a revoked membership *undo* a
+// mute, which is the direction that alerts someone who asked not to be.
+const mutedProjection = `
+	EXISTS (
+		SELECT 1
+		FROM chat.messages m
+		JOIN chat.conversation_notification_prefs p
+		  ON p.user_id = o.recipient_user_id
+		 AND p.workspace_id = o.workspace_id
+		 AND ((p.channel_id IS NOT NULL AND p.channel_id = m.channel_id)
+		   OR (p.dm_conversation_id IS NOT NULL AND p.dm_conversation_id = m.dm_conversation_id))
+		WHERE m.id = o.message_id
+		  AND m.workspace_id = o.workspace_id
+	)`
+
 // notificationColumns is the projection both reads share, so a column added to
 // one can never be forgotten in the other.
 const notificationColumns = `
 	o.id::text, o.workspace_id::text, o.recipient_user_id::text,
-	o.kind, o.priority, o.source_type, o.message_id::text,
-	COALESCE(o.dedupe_key, ''), o.attempts, o.occurred_at`
+	o.kind, o.priority, o.source_type, o.message_id::text, o.origin,
+	COALESCE(o.dedupe_key, ''), o.attempts, o.occurred_at,` + mutedProjection
 
 // listPendingQuery reads events no policy has looked at yet.
 //
@@ -467,7 +542,8 @@ func scanNotificationEvents(rows pgx.Rows, operation string) ([]NotificationEven
 		var event NotificationEvent
 		if err := rows.Scan(&event.ID, &event.WorkspaceID, &event.RecipientID,
 			&event.EventType, &event.Priority, &event.SourceType, &event.SourceID,
-			&event.DedupeKey, &event.Attempts, &event.OccurredAt); err != nil {
+			&event.Origin, &event.DedupeKey, &event.Attempts, &event.OccurredAt,
+			&event.Muted); err != nil {
 			return nil, fmt.Errorf("%s: %w", operation, err)
 		}
 		events = append(events, event)

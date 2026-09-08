@@ -40,6 +40,11 @@ type Notification struct {
 	Priority    string
 	SourceType  string
 	SourceID    string
+	// Origin is where the event came from — live, import, replay, resync — and
+	// it is the one field here no delivery adapter needs. It is carried because
+	// the policy reads it: an import backfilling a year of messages must not
+	// alert anybody, and only the producer can say that a row is one.
+	Origin string
 	// DedupeKey is the logical identity of the event, in the form
 	// libs/go/platform/notificationevent defines. Two rows with the same key in
 	// one workspace for one recipient cannot exist: the unique index refuses it.
@@ -55,6 +60,12 @@ type Notification struct {
 	// claim that has already moved on.
 	Attempt    int
 	OccurredAt time.Time
+	// Muted is the recipient's own mute preference for this conversation, as
+	// the outbox projection resolved it from chat.conversation_notification_prefs
+	// (issue #744). Like Origin, no delivery adapter reads it: it is carried
+	// because the policy does, and the policy is the only thing that may decide
+	// what a mute means.
+	Muted bool
 }
 
 // IdempotencyKey is what an adapter must present to a provider that supports
@@ -82,9 +93,11 @@ func notificationFrom(event storage.NotificationEvent) Notification {
 		Priority:    event.Priority,
 		SourceType:  event.SourceType,
 		SourceID:    event.SourceID,
+		Origin:      event.Origin,
 		DedupeKey:   event.DedupeKey,
 		Attempt:     event.Attempts,
 		OccurredAt:  event.OccurredAt,
+		Muted:       event.Muted,
 	}
 }
 
@@ -97,6 +110,12 @@ type Verdict struct {
 	// SuppressedReason is operational shorthand recorded against the row so an
 	// operator can answer "why did nobody get this?" months later.
 	SuppressedReason string
+	// PolicyVersion identifies the rule set that produced the verdict, so a
+	// decision recorded today can still be explained after the rules change.
+	// The reason goes to the outbox column; this goes to the log beside it,
+	// because the table has no column for it and inventing one would be a
+	// migration this issue does not need.
+	PolicyVersion int
 }
 
 // defaultSuppressedReason stands in for a policy that suppressed an event
@@ -121,9 +140,10 @@ func (v Verdict) Reason() string {
 
 // Evaluator decides whether an event should be delivered at all.
 //
-// This is the seam the policy engine plugs into. Nothing about quiet hours,
-// mute preferences, read state or channel selection belongs in the worker loop,
-// and none of it is here.
+// This is the seam the policy engine plugs into, and it is plugged in:
+// NewPolicyEvaluator is what the worker is built with, here and in the app
+// wiring. Nothing about quiet hours, mute preferences, read state or channel
+// selection belongs in the worker loop, and none of it is here.
 type Evaluator interface {
 	Evaluate(ctx context.Context, notification Notification) (Verdict, error)
 }
@@ -134,18 +154,6 @@ type EvaluatorFunc func(ctx context.Context, notification Notification) (Verdict
 // Evaluate calls f.
 func (f EvaluatorFunc) Evaluate(ctx context.Context, notification Notification) (Verdict, error) {
 	return f(ctx, notification)
-}
-
-// DeliverEverything is the policy in force until a policy engine exists: every
-// event a producer wrote is eligible.
-//
-// It suppresses nothing, and that is the honest default. A worker with no
-// policy must not invent one — inventing "probably do not send this" here would
-// be a product decision made in a retry loop.
-func DeliverEverything() Evaluator {
-	return EvaluatorFunc(func(context.Context, Notification) (Verdict, error) {
-		return Verdict{Deliver: true}, nil
-	})
 }
 
 // Deliverer is one delivery channel.

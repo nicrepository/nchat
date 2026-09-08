@@ -303,9 +303,98 @@ type MessagePayload struct {
 	// message has none, and — like the rest of this payload — dropped from the
 	// event relayed over the bus, where a remote instance re-reads it instead.
 	Attachments []MessageAttachmentPayload `json:"attachments,omitempty"`
+	// NotificationPolicy is the central delivery decision for this event
+	// (issue #744): what libs/go/platform/notificationpolicy allowed, so a
+	// subscriber consumes the decision instead of recomputing it.
+	//
+	// Always set on a payload this build produces, including for a message that
+	// is not notifiable at all — see notificationPolicyFor in the app package.
+	// That is deliberate and it is the rollout contract: absence means the
+	// server predates issue #744 and cannot answer, which a client must not
+	// read as a denial.
+	NotificationPolicy *NotificationPolicyPayload `json:"notification_policy,omitempty"`
 	// HasReference forces route-only delivery so each subscriber resolves RF-09
 	// through an authenticated GET. It is process-local and never serialized.
 	HasReference bool `json:"-"`
+}
+
+// Channel decisions, as the wire spells them.
+const (
+	// NotificationAllow means the central policy permitted the channel.
+	NotificationAllow = "allow"
+	// NotificationDeny means it did not. A client may never turn this into an
+	// allow; a local condition may only take an allow away.
+	NotificationDeny = "deny"
+)
+
+// Sound classes. They are the authoritative classification of the event, so a
+// client applying a local preference does not have to work out what kind of
+// event it received.
+const (
+	// SoundClassGeneral is activity in a room the recipient subscribes to.
+	SoundClassGeneral = "general"
+	// SoundClassDirect is a conversation addressed to its members — a DM or a
+	// group.
+	SoundClassDirect = "direct"
+)
+
+// NotificationPolicyPayload is the part of the delivery plan a realtime
+// subscriber can act on.
+//
+// It carries the decision, never the inputs: no schedule, no preferences, no
+// subscription, no token. A subscriber learns what was allowed and, for the one
+// preference that still has no server-side source of truth, which class of
+// event it was.
+//
+// The decision is per *recipient*, and it is authoritative wherever it appears.
+// The publisher encodes one for the whole target; the fan-out then re-evaluates
+// it against each subscriber's own preferences, so two subscribers of one
+// message can be sent different decisions. A client acts on the one it received
+// and never recomputes it.
+//
+// "Was I named" is the one per-recipient fact a client still resolves for
+// itself, from the authoritative naming below rather than from its own reading
+// of the body.
+type NotificationPolicyPayload struct {
+	// PolicyVersion is the rule set that produced this decision, so a client
+	// observation can be correlated with the policy that caused it.
+	PolicyVersion int `json:"policy_version"`
+	// InApp authorises the interruptive in-app surface — the toast — and
+	// nothing else. It is not the sidebar, the badge or the unread count: those
+	// are properties of the message and no policy may hide them.
+	//
+	// It is carried for the same reason as the other two and decided the same
+	// way: the engine plans three channels, and a plan that arrives with one of
+	// them missing is a plan the consumer has to complete by guessing. A client
+	// must never take an allow on a neighbouring channel as authorisation for
+	// this one.
+	InApp string `json:"in_app"`
+	// Sound authorises the local chime and nothing else.
+	Sound string `json:"sound"`
+	// WebPush authorises the OS-level notification surface and nothing else —
+	// the one a page raises through the Notification API while it is not in
+	// front of the reader.
+	//
+	// It is a separate decision, never derived from Sound: the engine decides
+	// each channel on its own, and a client that inferred one from the other
+	// would be re-deciding delivery. Today it is always a denial on this path,
+	// because the realtime evaluation runs on the foreground surface and
+	// declares no push capability; that is the honest state of a channel with
+	// no provider behind it, not a placeholder.
+	WebPush string `json:"web_push"`
+	// Reasons explains a suppression, in the policy's own closed vocabulary.
+	// Present exactly when the policy allowed no channel at all; a decision that
+	// merely routes an event away from one surface has nothing to explain.
+	Reasons []string `json:"reasons,omitempty"`
+	// SoundClass is the class every recipient of this event shares.
+	SoundClass string `json:"sound_class"`
+	// NamedUserIDs are the recipients the message names, and NamesEveryone says
+	// it names all of them. A recipient in either case is *mentioned*, which is
+	// the distinction the "mentions" preferences turn on. Both are derived by
+	// the server's own mention codec; neither is a new disclosure, since the
+	// tokens they come from are already in BodyText.
+	NamedUserIDs  []string `json:"named_user_ids,omitempty"`
+	NamesEveryone bool     `json:"names_everyone,omitempty"`
 }
 
 // MessageUpdatedPayload carries authoritative edit or deletion fields.

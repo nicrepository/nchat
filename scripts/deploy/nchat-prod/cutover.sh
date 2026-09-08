@@ -102,6 +102,21 @@ main() {
   require_context
   require_namespace
   mapping="$(collect_service_slots)"
+  # The reading that decides the mutation is the reading that gets classified,
+  # and it is classified here rather than only by whoever called this.
+  #
+  # A caller that validated its own earlier reading has proved something about a
+  # different moment: between that check and this one a Service can be deleted,
+  # have its selector cleared, or be patched to a value that is neither slot,
+  # and every one of those states used to reach switch_services_to_slot -- the
+  # `all_services_on_slot` test below simply returns false for them, which is
+  # the same answer it gives for an ordinary pending promotion. So the gate has
+  # to sit on this mapping, before anything is patched.
+  #
+  # A blue/green split still passes: that is the shape a cutover to this same
+  # target that stopped part-way leaves behind, and converging it is what a
+  # retry with the same --target exists for.
+  require_promotable_selectors "$mapping" "$target"
   print_context_banner "$mapping"
   echo "target slot: $target"
   # Two gates, and readiness alone is not the interesting one. A slot can be
@@ -119,7 +134,10 @@ main() {
   fi
   require_smoke_evidence "$target" "$target:$release"
   confirm "Move production traffic to slot $target"
-  if ! switch_services_to_slot "$target"; then
+  # Backends take the new slot before the browser is served the new bundle:
+  # a client is compatible with its own release or newer, never with an
+  # older backend. See service_switch_order.
+  if ! switch_services_to_slot "$target" backends-first; then
     echo "Cutover stopped part-way. Production is in a mixed state." >&2
     echo "Re-run 'cutover.sh --target $target' to finish converging, or" >&2
     echo "'rollback.sh --target <previous> <reason>' to go back. Do not leave it mixed." >&2

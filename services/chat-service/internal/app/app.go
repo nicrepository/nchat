@@ -212,6 +212,7 @@ func New(cfg config.Config) (*App, error) {
 	var pinSvc *service.PinService
 	var sidebarPinStore *storage.PGXSidebarPinStore
 	var conversationReadStateStore *storage.PGXConversationReadStateStore
+	var notificationPrefStore *storage.PGXNotificationPrefStore
 	var permissionSvc *service.PermissionService
 	var channelSvc *service.ChannelService
 	var channelCategorySvc *service.ChannelCategoryService
@@ -257,10 +258,11 @@ func New(cfg config.Config) (*App, error) {
 			// channelStore is both the category store and the visible-channel read
 			// side, so RF-17 groups channels through the same query the sidebar uses.
 			channelCategorySvc = service.NewChannelCategoryService(workspaceStore, memberStore, channelStore, channelStore)
+			notificationPrefStore = storage.NewPGXNotificationPrefStore(pool)
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).
 				WithPins(sidebarPinStore).
 				WithReadState(conversationReadStateStore).
-				WithNotificationPrefs(storage.NewPGXNotificationPrefStore(pool))
+				WithNotificationPrefs(notificationPrefStore)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages).
 				WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
 			// RF-21. Wired here, where the message service exists, and fatal:
@@ -436,6 +438,7 @@ func New(cfg config.Config) (*App, error) {
 	if channelCategorySvc != nil && reactionLimiter != nil {
 		channelCategories = httpapi.NewChannelCategoryHandler(workspaceStore, channelCategorySvc, reactionLimiter)
 	}
+	options = withRecipientPolicyOption(options, notificationPrefStore)
 	hub := ws.NewHub(authorizer, logger, bus, instanceID, options...)
 	wsHandler := ws.ServeWSWithConfig(hub, logger, wsWorkspaces, httpapi.GetContextUserID, wsHandlerConfig(cfg, sessionValidator, wsDisplayNames))
 
@@ -899,27 +902,28 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		body, quoted, attachments = "", nil, nil
 	}
 	return ws.MessagePayload{
-		ID:                msg.ID,
-		WorkspaceID:       msg.WorkspaceID,
-		ChannelID:         msg.ChannelID,
-		DMConversationID:  msg.DMConversationID,
-		SenderID:          msg.SenderID,
-		SenderDisplayName: msg.SenderDisplayName,
-		SenderAvatarURL:   msg.SenderAvatarURL,
-		Kind:              string(msg.Kind),
-		BodyText:          body,
-		BodyFormat:        string(msg.BodyFormat),
-		Status:            string(msg.Status),
-		LinkSafetyState:   string(msg.LinkSafety),
-		IsRemoved:         removed,
-		CreatedAt:         msg.CreatedAt,
-		UpdatedAt:         msg.UpdatedAt,
-		EditedAt:          editedAt,
-		DeletedAt:         deletedAt,
-		Quoted:            quoted,
-		Attachments:       attachments,
-		IsForwarded:       msg.ForwardedFromMessageID != "",
-		HasReference:      msg.ReferencedMessageID != "",
+		ID:                 msg.ID,
+		WorkspaceID:        msg.WorkspaceID,
+		ChannelID:          msg.ChannelID,
+		DMConversationID:   msg.DMConversationID,
+		SenderID:           msg.SenderID,
+		SenderDisplayName:  msg.SenderDisplayName,
+		SenderAvatarURL:    msg.SenderAvatarURL,
+		Kind:               string(msg.Kind),
+		BodyText:           body,
+		BodyFormat:         string(msg.BodyFormat),
+		Status:             string(msg.Status),
+		LinkSafetyState:    string(msg.LinkSafety),
+		IsRemoved:          removed,
+		CreatedAt:          msg.CreatedAt,
+		UpdatedAt:          msg.UpdatedAt,
+		EditedAt:           editedAt,
+		DeletedAt:          deletedAt,
+		Quoted:             quoted,
+		Attachments:        attachments,
+		IsForwarded:        msg.ForwardedFromMessageID != "",
+		NotificationPolicy: notificationPolicyFor(msg, removed, recipientFacts{}),
+		HasReference:       msg.ReferencedMessageID != "",
 	}
 }
 

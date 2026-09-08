@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { showBrowserMessageNotification } from "./browserNotification";
@@ -21,8 +21,14 @@ import {
   savePersistedUnread,
   type PersistedUnreadEntry,
 } from "./sidebarUnreadPersistence";
+import type { InAppAlert } from "./InAppMessageAlert";
 import { getSoundNotificationMode } from "./soundPreference";
-import { classifySoundEvent, shouldPlayMessageSound } from "./soundRules";
+import {
+  isNamedRecipient,
+  shouldExecuteInAppNotification,
+  shouldExecuteNativeNotification,
+  shouldExecuteSound,
+} from "./soundRules";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -338,60 +344,149 @@ function announceMessage(
   activeTarget: WSSubscriptionTarget | undefined,
   isMuted: boolean,
   onNavigate: (path: string) => void,
+  onInApp: (alert: InAppAlert) => void,
+  conversationName: string,
 ): boolean {
   const payload = event.payload;
   if (!payload) return false;
-  const classified = classifySoundEvent(payload, event.target_type, currentUserId);
-  if (isMuted) return classified.isMentioned;
+  // Authoritative: the server's own mention codec decided this, not a reading
+  // of the body here.
+  const named = isNamedRecipient(payload.notification_policy, currentUserId);
   const isWindowFocused =
     document.visibilityState === "visible" &&
     typeof document.hasFocus === "function" &&
     document.hasFocus();
-  const play = shouldPlayMessageSound({
-    mode: getSoundNotificationMode(),
+  const execution = {
+    policy: payload.notification_policy,
+    currentUserId,
+    localMode: getSoundNotificationMode(),
     // Already past the seenRealtimeMessageIds check at the call site — this
     // event is guaranteed fresh by the time it reaches this decision.
     isDuplicate: false,
     isOwnMessage: (payload.sender_id ?? "") === currentUserId,
-    category: classified.category,
-    isMentioned: classified.isMentioned,
+    isMutedConversation: isMuted,
     isActiveConversation:
       activeTarget?.kind === event.target_type && activeTarget.targetId === event.target_id,
     isWindowFocused,
+  };
+  // Three surfaces, three authorisations, asked separately. No answer may be
+  // reused for another: a toast, a chime and an OS notification are different
+  // interruptions and the policy decides each on its own channel.
+  announce(event, payload, {
+    canPlaySound: shouldExecuteSound(execution),
+    canShowNative: shouldExecuteNativeNotification(execution),
+    canShowInApp: shouldExecuteInAppNotification(execution),
+    isWindowFocused,
+    onNavigate,
+    onInApp,
+    conversationName,
   });
-  if (play) notifyOrChime(event, payload, isWindowFocused, onNavigate);
-  return classified.isMentioned;
+  return named;
+}
+
+interface AnnounceSurfaces {
+  canPlaySound: boolean;
+  canShowNative: boolean;
+  canShowInApp: boolean;
+  isWindowFocused: boolean;
+  onNavigate: (path: string) => void;
+  onInApp: (alert: InAppAlert) => void;
+  conversationName: string;
 }
 
 /**
- * The native notification and the chime are alternate channels for the same
- * eligible event, never both: a native one shown successfully replaces the
- * chime; anything else (denied/default/unsupported permission, a background API
- * failure, or the tab being in the foreground — native notifications never fire
- * there) falls through to the sound path.
+ * What the sidebar already knows about the conversation an event arrived in.
+ *
+ * One lookup rather than one per field: the mute preference and the
+ * conversation's name are two facts about the same row, and reading it twice is
+ * how they eventually come from different rows. The absent row is normalised
+ * here as well, so the caller reads two plain values instead of re-deciding what
+ * a missing conversation means at each use.
  */
-function notifyOrChime(
+function conversationRowFor(
+  event: WSMessageCreatedEvent,
+  state: SidebarState,
+): { muted: boolean; name: string } {
+  const items =
+    state.status !== "ready" ? [] : event.target_type === "channel" ? state.channels : state.dms;
+  const row = items.find(({ id }) => id === event.target_id);
+  return { muted: Boolean(row?.muted), name: row?.name ?? "" };
+}
+
+/**
+ * Raises the in-app surface, if its own channel authorised one.
+ *
+ * Separate from announce because building the alert is the whole of what this
+ * surface needs and none of it is shared with the other two: they take the
+ * message as it is, this one projects it onto what the alert renders.
+ */
+function raiseInAppAlert(
   event: WSMessageCreatedEvent,
   payload: NonNullable<WSMessageCreatedEvent["payload"]>,
-  isWindowFocused: boolean,
-  onNavigate: (path: string) => void,
+  surfaces: AnnounceSurfaces,
 ): void {
-  let shown = false;
-  if (!isWindowFocused) {
-    try {
-      shown = showBrowserMessageNotification({
-        targetKind: event.target_type,
-        targetId: event.target_id,
-        senderDisplayName: payload.sender_display_name,
-        bodyText: payload.body_text,
-        onNavigate,
-      }).shown;
-    } catch {
-      // The module already guards itself; this is defense in depth — the WS
-      // callback must never break because of it.
-    }
+  if (!surfaces.canShowInApp) return;
+  surfaces.onInApp({
+    messageId: payload.id,
+    targetKind: event.target_type,
+    targetId: event.target_id,
+    senderDisplayName: payload.sender_display_name ?? "",
+    // Typed unknown on the wire on purpose: it is a URL from another user's
+    // profile and the payload does not vouch for it. A non-string is simply
+    // no avatar, which the alert already renders as initials.
+    senderAvatarUrl:
+      typeof payload.sender_avatar_url === "string" ? payload.sender_avatar_url : undefined,
+    bodyText: payload.body_text ?? "",
+    conversationName: surfaces.conversationName,
+  });
+}
+
+/**
+ * Raises the OS-level surface, if its own channel authorised one and this
+ * window is not already in front of the reader. Reports whether it appeared,
+ * which is what tells the chime it would be redundant.
+ */
+function raiseNativeNotification(
+  event: WSMessageCreatedEvent,
+  payload: NonNullable<WSMessageCreatedEvent["payload"]>,
+  surfaces: AnnounceSurfaces,
+): boolean {
+  if (!surfaces.canShowNative || surfaces.isWindowFocused) return false;
+  try {
+    return showBrowserMessageNotification({
+      targetKind: event.target_type,
+      targetId: event.target_id,
+      senderDisplayName: payload.sender_display_name,
+      bodyText: payload.body_text,
+      onNavigate: surfaces.onNavigate,
+    }).shown;
+  } catch {
+    // The module already guards itself; this is defense in depth — the WS
+    // callback must never break because of it.
+    return false;
   }
-  if (shown) return;
+}
+
+/**
+ * Executes whichever surfaces were authorised.
+ *
+ * Where the reader is looking decides which mechanism makes sense, never
+ * whether it is allowed: a native notification is pointless while the tab is in
+ * front, and a chime is redundant once the operating system has already
+ * interrupted them. Both of those only ever remove an effect — nothing here can
+ * run a surface its own channel denied.
+ */
+function announce(
+  event: WSMessageCreatedEvent,
+  payload: NonNullable<WSMessageCreatedEvent["payload"]>,
+  surfaces: AnnounceSurfaces,
+): void {
+  // The in-app surface is its own channel and is raised on its own
+  // authorisation. It is not conditioned on the other two: a reader who
+  // permitted a toast and silenced the chime gets the toast.
+  raiseInAppAlert(event, payload, surfaces);
+  const shown = raiseNativeNotification(event, payload, surfaces);
+  if (shown || !surfaces.canPlaySound) return;
   // playMessageSound() already never throws, but the unread badge must update
   // even if that guarantee is ever violated — a failed chime is never allowed to
   // break message receipt.
@@ -406,6 +501,11 @@ function notifyOrChime(
 
 export function useChatSidebar() {
   const [state, dispatch] = useReducer(reducer, { status: "loading" });
+  // The in-app surface of the delivery plan (issue #744). One alert, the newest,
+  // and nothing kept: it is a notification, not a history. Held here because
+  // this hook is where an arriving message is already turned into effects.
+  const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
+  const dismissInAppAlert = useCallback(() => setInAppAlert(null), []);
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const openedTarget = targetFromPath(pathname);
@@ -616,21 +716,20 @@ export function useChatSidebar() {
         refreshSidebar();
         return;
       }
+      const row = conversationRowFor(event, state);
       const isMentioned =
         state.status === "ready" &&
         announceMessage(
           event,
           state.currentUserId,
           openedTarget,
-          Boolean(
-            (event.target_type === "channel" ? state.channels : state.dms).find(
-              ({ id }) => id === event.target_id,
-            )?.muted,
-          ),
+          row.muted,
           (path) => {
             navigate(path);
             refreshSidebar();
           },
+          setInAppAlert,
+          row.name,
         );
       dispatch({
         type: "message_created",
@@ -776,5 +875,7 @@ export function useChatSidebar() {
     renameGroup,
     setMuted,
     leaveConversation,
+    inAppAlert,
+    dismissInAppAlert,
   };
 }

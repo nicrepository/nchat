@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -32,11 +33,108 @@ func newNotificationMock(t *testing.T) pgxmock.PgxPoolIface {
 }
 
 func notificationRows() *pgxmock.Rows {
+	return mutedNotificationRows(false)
+}
+
+// mutedNotificationRows is the same row with the mute the projection resolved
+// (issue #744). A parameter rather than a second literal, so the column can
+// never be present in one helper and forgotten in the other.
+func mutedNotificationRows(muted bool) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"id", "workspace_id", "recipient_user_id", "kind", "priority",
-		"source_type", "message_id", "dedupe_key", "attempts", "occurred_at",
+		"source_type", "message_id", "origin", "dedupe_key", "attempts", "occurred_at",
+		"muted",
 	}).AddRow("n1", "ws-1", "user-1", "mention", "high",
-		"message", "msg-1", "message:msg-1:mention", 2, time.Now())
+		"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), muted)
+}
+
+// The mute the policy engine reads has to survive the projection, and it is the
+// one field whose loss is invisible: a dropped column would scan as false,
+// which is indistinguishable from a recipient who never muted anything, and
+// every muted conversation would quietly start alerting again.
+func TestListPendingProjectsTheRecipientsMute(t *testing.T) {
+	for _, muted := range []bool{true, false} {
+		mock := newNotificationMock(t)
+		mock.ExpectQuery(`FROM chat\.notification_outbox`).
+			WithArgs(10).
+			WillReturnRows(mutedNotificationRows(muted))
+
+		events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("ListPending: %v", err)
+		}
+		if len(events) != 1 || events[0].Muted != muted {
+			t.Fatalf("Muted = %v, want %v", events, muted)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	}
+}
+
+// The three predicates that keep one person's preference out of another's
+// notifications. They are asserted against the statement text because that is
+// where they live: a projection that dropped any one of them would still return
+// a boolean, and the mock cannot tell a correctly scoped one from a leak.
+func TestMuteProjectionIsScopedToRecipientWorkspaceAndConversation(t *testing.T) {
+	mock := newNotificationMock(t)
+	for _, predicate := range []string{
+		// The preference belongs to this recipient, never to another member of
+		// the same conversation.
+		`p\.user_id = o\.recipient_user_id`,
+		// ...and to this tenant. The prefs table's foreign keys do not tie the
+		// workspace to the target, so nothing but this predicate does.
+		`p\.workspace_id = o\.workspace_id`,
+		// ...and the conversation is resolved from a message of the same tenant.
+		`m\.workspace_id = o\.workspace_id`,
+		// Each target kind matches only a preference written for that kind.
+		`p\.channel_id = m\.channel_id`,
+		`p\.dm_conversation_id = m\.dm_conversation_id`,
+	} {
+		mock.ExpectQuery(predicate).WithArgs(10).WillReturnRows(notificationRows())
+		if _, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10); err != nil {
+			t.Fatalf("ListPending (%s): %v", predicate, err)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// One statement per batch is the whole N+1 defence, and it is structural: the
+// mute is resolved inside the read that was already happening, so a batch of
+// many events issues exactly the one query a batch of one does.
+func TestListPendingResolvesEveryMuteInOneQuery(t *testing.T) {
+	mock := newNotificationMock(t)
+	rows := pgxmock.NewRows([]string{
+		"id", "workspace_id", "recipient_user_id", "kind", "priority",
+		"source_type", "message_id", "origin", "dedupe_key", "attempts", "occurred_at",
+		"muted",
+	})
+	const batch = 25
+	for i := 0; i < batch; i++ {
+		rows.AddRow("n"+strconv.Itoa(i), "ws-1", "user-1", "mention", "high",
+			"message", "msg-1", "live", "", 1, time.Now(), i%2 == 0)
+	}
+	// Exactly one ExpectQuery is registered. pgxmock fails any further query,
+	// so a per-event lookup could not pass this test.
+	mock.ExpectQuery(`FROM chat\.notification_outbox`).WithArgs(batch).WillReturnRows(rows)
+
+	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(events) != batch {
+		t.Fatalf("got %d events, want %d", len(events), batch)
+	}
+	for i, event := range events {
+		if event.Muted != (i%2 == 0) {
+			t.Fatalf("event %d muted = %v, want %v", i, event.Muted, i%2 == 0)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
 
 func TestListPendingReadsTheEventContract(t *testing.T) {
@@ -56,6 +154,27 @@ func TestListPendingReadsTheEventContract(t *testing.T) {
 	if event.ID != "n1" || event.WorkspaceID != "ws-1" || event.RecipientID != "user-1" ||
 		event.EventType != "mention" || event.SourceID != "msg-1" || event.Attempts != 2 {
 		t.Fatalf("unexpected event: %+v", event)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The policy reads origin, so a projection that dropped it would silently turn
+// every event into one this build does not recognise — and refuse to alert for
+// all of them.
+func TestListPendingProjectsTheOrigin(t *testing.T) {
+	mock := newNotificationMock(t)
+	mock.ExpectQuery(`FROM chat\.notification_outbox`).
+		WithArgs(10).
+		WillReturnRows(notificationRows())
+
+	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(events) != 1 || events[0].Origin != "live" {
+		t.Fatalf("origin = %+v, want the column the row carries", events)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

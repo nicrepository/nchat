@@ -46,12 +46,8 @@ var (
 	}
 	newNotificationWorker = func(cfg config.Config, store storage.NotificationOutboxStore,
 		deliverer worker.Deliverer, metrics *worker.NotificationMetrics, logger *slog.Logger) backgroundWorker {
-		return worker.NewNotificationWorker(cfg.NotificationWorker, worker.NotificationWorkerDeps{
-			Store:     store,
-			Deliverer: deliverer,
-			Metrics:   metrics,
-			Logger:    logger,
-		})
+		return worker.NewNotificationWorker(cfg.NotificationWorker,
+			notificationWorkerDeps(store, deliverer, metrics, logger))
 	}
 	startNotificationWorker = func(ctx context.Context, w backgroundWorker) {
 		w.Start(ctx)
@@ -348,6 +344,27 @@ func (a *App) startSMTPWorker(cfg config.Config, pool storage.Pool, decryptor *e
 	logger.Info("smtp worker started")
 }
 
+// notificationWorkerDeps is what the production notification worker is built
+// with, and it exists as a named function so that one of those dependencies is
+// assertable: the policy.
+//
+// Evaluator is named here rather than left to the constructor's default, so the
+// production wiring says out loud which authority decides delivery (issue
+// #744). There is no other one to pass — the permissive stand-in that used to
+// live in the worker package is gone.
+func notificationWorkerDeps(
+	store storage.NotificationOutboxStore, deliverer worker.Deliverer,
+	metrics *worker.NotificationMetrics, logger *slog.Logger,
+) worker.NotificationWorkerDeps {
+	return worker.NotificationWorkerDeps{
+		Store:     store,
+		Evaluator: worker.NewPolicyEvaluator(),
+		Deliverer: deliverer,
+		Metrics:   metrics,
+		Logger:    logger,
+	}
+}
+
 // notificationDisabledReason names why the notification outbox worker cannot
 // run, or "" when it can. Each absence is its own logged reason rather than one
 // opaque failure, exactly as the SMTP worker's is.
@@ -389,6 +406,11 @@ func (a *App) startNotificationWorker(
 		newNotificationWorker(cfg, storage.NewPGXNotificationOutboxStore(pool),
 			deliverer, worker.NewNotificationMetrics(metrics), logger),
 		startNotificationWorker, cfg.NotificationWorker.ProcessingBudget())
+	// No policy version here, deliberately. It belongs to a decision, not to a
+	// process: during a rollout two replicas run different rule sets, so a
+	// version stamped at startup would answer a question nobody asked and look
+	// like the answer to the one that matters. The worker logs it against each
+	// notification instead — see NotificationWorker.logDecision.
 	logger.Info("notification worker started")
 }
 

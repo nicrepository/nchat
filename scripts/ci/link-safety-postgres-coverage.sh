@@ -121,6 +121,7 @@ case "$MODULE" in
       TestNotificationEvaluationStampsAvailabilityPostgreSQL
       TestNotificationSuppressionStampsNoAvailabilityPostgreSQL
       TestNotificationFutureRetryStaysUnclaimedPostgreSQL
+      TestMuteResolutionPostgreSQL
     )
     ;;
   services/file-service)

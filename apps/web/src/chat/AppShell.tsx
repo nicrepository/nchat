@@ -1,8 +1,9 @@
 import { useCallback, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
-import { Outlet, useLocation } from "react-router";
+import { Outlet, useLocation, useNavigate } from "react-router";
 
 import "./AppShell.css";
 import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
+import InAppMessageAlert, { type InAppAlert } from "./InAppMessageAlert";
 import { useNavDrawer } from "./useNavDrawer";
 import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
 import type { Channel, DMConversation } from "./chatTypes";
@@ -186,6 +187,8 @@ export default function AppShell() {
     renameGroup,
     setMuted,
     leaveConversation,
+    inAppAlert,
+    dismissInAppAlert,
   } = sidebar;
   // Details opened from a row menu, for that row's target (issue #527). Held
   // here rather than in ChatMessageArea because the target may be a
@@ -235,6 +238,16 @@ export default function AppShell() {
   // that is about to unmount — the menu restores its own trigger in an effect,
   // one commit later.
   const detailsOpenerRef = useRef<HTMLElement | null>(null);
+  // Opening the alert is the one action it offers, and it is plain navigation:
+  // the alert is a pointer at a conversation, not a place to read it.
+  const navigateFromAlert = useNavigate();
+  const openInAppAlert = useCallback(
+    (alert: InAppAlert) => {
+      dismissInAppAlert();
+      navigateFromAlert(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
+    },
+    [dismissInAppAlert, navigateFromAlert],
+  );
   const openSidebarDetails = useCallback(
     (kind: "channel" | "dm", targetId: string, opener: HTMLElement | null) => {
       const resolved = resolveDetailsTarget(kind, targetId, dms);
@@ -313,6 +326,19 @@ export default function AppShell() {
         currentUserId={state.status === "ready" ? state.currentUserId : ""}
         onClose={closeSidebarDetails}
       />
+      {/* The in-app channel of the delivery plan (issue #744). Whether it is
+          here at all was decided by chat-service for this recipient; this shell
+          only renders what the decision allowed. Keyed by the message so a newer
+          alert replaces the current one outright rather than inheriting its
+          dismissal timer. */}
+      {inAppAlert && (
+        <InAppMessageAlert
+          key={inAppAlert.messageId}
+          alert={inAppAlert}
+          onOpen={openInAppAlert}
+          onDismiss={dismissInAppAlert}
+        />
+      )}
     </div>
   );
 }

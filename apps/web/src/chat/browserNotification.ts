@@ -103,9 +103,9 @@ export interface ShowBrowserMessageNotificationResult {
 }
 
 /**
- * Eligibility (own message, duplicate, sound mode, active-conversation/focus)
- * is already decided by the caller via shouldPlayMessageSound — this function
- * only knows how to render and wire up one native notification, never why.
+ * Whether the event may alert at all was decided by the central policy engine
+ * and consumed by the caller via shouldExecuteSound — this function only knows
+ * how to render and wire up one native notification, never why.
  */
 export function showBrowserMessageNotification(
   input: ShowBrowserMessageNotificationInput,

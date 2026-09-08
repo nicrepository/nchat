@@ -95,7 +95,10 @@ main() {
     return 0
   fi
   confirm "Move production traffic back to slot $target"
-  if ! switch_services_to_slot "$target"; then
+  # The reverse of a promotion, and so is the order: the browser is served
+  # the older bundle before the backends go back to it. See
+  # service_switch_order.
+  if ! switch_services_to_slot "$target" frontends-first; then
     echo "Rollback stopped part-way; production is mixed." >&2
     echo "Re-run 'rollback.sh --target $target \"$reason\"' to finish converging." >&2
     return 1

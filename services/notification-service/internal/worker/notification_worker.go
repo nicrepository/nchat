@@ -99,7 +99,12 @@ func NewNotificationWorker(cfg config.NotificationWorkerConfig, deps Notificatio
 	}
 	evaluator := deps.Evaluator
 	if evaluator == nil {
-		evaluator = DeliverEverything()
+		// The central policy, never a permissive stand-in. A missing Evaluator
+		// is a wiring omission, and the safe resolution of one is the authority
+		// every other caller already uses — not "deliver everything", which
+		// would make the absence of a policy indistinguishable from a policy
+		// that allowed it.
+		evaluator = NewPolicyEvaluator()
 	}
 	normalized := cfg.Normalized()
 	return &NotificationWorker{
@@ -244,11 +249,44 @@ func (w *NotificationWorker) evaluateOne(ctx context.Context, event storage.Noti
 	if !verdict.Deliver {
 		state, result = notificationevent.StateSuppressed, resultSuppressed
 	}
+	w.logDecision(event.ID, state, verdict)
 	if err := w.store.MarkEvaluated(ctx, event.ID, state, verdict.Reason()); err != nil {
 		w.recordTransitionFailure("evaluate", event.ID, err)
 		return
 	}
 	w.metrics.Count(result, 1)
+}
+
+// logDecision records one policy decision against the notification it was about
+// (issue #744).
+//
+// It says "the policy produced this decision", and it is emitted *before*
+// MarkEvaluated for exactly that reason: every evaluation is observable,
+// including the ones whose write then loses a compare-and-set or hits a
+// database that is refusing. Emitting it afterwards made the two facts one, and
+// the decision that failed to persist — the case an operator most needs to see
+// — was the one that left no trace of which rules produced it.
+//
+// The two facts stay two events instead. What happened to the write is reported
+// by recordTransitionFailure, against the same notification_id, so a failed
+// persist is one correlation away from the decision that preceded it. A
+// notification decided twice logs twice, which is honest: it was decided twice.
+//
+// The policy version comes from the verdict, never from the build. During a
+// rollout two replicas run different rule sets, and "which rules decided this
+// notification" is exactly the question that cannot be answered from a version
+// the process stamped on itself.
+//
+// Every field is a reference or a closed vocabulary: an id, a version, a state,
+// a suppression code. No body, no recipient address, no subscription, no token
+// — the same restraint the outbox row itself is built on.
+func (w *NotificationWorker) logDecision(id string, state notificationevent.State, verdict Verdict) {
+	w.logger.Info("notification policy decision",
+		"notification_id", id,
+		"policy_version", verdict.PolicyVersion,
+		"state", string(state),
+		"reason", verdict.Reason(),
+		"worker_id", w.id)
 }
 
 // deliverDue claims a batch and delivers it.

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
+	"github.com/nicrepository/nchat/libs/go/platform/notificationpolicy"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 	"github.com/nicrepository/nchat/services/notification-service/internal/storage"
 )
@@ -707,10 +708,44 @@ func TestNewNotificationWorkerSuppliesItsDefaults(t *testing.T) {
 
 	worker.runPass()
 
-	// The default policy suppresses nothing, so the event is decided and
-	// delivered in the one pass.
+	// A live mention with nothing against it is eligible under the central
+	// policy, so the event is decided and delivered in the one pass.
 	if got := outbox.snapshot("n1").state; got != notificationevent.StateSent {
 		t.Fatalf("state = %q, want the default policy to have delivered it", got)
+	}
+}
+
+// TestTheDefaultPolicyIsTheCentralOneAndNotAPermissiveStandIn is issue #744's
+// acceptance criterion at the point it actually matters: a worker nobody handed
+// an Evaluator must not decide that everything is deliverable.
+//
+// The imported event is the proof. It is a row the previous default would have
+// delivered — a backfill ringing every phone in the workspace — and the only
+// thing that suppresses it is the central policy having been consulted.
+func TestTheDefaultPolicyIsTheCentralOneAndNotAPermissiveStandIn(t *testing.T) {
+	outbox := newFakeOutbox()
+	outbox.seedPending("imported").event.Origin = string(notificationevent.OriginImport)
+	outbox.seedPending("live")
+	deliverer := &recordingDeliverer{}
+	worker := NewNotificationWorker(notificationTestConfig(), NotificationWorkerDeps{
+		Store: outbox, Deliverer: deliverer, Logger: silentLogger(),
+	})
+
+	worker.runPass()
+	worker.runPass()
+
+	imported := outbox.snapshot("imported")
+	if imported.state != notificationevent.StateSuppressed {
+		t.Fatalf("imported state = %q, want %q", imported.state, notificationevent.StateSuppressed)
+	}
+	if imported.reason != string(notificationpolicy.ReasonHistoricalOrImported) {
+		t.Fatalf("imported reason = %q, want the policy's own", imported.reason)
+	}
+	if got := outbox.snapshot("live").state; got != notificationevent.StateSent {
+		t.Fatalf("live state = %q, want %q", got, notificationevent.StateSent)
+	}
+	if delivered := deliverer.delivered(); len(delivered) != 1 || delivered[0] != "live" {
+		t.Fatalf("delivered = %v, want only the live event", delivered)
 	}
 }
 

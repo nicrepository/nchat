@@ -38,6 +38,19 @@ type NotificationPrefStore interface {
 	// ListMuted returns every preference of this (workspace, user) that still
 	// points at something they can see.
 	ListMuted(ctx context.Context, workspaceID, userID string) ([]MutedConversation, error)
+	// FilterMutedUsers returns, of the users given, those who silenced this one
+	// target. It is ListMuted asked the other way round, for the realtime
+	// fan-out: there the target is fixed and the recipients vary, so asking per
+	// user would be one query per subscriber of every message.
+	//
+	// No visibility predicate, and that is the same reasoning the notification
+	// worker's projection is written on: the write path already established
+	// membership, and re-checking it on read would let a revoked membership
+	// *undo* a mute — the direction that alerts somebody who asked not to be.
+	// The caller has separately authorised every user it passes in.
+	FilterMutedUsers(
+		ctx context.Context, workspaceID, targetType, targetID string, userIDs []string,
+	) ([]string, error)
 }
 
 type PGXNotificationPrefStore struct{ pool Pool }
@@ -169,6 +182,61 @@ func (s *PGXNotificationPrefStore) ListMuted(ctx context.Context, workspaceID, u
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate muted conversations: %w", err)
+	}
+	return muted, nil
+}
+
+// filterMutedChannelSQL and filterMutedDMSQL read the one target against a list
+// of recipients. Keyed by (user_id, target), which is exactly the shape of the
+// partial unique indexes 000037 created, so this is an index lookup per user
+// rather than a scan.
+const filterMutedChannelSQL = `
+	SELECT p.user_id::text
+	FROM chat.conversation_notification_prefs p
+	WHERE p.workspace_id = $1::uuid
+	  AND p.channel_id = $2::uuid
+	  AND p.user_id = ANY($3::uuid[])`
+
+const filterMutedDMSQL = `
+	SELECT p.user_id::text
+	FROM chat.conversation_notification_prefs p
+	WHERE p.workspace_id = $1::uuid
+	  AND p.dm_conversation_id = $2::uuid
+	  AND p.user_id = ANY($3::uuid[])`
+
+func (s *PGXNotificationPrefStore) FilterMutedUsers(
+	ctx context.Context, workspaceID, targetType, targetID string, userIDs []string,
+) ([]string, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	var query string
+	switch targetType {
+	case NotificationPrefTargetChannel:
+		query = filterMutedChannelSQL
+	case NotificationPrefTargetDM:
+		query = filterMutedDMSQL
+	default:
+		// Fail closed the way the rest of this store does: an unrecognised kind
+		// is not a reason to report anybody as muted, and it is not a reason to
+		// report anybody as unmuted either — so it is an error, not an answer.
+		return nil, domain.ErrInvalidInput
+	}
+	rows, err := s.pool.Query(ctx, query, workspaceID, targetID, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("filter muted users: %w", err)
+	}
+	defer rows.Close()
+	muted := make([]string, 0, len(userIDs))
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("scan muted user: %w", err)
+		}
+		muted = append(muted, userID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate muted users: %w", err)
 	}
 	return muted, nil
 }

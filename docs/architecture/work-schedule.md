@@ -1,8 +1,10 @@
 # Horario de trabalho (work schedule)
 
-Dominio temporal de disponibilidade do NChat (issue #743, parent #678). Policy
-Engine, Web Push, som, toast, digest, feriados, ferias, overrides e a UI de
-Perfil > Notificacoes (#729) **estao fora** desta camada e nao existem ainda.
+Dominio temporal de disponibilidade do NChat (issue #743, parent #678). Web
+Push, som, toast, digest, feriados, ferias, overrides e a UI de Perfil >
+Notificacoes (#729) **estao fora** desta camada e nao existem ainda. O consumidor
+desta resposta e o Policy Engine (#744, `libs/go/platform/notificationpolicy`,
+[notification-policy.md](notification-policy.md)).
 
 Contrato em Go: `libs/go/platform/workschedule`.
 
@@ -26,8 +28,8 @@ canal de entrega — o mesmo acoplamento que `notificationevent` ja recusa.
 
 O pacote fica em `libs/go/platform` pelo motivo dos vizinhos (`notificationevent`,
 `uploadpolicy`, `antispampolicy`): a regra tem mais de um consumidor previsto e
-nenhum dono natural entre os servicos. O consumidor real sera o Policy Engine em
-notification-service.
+nenhum dono natural entre os servicos. O consumidor real e o Policy Engine, que
+ficou em `libs/go/platform/notificationpolicy` pelo mesmo motivo.
 
 **Nenhuma tabela nova foi criada nesta issue**, e isso e deliberado:
 
@@ -148,6 +150,10 @@ dado de timezone malformado.
 Zero (`IsZero`) significa "nao calculavel": sem schedule, ou schedule sem nenhum
 intervalo em dia nenhum. Um schedule vazio e aceito e **nao** e o mesmo que
 `not_configured` — "nunca trabalha" e "nao sabemos" sao fatos distintos.
+
+O consumidor ja decidiu o que fazer com `not_configured`: o Policy Engine (#744)
+**nao suprime** por ele, e o worker de notificacoes passa exatamente esse estado
+hoje, porque e o estado real enquanto nao houver escritor de jornada.
 
 ## Extensao
 

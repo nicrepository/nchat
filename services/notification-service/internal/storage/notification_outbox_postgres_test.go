@@ -985,3 +985,142 @@ func containsEvent(events []storage.NotificationEvent, id string) bool {
 	}
 	return false
 }
+
+// TestMuteResolutionPostgreSQL proves the mute projection against the real
+// schema (issue #744).
+//
+// None of this is provable with a mock. What is under test is the meaning of the
+// join — which preference row reaches which outbox row — and that meaning comes
+// entirely from the two tables' keys and the XOR invariant on each. A fake would
+// have to reimplement all of it and would then be testing itself.
+//
+// The three isolations proved here are the ones a leak would look like:
+// somebody else's mute, another tenant's mute, and a mute that was never
+// expressed at all.
+func TestMuteResolutionPostgreSQL(t *testing.T) {
+	fixture := seedOutbox(t, notificationevent.StatePending, 2)
+	muter, bystander := fixture.users[1], fixture.users[2]
+
+	assertNoPreferenceIsNotMuted(t, fixture, muter, bystander)
+	t.Run("one member's mute does not reach another", func(t *testing.T) {
+		assertMuteIsPerRecipient(t, fixture, muter, bystander)
+	})
+	t.Run("a preference from another tenant does not reach this event", func(t *testing.T) {
+		assertMuteDoesNotCrossTenants(t, fixture, muter, bystander)
+	})
+	t.Run("unmuting restores the default", func(t *testing.T) {
+		assertUnmuteRestoresTheDefault(t, fixture, muter)
+	})
+}
+
+// No preference row anywhere: the product default, which the table expresses as
+// the absence it is. Nothing may invent a mute here.
+func assertNoPreferenceIsNotMuted(t *testing.T, f *outboxFixture, muter, bystander string) {
+	t.Helper()
+	muted := f.mutedByRecipient(t)
+	if muted[muter] || muted[bystander] {
+		t.Fatalf("a recipient with no preference row read as muted: %+v", muted)
+	}
+}
+
+// The table is keyed by user, and this is the assertion that the projection
+// honours that key: the other member of the very same conversation is untouched.
+func assertMuteIsPerRecipient(t *testing.T, f *outboxFixture, muter, bystander string) {
+	t.Helper()
+	f.muteChannel(t, muter, notifyWorkerWorkspace)
+
+	muted := f.mutedByRecipient(t)
+	if !muted[muter] {
+		t.Fatal("the recipient who muted the conversation did not read as muted")
+	}
+	if muted[bystander] {
+		t.Fatal("one member's mute silenced another member of the same conversation")
+	}
+}
+
+// conversation_notification_prefs references workspaces and the target through
+// separate foreign keys, so a row naming a workspace that does not own the
+// channel is insertable — the projection's workspace predicate is the only thing
+// that stops it being usable.
+func assertMuteDoesNotCrossTenants(t *testing.T, f *outboxFixture, muter, bystander string) {
+	t.Helper()
+	f.muteChannel(t, bystander, newIsolatedWorkspace(t, f.pool))
+
+	muted := f.mutedByRecipient(t)
+	if muted[bystander] {
+		t.Fatal("a preference row from another workspace reached this tenant's event")
+	}
+	if !muted[muter] {
+		t.Fatal("the in-tenant mute stopped resolving")
+	}
+}
+
+// Unmuting deletes the row rather than writing false, so the absence has to read
+// as not muted again.
+func assertUnmuteRestoresTheDefault(t *testing.T, f *outboxFixture, muter string) {
+	t.Helper()
+	execFixture(t, f.pool, `
+		DELETE FROM chat.conversation_notification_prefs
+		WHERE user_id = $1::uuid AND channel_id = $2::uuid`,
+		muter, notifyWorkerChannel)
+	if muted := f.mutedByRecipient(t); muted[muter] {
+		t.Fatal("a deleted preference row still read as muted")
+	}
+}
+
+// mutedByRecipient reads what the projection resolved for every pending row.
+func (f *outboxFixture) mutedByRecipient(t *testing.T) map[string]bool {
+	t.Helper()
+	events, err := f.store().ListPending(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	byRecipient := make(map[string]bool, len(events))
+	for _, event := range events {
+		byRecipient[event.RecipientID] = event.Muted
+	}
+	return byRecipient
+}
+
+// muteChannel silences the fixture's channel for one user, under the workspace
+// the caller names — which is what makes the cross-tenant case expressible.
+func (f *outboxFixture) muteChannel(t *testing.T, userID, workspaceID string) {
+	t.Helper()
+	execFixture(t, f.pool, `
+		INSERT INTO chat.conversation_notification_prefs (user_id, workspace_id, channel_id)
+		VALUES ($1::uuid, $2::uuid, $3::uuid)`,
+		userID, workspaceID, notifyWorkerChannel)
+}
+
+// newIsolatedWorkspace creates a second tenant and returns its id.
+//
+// The workspace and its general channel go in together: a deferred constraint
+// requires every workspace to have exactly one, so the two statements have to
+// share a transaction.
+func newIsolatedWorkspace(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	tx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	var workspace string
+	if err := tx.QueryRow(t.Context(), `
+		INSERT INTO chat.workspaces (slug, name)
+		VALUES ('mute-744-' || gen_random_uuid()::text, 'Mute isolation')
+		RETURNING id::text`).Scan(&workspace); err != nil {
+		t.Fatalf("seed second workspace: %v", err)
+	}
+	if _, err := tx.Exec(t.Context(), `
+		INSERT INTO chat.channels (workspace_id, slug, display_name, type, is_general)
+		VALUES ($1::uuid, 'geral', 'Geral', 'public', true)`, workspace); err != nil {
+		t.Fatalf("seed second workspace general channel: %v", err)
+	}
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatalf("commit second workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(),
+			`DELETE FROM chat.workspaces WHERE id = $1::uuid`, workspace)
+	})
+	return workspace
+}

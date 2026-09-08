@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
+	"github.com/nicrepository/nchat/libs/go/platform/notificationpolicy"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 	"github.com/nicrepository/nchat/services/notification-service/internal/storage"
 	"github.com/nicrepository/nchat/services/notification-service/internal/worker"
@@ -440,5 +442,43 @@ func TestShutdownStillHonoursAShorterCallerDeadline(t *testing.T) {
 	}
 	if elapsed > 5*time.Second {
 		t.Fatalf("StopWorker waited %s, ignoring the caller's 50ms deadline", elapsed)
+	}
+}
+
+// Issue #744: the wiring names its policy.
+//
+// The production worker must not be constructed without one, and the one it is
+// constructed with must be the central engine rather than anything this service
+// decided for itself. Asserting it through the dependencies is what makes that
+// checkable without starting a worker and waiting for a tick.
+func TestNotificationWorkerIsWiredWithTheCentralPolicy(t *testing.T) {
+	deps := notificationWorkerDeps(nil, nil, nil, slog.New(slog.DiscardHandler))
+	if deps.Evaluator == nil {
+		t.Fatal("the production worker was wired without a policy")
+	}
+
+	imported := worker.Notification{
+		ID:        "n1",
+		EventType: string(notificationevent.EventTypeMention),
+		Origin:    string(notificationevent.OriginImport),
+	}
+	verdict, err := deps.Evaluator.Evaluate(context.Background(), imported)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if verdict.Deliver {
+		t.Fatal("the wired policy delivered an imported event")
+	}
+	if verdict.Reason() != string(notificationpolicy.ReasonHistoricalOrImported) {
+		t.Fatalf("reason = %q, want the central policy's own", verdict.Reason())
+	}
+	if verdict.PolicyVersion != notificationpolicy.Version {
+		t.Fatalf("policy version = %d, want %d", verdict.PolicyVersion, notificationpolicy.Version)
+	}
+
+	live := imported
+	live.Origin = string(notificationevent.OriginLive)
+	if verdict, err = deps.Evaluator.Evaluate(context.Background(), live); err != nil || !verdict.Deliver {
+		t.Fatalf("Evaluate(live) = (%+v, %v), want a delivery", verdict, err)
 	}
 }

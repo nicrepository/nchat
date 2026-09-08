@@ -303,6 +303,7 @@ type Hub struct {
 	unregister      chan *Client
 	subReq          chan subscribeReq
 	revokeReq       chan revokeSubscriptionReq
+	recipientPolicy RecipientPolicy
 	bcast           chan broadcastReq
 	remoteBcast     chan broadcastReq // events received from the distributed bus
 	presenceSignal  chan struct{}     // capacity 1; wakes the presence fan-out
@@ -3173,6 +3174,11 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		return
 	}
 
+	// The delivery decision is per recipient, and this loop is the first place a
+	// recipient exists. See notification_policy_fanout.go: one query for the
+	// whole subscriber list, then the engine per recipient.
+	encodings := h.recipientEncodingsFor(req, subscriptions)
+
 	for _, subscription := range subscriptions {
 		c := subscription.client
 		if !h.subscriptionIsCurrent(subscription, key) {
@@ -3209,7 +3215,8 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 			continue
 		}
 
-		_, outboxFull := h.enqueueAuthorizedBroadcast(authCtx, subscription, key, req.data)
+		_, outboxFull := h.enqueueAuthorizedBroadcast(
+			authCtx, subscription, key, encodings.bytesFor(c.userID, req.data))
 		cancel()
 		if outboxFull {
 			// Outbox full: slow client. Drop connection and clean up.

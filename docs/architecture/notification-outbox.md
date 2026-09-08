@@ -1,8 +1,9 @@
 # Notification outbox
 
 Fundacao de notificacoes do NChat (issue #741, parent #678, RNF-25). Worker,
-policy engine, Web Push, Service Worker, DND e UI **estao fora** desta camada e
-nao existem ainda.
+Web Push, Service Worker, DND e UI **estao fora** desta camada e nao existem
+ainda. Quem decide se um evento vira alerta e o Policy Engine (#744,
+`libs/go/platform/notificationpolicy`, [notification-policy.md](notification-policy.md)).
 
 ## Duas outboxes, propositos diferentes
 

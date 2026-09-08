@@ -9,7 +9,7 @@ import type {
 } from "./browserNotification";
 import { parseInstant } from "./sidebarOrder";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
-import type { WSMessageCreatedEvent } from "./useChatWebSocket";
+import type { WSMessageCreatedEvent, WSNotificationPolicy } from "./useChatWebSocket";
 import { useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 const {
@@ -183,11 +183,93 @@ function messageCreated(
       body_text: bodyText,
       status: "active",
       is_removed: false,
+      notification_policy: serverDecision(targetType, bodyText, kind),
       created_at: messageCreatedAt,
       updated_at: messageCreatedAt,
     },
   };
 }
+
+/**
+ * Stands in for the decision chat-service publishes with the event (issue
+ * #744): the central policy's answer plus the authoritative classification.
+ *
+ * The derivation itself is the server's, and it is tested there
+ * (services/chat-service/internal/app/notification_policy_test.go). What these
+ * tests own is the other half — that the client consumes the decision instead
+ * of working one out.
+ */
+function serverDecision(
+  targetType: "channel" | "dm",
+  bodyText: string,
+  kind: string,
+): WSNotificationPolicy {
+  const soundClass = targetType === "dm" ? "direct" : "general";
+  // A system message is not a notifiable event. The server still says so
+  // explicitly — an omitted object would mean "a server older than the
+  // contract", which is a different thing entirely.
+  if (kind !== "user") {
+    return {
+      policy_version: 1,
+      in_app: "deny",
+      sound: "deny",
+      web_push: "deny",
+      sound_class: soundClass,
+    };
+  }
+  const named = [...bodyText.matchAll(/\(mention:user:([^)]+)\)/g)].map(([, id]) => id);
+  return {
+    policy_version: 1,
+    // Allowed on this path: the realtime evaluation runs on the foreground
+    // surface, which is the one the toast lives on.
+    in_app: "allow",
+    sound: "allow",
+    // Denied on this path, and faithfully so: the realtime evaluation runs on
+    // the foreground surface and declares no push capability, so the central
+    // decision never allows the OS surface here. A fixture that allowed it
+    // would be testing a server that does not exist.
+    web_push: "deny",
+    sound_class: soundClass,
+    named_user_ids: named.length > 0 ? named : undefined,
+    names_everyone: bodyText.includes(`(mention:all:${ALL_MENTION_ID})`) || undefined,
+  };
+}
+
+/**
+ * A message.created carrying a deliberately chosen delivery plan (issue #744).
+ *
+ * The channels are set at odds with each other on purpose: a consumer that read
+ * a neighbouring channel's answer passes a uniform fixture and fails here.
+ */
+function messageWithPolicy(
+  messageId: string,
+  targetId: string,
+  policy: WSNotificationPolicy | undefined,
+  targetType: "channel" | "dm" = "channel",
+): WSMessageCreatedEvent {
+  const event = messageCreated(messageId, targetId, "other-1", targetType);
+  return {
+    ...event,
+    payload: event.payload ? { ...event.payload, notification_policy: policy } : undefined,
+  };
+}
+
+function plan(
+  inApp: "allow" | "deny",
+  sound: "allow" | "deny",
+  webPush: "allow" | "deny",
+): WSNotificationPolicy {
+  return {
+    policy_version: 1,
+    in_app: inApp,
+    sound,
+    web_push: webPush,
+    sound_class: "general",
+  };
+}
+
+/** The reserved id the server accepts as "everyone"; anything else is forged. */
+const ALL_MENTION_ID = "00000000-0000-0000-0000-000000000000";
 
 /** The same official mention token format RichTextRenderer parses (see richTextMarkers.ts). */
 function mentionToken(userId: string, label = "Você") {
@@ -693,6 +775,21 @@ describe("useChatSidebar notification sound", () => {
   });
 });
 
+/**
+ * The same event with the OS-notification channel allowed.
+ *
+ * The cases below are about how a native notification is rendered, dismissed
+ * and clicked — not about whether the policy permits one, which
+ * soundRules.test.ts owns. Since the realtime decision denies `web_push`
+ * today, saying so here is what keeps these exercising the surface at all,
+ * and it says out loud which channel authorises it.
+ */
+function nativeAllowed(event: WSMessageCreatedEvent): WSMessageCreatedEvent {
+  const policy = event.payload?.notification_policy;
+  if (policy) policy.web_push = "allow";
+  return event;
+}
+
 describe("useChatSidebar native browser notification", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
@@ -722,7 +819,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-1", channelA)));
+    act(() => websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-1", channelA))));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledWith(
@@ -736,6 +833,64 @@ describe("useChatSidebar native browser notification", () => {
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
   });
 
+  // Issue #744, round 4: the chime and the OS notification are different
+  // interruptions, decided on different channels. Before this, one `sound:
+  // allow` opened both — a permitted chime silently bought a permission the
+  // policy had refused.
+  it("does not raise a native notification when only the chime was allowed", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // No nativeAllowed(): this is the decision the server actually publishes
+    // today — sound allowed, the OS surface denied — with the tab backgrounded,
+    // which is exactly where the two used to be confused.
+    act(() => websocket.onMessageCreated?.(messageCreated("native-sound-only", channelA)));
+
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("raises a native notification without a chime when only that channel was allowed", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const event = nativeAllowed(messageCreated("native-push-only", channelA));
+    const policy = event.payload?.notification_policy;
+    if (policy) policy.sound = "deny";
+    act(() => websocket.onMessageCreated?.(event));
+
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("stays silent on both surfaces when the policy allows neither", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const event = messageCreated("native-neither", channelA);
+    const policy = event.payload?.notification_policy;
+    if (policy) policy.sound = "deny";
+    act(() => websocket.onMessageCreated?.(event));
+
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
   it("falls back to the chime when the native notification is not shown", async () => {
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
     const visibility = vi.spyOn(document, "visibilityState", "get");
@@ -745,7 +900,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-2", channelA)));
+    act(() => websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-2", channelA))));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
@@ -761,7 +916,9 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-unfocused", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-unfocused", channelA))),
+    );
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
@@ -776,12 +933,18 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-visible", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-visible", channelA))),
+    );
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
   });
 
+  // Mute is resolved server-side per recipient (issue #744, review round 6), so
+  // the decision that arrives for a muted conversation is already a denial — the
+  // browser does not re-apply the preference, and this fixture is the server
+  // saying so rather than the sidebar row saying it locally.
   it("keeps a muted conversation unread without a native notification or chime", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("hidden");
@@ -798,11 +961,46 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-muted", channelA)));
+    const muted = messageWithPolicy("native-muted", channelA, {
+      policy_version: 1,
+      in_app: "deny",
+      sound: "deny",
+      web_push: "deny",
+      reasons: ["muted"],
+      sound_class: "general",
+    });
+    act(() => websocket.onMessageCreated?.(muted));
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    // Silencing an alert never hides the message: the badge still counts it.
     expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  // The other half of the same move: with a decision in hand the browser must
+  // not re-apply its own copy of the mute list. A server that allowed the event
+  // for this recipient has already accounted for their preferences.
+  it("does not re-apply its own mute list to a decision that allowed the event", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, muted: true },
+        { id: channelB, name: "B", type: "private", canWrite: true, muted: false },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], muted: false }],
+    });
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-allowed", channelA))),
+    );
+
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
   });
 
   it("attempts a native notification at most once for a duplicate delivery", async () => {
@@ -813,7 +1011,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    const event = messageCreated("native-dup", channelA);
+    const event = nativeAllowed(messageCreated("native-dup", channelA));
     act(() => {
       websocket.onMessageCreated?.(event);
       websocket.onMessageCreated?.(event);
@@ -830,7 +1028,11 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-own", channelA, currentUserId)));
+    act(() =>
+      websocket.onMessageCreated?.(
+        nativeAllowed(messageCreated("native-own", channelA, currentUserId)),
+      ),
+    );
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
@@ -844,7 +1046,9 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() =>
-      websocket.onMessageCreated?.(messageCreated("native-active-dm", dmC, "other-1", "dm")),
+      websocket.onMessageCreated?.(
+        nativeAllowed(messageCreated("native-active-dm", dmC, "other-1", "dm")),
+      ),
     );
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
@@ -862,7 +1066,9 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     expect(() =>
-      act(() => websocket.onMessageCreated?.(messageCreated("native-throws", channelA))),
+      act(() =>
+        websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-throws", channelA))),
+      ),
     ).not.toThrow();
 
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
@@ -883,7 +1089,9 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     const fetchesBeforeClick = mockFetchSidebarData.mock.calls.length;
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-late-click", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-late-click", channelA))),
+    );
     expect(unreadCounts(result.current.state).channelA).toBe(1);
 
     const { onNavigate } = mockShowBrowserMessageNotification.mock.calls[0][0];
@@ -916,7 +1124,9 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-burst", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-burst", channelA))),
+    );
     const { onNavigate } = mockShowBrowserMessageNotification.mock.calls[0][0];
     const fetchesBeforeClicks = mockFetchSidebarData.mock.calls.length;
 
@@ -1351,7 +1561,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() =>
       websocket.onMessageCreated?.(
-        messageCreated("all-1", channelA, "other-1", "channel", undefined, "heads up @all"),
+        messageCreated(
+          "all-1",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `heads up @[all](mention:all:${ALL_MENTION_ID})`,
+        ),
       ),
     );
 
@@ -1366,7 +1583,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() =>
       websocket.onMessageCreated?.(
-        messageCreated("all-2", channelA, "other-1", "channel", undefined, "heads up @all"),
+        messageCreated(
+          "all-2",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `heads up @[all](mention:all:${ALL_MENTION_ID})`,
+        ),
       ),
     );
 
@@ -2672,5 +2896,182 @@ describe("useChatSidebar conversation preferences", () => {
     expect(result.current.state.dms.map((dm) => dm.id)).toEqual([dmC, groupD]);
     expect(result.current.state.channels.every((channel) => !channel.muted)).toBe(true);
     expect(result.current.state.dms.every((dm) => !dm.muted && !dm.pinnedAt)).toBe(true);
+  });
+});
+
+/**
+ * Issue #744, review round 6: the in-app channel has a consumer, and these
+ * assert the consumer rather than the helper that gates it.
+ *
+ * `result.current.inAppAlert` is what AppShell renders InAppMessageAlert from,
+ * so a case that expects a toast expects that value to be set and a case that
+ * forbids one expects it to stay null. The chime and the OS notification are
+ * asserted through the same mocks the rest of this file uses, so every case
+ * states what all three surfaces did.
+ */
+describe("the in-app surface consumes its own channel", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    // The chime preference is a local execution preference and a previous
+    // describe may have left it at "off"; these cases are about the channels.
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [] }],
+    });
+  });
+
+  // The in-app surface is drawn in this window, so every case has to say
+  // whether anyone is looking at it. jsdom reports an unfocused document by
+  // default, which is itself one of the cases below.
+  function setWindowFocused(focused: boolean) {
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue(focused ? "visible" : "hidden");
+  }
+
+  async function deliver(event: WSMessageCreatedEvent, path = "/chat", focused = true) {
+    setWindowFocused(focused);
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper(path) });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(event));
+    return result;
+  }
+
+  it("raises the toast and nothing else when only in_app is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-a", channelA, plan("allow", "deny", "deny")));
+    expect(result.current.inAppAlert?.messageId).toBe("m-a");
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not raise the toast when in_app is denied and sound is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-b", channelA, plan("deny", "allow", "deny")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not raise the toast when only web_push is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-c", channelA, plan("deny", "deny", "allow")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("raises nothing when every channel is denied", async () => {
+    const result = await deliver(messageWithPolicy("m-d", channelA, plan("deny", "deny", "deny")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("keeps the accepted legacy behaviour for a payload with no decision", async () => {
+    const result = await deliver(messageWithPolicy("m-e", channelA, undefined));
+    // Absence is "nobody told us", so the local gates alone decide — and they do
+    // not silence. This is the compatibility path agreed in an earlier round.
+    expect(result.current.inAppAlert?.messageId).toBe("m-e");
+    // Focused, so the OS surface is the one that makes no sense here and the
+    // chime is what runs. Neither is a policy decision.
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).toHaveBeenCalled();
+  });
+
+  it("suppresses the toast for the conversation this tab is showing", async () => {
+    // in_app is allowed centrally; the local gate is the only thing that removes
+    // it, and it can only remove.
+    const result = await deliver(
+      messageWithPolicy("m-f", channelA, plan("allow", "allow", "deny")),
+      `/chat/channel/${channelA}`,
+    );
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  it("dismisses the alert on request", async () => {
+    const result = await deliver(messageWithPolicy("m-g", channelA, plan("allow", "deny", "deny")));
+    expect(result.current.inAppAlert).not.toBeNull();
+    act(() => result.current.dismissInAppAlert());
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  // A central denial is final. No local state may put the surface back.
+  it("never turns a central in-app denial into a toast", async () => {
+    for (const path of ["/chat", `/chat/channel/${channelB}`]) {
+      mockPlayMessageSound.mockClear();
+      const result = await deliver(
+        messageWithPolicy("m-h", channelA, plan("deny", "allow", "allow")),
+        path,
+      );
+      expect(result.current.inAppAlert).toBeNull();
+    }
+  });
+});
+
+/**
+ * Issue #744, review round 7: focus gates the in-app surface in the flow the UI
+ * actually reads.
+ *
+ * `result.current.inAppAlert` is what AppShell renders InAppMessageAlert from,
+ * so "no alert is created" is asserted as that value staying null — and staying
+ * null, rather than being held for later.
+ */
+describe("the in-app surface is not created for an unfocused window", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [] }],
+    });
+  });
+
+  async function deliverWithFocus(focused: boolean) {
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue(focused ? "visible" : "hidden");
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageWithPolicy("focus-1", channelA, plan("allow", "allow", "allow")),
+      ),
+    );
+    return result;
+  }
+
+  it("creates no alert while the window is hidden, even though in_app is allowed", async () => {
+    const result = await deliverWithFocus(false);
+    expect(result.current.inAppAlert).toBeNull();
+    // ...and the OS surface is exactly the one that does make sense here.
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalled();
+  });
+
+  it("creates the alert once the window is the one in front", async () => {
+    const result = await deliverWithFocus(true);
+    expect(result.current.inAppAlert?.messageId).toBe("focus-1");
+  });
+
+  // The alert must not be queued: a hidden window produces nothing to show
+  // later, so returning to the tab does not surface a stale message.
+  it("does not hold a hidden window's alert for later", async () => {
+    const result = await deliverWithFocus(false);
+    expect(result.current.inAppAlert).toBeNull();
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.inAppAlert).toBeNull();
   });
 });

@@ -1,0 +1,85 @@
+/* The in-app delivery surface (issue #744).
+ *
+ * Existing tokens and existing conventions only: the same custom properties the
+ * rest of the chat uses, the same avatar element, no animation and no new
+ * palette. It is positioned over the shell rather than inside the layout so it
+ * cannot reflow the conversation underneath it.
+ */
+.in-app-alert {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.25rem;
+  max-width: min(22rem, calc(100vw - 2rem));
+  padding: 0.5rem;
+  border: 1px solid var(--color-border, #d0d5dd);
+  border-radius: 0.5rem;
+  background: var(--color-surface, #ffffff);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
+}
+
+.in-app-alert__open {
+  display: flex;
+  flex: 1;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.25rem;
+  border: 0;
+  border-radius: 0.375rem;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.in-app-alert__avatar,
+.in-app-alert__avatar-img {
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.in-app-alert__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.in-app-alert__sender {
+  font-size: 0.875rem;
+}
+
+.in-app-alert__where {
+  font-size: 0.75rem;
+  color: var(--color-text-muted, #667085);
+}
+
+/* One line, clipped: a preview, not the message. */
+.in-app-alert__preview {
+  overflow: hidden;
+  font-size: 0.8125rem;
+  color: var(--color-text-muted, #667085);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.in-app-alert__dismiss {
+  flex: 0 0 auto;
+  padding: 0.25rem;
+  border: 0;
+  border-radius: 0.375rem;
+  background: none;
+  color: var(--color-text-muted, #667085);
+  cursor: pointer;
+}
+
+.in-app-alert__open:hover,
+.in-app-alert__dismiss:hover {
+  background: var(--color-surface-hover, #f2f4f7);
+}

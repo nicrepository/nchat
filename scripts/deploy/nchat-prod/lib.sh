@@ -186,6 +186,34 @@ all_services_on_slot() {
   [[ "$slots" == "$target" ]]
 }
 
+# The preflight of a promotion to an explicit, already-authorised target.
+#
+# `resolve_active_slot` is the wrong question here and answering it is a bug: it
+# refuses every mixed reading, and a mixed reading of blue and green is the
+# normal shape of a cutover to this same target that stopped part-way. Refusing
+# it would make the documented retry -- `--target <the same slot>` -- impossible
+# through the one path that is supposed to converge it, while a namespace
+# holding `purple`, an unset selector or a Service that is not there would be
+# just as "mixed" and needs to fail.
+#
+# So the mapping is classified against the target instead of being resolved into
+# an active slot. Every stable Service must select the target or its opposite;
+# anything else is a state this cannot describe, and it fails before any
+# mutation. The target itself is never derived from what is found -- it is the
+# caller's, it stays the caller's, and a retry converges rather than reversing.
+require_promotable_selectors() {
+  local mapping="$1" target="$2" other service slot
+  is_valid_slot "$target" ||
+    prod_fail "the promotion target must be one of ${NCHAT_PROD_SLOTS[*]}, got '$target'"
+  other="$(opposite_slot "$target")"
+  while read -r service slot; do
+    if [[ "$slot" != "$target" && "$slot" != "$other" ]]; then
+      printf '%s\n' "$mapping" >&2
+      prod_fail "service/$service selects '$slot', which is neither $target nor $other; cutover blocked"
+    fi
+  done <<<"$mapping"
+}
+
 # Everything Kubernetes reports about a rollout, as one pipe-separated record:
 #   generation|observedGeneration|replicas|updated|ready|available|unavailable
 deployment_rollout_state() {
@@ -556,12 +584,74 @@ patch_service_slot() {
 # milliseconds of two slots serving at once, which the release contract already
 # requires to be safe — Blue and Green run against one database, one Valkey and
 # one object store, and both must speak the same event and API shapes.
-switch_services_to_slot() {
-  local slot="$1" service moved=0
-  is_valid_slot "$slot" || return 1
+# The Services that serve the browser its own code. Everything else in the
+# stable list is something that code talks to.
+#
+# The distinction exists because a slot change is not instantaneous: the
+# Services are patched one at a time, and between two patches production is
+# genuinely split. Which half is ahead in that window decides whether the split
+# is harmless or not — a browser is only ever compatible with a backend of its
+# own release or newer, never with an older one. chat-service is the case that
+# made this concrete: since issue #744 the realtime event carries the delivery
+# decision the client consumes, and a new bundle talking to a chat-service that
+# predates it would have to guess.
+NCHAT_PROD_FRONTEND_SERVICES=(
+  nchat-web
+  nchat-admin-web
+)
+
+is_frontend_service() {
+  local candidate="$1" service
+  for service in "${NCHAT_PROD_FRONTEND_SERVICES[@]}"; do
+    [[ "$candidate" == "$service" ]] && return 0
+  done
+  return 1
+}
+
+# Prints the stable Services of one half, in declaration order.
+print_services_of_kind() {
+  local want="$1" service kind
   for service in "${NCHAT_PROD_STABLE_SERVICES[@]}"; do
+    if is_frontend_service "$service"; then kind=frontend; else kind=backend; fi
+    if [[ "$kind" == "$want" ]]; then printf '%s\n' "$service"; fi
+  done
+  return 0
+}
+
+# The order a slot change moves the Services in.
+#
+#   backends-first   promoting a newer release: every backend takes the new slot
+#                    before the browser is served the new bundle, so a new client
+#                    can never reach an older backend
+#   frontends-first  going back to an older release: the browser is served the
+#                    older bundle first, for the same reason read the other way
+#
+# Neither is a default anyone should have to infer, so both call sites name the
+# one they need.
+service_switch_order() {
+  case "$1" in
+    backends-first)
+      print_services_of_kind backend
+      print_services_of_kind frontend
+      ;;
+    frontends-first)
+      print_services_of_kind frontend
+      print_services_of_kind backend
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+switch_services_to_slot() {
+  local slot="$1" direction="$2" service moved=0 total="${#NCHAT_PROD_STABLE_SERVICES[@]}" order
+  is_valid_slot "$slot" || return 1
+  order="$(service_switch_order "$direction")" || {
+    echo "unknown switch order: $direction" >&2
+    return 1
+  }
+  while read -r service; do
     if ! patch_service_slot "$service" "$slot"; then
-      echo "failed to patch service/$service after $moved of ${#NCHAT_PROD_STABLE_SERVICES[@]}" >&2
+      echo "failed to patch service/$service after $moved of $total" >&2
       return 1
     fi
     if [[ "$(service_slot "$service")" != "$slot" ]]; then
@@ -570,7 +660,13 @@ switch_services_to_slot() {
     fi
     moved=$((moved + 1))
     echo "  service/$service -> $slot"
-  done
+  done <<<"$order"
+  # A Service missing from the order would leave production split with nothing
+  # reporting it, so the count is checked rather than assumed.
+  if [[ "$moved" -ne "$total" ]]; then
+    echo "switch order covered $moved of $total stable services" >&2
+    return 1
+  fi
 }
 
 # --- capacity preflight -------------------------------------------------
