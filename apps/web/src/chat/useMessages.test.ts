@@ -4905,6 +4905,45 @@ describe("useMessages — reconnect authoritative security refresh", () => {
     await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("safe"));
   });
 
+  it("reads a DM's authoritative security state through the DM endpoint", async () => {
+    mockFetchDMMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "dm-source", linkSafetyState: "inconclusive" })],
+      nextCursor: "",
+    });
+    mockFetchDMMessageSecuritySnapshots.mockResolvedValue([
+      {
+        messageId: "dm-source",
+        available: true,
+        status: "active",
+        linkSafetyState: "malicious",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+    ]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "dm",
+        target_id: "dm-1",
+      });
+      await Promise.resolve();
+    });
+
+    expect(mockFetchDMMessageSecuritySnapshots).toHaveBeenCalledWith(
+      "dm-1",
+      ["dm-source"],
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchChannelMessageSecuritySnapshots).not.toHaveBeenCalled();
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("malicious"));
+    expect(result.current.state.messages[0].bodyText).toBe("");
+  });
+
   it("does not let an older reconnect snapshot overwrite a newer quote", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [
@@ -5160,5 +5199,156 @@ describe("useMessages — inline attachment preview reconciliation", () => {
     });
 
     expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("pending");
+  });
+});
+
+// ── Page reads that outlive their conversation ────────────────────────────────
+//
+// The initial page and the older pages are the two reads that are not triggered
+// by a realtime event, so nothing else cancels them. Each is aborted when the
+// reader leaves, and any completion that still arrives is discarded rather than
+// applied — a page of channel A appearing in channel B would be a cross-target
+// leak, and its cursor would silently corrupt B's pagination.
+
+describe("useMessages — page reads across a target change", () => {
+  const renderForTarget = (id: string) =>
+    renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: id } },
+    );
+
+  const pending = <T>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
+  it("aborts the in-flight initial page when the target changes", async () => {
+    let firstSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, signal) => {
+      firstSignal = signal;
+      return new Promise<MessagePage>(() => {});
+    });
+
+    const { rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(firstSignal).toBeDefined());
+    expect(firstSignal?.aborted).toBe(false);
+
+    mockFetchChannelMessages.mockResolvedValueOnce(emptyPage);
+    rerender({ targetId: "ch-b" });
+
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+  });
+
+  it("aborts the in-flight initial page on unmount", async () => {
+    let signal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, requestSignal) => {
+      signal = requestSignal;
+      return new Promise<MessagePage>(() => {});
+    });
+
+    const { unmount } = renderForTarget("ch-a");
+    await waitFor(() => expect(signal).toBeDefined());
+
+    unmount();
+
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("discards an initial page that resolves after the target changed", async () => {
+    const first = pending<MessagePage>();
+    mockFetchChannelMessages.mockImplementationOnce(() => first.promise);
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-a",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      first.resolve({ messages: [makeMessage({ id: "msg-a" })], nextCursor: "cursor-a" });
+      await first.promise;
+    });
+
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+    expect(result.current.state.nextCursor).toBe("");
+  });
+
+  it("ignores an initial page failure that arrives after the target changed", async () => {
+    let rejectFirst!: (error: unknown) => void;
+    mockFetchChannelMessages.mockImplementationOnce(
+      () =>
+        new Promise<MessagePage>((_resolve, reject) => {
+          rejectFirst = reject;
+        }),
+    );
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1));
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      rejectFirst(new Error("previous conversation is gone"));
+      await Promise.resolve();
+    });
+
+    expect(result.current.state.status).toBe("ready");
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+  });
+
+  it("aborts and discards an older page when the target changes mid-fetch", async () => {
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-a" })],
+      nextCursor: "cursor-a",
+    });
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const older = pending<MessagePage>();
+    let olderSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, signal) => {
+      olderSignal = signal;
+      return older.promise;
+    });
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(olderSignal).toBeDefined());
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(olderSignal?.aborted).toBe(true));
+    await waitFor(() =>
+      expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]),
+    );
+
+    await act(async () => {
+      older.resolve({ messages: [makeMessage({ id: "msg-older" })], nextCursor: "cursor-older" });
+      await older.promise;
+    });
+
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+    expect(result.current.state.nextCursor).toBe("");
   });
 });
