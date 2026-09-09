@@ -215,3 +215,44 @@ func classifyDelivery(err error) (category string, permanent bool) {
 		return CategoryTransient, false
 	}
 }
+
+// RetryAfterError is a transient failure that also carries the provider's own
+// opinion about when to try again (issue #746).
+//
+// It exists because a rate limiter is the one case where the adapter knows
+// something the worker's backoff cannot work out: a 429 with a Retry-After is
+// the provider stating a fact about its own capacity. Every other transient
+// failure is scheduled by RetryPolicy alone, and this type changes nothing
+// about how such a failure is classified — it wraps an ordinary error, so
+// classifyDelivery still reads it as transient.
+//
+// The worker treats After as a floor, never as the schedule. See
+// NotificationWorker.retryDelay for why both bounds are kept.
+type RetryAfterError struct {
+	// After is what the provider asked for, already normalised by the adapter:
+	// zero when it asked for nothing, or asked for something unusable.
+	After time.Duration
+	// Err is the failure itself. Unwrapping reaches it, so errors.Is against
+	// ErrPermanentDelivery or a context error behaves exactly as it would
+	// without this wrapper.
+	Err error
+}
+
+func (e *RetryAfterError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *RetryAfterError) Unwrap() error { return e.Err }
+
+// requestedRetryDelay reports the delay an adapter asked for, if it asked.
+//
+// A free function rather than a method on the worker so the rule has one
+// definition and can be exercised on its own: any error in the chain that
+// carries a positive After wins, and everything else asks for nothing.
+func requestedRetryDelay(err error) time.Duration {
+	var retryAfter *RetryAfterError
+	if errors.As(err, &retryAfter) && retryAfter.After > 0 {
+		return retryAfter.After
+	}
+	return 0
+}

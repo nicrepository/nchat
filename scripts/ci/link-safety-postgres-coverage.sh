@@ -2,8 +2,9 @@
 # Coverage for the chat/file tests that need a real PostgreSQL.
 #
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
-# outbox suite, issue #742's worker claim suite and issue #745's push
-# subscription suite: all of them prove properties only a database can hold —
+# outbox suite, issue #742's worker claim suite, issue #745's push subscription
+# suite and issue #746's Web Push delivery ledger: all of them prove properties
+# only a database can hold —
 # atomicity across one statement, a unique index deciding what counts as the same
 # event or the same subscription, an ON CONFLICT that refuses to move ownership,
 # and FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows.
@@ -163,6 +164,27 @@ case "$MODULE" in
       TestPushPrincipalRefusesAMismatchedSessionPostgreSQL
       TestPushPrincipalRefusesARetiredSessionPostgreSQL
       TestPushPrincipalRefusesALostMembershipPostgreSQL
+      # Issue #746. The Web Push delivery ledger: a primary key deduplicating
+      # under genuine concurrency with no read before any write, a fan-out whose
+      # exclusions are a join rather than a filter in Go, and two cascades that
+      # are the whole of this table's retention policy.
+      TestPushDeliveryFanOutReturnsEveryActiveBrowserPostgreSQL
+      TestPushDeliveryFanOutIsScopedToTheRecipientPostgreSQL
+      TestPushDeliveryFanOutExcludesRetiredBrowsersPostgreSQL
+      TestPushDeliveryFanOutExcludesDisabledBrowsersPostgreSQL
+      TestPushDeliveryFanOutExcludesAlreadyDeliveredBrowsersPostgreSQL
+      TestPushDeliveryLedgerIsPerNotificationPostgreSQL
+      TestPushDeliveryConcurrentRecordsStaySinglePostgreSQL
+      TestPushDeliveryReplayKeepsTheFirstRecordPostgreSQL
+      TestPushDeliveryLedgerCascadesFromBothParentsPostgreSQL
+      TestPushDeliveryLedgerRefusesIncoherentRowsPostgreSQL
+      TestPushDeliveryLedgerMigrationRoundTripPostgreSQL
+      # Issue #746 again: why a compare-and-set matched nothing. A 410 about an
+      # endpoint the browser has already replaced must not retire the live
+      # generation that replaced it, and only the database can decide that.
+      TestPushDeliveryStale410DoesNotRetireARotatedSubscriptionPostgreSQL
+      TestPushDeliveryClassifiesEveryCompareAndSetOutcomePostgreSQL
+      TestPushDeliveryEveryOutcomeIsClassifiedPostgreSQL
     )
     ;;
   services/file-service)

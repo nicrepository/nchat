@@ -276,32 +276,55 @@ func (s *PGXPushSubscriptionStore) Disable(
 }
 
 // RecordDelivery applies the outcome of one delivery attempt to the generation
-// that attempt was made against, and reports whether it applied.
+// that attempt was made against, and says what that did.
 //
 // generation is the caller's half of the contract: an attempt captures it with
 // the id when it starts and hands both back here. A result that no longer
-// matches the row is a no-op and applied is false — the subscription rotated,
-// was disabled, or is already retired. That is an ordinary outcome in a system
-// where a send and its answer are not simultaneous, not a failure: it is
-// reported as a boolean rather than an error so a caller has nothing to log
-// about it. Only a database that could not answer is an error.
+// matches the row changes nothing — and *why* it changed nothing is the whole
+// answer, not a detail. A 410 that retired the endpoint it was about is
+// terminal; a 410 whose endpoint the browser has already replaced is not, and
+// the replacement is still owed the notification. Returning a boolean made
+// those two indistinguishable, so it returns domain.DeliveryApplication.
 //
 // It is a store API and not an HTTP route on purpose: the only caller is the
-// delivery worker that does not exist yet, and publishing an endpoint that lets
-// a client declare somebody's subscription dead would be handing out an
-// unsubscribe primitive.
+// delivery worker, and publishing an endpoint that lets a client declare
+// somebody's subscription dead would be handing out an unsubscribe primitive.
 func (s *PGXPushSubscriptionStore) RecordDelivery(
 	ctx context.Context, subscriptionID string, generation int64, result domain.DeliveryResult,
-) (bool, error) {
+) (domain.DeliveryApplication, error) {
 	query, args := deliveryStatement(subscriptionID, generation, result)
-	tag, err := s.pool.Exec(ctx, query, args...)
-	if err != nil {
-		return false, fmt.Errorf("record push delivery: %w", err)
+
+	var applied bool
+	var status string
+	if err := s.pool.QueryRow(ctx, query, args...).Scan(&applied, &status); err != nil {
+		return domain.ApplicationMissing, fmt.Errorf("record push delivery: %w", err)
 	}
-	return tag.RowsAffected() > 0, nil
+	return classifyApplication(applied, status), nil
 }
 
-// deliveryStatement picks the statement one outcome authorises.
+// classifyApplication turns the statement's two facts into the outcome.
+//
+// Deliberately conservative, and the ordering is where that lives: a
+// subscription that reads as active is Superseded whatever its generation says,
+// because the read comes from the statement's own snapshot and a row that is
+// active *now* may have rotated again since. Being wrong in that direction
+// costs one re-evaluation; being wrong the other way retires a live endpoint
+// and loses a notification, so Inactive and Missing are only returned when the
+// database positively showed a subscription that cannot be delivered to.
+func classifyApplication(applied bool, status string) domain.DeliveryApplication {
+	switch {
+	case applied:
+		return domain.ApplicationRecorded
+	case status == "":
+		return domain.ApplicationMissing
+	case status == string(domain.StatusActive):
+		return domain.ApplicationSuperseded
+	default:
+		return domain.ApplicationInactive
+	}
+}
+
+// deliveryStatement picks the statement one outcome authorises, classified.
 //
 // An outcome this build does not know is treated as transient, which is the
 // direction that keeps a real person subscribed: the two statements that retire
@@ -312,13 +335,37 @@ func deliveryStatement(
 ) (string, []any) {
 	switch result.Outcome {
 	case domain.OutcomeSucceeded:
-		return recordPushSuccessQuery, []any{subscriptionID, generation}
+		return classified(recordPushSuccessQuery), []any{subscriptionID, generation}
 	case domain.OutcomeInvalidated:
-		return invalidatePushSubscriptionQuery,
+		return classified(invalidatePushSubscriptionQuery),
 			[]any{subscriptionID, generation, string(result.Reason)}
 	default:
-		return recordPushTransientFailureQuery, []any{subscriptionID, generation}
+		return classified(recordPushTransientFailureQuery), []any{subscriptionID, generation}
 	}
+}
+
+// classified wraps one compare-and-set so the caller learns not only whether it
+// applied but what it found instead.
+//
+// One statement, not two. A separate SELECT after a zero-row UPDATE would leave
+// a window in which the subscription changes between them, and the caller would
+// be classifying a row it never saw. Here the update and the read are the same
+// command: the read is the statement's own snapshot, so at worst it is slightly
+// behind — never a different row, and never a state nothing ever held.
+//
+// The scalar subquery makes the result exactly one row even when the
+// subscription has been deleted, which is what lets a missing row be a value
+// rather than an absent one. The empty string is impossible for a real row:
+// status is NOT NULL and closed by a CHECK.
+func classified(update string) string {
+	return `
+	WITH applied AS (` + update + `
+		RETURNING 1
+	)
+	SELECT EXISTS (SELECT 1 FROM applied),
+	       COALESCE((SELECT s.status
+	                 FROM chat.push_subscriptions s
+	                 WHERE s.id = $1::uuid), '')`
 }
 
 // scanPushSubscription reads one row of the shared projection.

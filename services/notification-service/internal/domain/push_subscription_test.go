@@ -233,3 +233,23 @@ func TestClassifyDeliveryStatus(t *testing.T) {
 		}
 	}
 }
+
+// Only a rotated subscription still has something to deliver to (issue #746).
+//
+// This is the distinction the whole finding turns on: a compare-and-set that
+// matched nothing means four different things, and exactly one of them leaves a
+// live endpoint that the notification has not reached. Asserted on the type,
+// because it is the type that the delivery layer routes on.
+func TestOnlyASupersededApplicationIsStillDeliverable(t *testing.T) {
+	deliverable := map[domain.DeliveryApplication]bool{
+		domain.ApplicationRecorded:   false,
+		domain.ApplicationSuperseded: true,
+		domain.ApplicationInactive:   false,
+		domain.ApplicationMissing:    false,
+	}
+	for application, want := range deliverable {
+		if got := application.Deliverable(); got != want {
+			t.Fatalf("%v.Deliverable() = %v, want %v", application, got, want)
+		}
+	}
+}

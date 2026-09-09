@@ -64,6 +64,43 @@ type DeliveryResult struct {
 	Reason  InvalidationReason
 }
 
+// DeliveryApplication is what happened when an attempt's outcome was applied to
+// the subscription it was about.
+//
+// Every lifecycle write is a compare-and-set on (id, generation, status), so
+// "it changed nothing" is an ordinary result. What it is not is a single fact:
+// the subscription may have rotated to a live new endpoint, or been disabled,
+// or already been retired, or deleted — and a caller holding a 410 has to tell
+// the first of those from the rest. Retiring nothing because a *newer* endpoint
+// replaced the dead one is not a reason to give up on the notification; it is a
+// reason to look again.
+type DeliveryApplication int
+
+const (
+	// ApplicationRecorded: the compare-and-set matched. The answer was written
+	// to the endpoint lifetime it was actually about.
+	ApplicationRecorded DeliveryApplication = iota
+	// ApplicationSuperseded: nothing matched, and the subscription is active
+	// now. The answer describes an endpoint the browser has already replaced,
+	// and the replacement is live and has not been delivered to.
+	ApplicationSuperseded
+	// ApplicationInactive: nothing matched, and the subscription is not active.
+	// Disabled by its owner or already retired: nothing to retire, and nothing
+	// to deliver to either.
+	ApplicationInactive
+	// ApplicationMissing: the subscription no longer exists.
+	ApplicationMissing
+)
+
+// Deliverable reports whether this subscription still has a live endpoint that
+// the notification has not reached.
+//
+// Only ApplicationSuperseded does. It is the one outcome that means "the answer
+// you brought is about something that no longer exists, and something that does
+// exist is still owed a delivery" — which is what stops a stale 404 or 410 from
+// retiring a notification that a rotated browser could still receive.
+func (a DeliveryApplication) Deliverable() bool { return a == ApplicationSuperseded }
+
 // ClassifyDeliveryStatus maps a push service's HTTP status onto the transition
 // it authorises (RFC 8030 §5, and the Web Push protocol's use of 404/410).
 //
@@ -166,7 +203,7 @@ func (r Registration) Validate() error {
 	if !deviceIDPattern.MatchString(r.DeviceID) {
 		return ErrInvalidRegistration
 	}
-	if err := validateEndpoint(r.Endpoint); err != nil {
+	if err := ValidateEndpoint(r.Endpoint); err != nil {
 		return err
 	}
 	if !validKey(r.P256dh, p256dhBytes) || !isUncompressedPoint(r.P256dh) {
@@ -178,8 +215,15 @@ func (r Registration) Validate() error {
 	return nil
 }
 
-// validateEndpoint accepts only an absolute https URL naming a host.
-func validateEndpoint(endpoint string) error {
+// ValidateEndpoint accepts only an absolute https URL naming a host.
+//
+// Exported because the delivery layer applies it a second time, to the endpoint
+// it just read from the table rather than to the one a client just sent (issue
+// #746). Nothing in the write path can produce a row that fails it, so the
+// second call is defence in depth against a row that arrived some other way —
+// a restored dump, a repair script — reaching an http: or schemeless
+// destination through a client that would happily dereference it.
+func ValidateEndpoint(endpoint string) error {
 	if endpoint == "" || len(endpoint) > MaxEndpointBytes {
 		return ErrInvalidRegistration
 	}

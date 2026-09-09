@@ -291,14 +291,14 @@ func TestRecordDeliveryRunsTheStatementTheOutcomeAuthorises(t *testing.T) {
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			mock := newPushMock(t)
-			mock.ExpectExec(regexpQuote(testCase.expect)).
+			mock.ExpectQuery(regexpQuote(testCase.expect)).
 				WithArgs(testCase.args...).
-				WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+				WillReturnRows(applicationRow(true, string(domain.StatusActive)))
 
-			applied, err := storage.NewPGXPushSubscriptionStore(mock).
+			application, err := storage.NewPGXPushSubscriptionStore(mock).
 				RecordDelivery(context.Background(), "sub-1", 4, testCase.result)
-			if err != nil || !applied {
-				t.Fatalf("RecordDelivery = %v, %v", applied, err)
+			if err != nil || application != domain.ApplicationRecorded {
+				t.Fatalf("RecordDelivery = %v, %v", application, err)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("unmet expectations: %v", err)
@@ -319,9 +319,9 @@ func TestEveryDeliveryStatementComparesTheGeneration(t *testing.T) {
 	for name, result := range results {
 		t.Run(name, func(t *testing.T) {
 			mock := newPushMock(t)
-			mock.ExpectExec(`generation = \$2::bigint AND status = 'active'`).
+			mock.ExpectQuery(`generation = \$2::bigint AND status = 'active'`).
 				WithArgs(anyArgs(len(deliveryArgs(result)))...).
-				WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+				WillReturnRows(applicationRow(true, string(domain.StatusActive)))
 
 			if _, err := storage.NewPGXPushSubscriptionStore(mock).
 				RecordDelivery(context.Background(), "sub-1", 4, result); err != nil {
@@ -345,9 +345,9 @@ func deliveryArgs(result domain.DeliveryResult) []any {
 // the two provider verdicts that mean "gone" may reach the retiring statement.
 func TestRecordDeliveryTreatsAnUnknownOutcomeAsTransient(t *testing.T) {
 	mock := newPushMock(t)
-	mock.ExpectExec(regexpQuote("failure_count = LEAST")).
+	mock.ExpectQuery(regexpQuote("failure_count = LEAST")).
 		WithArgs(anyArgs(2)...).
-		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		WillReturnRows(applicationRow(true, string(domain.StatusActive)))
 
 	if _, err := storage.NewPGXPushSubscriptionStore(mock).RecordDelivery(
 		context.Background(), "sub-1", 4, domain.DeliveryResult{Outcome: domain.Outcome(99)},
@@ -363,34 +363,73 @@ func TestRecordDeliveryTreatsAnUnknownOutcomeAsTransient(t *testing.T) {
 // subscription rotated, was disabled, or is already retired. Reporting it as an
 // error would put a log line on every late answer in a system where a send and
 // its answer are never simultaneous.
-func TestRecordDeliveryReportsAStaleResultAsNotApplied(t *testing.T) {
-	mock := newPushMock(t)
-	mock.ExpectExec(`UPDATE chat\.push_subscriptions`).
-		WithArgs(anyArgs(2)...).
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-
-	applied, err := storage.NewPGXPushSubscriptionStore(mock).RecordDelivery(
-		context.Background(), "sub-1", 4, domain.DeliveryResult{Outcome: domain.OutcomeSucceeded})
-	if err != nil {
-		t.Fatalf("RecordDelivery: %v", err)
+//
+// What it is *not* is one fact. Each of those three is classified separately,
+// because a caller holding a 410 has to tell "this subscription is finished"
+// from "a live endpoint replaced the dead one" (issue #746).
+func TestRecordDeliveryClassifiesWhyNothingMatched(t *testing.T) {
+	cases := map[string]struct {
+		status string
+		want   domain.DeliveryApplication
+	}{
+		// Active, and the compare-and-set still matched nothing: the browser
+		// re-registered, so the row is on a newer generation with a live
+		// endpoint that has had nothing.
+		"rotated to a live generation": {
+			status: string(domain.StatusActive), want: domain.ApplicationSuperseded,
+		},
+		"already retired": {
+			status: string(domain.StatusInvalid), want: domain.ApplicationInactive,
+		},
+		"disabled by its owner": {
+			status: string(domain.StatusDisabled), want: domain.ApplicationInactive,
+		},
+		// The scalar subquery yields the empty string when the row is gone,
+		// which is impossible for a real subscription: status is NOT NULL and
+		// closed by a CHECK.
+		"deleted": {status: "", want: domain.ApplicationMissing},
 	}
-	if applied {
-		t.Fatal("a statement that matched no row reported applied")
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			mock := newPushMock(t)
+			mock.ExpectQuery(`UPDATE chat\.push_subscriptions`).
+				WithArgs(anyArgs(2)...).
+				WillReturnRows(applicationRow(false, tc.status))
+
+			application, err := storage.NewPGXPushSubscriptionStore(mock).RecordDelivery(
+				context.Background(), "sub-1", 4,
+				domain.DeliveryResult{Outcome: domain.OutcomeSucceeded})
+			if err != nil {
+				t.Fatalf("RecordDelivery: %v", err)
+			}
+			if application != tc.want {
+				t.Fatalf("application = %v, want %v", application, tc.want)
+			}
+			if application == domain.ApplicationRecorded {
+				t.Fatal("a statement that matched no row reported applied")
+			}
+		})
 	}
 }
 
 // A database that could not answer is the one thing that is an error here.
-func TestRecordDeliveryReportsAnExecFailure(t *testing.T) {
+func TestRecordDeliveryReportsAQueryFailure(t *testing.T) {
 	mock := newPushMock(t)
-	mock.ExpectExec(`UPDATE chat\.push_subscriptions`).
+	mock.ExpectQuery(`UPDATE chat\.push_subscriptions`).
 		WithArgs(anyArgs(2)...).
 		WillReturnError(errors.New("boom"))
 
-	applied, err := storage.NewPGXPushSubscriptionStore(mock).RecordDelivery(
+	application, err := storage.NewPGXPushSubscriptionStore(mock).RecordDelivery(
 		context.Background(), "sub-1", 4, domain.DeliveryResult{Outcome: domain.OutcomeSucceeded})
-	if err == nil || applied {
-		t.Fatalf("RecordDelivery = %v, %v, want a failure", applied, err)
+	if err == nil || application == domain.ApplicationRecorded {
+		t.Fatalf("RecordDelivery = %v, %v, want a failure", application, err)
 	}
+}
+
+// applicationRow is what the classified compare-and-set returns: whether it
+// applied, and the subscription's status as the statement saw it.
+func applicationRow(applied bool, status string) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"applied", "status"}).AddRow(applied, status)
 }
 
 // anyArgs matches n arguments whose values are asserted elsewhere; these tests

@@ -1075,9 +1075,19 @@ func TestPushSubscriptionMigrationRoundTripPostgreSQL(t *testing.T) {
 	}
 	defer func() { _ = transaction.Rollback(context.Background()) }()
 
-	if _, err := transaction.Exec(t.Context(),
-		`DROP TABLE IF EXISTS chat.push_subscriptions`); err != nil {
-		t.Fatalf("down migration failed: %v", err)
+	// In reverse order, which is the only order a rollback ever runs in.
+	// 000046's delivery ledger references this table (issue #746), so its own
+	// down migration goes first — exactly as scripts/db/migrate.sh would do it.
+	// Dropping this table with CASCADE instead would pass here and quietly take
+	// a later migration's table with it in production.
+	for _, table := range []string{
+		"chat.notification_push_deliveries",
+		"chat.push_subscriptions",
+	} {
+		if _, err := transaction.Exec(t.Context(),
+			`DROP TABLE IF EXISTS `+table); err != nil {
+			t.Fatalf("down migration failed on %s: %v", table, err)
+		}
 	}
 	var remaining int
 	if err := transaction.QueryRow(t.Context(), `
@@ -1134,12 +1144,22 @@ func recordStatusApplied(
 	t *testing.T, fixture *pushFixture, subscriptionID string, generation int64, status int,
 ) bool {
 	t.Helper()
-	applied, err := fixture.store().RecordDelivery(t.Context(), subscriptionID, generation,
+	return recordStatusApplication(t, fixture, subscriptionID, generation, status) ==
+		domain.ApplicationRecorded
+}
+
+// recordStatusApplication is the same call returning the full classification,
+// for the tests whose subject is *why* a result did not apply (issue #746).
+func recordStatusApplication(
+	t *testing.T, fixture *pushFixture, subscriptionID string, generation int64, status int,
+) domain.DeliveryApplication {
+	t.Helper()
+	application, err := fixture.store().RecordDelivery(t.Context(), subscriptionID, generation,
 		domain.ClassifyDeliveryStatus(status))
 	if err != nil {
 		t.Fatalf("record status %d: %v", status, err)
 	}
-	return applied
+	return application
 }
 
 // ── principal resolution ─────────────────────────────────────────────────────

@@ -53,6 +53,12 @@ type Config struct {
 	// nine more SMTP-prefixed-looking fields would say nothing about which
 	// belongs to which.
 	NotificationWorker NotificationWorkerConfig
+
+	// WebPush is the delivery channel that worker sends through (issue #746).
+	// Separate from NotificationWorker because the two fail independently: a
+	// worker with no keys is a misconfigured channel, not a misconfigured
+	// worker, and the readiness reason has to be able to say which.
+	WebPush WebPushConfig
 }
 
 func Load() Config {
@@ -83,6 +89,7 @@ func Load() Config {
 		SMTPWorkerPollSeconds: platformconfig.GetInt("SMTP_WORKER_POLL_SECONDS", 10),
 
 		NotificationWorker: loadNotificationWorker(),
+		WebPush:            loadWebPush(),
 	}
 }
 

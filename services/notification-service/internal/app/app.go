@@ -31,21 +31,17 @@ var (
 	}
 
 	// newNotificationDeliverer builds the channel the notification worker sends
-	// through (issue #742).
+	// through (issues #742, #746).
 	//
-	// It returns nil, and that is the honest state of the pipeline rather than an
-	// oversight. Web Push, the browser service worker and the e-mail digest are
-	// all explicitly out of this issue's scope, so no delivery channel for chat
-	// notifications exists yet — and a placeholder that "delivered" to a log line
-	// would be a fake in production, claiming recipients were told when nobody
-	// was. Until a real adapter lands here the worker declines to start and says
-	// why, which is a state an operator can see. Nothing else changes: the outbox
-	// keeps accumulating events, because that is precisely what a durable outbox
-	// is for.
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
-		return nil
-	}
-	newNotificationWorker = func(cfg config.Config, store storage.NotificationOutboxStore,
+	// Web Push is that channel, and it is the only one: a chat notification is
+	// delivered to the recipient's registered browsers or it is not delivered at
+	// all. The factory returns nil when it cannot be built, which is not a
+	// failure path bolted on — it is the same signal issue #742 designed the
+	// worker around. A worker with no channel declines to start and says why on
+	// the readiness probe, and the outbox keeps accumulating events, because
+	// that is precisely what a durable outbox is for.
+	newNotificationDeliverer = newWebPushDeliverer
+	newNotificationWorker    = func(cfg config.Config, store storage.NotificationOutboxStore,
 		deliverer worker.Deliverer, metrics *worker.NotificationMetrics, logger *slog.Logger) backgroundWorker {
 		return worker.NewNotificationWorker(cfg.NotificationWorker,
 			notificationWorkerDeps(store, deliverer, metrics, logger))
@@ -393,7 +389,7 @@ func notificationDisabledReason(cfg config.Config, pool storage.Pool) string {
 // startNotificationWorker owns the decision to run the outbox worker: whether it
 // may, what it delivers through, and starting it.
 func (a *App) startNotificationWorker(
-	cfg config.Config, pool storage.Pool, metrics *observability.Metrics, logger *slog.Logger,
+	cfg config.Config, pool storage.Pool, obsMetrics *observability.Metrics, logger *slog.Logger,
 ) {
 	if !cfg.NotificationWorker.Enabled {
 		return
@@ -402,7 +398,11 @@ func (a *App) startNotificationWorker(
 		logger.Warn("notification worker disabled", "reason", reason)
 		return
 	}
-	deliverer := newNotificationDeliverer(cfg, logger)
+	// One NotificationMetrics for the worker and the channel it delivers
+	// through: both register on the shared registry, and building two would
+	// register the same collectors twice.
+	metrics := worker.NewNotificationMetrics(obsMetrics)
+	deliverer := newNotificationDeliverer(cfg, pool, metrics, logger)
 	if deliverer == nil {
 		// No channel to deliver through. Claiming events would move them into
 		// 'processing' and back out again with nothing sent, so the worker does
@@ -416,7 +416,7 @@ func (a *App) startNotificationWorker(
 	// pass is entitled to run and not a second less.
 	a.notification = a.launchWorker("notification",
 		newNotificationWorker(cfg, storage.NewPGXNotificationOutboxStore(pool),
-			deliverer, worker.NewNotificationMetrics(metrics), logger),
+			deliverer, metrics, logger),
 		startNotificationWorker, cfg.NotificationWorker.ProcessingBudget())
 	// No policy version here, deliberately. It belongs to a decision, not to a
 	// process: during a rollout two replicas run different rule sets, so a
@@ -483,4 +483,41 @@ func pushSubscriptionOptions(cfg config.Config, pool storage.Pool, logger *slog.
 	logger.Info("push subscription api enabled")
 	return []httpapi.Option{httpapi.WithPushSubscriptions(
 		validator, storage.NewPGXPrincipalResolver(pool), handler)}
+}
+
+// newWebPushDeliverer builds the Web Push channel, or reports why it cannot
+// (issue #746).
+//
+// Configuration is the whole of the decision, and it is made once here rather
+// than rediscovered on every send. A deployment with no VAPID keys, or with
+// keys that are not keys, gets no channel — so the worker does not start, the
+// readiness probe says so, and no half-configured send is ever attempted. The
+// reason names the variable and never its value: this function is the last
+// place a key could be turned into a log line, and it does not.
+func newWebPushDeliverer(
+	cfg config.Config, pool storage.Pool,
+	metrics *worker.NotificationMetrics, logger *slog.Logger,
+) worker.Deliverer {
+	if ready, reason := cfg.WebPush.Ready(); !ready {
+		logger.Warn("web push delivery disabled", "reason", reason)
+		return nil
+	}
+	if pool == nil {
+		logger.Warn("web push delivery disabled", "reason", "database_not_configured")
+		return nil
+	}
+	// The sender's HTTP timeout is the worker's own delivery budget. The
+	// delivery context bounds the fan-out to the same figure, so whichever
+	// expires first ends the attempt; the client's copy exists so a client
+	// without a context could not outlive the pass that owns it.
+	sender := worker.NewVAPIDSender(cfg.WebPush,
+		time.Duration(cfg.NotificationWorker.DeliveryTimeoutSeconds)*time.Second)
+	logger.Info("web push delivery enabled",
+		"ttl_seconds", cfg.WebPush.Normalized().TTLSeconds)
+	return worker.NewWebPushDeliverer(cfg.WebPush, worker.WebPushDeps{
+		Store:   storage.NewPGXPushDeliveryStore(pool),
+		Sender:  sender,
+		Metrics: metrics,
+		Logger:  logger,
+	})
 }

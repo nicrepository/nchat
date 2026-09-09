@@ -1,9 +1,35 @@
 package config
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"testing"
 	"time"
 )
+
+// readyWebPushConfig is a usable Web Push channel: a real P-256 pair and a
+// contact URI.
+//
+// Generated rather than committed. The key pair is now validated semantically
+// (issue #746), so a fabricated constant would not pass — and a real private
+// key in the repository would be a secret in version control whatever it was
+// for. webpush_test.go carries the same generator for the external test
+// package; the duplication is two packages' worth of a fixture, not a
+// production concern.
+func readyWebPushConfig(t *testing.T) WebPushConfig {
+	t.Helper()
+	key, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate P-256 key: %v", err)
+	}
+	return WebPushConfig{
+		VAPIDPublicKey:  base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()),
+		VAPIDPrivateKey: base64.RawURLEncoding.EncodeToString(key.Bytes()),
+		VAPIDSubject:    "mailto:ops@example.test",
+		TTLSeconds:      3600,
+	}
+}
 
 // Issue #742: the worker's configuration is a safety boundary, not a preference.
 // Every test here is about a value that, unbounded, would break something the
@@ -154,10 +180,21 @@ func TestNotificationWorkerReadyReportsWhyItCannotRun(t *testing.T) {
 			wantOK:   false,
 			wantSaid: true,
 		},
+		// Web Push is the only channel the worker has (issue #746), so an
+		// enabled worker whose channel cannot be built is not ready either.
+		"enabled without a usable delivery channel": {
+			cfg: Config{
+				DatabaseURL:        "postgres://localhost/nchat",
+				NotificationWorker: NotificationWorkerConfig{Enabled: true}.Normalized(),
+			},
+			wantOK:   false,
+			wantSaid: true,
+		},
 		"enabled and coherent": {
 			cfg: Config{
 				DatabaseURL:        "postgres://localhost/nchat",
 				NotificationWorker: NotificationWorkerConfig{Enabled: true}.Normalized(),
+				WebPush:            readyWebPushConfig(t),
 			},
 			wantOK: true,
 		},

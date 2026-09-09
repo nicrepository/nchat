@@ -1,6 +1,9 @@
 package httpapi
 
 import (
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,7 +21,25 @@ func workingNotificationConfig() config.Config {
 	cfg := testConfig()
 	cfg.DatabaseURL = "postgres://user@127.0.0.1:5432/nchat?sslmode=disable"
 	cfg.NotificationWorker = config.NotificationWorkerConfig{Enabled: true}.Normalized()
+	// Web Push is the worker's only delivery channel, so since issue #746 an
+	// enabled worker without a usable VAPID pair is not a working configuration
+	// and readiness says so.
+	cfg.WebPush = workingWebPushConfig()
 	return cfg
+}
+
+// workingWebPushConfig is a real P-256 pair, generated rather than committed.
+func workingWebPushConfig() config.WebPushConfig {
+	key, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return config.WebPushConfig{
+		VAPIDPublicKey:  base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()),
+		VAPIDPrivateKey: base64.RawURLEncoding.EncodeToString(key.Bytes()),
+		VAPIDSubject:    "mailto:ops@example.test",
+		TTLSeconds:      3600,
+	}
 }
 
 // Disabled on purpose is not a fault, and it is the default everywhere.

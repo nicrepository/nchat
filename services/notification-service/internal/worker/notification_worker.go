@@ -392,7 +392,30 @@ func (w *NotificationWorker) recordOutcome(
 	}
 	return deliveryOutcome{result: resultRetry, category: category},
 		w.store.ScheduleRetry(ctx, notification.ID, notification.Attempt,
-			w.retry.Delay(notification.Attempt), category)
+			w.retryDelay(notification.Attempt, deliveryErr), category)
+}
+
+// retryDelay is when a failed attempt becomes due again.
+//
+// RetryPolicy decides it, and a provider that asked for longer gets it — as a
+// floor, bounded by the ceiling the configuration already sets:
+//
+//	max(backoff(attempt), Retry-After), capped at RetryMaxSeconds
+//
+// Both bounds are load-bearing. Taking the provider's value outright would let
+// a 429 answered with "1" replace an exponential backoff with a tight loop
+// against something that is already rate limiting us. Honouring it unbounded
+// would let one header park a notification past its own TTL, or past every
+// remaining attempt. Between those, the larger of the two respects a rate
+// limiter that genuinely needs more time than the backoff had reached, which is
+// the only thing Retry-After is for.
+func (w *NotificationWorker) retryDelay(attempt int, deliveryErr error) time.Duration {
+	delay := w.retry.Delay(attempt)
+	requested := requestedRetryDelay(deliveryErr)
+	if requested <= delay {
+		return delay
+	}
+	return min(requested, time.Duration(w.cfg.RetryMaxSeconds)*time.Second)
 }
 
 // logOutcome states what happened, in identifiers and categories only.

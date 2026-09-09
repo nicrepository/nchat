@@ -39,7 +39,7 @@ type fakeStore struct {
 	delivered []recordedDelivery
 
 	subscription domain.PushSubscription
-	applied      bool
+	application  domain.DeliveryApplication
 	err          error
 }
 
@@ -64,9 +64,9 @@ func (f *fakeStore) Disable(_ context.Context, _ domain.Principal, subscriptionI
 
 func (f *fakeStore) RecordDelivery(
 	_ context.Context, subscriptionID string, generation int64, result domain.DeliveryResult,
-) (bool, error) {
+) (domain.DeliveryApplication, error) {
 	f.delivered = append(f.delivered, recordedDelivery{subscriptionID, generation, result})
-	return f.applied, f.err
+	return f.application, f.err
 }
 
 // encodedKey builds a structurally valid key of the right size. Built rather
@@ -171,11 +171,11 @@ func TestRecordDeliveryStatusClassifiesBeforeWriting(t *testing.T) {
 		0:                              {Outcome: domain.OutcomeTransient},
 	}
 	for status, want := range cases {
-		store := &fakeStore{applied: true}
-		applied, err := service.NewPushSubscriptions(store).
+		store := &fakeStore{application: domain.ApplicationRecorded}
+		application, err := service.NewPushSubscriptions(store).
 			RecordDeliveryStatus(context.Background(), "sub-1", 7, status)
-		if err != nil || !applied {
-			t.Fatalf("RecordDeliveryStatus(%d) = %v, %v", status, applied, err)
+		if err != nil || application != domain.ApplicationRecorded {
+			t.Fatalf("RecordDeliveryStatus(%d) = %v, %v", status, application, err)
 		}
 		if len(store.delivered) != 1 ||
 			store.delivered[0] != (recordedDelivery{"sub-1", 7, want}) {
@@ -189,17 +189,24 @@ func TestRecordDeliveryStatusClassifiesBeforeWriting(t *testing.T) {
 // attributed to the endpoint that is on file now rather than the one the attempt
 // was actually made against.
 func TestRecordDeliveryStatusCarriesTheAttemptsGeneration(t *testing.T) {
-	store := &fakeStore{applied: false}
+	// The browser re-registered while the attempt was in flight, so the row is
+	// active again on a newer generation.
+	store := &fakeStore{application: domain.ApplicationSuperseded}
 
-	applied, err := service.NewPushSubscriptions(store).
+	application, err := service.NewPushSubscriptions(store).
 		RecordDeliveryStatus(context.Background(), "sub-1", 3, http.StatusGone)
 	if err != nil {
 		t.Fatalf("RecordDeliveryStatus: %v", err)
 	}
-	// A stale result is an ordinary outcome, reported as false and never as an
-	// error: there is nothing for the caller to log or retry.
-	if applied {
+	// A stale result is an ordinary outcome, never an error — and it is
+	// classified, not merely refused, so the caller can see that a live
+	// endpoint replaced the dead one instead of concluding the subscription is
+	// finished (issue #746).
+	if application == domain.ApplicationRecorded {
 		t.Fatal("a stale result was reported as applied")
+	}
+	if !application.Deliverable() {
+		t.Fatal("a rotated subscription was not reported as still deliverable")
 	}
 	if len(store.delivered) != 1 || store.delivered[0].generation != 3 {
 		t.Fatalf("store saw %+v, want generation 3", store.delivered)

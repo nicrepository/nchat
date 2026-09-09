@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"testing"
@@ -36,6 +39,25 @@ func restoreNotificationFactories(t *testing.T) {
 	})
 }
 
+// testWebPushConfig is a structurally valid VAPID configuration (issue #746).
+//
+// The key pair is generated for the test rather than committed. A real private
+// key in the repository would be a secret in version control whatever its
+// intended use, and a fabricated string would only prove that the validation
+// accepts fabrications.
+func testWebPushConfig() config.WebPushConfig {
+	private, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return config.WebPushConfig{
+		VAPIDPublicKey:  base64.RawURLEncoding.EncodeToString(private.PublicKey().Bytes()),
+		VAPIDPrivateKey: base64.RawURLEncoding.EncodeToString(private.Bytes()),
+		VAPIDSubject:    "mailto:ops@example.test",
+		TTLSeconds:      3600,
+	}
+}
+
 func notificationWorkerConfig() config.Config {
 	return config.Config{
 		ServiceName:              "notification-service",
@@ -45,6 +67,10 @@ func notificationWorkerConfig() config.Config {
 		DatabaseURL:              "postgres://user@127.0.0.1:1/nchat?sslmode=disable",
 		DBConnectTimeoutSeconds:  1,
 		NotificationWorker:       config.NotificationWorkerConfig{Enabled: true}.Normalized(),
+		// An enabled worker needs a usable channel to be coherent (issue #746):
+		// Web Push is the only one it has, so a fixture without a key pair is a
+		// configuration the readiness probe is right to refuse.
+		WebPush: testWebPushConfig(),
 	}
 }
 
@@ -53,9 +79,10 @@ type noopDeliverer struct{}
 
 func (noopDeliverer) Deliver(context.Context, worker.Notification) error { return nil }
 
-// The state the pipeline is actually in: enabled, but with nothing to deliver
-// through. Claiming events would move them into 'processing' and back out with
-// nothing sent, so the worker must not start.
+// Enabled, with nothing to deliver through. Claiming events would move them
+// into 'processing' and back out with nothing sent, so the worker must not
+// start — and since issue #746 that condition is reached by configuration
+// rather than by there being no adapter in the tree: no VAPID keys, no channel.
 func TestNotificationWorkerDoesNotStartWithoutADeliveryChannel(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
@@ -64,7 +91,9 @@ func TestNotificationWorkerDoesNotStartWithoutADeliveryChannel(t *testing.T) {
 	started := false
 	startNotificationWorker = func(context.Context, backgroundWorker) { started = true }
 
-	application := New(notificationWorkerConfig())
+	cfg := notificationWorkerConfig()
+	cfg.WebPush = config.WebPushConfig{}
+	application := New(cfg)
 
 	if started {
 		t.Fatal("the worker started with no channel to deliver through")
@@ -78,7 +107,8 @@ func TestNotificationWorkerDoesNotStartWhenDisabled(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
 	openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
+	newNotificationDeliverer = func(config.Config, storage.Pool,
+		*worker.NotificationMetrics, *slog.Logger) worker.Deliverer {
 		return noopDeliverer{}
 	}
 
@@ -99,7 +129,8 @@ func TestNotificationWorkerDoesNotStartWhenDisabled(t *testing.T) {
 func TestNotificationWorkerDoesNotStartWithoutADatabase(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
+	newNotificationDeliverer = func(config.Config, storage.Pool,
+		*worker.NotificationMetrics, *slog.Logger) worker.Deliverer {
 		return noopDeliverer{}
 	}
 
@@ -125,7 +156,8 @@ func TestNotificationWorkerDoesNotStartOnALeaseItCannotHonour(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
 	openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
+	newNotificationDeliverer = func(config.Config, storage.Pool,
+		*worker.NotificationMetrics, *slog.Logger) worker.Deliverer {
 		return noopDeliverer{}
 	}
 
@@ -150,7 +182,8 @@ func TestNotificationWorkerRunsAndIsStoppedByShutdown(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
 	openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
+	newNotificationDeliverer = func(config.Config, storage.Pool,
+		*worker.NotificationMetrics, *slog.Logger) worker.Deliverer {
 		return noopDeliverer{}
 	}
 
@@ -225,12 +258,33 @@ func TestNotificationDisabledReasonNamesTheCause(t *testing.T) {
 	}
 }
 
-// The default factory is deliberately empty: no chat notification channel
-// exists yet, and a placeholder that "delivered" to a log line would claim
-// recipients were told when nobody was.
-func TestNoDeliveryChannelIsRegisteredYet(t *testing.T) {
-	if newNotificationDeliverer(config.Config{}, quietTestLogger()) != nil {
-		t.Fatal("a delivery channel appeared without an adapter to back it")
+// An unconfigured deployment gets no delivery channel (issue #746).
+//
+// The empty config has no VAPID keys, so Web Push cannot be built and the
+// factory says so by returning nil — which is what makes the worker decline to
+// start rather than claim recipients were told when nobody was. A placeholder
+// that "delivered" to a log line would be exactly that claim.
+func TestNoDeliveryChannelWithoutWebPushConfiguration(t *testing.T) {
+	if newNotificationDeliverer(config.Config{}, fakePool{}, nil, quietTestLogger()) != nil {
+		t.Fatal("a delivery channel appeared without VAPID configuration")
+	}
+}
+
+// Configured keys are not enough on their own: the fan-out reads the database,
+// so a deployment without one has no channel either.
+func TestNoDeliveryChannelWithoutADatabase(t *testing.T) {
+	cfg := config.Config{WebPush: testWebPushConfig()}
+	if newNotificationDeliverer(cfg, nil, nil, quietTestLogger()) != nil {
+		t.Fatal("a delivery channel appeared without a database behind it")
+	}
+}
+
+// With both in place the real Web Push channel is built.
+func TestWebPushDeliveryChannelIsBuiltWhenConfigured(t *testing.T) {
+	cfg := notificationWorkerConfig()
+	cfg.WebPush = testWebPushConfig()
+	if newNotificationDeliverer(cfg, fakePool{}, nil, quietTestLogger()) == nil {
+		t.Fatal("a configured deployment got no delivery channel")
 	}
 }
 
@@ -320,7 +374,8 @@ func TestNotificationWorkerHandleCarriesItsConfiguredBudget(t *testing.T) {
 	restoreFactories(t)
 	restoreNotificationFactories(t)
 	openDB = func(context.Context, string, int) (storage.Pool, error) { return fakePool{}, nil }
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
+	newNotificationDeliverer = func(config.Config, storage.Pool,
+		*worker.NotificationMetrics, *slog.Logger) worker.Deliverer {
 		return noopDeliverer{}
 	}
 	starter := newFakeSMTPWorkerStarter()
@@ -480,5 +535,76 @@ func TestNotificationWorkerIsWiredWithTheCentralPolicy(t *testing.T) {
 	live.Origin = string(notificationevent.OriginLive)
 	if verdict, err = deps.Evaluator.Evaluate(context.Background(), live); err != nil || !verdict.Deliver {
 		t.Fatalf("Evaluate(live) = (%+v, %v), want a delivery", verdict, err)
+	}
+}
+
+// A VAPID pair that is not a pair gets no delivery channel (issue #746).
+//
+// Both keys are individually valid P-256 values, so nothing structural refuses
+// them — only deriving the public key from the private one does. Without that
+// check the worker started, claimed events, and every push failed at the
+// provider as a permanent error, retiring outbox rows for what is a
+// configuration mistake.
+func TestNoDeliveryChannelForAMismatchedVAPIDPair(t *testing.T) {
+	first := testWebPushConfig()
+	second := testWebPushConfig()
+
+	mismatched := first
+	mismatched.VAPIDPublicKey = second.VAPIDPublicKey
+
+	cfg := notificationWorkerConfig()
+	cfg.WebPush = mismatched
+
+	if newNotificationDeliverer(cfg, fakePool{}, nil, quietTestLogger()) != nil {
+		t.Fatal("a mismatched VAPID pair produced a delivery channel")
+	}
+}
+
+// Keys that decode to the right number of bytes but are not usable P-256
+// values get no channel either.
+func TestNoDeliveryChannelForKeysThatAreNotKeys(t *testing.T) {
+	valid := testWebPushConfig()
+
+	cases := map[string]func(*config.WebPushConfig){
+		"zero private scalar": func(c *config.WebPushConfig) {
+			c.VAPIDPrivateKey = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+		},
+		"public point off the curve": func(c *config.WebPushConfig) {
+			point := make([]byte, 65)
+			point[0] = 0x04
+			point[1] = 0x01
+			c.VAPIDPublicKey = base64.RawURLEncoding.EncodeToString(point)
+		},
+	}
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := notificationWorkerConfig()
+			cfg.WebPush = valid
+			breakIt(&cfg.WebPush)
+
+			if newNotificationDeliverer(cfg, fakePool{}, nil, quietTestLogger()) != nil {
+				t.Fatal("an unusable key produced a delivery channel")
+			}
+		})
+	}
+}
+
+// An unusable channel does not merely disable the worker quietly — the
+// readiness probe reports it, so the pod never goes green with a backlog that
+// nothing is draining.
+func TestAnUnusableChannelKeepsTheWorkerFromReportingReady(t *testing.T) {
+	cfg := notificationWorkerConfig()
+	cfg.NotificationWorker.Enabled = true
+	cfg.WebPush = config.WebPushConfig{}
+
+	if ready, reason := cfg.NotificationWorkerReady(); ready {
+		t.Fatal("an enabled worker with no Web Push configuration reported ready")
+	} else if reason == "" {
+		t.Fatal("the refusal said nothing")
+	}
+
+	cfg.WebPush = testWebPushConfig()
+	if ready, reason := cfg.NotificationWorkerReady(); !ready {
+		t.Fatalf("a usable channel was refused: %s", reason)
 	}
 }
