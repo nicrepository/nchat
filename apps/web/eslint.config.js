@@ -24,5 +24,15 @@ export default tseslint.config(
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
     },
   },
+  {
+    // The Service Worker is a classic script with worker globals, not a
+    // module in the application bundle (issue #747).
+    files: ["public/sw.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: globals.serviceworker,
+    },
+  },
   eslintConfigPrettier,
 );

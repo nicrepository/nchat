@@ -4,9 +4,11 @@ Camada de entrega do pipeline de notificacoes (issue #746, parent #678).
 Codigo em `services/notification-service/internal/worker/webpush_*.go`,
 `internal/storage/push_delivery_store.go` e `internal/config/webpush.go`.
 
-Service Worker, `notificationclick`, reconcile do browser, digest pos-expediente
-e a UI de Perfil > Notificacoes **estao fora** desta camada e continuam nao
-existindo.
+Reconcile do browser, digest pos-expediente e a UI de Perfil > Notificacoes
+**estao fora** desta camada e continuam nao existindo. Service Worker e
+`notificationclick` tambem estao fora dela, e passaram a existir na #747 — ver
+[notification-service-worker.md](notification-service-worker.md), que consome
+o payload descrito abaixo.
 
 ## Onde encaixa
 
