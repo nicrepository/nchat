@@ -1,0 +1,22 @@
+# The production migration participates in the production mutation lock.
+#
+# Blue and Green share one database, and a rollback proves the schema still fits
+# the release it is restoring. A migration that applied itself during that proof
+# would invalidate it, so this Job takes the shared mutation lock first and
+# REFUSES if a rollback holds it -- it does not queue. Refusing costs a release;
+# queueing would apply a migration onto the release a rollback had just restored.
+#
+# Set only here. Dev and staging migrate against their own databases with
+# nothing to exclude, and base/ stays the shape they share.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nchat-migrations
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrations
+          env:
+            - name: NCHAT_PROD_MUTATION_LOCK
+              value: "1"

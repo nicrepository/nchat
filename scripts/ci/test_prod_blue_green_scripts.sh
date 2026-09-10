@@ -142,9 +142,17 @@ replicas_for() {
 }
 
 # Builds a cluster: every Service on $1, every Deployment of the slots in $2 Ready.
+#
+# `mktemp -d`, not "$WORK/state.$RANDOM". $RANDOM draws from 32768 values and
+# this suite builds a fixture well over a hundred times, so by the birthday
+# bound a collision is not unlikely, it is expected -- and a collision here does
+# not fail loudly: `mkdir -p` succeeds on the existing directory and the new case
+# silently inherits the previous one's Services, rollout records and patch log.
+# That is a test reporting on a cluster nobody built. mktemp asks the kernel for
+# a name no one else holds and fails if it cannot get one.
 new_state() {
   local active="$1" ready_slots="$2" state slot service secret count
-  state="$WORK/state.$RANDOM"
+  state="$(mktemp -d "$WORK/state.XXXXXXXX")"
   mkdir -p "$state/services" "$state/ready" "$state/sha" "$state/image" "$state/secrets"
   printf 'nchat-prod-deployer' >"$state/context"
   printf 'nchat-prod' >"$state/namespace"
@@ -1444,6 +1452,293 @@ expect_exit 1 "$status"
 grep -q "past its baseline" "$WORK/err.txt" || fail "baseline mode survived past the first release"
 pass
 
+# --- the post-rollback minimum smoke -----------------------------------------
+#
+# After a rollback the target carries production traffic by definition, so the
+# candidate isolation rule asks the opposite question and could only ever fail.
+# `--active` asks the one that matters after a traffic switch -- is this slot
+# what every stable Service selects -- and the cases below prove it is a
+# stronger precondition rather than a way around the candidate rule.
+
+begin "--active validates the slot the stable Services select"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --active || status=$?
+expect_exit 0 "$status"
+grep -q "mode: active" "$WORK/out.txt" || fail "did not run in active mode"
+grep -q "active: every stable Service selects slot blue" "$WORK/out.txt" ||
+  fail "did not report the active precondition"
+grep -q "Automated smoke            : PASS" "$WORK/out.txt" || fail "no automated verdict"
+pass
+
+begin "--active authorises no promotion and prints no cutover evidence"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --active || status=$?
+expect_exit 0 "$status"
+grep -q "NCHAT_PROD_SMOKE_CONFIRMED=" "$WORK/out.txt" &&
+  fail "offered promotion evidence after a rollback"
+grep -q "Cutover eligibility" "$WORK/out.txt" &&
+  fail "reported cutover eligibility for the slot already serving production"
+grep -q "authorises no promotion" "$WORK/out.txt" || fail "did not say what it authorises"
+grep -q "NOT CONFIRMED BY THIS COMMAND" "$WORK/out.txt" ||
+  fail "stopped flagging the authenticated smoke"
+pass
+
+begin "--active refuses the slot that is not serving production"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green --active || status=$?
+expect_exit 1 "$status"
+grep -q "applies to the slot serving production" "$WORK/err.txt" ||
+  fail "validated a slot that carries no traffic as the active one"
+pass
+
+# A rollback that converged part-way must not be reported as smoked. The mode is
+# unavailable in a mixed namespace at all, which is what makes it a precondition
+# rather than a bypass.
+begin "--active refuses a namespace whose Services are mixed"
+state="$(new_state blue "blue green")"
+printf 'green' >"$state/services/chat-service"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --active || status=$?
+expect_exit 1 "$status"
+grep -q "do not agree on a slot" "$WORK/err.txt" || fail "smoked a mixed namespace"
+pass
+
+begin "--active still fails a target that is not Ready"
+state="$(new_state blue "blue green")"
+set_rollout "$state" chat-service-blue 1 1 2 2 1 1 1
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --active || status=$?
+expect_exit 1 "$status"
+grep -q "not all replicas Ready" "$WORK/err.txt" || fail "passed an unready active slot"
+pass
+
+begin "--active still fails a target carrying more than one release"
+state="$(new_state blue "blue green")"
+set_workload_release "$state" file-service-blue "$RELEASE_B"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --active || status=$?
+expect_exit 1 "$status"
+grep -q "more than one release" "$WORK/err.txt" || fail "smoked an incoherent active slot"
+pass
+
+# The rule this mode must never weaken: the candidate smoke still refuses a slot
+# that holds traffic, and the two modes are not interchangeable.
+begin "--active does not weaken the candidate isolation rule"
+state="$(new_state blue "blue green")"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue || status=$?
+expect_exit 1 "$status"
+grep -q "already selected by" "$WORK/err.txt" || fail "isolation rule was weakened"
+status=0; run "$state" "$SCRIPTS/smoke.sh" --target green --active || status=$?
+expect_exit 1 "$status"
+pass
+
+# --- the applied-migration ledger reader --------------------------------------
+#
+# The authoritative source the rollback schema gate consumes. It replaced a
+# reading of the releases observed on the cluster's workloads, and that is the
+# point: deploy.sh runs the migration Job BEFORE it applies the candidate and
+# before it waits for it, so a release can advance the schema and then fail to
+# roll out, leaving no Pod, Deployment or slot annotation carrying it. Every
+# workload-derived source reports that release as never having happened.
+#
+# What is proved here is that the reader is authoritative or silent: it never
+# emits a usable ledger it did not actually read.
+
+LEDGER_HEADER='# nchat-applied-migrations v1'
+RUNTIME_DSN='postgres://nchat_app:s3cr3t-not-a-real-password@postgres:5432/nchat'
+
+# A namespace whose runtime Secret carries the DSN and whose database answers.
+with_ledger() {
+  local state="$1" rows="${2-}"
+  mkdir -p "$state/secret-data/nchat-secrets"
+  printf '%s' "$RUNTIME_DSN" >"$state/secret-data/nchat-secrets/DATABASE_URL"
+  printf 'CLEAN' >"$state/ledger-state"
+  printf '%s' "$rows" >"$state/ledger-rows"
+}
+
+read_ledger() {
+  local state="$1"
+  FAKE_STATE_DIR="$state" bash "$SCRIPTS/applied-migrations.sh" \
+    >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
+CHECKSUM_A=0000000000000000000000000000000000000000000000000000000000000001
+CHECKSUM_B=0000000000000000000000000000000000000000000000000000000000000002
+
+# The rows are written in the shape PostgreSQL really holds: three columns, and
+# a filename with no ".up.sql" -- migrate.sh strips it before persisting
+# (parse_up_file: MFILE="${filename%.up.sql}"). Reconstructing the file name is
+# the reader's job, and this is where that is proved end to end. A fixture that
+# handed the reader the canonical path would be testing nothing.
+begin "the ledger reader reconstructs the file names the database does not store"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+auth 000101_add $CHECKSUM_B
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 0 "$status"
+assert_equals "the ledger" \
+  "$LEDGER_HEADER
+chat/000100_pin.up.sql $CHECKSUM_A
+auth/000101_add.up.sql $CHECKSUM_B" "$(cat "$WORK/out.txt")"
+pass
+
+# The one empty answer that is allowed, and it is allowed because the source
+# said so rather than because nothing was read.
+begin "a database with no applied migrations still emits the proof header"
+state="$(new_state blue "blue green")"
+with_ledger "$state" ""
+status=0; read_ledger "$state" || status=$?
+expect_exit 0 "$status"
+assert_equals "the ledger" "$LEDGER_HEADER" "$(cat "$WORK/out.txt")"
+pass
+
+# The refusals. None of them may produce a usable ledger, because the gate reads
+# an empty one as "nothing was applied".
+begin "a database that cannot be reached blocks and emits no ledger"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+"
+printf '1' >"$state/exec-fails"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+grep -q "could not be read" "$WORK/err.txt" || fail "did not report an unreadable ledger"
+grep -q "$LEDGER_HEADER" "$WORK/out.txt" && fail "emitted a header it never read"
+pass
+
+begin "a runtime Secret the identity cannot read blocks"
+state="$(new_state blue "blue green")"
+printf 'CLEAN' >"$state/ledger-state"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+grep -q "cannot read secret/nchat-secrets" "$WORK/err.txt" ||
+  fail "did not name the Secret it needs"
+pass
+
+# A half-applied migration means the schema contains something nobody can
+# describe, and that is never rounded down to a readable ledger.
+begin "a dirty ledger blocks rather than reporting the rows it can see"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+"
+printf 'DIRTY' >"$state/ledger-state"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+grep -q "half-applied migration" "$WORK/err.txt" || fail "did not refuse a dirty ledger"
+grep -q "$LEDGER_HEADER" "$WORK/out.txt" && fail "emitted a header for a dirty ledger"
+pass
+
+begin "a ledger row the reader cannot parse blocks"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "not a ledger row
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+grep -q "a row this cannot read" "$WORK/err.txt" || fail "passed on a row it could not read"
+pass
+
+# Evidence is all of it or none of it.
+#
+# The reader emits nothing until every row has been validated, because a file
+# holding the proof header and the rows that happened to come before the bad one
+# is exactly the shape the schema gate accepts as "this is everything production
+# has applied". A ledger that stops half-way is worse than no ledger: only one of
+# the two is recognisable as missing.
+assert_no_partial_evidence() {
+  grep -q "$LEDGER_HEADER" "$WORK/out.txt" &&
+    fail "emitted the proof header for a ledger it could not read"
+  [[ ! -s "$WORK/out.txt" ]] || fail "emitted output a consumer could read: $(cat "$WORK/out.txt")"
+}
+
+begin "a bad row after good ones leaves no partial evidence"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+auth 000101_add $CHECKSUM_B
+chat not-a-migration-name $CHECKSUM_A
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+assert_no_partial_evidence
+pass
+
+begin "a bad first row leaves no partial evidence"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat ../escape $CHECKSUM_A
+chat 000100_pin $CHECKSUM_A
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+assert_no_partial_evidence
+pass
+
+begin "a bad checksum on a later row leaves no partial evidence"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+auth 000101_add not-a-checksum
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+assert_no_partial_evidence
+pass
+
+# A stored name that already carries the suffix is not a row migrate.sh can
+# write. It must be refused, never normalised by appending a second suffix.
+begin "a stored filename that already carries .up.sql is refused, not doubled"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin.up.sql $CHECKSUM_A
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 1 "$status"
+assert_no_partial_evidence
+grep -q "000100_pin.up.sql.up.sql" "$WORK/out.txt" "$WORK/err.txt" &&
+  fail "appended a second .up.sql to a name that already had one"
+pass
+
+# Values that cannot come out of migrate.sh's own validators. Each is refused on
+# the field it breaks, and none is normalised into something path-shaped.
+begin "rows that escape the stored format are refused"
+state="$(new_state blue "blue green")"
+for bad_row in "chat ../000100_pin $CHECKSUM_A" \
+  "chat chat/000100_pin $CHECKSUM_A" \
+  "../chat 000100_pin $CHECKSUM_A" \
+  "chat/sub 000100_pin $CHECKSUM_A" \
+  "chat 000100_pin $CHECKSUM_A extra" \
+  "chat 000100 pin $CHECKSUM_A" \
+  "Chat 000100_pin $CHECKSUM_A" \
+  "chat 00100_pin $CHECKSUM_A"; do
+  with_ledger "$state" "$bad_row
+"
+  status=0; read_ledger "$state" || status=$?
+  expect_exit 1 "$status"
+  assert_no_partial_evidence
+done
+pass
+
+# The connection string is the one value that must never become an argument or
+# a log line: this output is a public run log.
+begin "the connection string never reaches an argument list or the output"
+state="$(new_state blue "blue green")"
+with_ledger "$state" "chat 000100_pin $CHECKSUM_A
+"
+status=0; read_ledger "$state" || status=$?
+expect_exit 0 "$status"
+grep -q "s3cr3t-not-a-real-password" "$WORK/out.txt" && fail "printed the connection string"
+grep -q "s3cr3t-not-a-real-password" "$WORK/err.txt" && fail "printed the connection string on stderr"
+grep -q "s3cr3t-not-a-real-password" "$state/exec-log" && fail "put the connection string in kubectl's arguments"
+grep -q "s3cr3t-not-a-real-password" "$state/exec-stdin" || fail "did not hand the client the connection string at all"
+pass
+
+# It reads, and only reads. Nothing in this path may mutate the database or the
+# cluster, which is what makes it safe to run from the rollback workflow.
+begin "the ledger reader mutates nothing"
+state="$(new_state blue "blue green")"
+with_ledger "$state" ""
+status=0; read_ledger "$state" || status=$?
+expect_exit 0 "$status"
+[[ ! -s "$state/patch-log" ]] || fail "patched a Service"
+[[ ! -f "$state/delete-log" ]] || fail "deleted something"
+[[ ! -f "$state/applied" ]] || fail "applied a manifest"
+grep -qiE "insert|update|delete|drop|alter|create" "$state/exec-log" &&
+  fail "sent something other than a read to the database"
+pass
+
 begin "an unknown smoke argument is refused"
 state="$(new_state blue "blue")"
 status=0; run "$state" "$SCRIPTS/smoke.sh" --target blue --force || status=$?
@@ -2160,6 +2455,230 @@ assert_equals "services patched" "${#SERVICES[@]}" "$(wc -l <"$state/patch-log")
 assert_equals "distinct services patched" "${#SERVICES[@]}" "$(awk '{ print $1 }' "$state/patch-log" | sort -u | wc -l)"
 pass
 
+echo "--- the production mutation lock ---"
+#
+# The exclusion that makes the schema proof still true when the traffic moves.
+# The rollback holds the advisory lock scripts/db/migrate.sh takes, for the
+# whole of the ledger read, the gate and the switch; a migration that starts in
+# that window blocks in the server and refuses rather than applying.
+#
+# The fake models the lock with `mkdir`, which fails atomically on an existing
+# directory: two holders genuinely cannot coexist here, so what is proved is the
+# exclusion and not merely the SQL that was sent.
+
+LOCK_LIB="$SCRIPTS/production-mutation-lock.sh"
+
+# The rollback and the production migration must name the same outer lock, or
+# there is no barrier at all. It is also distinct from migrate.sh's internal
+# lock, because the two are nested rather than shared:
+#
+#   production mutation lock  ->  migration internal lock
+begin "the rollback and the production migration name the same mutation lock"
+migrate_prod_id="$(grep -oP '^PRODUCTION_MUTATION_LOCK_ID=\K[0-9]+' "$ROOT_DIR/scripts/db/migrate.sh")"
+migrate_inner_id="$(grep -oP '^MIGRATION_LOCK_ID=\K[0-9]+' "$ROOT_DIR/scripts/db/migrate.sh")"
+rollback_id="$(
+  NCHAT_PROD_MUTATION_LOCK_ID="" bash -c '
+    source "$1" >/dev/null 2>&1
+    printf "%s" "$NCHAT_PROD_MUTATION_LOCK_ID"' _ "$LOCK_LIB"
+)"
+assert_equals "the shared production mutation lock id" "$migrate_prod_id" "$rollback_id"
+[[ "$migrate_prod_id" != "$migrate_inner_id" ]] ||
+  fail "the outer and inner locks share an id; the nesting order cannot be stated"
+pass
+
+# Refusal, not a queue. A migration that waited would wake when the rollback
+# finished and apply itself onto the release the rollback had just restored.
+begin "the production migration asks for the lock without waiting for it"
+grep -q "pg_try_advisory_lock" "$ROOT_DIR/scripts/db/migrate.sh" ||
+  fail "the production migration path does not use a try-lock"
+grep -q "pg_try_advisory_lock" "$LOCK_LIB" ||
+  fail "the rollback path does not use a try-lock"
+pass
+
+# Runs a shell snippet with the lock library sourced against a fixture cluster.
+in_lock_session() {
+  local state="$1" snippet="$2"
+  FAKE_STATE_DIR="$state" bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      source "$2"
+      eval "$3"
+    ' _ "$SCRIPTS/lib.sh" "$LOCK_LIB" "$snippet" >"$WORK/out.txt" 2>"$WORK/err.txt"
+}
+
+begin "the lock is acquired, proved held, and released"
+state="$(new_state blue "blue green")"
+status=0
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"
+  assert_production_mutation_lock_held "in the test"
+  release_production_mutation_lock
+  echo "cycle complete"' || status=$?
+expect_exit 0 "$status"
+grep -q "cycle complete" "$WORK/out.txt" || fail "the lock cycle did not complete"
+[[ ! -d "$state/advisory-lock" ]] || fail "the lock was not released"
+pass
+
+# THE FINDING, reproduced: a migration that tries to start while the rollback
+# holds the lock must not be able to apply.
+begin "a migration cannot acquire the lock while the rollback holds it"
+state="$(new_state blue "blue green")"
+mkdir -p "$state/advisory-lock"   # stands in for the rollback already holding it
+status=0
+started="$(date +%s)"
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"' || status=$?
+expect_exit 1 "$status"
+grep -q "BUSY" "$WORK/err.txt" || fail "the second mutation did not report BUSY"
+grep -q "not queued and will not resume on its own" "$WORK/err.txt" ||
+  fail "did not say the operation is not queued"
+grep -q "Nothing has been moved" "$WORK/err.txt" ||
+  fail "did not say that nothing was moved"
+# Refusal is immediate: a queue would have taken as long as the other holder.
+[[ "$(($(date +%s) - started))" -lt 10 ]] || fail "the refusal waited for the lock"
+[[ -d "$state/advisory-lock" ]] || fail "the refused caller released a lock it never held"
+rmdir "$state/advisory-lock"
+pass
+
+# And the inverse: a rollback that starts while a migration holds the lock does
+# not enter the critical section.
+begin "the rollback cannot enter the critical section while a migration holds the lock"
+state="$(new_state blue "blue green")"
+mkdir -p "$state/advisory-lock"
+status=0
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"
+  echo "ENTERED CRITICAL SECTION"' || status=$?
+expect_exit 1 "$status"
+grep -q "ENTERED CRITICAL SECTION" "$WORK/out.txt" &&
+  fail "the rollback entered the critical section while a migration held the lock"
+grep -q "BUSY" "$WORK/err.txt" || fail "the rollback did not report BUSY"
+rmdir "$state/advisory-lock"
+pass
+
+# Once the first holder is gone the second can proceed: the barrier is exclusion,
+# not a permanent refusal.
+begin "the lock becomes available again once it is released"
+state="$(new_state blue "blue green")"
+status=0
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"
+  release_production_mutation_lock
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"
+  assert_production_mutation_lock_held "on the second acquire"
+  release_production_mutation_lock
+  echo "reacquired"' || status=$?
+expect_exit 0 "$status"
+grep -q "reacquired" "$WORK/out.txt" || fail "the lock could not be taken again"
+pass
+
+# Released on failure, not only on success: a gate that refuses inside the
+# critical section must not leave the lock held against the next operator.
+begin "the lock is released when the work inside it fails"
+state="$(new_state blue "blue green")"
+status=0
+in_lock_session "$state" '
+  with_production_mutation_lock "postgres://u:p@postgres/nchat" false' || status=$?
+expect_exit 1 "$status"
+[[ ! -d "$state/advisory-lock" ]] || fail "a failure inside the lock left it held"
+pass
+
+# Signals must END the operation, not tidy up and carry on.
+#
+# `trap cleanup EXIT INT TERM` released the lock and then RETURNED to the
+# interrupted flow, which went on switching production traffic with no lock
+# held. The sentinel below is the proof: it is the line after the signal, and it
+# must never be written.
+signal_during_lock() {
+  local state="$1" signal="$2"
+  rm -f "$state/sentinel-after-signal" "$state/lock-taken"
+  # `set -m` matters and is not decoration. A background job started by a
+  # non-interactive shell without job control inherits SIGINT set to SIG_IGN,
+  # and `trap ... INT` cannot re-enable a signal that was ignored on entry -- so
+  # the INT case would hang forever testing bash's job handling rather than the
+  # handler. Job control gives the job its own process group and the default
+  # disposition, which is what an operator's Ctrl-C really delivers.
+  set -m
+  FAKE_STATE_DIR="$state" bash -c '
+    set -Eeuo pipefail
+    source "$1"; source "$2"
+    protected() {
+      : >"$FAKE_STATE_DIR/lock-taken"
+      # Waits to be signalled, then must not reach the next line.
+      while [[ ! -f "$FAKE_STATE_DIR/go" ]]; do sleep 0.05; done
+      : >"$FAKE_STATE_DIR/sentinel-after-signal"
+    }
+    with_production_mutation_lock "postgres://u:p@postgres/nchat" protected
+  ' _ "$SCRIPTS/lib.sh" "$LOCK_LIB" >"$WORK/out.txt" 2>"$WORK/err.txt" &
+  local holder=$!
+  set +m
+  # Deterministic: wait for the lock to exist rather than sleeping blind.
+  for _ in $(seq 1 200); do [[ -f "$state/lock-taken" ]] && break; sleep 0.05; done
+  [[ -f "$state/lock-taken" ]] || fail "the protected function never started"
+  kill "-$signal" "$holder" 2>/dev/null || true
+  local status=0
+  wait "$holder" || status=$?
+  printf '%s' "$status"
+}
+
+begin "TERM ends the operation with 143 and nothing after it runs"
+state="$(new_state blue "blue green")"
+status="$(signal_during_lock "$state" TERM)"
+assert_equals "the exit status" "143" "$status"
+[[ ! -f "$state/sentinel-after-signal" ]] ||
+  fail "the protected operation continued after TERM"
+[[ ! -d "$state/advisory-lock" ]] || fail "TERM left the lock held"
+pass
+
+begin "INT ends the operation with 130 and nothing after it runs"
+state="$(new_state blue "blue green")"
+status="$(signal_during_lock "$state" INT)"
+assert_equals "the exit status" "130" "$status"
+[[ ! -f "$state/sentinel-after-signal" ]] ||
+  fail "the protected operation continued after INT"
+[[ ! -d "$state/advisory-lock" ]] || fail "INT left the lock held"
+pass
+
+# The signal handler exits, which runs the EXIT trap, which releases again. The
+# unlock has to happen once: twice would release a lock a later holder owns.
+begin "a signalled release unlocks exactly once"
+state="$(new_state blue "blue green")"
+signal_during_lock "$state" TERM >/dev/null
+assert_equals "unlock statements sent" "1" \
+  "$(grep -c 'pg_advisory_unlock' "$state/session-log" 2>/dev/null || echo 0)"
+pass
+
+# The liveness proof either side of the switch. A session that lost the lock
+# must report it, because that is the only way the run can know its exclusion
+# did not hold.
+begin "a lock lost mid-section is reported, never assumed"
+state="$(new_state blue "blue green")"
+status=0
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://u:p@postgres/nchat"
+  rmdir "$FAKE_STATE_DIR/advisory-lock"
+  assert_production_mutation_lock_held "after the switch"' || status=$?
+expect_exit 1 "$status"
+grep -q "no longer held after the switch" "$WORK/err.txt" ||
+  fail "a lost lock was not reported"
+grep -q "exclusion with migrations cannot be proved" "$WORK/err.txt" ||
+  fail "did not say what could not be proved"
+pass
+
+# The connection string is handed to the session on stdin and never appears in
+# an argument list, exactly as for the ledger read.
+begin "the lock session never puts the connection string in an argument list"
+state="$(new_state blue "blue green")"
+status=0
+in_lock_session "$state" '
+  acquire_production_mutation_lock "postgres://nchat_app:s3cr3t-not-a-real-password@postgres/nchat"
+  release_production_mutation_lock' || status=$?
+expect_exit 0 "$status"
+grep -q "s3cr3t-not-a-real-password" "$state/exec-log" &&
+  fail "the connection string reached kubectl's arguments"
+grep -q "s3cr3t-not-a-real-password" "$WORK/out.txt" "$WORK/err.txt" &&
+  fail "the connection string was printed"
+pass
 
 echo
 if [ "$FAILURES" -gt 0 ]; then

@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# A psql that speaks the advisory-lock protocol, shared by the two suites that
+# model it (scripts/db/migration-runtime-tests.sh and
+# scripts/ci/test_rollback_critical_section.sh).
+#
+# One fixture, because two models of one protocol is how they drift: an earlier
+# copy answered the PRODUCTION verdicts to the MIGRATION lock, which let a test
+# sit through a timeout and still report a pass. The two locks are modelled
+# separately here -- own directory, own verdict vocabulary, own release -- as
+# PostgreSQL gives each advisory id its own state.
+#
+# Environment:
+#   FAKE_PSQL_LOG     every invocation and every statement, appended
+#   FAKE_OUTER_LOCK   directory standing in for the production mutation lock
+#   FAKE_INNER_LOCK   directory standing in for the migration-specific lock
+#   FAKE_HANG         when it exists, the blocking acquisition never answers
+#
+# A directory is the lock because `mkdir` succeeds or fails atomically on one
+# that exists -- which is `pg_try_advisory_lock` exactly. Locks are released by
+# the exit of this process, as a backend releases its session locks.
+# One-shot invocations (connectivity probe, -c, -f) succeed and exit.
+handle_one_shot() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -c | -f) echo 1; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# The production mutation lock: its own id, its own directory, its own words.
+handle_prod_lock() {
+  if mkdir "$FAKE_OUTER_LOCK" 2>/dev/null; then
+    OUTER_HELD=true
+    printf 'prod-acquired\n'
+  else
+    printf 'prod-busy\n'
+  fi
+}
+
+# The migration-specific lock. It never answers 'prod-*'.
+handle_migration_lock() {
+  if mkdir "$FAKE_INNER_LOCK" 2>/dev/null; then
+    INNER_HELD=true
+    printf 'locked\n'
+  else
+    printf 'inner-busy\n'
+  fi
+}
+
+# The blocking form, reachable only outside production. `hang` models a server
+# that never answers, which is what bounded cleanup has to survive.
+handle_blocking_migration_lock() {
+  [[ ! -f "$FAKE_HANG" ]] || { while :; do sleep 0.2; done; }
+  mkdir "$FAKE_INNER_LOCK" 2>/dev/null && INNER_HELD=true
+  printf '\n'
+}
+
+release_outer() {
+  [[ "$OUTER_HELD" != true ]] || rmdir "$FAKE_OUTER_LOCK" 2>/dev/null || true
+  OUTER_HELD=false
+}
+
+release_inner() {
+  [[ "$INNER_HELD" != true ]] || rmdir "$FAKE_INNER_LOCK" 2>/dev/null || true
+  INNER_HELD=false
+}
+
+release_all() { release_inner; release_outer; }
+
+# The sentinel protected_sql waits for. Echoing it back is what proves the
+# statement travelled through THIS session and not some other connection.
+handle_session_sentinel() {
+  printf '%s\n' "$(sed -n "s/.*'\(nchat-session-ok-[0-9]*\)'.*/\1/p" <<<"$1")"
+}
+
+dispatch_session_command() {
+  local line="$1"
+  case "$line" in
+    *pg_try_advisory_lock*prod_lock_id*) handle_prod_lock ;;
+    *pg_try_advisory_lock*) handle_migration_lock ;;
+    *"pg_advisory_lock("*) handle_blocking_migration_lock ;;
+    *"'locked'"*) printf 'locked\n' ;;
+    *nchat-session-ok-*) handle_session_sentinel "$line" ;;
+    *pg_advisory_unlock*prod_lock_id*) release_outer; printf '\n' ;;
+    *pg_advisory_unlock*) release_inner; printf '\n' ;;
+    '\q') return 1 ;;
+    *) printf '\n' ;;
+  esac
+}
+
+printf '%s\n' "$*" >>"$FAKE_PSQL_LOG"
+handle_one_shot "$@" && exit 0
+OUTER_HELD=false
+INNER_HELD=false
+trap release_all EXIT
+while IFS= read -r line; do
+  printf 'SQL %s\n' "$line" >>"$FAKE_PSQL_LOG"
+  dispatch_session_command "$line" || exit 0
+done

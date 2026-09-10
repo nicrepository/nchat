@@ -37,6 +37,18 @@ PGUSER="nchat"
 DSN=""
 MIGRATIONS_TABLE_EXISTS=false
 MIGRATION_LOCK_ID=2026052201
+# The production mutation lock, shared with the rollback path
+# (scripts/deploy/nchat-prod/production-mutation-lock.sh). Distinct from the id
+# above and taken BEFORE it, never after: the order is
+#
+#   production mutation lock  ->  migration internal lock
+#
+# and stating it in one place is what keeps two scripts from inverting it.
+#
+# Only production takes it, which is what NCHAT_PROD_MUTATION_LOCK selects. Dev
+# and staging migrate against their own databases with nothing to exclude, and
+# making them fail-fast would break local workflows for no gain.
+PRODUCTION_MUTATION_LOCK_ID=2026052202
 LOCK_HOLDER_PID=""
 LOCK_ACQUIRED=false
 
@@ -172,45 +184,302 @@ validate_checksum() {
 # ---------------------------------------------------------------------------
 # Advisory lock: held by an open psql coprocess for the full mutating command.
 # ---------------------------------------------------------------------------
+# How long cleanup will wait for the session to close before it stops asking
+# politely. Short, deterministic and testable: a psql stuck inside a blocking
+# query never reads `\q`, and waiting on it forever would hold the production
+# mutation lock open for everyone else.
+MIGRATION_LOCK_CLOSE_ATTEMPTS="${MIGRATION_LOCK_CLOSE_ATTEMPTS:-50}"
+# The server-side ceiling on any single lock acquisition, so a wait that is
+# declared to be bounded actually is. `read -t` alone bounds only this script's
+# patience, not the query, and the two disagreeing is what left a coprocess
+# blocked in the server while its owner had already given up on it.
+MIGRATION_LOCK_TIMEOUT_MS="${MIGRATION_LOCK_TIMEOUT_MS:-60000}"
+# How long to wait for a lock verdict. Production keeps the values it had; the
+# tests override it, and it is read here rather than written literally at each
+# call site so that override is real -- setting it and still waiting ninety
+# seconds is a comment that disagrees with the code.
+MIGRATION_LOCK_REPLY_TIMEOUT="${MIGRATION_LOCK_REPLY_TIMEOUT:-60}"
+# The blocking acquisition outside production waits on the server as well, so it
+# is given more room than a try-lock verdict needs.
+MIGRATION_LOCK_BLOCKING_TIMEOUT="${MIGRATION_LOCK_BLOCKING_TIMEOUT:-90}"
+
+production_mutation_lock_enabled() {
+  [[ "${NCHAT_PROD_MUTATION_LOCK:-0}" == "1" ]]
+}
+
+# Reads the session until one of the expected tokens or the deadline. psql emits
+# an empty line for a void return, so anything unrecognised is skipped.
+migration_lock_await() {
+  local timeout="$1" line expected read_fd
+  shift
+  # Captured once, before the loop. bash unsets the coprocess array when it
+  # reaps the dead coprocess, and that can happen between two iterations -- so
+  # re-expanding it each time turns a session death into an unbound-variable
+  # abort instead of the clean read failure the callers handle. A stale fd
+  # number simply fails to read, which is exactly the answer wanted.
+  read_fd="${MIGRATION_LOCK_PSQL[0]:-}"
+  [[ -n "$read_fd" ]] || return 1
+  while IFS= read -r -t "$timeout" line 0<&"$read_fd"; do
+    for expected in "$@"; do
+      [[ "$line" != "$expected" ]] || { printf '%s' "$line"; return 0; }
+    done
+  done
+  return 1
+}
+
+# The production mutation lock, taken first and never waited on.
+#
+# `pg_try_advisory_lock`, not `pg_advisory_lock`: a migration that queued behind
+# a rollback would wake when the rollback finished and apply itself onto the
+# release that rollback had just restored. Refusing is the safe answer -- nothing
+# has been applied, and whoever is deploying gets to look at what the other
+# operation did before deciding again.
+#
+# Taken in the same session as the internal lock below, so there is one session
+# to clean up and the order between the two cannot be got wrong.
+acquire_production_mutation_lock_for_migration() {
+  local verdict
+  production_mutation_lock_enabled || return 0
+  printf "%s\n" \
+    "SELECT CASE WHEN pg_try_advisory_lock(:'prod_lock_id'::bigint) THEN 'prod-acquired' ELSE 'prod-busy' END;" \
+    1>&"${MIGRATION_LOCK_PSQL[1]}"
+  verdict="$(migration_lock_await "$MIGRATION_LOCK_REPLY_TIMEOUT" prod-acquired prod-busy)" || verdict=""
+  case "$verdict" in
+    prod-acquired) PRODUCTION_LOCK_ACQUIRED=true; return 0 ;;
+    prod-busy)
+      echo "[ERROR] BUSY: a production rollback or another production mutation holds the mutation lock." >&2
+      echo "[ERROR] No migration has been applied. This is not queued and will not resume on its own;" >&2
+      echo "[ERROR] look at what that operation did, then run the migration again if it is still correct." >&2
+      return 1
+      ;;
+  esac
+  echo "[ERROR] The production mutation lock could not be taken. No migration has been applied." >&2
+  return 1
+}
+
+# The migration-specific lock, taken second and only ever second.
+#
+# In production it is a try-lock for the same reason the outer one is: this
+# process is already holding the production mutation lock, and blocking here
+# would hold that lock -- the one every rollback and deploy contends for -- for
+# as long as the other migration runs. A refusal costs a release; queueing
+# behind an unknown operation while holding the barrier costs everyone.
+#
+# Outside production the wait is kept, because local and CI flows rely on a
+# second `migrate up` settling behind the first. It is a bounded wait now:
+# `lock_timeout` makes the server itself give up, so the declared timeout is
+# true of the query and not merely of this script's patience.
+acquire_migration_specific_lock() {
+  local verdict
+  if production_mutation_lock_enabled; then
+    printf "%s\n" \
+      "SELECT CASE WHEN pg_try_advisory_lock(:'lock_id'::bigint) THEN 'locked' ELSE 'inner-busy' END;" \
+      1>&"${MIGRATION_LOCK_PSQL[1]}"
+    verdict="$(migration_lock_await "$MIGRATION_LOCK_REPLY_TIMEOUT" locked inner-busy)" || verdict=""
+    case "$verdict" in
+      locked) LOCK_ACQUIRED=true; return 0 ;;
+      inner-busy)
+        echo "[ERROR] BUSY: another migration is already running." >&2
+        echo "[ERROR] No migration has been applied, and this will not resume on its own." >&2
+        return 1
+        ;;
+    esac
+    echo "[ERROR] The migration lock could not be taken. No migration has been applied." >&2
+    return 1
+  fi
+  printf "%s\n" \
+    "SET lock_timeout = '${MIGRATION_LOCK_TIMEOUT_MS}ms';" \
+    "SELECT pg_advisory_lock(:'lock_id'::bigint);" \
+    "SELECT 'locked';" 1>&"${MIGRATION_LOCK_PSQL[1]}"
+  if verdict="$(migration_lock_await "$MIGRATION_LOCK_BLOCKING_TIMEOUT" locked)"; then
+    LOCK_ACQUIRED=true
+    return 0
+  fi
+  echo "[ERROR] Timed out waiting for PostgreSQL advisory lock." >&2
+  return 1
+}
+
+# Everything protected runs in the session that holds the locks.
+#
+# This is the property the advisory locks were useless without. They are
+# session-level: PostgreSQL releases them the instant their session dies. But
+# every statement used to run through `db_exec`, which opens a NEW psql each
+# time -- so a lock session that died left the locks free for a rollback to take
+# while the migration carried on applying schema from connections that knew
+# nothing about it. Checking `kill -0`, or asking pg_locks, or a heartbeat, all
+# leave the same window: the answer is stale the moment it is read.
+#
+# There is no window if the SQL and the locks are the same connection. If it
+# dies the locks go and the SQL goes with them, atomically, because they were
+# never separable in the first place.
+#
+# Advisory locks are session-scoped rather than transaction-scoped, so the
+# migrations keep their own transaction boundaries; only the connection is
+# shared.
+LOCK_SESSION_ACTIVE=false
+SESSION_SEQ=0
+# How long one statement may take to answer. A migration can be slow, so this is
+# generous in production; the tests override it to keep the suite about
+# lifecycle rather than about the clock.
+SESSION_REPLY_TIMEOUT="${MIGRATION_SESSION_REPLY_TIMEOUT:-900}"
+
+# Sends a script into the lock session and waits for its own sentinel.
+#
+# Both halves are failure paths that matter. A write to a dead coprocess fails,
+# and a session that stopped answering never returns the sentinel -- either way
+# nothing further is applied and the runner exits non-zero. No reconnection is
+# attempted: a new attempt is a new, explicit run.
+# Whether the session is still there to be spoken to.
+#
+# bash UNSETS the coprocess array when the coprocess dies, so the fd expansion
+# is what notices first -- and under `set -u` that would end the run with an
+# unbound-variable diagnostic instead of the refusal this is supposed to report.
+# Asking first turns the same fact into a message an operator can act on.
+lock_session_is_open() {
+  [[ -n "${MIGRATION_LOCK_PSQL[1]:-}" && -n "${LOCK_HOLDER_PID:-}" ]]
+}
+
+session_send_and_confirm() {
+  local script="$1" token write_fd
+  [[ "$LOCK_SESSION_ACTIVE" == "true" ]] || {
+    echo "[ERROR] Refusing to run protected SQL without the lock-owning session." >&2
+    return 1
+  }
+  lock_session_is_open || {
+    echo "[ERROR] The session holding the advisory locks is gone; nothing further is applied." >&2
+    return 1
+  }
+  SESSION_SEQ=$((SESSION_SEQ + 1))
+  token="nchat-session-ok-$SESSION_SEQ"
+  write_fd="${MIGRATION_LOCK_PSQL[1]:-}"
+  printf '%s\n' "$script" "SELECT '$token';" 1>&"$write_fd" 2>/dev/null || {
+    echo "[ERROR] The session holding the advisory locks is gone; nothing further is applied." >&2
+    return 1
+  }
+  migration_lock_await "$SESSION_REPLY_TIMEOUT" "$token" >/dev/null || {
+    echo "[ERROR] The session holding the advisory locks stopped responding; nothing further is applied." >&2
+    return 1
+  }
+}
+
+# SQL in the lock session. Extra arguments are psql variables as NAME=VALUE, set
+# with `\set` inside that same session, so the SQL keeps referring to :'name'
+# and a value is never interpolated into the statement text.
+protected_sql() {
+  local sql="$1" script="" pair
+  shift
+  for pair in "$@"; do
+    script+="\\set ${pair%%=*} '${pair#*=}'"$'\n'
+  done
+  script+="$sql"
+  session_send_and_confirm "$script"
+}
+
+# A .sql file, executed by the lock session itself rather than by a psql of its
+# own. If the session dies part-way through the file, the file stops there.
+protected_file() {
+  # The path goes through a psql variable, not straight into the meta-command.
+  #
+  # `\i $1` is split on whitespace by psql's own parser, so a checkout under a
+  # directory with a space in its name -- "/work/NChat Project/migrations/..." --
+  # arrives as several arguments and the migration is never found. `:'name'`
+  # quotes it the way psql quotes anything else.
+  session_send_and_confirm "$(printf "\\set migration_file '%s'\n\\i :'migration_file'" "$1")"
+}
+
 acquire_migration_lock() {
-  coproc MIGRATION_LOCK_PSQL { psql --no-password -v ON_ERROR_STOP=1 -q -t -A --set=lock_id="$MIGRATION_LOCK_ID" "$DSN"; }
+  coproc MIGRATION_LOCK_PSQL { psql --no-password -v ON_ERROR_STOP=1 -q -t -A --set=lock_id="$MIGRATION_LOCK_ID" --set=prod_lock_id="$PRODUCTION_MUTATION_LOCK_ID" "$DSN"; }
   LOCK_HOLDER_PID="$MIGRATION_LOCK_PSQL_PID"
 
-  printf "%s\n" "SELECT pg_advisory_lock(:'lock_id'::bigint);" "SELECT 'locked';" 1>&"${MIGRATION_LOCK_PSQL[1]}"
-
-  local line
-  while true; do
-    if IFS= read -r -t 60 line 0<&"${MIGRATION_LOCK_PSQL[0]}"; then
-      if [[ "$line" == "locked" ]]; then
-        LOCK_ACQUIRED=true
-        return
-      fi
-      continue
-    fi
-    echo "[ERROR] Timed out waiting for PostgreSQL advisory lock." >&2
+  # Order, stated once: production mutation lock, then the migration lock, and
+  # never the reverse. A failure at either point releases whatever was taken.
+  if ! acquire_production_mutation_lock_for_migration; then
     release_migration_lock
     exit 1
-  done
+  fi
+  if ! acquire_migration_specific_lock; then
+    release_migration_lock
+    exit 1
+  fi
+  LOCK_SESSION_ACTIVE=true
 }
 
-release_migration_lock() {
-  if [[ -n "${LOCK_HOLDER_PID:-}" ]]; then
-    if [[ "${LOCK_ACQUIRED:-false}" == "true" ]]; then
-      printf "%s\n" "SELECT pg_advisory_unlock(:'lock_id'::bigint);" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
-      LOCK_ACQUIRED=false
-    fi
+# Ends the session in bounded time, whatever state it is in.
+#
+# `wait` alone was the defect: a psql blocked inside pg_advisory_lock never
+# reads the `\q`, so the wait never returned -- and the production mutation lock
+# stayed held while it did not. So the quit is asked for, the process is polled
+# for a bounded number of attempts, and if it is still there it is signalled and
+# killed. `wait` runs last, on a process already known to be finishing, so it
+# reaps rather than blocks.
+close_migration_lock_session() {
+  local attempt=0
+  [[ -z "${MIGRATION_LOCK_PSQL[1]:-}" ]] ||
     printf "\\q\n" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
-    wait "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
-    LOCK_HOLDER_PID=""
-  fi
+  while kill -0 "$LOCK_HOLDER_PID" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [[ "$attempt" -gt "$MIGRATION_LOCK_CLOSE_ATTEMPTS" ]]; then
+      kill -TERM "$LOCK_HOLDER_PID" 2>/dev/null || true
+      kill -KILL "$LOCK_HOLDER_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 0.1
+  done
+  wait "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
 }
+
+# Idempotent: a second call finds nothing to do and returns. That matters
+# because the signal handlers exit, which runs the EXIT trap, which releases
+# again -- and each unlock must be sent exactly once.
+release_migration_lock() {
+  LOCK_SESSION_ACTIVE=false
+  [[ -n "${LOCK_HOLDER_PID:-}" ]] || return 0
+  if [[ "${LOCK_ACQUIRED:-false}" == "true" ]]; then
+    [[ -z "${MIGRATION_LOCK_PSQL[1]:-}" ]] ||
+      printf "%s\n" "SELECT pg_advisory_unlock(:'lock_id'::bigint);" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
+    LOCK_ACQUIRED=false
+  fi
+  # Released after the inner one, mirroring the order they were taken in.
+  if [[ "${PRODUCTION_LOCK_ACQUIRED:-false}" == "true" ]]; then
+    [[ -z "${MIGRATION_LOCK_PSQL[1]:-}" ]] ||
+      printf "%s\n" "SELECT pg_advisory_unlock(:'prod_lock_id'::bigint);" 1>&"${MIGRATION_LOCK_PSQL[1]}" 2>/dev/null || true
+    PRODUCTION_LOCK_ACQUIRED=false
+  fi
+  close_migration_lock_session
+  LOCK_HOLDER_PID=""
+}
+
+# What a signal must do, and why this is not the EXIT handler.
+#
+# `trap release_migration_lock EXIT INT TERM` was wrong in a way that is easy to
+# miss: on a signal the handler ran, released both locks, and then RETURNED to
+# the interrupted flow, which carried on migrating with no lock held and exited
+# 0. A signal handler for an operation like this has to end the process.
+#
+# The guard is not decoration: a second Ctrl-C during teardown would otherwise
+# re-enter it half-way through and send each unlock twice.
+migration_lock_signal_exit() {
+  local code="$1"
+  [[ "${MIGRATION_LOCK_SIGNALLED:-false}" != "true" ]] || return 0
+  MIGRATION_LOCK_SIGNALLED=true
+  echo "[ERROR] Signalled; releasing the migration locks and stopping." >&2
+  release_migration_lock
+  exit "$code"
+}
+
+migration_lock_on_exit() { release_migration_lock; }
+migration_lock_on_int() { migration_lock_signal_exit 130; }
+migration_lock_on_term() { migration_lock_signal_exit 143; }
 
 with_migration_lock() {
+  local status=0
   acquire_migration_lock
-  trap release_migration_lock EXIT INT TERM
+  trap migration_lock_on_exit EXIT
+  trap migration_lock_on_int INT
+  trap migration_lock_on_term TERM
   set +e
   "$@"
-  local status=$?
+  status=$?
   set -e
   release_migration_lock
   trap - EXIT INT TERM
@@ -221,7 +490,7 @@ with_migration_lock() {
 # schema_migrations table: tracks clean/dirty state and file checksum.
 # ---------------------------------------------------------------------------
 ensure_migrations_table() {
-  db_exec -q -c "
+  protected_sql "
     CREATE TABLE IF NOT EXISTS public.schema_migrations (
       id              SERIAL PRIMARY KEY,
       domain          TEXT        NOT NULL,
@@ -313,10 +582,9 @@ record_apply_started() {
   validate_domain "$domain"
   validate_migration_base "$filename"
   validate_checksum "$checksum"
-  db_exec -q --set=domain="$domain" --set=filename="$filename" --set=checksum="$checksum" <<'SQL'
-    INSERT INTO public.schema_migrations(domain, filename, checksum_sha256, dirty, in_progress, applied_at, updated_at)
-    VALUES(:'domain', :'filename', :'checksum', true, true, now(), now());
-SQL
+  protected_sql "INSERT INTO public.schema_migrations(domain, filename, checksum_sha256, dirty, in_progress, applied_at, updated_at)
+    VALUES(:'domain', :'filename', :'checksum', true, true, now(), now());" \
+    "domain=$domain" "filename=$filename" "checksum=$checksum"
 }
 
 record_apply_clean() {
@@ -324,31 +592,28 @@ record_apply_clean() {
   validate_domain "$domain"
   validate_migration_base "$filename"
   validate_checksum "$checksum"
-  db_exec -q --set=domain="$domain" --set=filename="$filename" --set=checksum="$checksum" <<'SQL'
-    UPDATE public.schema_migrations
+  protected_sql "UPDATE public.schema_migrations
        SET checksum_sha256 = :'checksum', dirty = false, in_progress = false, applied_at = now(), updated_at = now()
-     WHERE domain = :'domain' AND filename = :'filename';
-SQL
+     WHERE domain = :'domain' AND filename = :'filename';" \
+    "domain=$domain" "filename=$filename" "checksum=$checksum"
 }
 
 record_rollback_started() {
   local domain="$1" filename="$2"
   validate_domain "$domain"
   validate_migration_base "$filename"
-  db_exec -q --set=domain="$domain" --set=filename="$filename" <<'SQL'
-    UPDATE public.schema_migrations
+  protected_sql "UPDATE public.schema_migrations
        SET dirty = true, in_progress = true, updated_at = now()
-     WHERE domain = :'domain' AND filename = :'filename';
-SQL
+     WHERE domain = :'domain' AND filename = :'filename';" \
+    "domain=$domain" "filename=$filename"
 }
 
 record_rollback_clean() {
   local domain="$1" filename="$2"
   validate_domain "$domain"
   validate_migration_base "$filename"
-  db_exec -q --set=domain="$domain" --set=filename="$filename" <<'SQL'
-    DELETE FROM public.schema_migrations WHERE domain = :'domain' AND filename = :'filename';
-SQL
+  protected_sql "DELETE FROM public.schema_migrations WHERE domain = :'domain' AND filename = :'filename';" \
+    "domain=$domain" "filename=$filename"
 }
 
 # ---------------------------------------------------------------------------
@@ -424,7 +689,7 @@ cmd_up_locked() {
     fi
     echo "  [APPLY] $MDOM/$MFILE"
     record_apply_started "$MDOM" "$MFILE" "$checksum"
-    db_exec -f "$up_file"
+    protected_file "$up_file"
     record_apply_clean "$MDOM" "$MFILE" "$checksum"
     applied=$((applied + 1))
   done < <(collect_up_files)
@@ -441,7 +706,7 @@ run_post_up_sql() {
     echo "[ERROR] Post-migration SQL file is missing or unsafe." >&2
     return 1
   fi
-  db_exec -f "$sql_file"
+  protected_file "$sql_file"
 }
 
 cmd_up() {
@@ -479,7 +744,7 @@ run_down_steps() {
     fi
     echo "  [ROLLBACK] $dom/$file"
     record_rollback_started "$dom" "$file"
-    db_exec -f "$down_file"
+    protected_file "$down_file"
     record_rollback_clean "$dom" "$file"
     rolled=$((rolled + 1))
   done < <(db_exec -t -A -F '|' --set=steps="$steps" <<'SQL'
@@ -520,8 +785,19 @@ cmd_down() {
 cmd_status() {
   need_db
   wait_for_database
-  ensure_migrations_table
-  assert_no_dirty_migrations
+  # Status is a read, and reads do not create things.
+  #
+  # It used to call ensure_migrations_table, which was harmless while that was a
+  # plain `db_exec` and became a regression the moment the ledger writers moved
+  # into the lock-owning session: `protected_sql` refuses to run without one,
+  # and a status run has no reason to open a session or take the production
+  # mutation lock. So the table is probed rather than created; a database that
+  # has never been migrated simply reports every migration as pending.
+  MIGRATIONS_TABLE_EXISTS=false
+  if migrations_table_exists; then
+    MIGRATIONS_TABLE_EXISTS=true
+    assert_no_dirty_migrations
+  fi
   echo "=== migration status ==="
   printf "%-12s %-52s %s\n" "DOMAIN" "FILENAME" "STATUS"
   printf "%-12s %-52s %s\n" "------" "--------" "------"

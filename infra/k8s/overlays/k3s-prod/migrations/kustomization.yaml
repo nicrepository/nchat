@@ -9,6 +9,10 @@ kind: Kustomization
 namespace: nchat-prod
 resources:
   - ../../../base/migrations
+# The production migration refuses to run while a rollback holds the shared
+# mutation lock; see the patch for why it refuses rather than waits.
+patches:
+  - path: production-mutation-lock.yaml
 images:
   - name: ghcr.io/nicrepository/nchat/migrations
     newTag: sha-placeholder

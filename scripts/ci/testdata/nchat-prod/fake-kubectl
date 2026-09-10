@@ -328,8 +328,119 @@ if [[ "${1:-}" == "get" && "${2:-}" == "secret" ]]; then
   # Recorded so a flow can assert it read none: the deploy identity is not
   # allowed to read Secrets, and nothing here may start.
   printf '%s\n' "$*" >>"$STATE/secret-read-log"
+  # A jsonpath read of one key. secret-data/<name>/<key> holds the plaintext;
+  # what a real kubectl returns is base64, so that is what this returns.
+  # Modelled separately from the existence check above, which several flows
+  # depend on answering exactly as it always has.
+  if [[ "$*" =~ jsonpath=\{\.data\.([A-Za-z0-9_.-]+)\} ]]; then
+    secret_key="${BASH_REMATCH[1]}"
+    [[ -f "$STATE/secret-data/${3:-}/$secret_key" ]] || exit 1
+    base64 -w0 <"$STATE/secret-data/${3:-}/$secret_key"
+    exit 0
+  fi
   [[ -f "$STATE/secrets/${3:-}" ]] || exit 1
   echo "secret/${3:-} found"
+  exit 0
+fi
+
+# kubectl exec: the one read the rollback schema gate's ledger reader makes.
+#
+# The connection string arrives on stdin and is consumed rather than echoed,
+# which is what the reader relies on to keep it out of every argument list. The
+# fixture decides what the query answers:
+#
+#   ledger-state    first line of the result: CLEAN (default) or DIRTY
+#   ledger-rows     the "<domain>/<file> <checksum>" rows, one per line
+#   exec-fails      "1" makes the exec fail, as an unreachable database does
+# The one-shot ledger read: consume the connection string, answer, exit.
+#
+# Which of the two shapes an exec is gets decided from the invocation itself
+# rather than from fixture state: the lock session sets PGCONNECT_TIMEOUT and
+# then talks statement by statement over stdin, while the ledger reader passes
+# its SQL as an argument and expects one answer. A fixture that models a whole
+# critical section sees both, from the same namespace, so the two cannot be
+# selected by a mode file.
+exec_one_shot_ledger_read() {
+  cat >"$STATE/exec-stdin"
+  printf '%s\n' "$(read_state ledger-state)"
+  [[ ! -f "$STATE/ledger-rows" ]] || cat "$STATE/ledger-rows"
+}
+
+# The held session: a psql that stays open and answers statement by statement,
+# which is what the production mutation lock needs.
+#
+# The advisory lock is modelled with `mkdir`: on an existing directory it fails
+# atomically, which is `pg_try_advisory_lock` exactly. A fake that merely
+# recorded the SQL would let the coordination tests pass with no exclusion
+# happening at all. NCHAT_TEST_LOCK_DIR lets a fixture point this fake and the
+# fake psql the migration path uses at ONE directory, which is what they share
+# in production: one advisory lock in one database.
+#
+# The directory IS the lock, so it stays empty: `rmdir` releases it, and `rmdir`
+# on a directory holding anything would fail and leak it.
+exec_session_answer() {
+  local line="$1"
+  case "$line" in
+    *pg_try_advisory_lock*)
+      if mkdir "$lock_dir" 2>/dev/null; then
+        held=true
+        printf 'acquired\n'
+      else
+        printf 'busy\n'
+      fi
+      ;;
+    # The ledger read also arrives over a session in the fixtures that model a
+    # whole critical section. These two lines are unique to each of its SELECTs.
+    *"dirty OR in_progress"*) printf '%s\n' "$(read_state ledger-state)" ;;
+    *"ORDER BY domain, filename"*)
+      [[ ! -f "$STATE/ledger-rows" ]] || cat "$STATE/ledger-rows"
+      ;;
+    *pg_advisory_unlock*) cleanup_session; held=false; printf '\n' ;;
+    *pg_locks*) exec_answer_liveness ;;
+    '\q') return 1 ;;
+    *) printf '\n' ;;
+  esac
+}
+
+# The liveness proof, answered from the modelled lock so a session that lost it
+# reports lost.
+#
+# `hold-switch` pauses here on purpose: this is the proof taken immediately
+# before the switch, so a signal delivered while it waits lands inside the
+# critical section -- past the lock and the gate, short of rollback.sh -- which
+# is exactly where a signal has to be proved to stop the run.
+exec_answer_liveness() {
+  while [[ -f "$STATE/hold-switch" ]]; do sleep 0.05; done
+  if [[ "$held" == true && -d "$lock_dir" ]]; then
+    printf 'held\n'
+  else
+    printf 'lost\n'
+  fi
+}
+
+exec_held_session() {
+  local line
+  trap cleanup_session EXIT
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >>"$STATE/session-log"
+    exec_session_answer "$line" || return 0
+  done
+}
+
+cleanup_session() {
+  [[ "$held" != true ]] || rmdir "$lock_dir" 2>/dev/null || true
+}
+
+if [[ "${1:-}" == "exec" ]]; then
+  printf '%s\n' "$*" >>"$STATE/exec-log"
+  [[ "$(read_state exec-fails)" != "1" ]] || exit 1
+  lock_dir="${NCHAT_TEST_LOCK_DIR:-$STATE/advisory-lock}"
+  held=false
+  if [[ "$*" != *PGCONNECT_TIMEOUT* ]]; then
+    exec_one_shot_ledger_read
+  else
+    exec_held_session
+  fi
   exit 0
 fi
 

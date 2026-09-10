@@ -42,7 +42,7 @@ else
   echo "Install the repository-approved actionlint version before running this check."
 fi
 
-for workflow in governance.yml security.yml images.yml build-nchat-images.yml deploy-nchat-dev.yml deploy-nchat-prod.yml; do
+for workflow in governance.yml security.yml images.yml build-nchat-images.yml deploy-nchat-dev.yml deploy-nchat-prod.yml rollback-nchat-prod.yml; do
   while IFS= read -r line; do
     [[ "$line" =~ uses:[[:space:]]*([^[:space:]#]+) ]] || continue
     reference="${BASH_REMATCH[1]}"
@@ -58,7 +58,8 @@ if grep -En '@(latest|main|master)([^A-Za-z0-9_.-]|$)' \
   "$ROOT/.github/workflows/security.yml" "$ROOT/.github/workflows/images.yml" \
   "$ROOT/.github/workflows/build-nchat-images.yml" \
   "$ROOT/.github/workflows/deploy-nchat-dev.yml" \
-  "$ROOT/.github/workflows/deploy-nchat-prod.yml"; then
+  "$ROOT/.github/workflows/deploy-nchat-prod.yml" \
+  "$ROOT/.github/workflows/rollback-nchat-prod.yml"; then
   echo "Mutable tool/action reference found in nchat deployment workflows." >&2
   exit 1
 fi
@@ -66,7 +67,8 @@ fi
 if grep -q 'pull_request_target:' "$ROOT/.github/workflows/security.yml" \
   "$ROOT/.github/workflows/images.yml" "$ROOT/.github/workflows/build-nchat-images.yml" \
   "$ROOT/.github/workflows/deploy-nchat-dev.yml" \
-  "$ROOT/.github/workflows/deploy-nchat-prod.yml"; then
+  "$ROOT/.github/workflows/deploy-nchat-prod.yml" \
+  "$ROOT/.github/workflows/rollback-nchat-prod.yml"; then
   echo "pull_request_target is prohibited in nchat deployment workflows." >&2
   exit 1
 fi

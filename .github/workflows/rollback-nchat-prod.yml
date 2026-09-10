@@ -1,0 +1,327 @@
+name: Rollback nchat-prod
+
+# Returning production traffic to a named Blue/Green slot, by hand (CICD-08).
+#
+# This file is deliberately not part of the release pipeline. It is dispatched
+# on its own, it consumes no artifact, no job output and no state from any other
+# run, and every fact it decides from is read out of the cluster and this
+# checkout at the moment it runs. That is the whole point: the run it exists to
+# recover from is the one that failed, and a rollback that needed the release
+# workflow to be working would be unavailable exactly when it is needed.
+#
+# It moves selectors and nothing else. There is no build here, no image, no
+# migration, no down migration, no Secret, no volume and no DNS -- rollback is a
+# traffic switch precisely because Blue and Green share one schema and the
+# expand/contract rule keeps that schema compatible with the previous slot. The
+# gate below is what proves that rule actually held for this pair of releases
+# rather than assuming it; when it did not, the answer is section 17 of the
+# runbook, not a blind switch.
+#
+# The mutation itself is `rollback.sh`, unchanged and unwrapped. Every rule that
+# decides whether traffic may move -- the named target, the readiness gate, the
+# one-consistent-release gate, the mixed-state refusal, the read-back after each
+# patch, the idempotent no-op -- lives in that script, where the operator
+# procedure of runbook section 14 runs the same code down the same path.
+# Restating any of them here would be a second implementation of one gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_slot:
+        description: The slot production traffic must be returned to. Chosen explicitly, never derived.
+        required: true
+        type: choice
+        options:
+          - blue
+          - green
+      reason:
+        description: Why production is being rolled back. Recorded in the run evidence and the release log.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# The same group the deploy holds, and that is the requirement rather than a
+# convenience: a rollback and a cutover both patch the same ten stable Service
+# selectors, and two runs doing that at once would leave a namespace neither of
+# them can describe. A separate group would serialise rollbacks against each
+# other and race them against `cutover.sh`, which is the one collision that
+# matters.
+#
+# cancel-in-progress must be the boolean false -- the string "false" is truthy
+# to the expression evaluator, and cancelling a run that is part-way through
+# moving production traffic is the state this whole file exists to avoid.
+concurrency:
+  group: nchat-prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  # One job. There is no candidate half to separate from, nothing precedes this
+  # and nothing follows it, so a second job would only be somewhere for a step
+  # that does not belong here to live.
+  rollback:
+    runs-on: [self-hosted, linux, x64, nchat-prod-deploy]
+    permissions:
+      # Read the checkout, and nothing else. No artifact is downloaded, so not
+      # even `actions: read` is needed; the Kubernetes credentials are the
+      # runner's own least-privilege identity, admitted by the host-side pre-job
+      # guard, and no token declared here reaches them.
+      contents: read
+    # Ten sequential patches, each read back, with the reads either side of
+    # them and a minimum smoke after. Minutes -- and a limit at all, because
+    # this run is holding the production traffic concurrency group.
+    timeout-minutes: 15
+    steps:
+      # Before anything else, and before either value reaches a command. Both
+      # arrive as environment variables rather than through expression
+      # interpolation, so neither is ever text in a script the shell parses.
+      - name: Validate the rollback request
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          ROLLBACK_REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SLOT" == "blue" || "$TARGET_SLOT" == "green" ]]
+          # A reason of spaces is not a reason, and one of two characters is not
+          # either. Content and length, and nothing else.
+          #
+          # There was an ASCII allowlist here and it was wrong twice over. It
+          # refused ordinary incident notes -- "rollback apos latencia" written
+          # properly has accents -- and asking an operator to reword their
+          # justification mid-incident is not a safety measure. It also could
+          # not be parsed: a `;` inside a bracket expression ends the `[[`
+          # command, so every dispatch died here before any gate ran.
+          #
+          # Nothing is lost by dropping it. The value never reaches a shell as
+          # text: it travels as `env:` and is passed to rollback.sh as a quoted
+          # argument, which is what made it safe all along.
+          [[ "$ROLLBACK_REASON" =~ [^[:space:]] ]]
+          [[ "${#ROLLBACK_REASON}" -ge 3 && "${#ROLLBACK_REASON}" -le 200 ]]
+          # A dispatch carries the workflow file of the ref it was started from,
+          # so a feature branch would run its own copy of these gates. The
+          # runner's pre-job guard is the boundary behind this one.
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+      # No `ref:`: this workflow runs the operational branch it was dispatched
+      # from, which the step above has already required to be main. Full
+      # history, because the schema gate walks the migrations between two
+      # releases and cannot do that on a shallow clone.
+      - name: Checkout the operational branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The state the rollback is decided from, classified against the target
+      # rather than resolved into an active slot.
+      #
+      # A namespace split between blue and green is the normal shape of a
+      # rollback that stopped part-way, and converging it is exactly what a
+      # retry with the same target is for; refusing every mixed reading would
+      # close the one path that finishes it. What must fail is a reading this
+      # cannot describe -- a Service selecting something that is neither slot,
+      # one carrying no release-slot key, one that is not there -- and
+      # require_promotable_selectors fails on each of those, before any patch.
+      - name: Read and classify the stable Services before the rollback
+        id: before
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          mapping="$(collect_service_slots)"
+          printf '%s\n' "$mapping" >"$SELECTORS_BEFORE"
+          echo "stable Service selectors before the rollback:"
+          cat "$SELECTORS_BEFORE"
+          require_promotable_selectors "$mapping" "$TARGET_SLOT"
+          echo "Every stable Service selects $TARGET_SLOT or $(opposite_slot "$TARGET_SLOT")."
+      # Readiness alone is not it. A slot whose ten Deployments are all Ready
+      # can still be carrying two different releases, because a deploy that
+      # failed part-way leaves the workloads it never reached running and
+      # healthy on the previous version. Rolling onto that serves users a
+      # combination nobody built.
+      #
+      # rollback.sh checks both again for itself; this step is not that check,
+      # it is where the release the later proofs compare against comes from.
+      - name: Prove the target is deployed, Ready and carrying one release
+        id: target
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          release="$(require_consistent_release "$TARGET_SLOT")"
+          slot_ready "$TARGET_SLOT"
+          echo "target_release=$release" >>"$GITHUB_OUTPUT"
+          echo "Slot $TARGET_SLOT is Ready and carries release $release."
+      # The schema proof and the switch, in one process, under one lock.
+      #
+      # These were three steps and could not stay three. The gate answers "does
+      # the release on the target still fit the schema?", and that answer stops
+      # being true the moment a migration completes -- from the deploy
+      # workflow's migration Job, or from an operator's `make migrations-up`,
+      # which GitHub's `concurrency:` does not serialise at all. Reading the
+      # ledger in one step and switching in a later one leaves exactly that
+      # window, and checking afterwards does not close it: production is already
+      # serving the release by then.
+      #
+      # So rollback-critical-section.sh takes the advisory lock that
+      # scripts/db/migrate.sh takes -- the same id, on the same database, which
+      # is the one barrier both the workflow and the documented shell commands
+      # already share -- and holds it while it reads the ledger, runs the gate,
+      # proves the lock is still its own, calls rollback.sh, and proves the lock
+      # is still its own again. Any ledger read before this point would be
+      # diagnostics; the authorisation is the reading taken inside the lock.
+      #
+      # rollback.sh is still the only thing that patches a Service, and it is
+      # called with the named target and the recorded reason exactly as before.
+      - name: Prove the schema and return production traffic under the migration lock
+        id: rollback
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          ROLLBACK_REASON: ${{ inputs.reason }}
+          NCHAT_PROD_APPLIED_LEDGER: ${{ runner.temp }}/applied-migrations.txt
+          NCHAT_PROD_ASSUME_YES: "1"
+        run: scripts/deploy/nchat-prod/rollback-critical-section.sh --target "$TARGET_SLOT" "$ROLLBACK_REASON"
+      # Recording what the rollback left behind, separately from judging it. A
+      # rollback that stops part-way is the run whose after-state matters most
+      # and the run an asserting step would never reach, so this one reads and
+      # prints, asserts nothing, and runs whenever the mutation was reached at
+      # all -- success or failure.
+      #
+      # The condition is an allowlist of the two conclusions that mean the
+      # rollback actually ran. Naming any status function stops Actions
+      # inserting the implicit success(), so a looser test would run this step
+      # on a run that never reached the mutation: `conclusion != ''` is
+      # satisfied by `skipped`, which is what a step reports when an earlier one
+      # failed.
+      #
+      # Read-only. It repairs nothing and it never tries the other slot.
+      - name: Record the stable Services after the rollback
+        if: ${{ !cancelled() && (steps.rollback.conclusion == 'success' || steps.rollback.conclusion == 'failure') }}
+        env:
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          collect_service_slots >"$SELECTORS_AFTER"
+          echo "stable Service selectors after the rollback:"
+          cat "$SELECTORS_AFTER"
+      # Total convergence, proved from the recording above. An ordinary step, so
+      # a failed rollback never reaches it and no success is claimed for one.
+      # A Service that is missing, carries no release-slot key, kept the other
+      # slot or holds an unexpected value all read as a distinct value and fail
+      # here. Partial success has no spelling that passes.
+      - name: Prove every stable Service converged on the target
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          all_services_on_slot "$(cat "$SELECTORS_AFTER")" "$TARGET_SLOT"
+          echo "Every stable Service selects slot $TARGET_SLOT."
+      # Convergence is about selectors; it says nothing about what the slot they
+      # now point at is running. A slot redeployed or degraded during the
+      # patches would satisfy the step above and still be serving something the
+      # gates never saw, so the identity is read once more after the switch and
+      # compared to the release the preflight established.
+      - name: Prove the target still carries the release the gates passed
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          TARGET_RELEASE: ${{ steps.target.outputs.target_release }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          require_slot_release_identity "$TARGET_SLOT" "$TARGET_RELEASE"
+          echo
+          echo "Production serves $TARGET_RELEASE on slot $TARGET_SLOT."
+      # The minimum smoke, in the one mode that is semantically valid after a
+      # traffic switch. `--active` requires every stable Service to select this
+      # slot before it validates anything, which is the opposite of the
+      # candidate isolation rule and a stronger statement than it -- the
+      # candidate rule is untouched and still refuses a live slot. It reports no
+      # authenticated result and claims none: the authenticated checklist stays
+      # a human step, here as everywhere else.
+      - name: Post-rollback minimum smoke
+        id: smoke
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+        run: scripts/deploy/nchat-prod/smoke.sh --target "$TARGET_SLOT" --active
+      # The evidence, written whenever the run was not cancelled -- including
+      # every failure above, because a rollback that was refused or that stopped
+      # part-way is the run whose record an operator most needs. It asserts
+      # nothing and cannot turn a failure into a success: every step that judges
+      # keeps its own status.
+      #
+      # Nothing here reads a Secret, a kubeconfig or the environment: the
+      # selectors are the two files the read-only steps wrote, and the reason is
+      # an operator input, fenced so it is recorded rather than rendered.
+      - name: Publish the rollback evidence
+        if: ${{ !cancelled() }}
+        env:
+          TARGET_SLOT: ${{ inputs.target_slot }}
+          ROLLBACK_REASON: ${{ inputs.reason }}
+          TARGET_RELEASE: ${{ steps.target.outputs.target_release }}
+          APPLIED_LEDGER: ${{ runner.temp }}/applied-migrations.txt
+          ROLLBACK_RESULT: ${{ steps.rollback.conclusion }}
+          SMOKE_RESULT: ${{ steps.smoke.conclusion }}
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          recorded() { if [[ -f "$1" ]]; then cat "$1"; else echo "not recorded"; fi; }
+          # The ledger the decision was made from, as a count rather than a
+          # dump: the rows are the schema's history, not the rollback's, and the
+          # file itself is the record.
+          #
+          # `-f` is not enough to decide this. The step redirects into the file,
+          # so a reader that failed still leaves one behind -- empty, and
+          # "lines minus the header" then reported -1 rows. The header is what
+          # says a read actually happened, so it is checked before anything is
+          # counted, and every other shape gets a name instead of a number.
+          recorded_count() {
+            if [[ ! -f "$1" ]]; then echo "NOT READ"; return; fi
+            if [[ ! -s "$1" ]]; then echo "READ FAILED (empty)"; return; fi
+            if [[ "$(head -n 1 "$1")" != "# nchat-applied-migrations v1" ]]; then
+              echo "INVALID (no ledger header)"
+              return
+            fi
+            printf '%s row(s) read under the lock' "$(($(wc -l <"$1") - 1))"
+          }
+          {
+            echo "## Production rollback"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| operation | production rollback (stable Service selectors only) |"
+            echo "| target slot | $TARGET_SLOT |"
+            echo "| target release | ${TARGET_RELEASE:-not established} |"
+            echo "| schema proof + switch (under lock) | $ROLLBACK_RESULT |"
+            echo "| applied-migration ledger | $(recorded_count "$APPLIED_LEDGER") |"
+            echo "| rollback result | $ROLLBACK_RESULT |"
+            echo "| minimum smoke | $SMOKE_RESULT |"
+            echo "| run | $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT |"
+            echo
+            echo "### Reason"
+            echo '```text'
+            printf '%s\n' "$ROLLBACK_REASON"
+            echo '```'
+            echo "### Stable Service selectors before"
+            echo '```text'
+            recorded "$SELECTORS_BEFORE"
+            echo '```'
+            echo "### Stable Service selectors after"
+            echo '```text'
+            recorded "$SELECTORS_AFTER"
+            echo '```'
+            echo
+            echo "No build, no image, no migration and no database change: a rollback moves"
+            echo "the stable Service selectors and nothing else. The slot that left traffic is"
+            echo "still running and must not be drained during the observation window."
+          } >>"$GITHUB_STEP_SUMMARY"

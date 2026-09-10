@@ -5,9 +5,12 @@
 # the first step of a job, whether the job may run as the identity that can read
 # the production kubeconfig. So what is proved here is refusal, not features.
 #
-# One context is allowed, and every deviation from it -- a different repository,
-# workflow, ref or event, a missing variable, an empty one, a value that merely
-# looks like the authorised one -- must exit non-zero. The suite also proves the
+# Two contexts are allowed -- the production deploy and the production rollback,
+# each on main and dispatched by hand -- and every deviation from either -- a
+# different repository, workflow, ref or event, a missing variable, an empty
+# one, a value that merely looks like an authorised one -- must exit non-zero.
+# The second entry is a second exact comparison, not a looser one, so the whole
+# refusal suite below still runs against a closed list. The suite also proves the
 # two properties a log-reading operator depends on: the values a workflow chose
 # never reach the guard's output, and no shell metacharacter in them is ever
 # executed.
@@ -178,9 +181,16 @@ expect_allow() { check "$1" "" "${@:2}"; }
 expect_deny() { check "$1" "$2" "${@:3}"; }
 
 
-# --- the one authorised context ---------------------------------------------
+# --- the authorised contexts -------------------------------------------------
+
+ROLLBACK_WORKFLOW_REF="nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml@refs/heads/main"
 
 expect_allow "the production deploy dispatched from main is allowed"
+# The rollback workflow needs the same identity for the same reason: it is the
+# one procedure that returns production to a working slot, and without an entry
+# of its own it could not run at all (CICD-08).
+expect_allow "the production rollback dispatched from main is allowed" \
+  "GITHUB_WORKFLOW_REF=$ROLLBACK_WORKFLOW_REF"
 
 # --- repository --------------------------------------------------------------
 
@@ -230,6 +240,19 @@ expect_deny "a ref that merely contains the authorised one is refused" GITHUB_RE
 expect_deny "a differently cased ref is refused" GITHUB_REF GITHUB_REF=refs/heads/MAIN
 expect_deny "a workflow path under the authorised one is refused" GITHUB_WORKFLOW_REF \
   GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml.bak@refs/heads/main
+# The rollback entry is one more exact value, not a pattern: neither branch, nor
+# spelling, nor a neighbouring file in the same directory comes with it.
+expect_deny "the rollback workflow on develop is refused" GITHUB_WORKFLOW_REF \
+  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml@refs/heads/develop
+expect_deny "the rollback workflow on a pull request ref is refused" GITHUB_WORKFLOW_REF \
+  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml@refs/pull/123/merge
+expect_deny "a path under the rollback workflow is refused" GITHUB_WORKFLOW_REF \
+  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml.bak@refs/heads/main
+expect_deny "a third workflow beside the two authorised ones is refused" GITHUB_WORKFLOW_REF \
+  GITHUB_WORKFLOW_REF=nicrepository/nchat/.github/workflows/drain-nchat-prod.yml@refs/heads/main
+expect_deny "the rollback workflow from a fork is refused" GITHUB_REPOSITORY \
+  GITHUB_REPOSITORY=attacker/nchat \
+  "GITHUB_WORKFLOW_REF=$ROLLBACK_WORKFLOW_REF"
 expect_deny "trailing whitespace is not trimmed away" GITHUB_REF GITHUB_REF="refs/heads/main "
 
 # --- hostile values ----------------------------------------------------------

@@ -23,9 +23,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 AUTOMATED_FAILURES=0
-# candidate (default) or baseline. Never inferred: a mode that turned itself on
-# because the target happened to be live would be the isolation rule quietly
-# disabling itself on exactly the release where it matters.
+# candidate (default), baseline or active. Never inferred: a mode that turned
+# itself on because the target happened to be live would be the isolation rule
+# quietly disabling itself on exactly the release where it matters.
 SMOKE_MODE=candidate
 
 record() {
@@ -131,13 +131,41 @@ check_no_rival_slot() {
   record ok "baseline: $slot is the only deployed slot and is what the stable Services select"
 }
 
-check_traffic_boundary() {
-  local slot="$1"
-  if [[ "$SMOKE_MODE" == baseline ]]; then
-    check_baseline_preconditions "$slot"
+# The post-rollback minimum smoke (CICD-08).
+#
+# After a rollback the target is carrying production traffic by definition, so
+# the candidate isolation rule is not merely inconvenient here -- it is asking
+# the opposite question, and answering it would mean reporting PASS on a slot
+# that failed the check that matters. The check that matters after a traffic
+# switch is the mirror image: every stable Service must select this slot, and
+# nothing less than every one of them.
+#
+# That is a precondition, not a bypass. `resolve_active_slot` refuses a mixed
+# namespace outright, so a rollback that converged part-way cannot reach this
+# mode at all, and a target that is not the active slot fails it. There is no
+# argument that relaxes the candidate rule; there is a second mode that proves a
+# stronger fact about a different situation.
+check_active_preconditions() {
+  local slot="$1" mapping active
+  mapping="$(collect_service_slots)"
+  if ! active="$(resolve_active_slot "$mapping" 2>/dev/null)"; then
+    record fail "the stable Services do not agree on a slot; slot $slot is not the active slot"
     return
   fi
-  check_isolation "$slot"
+  if [[ "$active" != "$slot" ]]; then
+    record fail "the stable Services select $active, not $slot; --active applies to the slot serving production"
+    return
+  fi
+  record ok "active: every stable Service selects slot $slot"
+}
+
+check_traffic_boundary() {
+  local slot="$1"
+  case "$SMOKE_MODE" in
+    baseline) check_baseline_preconditions "$slot" ;;
+    active) check_active_preconditions "$slot" ;;
+    *) check_isolation "$slot" ;;
+  esac
 }
 
 # Configuration that decides whether whole features work at all. These are the
@@ -236,6 +264,27 @@ Administrative console, on admin-$slot.preview.<host>:
 EOF
 }
 
+# What this run authorises next. A cutover is the answer for a candidate and a
+# baseline; for a slot that is already serving production it is not an answer at
+# all, and printing promotion evidence there would offer a token for promoting
+# the slot that is already promoted.
+print_next_step() {
+  local slot="$1"
+  if [[ "$SMOKE_MODE" == active ]]; then
+    echo "Slot $slot is the active slot and this run validated it after a traffic switch."
+    echo "It authorises no promotion. Continue the observation window; the slot that"
+    echo "left traffic stays running and is the rollback target."
+    return
+  fi
+  # The evidence names the release, not just the slot, and the release is the
+  # commit AND the sealed build: rebuild or redeploy the candidate and this token
+  # stops matching, so the next cutover asks for a fresh smoke.
+  echo "When the checklist has been completed and recorded, promote with:"
+  echo "  NCHAT_PROD_SMOKE_CONFIRMED=$slot:$SMOKE_RELEASE \\"
+  echo "    NCHAT_PROD_RELEASE_MANIFEST_DIR=<dir holding the sealed release-manifest.json> \\"
+  echo "    scripts/deploy/nchat-prod/cutover.sh --target $slot"
+}
+
 print_verdict() {
   local slot="$1"
   echo
@@ -246,23 +295,19 @@ print_verdict() {
   fi
   echo "Release validated          : ${SMOKE_RELEASE:-NONE (candidate does not carry one release)}"
   echo "Authenticated release smoke: REQUIRED / NOT CONFIRMED BY THIS COMMAND"
-  echo "Cutover eligibility        : BLOCKED until the checklist above is recorded"
+  [[ "$SMOKE_MODE" == active ]] ||
+    echo "Cutover eligibility        : BLOCKED until the checklist above is recorded"
   [[ "$AUTOMATED_FAILURES" -eq 0 ]] || return 1
   echo
-  # The evidence names the release, not just the slot, and the release is the
-  # commit AND the sealed build: rebuild or redeploy the candidate and this token
-  # stops matching, so the next cutover asks for a fresh smoke.
-  echo "When the checklist has been completed and recorded, promote with:"
-  echo "  NCHAT_PROD_SMOKE_CONFIRMED=$slot:$SMOKE_RELEASE \\"
-  echo "    NCHAT_PROD_RELEASE_MANIFEST_DIR=<dir holding the sealed release-manifest.json> \\"
-  echo "    scripts/deploy/nchat-prod/cutover.sh --target $slot"
+  print_next_step "$slot"
 }
 
 parse_mode() {
   case "${1:-}" in
     "") return 0 ;;
     --baseline) SMOKE_MODE=baseline ;;
-    *) prod_fail "unknown argument: $1 (expected --target <slot> [--baseline])" ;;
+    --active) SMOKE_MODE=active ;;
+    *) prod_fail "unknown argument: $1 (expected --target <slot> [--baseline|--active])" ;;
   esac
 }
 

@@ -9,10 +9,17 @@
 # executes through ACTIONS_RUNNER_HOOK_JOB_STARTED before the first step of
 # every job it accepts.
 #
-# One context is authorised: the production deploy workflow, as it exists on
-# main, dispatched by hand. Every other repository, workflow, ref and event is
-# a refusal, and so is a variable the runner did not set -- an absent value
-# authorises nothing.
+# Two contexts are authorised, and only two: the production deploy workflow and
+# the production rollback workflow, each as it exists on main and dispatched by
+# hand. Every other repository, workflow, ref and event is a refusal, and so is
+# a variable the runner did not set -- an absent value authorises nothing.
+#
+# The rollback workflow is here because the guard is the boundary, not a
+# convenience: without an entry of its own, the one procedure that returns
+# production to a working slot could not run at all on the only identity that
+# can reach the cluster (CICD-08). It is a second entry in a closed list, not a
+# relaxation of the comparison -- the match is still exact, and every other
+# workflow file, branch and event is refused exactly as before.
 #
 # It reads four variables and compares them. It resolves no path, runs no
 # command built from them, and needs no network, git, kubectl or jq: the
@@ -25,14 +32,17 @@
 set -Eeuo pipefail
 
 ALLOWED_REPOSITORY="nicrepository/nchat"
-ALLOWED_WORKFLOW_REF="nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main"
+ALLOWED_WORKFLOW_REFS=(
+  "nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main"
+  "nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml@refs/heads/main"
+)
 ALLOWED_REF="refs/heads/main"
 ALLOWED_EVENT_NAME="workflow_dispatch"
 
 # What disagreed, never what it said. The values are strings an untrusted
 # workflow chooses, and this line is read out of a system log.
 deny() {
-  printf 'runner job guard: DENY, %s is not the authorised production deploy context.\n' "$1" >&2
+  printf 'runner job guard: DENY, %s is not an authorised production release context.\n' "$1" >&2
   exit 1
 }
 
@@ -43,12 +53,24 @@ require_exactly() {
   [[ "$actual" == "$allowed" ]] || deny "$name"
 }
 
+# Membership of the closed list, by the same exact comparison. A value that is
+# merely shaped like one of them -- a prefix, another branch, another file in
+# the same directory -- is a different value and matches nothing.
+require_one_of() {
+  local name="$1" actual="$2" allowed
+  shift 2
+  for allowed in "$@"; do
+    [[ "$actual" == "$allowed" ]] && return 0
+  done
+  deny "$name"
+}
+
 main() {
   require_exactly GITHUB_REPOSITORY "$ALLOWED_REPOSITORY" "${GITHUB_REPOSITORY-}"
-  require_exactly GITHUB_WORKFLOW_REF "$ALLOWED_WORKFLOW_REF" "${GITHUB_WORKFLOW_REF-}"
+  require_one_of GITHUB_WORKFLOW_REF "${GITHUB_WORKFLOW_REF-}" "${ALLOWED_WORKFLOW_REFS[@]}"
   require_exactly GITHUB_REF "$ALLOWED_REF" "${GITHUB_REF-}"
   require_exactly GITHUB_EVENT_NAME "$ALLOWED_EVENT_NAME" "${GITHUB_EVENT_NAME-}"
-  printf 'runner job guard: ALLOW, the production deploy from main.\n'
+  printf 'runner job guard: ALLOW, an authorised production release workflow from main.\n'
 }
 
 main "$@"

@@ -630,8 +630,11 @@ objects — which is why its `GRANT`s succeed where the admin's restore would ha
 left them failing.
 
 ```bash
-make migrations-up
+make migrations-prod-up
 ```
+
+This is a production mutation, so it takes the mutation lock and refuses if a
+rollback holds it. See section 14 for what a refusal means.
 
 #### 3b.7.4 Verifying a restore
 
@@ -651,7 +654,7 @@ restore was run by the wrong role: drop the database and repeat 3b.7.3 rather
 than trying to repair ownership in place.
 
 Then confirm a migration still applies (`make migrations-status` and, if
-anything is pending, `make migrations-up`), and that the application can read
+anything is pending, `make migrations-prod-up`), and that the application can read
 and write — the smoke in section 6 covers the second.
 
 To rehearse all of this without a cluster, on any machine with Docker:
@@ -1417,18 +1420,30 @@ The boundary is host-side and outside the repository's reach:
 and wired to `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner executes it before
 the first step of every job it accepts, and a non-zero exit ends the job there.
 
-It authorises one context, by exact comparison, and refuses everything else —
+It authorises two contexts, by exact comparison, and refuses everything else —
 including a variable the runner did not set:
 
-| Variable              | Only accepted value                                                           |
-| --------------------- | ----------------------------------------------------------------------------- |
-| `GITHUB_REPOSITORY`   | `nicrepository/nchat`                                                         |
-| `GITHUB_WORKFLOW_REF` | `nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main` |
-| `GITHUB_REF`          | `refs/heads/main`                                                             |
-| `GITHUB_EVENT_NAME`   | `workflow_dispatch`                                                           |
+| Variable              | Only accepted values                                                            |
+| --------------------- | ------------------------------------------------------------------------------- |
+| `GITHUB_REPOSITORY`   | `nicrepository/nchat`                                                           |
+| `GITHUB_WORKFLOW_REF` | `nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main`   |
+|                       | `nicrepository/nchat/.github/workflows/rollback-nchat-prod.yml@refs/heads/main` |
+| `GITHUB_REF`          | `refs/heads/main`                                                               |
+| `GITHUB_EVENT_NAME`   | `workflow_dispatch`                                                             |
 
-So a pull request, a dispatch from `develop`, another workflow file, another
+The rollback workflow has an entry of its own because the guard is the boundary
+rather than a convenience: without one, the procedure that returns production to
+a working slot could not run at all on the identity that can reach the cluster.
+It is a second exact value in a closed list, not a looser comparison — a
+neighbouring file in the same directory, either workflow on another branch, and
+either under another event are all still refused.
+
+So a pull request, a dispatch from `develop`, a third workflow file, another
 event, a fork, and an empty environment are all the same outcome: no step runs.
+
+**Changing this list is a host-side change.** The copy the runner executes is
+the root-owned one under `/usr/local/libexec/nchat-prod`; editing the file in
+the repository changes nothing until it is reinstalled by the procedure below.
 The refusal names the variable that disagreed and never its value, because the
 value is a string an untrusted workflow chose and the line is read out of a
 system log.
@@ -1544,7 +1559,7 @@ PASS requires all three:
   ```bash
   sudo journalctl -u actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service \
     --since '-15 min' | grep 'runner job guard'
-  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not the authorised production deploy context.
+  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not an authorised production release context.
   ```
 
 - `make prod-blue-green-status` is unchanged.
@@ -1665,11 +1680,197 @@ kubectl logs -n nchat-prod -l nchat.io/release-slot=green --all-containers --tai
 
 ## 14. Rollback
 
+From a shell on the deploy host:
+
 ```bash
 make prod-blue-green-rollback ARGS="--target blue 'reason recorded in the log'"
 ```
 
-No build, no image, no migration — the same nine selectors move back. The reason
+or, as a manual GitHub Actions run, **Rollback nchat-prod** →
+`workflow_dispatch`, choosing the target slot and typing the reason. The
+workflow is dispatched on its own: it consumes no artifact and no output of the
+release pipeline, so it stays available when that pipeline is what failed. It
+runs the same `rollback.sh` down the same path, adding only what a run can prove
+that a shell cannot record: the selectors before and after, the target's
+release, the schema verdict and the reason, written into the run summary.
+
+It shares the `nchat-prod-deploy` concurrency group with the deploy, because a
+rollback and a cutover patch the same selectors and must never do so at once. A
+deploy run waiting for its approval holds that group, so **cancel a pending
+deploy run before dispatching a rollback**; the shell form above is the path
+that answers to nobody's queue.
+
+It carries no environment approval. Requiring one would put the procedure that
+restores service behind the same queue as the one that promotes; what authorises
+it is the dispatch permission, the `refs/heads/main` requirement and the
+host-side runner guard, none of which a feature branch can edit.
+
+Before it moves anything the run proves the target is deployed, Ready and
+carrying one release, and then proves the schema still supports that release:
+
+```bash
+scripts/deploy/nchat-prod/applied-migrations.sh > applied.txt
+scripts/deploy/nchat-prod/rollback-schema-gate.sh migrations <target-sha> applied.txt
+```
+
+Blue and Green share one schema, so returning traffic to an older release is
+safe exactly while every migration applied since that release was expand-only.
+
+**The gate asks the database, not the cluster, and that is the whole design.**
+`deploy.sh` runs the migration Job _before_ it applies the candidate workloads
+and before it waits for them, so a release can complete its migration and then
+fail to roll out: the schema is advanced and no Pod, Deployment or slot
+annotation anywhere carries that release. Anything read off the workloads
+reports it as never having happened, and a gate built on one would clear a
+rollback straight across a migration it cannot see. The migration Jobs cannot
+answer either — `infra/k8s/base/migrations/job.yaml` sets
+`ttlSecondsAfterFinished: 3600`, so Kubernetes collects them an hour after they
+finish and a missing Job is indistinguishable from a migration that never ran.
+
+`public.schema_migrations` is the record of what actually ran.
+`applied-migrations.sh` reads it with two `SELECT`s — the ledger's verdict on
+itself, then its rows — as the runtime role, over a table that role holds nothing
+but `SELECT` on (`scripts/db/grant-runtime.sql`). The connection string comes
+from `secret/nchat-secrets`, is handed to the client on standard input and never
+becomes an argument or a log line.
+
+The table stores `domain` and `filename` separately, and `filename` is the base
+name: `migrate.sh` strips `.up.sql` before persisting it, so a row reads
+`chat` / `000100_pin` for `migrations/chat/000100_pin.up.sql`. Reconstructing
+that path is the reader's job and happens in exactly one place —
+`canonical_migration` — which validates each field against `migrate.sh`'s own
+validators, so a stored name that could not have come from that script is
+refused rather than normalised. The reader emits nothing at all until every row
+has passed: a ledger that stops half-way would carry the proof header and look
+like the whole truth.
+
+The gate then compares that ledger against the tree of the release the target
+carries, correlating each applied migration by name **and** by the checksum the
+runner stored. It blocks on any of:
+
+- a migration applied since the target's release that declares
+  `-- nchat:blue-green contract-phase`, or is listed in
+  `scripts/ci/blue-green-migration-exceptions.txt` — it took away something that
+  release depends on;
+- an applied migration that is not in this checkout, or whose bytes differ from
+  it — its shape cannot be read;
+- a migration the target's release expects and the ledger does not hold — the
+  schema is behind that release;
+- a dirty or in-progress ledger, an unreadable one, or one with no proof header.
+
+There is no verdict of "nothing found, therefore compatible": an empty answer is
+accepted only when the ledger itself, header and all, says nothing was applied.
+A blocked rollback is an incident with a database in it, and "A migration that
+has to be undone" in section 17 is where it goes. **The gate runs no migration,
+applies no schema change and writes nothing.**
+
+**The proof and the switch happen under one lock.** A schema proof stops being
+true the moment a migration completes, and a migration can complete from the
+deploy workflow's migration Job or from an operator migrating by hand — which
+GitHub's `concurrency:` does not serialise at all. So
+`rollback-critical-section.sh` takes the **production mutation lock** and holds
+it across the ledger read, the gate, the call to `rollback.sh` and the
+convergence read-back inside it. There are two advisory locks and they are
+nested, never shared:
+
+| Lock                    | Id           | Held by                                                | Acquisition                                    |
+| ----------------------- | ------------ | ------------------------------------------------------ | ---------------------------------------------- |
+| **Production mutation** | `2026052202` | rollback, and production migration/deploy              | `pg_try_advisory_lock` — fail-fast             |
+| **Migration-specific**  | `2026052201` | `migrate.sh` only, to protect the migrator from itself | try-lock in production; bounded wait elsewhere |
+
+The order is always
+
+```text
+production mutation lock (2026052202)
+    ↓
+migration-specific lock (2026052201)
+    ↓
+migration
+```
+
+and **never the reverse**. The rollback takes only the outer lock and never
+calls `migrate.sh`, so it holds exactly one and no inversion has a spelling.
+
+**A conflict is a refusal, never a queue.** The lock is taken with
+`pg_try_advisory_lock`, which answers immediately. Whoever finds it held stops:
+
+| Situation  | What happens                                                    |
+| ---------- | --------------------------------------------------------------- |
+| lock free  | the operation acquires it and proceeds                          |
+| lock held  | **BUSY** — the operation exits non-zero having changed nothing  |
+| cannot ask | **ERROR** — the operation exits non-zero having changed nothing |
+
+Nothing waits and nothing is retried on your behalf. A migration that queued
+behind a rollback would wake when the rollback finished and apply itself onto
+the release that rollback had just restored — the exact outcome the lock exists
+to prevent, arriving a few seconds later. So **look at what the other operation
+did, then decide again and run yours explicitly.** There is no queue to join and
+nothing resumes on its own.
+
+The order is stated once and is the same on both paths:
+
+```text
+production mutation lock  (2026052202)
+    └── migration internal lock  (2026052201, migrate.sh only)
+```
+
+The production migration Job takes the outer lock because the `k3s-prod`
+overlay sets `NCHAT_PROD_MUTATION_LOCK=1`. A **manual** production migration
+takes it because it has its own command:
+
+```bash
+make migrations-prod-up
+```
+
+That entrypoint sets the flag by construction — there is nothing for an operator
+to remember and no documented way to migrate production without the lock.
+`make migrations-up` remains the generic local and CI path, against databases
+with nothing to exclude; **do not use it against production.**
+
+In production the migration-specific lock is a try-lock too. Blocking on it
+would mean waiting while still holding the production mutation lock — the
+barrier every rollback and deploy contends for — so a second migration refuses
+instead. Outside production it still waits, bounded by `lock_timeout` in the
+server so the declared timeout is true of the query and not merely of the
+script's patience.
+
+The session's liveness is checked immediately before the switch and again
+immediately after it — a session that died would have released the lock in the
+server, and the run refuses to claim an exclusion it cannot show. **Ctrl-C or a
+cancelled run stops the operation**: the handlers release the lock and exit
+130 (INT) or 143 (TERM), and nothing after the signal runs.
+
+Any ledger read before the lock is taken is diagnostics. The authorisation is
+the reading taken inside it.
+
+Two operational preconditions follow from this:
+
+- the `GRANT SELECT` reaches the database with the next `migrate up`, which
+  `run-migrations.sh` performs on every deploy even when nothing is pending. Until
+  a release carrying it has been deployed, the gate blocks and the shell form of
+  the rollback below is the path;
+- the identity the workflow runs as needs `get` on `secret/nchat-secrets` and
+  `create` on `pods/exec` for `statefulset/postgres` in `nchat-prod`. Without
+  either the gate blocks, naming what it could not do.
+
+After the switch the run reads every stable Service back, requires all of them
+on the target, re-reads the release identity, and runs the minimum smoke in the
+one mode that means anything once traffic has moved:
+
+```bash
+scripts/deploy/nchat-prod/smoke.sh --target blue --active
+```
+
+`--active` requires every stable Service to select the slot before it validates
+anything — the mirror of the candidate rule, not a relaxation of it. The
+candidate smoke still refuses a slot that holds traffic, and `--active` claims
+no authenticated result: the checklist in section 10 stays a human step.
+
+A rollback that stops part-way fails the run, and the evidence records the mixed
+state rather than repairing it. The instruction is always to converge on the
+**same** target; nothing here ever selects the other slot.
+
+No build, no image, no migration — the same ten selectors move back. The reason
 is mandatory and is recorded.
 
 The target is named for the same reason as cutover, and here the cost of getting
