@@ -5,7 +5,11 @@ Codigo em `apps/web/public/sw.js` e
 `apps/web/src/notifications/serviceWorkerRegistration.ts`.
 
 Registro de `PushSubscription` (#745), envio (#746) e a UI de
-Perfil > Notificacoes (#729) **estao fora** desta camada.
+Perfil > Notificacoes (#729) **estao fora** desta camada. O diagnostico e o
+auto-reparo que decidem _quando_ uma subscription precisa ser criada ou
+reapresentada tambem estao, e vivem na #748 — ver
+[notification-web-push-reconcile.md](notification-web-push-reconcile.md), que
+chama o registrar deste documento em vez de reimplementa-lo.
 
 ## Onde encaixa
 
