@@ -83,8 +83,12 @@ spec:
               mountPath: /tmp
       volumes:
         - name: work
+          # Also holds the ffmpeg audio route's request scratch files
+          # (input + output, each bounded by converter.MaxAudio{Input,Output}Bytes
+          # = 50Mi) alongside LibreOffice's, so the ceiling leaves room for a
+          # document and an audio conversion running concurrently.
           emptyDir:
-            sizeLimit: 128Mi
+            sizeLimit: 256Mi
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

@@ -485,6 +485,21 @@ type AttachmentService struct {
 	scanRequired   bool
 	orphans        OrphanObserver
 	logger         *slog.Logger
+	// audioTranscoder is nil unless SetAudioTranscoder was called, which is
+	// how every existing test keeps its pre-transcoding behaviour unchanged:
+	// Download only attempts a re-encode when this is set.
+	audioTranscoder AudioTranscoder
+}
+
+// SetAudioTranscoder wires the Nic-Gravador compatibility task's MP3
+// re-encode into Download. It is optional and separate from
+// NewAttachmentService's constructor arguments on purpose: the constructor
+// already has ten parameters and this one dependency is wired later in
+// internal/app/app.go, alongside the same converter client the preview
+// pipeline uses — see preview.NewWithDocumentConverter for the sibling
+// pattern.
+func (s *AttachmentService) SetAudioTranscoder(t AudioTranscoder) {
+	s.audioTranscoder = t
 }
 
 // NewAttachmentService wires the use cases. maxUploadBytes is the validated
@@ -1093,6 +1108,26 @@ func (s *AttachmentService) Download(ctx context.Context, input AttachmentAuthIn
 	record, err := s.downloadableAttachment(ctx, input)
 	if err != nil {
 		return Download{}, err
+	}
+	// Nic-Gravador compatibility task: every audio download must be a real
+	// MP3, never the stored container renamed. isMP3Already and
+	// audioTranscodeFormat are mutually exclusive by construction (the first
+	// matches only audio/mpeg, the second explicitly excludes it), so at most
+	// one of these two branches runs.
+	if isMP3Already(record) {
+		content, err := s.openDecryptedContent(ctx, record)
+		if err != nil {
+			return Download{}, err
+		}
+		return Download{
+			Filename:    withMP3Extension(record.Filename),
+			ContentType: contentType(record),
+			Size:        record.Size,
+			Content:     content,
+		}, nil
+	}
+	if format, ok := audioTranscodeFormat(record); ok && s.audioTranscoder != nil {
+		return s.downloadTranscodedAudio(ctx, record, format)
 	}
 	content, err := s.openDecryptedContent(ctx, record)
 	if err != nil {

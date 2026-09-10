@@ -40,7 +40,11 @@ import AttachmentVideo from "./AttachmentVideo";
 import DocumentPreviewViewer from "./DocumentPreviewViewer";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
-import { saveAttachmentToDisk, voiceMessageFilename } from "./attachmentDownload";
+import {
+  attachmentDownloadFilename,
+  saveAttachmentToDisk,
+  voiceMessageFilename,
+} from "./attachmentDownload";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
 
@@ -103,7 +107,7 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
     if (state === "loading") return;
     setState("loading");
     try {
-      await saveAttachmentToDisk(attachment.id, attachment.filename || "arquivo");
+      await saveAttachmentToDisk(attachment.id, attachmentDownloadFilename(attachment));
       setState("idle");
     } catch {
       // No server text is surfaced: it may carry detail that does not belong
@@ -178,7 +182,7 @@ function VoiceMessageAttachment({
   const download = {
     label: "Baixar mensagem de voz",
     title: "Baixar áudio",
-    start: () => saveAttachmentToDisk(attachment.id, voiceMessageFilename(attachment, sentAt)),
+    start: () => saveAttachmentToDisk(attachment.id, voiceMessageFilename(sentAt)),
   };
 
   return (

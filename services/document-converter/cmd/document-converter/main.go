@@ -24,9 +24,14 @@ func main() {
 		slog.Error("document converter failed to start", "error", err)
 		os.Exit(1)
 	}
+	audioRunner, err := converter.NewAudioRunner("ffmpeg", workDir, 40*time.Second)
+	if err != nil {
+		slog.Error("document converter failed to start", "error", err)
+		os.Exit(1)
+	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           converter.NewHandler(runner),
+		Handler:           converter.NewHandler(runner, converter.WithAudioConverter(audioRunner)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       45 * time.Second,
 		WriteTimeout:      45 * time.Second,

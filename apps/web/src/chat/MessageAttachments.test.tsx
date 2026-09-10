@@ -229,6 +229,36 @@ describe("message attachments", () => {
     vi.unstubAllGlobals();
   });
 
+  it("saves an ordinary (non-voice) audio file's download as .mp3, matching what file-service always serves", async () => {
+    // Nic-Gravador compatibility task: file-service re-encodes every audio
+    // download to real MP3 regardless of the stored container, so the name
+    // the browser is offered must match — an .ogg file must not still be
+    // suggested as "clip.ogg" once the bytes it receives are genuinely MP3.
+    const user = userEvent.setup();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:att-1"),
+      revokeObjectURL: vi.fn(),
+    });
+
+    render(
+      <MessageAttachments
+        sentAt="2026-07-15T12:00:00.000Z"
+        attachments={[
+          attachment({ filename: "clip.ogg", contentType: "audio/ogg", status: "clean" }),
+        ]}
+      />,
+    );
+
+    await user.click(downloadButton() as HTMLElement);
+
+    await waitFor(() => expect(mockContent).toHaveBeenCalledWith("att-1"));
+    const anchor = click.mock.instances[0] as HTMLAnchorElement;
+    expect(anchor.download).toBe("clip.mp3");
+    vi.unstubAllGlobals();
+  });
+
   it("says a failed download failed, and keeps the row intact for another try", async () => {
     const user = userEvent.setup();
     mockContent.mockRejectedValue(new Error("403"));
@@ -704,7 +734,9 @@ describe("message attachments — voice message download", () => {
     await waitFor(() => expect(mockContent).toHaveBeenCalledTimes(1));
     expect(mockContent).toHaveBeenCalledWith("voice-2");
     const anchor = click.mock.instances[0] as HTMLAnchorElement;
-    expect(anchor.download).toMatch(/^mensagem-de-voz-[\d-]+\.webm$/);
+    // file-service always re-encodes voice-message downloads to real MP3
+    // (Nic-Gravador compatibility task), regardless of the recorded container.
+    expect(anchor.download).toMatch(/^mensagem-de-voz-[\d-]+\.mp3$/);
   });
 
   it("does not start playback, and keeps the recording playable afterwards", async () => {

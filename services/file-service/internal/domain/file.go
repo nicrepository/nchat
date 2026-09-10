@@ -31,6 +31,12 @@ var (
 	// ErrNotDownloadable is returned for an attachment that exists and is
 	// visible to the caller but has not been cleared by the antimalware scan.
 	ErrNotDownloadable = errors.New("attachment not available for download")
+	// ErrAudioTranscodeFailed is returned when a non-MP3 audio attachment (or
+	// a voice message recorded in a WebM/MP4 container — see
+	// VoiceCompatibleContent) could not be re-encoded to real MP3 for
+	// download. The stored bytes are never served under a false content type
+	// as a fallback: the download fails outright instead.
+	ErrAudioTranscodeFailed = errors.New("audio transcode failed")
 
 	ErrUploadsDisabled         = fmt.Errorf("%w: uploads disabled", ErrUnavailable)
 	ErrDependenciesUnavailable = fmt.Errorf("%w: dependencies unavailable", ErrUnavailable)

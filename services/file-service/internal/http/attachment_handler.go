@@ -52,6 +52,11 @@ const (
 	// carries previewStatus, so a client already knows whether to wait or to
 	// draw its fallback, and this route never has to describe internal state.
 	errCodePreviewUnavailable = "preview_not_available"
+	// errCodeAudioTranscodeFailed tells the client an audio download could not
+	// be re-encoded to MP3 right now. The attachment itself is fine — this is
+	// never returned for anything the malware scan or authorization gates
+	// would otherwise refuse — so a retry is reasonable.
+	errCodeAudioTranscodeFailed = "audio_transcode_failed"
 )
 
 // UploadAdmission bounds how many uploads are in flight across the cluster.
@@ -978,6 +983,11 @@ func attachmentErrorStatus(err error) (int, string) {
 		return http.StatusForbidden, errCodeNotScanned
 	case errors.Is(err, domain.ErrPreviewUnavailable):
 		return http.StatusConflict, errCodePreviewUnavailable
+	case errors.Is(err, domain.ErrAudioTranscodeFailed):
+		// 502: the failure is the converter sidecar's, not the caller's
+		// request — nothing about retrying with different headers or a
+		// different byte range would help.
+		return http.StatusBadGateway, errCodeAudioTranscodeFailed
 	case errors.Is(err, domain.ErrUnavailable):
 		return http.StatusServiceUnavailable, errCodeServiceUnavailable
 	default:

@@ -964,6 +964,43 @@ func TestDownloadServesTheContentWithSafeHeaders(t *testing.T) {
 	}
 }
 
+// TestDownloadServesTranscodedAudioWithMP3Headers is the HTTP-level half of
+// the Nic-Gravador compatibility task: whatever the service layer decided
+// (proven separately in service.Download's own tests, with a fake
+// transcoder), the handler must forward it as coherent MP3 headers — a
+// Content-Type of audio/mpeg and a Content-Disposition filename ending in
+// .mp3 — never recompute or second-guess either one.
+func TestDownloadServesTranscodedAudioWithMP3Headers(t *testing.T) {
+	id := uuid.NewString()
+	mp3 := []byte("\xff\xfb\x90\x44FAKE-MP3-PAYLOAD")
+	useCases := readyUseCases()
+	useCases.download = service.Download{
+		Filename: "voice-message.mp3", ContentType: "audio/mpeg",
+		Size: int64(len(mp3)), Content: seekableContent(mp3),
+	}
+	router := newTestRouter(t, useCases, enabledConfig())
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, downloadRequest(t, id))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	if !bytes.Equal(response.Body.Bytes(), mp3) {
+		t.Fatal("unexpected body")
+	}
+	if got := response.Header().Get("Content-Type"); got != "audio/mpeg" {
+		t.Fatalf("unexpected content type %q", got)
+	}
+	disposition := response.Header().Get("Content-Disposition")
+	if !strings.HasPrefix(disposition, "attachment;") {
+		t.Fatalf("content must never be served inline, got %q", disposition)
+	}
+	if !strings.Contains(disposition, `filename="voice-message.mp3"`) {
+		t.Fatalf("expected the .mp3 filename in the disposition, got %q", disposition)
+	}
+}
+
 // Active content is never rendered in the API origin: the disposition and the
 // nosniff header hold whatever the detected type is.
 func TestDownloadNeverServesActiveContentInline(t *testing.T) {
@@ -1304,6 +1341,7 @@ func TestDownloadMapsServiceErrors(t *testing.T) {
 		{name: "not visible", err: domain.ErrNotFound, want: http.StatusNotFound, wantCode: httputil.ErrCodeNotFound},
 		{name: "session expired", err: domain.ErrUnauthorized, want: http.StatusUnauthorized, wantCode: httputil.ErrCodeUnauthorized},
 		{name: "storage down", err: domain.ErrUnavailable, want: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "audio transcode failed", err: domain.ErrAudioTranscodeFailed, want: http.StatusBadGateway, wantCode: "audio_transcode_failed"},
 		{name: "unexpected", err: errors.New("seaweedfs-filer:8888 refused the connection"), want: http.StatusInternalServerError, wantCode: httputil.ErrCodeInternal},
 	}
 	for _, tt := range tests {
