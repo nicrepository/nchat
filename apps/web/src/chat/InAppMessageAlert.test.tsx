@@ -40,6 +40,53 @@ describe("InAppMessageAlert", () => {
     expect(onOpen).toHaveBeenCalledWith(alert);
   });
 
+  // The action is a labelled control, not a clickable card: its visible label
+  // starts its accessible name (WCAG 2.5.3), and the conversation is what makes
+  // that name unambiguous when it is read out of context.
+  it("offers Abrir as a named, keyboard-reachable action", async () => {
+    const onOpen = vi.fn();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<InAppMessageAlert alert={alert} onOpen={onOpen} onDismiss={vi.fn()} />);
+
+    const open = screen.getByRole("button", { name: "Abrir conversa geral" });
+    expect(open).toHaveTextContent("Abrir");
+
+    await user.tab();
+    expect(open).toHaveFocus();
+    await user.keyboard("{Enter}");
+
+    expect(onOpen).toHaveBeenCalledWith(alert);
+  });
+
+  // An alert about somewhere else must never take the reader out of what they
+  // are doing here.
+  it("does not move focus when it appears", () => {
+    const input = document.createElement("input");
+    document.body.append(input);
+    input.focus();
+
+    render(<InAppMessageAlert alert={alert} onOpen={vi.fn()} onDismiss={vi.fn()} />);
+
+    expect(input).toHaveFocus();
+    input.remove();
+  });
+
+  // The body is data on the way in and data on the way out: whatever a sender
+  // writes is text in the DOM, never markup.
+  it("renders a message body as text, never as markup", () => {
+    render(
+      <InAppMessageAlert
+        alert={{ ...alert, bodyText: "<img src=x onerror=alert(1)>" }}
+        onOpen={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    const surface = screen.getByTestId("in-app-message-alert");
+    expect(surface.querySelector("img")).toBeNull();
+    expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeInTheDocument();
+  });
+
   it("can be dismissed", async () => {
     const onDismiss = vi.fn();
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });

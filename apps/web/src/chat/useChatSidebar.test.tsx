@@ -87,6 +87,32 @@ vi.mock("./useChatWebSocket", () => ({
   ),
 }));
 
+/**
+ * These tests are about what an arriving message does to unread and to the
+ * alert surfaces — never about which tab gets to announce it.
+ *
+ * jsdom implements no Web Locks, and the presentation layer fails closed
+ * without them (see notificationPresentation.ts), so without this every one of
+ * these would find nothing presented. This grants the claim, which is the path
+ * a browser with Web Locks takes. Contention between tabs, and the fail-closed
+ * behaviour itself, are covered by that module's own suite.
+ */
+beforeEach(() => {
+  Object.defineProperty(navigator, "locks", {
+    value: {
+      request: (_name: string, _options: unknown, callback: (lock: unknown) => unknown) => {
+        callback({ name: _name });
+        return Promise.resolve();
+      },
+    },
+    configurable: true,
+  });
+});
+
+afterEach(() => {
+  Reflect.deleteProperty(navigator, "locks");
+});
+
 const channelA = "11111111-1111-4111-8111-111111111111";
 const channelB = "22222222-2222-4222-8222-222222222222";
 const dmC = "33333333-3333-4333-8333-333333333333";

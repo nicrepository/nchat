@@ -50,42 +50,54 @@ export default function InAppMessageAlert({ alert, onOpen, onDismiss }: InAppMes
       className="in-app-alert"
       // Polite, not assertive: a message arriving elsewhere is worth announcing
       // and is never worth interrupting what the reader is doing or saying.
+      // Nothing here takes focus either — the reader stays wherever they were,
+      // and reaches the two actions by tabbing to them.
       role="status"
       aria-live="polite"
       data-testid="in-app-message-alert"
     >
-      <button
-        type="button"
-        className="in-app-alert__open"
-        onClick={() => onOpen(alert)}
-        data-testid="in-app-message-alert-open"
-      >
-        <span className="in-app-alert__avatar" aria-hidden="true">
-          <PersonAvatarImage
-            src={alert.senderAvatarUrl}
-            initials={initialsFrom(alert.senderDisplayName)}
-            imgClassName="in-app-alert__avatar-img"
-          />
-        </span>
-        <span className="in-app-alert__text">
-          <strong className="in-app-alert__sender">{alert.senderDisplayName}</strong>
-          <span className="in-app-alert__where">{alert.conversationName}</span>
-          {/* The same preview the OS notification already shows; no field the
-              product does not already put on another surface. */}
-          <span className="in-app-alert__preview">{alert.bodyText}</span>
-        </span>
-      </button>
-      <button
-        type="button"
-        className="in-app-alert__dismiss"
-        onClick={onDismiss}
-        aria-label="Dispensar notificação"
-        data-testid="in-app-message-alert-dismiss"
-      >
-        <span className="material-symbols-outlined" aria-hidden="true">
-          close
-        </span>
-      </button>
+      <span className="in-app-alert__avatar" aria-hidden="true">
+        <PersonAvatarImage
+          src={alert.senderAvatarUrl}
+          initials={initialsFrom(alert.senderDisplayName)}
+          imgClassName="in-app-alert__avatar-img"
+        />
+      </span>
+      <span className="in-app-alert__text">
+        <strong className="in-app-alert__sender">{alert.senderDisplayName}</strong>
+        <span className="in-app-alert__where">{alert.conversationName}</span>
+        {/* Plain text, built by the presentation layer: mention tokens have
+            already become their labels, and JSX renders the result as data.
+            No message body ever reaches this surface as markup. */}
+        <span className="in-app-alert__preview">{alert.bodyText}</span>
+      </span>
+      <span className="in-app-alert__actions">
+        {/* The one action the alert offers, as its own labelled control rather
+            than a clickable card: a keyboard user tabs to something that says
+            what it does, and the announced text above stays text. The
+            accessible name starts with the visible label (WCAG 2.5.3) and adds
+            the conversation, which is what makes it unambiguous out of order. */}
+        <button
+          type="button"
+          className="in-app-alert__open"
+          onClick={() => onOpen(alert)}
+          aria-label={`Abrir conversa ${alert.conversationName}`}
+          data-testid="in-app-message-alert-open"
+        >
+          Abrir
+        </button>
+        <button
+          type="button"
+          className="in-app-alert__dismiss"
+          onClick={onDismiss}
+          aria-label="Dispensar notificação"
+          data-testid="in-app-message-alert-dismiss"
+        >
+          <span className="material-symbols-outlined" aria-hidden="true">
+            close
+          </span>
+        </button>
+      </span>
     </aside>
   );
 }

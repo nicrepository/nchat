@@ -11,17 +11,11 @@
  * calls requestPermission() on its own initiative.
  */
 
-import { MENTION_TOKEN_RE, unescapeRichTextV3 } from "./richTextMarkers";
+import { buildMessagePreview } from "./messagePreview";
 
 export type BrowserNotificationPermission = "default" | "granted" | "denied" | "unsupported";
 
 const NOTIFICATION_ICON = "/assets/nic-labs-icon.png";
-const PREVIEW_MAX_LENGTH = 140;
-
-// Same technique as soundRules.ts: reuse the canonical (anchored) mention
-// grammar unanchored and globally, instead of re-deriving the token pattern,
-// to swap each raw token for its readable label in the notification preview.
-const MENTION_TOKEN_GLOBAL_RE = new RegExp(MENTION_TOKEN_RE.source.replace(/^\^/, ""), "gi");
 
 function isSecureContext(): boolean {
   try {
@@ -77,18 +71,6 @@ export async function requestBrowserNotificationPermission(): Promise<BrowserNot
   }
 }
 
-/** Plain-text preview: mention tokens become their label, never raw markup. */
-function buildNotificationPreview(bodyText: string): string {
-  MENTION_TOKEN_GLOBAL_RE.lastIndex = 0;
-  const withLabels = bodyText.replace(
-    MENTION_TOKEN_GLOBAL_RE,
-    (_match, label: string) => `@${unescapeRichTextV3(label)}`,
-  );
-  return withLabels.length > PREVIEW_MAX_LENGTH
-    ? `${withLabels.slice(0, PREVIEW_MAX_LENGTH - 1)}…`
-    : withLabels;
-}
-
 export interface ShowBrowserMessageNotificationInput {
   targetKind: "channel" | "dm";
   targetId: string;
@@ -115,7 +97,7 @@ export function showBrowserMessageNotification(
   let notification: Notification;
   try {
     notification = new window.Notification(input.senderDisplayName || "Nova mensagem", {
-      body: buildNotificationPreview(input.bodyText),
+      body: buildMessagePreview(input.bodyText),
       tag: `nchat-message-${input.targetKind}-${input.targetId}`,
       icon: NOTIFICATION_ICON,
     });
