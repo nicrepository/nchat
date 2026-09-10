@@ -48,6 +48,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+import { useAttachmentGate } from "./lazyAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchDocumentPreviewPage, regenerateDocumentPreview } from "./filesApi";
 import { isPreviewAvailable, isPreviewPending, type ChannelAttachment } from "./chatTypes";
@@ -59,6 +60,27 @@ import { isPreviewAvailable, isPreviewPending, type ChannelAttachment } from "./
  */
 function firstDocumentPreviewPage(attachmentId: string, signal?: AbortSignal): Promise<Blob> {
   return fetchDocumentPreviewPage(attachmentId, 1, signal);
+}
+
+/**
+ * In-flight regenerations, keyed by attachment (issue #675).
+ *
+ * Regenerating is a POST that starts real work on the server, and it is not a
+ * blob fetch, so it does not go through previewScheduler. What it still must
+ * not do is fire twice for the same document — two cards for the same
+ * attachment, or a remount as the row scrolls back into range, would otherwise
+ * queue a second render of the same file.
+ */
+const regenerationsInFlight = new Map<string, Promise<unknown>>();
+
+function requestPreviewRegeneration(attachmentId: string): Promise<unknown> {
+  const existing = regenerationsInFlight.get(attachmentId);
+  if (existing) return existing;
+  const started = regenerateDocumentPreview(attachmentId).finally(() => {
+    regenerationsInFlight.delete(attachmentId);
+  });
+  regenerationsInFlight.set(attachmentId, started);
+  return started;
 }
 
 /**
@@ -103,19 +125,28 @@ export default function AttachmentDocumentPreview({
   // useAttachmentBlobUrl never fetches, and the early return below (after
   // every hook has run) is what actually keeps this component from
   // rendering anything for it. See the module comment.
+  // Issue #675: a document card far from the viewport draws its skeleton and
+  // fetches nothing — not even the derived first page, and never the original.
+  const gate = useAttachmentGate();
   const eligible = isImageDocument && isPreviewAvailable(attachment.previewStatus);
   const [regenerating, setRegenerating] = useState(false);
   const expiredAttempted = useRef(false);
+  // Issue #675: an expired preview far from the scrollport asks for nothing.
+  // Regeneration is server-side work, so a timeline that merely *contains* a
+  // hundred stale documents must not schedule a hundred re-renders of them;
+  // only proximity does, and the dedupe above keeps it to one per document.
   useEffect(() => {
-    if (attachment.previewStatus !== "expired" || expiredAttempted.current) return;
+    if (attachment.previewStatus !== "expired" || !gate.active) return;
+    if (expiredAttempted.current) return;
     expiredAttempted.current = true;
     setRegenerating(true);
-    void regenerateDocumentPreview(attachment.id).catch(() => setRegenerating(false));
-  }, [attachment.id, attachment.previewStatus]);
+    void requestPreviewRegeneration(attachment.id).catch(() => setRegenerating(false));
+  }, [attachment.id, attachment.previewStatus, gate.active]);
   const { url, failed, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
     eligible,
     firstDocumentPreviewPage,
+    { priority: gate.priority, active: gate.active },
   );
 
   if (
@@ -133,7 +164,7 @@ export default function AttachmentDocumentPreview({
         className="chat-msg-area__attachment-action"
         onClick={() => {
           setRegenerating(true);
-          void regenerateDocumentPreview(attachment.id).catch(() => setRegenerating(false));
+          void requestPreviewRegeneration(attachment.id).catch(() => setRegenerating(false));
         }}
       >
         Tentar novamente

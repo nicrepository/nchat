@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import AttachmentImagePreview from "./AttachmentImagePreview";
 import { MAX_INLINE_ORIGINAL_IMAGE_BYTES } from "./attachmentImageRules";
+import { AttachmentHydrationContext, type AttachmentGate } from "./lazyAttachment";
 import type { ChannelAttachment } from "./chatTypes";
 
 const { mockPreview, mockContent } = vi.hoisted(() => ({
@@ -126,23 +127,10 @@ describe("PNG/JPEG", () => {
    * just sent in this session — must not wait on it forever. It falls back to
    * the original instead, the same mechanism GIF/WebP already use.
    */
-  it("falls back to the original, not an indefinite skeleton, when the preview never becomes ready", async () => {
-    render(
-      <AttachmentImagePreview
-        attachment={attachment({ previewStatus: "pending" })}
-        fallback={fallback}
-        onOpen={onOpen}
-      />,
-    );
-
-    const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
-    expect(trigger.querySelector("img")).toHaveAttribute("src", "blob:img-1");
-    expect(mockContent).toHaveBeenCalledTimes(1);
-    expect(mockPreview).not.toHaveBeenCalled();
-  });
-
-  it("shows a skeleton, never the fallback icon, while that fallback original is in flight", () => {
-    mockContent.mockReturnValue(new Promise(() => {}));
+  it("waits on the shell, never the original, while the preview is still being rendered", () => {
+    // Issue #675: the card is not worth a full-resolution photograph. The
+    // skeleton stays until the preview lands, which is a deliberate trade —
+    // see the module comment on the preview-ready notification gap.
     render(
       <AttachmentImagePreview
         attachment={attachment({ previewStatus: "pending" })}
@@ -152,10 +140,10 @@ describe("PNG/JPEG", () => {
     );
 
     expect(screen.getByTestId("chat-message-attachment-image-loading-img-1")).toBeInTheDocument();
-    expect(screen.queryByTestId("fallback-icon")).not.toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
   });
 
-  it("falls back to the original, the same way, when the server marks the preview unsupported or failed", async () => {
+  it("shows the file-type icon, and fetches nothing, when there will never be a preview", () => {
     render(
       <AttachmentImagePreview
         attachment={attachment({ previewStatus: "unsupported" })}
@@ -164,24 +152,20 @@ describe("PNG/JPEG", () => {
       />,
     );
 
-    const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
-    expect(trigger.querySelector("img")).toHaveAttribute("src", "blob:img-1");
-    expect(mockContent).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("fallback-icon")).toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
     expect(mockPreview).not.toHaveBeenCalled();
   });
 
-  it("falls back to the icon, never a broken-image glyph, only once the fallback original itself fails", async () => {
-    mockContent.mockRejectedValue(new Error("403"));
+  it("falls back to the icon, never a broken-image glyph, once the preview itself fails to load", async () => {
+    mockPreview.mockRejectedValue(new Error("403"));
     render(
-      <AttachmentImagePreview
-        attachment={attachment({ previewStatus: "unsupported" })}
-        fallback={fallback}
-        onOpen={onOpen}
-      />,
+      <AttachmentImagePreview attachment={attachment()} fallback={fallback} onOpen={onOpen} />,
     );
 
     expect(await screen.findByTestId("fallback-icon")).toBeInTheDocument();
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
   });
 
   it("keeps waiting on the skeleton, not the original, past the size cap with no ready preview", () => {
@@ -222,9 +206,11 @@ describe("PNG/JPEG", () => {
     const trigger = await screen.findByRole("button", { name: "Ampliar paisagem.png" });
     await user.click(trigger);
 
+    // The bytes, not the card's object URL (issue #675): the viewer outlives
+    // this card, so it mints an address of its own.
     expect(onOpen).toHaveBeenCalledWith({
       trigger,
-      url: "blob:img-1",
+      blob: expect.any(Blob),
       isOriginal: false,
     });
     expect(mockContent).not.toHaveBeenCalled();
@@ -247,7 +233,10 @@ describe("PNG/JPEG", () => {
 });
 
 describe("WebP", () => {
-  it("fetches the original directly, since there is no server preview for WebP", async () => {
+  it("draws the file-type icon and fetches nothing, having no derived preview to show", () => {
+    // Issue #675: WebP has no server preview, and the timeline is not where an
+    // original gets downloaded. Opening the card still shows the real image —
+    // the viewer is what fetches it.
     render(
       <AttachmentImagePreview
         attachment={attachment({ contentType: "image/webp", previewStatus: "unsupported" })}
@@ -256,9 +245,8 @@ describe("WebP", () => {
       />,
     );
 
-    const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
-    expect(trigger.querySelector("img")).toHaveAttribute("src", "blob:img-1");
-    expect(mockContent).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("fallback-icon")).toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
     expect(mockPreview).not.toHaveBeenCalled();
   });
 
@@ -341,7 +329,7 @@ describe("GIF, reduced motion", () => {
     const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
     await user.click(trigger);
     expect(onOpen).toHaveBeenLastCalledWith(
-      expect.objectContaining({ isOriginal: true, url: "blob:img-2" }),
+      expect.objectContaining({ isOriginal: true, blob: expect.any(Blob) }),
     );
   });
 
@@ -357,5 +345,117 @@ describe("GIF, reduced motion", () => {
     expect(screen.getByTestId("fallback-icon")).toBeInTheDocument();
     expect(mockContent).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Reproduzir animação" })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Proximity, which is what decides whether the one heavy original this
+ * component may still fetch — a GIF's animated form — is worth fetching at all
+ * (issue #675).
+ */
+describe("proximity", () => {
+  const FAR: AttachmentGate = { proximity: "far", active: false, priority: 1 };
+  const NEAR: AttachmentGate = { proximity: "near", active: true, priority: 1 };
+  const VISIBLE: AttachmentGate = { proximity: "visible", active: true, priority: 0 };
+
+  function renderAt(gate: AttachmentGate, attachmentOverrides: Partial<ChannelAttachment> = {}) {
+    const node = (currentGate: AttachmentGate) => (
+      <AttachmentHydrationContext.Provider value={currentGate}>
+        <AttachmentImagePreview
+          attachment={attachment(attachmentOverrides)}
+          fallback={fallback}
+          onOpen={onOpen}
+        />
+      </AttachmentHydrationContext.Provider>
+    );
+    const result = render(node(gate));
+    return { ...result, moveTo: (next: AttachmentGate) => result.rerender(node(next)) };
+  }
+
+  const gifType = { contentType: "image/gif" } as const;
+
+  it("asks for nothing at all while the row is far from the scrollport", () => {
+    renderAt(FAR);
+
+    expect(mockPreview).not.toHaveBeenCalled();
+    expect(mockContent).not.toHaveBeenCalled();
+  });
+
+  it("asks for nothing for a far GIF either — not even its static frame", () => {
+    renderAt(FAR, gifType);
+
+    expect(mockPreview).not.toHaveBeenCalled();
+    expect(mockContent).not.toHaveBeenCalled();
+  });
+
+  it("shows a near GIF its static frame, never the animated original", async () => {
+    renderAt(NEAR, gifType);
+
+    await screen.findByTestId("chat-message-attachment-image-img-1");
+    expect(mockPreview).toHaveBeenCalledTimes(1);
+    expect(mockContent).not.toHaveBeenCalled();
+  });
+
+  it("animates a GIF only once it is genuinely on screen", async () => {
+    renderAt(VISIBLE, gifType);
+
+    await screen.findByTestId("chat-message-attachment-image-img-1");
+    expect(mockContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a GIF to its static frame when it scrolls out of the viewport", async () => {
+    const { moveTo } = renderAt(VISIBLE, gifType);
+    const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
+    expect(trigger.querySelector("img")).toHaveAttribute("src", "blob:img-1");
+    expect(mockContent).toHaveBeenCalledTimes(1);
+
+    moveTo(NEAR);
+
+    // The animated original is dropped and its address revoked: a timeline of
+    // GIFs must not keep decoding the ones nobody is looking at.
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:img-1"));
+  });
+
+  it("still refuses to animate a visible GIF under reduced motion until asked", async () => {
+    stubMatchMedia(true);
+    renderAt(VISIBLE, gifType);
+
+    await screen.findByTestId("chat-message-attachment-image-img-1");
+    expect(mockPreview).toHaveBeenCalledTimes(1);
+    expect(mockContent).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Reproduzir animação" })).toBeInTheDocument();
+  });
+
+  it("keeps a static preview that already arrived when the row drifts far away", async () => {
+    const { moveTo } = renderAt(VISIBLE);
+    const trigger = await screen.findByTestId("chat-message-attachment-image-img-1");
+    expect(trigger.querySelector("img")).toHaveAttribute("src", "blob:img-1");
+
+    moveTo(FAR);
+
+    // Bytes already on screen stay: revoking them would buy a flicker and a
+    // second request for a row that is one scroll tick from being useful.
+    expect(screen.getByTestId("chat-message-attachment-image-img-1")).toBeInTheDocument();
+    expect(revokeObjectURL).not.toHaveBeenCalledWith("blob:img-1");
+    expect(mockPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("abandons a preview still in flight when the row goes far, and asks again on return", async () => {
+    let inFlightSignal: AbortSignal | undefined;
+    mockPreview.mockImplementation((_id: string, signal: AbortSignal) => {
+      inFlightSignal = signal;
+      return new Promise<Blob>(() => {});
+    });
+    const { moveTo } = renderAt(VISIBLE);
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledTimes(1));
+
+    moveTo(FAR);
+    await waitFor(() => expect(inFlightSignal?.aborted).toBe(true));
+
+    mockPreview.mockResolvedValue(new Blob(["preview-bytes"]));
+    moveTo(VISIBLE);
+
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledTimes(2));
   });
 });

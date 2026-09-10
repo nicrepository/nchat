@@ -30,6 +30,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router";
+import { useVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
 
 import "./ChatMessageArea.css";
 import ActiveDirectCallBar, { type ActiveDirectCallBarProps } from "../calls/ActiveDirectCallBar";
@@ -63,7 +64,9 @@ import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import ConversationSystemMessage from "./ConversationSystemMessage.tsx";
 import { systemScopeFor, type SystemMessageScope } from "./conversationSystemMessage";
 import { conversationDetailsPanelId } from "./conversationDetailsDisplay";
+import AttachmentViewerHost from "./AttachmentViewerHost";
 import ChatComposer from "./ChatComposer";
+import { TimelineScrollRootContext } from "./lazyAttachment";
 import ForwardMessageDialog, { type ForwardSourceContext } from "./ForwardMessageDialog";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
 import PresenceDot from "./PresenceDot";
@@ -90,8 +93,40 @@ import {
   saveViewportAnchor,
   type ViewportAnchor,
 } from "./chatViewportPersistence";
+import {
+  buildTimelineRows,
+  ESTIMATED_ROW_HEIGHT_PX,
+  INITIAL_VIEWPORT_HEIGHT_PX,
+  MAX_PREPEND_RESTORE_PASSES,
+  prependRestoreStep,
+  scrollToEndBehavior,
+  shouldShiftReadingPositionForResize,
+  shouldVirtualize,
+  TIMELINE_OVERSCAN_ROWS,
+  timelineRowIndex,
+  UNREAD_DIVIDER_KEY,
+  type TimelineRow,
+} from "./timelineVirtualization";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Where the scrollport has to sit for row `index` to show `offsetPx` below its
+ * top edge, according to the row model (issue #675).
+ *
+ * Only ever used to *reach* a row that is not mounted — while it is unmounted
+ * there is no box to measure, and the model is the only answer available. It is
+ * as good as the estimates the model still holds, which is why the restoration
+ * measures again as soon as the row exists.
+ */
+function prependScrollTopFor(
+  virtualizer: Virtualizer<HTMLDivElement, Element>,
+  index: number,
+  offsetPx: number,
+): number {
+  const rowStart = virtualizer.getOffsetForIndex(index, "start")?.[0] ?? 0;
+  return Math.max(0, rowStart - offsetPx);
+}
 
 const quoteHighlightMs = 1_200;
 const reactionMenuLeaveDelayMs = 150;
@@ -539,9 +574,18 @@ function prefersReducedMotion(): boolean {
   );
 }
 
-/** The behavior an explicit user-triggered scroll (button, own-send) should use. */
-function explicitScrollBehavior(): ScrollBehavior {
-  return prefersReducedMotion() ? "auto" : "smooth";
+/**
+ * The behavior an explicit user-triggered scroll (button, own-send) should use.
+ *
+ * Animated when the trip is short enough for the animation to survive it — see
+ * MAX_SMOOTH_SCROLL_DISTANCE_PX for why distance is the deciding factor and not
+ * taste.
+ */
+function explicitScrollBehavior(container: HTMLDivElement | null): ScrollBehavior {
+  const remaining = container
+    ? container.scrollHeight - container.scrollTop - container.clientHeight
+    : 0;
+  return scrollToEndBehavior(remaining, prefersReducedMotion());
 }
 
 /**
@@ -668,6 +712,14 @@ function MessageList({
   onReachedBottom,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  // #675: the same element, as state, because the attachment observers need it
+  // as their IntersectionObserver root and a ref alone never tells a consumer
+  // it has arrived. Written from the callback ref below, at commit time.
+  const [scrollRoot, setScrollRoot] = useState<HTMLDivElement | null>(null);
+  const attachListRef = useCallback((element: HTMLDivElement | null) => {
+    listRef.current = element;
+    setScrollRoot(element);
+  }, []);
   // #788: the timeline content wrapper — see the ResizeObserver effect below.
   const contentRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -691,10 +743,27 @@ function MessageList({
     if (el) messageRefs.current.set(messageId, el);
     else messageRefs.current.delete(messageId);
   }, []);
+  // #675: jumping cannot depend on messageRefs holding the whole conversation
+  // any more — a virtualized timeline only ever has its own window mounted. The
+  // row model and the virtualizer are both built further down (they need state
+  // declared after this), so the jump helper reads them through refs kept in
+  // sync by a layout effect, which is also what keeps its identity stable for
+  // the deep-link effect's dependency list.
+  const rowIndexRef = useRef<Map<string, number>>(new Map());
+  const virtualizerRef = useRef<Virtualizer<HTMLDivElement, Element> | null>(null);
   const handleQuoteJump = useCallback((messageId: string) => {
     const el = messageRefs.current.get(messageId);
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+      // Not mounted: identify the row logically, then let the virtualizer mount
+      // and position it. `auto` rather than `smooth` — an animated scroll cannot
+      // be corrected as rows on the way are measured for the first time, which
+      // is exactly what happens when travelling into unvisited history.
+      const index = rowIndexRef.current.get(messageId);
+      if (index === undefined) return;
+      virtualizerRef.current?.scrollToIndex(index, { align: "center" });
+    }
     setHighlightedMessageId(messageId);
     if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
     highlightTimerRef.current = window.setTimeout(() => {
@@ -709,8 +778,10 @@ function MessageList({
       return;
     }
     if (focusedMessageRef.current === focusMessageId) return;
-    const el = messageRefs.current.get(focusMessageId);
-    if (!el) return;
+    // Loaded is enough — mounted is the virtualizer's business, not this
+    // effect's. A message no page has reached yet is still skipped, and the
+    // bounded backward search below is what brings it in.
+    if (!rowIndexRef.current.has(focusMessageId)) return;
     focusedMessageRef.current = focusMessageId;
     handleQuoteJump(focusMessageId);
   }, [focusMessageId, handleQuoteJump, messages]);
@@ -779,8 +850,135 @@ function MessageList({
   const [searchedForLength, setSearchedForLength] = useState(-1);
   const [countedMessages, setCountedMessages] = useState(messages);
   const [scrollAnimationRequest, setScrollAnimationRequest] = useState(0);
+
+  // #675: the rows the timeline draws — messages, day dividers and the unread
+  // separator — and the index the jump/anchor logic looks them up in. Built
+  // before the virtualizer because it is what the virtualizer counts.
+  /**
+   * Who writes the scroll position, by state (#675).
+   *
+   * Exactly one writer per state, and the virtualizer's automatic resize
+   * compensation counts as a writer — which is why the predicate below has to
+   * know about the two states that claim the position outright.
+   *
+   *   RESOLVING            nobody; the timeline has not been positioned yet.
+   *   RESTORING_POSITION   the #492 resolution, once, then it hands over.
+   *   AT_FIRST_UNREAD      the same, landing on the separator.
+   *   READING_HISTORY      the reader, plus the virtualizer's compensation so
+   *                        rows settling above them do not move them.
+   *   PREPEND_RESTORE      the restoration alone. Compensation OFF; the
+   *                        tail-lock stands down; the scroll handler records
+   *                        nothing. Every pass either finishes or moves the
+   *                        viewport, so it ends within a few commits.
+   *   SCROLLING_TO_BOTTOM  the explicit scroll, plus the tail-lock following
+   *                        the growing content. Compensation OFF: a write to
+   *                        scrollTop cancels the browser's animation and leaves
+   *                        nobody to finish the trip.
+   *   AT_BOTTOM            the tail-lock while the follow-the-tail intent
+   *                        holds, plus compensation again.
+   *
+   * The in-flight prepend restoration, or null when there is none.
+   *
+   * Declared before the virtualizer because the resize predicate below reads
+   * it: while this is set, PREPEND_RESTORE is the single writer of scrollTop
+   * and the virtualizer's own adjustment stands down.
+   */
+  const prependRestoreRef = useRef<{
+    messageId: string;
+    offsetPx: number;
+    passes: number;
+    /** Whether the anchor row has been measured at least once. */
+    measured: boolean;
+  } | null>(null);
+
+  /**
+   * What a row's size change does to the reading position.
+   *
+   * Stable across renders — it reads everything it needs from the virtualizer
+   * and from a ref — so the virtualizer is handed the same function on every
+   * commit rather than a new one to compare against.
+   */
+  const adjustForRowResize = useCallback(
+    (
+      item: { key: unknown; start: number; size: number },
+      _delta: number,
+      instance: Virtualizer<HTMLDivElement, Element>,
+    ): boolean =>
+      shouldShiftReadingPositionForResize({
+        rowStartPx: item.start,
+        rowSizePx: item.size,
+        // The element's own scrollTop, not the virtualizer's cached offset:
+        // that one is refreshed from a scroll event, which is asynchronous, so
+        // straight after any programmatic scroll it still reports the position
+        // from before the move. The reading position is a fact about the
+        // element.
+        readingOffsetPx:
+          instance.scrollElement?.scrollTop ??
+          (instance.scrollOffset ?? 0) + instance.scrollAdjustments,
+        // The virtualizer's own measurement cache, read before it records this
+        // change: a key it does not hold yet is an estimate being replaced.
+        // No per-row state of our own, and no second cache to keep in sync.
+        isFirstMeasurement: !instance.itemSizeCache.has(item.key as never),
+        restoring: prependRestoreRef.current !== null,
+        scrollingToEnd: phaseRef.current === "SCROLLING_TO_BOTTOM",
+      }),
+    [],
+  );
+
+  const rows = useMemo(
+    () => buildTimelineRows(messages, firstUnreadMessageId, formatDayLabel, formatTime),
+    [messages, firstUnreadMessageId],
+  );
+  const rowIndex = useMemo(() => timelineRowIndex(rows), [rows]);
+  const virtualized = shouldVirtualize(rows.length);
+  // Same scroll container as before, so every #492/#788 invariant built on it —
+  // the scroll handler, the tail lock, the top/bottom sentinels, the prepend
+  // delta — keeps working unchanged; only which rows exist in it changes.
+  const virtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => ESTIMATED_ROW_HEIGHT_PX,
+    overscan: TIMELINE_OVERSCAN_ROWS,
+    // Keyed by row identity, never by index: a prepended page must not
+    // invalidate every measurement above it. See timelineVirtualization.ts.
+    getItemKey: (index) => rows[index].key,
+    initialRect: { width: 0, height: INITIAL_VIEWPORT_HEIGHT_PX },
+    enabled: virtualized,
+  });
+  // #492 through #675: what a row's real height replacing its estimate does to
+  // the reading position. An instance property in this version rather than an
+  // option, and idempotent, so the layout effect below is free to reassert it
+  // on every commit. See the predicate for why the default is wrong here.
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = adjustForRowResize;
+
+  useLayoutEffect(() => {
+    rowIndexRef.current = rowIndex;
+    virtualizerRef.current = virtualized ? virtualizer : null;
+    // #675: finish an anchor the scroll handler could not resolve because the
+    // mounted window was still a commit behind it. At most one scan of the
+    // mounted rows per scroll burst, not one per commit — the flag is cleared
+    // as soon as an answer exists.
+    const el = listRef.current;
+    if (!anchorStaleRef.current || !el || prependRestoreRef.current) return;
+    const topmost = computeTopmostVisible(el, messageRefs.current);
+    if (topmost) {
+      currentAnchorRef.current = topmost;
+      anchorStaleRef.current = false;
+    }
+  });
+
   const reachedBottomFiredRef = useRef(false);
   const currentAnchorRef = useRef<{ messageId: string; offsetPx: number } | null>(null);
+  /**
+   * The in-flight prepend restoration (#675), or null when there is none.
+   *
+   * While this is set it is the ONLY thing allowed to write scrollTop: the
+   * tail-lock stands down and the scroll handler stops re-deriving the anchor,
+   * so a correction cannot be mistaken for the reader moving. See the
+   * restoration effect for why one write is not enough.
+   */
+  /** Whether the last scroll could not resolve an anchor (see the handler). */
+  const anchorStaleRef = useRef(false);
   const conversationKeyRef = useRef(conversationKey);
   const onCaptureAnchorRef = useRef(onCaptureAnchor);
   const onReachedBottomRef = useRef(onReachedBottom);
@@ -826,16 +1024,24 @@ function MessageList({
    * box as zero-sized, so this deterministically resolves to the first loaded
    * message there; a real browser resolves it to whatever message is actually
    * scrolled to the top of the viewport.
+   *
+   * #675: null when no *mounted* message is in the viewport at all. Under
+   * virtualization the mounted window is recomputed a commit after the scroll
+   * that moved it, so between the two there is a moment when every mounted row
+   * is far below the viewport — and without this bound the nearest of them,
+   * hundreds of pixels down, would be recorded as "the message being read".
+   * Restoring a prepend to that is a reading position nobody ever had.
    */
   function computeTopmostVisible(
     container: HTMLDivElement,
     refs: Map<string, HTMLDivElement>,
   ): { messageId: string; offsetPx: number } | null {
     const containerTop = container.getBoundingClientRect().top;
+    const viewportPx = container.clientHeight;
     let best: { messageId: string; offsetPx: number } | null = null;
     for (const [id, el] of refs) {
       const offsetPx = el.getBoundingClientRect().top - containerTop;
-      if (offsetPx >= -4 && (!best || offsetPx < best.offsetPx)) {
+      if (offsetPx >= -4 && offsetPx < viewportPx && (!best || offsetPx < best.offsetPx)) {
         best = { messageId: id, offsetPx };
       }
     }
@@ -895,8 +1101,23 @@ function MessageList({
           }
         }
       }
+      // #675: a restoration in flight is writing scrollTop itself, and the
+      // scroll events it produces describe intermediate layouts, not a reading
+      // position. Re-deriving the anchor from one of them would replace the
+      // very target being restored to, so while it owns the scrollport this
+      // records nothing. It owns it for a handful of commits at most — see the
+      // restoration's own endings.
+      if (prependRestoreRef.current) return;
       const topmost = computeTopmostVisible(el, messageRefs.current);
-      if (topmost) currentAnchorRef.current = topmost;
+      if (topmost) {
+        currentAnchorRef.current = topmost;
+        anchorStaleRef.current = false;
+      } else {
+        // The mounted window has not caught up with this scroll yet. Rather
+        // than record a message nobody is looking at, ask the next commit —
+        // which is the one that mounts the right rows — to answer instead.
+        anchorStaleRef.current = true;
+      }
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
@@ -972,6 +1193,11 @@ function MessageList({
     const observer = new ResizeObserver(() => {
       const el = listRef.current;
       if (!el) return;
+      // #675 single scroll authority: a prepend restoration owns scrollTop
+      // until it finishes. The phase alone already makes this a no-op during
+      // one (a prepend only happens up in the history), but saying it here is
+      // what keeps the two from ever being two writers.
+      if (prependRestoreRef.current) return;
       const holdsTail =
         phaseRef.current === "SCROLLING_TO_BOTTOM" ||
         (phaseRef.current === "AT_BOTTOM" && followTailRef.current);
@@ -1002,6 +1228,48 @@ function MessageList({
     return () => {
       if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
       if (hoverCloseTimerRef.current !== null) window.clearTimeout(hoverCloseTimerRef.current);
+    };
+  }, []);
+
+  /** Where focus lands when the thing that had it is gone (#675). */
+  const focusList = useCallback(() => {
+    listRef.current?.focus();
+  }, []);
+
+  // #675 focus recovery. Unmounting the row that holds focus sends focus to
+  // <body>, where a keyboard user has lost the conversation entirely and gets
+  // no announcement about it. Whenever focus was inside this list and has
+  // ended up nowhere, it comes back to the list itself — a predictable place
+  // that still reads as "Mensagens" and still scrolls with the arrow keys.
+  const hadFocusRef = useRef(false);
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    let pending: number | null = null;
+    const onFocusIn = () => {
+      hadFocusRef.current = true;
+    };
+    const onFocusOut = () => {
+      // Deferred one task: focusout fires before the next element receives
+      // focus, so reading document.activeElement now would always say <body>.
+      if (pending !== null) window.clearTimeout(pending);
+      pending = window.setTimeout(() => {
+        pending = null;
+        if (!hadFocusRef.current) return;
+        if (document.activeElement !== document.body) {
+          hadFocusRef.current = el.contains(document.activeElement);
+          return;
+        }
+        hadFocusRef.current = false;
+        el.focus();
+      }, 0);
+    };
+    el.addEventListener("focusin", onFocusIn);
+    el.addEventListener("focusout", onFocusOut);
+    return () => {
+      if (pending !== null) window.clearTimeout(pending);
+      el.removeEventListener("focusin", onFocusIn);
+      el.removeEventListener("focusout", onFocusOut);
     };
   }, []);
 
@@ -1105,30 +1373,47 @@ function MessageList({
     if (!scrollTarget) return;
     if (scrollTarget.messageId === null) {
       scrollToBottom(bottomRef, "auto");
-    } else if (scrollTarget.messageId === firstUnreadMessageId && unreadDividerRef.current) {
-      // Land on the separator, not the message: the message sits right below
-      // it, so scrolling to the message alone would push the separator (and
-      // its "Novas mensagens" label) off-screen above the viewport.
-      unreadDividerRef.current.scrollIntoView({ behavior: "auto", block: "start" });
-    } else {
-      messageRefs.current
-        .get(scrollTarget.messageId)
-        ?.scrollIntoView({ behavior: "auto", block: "start" });
+      return;
     }
+    // Land on the separator, not the message: the message sits right below it,
+    // so scrolling to the message alone would push the separator (and its
+    // "Novas mensagens" label) off-screen above the viewport.
+    const targetKey =
+      scrollTarget.messageId === firstUnreadMessageId ? UNREAD_DIVIDER_KEY : scrollTarget.messageId;
+    // Read through the refs, not the render values: the dependency list has to
+    // stay [scrollTarget, firstUnreadMessageId]. Positioning happens once, when
+    // resolution picks a target — re-running it because the row model changed
+    // would re-scroll on every prepended page, which is precisely the "not
+    // moving the message being read" invariant #492 exists to protect.
+    const activeVirtualizer = virtualizerRef.current;
+    if (activeVirtualizer) {
+      // #675: the row this resolves to is very often outside the initial
+      // window, so the virtualizer places it rather than a DOM node that does
+      // not exist yet.
+      const index = rowIndexRef.current.get(targetKey);
+      if (index !== undefined) activeVirtualizer.scrollToIndex(index, { align: "start" });
+      return;
+    }
+    const element =
+      targetKey === UNREAD_DIVIDER_KEY
+        ? unreadDividerRef.current
+        : messageRefs.current.get(targetKey);
+    element?.scrollIntoView({ behavior: "auto", block: "start" });
   }, [scrollTarget, firstUnreadMessageId]);
 
   // Real event handler (button onClick) — calling setState here is completely
   // ordinary, not an effect.
   const startScrollToBottom = useCallback(() => {
     setPhase("SCROLLING_TO_BOTTOM");
-    scrollToBottom(bottomRef, explicitScrollBehavior());
+    scrollToBottom(bottomRef, explicitScrollBehavior(listRef.current));
   }, [setPhase]);
 
   // Consumes an own-send's animated-scroll request (set during render below)
   // — a plain DOM operation, no setState of its own, so the mutation effect
   // further down never has to call startScrollToBottom() itself.
   useEffect(() => {
-    if (scrollAnimationRequest > 0) scrollToBottom(bottomRef, explicitScrollBehavior());
+    if (scrollAnimationRequest > 0)
+      scrollToBottom(bottomRef, explicitScrollBehavior(listRef.current));
   }, [scrollAnimationRequest]);
 
   // #492: reacts to a new message array — grows the pending-count badge for
@@ -1174,8 +1459,45 @@ function MessageList({
     const el = listRef.current;
 
     if (lastMutation === "prepend") {
-      // Shift scrollTop by the amount the container grew so the user's view is stable.
-      el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
+      const activeVirtualizer = virtualizerRef.current;
+      const anchor = currentAnchorRef.current;
+      const anchorIndex = anchor ? rowIndexRef.current.get(anchor.messageId) : undefined;
+      if (activeVirtualizer && anchor && anchorIndex !== undefined) {
+        // #675: hand the position back to the restoration below, which is the
+        // only writer while it runs.
+        //
+        // Neither of the one-shot compensations works here. The scrollHeight
+        // delta is exact only while every row is mounted; and scrollToIndex
+        // positions against the *estimated* heights the prepended page enters
+        // with, which the virtualizer then rewrites as it measures each newly
+        // mounted row — so whatever either of them computes is already stale
+        // by the time the layout settles. That is where the 722px of measured
+        // drift came from.
+        //
+        // What survives measurement is the row's identity, so that is what is
+        // named here; the restoration turns it back into pixels once the
+        // pixels are real.
+        prependRestoreRef.current = {
+          messageId: anchor.messageId,
+          offsetPx: anchor.offsetPx,
+          passes: 0,
+          measured: false,
+        };
+        // Deliberately no scrollToIndex, here or in the restoration: it arms a
+        // reconcile of the virtualizer's own that keeps re-targeting that
+        // index on every animation frame for seconds afterwards. That is a
+        // second scroll authority outliving the restoration — it lands the row
+        // flush against the top edge, discarding the offset the reader
+        // actually had, which is what made a restored position slip by exactly
+        // one row. The restoration writes scrollTop and nothing else.
+        //
+        // Nor is the viewport moved here: the restoration's first pass, in this
+        // same commit, is what does it. That keeps every move on one code path,
+        // where "a pass that moves nothing is a pass with no successor" can hold.
+      } else {
+        // Shift scrollTop by the amount the container grew so the user's view is stable.
+        el.scrollTop += el.scrollHeight - prevScrollHeightRef.current;
+      }
     } else if (resolved && lastMutation === "ws_append" && phase === "AT_BOTTOM") {
       scrollToBottom(bottomRef, "auto");
       // Not-at-bottom growth of the pending-count badge, and an own-send's
@@ -1190,6 +1512,131 @@ function MessageList({
       prevScrollHeightRef.current = el.scrollHeight;
     }
   }, [messages, lastMutation, resolved, phase]);
+
+  /**
+   * Moves the scrollport, or ends the restoration if it cannot (#675).
+   *
+   * This is what keeps the restoration from ever becoming a stuck owner of the
+   * scrollport. Its passes are driven by commits, and the only thing guaranteed
+   * to produce the next commit is the viewport actually moving — so a pass that
+   * changes nothing is a pass with no successor. Staying armed in that state
+   * means silently undoing every later scroll, the reader's own trip back to
+   * the top sentinel included, which is exactly what it did before this rule.
+   *
+   * Ending early costs a few pixels of accuracy at most: from there the
+   * virtualizer's reading-position adjustment is the correct authority anyway.
+   */
+  const finishRestore = useCallback((restore: NonNullable<typeof prependRestoreRef.current>) => {
+    if (prependRestoreRef.current !== restore) return;
+    prependRestoreRef.current = null;
+    // Handing the scroll position back also hands back the virtualizer's own
+    // resize compensation, which stood down for the duration — and the rows
+    // measured while it was off may have left the reading position stale.
+    // Recomputing it here is one scan of the mounted window, once.
+    const el = listRef.current;
+    if (!el) return;
+    const topmost = computeTopmostVisible(el, messageRefs.current);
+    if (topmost) {
+      currentAnchorRef.current = topmost;
+      anchorStaleRef.current = false;
+    } else {
+      anchorStaleRef.current = true;
+    }
+  }, []);
+
+  const moveOrFinish = useCallback(
+    (el: HTMLDivElement, top: number) => {
+      const restore = prependRestoreRef.current;
+      if (!restore) return;
+      const before = el.scrollTop;
+      el.scrollTop = top;
+      if (el.scrollTop === before) finishRestore(restore);
+    },
+    [finishRestore],
+  );
+
+  /**
+   * PREPEND_RESTORE (#675): puts the reader back on the same message, at the
+   * same offset, once the prepended rows have real heights.
+   *
+   * Declared right after the mutation effect so it runs in the same commit
+   * that armed it, and with no dependency list so it runs again on every
+   * commit while it is armed. Those commits are not a poll: the virtualizer
+   * re-renders when it measures a row and when the scroll offset moves, so
+   * each pass is driven by an actual layout event. Nothing here waits on a
+   * timer, a frame, or a fixed number of retries.
+   *
+   * Every pass re-reads where the anchor row really is and corrects to where it
+   * must be, and it is the only writer while it runs: the virtualizer's own
+   * resize adjustment is switched off for the duration (see the authority table
+   * on prependRestoreRef). The correction is absolute rather than incremental
+   * anyway, so a pass never depends on what the previous one managed to apply.
+   *
+   * It disarms as soon as the anchor is within a pixel of its target — from
+   * there the virtualizer's adjustment is the right authority again, because
+   * every remaining row is measured on the way into the window like any other
+   * scroll. It also ends the moment a pass cannot move the viewport at all: see
+   * moveOrFinish. What each pass decides is prependRestoreStep, which is pure
+   * so that every one of those endings can be exercised directly.
+   *
+   * Cost per pass is two getBoundingClientRect calls, on the scrollport and on
+   * one row — never a scan of the timeline.
+   */
+  useLayoutEffect(() => {
+    const restore = prependRestoreRef.current;
+    if (!restore) return;
+    const el = listRef.current;
+    const activeVirtualizer = virtualizerRef.current;
+    if (!el || !activeVirtualizer) {
+      prependRestoreRef.current = null;
+      return;
+    }
+    restore.passes += 1;
+    if (restore.passes > MAX_PREPEND_RESTORE_PASSES) {
+      // A ceiling, never the expected exit: every branch below either finishes
+      // or moves the viewport, and a move is what produces the next pass.
+      finishRestore(restore);
+      return;
+    }
+    // An explicit "take me to the end" outranks putting a reading position
+    // back: the reader has just said they do not want it any more, and two
+    // writers pulling in opposite directions would leave them at neither end.
+    if (phaseRef.current === "SCROLLING_TO_BOTTOM") {
+      finishRestore(restore);
+      return;
+    }
+    const index = rowIndexRef.current.get(restore.messageId);
+    const node = index === undefined ? null : (messageRefs.current.get(restore.messageId) ?? null);
+    if (node) restore.measured = true;
+    const step = prependRestoreStep({
+      anchorIndex: index,
+      anchorOffsetPx: restore.offsetPx,
+      measuredOffsetPx: node
+        ? node.getBoundingClientRect().top - el.getBoundingClientRect().top
+        : null,
+      modelScrollTopPx:
+        index === undefined
+          ? el.scrollTop
+          : prependScrollTopFor(activeVirtualizer, index, restore.offsetPx),
+      currentScrollTopPx: el.scrollTop,
+      hasBeenMeasured: restore.measured,
+    });
+    if (step.kind === "finish") {
+      if (node) {
+        // On target. The reader is where they were, so that is what the next
+        // prepend — and the anchor captured on leaving the conversation — must
+        // start from; the scroll handler was not allowed to record anything
+        // while this ran.
+        currentAnchorRef.current = { messageId: restore.messageId, offsetPx: restore.offsetPx };
+      }
+      finishRestore(restore);
+      return;
+    }
+    // Either way the viewport is asked to move, which is what makes the next
+    // pass certain — and a move the scrollport cannot take is the end of the
+    // road, which moveOrFinish is what notices.
+    moveOrFinish(el, step.kind === "seek" ? step.scrollTopPx : el.scrollTop + step.deltaPx);
+  });
 
   // IntersectionObserver: fire loadMore when the top sentinel enters the viewport.
   //
@@ -1218,46 +1665,107 @@ function MessageList({
     return () => observer.disconnect();
   }, [hasMore]);
 
-  // Group messages by day for dividers; track same-sender/same-minute for visual grouping.
-  // #492: an "unread-divider" is inserted immediately before firstUnreadMessageId,
-  // once resolution lands AT_FIRST_UNREAD — never persisted, never a message.
-  const withDividers: Array<
-    | { type: "divider"; label: string }
-    | { type: "unread-divider" }
-    | { type: "msg"; message: Message; isGrouped: boolean }
-  > = [];
-  let lastDay = "";
-  let lastSenderId = "";
-  let lastMinute = "";
-  for (const msg of messages) {
-    const day = formatDayLabel(msg.createdAt);
-    if (day !== lastDay) {
-      withDividers.push({ type: "divider", label: day });
-      lastDay = day;
-      lastSenderId = "";
-      lastMinute = "";
-    }
-    if (msg.id === firstUnreadMessageId) {
-      withDividers.push({ type: "unread-divider" });
-    }
-    const minute = formatTime(msg.createdAt);
-    const isGrouped = msg.senderId === lastSenderId && minute === lastMinute;
-    withDividers.push({ type: "msg", message: msg, isGrouped });
-    lastSenderId = msg.senderId;
-    lastMinute = minute;
-  }
-
   const scrollButtonVisible =
     phase === "READING_HISTORY" || phase === "AT_FIRST_UNREAD" || phase === "SCROLLING_TO_BOTTOM";
 
-  return (
+  /**
+   * One row, written once for both paths.
+   *
+   * The virtualized path wraps this in a positioned box and the plain path
+   * does not — nothing else about a row changes, which is the point: a message
+   * must not be able to look or behave differently depending on how many of
+   * them are loaded.
+   */
+  function renderRow(item: TimelineRow) {
+    if (item.type === "divider") {
+      return (
+        <div key={item.key} className="chat-msg-area__day-divider" aria-label={item.label}>
+          {item.label}
+        </div>
+      );
+    }
+    if (item.type === "unread-divider") {
+      return (
+        <div
+          key={item.key}
+          ref={unreadDividerRef}
+          className="chat-msg-area__new-messages-divider"
+          role="separator"
+          aria-label="Novas mensagens"
+        >
+          Novas mensagens
+        </div>
+      );
+    }
+    if (item.message.kind === "system") {
+      // A conversation event is not something a person said, so it never
+      // becomes a MessageBubble: no bubble, no avatar, and none of the
+      // message actions — editing "Fulano saiu do grupo" is not a thing
+      // (issue #527).
+      return (
+        <ConversationSystemMessage
+          key={item.key}
+          message={item.message}
+          scope={systemScope}
+          viewerId={currentUserId}
+        />
+      );
+    }
+    return (
+      <MessageBubble
+        key={item.key}
+        message={item.message}
+        isMine={!!currentUserId && item.message.senderId === currentUserId}
+        isGrouped={item.isGrouped}
+        onToggleReaction={onToggleReaction}
+        onReplyMessage={onReplyMessage}
+        onReferenceMessage={onReferenceMessage}
+        onForwardMessage={onForwardMessage}
+        onToggleFavorite={onToggleFavorite}
+        onReconcileLinkSafety={onReconcileLinkSafety}
+        onEditMessage={onEditMessage}
+        onEditForbidden={onEditForbidden}
+        onDeleteMessage={onDeleteMessage}
+        editDisabled={editDisabledIds.has(item.message.id)}
+        mentionTarget={mentionTarget}
+        presenceTarget={presenceTarget}
+        onTogglePin={onTogglePin}
+        isPinned={pinnedIds?.has(item.message.id) ?? false}
+        recentReactionEmojis={recentReactionEmojis}
+        emojiUsage={emojiUsage}
+        onEmojiToneChange={onEmojiToneChange}
+        currentUserId={currentUserId}
+        reactionMenuVisible={hoveredMessageId === item.message.id}
+        onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
+        pickerOpen={openPickerMessageId === item.message.id}
+        onPickerOpenChange={handlePickerOpenChange}
+        quoteAuthorLabel={
+          item.message.quoted ? quoteAuthorLabel(item.message.quoted, messagesById) : undefined
+        }
+        canJumpToQuote={item.message.quoted ? messagesById.has(item.message.quoted.id) : false}
+        onQuoteJump={handleQuoteJump}
+        onReferenceJump={onReferenceJump}
+        onOpenAuthorDM={onOpenAuthorDM}
+        openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
+        isHighlighted={highlightedMessageId === item.message.id}
+        setMessageRef={setMessageRef}
+      />
+    );
+  }
+
+  const timeline = (
     <div className="chat-msg-area__list-wrap">
       <div
-        ref={listRef}
+        ref={attachListRef}
         className="chat-msg-area__list"
         role="log"
         aria-live="polite"
         aria-label="Mensagens"
+        // #675: where focus goes when the row holding it is unmounted by the
+        // virtualizer. Never in the tab order — only ever focused
+        // programmatically, by the recovery effect above and by a viewer
+        // closing after its trigger has gone.
+        tabIndex={-1}
       >
         {/* #788: the ResizeObserver target — see the tail-lock effect above. */}
         <div ref={contentRef} className="chat-msg-area__list-content">
@@ -1270,76 +1778,29 @@ function MessageList({
               data-testid="load-more-indicator"
             />
           )}
-          {withDividers.map((item, i) =>
-            item.type === "divider" ? (
-              <div key={`d-${i}`} className="chat-msg-area__day-divider" aria-label={item.label}>
-                {item.label}
-              </div>
-            ) : item.type === "unread-divider" ? (
-              <div
-                key="unread-divider"
-                ref={unreadDividerRef}
-                className="chat-msg-area__new-messages-divider"
-                role="separator"
-                aria-label="Novas mensagens"
-              >
-                Novas mensagens
-              </div>
-            ) : item.message.kind === "system" ? (
-              // A conversation event is not something a person said, so it never
-              // becomes a MessageBubble: no bubble, no avatar, and none of the
-              // message actions — editing "Fulano saiu do grupo" is not a thing
-              // (issue #527).
-              <ConversationSystemMessage
-                key={item.message.id}
-                message={item.message}
-                scope={systemScope}
-                viewerId={currentUserId}
-              />
-            ) : (
-              <MessageBubble
-                key={item.message.id}
-                message={item.message}
-                isMine={!!currentUserId && item.message.senderId === currentUserId}
-                isGrouped={item.isGrouped}
-                onToggleReaction={onToggleReaction}
-                onReplyMessage={onReplyMessage}
-                onReferenceMessage={onReferenceMessage}
-                onForwardMessage={onForwardMessage}
-                onToggleFavorite={onToggleFavorite}
-                onReconcileLinkSafety={onReconcileLinkSafety}
-                onEditMessage={onEditMessage}
-                onEditForbidden={onEditForbidden}
-                onDeleteMessage={onDeleteMessage}
-                editDisabled={editDisabledIds.has(item.message.id)}
-                mentionTarget={mentionTarget}
-                presenceTarget={presenceTarget}
-                onTogglePin={onTogglePin}
-                isPinned={pinnedIds?.has(item.message.id) ?? false}
-                recentReactionEmojis={recentReactionEmojis}
-                emojiUsage={emojiUsage}
-                onEmojiToneChange={onEmojiToneChange}
-                currentUserId={currentUserId}
-                reactionMenuVisible={hoveredMessageId === item.message.id}
-                onReactionMenuVisibleChange={handleReactionMenuVisibleChange}
-                pickerOpen={openPickerMessageId === item.message.id}
-                onPickerOpenChange={handlePickerOpenChange}
-                quoteAuthorLabel={
-                  item.message.quoted
-                    ? quoteAuthorLabel(item.message.quoted, messagesById)
-                    : undefined
-                }
-                canJumpToQuote={
-                  item.message.quoted ? messagesById.has(item.message.quoted.id) : false
-                }
-                onQuoteJump={handleQuoteJump}
-                onReferenceJump={onReferenceJump}
-                onOpenAuthorDM={onOpenAuthorDM}
-                openingAuthorDM={openingAuthorDMIds?.has(item.message.senderId) ?? false}
-                isHighlighted={highlightedMessageId === item.message.id}
-                setMessageRef={setMessageRef}
-              />
-            ),
+          {virtualized ? (
+            <div
+              className="chat-msg-area__virtual-canvas"
+              data-testid="chat-virtual-canvas"
+              style={{ height: virtualizer.getTotalSize() }}
+            >
+              {virtualizer.getVirtualItems().map((virtualRow) => (
+                <div
+                  key={virtualRow.key}
+                  data-index={virtualRow.index}
+                  // Reports its real height back, which is what makes variable
+                  // height work: an attachment finishing its layout remeasures
+                  // its own row, and the tail lock above absorbs the shift.
+                  ref={virtualizer.measureElement}
+                  className="chat-msg-area__virtual-row"
+                  style={{ transform: `translateY(${virtualRow.start}px)` }}
+                >
+                  {renderRow(rows[virtualRow.index])}
+                </div>
+              ))}
+            </div>
+          ) : (
+            rows.map(renderRow)
           )}
           <div ref={bottomRef} data-testid="chat-bottom-sentinel" />
         </div>
@@ -1350,6 +1811,19 @@ function MessageList({
         onClick={startScrollToBottom}
       />
     </div>
+  );
+
+  return (
+    // #675: the viewers live above the list, so a lightbox stays open when the
+    // message that opened it is unmounted by the virtualizer, and focus has
+    // somewhere predictable to land when its trigger is gone with it.
+    //
+    // The scroll root goes down the same way: the timeline scrolls in its own
+    // box, so "800px before the viewport" only means anything measured against
+    // that box rather than against the window.
+    <TimelineScrollRootContext.Provider value={scrollRoot}>
+      <AttachmentViewerHost onFocusFallback={focusList}>{timeline}</AttachmentViewerHost>
+    </TimelineScrollRootContext.Provider>
   );
 }
 

@@ -582,18 +582,28 @@ describe("message attachments — image preview and lightbox", () => {
     expect(mockPreview).not.toHaveBeenCalled();
   });
 
-  it("wires a WebP attachment through to the original — there is no server preview for it", async () => {
+  it("leaves a WebP as a shell in the timeline — it has no derived preview, and the card is not worth an original", async () => {
     render(
       <MessageAttachments
         sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
-          imageAttachment({ id: "webp-1", filename: "banner.webp", contentType: "image/webp" }),
+          imageAttachment({
+            id: "webp-1",
+            filename: "banner.webp",
+            contentType: "image/webp",
+            // The case that used to reach for the original: no derived preview
+            // exists for this file at all.
+            previewStatus: "unsupported",
+          }),
         ]}
       />,
     );
 
-    await screen.findByTestId("chat-message-attachment-image-webp-1");
-    expect(mockContent).toHaveBeenCalledWith("webp-1", expect.any(AbortSignal));
+    // The row itself still renders, with its name, size and Baixar action;
+    // issue #675 only removes the original download behind the picture.
+    await screen.findByTestId("chat-message-attachment-webp-1");
+    expect(screen.queryByTestId("chat-message-attachment-image-webp-1")).not.toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
   });
 
   it("groups contiguous images, keeps mixed document order and expands the +N remainder", async () => {

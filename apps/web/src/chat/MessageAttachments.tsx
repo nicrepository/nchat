@@ -23,21 +23,27 @@
  * Images and GIFs (issue #491) are the one exception to "a row per
  * attachment": AttachmentImagePreview draws a large preview above the same
  * name/size/status/Baixar footer every other type shows in its row, and a
- * click on it opens AttachmentLightbox. This component owns the one lightbox
- * that can be open at a time and the focus-return-on-close that goes with it,
- * the same way ConversationDetailsPanel owns focus return for AddMembersDialog
- * — the dialog itself only ever calls onClose.
+ * click on it asks AttachmentViewerHost to open AttachmentLightbox. The viewer
+ * is hosted above the timeline rather than here (issue #675) so it survives the
+ * virtualization unmounting this message underneath it; this component only
+ * ever asks, and the host owns the one viewer that can be open at a time and
+ * the focus return that goes with it.
+ *
+ * Each attachment is also its own lazy-hydration unit (issue #675): far from
+ * the viewport it is a shell with no request behind it, and the gate it
+ * provides is what every renderer below reads before fetching anything.
  */
 
-import { useState } from "react";
+import { useState, type Ref } from "react";
 
 import AttachmentAudio from "./AttachmentAudio";
 import AttachmentDocumentPreview from "./AttachmentDocumentPreview";
 import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
-import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
-import DocumentPreviewViewer from "./DocumentPreviewViewer";
+import AttachmentViewerHost from "./AttachmentViewerHost";
+import { useAttachmentViewer } from "./attachmentViewer";
+import { AttachmentHydrationContext, useLazyAttachment } from "./lazyAttachment";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
 import {
@@ -148,6 +154,11 @@ interface MessageAttachmentProps {
   onOpenDocument: (attachment: ChannelAttachment, trigger: HTMLButtonElement) => void;
 }
 
+interface AttachmentBodyProps extends MessageAttachmentProps {
+  /** The lazy-hydration observer's target — see MessageAttachment below. */
+  rowRef: Ref<HTMLLIElement>;
+}
+
 /**
  * A voice message's compact presentation (issue #670): a player and its scan
  * status, and deliberately nothing else — no filename, so a recording never
@@ -167,8 +178,10 @@ interface MessageAttachmentProps {
 function VoiceMessageAttachment({
   attachment,
   sentAt,
+  rowRef,
 }: {
   attachment: ChannelAttachment;
+  rowRef: Ref<HTMLLIElement>;
   /**
    * When the message was sent. It is what dates the saved file: an attachment
    * of a message has no createdAt of its own — chat-service dates it by the
@@ -187,6 +200,7 @@ function VoiceMessageAttachment({
 
   return (
     <li
+      ref={rowRef}
       className="chat-msg-area__attachment chat-msg-area__attachment--voice"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
@@ -209,14 +223,33 @@ function VoiceMessageAttachment({
   );
 }
 
-function MessageAttachment({
+/**
+ * One attachment, and the lazy-hydration gate that decides when it may fetch
+ * anything (issue #675).
+ *
+ * The gate is provided here rather than passed down: every renderer below —
+ * image preview, document card, thumbnail, video poster — reads it from context
+ * through its own hook, so a new attachment type inherits the policy without
+ * threading a prop through it.
+ */
+function MessageAttachment(props: MessageAttachmentProps) {
+  const { ref, gate } = useLazyAttachment();
+  return (
+    <AttachmentHydrationContext.Provider value={gate}>
+      <AttachmentBody {...props} rowRef={ref} />
+    </AttachmentHydrationContext.Provider>
+  );
+}
+
+function AttachmentBody({
   attachment,
   sentAt,
   onOpenImage,
   onOpenDocument,
-}: MessageAttachmentProps) {
+  rowRef,
+}: AttachmentBodyProps) {
   if (isVoiceMessage(attachment)) {
-    return <VoiceMessageAttachment attachment={attachment} sentAt={sentAt} />;
+    return <VoiceMessageAttachment attachment={attachment} sentAt={sentAt} rowRef={rowRef} />;
   }
   const icon = (
     <span className="chat-msg-area__attachment-icon" aria-hidden="true">
@@ -251,6 +284,7 @@ function MessageAttachment({
   if (isImageAttachment(attachment)) {
     return (
       <li
+        ref={rowRef}
         className="chat-msg-area__attachment"
         data-testid={`chat-message-attachment-${attachment.id}`}
       >
@@ -276,6 +310,7 @@ function MessageAttachment({
   if (isDocumentAttachment(attachment)) {
     return (
       <li
+        ref={rowRef}
         className="chat-msg-area__attachment"
         data-testid={`chat-message-attachment-${attachment.id}`}
       >
@@ -313,6 +348,7 @@ function MessageAttachment({
 
   return (
     <li
+      ref={rowRef}
       className="chat-msg-area__attachment"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
@@ -331,37 +367,32 @@ function MessageAttachment({
   );
 }
 
-interface OpenLightbox {
-  attachment: ChannelAttachment;
-  trigger: HTMLButtonElement;
-  url: string;
-  isOriginal: boolean;
-}
-
-export default function MessageAttachments({
-  attachments,
-  sentAt,
-}: {
+export default function MessageAttachments(props: {
   attachments: ChannelAttachment[] | undefined;
   /** The owning message's ISO timestamp. See VoiceMessageAttachment. */
   sentAt: string;
 }) {
-  const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
-  const [documentViewer, setDocumentViewer] = useState<{
-    attachment: ChannelAttachment;
-    trigger: HTMLButtonElement;
-  } | null>(null);
+  // The host steps aside when the timeline already provides one above the list,
+  // which is what keeps an open viewer alive after virtualization unmounts this
+  // message (issue #675). Rendered on its own, this is still self-sufficient.
+  return (
+    <AttachmentViewerHost>
+      <MessageAttachmentList {...props} />
+    </AttachmentViewerHost>
+  );
+}
+
+function MessageAttachmentList({
+  attachments,
+  sentAt,
+}: {
+  attachments: ChannelAttachment[] | undefined;
+  sentAt: string;
+}) {
+  const viewer = useAttachmentViewer();
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
   if (!attachments || attachments.length === 0) return null;
-
-  function closeLightbox() {
-    // The control that opened it gets focus back on close — this component
-    // owns that button, the same way ConversationDetailsPanel owns it for
-    // AddMembersDialog, so AttachmentLightbox itself never needs to know it.
-    lightbox?.trigger.focus();
-    setLightbox(null);
-  }
 
   const segments: Array<
     | { kind: "images"; attachments: ChannelAttachment[] }
@@ -378,12 +409,9 @@ export default function MessageAttachments({
   }
 
   const openImage = (openedAttachment: ChannelAttachment, payload: AttachmentImageOpenPayload) =>
-    setLightbox({
-      attachment: openedAttachment,
-      trigger: payload.trigger,
-      url: payload.url,
-      isOriginal: payload.isOriginal,
-    });
+    viewer.openImage(openedAttachment, payload);
+  const openDocument = (openedAttachment: ChannelAttachment, trigger: HTMLButtonElement) =>
+    viewer.openDocument(openedAttachment, trigger);
 
   return (
     <>
@@ -396,7 +424,7 @@ export default function MessageAttachments({
                 attachment={segment.attachment}
                 sentAt={sentAt}
                 onOpenImage={openImage}
-                onOpenDocument={(attachment, trigger) => setDocumentViewer({ attachment, trigger })}
+                onOpenDocument={openDocument}
               />
             );
           }
@@ -417,9 +445,7 @@ export default function MessageAttachments({
                     attachment={attachment}
                     sentAt={sentAt}
                     onOpenImage={openImage}
-                    onOpenDocument={(attachment, trigger) =>
-                      setDocumentViewer({ attachment, trigger })
-                    }
+                    onOpenDocument={openDocument}
                   />
                 ))}
               </ul>
@@ -443,23 +469,6 @@ export default function MessageAttachments({
           );
         })}
       </ul>
-      {lightbox && (
-        <AttachmentLightbox
-          attachment={lightbox.attachment}
-          inlineUrl={lightbox.url}
-          inlineIsOriginal={lightbox.isOriginal}
-          onClose={closeLightbox}
-        />
-      )}
-      {documentViewer && (
-        <DocumentPreviewViewer
-          attachment={documentViewer.attachment}
-          onClose={() => {
-            documentViewer.trigger.focus();
-            setDocumentViewer(null);
-          }}
-        />
-      )}
     </>
   );
 }

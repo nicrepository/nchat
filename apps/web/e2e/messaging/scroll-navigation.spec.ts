@@ -43,6 +43,51 @@ import {
  * Adopted via CSSOM rather than an injected <style> so it does not depend on
  * the page's style-src CSP.
  */
+/**
+ * A mensagem montada mais acima na janela.
+ *
+ * Desde a #675 a timeline virtualiza a partir de VIRTUALIZE_MIN_ROWS: uma
+ * mensagem distante simplesmente não existe no DOM, e um seletor por índice
+ * fixo não tem onde injetar o filler. O que a #788 descreve — conteúdo *acima
+ * do leitor* crescendo tarde — é exatamente esta linha, e passou a ser a única
+ * forma desse crescimento tardio ainda acontecer.
+ */
+function mountedMessage(page: Page, position: "first" | "second") {
+  const all = page.locator(".chat-msg-area__list [data-message-id]");
+  return position === "first" ? all.first() : all.nth(1);
+}
+
+/**
+ * Espera a timeline parar de se mexer.
+ *
+ * Duas leituras iguais de (scrollTop, scrollHeight), e não um tempo. As duas
+ * juntas porque cada uma sozinha mente: uma rolagem animada ainda em curso
+ * mantém o scrollTop mudando com a altura parada, e uma linha ainda por medir
+ * muda a altura com o scrollTop parado.
+ *
+ * A rolagem que a roda do mouse produz no Chromium é animada, e dura vários
+ * quadros depois de o evento ser entregue. Medir a posição de leitura no meio
+ * dela registra uma coordenada que a própria animação vai desmentir logo em
+ * seguida — foi exatamente o que produziu uma "deriva" de 147px numa timeline
+ * que não tinha movido o leitor um pixel sequer.
+ */
+async function settledTimeline(page: Page) {
+  let previous = "";
+  await expect
+    .poll(
+      async () => {
+        const now = await page
+          .locator(".chat-msg-area__list")
+          .evaluate((el) => `${Math.round(el.scrollTop)}/${el.scrollHeight}`);
+        const settled = now === previous;
+        previous = now;
+        return settled;
+      },
+      { timeout: 10_000, intervals: [100] },
+    )
+    .toBe(true);
+}
+
 async function disableNativeScrollAnchoring(page: Page) {
   await page.addInitScript(() => {
     const install = () => {
@@ -252,7 +297,7 @@ test.describe("chat scroll navigation (#492)", () => {
     // specific attachment component's internals, because #788 requires the
     // behaviour for ANY variable-height content.
     await page.waitForTimeout(50);
-    await page.locator(`[data-message-id="${targetId}-msg-10"]`).evaluate((el) => {
+    await mountedMessage(page, "first").evaluate((el) => {
       const filler = document.createElement("div");
       filler.style.height = "800px";
       filler.setAttribute("data-testid", "reflow-filler");
@@ -322,7 +367,7 @@ test.describe("chat scroll navigation (#492)", () => {
 
     // Arm the racer: its first (initial) notification is consumed here, two
     // frames before the reflow, so the next one is genuinely the first growth.
-    await page.evaluate((msgId) => {
+    await page.evaluate(() => {
       const content = document.querySelector(".chat-msg-area__list-content") as HTMLElement;
       const w = window as unknown as { __raceArmed?: boolean };
       let seen = 0;
@@ -330,7 +375,9 @@ test.describe("chat scroll navigation (#492)", () => {
         seen++;
         if (seen < 2) return;
         observer.disconnect();
-        const target = document.querySelector(`[data-message-id="${msgId}"]`) as HTMLElement;
+        const target = document.querySelector(
+          ".chat-msg-area__list [data-message-id]",
+        ) as HTMLElement;
         const filler = document.createElement("div");
         filler.style.height = "340px";
         filler.setAttribute("data-testid", "reflow-second");
@@ -338,13 +385,13 @@ test.describe("chat scroll navigation (#492)", () => {
       });
       observer.observe(content);
       w.__raceArmed = true;
-    }, `${targetId}-msg-10`);
+    });
     await page.evaluate(
       () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))),
     );
 
     // First, small reflow — the one the tail-lock corrects programmatically.
-    await page.locator(`[data-message-id="${targetId}-msg-10"]`).evaluate((el) => {
+    await mountedMessage(page, "first").evaluate((el) => {
       const filler = document.createElement("div");
       filler.style.height = "21px";
       filler.setAttribute("data-testid", "reflow-first");
@@ -357,7 +404,7 @@ test.describe("chat scroll navigation (#492)", () => {
 
     // A much larger late reflow — in the DEV capture this was +1628px and was
     // left entirely uncorrected once the tail-lock had been disarmed.
-    await page.locator(`[data-message-id="${targetId}-msg-12"]`).evaluate((el) => {
+    await mountedMessage(page, "second").evaluate((el) => {
       const filler = document.createElement("div");
       filler.style.height = "1628px";
       filler.setAttribute("data-testid", "reflow-large");
@@ -410,20 +457,74 @@ test.describe("chat scroll navigation (#492)", () => {
     await list.hover();
     await page.mouse.wheel(0, -100);
     await expect.poll(scrollTop).toBeLessThan(await list.evaluate((el) => el.scrollHeight));
+    // A roda do Chromium rola de forma animada: sem esperar o fim dela, tudo o
+    // que for medido a seguir descreve um quadro intermediário.
+    await settledTimeline(page);
     const afterWheel = await scrollTop();
     expect(afterWheel).toBeGreaterThan(0);
 
-    // Content above grows well after the reader stopped: the viewport must
-    // stay exactly where they left it.
-    await page.locator(`[data-message-id="${targetId}-msg-10"]`).evaluate((el) => {
+    // Content above grows well after the reader stopped: what they are looking
+    // at must stay exactly where they left it.
+    //
+    // Medido pelo conteúdo, não pelo scrollTop (#675): numa lista onde tudo
+    // está montado, manter o offset e manter o conteúdo são a mesma coisa. Com
+    // virtualização não são — quando uma linha acima da dobra cresce, o
+    // virtualizador soma esse crescimento ao offset justamente para que o
+    // conteúdo não desça. Afirmar o offset velho passaria a afirmar o oposto do
+    // que a #788 protege.
+    const readingBefore = await page.evaluate(() => {
+      const list = document.querySelector(".chat-msg-area__list") as HTMLElement;
+      const top = list.getBoundingClientRect().top;
+      const first = [...list.querySelectorAll<HTMLElement>("[data-message-id]")].find(
+        (element) => element.getBoundingClientRect().bottom > top,
+      );
+      return first
+        ? {
+            id: first.dataset.messageId,
+            offset: Math.round(first.getBoundingClientRect().top - top),
+          }
+        : null;
+    });
+    expect(readingBefore).not.toBeNull();
+
+    const heightBeforeReflow = await list.evaluate((el) => el.scrollHeight);
+    await mountedMessage(page, "first").evaluate((el) => {
       const filler = document.createElement("div");
       filler.style.height = "800px";
       filler.setAttribute("data-testid", "reflow-filler");
       el.appendChild(filler);
     });
-    await page.waitForTimeout(500);
+    // O crescimento foi medido — a linha foi remedida, e não apenas o nó
+    // inserido no DOM — e depois a timeline voltou a ficar parada. Duas
+    // condições observáveis, nenhuma delas um tempo de espera, e nenhuma delas
+    // um número: "cresceu" e "parou de mudar" bastam. O quanto cresceu é
+    // assunto do layout — margens fazem a linha ganhar um pouco menos que a
+    // altura do preenchimento —, e fixar esse valor aqui só criaria um segundo
+    // motivo de falha que não tem nada a ver com a posição de leitura.
+    await expect
+      .poll(() => list.evaluate((el) => el.scrollHeight), { timeout: 10_000 })
+      .toBeGreaterThan(heightBeforeReflow);
+    await settledTimeline(page);
 
-    expect(await scrollTop()).toBe(afterWheel);
-    await expect(page.getByTestId("chat-bottom-sentinel")).not.toBeInViewport();
+    const readingAfter = await page.evaluate((id: string) => {
+      const list = document.querySelector(".chat-msg-area__list") as HTMLElement;
+      const top = list.getBoundingClientRect().top;
+      const target = list.querySelector<HTMLElement>(`[data-message-id="${id}"]`);
+      return target ? Math.round(target.getBoundingClientRect().top - top) : null;
+    }, readingBefore!.id!);
+
+    expect(readingAfter).not.toBeNull();
+    expect(Math.abs(readingAfter! - readingBefore!.offset)).toBeLessThanOrEqual(2);
+
+    // E continuam fora do tail — não foram puxados de volta. Medido pela
+    // distância até o fim, e não pela visibilidade do sentinel: com a
+    // virtualização compensando o crescimento acima da dobra, a distância até o
+    // fim é a mesma que o leitor escolheu com a roda, e essa distância é menor
+    // que uma viewport — o sentinel fica à vista sem que ninguém tenha sido
+    // arrastado para lá.
+    const distanceFromTail = await list.evaluate((el) =>
+      Math.round(el.scrollHeight - el.scrollTop - el.clientHeight),
+    );
+    expect(distanceFromTail).toBeGreaterThan(0);
   });
 });

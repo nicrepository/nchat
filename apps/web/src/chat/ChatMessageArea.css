@@ -290,6 +290,29 @@
   gap: 4px;
 }
 
+/* ── Virtualized timeline (#675) ───────────────────────────────────────────────
+   The canvas is as tall as the whole loaded history so the scrollbar tells the
+   truth, while only the rows near the viewport exist inside it. Each row is
+   positioned by transform rather than `top`: the browser can move a composited
+   layer without reflowing, which is what keeps a fast scroll smooth. */
+
+.chat-msg-area__virtual-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.chat-msg-area__virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  /* The gap the flex column above gives every other row, reproduced here: an
+     absolutely positioned row is outside that flow. */
+  padding-bottom: 4px;
+}
+
 /* ── New-messages separator (#492) ───────────────────────────────────────────── */
 
 .chat-msg-area__new-messages-divider {
@@ -2928,6 +2951,29 @@
   .chat-msg-area__attachment-preview-skeleton {
     animation: none;
   }
+}
+
+/* Video poster (issue #675): the card a clean video shows before anyone presses
+   Play. It reserves the same box the player will occupy, so arming playback
+   never shifts the timeline. */
+.chat-msg-area__attachment-video-poster {
+  all: unset;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: #fff;
+}
+
+.chat-msg-area__attachment-video-poster .material-symbols-outlined {
+  font-size: 56px;
+}
+
+.chat-msg-area__attachment-video-poster:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px;
 }
 
 .chat-msg-area__attachment-gif-toggle {
