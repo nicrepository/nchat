@@ -3198,10 +3198,13 @@ describe("useChatSidebar conversation preferences", () => {
   };
 
   it("mutes a direct conversation optimistically and keeps the other rows alone", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
     const result = await readyHook();
 
-    await act(async () => {
-      await result.current.setMuted({ kind: "dm", targetId: dmC }, true);
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "dm", targetId: dmC }, true);
     });
 
     expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", dmC, true);
@@ -3211,6 +3214,22 @@ describe("useChatSidebar conversation preferences", () => {
     if (result.current.state.status === "ready") {
       expect(result.current.state.channels[0]?.muted).toBeFalsy();
     }
+
+    // The server now holds it, so the refetch that follows a confirmed write
+    // keeps it — the optimistic guess and the canonical answer agree.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [
+        { id: dmC, name: "Juliane", type: "1:1", muted: true },
+        { id: groupD, name: "Squad", type: "group", isGroup: true },
+      ],
+    });
+    persisted.resolve();
+    await act(async () => operation);
+
+    await waitFor(() => expect(dmRow(result, dmC)?.muted).toBe(true));
+    expect(dmRow(result, groupD)?.muted).toBeFalsy();
   });
 
   it("rolls a mute back to what it was when the server refuses", async () => {
@@ -3238,12 +3257,151 @@ describe("useChatSidebar conversation preferences", () => {
     const result = await readyHook();
     expect(dmRow(result, groupD)?.muted).toBe(true);
 
+    // What the server will hold once the DELETE is accepted.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [],
+      dms: [{ id: groupD, name: "Squad", type: "group", isGroup: true, muted: false }],
+    });
     await act(async () => {
       await result.current.setMuted({ kind: "dm", targetId: groupD }, false);
     });
 
     expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", groupD, false);
-    expect(dmRow(result, groupD)?.muted).toBe(false);
+    await waitFor(() => expect(dmRow(result, groupD)?.muted).toBe(false));
+  });
+
+  // ── Mute: reconciliation and one-write-per-conversation (issue #729) ────────
+
+  it("refetches the canonical list once a mute is confirmed", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    // Optimistic while in flight, and no refetch yet: nothing is confirmed.
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+    expect(mockFetchSidebarData.mock.calls.length).toBe(fetchesBefore);
+
+    persisted.resolve();
+    await act(async () => operation);
+
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBefore),
+    );
+  });
+
+  it("does not refetch when the mute is refused", async () => {
+    mockSetConversationMuted.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    await act(async () => {
+      await expect(result.current.setMuted({ kind: "dm", targetId: dmC }, true)).rejects.toThrow(
+        "offline",
+      );
+    });
+
+    expect(mockFetchSidebarData.mock.calls.length).toBe(fetchesBefore);
+    expect(dmRow(result, dmC)?.muted).toBeFalsy();
+  });
+
+  // Two surfaces call this — the sidebar row menu and the notifications settings
+  // page, both mounted together on /profile — so the guard has to live here, not
+  // in either of them. A POST and a DELETE racing on the same mute endpoint have
+  // no ordering guarantee in flight.
+  it("drops a second mute for the same conversation while the first is in flight", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, false);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(1);
+    // The dropped call changed nothing either — the row still shows the write
+    // that is actually on its way to the server.
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+
+    persisted.resolve();
+    await act(async () => first);
+
+    // Once it is finished the conversation is writable again.
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, false);
+    });
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a different conversation be muted while another write is in flight", async () => {
+    const channelWrite = deferredValue<void>();
+    const groupWrite = deferredValue<void>();
+    mockSetConversationMuted
+      .mockReturnValueOnce(channelWrite.promise)
+      .mockReturnValueOnce(groupWrite.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+    act(() => {
+      second = result.current.setMuted({ kind: "dm", targetId: groupD }, true);
+    });
+
+    // The second conversation was never made to wait on the first.
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+    expect(mockSetConversationMuted).toHaveBeenLastCalledWith("dm", groupD, true);
+    expect(dmRow(result, groupD)?.muted).toBe(true);
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+
+    channelWrite.resolve();
+    groupWrite.resolve();
+    await act(async () => {
+      await Promise.all([first, second]);
+    });
+  });
+
+  it("releases the conversation after a refusal so a retry is possible", async () => {
+    mockSetConversationMuted.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(
+        result.current.setMuted({ kind: "channel", targetId: channelA }, true),
+      ).rejects.toThrow("offline");
+    });
+
+    // What the server holds once the retry is accepted.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, muted: true }],
+      dms: [],
+    });
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels[0]?.muted).toBe(true);
+    });
   });
 
   it("pins a direct conversation optimistically, then reconciles with the server", async () => {

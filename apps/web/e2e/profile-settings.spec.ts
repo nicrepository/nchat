@@ -100,7 +100,35 @@ async function mockProfileApi(page: Page, overrides: Partial<MockProfile> = {}) 
   return state;
 }
 
-async function mockChatSidebarApi(page: Page) {
+/** Wire shapes read from chatApi.ts's SidebarChannelResponse / SidebarDMResponse. */
+interface MockSidebarChannel {
+  id: string;
+  slug: string;
+  display_name: string;
+  type: "public" | "private";
+  can_write: boolean;
+  is_general?: boolean;
+  muted?: boolean;
+}
+
+interface MockSidebarDM {
+  id: string;
+  /** The server's own discriminator, exactly as chat.dm_conversations.type spells it. */
+  type: "direct" | "group";
+  name: string;
+  muted?: boolean;
+}
+
+async function mockChatSidebarApi(
+  page: Page,
+  conversations: { channels?: MockSidebarChannel[]; dms?: MockSidebarDM[] } = {},
+) {
+  // Mutable so the refetch that follows a confirmed mute returns what the
+  // server now holds — which is what makes "reload and it is still there" a
+  // real assertion rather than a re-render of the optimistic guess.
+  const channels = conversations.channels ?? [];
+  const dms = conversations.dms ?? [];
+
   await page.route("**/api/chat/sidebar", (route) =>
     route.fulfill({
       status: 200,
@@ -109,8 +137,8 @@ async function mockChatSidebarApi(page: Page) {
         data: {
           current_user_id: CURRENT_USER_ID,
           workspace: { id: "e2e-workspace", name: "E2E", slug: "e2e" },
-          channels: [],
-          dm_conversations: [],
+          channels,
+          dm_conversations: dms,
         },
       }),
     }),
@@ -125,6 +153,61 @@ async function mockChatSidebarApi(page: Page) {
       body: JSON.stringify({ data: { groups: [] } }),
     }),
   );
+
+  return { channels, dms };
+}
+
+interface MuteRequest {
+  method: string;
+  pathname: string;
+}
+
+/**
+ * POST/DELETE /api/chat/{channels|dm}/{id}/mute, per chatApi.ts's
+ * setConversationMuted: no body at all, the actor is the session.
+ *
+ * Writes straight into the same arrays the sidebar route serves, so the refetch
+ * the hook performs after a confirmed write observes the persisted value.
+ */
+async function mockMuteApi(
+  page: Page,
+  store: { channels: MockSidebarChannel[]; dms: MockSidebarDM[] },
+) {
+  const requests: MuteRequest[] = [];
+  let failNext = false;
+
+  const handle = (kind: "channel" | "dm") => async (route: import("@playwright/test").Route) => {
+    const method = route.request().method();
+    const { pathname } = new URL(route.request().url());
+    requests.push({ method, pathname });
+    if (failNext) {
+      failNext = false;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "internal", message: "boom" } }),
+      });
+      return;
+    }
+    const id = decodeURIComponent(pathname.split("/").slice(-2, -1)[0] ?? "");
+    const muted = method === "POST";
+    const row =
+      kind === "channel"
+        ? store.channels.find((channel) => channel.id === id)
+        : store.dms.find((dm) => dm.id === id);
+    if (row) row.muted = muted;
+    await route.fulfill({ status: 204 });
+  };
+
+  await page.route("**/api/chat/channels/*/mute", handle("channel"));
+  await page.route("**/api/chat/dm/*/mute", handle("dm"));
+
+  return {
+    requests,
+    failOnce() {
+      failNext = true;
+    },
+  };
 }
 
 /** Serves any avatar URL this spec mocks with a real, loadable image. */
@@ -347,6 +430,114 @@ test.describe("Profile & account settings (#672)", () => {
     await ringtone.uncheck();
     await expect(ringtone).not.toBeChecked();
     await expect(mentionsOnly).toBeChecked(); // untouched by the ringtone change
+  });
+
+  test("notifications: channels and groups are separate blocks, and a mute is really persisted", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, {
+      channels: [
+        {
+          id: "ch-general",
+          slug: "geral",
+          display_name: "geral",
+          type: "public",
+          can_write: true,
+          is_general: true,
+        },
+        {
+          id: "ch-infra",
+          slug: "infraestrutura",
+          display_name: "infraestrutura",
+          type: "public",
+          can_write: true,
+        },
+      ],
+      dms: [
+        { id: "dm-1on1", type: "direct", name: "Juliane" },
+        { id: "dm-group", type: "group", name: "Squad" },
+      ],
+    });
+    const mute = await mockMuteApi(page, store);
+    await page.goto("/profile/notifications");
+
+    const channelsCard = page.getByRole("region", { name: "Notificações por canal" });
+    const groupsCard = page.getByRole("region", { name: "Notificações por grupos" });
+    const infra = channelsCard.getByRole("checkbox", { name: "Notificações de infraestrutura" });
+    const squad = groupsCard.getByRole("checkbox", { name: "Notificações de Squad" });
+
+    await expect(infra).toBeVisible();
+    await expect(squad).toBeVisible();
+    // A 1:1 conversation is not a group, and is in neither block.
+    await expect(page.getByRole("checkbox", { name: "Notificações de Juliane" })).toHaveCount(0);
+    await expect(groupsCard.getByRole("checkbox")).toHaveCount(1);
+    // The general channel is listed but not silenceable — the server refuses it.
+    await expect(
+      channelsCard.getByRole("checkbox", { name: "Notificações de geral" }),
+    ).toBeDisabled();
+
+    await infra.click();
+    await expect
+      .poll(() => mute.requests)
+      .toContainEqual({ method: "POST", pathname: "/api/chat/channels/ch-infra/mute" });
+
+    await squad.click();
+    await expect
+      .poll(() => mute.requests)
+      .toContainEqual({ method: "POST", pathname: "/api/chat/dm/dm-group/mute" });
+
+    // What comes back from the server after a reload is what is on screen.
+    await page.reload();
+    await expect(infra).not.toBeChecked();
+    await expect(squad).not.toBeChecked();
+
+    await infra.click();
+    await expect
+      .poll(() => mute.requests)
+      .toContainEqual({ method: "DELETE", pathname: "/api/chat/channels/ch-infra/mute" });
+    await page.reload();
+    await expect(infra).toBeChecked();
+    await expect(squad).not.toBeChecked();
+  });
+
+  test("notifications: a refused mute never leaves the switch lying, and can be retried", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, {
+      channels: [
+        {
+          id: "ch-infra",
+          slug: "infraestrutura",
+          display_name: "infraestrutura",
+          type: "public",
+          can_write: true,
+        },
+      ],
+    });
+    const mute = await mockMuteApi(page, store);
+    await page.goto("/profile/notifications");
+
+    const infra = page.getByRole("checkbox", { name: "Notificações de infraestrutura" });
+    await expect(infra).toBeChecked();
+
+    mute.failOnce();
+    await infra.click();
+
+    await expect(page.getByRole("alert")).toContainText(
+      "Não foi possível atualizar as notificações de infraestrutura",
+    );
+    // Rolled back to the persisted value: a refusal must not leave the row
+    // showing something the server never accepted.
+    await expect(infra).toBeChecked();
+
+    await infra.click();
+
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(infra).not.toBeChecked();
+    await page.reload();
+    await expect(
+      page.getByRole("checkbox", { name: "Notificações de infraestrutura" }),
+    ).not.toBeChecked();
   });
 
   test("security: no local password/MFA form exists, and the Keycloak link is present when configured", async ({

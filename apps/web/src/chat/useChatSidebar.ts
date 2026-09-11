@@ -712,27 +712,54 @@ export function useChatSidebar() {
   );
 
   /**
+   * Conversations with a mute write in flight, keyed `kind:targetId`.
+   *
+   * A ref rather than state: nothing renders from it, and it has to be read and
+   * written synchronously inside one call — a state update would land a render
+   * later, which is exactly the window two clicks slip through.
+   */
+  const muteInFlight = useRef<Set<string>>(new Set());
+
+  /**
    * Silences or restores one conversation for this user only (issue #527).
    *
    * Optimistic like the pin, and for the same reason: it is a private
    * preference the server either accepts or refuses outright, so showing the
    * new state immediately and rolling back on failure is honest. The refetch
-   * after a confirmed write reconciles with what was actually persisted.
+   * after a confirmed write reconciles with what was actually persisted —
+   * without it the optimistic guess would be the last word, which is what the
+   * comment above this function already claimed and the code did not do.
+   *
+   * One write per conversation at a time (issue #729). Two surfaces reach this
+   * same function — the sidebar row menu and the notifications settings page,
+   * both mounted together on /profile — so a per-target guard here is what
+   * makes the property hold wherever the click came from, rather than each
+   * surface policing only itself. A second call for a conversation already
+   * being written is dropped, not queued: POST and DELETE to the same mute
+   * endpoint have no ordering guarantee in flight, and the refetch that follows
+   * the first one converges the row with the server anyway. Different
+   * conversations are independent and never wait on each other.
    */
   const setMuted = useCallback(
     async (target: WSSubscriptionTarget, muted: boolean) => {
       if (state.status !== "ready") return;
+      const key = `${target.kind}:${target.targetId}`;
+      if (muteInFlight.current.has(key)) return;
       const items = target.kind === "channel" ? state.channels : state.dms;
       const previous = Boolean(items.find((item) => item.id === target.targetId)?.muted);
+      muteInFlight.current.add(key);
       dispatch({ type: "mute_changed", target, muted });
       try {
         await setConversationMuted(target.kind, target.targetId, muted);
+        refreshSidebar();
       } catch (error) {
         dispatch({ type: "mute_changed", target, muted: previous });
         throw error;
+      } finally {
+        muteInFlight.current.delete(key);
       }
     },
-    [state],
+    [refreshSidebar, state],
   );
 
   /**

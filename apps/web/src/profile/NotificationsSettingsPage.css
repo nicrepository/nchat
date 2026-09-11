@@ -1,100 +1,361 @@
+/*
+ * NotificationsSettingsPage — /profile/notifications (issue #729).
+ *
+ * No width of its own: ProfileSettingsShell already centres the settings column
+ * at 1000px and the tab bar shares that calha. A second `max-width` here is what
+ * made the page a narrow strip under a wide tab bar, which is the misalignment
+ * the issue describes.
+ *
+ * Colours come from the shell's scoped tokens (AppShell.css), which is also why
+ * there is no `prefers-color-scheme` block: the theme is the product's, not the
+ * operating system's.
+ */
+
 .notifications-settings {
-  max-width: 640px;
-  margin: 0 auto;
-  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .notifications-settings__header {
-  margin-bottom: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .notifications-settings__title {
-  font-size: 22px;
+  margin: 0;
+  font-size: 20px;
   font-weight: 700;
-  margin: 0 0 8px;
+  color: var(--color-ink, #16121f);
 }
 
 .notifications-settings__description {
-  font-size: 14px;
-  color: #6b7280;
   margin: 0;
+  font-size: 14px;
+  color: var(--color-muted, #7c7390);
 }
 
-.notifications-settings__sound-modes {
+/* ── Card ──────────────────────────────────────────────────────────────────── */
+
+.notifications-settings__card {
+  background: var(--color-surface, #ffffff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  overflow: hidden;
+}
+
+.notifications-settings__card-head {
+  padding: 14px 20px;
+  background: var(--color-surface-2, #faf8fd);
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.notifications-settings__card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+}
+
+.notifications-settings__card-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  border: 0;
-  padding: 0;
-  margin: 0 0 20px;
-  padding: 24px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 12px;
+  padding: 4px 20px 16px;
 }
 
-.notifications-settings__sound-modes-legend {
-  font-size: 14px;
-  font-weight: 600;
-  padding: 0;
-  margin-bottom: 4px;
-}
+/* ── Row ───────────────────────────────────────────────────────────────────── */
 
-.notifications-settings__checkbox-row {
+.notifications-settings__row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 14px;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 44px;
+  padding: 12px 0;
   cursor: pointer;
 }
 
-.notifications-settings__browser-notifications {
-  margin-bottom: 20px;
-  padding: 24px;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 12px;
+/* The permission block is a status plus an action, not a labelled control, so it
+   is not a pointer target and its button may wrap below the text on a phone. */
+.notifications-settings__row--stacked {
+  flex-wrap: wrap;
+  cursor: auto;
 }
 
-.notifications-settings__browser-notifications-status {
+/* Dividers between consecutive rows only — never above the first one, and never
+   under the last, so the card body keeps its own padding as the outer edge. */
+.notifications-settings__row + .notifications-settings__row,
+.notifications-settings__row + .notifications-settings__fieldset,
+.notifications-settings__fieldset + .notifications-settings__row,
+.notifications-settings__fieldset + .notifications-settings__field,
+.notifications-settings__field + .notifications-settings__actions {
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.notifications-settings__row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.notifications-settings__row-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow-wrap: anywhere;
+}
+
+.notifications-settings__row-sub {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-muted, #7c7390);
+  overflow-wrap: anywhere;
+}
+
+.notifications-settings__hint {
+  margin: 12px 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-muted, #7c7390);
+}
+
+.notifications-settings__error {
   margin: 0 0 12px;
-  font-size: 14px;
+  font-size: 13px;
+  color: var(--color-danger, #dc2626);
 }
 
-.notifications-settings__browser-notifications-button {
-  padding: 8px 16px;
-  border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  background: #fff;
-  font-size: 14px;
-  cursor: pointer;
-  margin-bottom: 12px;
+.notifications-settings__retry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding-bottom: 12px;
 }
-.notifications-settings__browser-notifications-button:disabled {
-  opacity: 0.5;
+
+/* ── Switch (real booleans only) ───────────────────────────────────────────── */
+
+.notifications-settings__switch {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: 44px;
+  height: 24px;
+}
+
+.notifications-settings__switch input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.notifications-settings__switch-track {
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--color-border-strong, #d4cde3);
+  transition: background 0.15s ease;
+}
+
+.notifications-settings__switch-track::after {
+  content: "";
+  display: block;
+  width: 18px;
+  height: 18px;
+  margin: 3px;
+  border-radius: 50%;
+  background: var(--color-surface, #ffffff);
+  box-shadow: 0 1px 2px rgba(22, 18, 31, 0.25);
+  transition: transform 0.15s ease;
+}
+
+.notifications-settings__switch input:checked + .notifications-settings__switch-track {
+  background: var(--color-primary, #6d28d9);
+}
+
+.notifications-settings__switch input:checked + .notifications-settings__switch-track::after {
+  transform: translateX(20px);
+}
+
+.notifications-settings__switch input:focus-visible + .notifications-settings__switch-track {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.notifications-settings__switch input:disabled {
   cursor: not-allowed;
 }
 
-.notifications-settings__browser-notifications-help {
-  margin: 12px 0 0;
-  padding-left: 20px;
-  font-size: 14px;
-  line-height: 1.6;
+.notifications-settings__switch input:disabled + .notifications-settings__switch-track {
+  opacity: 0.45;
 }
 
-.notifications-settings__browser-notifications-help li {
+/* ── Choice groups (enums stay radios) ─────────────────────────────────────── */
+
+.notifications-settings__fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 12px 0;
+  border: 0;
+}
+
+.notifications-settings__fieldset:disabled .notifications-settings__choice {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.notifications-settings__legend {
+  display: block;
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+}
+
+.notifications-settings__choices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.notifications-settings__choices--inline {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.notifications-settings__choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  font-size: 14px;
+  color: var(--color-ink, #16121f);
+  cursor: pointer;
+}
+
+.notifications-settings__choice input {
+  accent-color: var(--color-primary, #6d28d9);
+  margin: 0;
+}
+
+.notifications-settings__choice:has(input:checked) {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+.notifications-settings__choice:has(input:focus-visible) {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* ── Digest fields ─────────────────────────────────────────────────────────── */
+
+.notifications-settings__field {
+  display: flex;
+  flex-direction: column;
+  padding: 12px 0;
+}
+
+.notifications-settings__time {
+  width: 160px;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  font-size: 14px;
+  color: var(--color-ink, #16121f);
+}
+
+.notifications-settings__time:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────────── */
+
+.notifications-settings__actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 12px;
+}
+
+.notifications-settings__button {
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  cursor: pointer;
+}
+
+.notifications-settings__button:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.notifications-settings__button--primary {
+  border-color: var(--color-primary, #6d28d9);
+  background: var(--color-primary, #6d28d9);
+  color: #ffffff;
+}
+
+.notifications-settings__button--primary:hover:not(:disabled) {
+  background: var(--color-primary-strong, #5b21b6);
+}
+
+.notifications-settings__button:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.notifications-settings__button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.notifications-settings__help {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-ink-2, #3d3550);
+}
+
+.notifications-settings__help li {
   margin-bottom: 6px;
 }
 
-@media (prefers-color-scheme: dark) {
-  .notifications-settings__sound-modes,
-  .notifications-settings__browser-notifications {
-    border-color: rgba(255, 255, 255, 0.12);
+/* Phone: one column throughout, and the switch stays on the same line as its
+   label — it is 44px wide, so wrapping it would cost more than it saves. */
+@media (max-width: 767.98px) {
+  .notifications-settings__card-body {
+    padding: 4px 16px 16px;
   }
-  .notifications-settings__description {
-    color: #d1d5db;
+
+  .notifications-settings__choices--inline {
+    flex-direction: column;
   }
-  .notifications-settings__browser-notifications-button {
-    background: transparent;
-    border-color: rgba(255, 255, 255, 0.2);
-    color: inherit;
+
+  .notifications-settings__actions {
+    justify-content: stretch;
+  }
+
+  .notifications-settings__actions .notifications-settings__button {
+    width: 100%;
   }
 }
