@@ -222,6 +222,11 @@ type CreateChannelMessageInput struct {
 	// and supplied by the client through the Idempotency-Key header — the same
 	// contract forwarding already uses.
 	IdempotencyKey string
+	// Priority is the author's stated message priority (issue #821). Empty means
+	// standard, so a client written before this field existed is not made to
+	// spell out the default; anything outside the three declared values is
+	// refused rather than quietly demoted.
+	Priority domain.MessagePriority
 }
 
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
@@ -242,6 +247,9 @@ type CreateDMMessageInput struct {
 	// IdempotencyKey makes a retried send return the original message, exactly as
 	// on the channel path.
 	IdempotencyKey string
+	// Priority is the author's stated message priority, on the same terms as the
+	// channel path's (issue #821).
+	Priority domain.MessagePriority
 }
 
 type ForwardChannelMessageInput struct {
@@ -442,6 +450,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		WorkspaceID: workspaceID, TargetID: input.ChannelID, TargetField: "channel_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
+		Priority: input.Priority,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -461,7 +470,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	// broadcast — the publish below is reached only by a message that committed.
 	// Idempotency first, before anything external: a retry asks for the message
 	// that already exists, not for a second one.
-	replayInput := channelReplayInput(workspaceID, channelID, senderID, body, bodyFormat, attachmentIDs, input)
+	replayInput := channelReplayInput(workspaceID, request, input)
 	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
 		return existing, err
 	}
@@ -504,6 +513,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		MentionedChannelIDs:    mentionedChannelIDs,
 		AttachmentIDs:          attachmentIDs,
 		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
+		Priority:               request.Priority,
 	}, links, body, replayInput, "create channel message")
 	if err != nil {
 		return domain.Message{}, err
@@ -532,6 +542,7 @@ type createRequestInput struct {
 	BodyText      string
 	BodyFormat    domain.MessageBodyFormat
 	AttachmentIDs []string
+	Priority      domain.MessagePriority
 }
 
 // createRequest is the same send after normalisation: trimmed, bounded, and with
@@ -542,6 +553,7 @@ type createRequest struct {
 	Body          string
 	BodyFormat    domain.MessageBodyFormat
 	AttachmentIDs []string
+	Priority      domain.MessagePriority
 }
 
 // normalizeCreateRequest applies the rules that hold for any send, before
@@ -572,7 +584,14 @@ func normalizeCreateRequest(input createRequestInput, maxAttachments int) (creat
 	if err != nil {
 		return createRequest{}, err
 	}
-	request.AttachmentIDs, request.BodyFormat = attachmentIDs, bodyFormat
+	// The domain owns which priorities exist; this is the one call that applies
+	// that rule to a send, for both targets, before anything is authorized or
+	// written (issue #821).
+	priority, err := domain.NormalizeMessagePriority(input.Priority)
+	if err != nil {
+		return createRequest{}, err
+	}
+	request.AttachmentIDs, request.BodyFormat, request.Priority = attachmentIDs, bodyFormat, priority
 	return request, nil
 }
 
@@ -791,6 +810,11 @@ type createIdentity struct {
 	ForwardedFromID     string
 	ReferencedMessageID string
 	AttachmentIDs       []string
+	// Priority is part of the identity because it changes what gets written
+	// (issue #821). Without it a key reused for the same body at a different
+	// priority would replay as the original — the one case where a caller asked
+	// for something different and would be told nothing.
+	Priority domain.MessagePriority
 }
 
 // createIdentityVersion tags the fingerprint's construction, so adding a field
@@ -799,33 +823,63 @@ type createIdentity struct {
 const createIdentityVersion = "create.v1"
 const orderedAttachmentIdentityVersion = "create.v2"
 
+// priorityIdentityVersion tags a send that states a non-default priority
+// (issue #821).
+//
+// Only such a send uses it. A standard-priority message — every message any
+// released client can produce — hashes exactly as it did before this field
+// existed, so keys already in flight when this ships still replay instead of
+// becoming conflicts. The version is what keeps that compatibility honest: a
+// v1 fingerprint now provably means "standard", because anything else is v3.
+const priorityIdentityVersion = "create.v3"
+
 // fingerprint serialises the identity deterministically.
 //
 // Length-prefixed rather than delimited, so no combination of fields can be
 // confused with a different one by concatenation — ("ab","c") and ("a","bc")
 // must not hash alike. Zero and one attachment retain create.v1 compatibility;
 // a multi-attachment message uses create.v2 and preserves order because that
-// order is rendered to every recipient. Everything else is taken in a fixed order.
+// order is rendered to every recipient; a send that states a non-default
+// priority uses create.v3 and appends it. Everything else is taken in a fixed
+// order.
 func (i createIdentity) fingerprint() string {
-	attachments := i.AttachmentIDs
-	version := createIdentityVersion
-	if len(attachments) > 1 {
-		version = orderedAttachmentIdentityVersion
-	}
-
-	digest := sha256.New()
-	for _, field := range []string{
-		version,
+	fields := []string{
+		i.version(),
 		i.DestinationType, i.DestinationID,
 		i.BodyText, i.BodyFormat,
 		i.ParentMessageID, i.ForwardedFromID, i.ReferencedMessageID,
-	} {
+	}
+	if i.statesPriority() {
+		fields = append(fields, string(i.Priority))
+	}
+	fields = append(fields, i.AttachmentIDs...)
+
+	digest := sha256.New()
+	for _, field := range fields {
 		writeFingerprintField(digest, field)
 	}
-	for _, attachment := range attachments {
-		writeFingerprintField(digest, attachment)
-	}
 	return hex.EncodeToString(digest.Sum(nil))
+}
+
+// statesPriority reports whether this send asked for something other than the
+// default. A standard or omitted priority states nothing, which is what keeps
+// its fingerprint identical to one recorded before the field existed.
+func (i createIdentity) statesPriority() bool {
+	return i.Priority != "" && i.Priority != domain.MessagePriorityStandard
+}
+
+// version names the construction this identity is hashed under, most specific
+// first. v3 implies v2's ordered attachments: it appends a field the earlier
+// versions do not have, so it already describes a distinct serialisation.
+func (i createIdentity) version() string {
+	switch {
+	case i.statesPriority():
+		return priorityIdentityVersion
+	case len(i.AttachmentIDs) > 1:
+		return orderedAttachmentIdentityVersion
+	default:
+		return createIdentityVersion
+	}
 }
 
 // persistMessage writes the message and resolves a concurrent replay.
@@ -866,20 +920,19 @@ func (s *MessageService) persistMessage(
 // that changes what gets written are, so a key reused for a different send is a
 // conflict rather than a replay of something the caller did not ask for.
 func channelReplayInput(
-	workspaceID, channelID, senderID, body string,
-	bodyFormat domain.MessageBodyFormat, attachmentIDs []string,
-	input CreateChannelMessageInput,
+	workspaceID string, request createRequest, input CreateChannelMessageInput,
 ) storage.CreateReplayInput {
 	return storage.CreateReplayInput{
-		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
+		WorkspaceID: workspaceID, ChannelID: request.TargetID, SenderID: request.SenderID,
 		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
 		RequestFingerprint: createIdentity{
-			DestinationType: "channel", DestinationID: channelID,
-			BodyText: body, BodyFormat: string(bodyFormat),
+			DestinationType: "channel", DestinationID: request.TargetID,
+			BodyText: request.Body, BodyFormat: string(request.BodyFormat),
 			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
 			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
 			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
-			AttachmentIDs:       attachmentIDs,
+			AttachmentIDs:       request.AttachmentIDs,
+			Priority:            request.Priority,
 		}.fingerprint(),
 	}
 }
@@ -888,20 +941,19 @@ func channelReplayInput(
 // generalised: the two carry different destination fields and different input
 // types, and collapsing them would mean a shape that is neither.
 func dmReplayInput(
-	workspaceID, conversationID, senderID, body string,
-	bodyFormat domain.MessageBodyFormat, attachmentIDs []string,
-	input CreateDMMessageInput,
+	workspaceID string, request createRequest, input CreateDMMessageInput,
 ) storage.CreateReplayInput {
 	return storage.CreateReplayInput{
-		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
+		WorkspaceID: workspaceID, DMConversationID: request.TargetID, SenderID: request.SenderID,
 		IdempotencyKey: strings.TrimSpace(input.IdempotencyKey),
 		RequestFingerprint: createIdentity{
-			DestinationType: "dm", DestinationID: conversationID,
-			BodyText: body, BodyFormat: string(bodyFormat),
+			DestinationType: "dm", DestinationID: request.TargetID,
+			BodyText: request.Body, BodyFormat: string(request.BodyFormat),
 			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
 			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
 			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
-			AttachmentIDs:       attachmentIDs,
+			AttachmentIDs:       request.AttachmentIDs,
+			Priority:            request.Priority,
 		}.fingerprint(),
 	}
 }
@@ -1090,6 +1142,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		WorkspaceID: workspaceID, TargetID: input.ConversationID, TargetField: "conversation_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
+		Priority: input.Priority,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -1107,7 +1160,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	// RF-21, on the same terms as the channel path: after authorization, before
 	// persistence. A DM is the likelier phishing vector of the two, not the
 	// lesser one.
-	replayInput := dmReplayInput(workspaceID, conversationID, senderID, body, bodyFormat, attachmentIDs, input)
+	replayInput := dmReplayInput(workspaceID, request, input)
 	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
 		return existing, err
 	}
@@ -1186,6 +1239,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		MentionAllGroupMembers: mentions.AllMention,
 		AttachmentIDs:          attachmentIDs,
 		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
+		Priority:               request.Priority,
 	}, links, body, replayInput, "create dm message")
 	if err != nil {
 		return domain.Message{}, err

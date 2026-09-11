@@ -1086,3 +1086,59 @@ func TestChatMigration_NotificationOutboxConstraintsAreValidated(t *testing.T) {
 		t.Error("the validate migration must be reversible to NOT VALID")
 	}
 }
+
+// Issue #821. The priority column is the message's own axis, and this pins the
+// three properties that make it safe to add to a table that grows forever: a
+// default that makes every pre-existing row meaningful, a bound the database
+// enforces itself, and no scan during the deploy.
+func TestChatMigration_MessagePriorityDefaultsAndBounds(t *testing.T) {
+	up := readChatMigration(t, "000047_message_priority.up.sql")
+	for _, expected := range []string{
+		// NOT NULL DEFAULT is what turns every message written before this
+		// column into a standard one without a backfill.
+		"ADD COLUMN priority TEXT NOT NULL DEFAULT 'standard'",
+		// Exactly the three the domain declares — no more, no fewer.
+		"CHECK (priority IN ('standard', 'important', 'urgent'))",
+		// The deploy must not scan chat.messages under ACCESS EXCLUSIVE.
+		"NOT VALID",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000047 missing %q", expected)
+		}
+	}
+	// No backfill: the column default is the backfill. An UPDATE over
+	// chat.messages is exactly the long-running write this design avoids.
+	if strings.Contains(up, "UPDATE chat.messages") {
+		t.Error("000047 must not rewrite chat.messages; the column default covers existing rows")
+	}
+
+	down := readChatMigration(t, "000047_message_priority.down.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT IF EXISTS messages_priority_check",
+		"DROP COLUMN IF EXISTS priority",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("000047 down missing %q", expected)
+		}
+	}
+}
+
+// The constraint 000047 leaves NOT VALID is validated by 000048, and 000048's
+// down puts it back. A constraint that stayed NOT VALID would enforce new rows
+// but let the planner ignore it, and nothing would ever say so.
+func TestChatMigration_MessagePriorityCheckIsValidated(t *testing.T) {
+	validate := readChatMigration(t, "000048_validate_message_priority_check.up.sql")
+	if !strings.Contains(validate, "VALIDATE CONSTRAINT messages_priority_check") {
+		t.Error("000048 does not validate messages_priority_check")
+	}
+	down := readChatMigration(t, "000048_validate_message_priority_check.down.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT messages_priority_check",
+		"CHECK (priority IN ('standard', 'important', 'urgent'))",
+		"NOT VALID",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("000048 down missing %q", expected)
+		}
+	}
+}

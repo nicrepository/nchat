@@ -123,6 +123,12 @@ type CreateMessageInput struct {
 	// path already excludes, so it is withheld from everyone until the worker
 	// promotes it. The service decides this; a client cannot ask for a status.
 	Status domain.MessageStatus
+	// Priority is the author's stated message priority (issue #821), already
+	// normalized and validated by the service. Empty means standard — see
+	// normalizeCreateMessageInput — so an internal caller that never saw a
+	// request still writes a value the CHECK constraint accepts.
+	Priority domain.MessagePriority
+
 	// LinkSafetyState is derived by the service from the same verdict snapshot as
 	// Status. Empty is correct for linkless and withheld messages; a cached-safe
 	// active message must carry safe immediately.
@@ -598,7 +604,8 @@ func messageColumns(alias string) string {
 	` + p + `created_at, ` + p + `updated_at,
 	` + p + `link_safety_state,
 	COALESCE(` + p + `event_type, ''),
-	COALESCE(` + p + `event_payload, '{}'::jsonb)`
+	COALESCE(` + p + `event_payload, '{}'::jsonb),
+	` + p + `priority`
 }
 
 // listMessageColumns returns messageColumns plus sender display info from
@@ -667,6 +674,7 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&msg.CreatedAt, &msg.UpdatedAt,
 		(*string)(&msg.LinkSafety),
 		&msg.EventType, &eventPayload,
+		(*string)(&msg.Priority),
 		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
@@ -1013,10 +1021,10 @@ var createMessageQuery = `
 				 parent_message_id, forwarded_from_message_id, referenced_message_id,
 				 create_idempotency_key, create_request_fingerprint, link_safety_state,
 				 link_safety_fingerprint,
-				 link_safety_projection_version)
+				 link_safety_projection_version, priority)
 			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
 			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), $19::text,
-			       NULLIF($17, ''), 1
+			       NULLIF($17, ''), 1, $23::text
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -1054,7 +1062,8 @@ var createMessageQuery = `
 			          -- system message is written by its own event path. The columns
 			          -- are still projected because the outer SELECT reads this CTE
 			          -- through messageColumns, which names them (issue #527).
-			          event_type, event_payload
+			          event_type, event_payload,
+			          priority
 		),
 		-- Who this message notifies (issue #741).
 		--
@@ -1266,19 +1275,24 @@ func normalizeCreateMessageInput(input CreateMessageInput) CreateMessageInput {
 		input.MaxAttachmentBytes = domain.DefaultMaxMessageAttachmentBytes
 	}
 	input.Status = messageStatusOrActive(input.Status)
+	input.Priority = input.Priority.OrStandard()
 	return input
 }
 
 // createMessageArgs is the bind order of createMessageQuery, fixed and stated
-// once. The query numbers its parameters up to $22 and reads several of them
+// once. The query numbers its parameters up to $23 and reads several of them
 // from more than one CTE, so the order is a contract between two things that sit
 // hundreds of lines apart; keeping it beside neither of them, in a function that
 // does nothing else, is what makes it checkable at a glance.
 //
 // $21 and $22 are issue #776's: whether this body carries an @all the service
 // already authorized for a group DM, and the bound that @all's fan-out may not
-// exceed. They are last because they were added last; the query reads them only
-// from the eligible_all_mention_recipients and invalid_all_mention_fanout CTEs.
+// exceed. The query reads them only from the eligible_all_mention_recipients and
+// invalid_all_mention_fanout CTEs.
+//
+// $23 is issue #821's message priority, read only by the INSERT. New parameters
+// are appended rather than inserted in a place that reads better: renumbering
+// would silently re-point every other parameter in a four-hundred-line query.
 func createMessageArgs(input CreateMessageInput) []any {
 	return []any{
 		input.WorkspaceID,
@@ -1303,6 +1317,7 @@ func createMessageArgs(input CreateMessageInput) []any {
 		input.MaxAttachmentBytes,
 		input.MentionAllGroupMembers,
 		domain.MaxGroupAllMentionRecipients,
+		string(input.Priority),
 	}
 }
 
@@ -1499,6 +1514,12 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          -- are still projected because the outer SELECT reads this CTE
 			          -- through messageColumns, which names them (issue #527).
 			          event_type, event_payload,
+			          -- Never copied from the source: a forward is a new message
+			          -- sent by a different author, so it takes the column default
+			          -- ('standard') rather than inheriting somebody else's claim.
+			          -- Carrying 'urgent' across would make forwarding a way to
+			          -- re-escalate a message its own author never escalated.
+			          priority,
 			          (xmax <> 0) AS replayed
 		),
 		-- RF-21, same atomicity argument as CreateMessage's: the withheld
@@ -2629,6 +2650,7 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.CreatedAt, &msg.UpdatedAt,
 			(*string)(&msg.LinkSafety),
 			&msg.EventType, &eventPayload,
+			(*string)(&msg.Priority),
 		}
 		if withSender {
 			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL, &msg.IsFavorited)

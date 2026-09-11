@@ -283,6 +283,17 @@ type MessagePayload struct {
 	BodyText        string `json:"body_text"`
 	BodyFormat      string `json:"body_format"`
 	Status          string `json:"status"`
+	// Priority is the author's stated message priority (issue #821): standard,
+	// important or urgent, mirroring the HTTP message contract's field of the
+	// same name.
+	//
+	// It is carried here because this payload is what a delivery decision is
+	// made from — RecipientPolicy.PolicyFor receives the whole MessagePayload —
+	// so a policy that later wants to weigh priority reads it from the event it
+	// already has, with no second contract and no lookup. Carrying the fact is
+	// not taking the decision: nothing in this package alerts, sounds or pushes
+	// because of this field.
+	Priority string `json:"priority"`
 	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
 	// A subscriber uses it to decide whether to draw the "could not verify this
 	// link" notice on a message it is inserting. It authorises nothing — see

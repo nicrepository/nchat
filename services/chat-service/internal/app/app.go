@@ -913,6 +913,7 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		BodyText:           body,
 		BodyFormat:         string(msg.BodyFormat),
 		Status:             string(msg.Status),
+		Priority:           string(msg.Priority.OrStandard()),
 		LinkSafetyState:    string(msg.LinkSafety),
 		IsRemoved:          removed,
 		CreatedAt:          msg.CreatedAt,

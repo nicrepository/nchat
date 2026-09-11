@@ -72,6 +72,9 @@ func messageCols() []string {
 		// The structured conversation event (issue #527). Non-null only on
 		// kind='system' rows, which the database enforces.
 		"event_type", "event_payload",
+		// The author's stated priority (issue #821). NOT NULL DEFAULT 'standard',
+		// so every row has one including every row written before the column did.
+		"priority",
 	}
 }
 
@@ -89,6 +92,8 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		"",
 		// A user message carries no conversation event.
 		"", []byte(nil),
+		// The priority almost every message carries.
+		"standard",
 	}
 }
 
@@ -168,6 +173,7 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // aggregate attachment byte limit
 			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
 			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
 		).
 		WillReturnRows(rows)
 }
@@ -236,6 +242,7 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(),
 					pgxmock.AnyArg(), // mention_all_group_members (issue #776)
 					pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+					pgxmock.AnyArg(), // priority (issue #821)
 				).
 				WillReturnError(dbErr)
 
@@ -584,7 +591,8 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(),  // mention_all_group_members (issue #776)
-					pgxmock.AnyArg()). // max_group_all_mention_recipients (issue #776 SR-002)
+					pgxmock.AnyArg(),  // max_group_all_mention_recipients (issue #776 SR-002)
+					pgxmock.AnyArg()). // priority (issue #821)
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -610,6 +618,7 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
 			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -656,6 +665,7 @@ func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			true,                                // mention_all_group_members
 			domain.MaxGroupAllMentionRecipients, // the bound, never a literal in SQL
+			pgxmock.AnyArg(),                    // priority (issue #821)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-bounded", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -684,6 +694,7 @@ func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOu
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			false,            // mention_all_group_members: not set by this input (issue #776)
 			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -712,6 +723,7 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
 			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -915,6 +927,7 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
+		"standard",
 		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)
@@ -1529,6 +1542,7 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
+		"standard",
 		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)

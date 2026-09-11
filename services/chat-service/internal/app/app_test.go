@@ -1179,3 +1179,51 @@ func (stubLinkStore) RefreshMessageLinkSafety(
 ) ([]storage.MessageLinkSafetyChange, error) {
 	return nil, nil
 }
+
+// Issue #821. message.created carries the message's priority, because that
+// payload is what a delivery decision is made from — RecipientPolicy.PolicyFor
+// receives the whole MessagePayload — so a policy that later weighs priority
+// reads it from the event it already has, with no second contract.
+func TestDomainMessageToWSPayloadCarriesPriority(t *testing.T) {
+	for _, priority := range []domain.MessagePriority{
+		domain.MessagePriorityStandard,
+		domain.MessagePriorityImportant,
+		domain.MessagePriorityUrgent,
+	} {
+		t.Run(string(priority), func(t *testing.T) {
+			got := domainMessageToWSPayload(domain.Message{
+				ID: "message-1", WorkspaceID: "workspace-1", ChannelID: "channel-1",
+				SenderID: "user-1", BodyText: "hello", Priority: priority,
+			})
+			if got.Priority != string(priority) {
+				t.Fatalf("payload priority = %q, want %q", got.Priority, priority)
+			}
+		})
+	}
+}
+
+// A Message built by a projection that does not carry the column still puts a
+// real priority on the socket. The default is the one that claims nothing, so a
+// missing value can never read as an escalation.
+func TestDomainMessageToWSPayloadDefaultsMissingPriorityToStandard(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{ID: "message-1", SenderID: "user-1"})
+	if got.Priority != string(domain.MessagePriorityStandard) {
+		t.Fatalf("payload priority = %q, want standard", got.Priority)
+	}
+}
+
+// Deleting a message does not change what it asked for. The removal path blanks
+// the body, the quote and the attachments — priority is not content, and is not
+// among them.
+func TestDomainMessageToWSPayloadKeepsPriorityOnARemovedMessage(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", SenderID: "user-1", BodyText: "hello",
+		Priority: domain.MessagePriorityUrgent, Status: domain.MessageStatusDeleted,
+	})
+	if !got.IsRemoved || got.BodyText != "" {
+		t.Fatalf("expected a removed message with no body: %+v", got)
+	}
+	if got.Priority != string(domain.MessagePriorityUrgent) {
+		t.Fatalf("removed message priority = %q, want urgent", got.Priority)
+	}
+}
