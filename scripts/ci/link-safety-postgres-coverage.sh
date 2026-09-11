@@ -3,11 +3,14 @@
 #
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
 # outbox suite, issue #742's worker claim suite, issue #745's push subscription
-# suite and issue #746's Web Push delivery ledger: all of them prove properties
+# suite, issue #746's Web Push delivery ledger and issue #821's message
+# priority column: all of them prove properties
 # only a database can hold —
 # atomicity across one statement, a unique index deciding what counts as the same
 # event or the same subscription, an ON CONFLICT that refuses to move ownership,
-# and FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows.
+# FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows, and a
+# column default plus CHECK constraint deciding what a row written by an older
+# release means and which values may ever be stored.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -57,6 +60,14 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      TestMessagePriorityDefaultsToStandardPostgreSQL
+      TestMessagePriorityAbsentOnCreateIsStandardPostgreSQL
+      TestMessagePriorityConstraintAcceptsDeclaredValuesPostgreSQL
+      TestMessagePriorityConstraintRejectsUnsupportedValuesPostgreSQL
+      TestMessagePriorityConstraintRejectsInvalidUpdatePostgreSQL
+      TestMessagePriorityCreateRoundTripsPostgreSQL
+      TestMessagePriorityListingPreservesPriorityPostgreSQL
+      TestMessagePriorityEditPreservesPriorityPostgreSQL
       TestNotificationOutboxCommitsWithMessagePostgreSQL
       TestNotificationOutboxRowContractPostgreSQL
       TestNotificationOutboxStoresNoMessageBodyPostgreSQL
