@@ -38,9 +38,9 @@ func (s *adapterCallStore) CreateCall(context.Context, storage.CreateCallInput) 
 	return domain.Call{}, false, domain.ErrConflict
 }
 
-func (s *adapterCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, error) {
+func (s *adapterCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, string, error) {
 	s.resourceInput = input
-	return domain.Call{}, false, "", domain.ErrConflict
+	return domain.Call{}, false, "", "", domain.ErrConflict
 }
 
 func (s *adapterCallStore) RenewCallPresence(_ context.Context, input storage.RenewCallPresenceInput) error {

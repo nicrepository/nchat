@@ -9,6 +9,7 @@ import {
   uploadAttachment,
 } from "./filesApi";
 import type { ChannelAttachment } from "./chatTypes";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
 
 export interface AttachmentUploadTarget {
   kind: "channel" | "dm";
@@ -68,17 +69,37 @@ const defaultLimits: WorkspaceAttachmentLimits = {
   maxBytes: Number.MAX_SAFE_INTEGER,
 };
 
+/** So a file added in a fresh mount never reuses a localId a hydrated draft already has. */
+function nextSequenceFrom(items: readonly AttachmentUploadItem[]): number {
+  let max = 0;
+  for (const item of items) {
+    const match = /^attachment-(\d+)$/.exec(item.localId);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return max;
+}
+
 export function useAttachmentUpload(
   target: AttachmentUploadTarget | null | undefined,
   limits: WorkspaceAttachmentLimits = defaultLimits,
   onUploaded?: () => void,
+  /**
+   * Issue #769: the conversation's draft, and the key this upload's items
+   * belong to. Both optional so every pre-#769 caller (and test) that does
+   * not pass them keeps today's behavior — an upload queue scoped purely to
+   * this component's own lifetime.
+   */
+  drafts?: ConversationDraftsApi,
+  draftKey?: string | null,
 ): AttachmentUploadState {
-  const [items, setItems] = useState<AttachmentUploadItem[]>([]);
+  const [items, setItems] = useState<AttachmentUploadItem[]>(
+    () => drafts?.getDraft(draftKey ?? "")?.attachments ?? [],
+  );
   const [notice, setNotice] = useState<string | null>(null);
   const itemsRef = useRef(items);
   const mountedRef = useRef(true);
   const activeRef = useRef(0);
-  const sequenceRef = useRef(0);
+  const sequenceRef = useRef(nextSequenceFrom(items));
   const startedRef = useRef(new Set<string>());
   const controllersRef = useRef(new Map<string, AbortController>());
   const targetRef = useRef(target);
@@ -88,6 +109,16 @@ export function useAttachmentUpload(
   const ownerRef = useRef(targetKey);
   const limitsRef = useRef(limits);
   limitsRef.current = limits;
+  // Stable across this hook instance's whole life in practice (ChatComposer
+  // remounts — new instance, new draftKey — rather than reusing one across a
+  // conversation switch), refs only for the same defensive-closure reason
+  // targetRef exists.
+  const draftsRef = useRef(drafts);
+  const draftKeyRef = useRef(draftKey);
+  useEffect(() => {
+    draftsRef.current = drafts;
+    draftKeyRef.current = draftKey;
+  });
 
   const replaceItems = useCallback(
     (update: (current: AttachmentUploadItem[]) => AttachmentUploadItem[]) => {
@@ -95,6 +126,8 @@ export function useAttachmentUpload(
       setItems((current) => {
         const next = update(current);
         itemsRef.current = next;
+        const key = draftKeyRef.current;
+        if (draftsRef.current && key) draftsRef.current.setAttachments(key, next);
         return next;
       });
     },
@@ -130,13 +163,33 @@ export function useAttachmentUpload(
               ),
             ),
         );
-        const stillOwned =
-          mountedRef.current &&
-          controllersRef.current.get(item.localId) === controller &&
-          itemsRef.current.some((entry) => entry.localId === item.localId);
-        if (!stillOwned) {
+        // Issue #769 ("UPLOAD EM BACKGROUND"): once a draft store is wired,
+        // it — not this component's own mountedRef/itemsRef — is the
+        // authority on whether the attachment this upload just produced is
+        // still wanted. That is what lets an upload started in conversation
+        // X keep going, and land correctly in X's draft, after the reader
+        // has already switched to Y and this ChatComposer instance (and the
+        // hook instance running this very callback) has unmounted.
+        const originDraftKey = draftKeyRef.current;
+        const store = draftsRef.current;
+        const stillWanted =
+          store && originDraftKey
+            ? (store
+                .getDraft(originDraftKey)
+                ?.attachments.some((entry) => entry.localId === item.localId) ?? false)
+            : mountedRef.current &&
+              controllersRef.current.get(item.localId) === controller &&
+              itemsRef.current.some((entry) => entry.localId === item.localId);
+        if (!stillWanted) {
           void deleteAttachmentDraft(attachment.id).catch(() => undefined);
           return;
+        }
+        if (store && originDraftKey) {
+          store.updateAttachment(originDraftKey, item.localId, {
+            status: "success",
+            progress: null,
+            attachment,
+          });
         }
         replaceItems((current) =>
           current.map((entry) =>
@@ -148,6 +201,15 @@ export function useAttachmentUpload(
         onUploaded?.();
       } catch (cause) {
         if (!(cause instanceof DOMException && cause.name === "AbortError")) {
+          const originDraftKey = draftKeyRef.current;
+          const store = draftsRef.current;
+          if (store && originDraftKey) {
+            store.updateAttachment(originDraftKey, item.localId, {
+              status: "failed",
+              progress: null,
+              error: failureMessage(cause),
+            });
+          }
           replaceItems((current) =>
             current.map((entry) =>
               entry.localId === item.localId
@@ -301,12 +363,22 @@ export function useAttachmentUpload(
     mountedRef.current = true;
     const controllers = controllersRef.current;
     return () => {
+      mountedRef.current = false;
+      // Issue #769: a draft store means this unmount is very likely just a
+      // conversation switch, not "the user is done with these files" — so,
+      // unlike the pre-#769 behavior, neither in-flight uploads nor
+      // already-uploaded server-side attachment drafts are torn down here.
+      // Uploads keep going (runItem's completion write-through targets the
+      // draft store directly, by draftKey + localId, not this now-gone
+      // component's state) and the finished/queued items stay in the
+      // conversation's draft until it is explicitly cleared (send,
+      // removal, logout — see dismiss()/clearAllSensitiveDrafts callers).
+      if (draftsRef.current && draftKeyRef.current) return;
       for (const controller of controllers.values()) controller.abort();
       controllers.clear();
       for (const item of itemsRef.current) {
         if (item.attachment) void deleteAttachmentDraft(item.attachment.id).catch(() => undefined);
       }
-      mountedRef.current = false;
     };
   }, []);
 

@@ -34,6 +34,7 @@ import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
+import { noopConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import type { CodecFormat } from "./tiptapSerializer";
 import type { MentionTarget, Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
@@ -116,6 +117,14 @@ export interface ChatComposerProps {
    * Absent, the picker still opens — it simply offers no "Recentes".
    */
   emoji?: ComposerEmojiOptions;
+  /**
+   * Issue #769: the store this composer's text, attachments and voice
+   * recording are lifted into, so they survive this component's own
+   * remount on a conversation switch. Absent (or no uploadTarget, which is
+   * what the draft is keyed by) falls back to a no-op store — every
+   * pre-#769 caller and test keeps behaving exactly as before.
+   */
+  drafts?: ConversationDraftsApi;
 }
 
 export interface ComposerReplyPreview {
@@ -740,6 +749,7 @@ export default function ChatComposer({
   onAttachmentUploaded,
   onActivity,
   emoji,
+  drafts: draftsProp,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
   const initialFocusOwnerRef = useRef(document.activeElement);
@@ -750,7 +760,25 @@ export default function ChatComposer({
   // conversation needs no code at all, because ChatMessageArea keys this
   // composer by target and the whole subtree — picker included — is remounted.
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
-  const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
+  // The defaulted store, safe for this component's own reads/writes below
+  // (getDraft always reporting "nothing" is a correct no-op here). NOT what
+  // is handed to useAttachmentUpload/useVoiceRecorder — those two tell "a
+  // real store is wired" apart from "it is not" by this prop's presence,
+  // and a noop store answers every ownership question the same inert way a
+  // real, empty one does, which would make an in-flight upload's result
+  // look "no longer wanted" the moment it resolves (issue #769 review).
+  const drafts = draftsProp ?? noopConversationDrafts;
+  // Issue #769: the same identity useAttachmentUpload/useVoiceRecorder
+  // already derive their own targetKey from — one draft per destination,
+  // never per mounted component instance.
+  const draftKey = uploadTarget ? `${uploadTarget.kind}:${uploadTarget.id}` : null;
+  const upload = useAttachmentUpload(
+    uploadTarget,
+    attachmentLimits,
+    onAttachmentUploaded,
+    draftsProp,
+    draftKey,
+  );
   const attachEnabled = Boolean(uploadTarget) && !disabled;
   const uploading = upload.busy;
   // Whether any attachment — queued, uploading, ready or even failed-but-not-
@@ -773,6 +801,8 @@ export default function ChatComposer({
       const result = await onSend("", [attachmentId]);
       return result.status === "sent";
     },
+    drafts: draftsProp,
+    draftKey,
   });
   const recording = recorder.phase !== "idle";
   const pendingAttachments = upload.items
@@ -792,13 +822,31 @@ export default function ChatComposer({
    *    result or a thrown error leaves it exactly where it was, so the same
    *    already-uploaded file can be sent again without re-uploading it.
    */
+  // Issue #769, "ACK ATRASADO": whether the text editor should actually
+  // clear once this send resolves. Decided the instant the send resolves —
+  // by comparing the draft's revision then against its revision when this
+  // send *started* — and deliberately before upload.resetAfterPublish()
+  // runs below, which bumps the revision itself (attachments consumed by
+  // this very send, not a new edit) and would otherwise read as "the reader
+  // moved on" every single time.
+  const shouldClearTextRef = useRef(true);
+  // -1 (never a real revision, which starts at 1 on a draft's first
+  // mutation) rather than null/undefined: with the no-op store every
+  // caller that does not opt into #769 gets — including most of this
+  // file's own tests — getDraft always reports undefined, and comparing
+  // two undefineds by strict equality is exactly as valid a "unchanged"
+  // signal as comparing two real revisions.
+  const noRevision = -1;
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
+    const revisionAtSubmit = drafts.getDraft(draftKey ?? "")?.revision ?? noRevision;
     const result = await onSend(
       body,
       pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
     );
     if (result.status === "sent") {
+      shouldClearTextRef.current =
+        (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
       upload.resetAfterPublish();
       setEmojiPickerOpen(false);
     }
@@ -813,8 +861,15 @@ export default function ChatComposer({
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
     canSendEmpty: hasSendableAttachment(upload),
+    // Issue #769: seeds this fresh editor instance with whatever was typed
+    // for this conversation before — read once, at creation, exactly like
+    // every other TipTap-instance-scoped option here (useEditor only
+    // re-reads its `content` option when it recreates the instance).
+    initialContent: draftKey ? (drafts.getDraft(draftKey)?.text ?? undefined) : undefined,
     onSend: handleComposerSend,
     onActivity,
+    onTextChange: draftKey ? (doc) => drafts.setText(draftKey, doc) : undefined,
+    shouldClearOnSent: () => shouldClearTextRef.current,
   });
 
   // Whether a new attachment may be taken at all right now. A voice

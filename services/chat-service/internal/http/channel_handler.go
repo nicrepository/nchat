@@ -625,6 +625,13 @@ func (h *ChannelHandler) AddMembers(w http.ResponseWriter, r *http.Request) {
 		h.broadcast.PublishConversationAvailable(
 			r.Context(), workspace.ID, "channel", channelID, result.AddedUserIDs,
 		)
+		// members.added tells existing subscribers' member/details panels to
+		// refetch, but carries no system message — without this, "Fulano
+		// entrou no canal" only ever showed up on the next reload (issue #835
+		// realtime follow-up), same gap RemoveMember below already closed.
+		if result.EventMessageID != "" {
+			h.broadcast.PublishConversationEvent(r.Context(), workspace.ID, "channel", channelID, result.EventMessageID)
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
 		Added:          result.Added,

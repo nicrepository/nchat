@@ -643,6 +643,49 @@
   white-space: nowrap;
 }
 
+/* ── Row lines (issue #769: draft preview under the name, never inline with
+   it) ───────────────────────────────────────────────────────────────────── */
+
+/*
+ * The name/badges row and the draft-preview row stacked as two lines, the
+ * same shape a "last message" preview would take in a messaging app. Without
+ * this the draft text and the conversation name were both flex children of
+ * the same single row, competing for the same line — cramped, unreadable,
+ * and reading as if the draft text WAS the conversation's name.
+ */
+.chat-sidebar__row-lines {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.chat-sidebar__row-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chat-sidebar__draft-badge {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 400;
+  font-style: italic;
+  /* Warm accent, the same family as the mention badge (#f59e0b) — a visual
+     hint, never the only signal: the word "Rascunho" itself is what a
+     screen reader (and a reader skimming without color) actually goes by. */
+  color: #f59e0b;
+}
+
+.chat-sidebar__nav-item--active .chat-sidebar__draft-badge,
+.chat-sidebar__dm-item--active .chat-sidebar__draft-badge {
+  color: #fde68a;
+}
+
 /* ── Icons ───────────────────────────────────────────────────────────────────── */
 
 .chat-sidebar__icon {

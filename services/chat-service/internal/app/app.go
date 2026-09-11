@@ -445,7 +445,12 @@ func New(cfg config.Config) (*App, error) {
 	var callWorkerCancel context.CancelFunc
 	var callWorkerWG *sync.WaitGroup
 	if callSvc != nil {
-		callSvc.SetPublisher(hub)
+		// hubBroadcaster, not hub directly: CallEventPublisher also needs
+		// PublishConversationEvent (issue #835 realtime follow-up), whose
+		// string targetType hubBroadcaster is what adapts to the hub's own
+		// typed ws.TargetType — the same adapter every other broadcaster
+		// below already goes through.
+		callSvc.SetPublisher(&hubBroadcaster{hub: hub})
 		workerCtx, cancel := context.WithCancel(context.Background())
 		callWorkerCancel = cancel
 		callWorkerWG = &sync.WaitGroup{}
@@ -775,6 +780,14 @@ func (p presenceReporter) OnlineUserIDs(workspaceID string) []string {
 // It converts the string targetType to ws.TargetType and domain.Message to
 // ws.MessagePayload, keeping the service package free of a direct ws import.
 type hubBroadcaster struct{ hub *ws.Hub }
+
+// PublishCall adapts the hub for service.CallEventPublisher (issue #835
+// realtime follow-up's CallEventPublisher now needs both this and
+// PublishConversationEvent below, and hub.PublishCall already matches this
+// signature exactly — no conversion needed, unlike the ws.TargetType one).
+func (b *hubBroadcaster) PublishCall(ctx context.Context, call domain.Call) {
+	b.hub.PublishCall(ctx, call)
+}
 
 type reactionHandlerAdapter struct{ service *service.ReactionService }
 

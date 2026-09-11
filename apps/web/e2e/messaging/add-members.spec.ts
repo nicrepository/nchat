@@ -10,6 +10,7 @@ import {
   channelDetailsFixture,
   createScenario,
   directProfileFixture,
+  emitConversationEvent,
   groupDetailsFixture,
   installMessagingMocks,
   makeMessage,
@@ -104,6 +105,66 @@ test.describe("adicionar membros pelo painel de detalhes", () => {
     // the message is still on screen.
     await expect(composer).toBeVisible();
     await expect(page.getByText("Mensagem no canal")).toBeVisible();
+  });
+
+  // Issue #835 realtime follow-up. Reproduces exactly what was reported:
+  // "Você adicionou Carla Local ao canal" — the system message the add just
+  // wrote — never appeared until the conversation was reopened. The add
+  // itself (POST .../members) only ever updated the details panel's own
+  // count; only a conversation.event WS frame, which chat-service now
+  // actually sends after the same commit, makes the open timeline show it
+  // without a reload. emitConversationEvent stands in for that frame —
+  // exactly the shape PublishConversationEvent puts on the wire (a message
+  // id, not the message itself) — to prove the client-side half of the
+  // fix independently of the server round-trip.
+  test("mostra a mensagem de sistema de membro adicionado na timeline em tempo real, sem reload", async ({
+    page,
+  }, testInfo) => {
+    const { scenario, targetId } = scenarioWith(testInfo, "add-members-realtime", {
+      canManage: true,
+      type: "public",
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const composer = page.getByTestId("chat-composer-input");
+    const timeline = page.getByRole("log", { name: "Mensagens" });
+    await expect(timeline).toBeVisible();
+    await expect(page.getByText("Você adicionou")).toBeHidden();
+
+    await page.getByTestId("chat-details-toggle").click();
+    const panel = page.getByTestId("chat-conversation-details");
+    await panel.getByTestId("chat-details-add-members").click();
+    const dialog = page.getByRole("dialog", { name: "Adicionar membros" });
+    await dialog.getByLabel("Pesquisar pessoa").fill("e2e");
+    await dialog.getByRole("button", { name: new RegExp(SECOND_CANDIDATE_NAME) }).click();
+    await dialog.getByRole("button", { name: "Adicionar", exact: true }).click();
+    await expect(dialog).toBeHidden();
+
+    // The server side of the fix: chat-service now broadcasts
+    // conversation.event with the member_added message's id after the same
+    // transaction that added SECOND_CANDIDATE_NAME commits.
+    await emitConversationEvent(page, scenario, {
+      kind: "channel",
+      targetId,
+      message: makeMessage({
+        id: `${targetId}-member-added-1`,
+        kind: "system",
+        sender_id: CURRENT_USER_ID,
+        sender_display_name: CURRENT_USER_NAME,
+        event_type: "conversation_member_added",
+        event_payload: {
+          target_users: [{ user_id: SECOND_CANDIDATE_ID, display_name: SECOND_CANDIDATE_NAME }],
+        },
+      }),
+    });
+
+    await expect(
+      timeline.getByText(`Você adicionou ${SECOND_CANDIDATE_NAME} ao canal`),
+    ).toBeVisible();
+    // No reload happened, and nothing else moved: the composer that survived
+    // the add above is still the same one.
+    await expect(composer).toBeVisible();
   });
 
   test("adiciona um membro a um canal privado", async ({ page }, testInfo) => {

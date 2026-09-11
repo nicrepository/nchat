@@ -184,6 +184,33 @@ func TestAddParticipants_BroadcastsWithTheDMTargetTypeAfterCommit(t *testing.T) 
 	}
 }
 
+// Issue #835 realtime follow-up: the group counterpart of
+// TestAddMembers_PublishesConversationEventFromTheCommittedResult —
+// "Fulano entrou no grupo" must reach open subscribers live, not only on
+// their next reload.
+func TestAddParticipants_PublishesConversationEventFromTheCommittedResult(t *testing.T) {
+	provider := &fakeDMProvider{
+		addMembersResult: storage.AddMembersResult{
+			Added: 1, TotalCount: 6,
+			AddedUserIDs:   []string{dmOtherUserID},
+			EventMessageID: "77777777-7777-4777-8777-777777777778",
+		},
+	}
+	broadcast := &recordingBroadcaster{}
+
+	serveAddParticipants(
+		addParticipantsHandler(provider, broadcast, nil), addParticipantsRequest(validAddMembersBody),
+	)
+
+	if len(broadcast.conversationEvents) != 1 {
+		t.Fatalf("conversation events = %d, want 1", len(broadcast.conversationEvents))
+	}
+	want := [4]string{testWorkspaceID, "dm", dmConversationID, "77777777-7777-4777-8777-777777777778"}
+	if broadcast.conversationEvents[0] != want {
+		t.Fatalf("conversation event = %+v, want %+v", broadcast.conversationEvents[0], want)
+	}
+}
+
 func TestAddParticipants_DoesNotBroadcastOnFailure(t *testing.T) {
 	broadcast := &recordingBroadcaster{}
 

@@ -27,11 +27,12 @@
  *    beyond that.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { UploadProgress } from "../lib/api";
 import type { AttachmentUploadTarget } from "./useAttachmentUpload";
 import { uploadAttachment } from "./filesApi";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
 
 export type VoiceRecorderPhase =
   | "idle"
@@ -103,6 +104,13 @@ export interface VoiceRecorderOptions {
    * leaves the uploaded blob available to retry from `reviewing`.
    */
   onUploaded: (attachmentId: string) => Promise<boolean>;
+  /**
+   * Issue #769: the conversation's draft, and the key this recording
+   * belongs to. Both optional so every pre-#769 caller keeps today's
+   * behavior — a recording that never survives a conversation switch.
+   */
+  drafts?: ConversationDraftsApi;
+  draftKey?: string | null;
 }
 
 const initialState: VoiceRecorderState = {
@@ -117,16 +125,39 @@ export function useVoiceRecorder({
   target,
   maxUploadBytes,
   onUploaded,
+  drafts,
+  draftKey,
 }: VoiceRecorderOptions): VoiceRecorderControls {
-  const [state, setState] = useState<VoiceRecorderState>(initialState);
+  // Computed once, at this instance's creation, exactly like ChatComposer
+  // seeds useChatEditor's initialContent — never re-read on a later drafts
+  // change, since a hydrated composer remounts a fresh instance rather than
+  // reusing one across conversations (issue #769).
+  const seededVoiceMessage = useMemo(
+    () => drafts?.getDraft(draftKey ?? "")?.voiceMessage ?? null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- seed-once, see comment above
+    [],
+  );
+  const [state, setState] = useState<VoiceRecorderState>(() =>
+    seededVoiceMessage
+      ? {
+          phase: "reviewing",
+          elapsedMs: seededVoiceMessage.durationMs,
+          previewUrl: seededVoiceMessage.previewUrl,
+          error: null,
+          uploadProgress: null,
+        }
+      : initialState,
+  );
   const stateRef = useRef(state);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const mimeTypeRef = useRef<string>("");
-  const blobRef = useRef<Blob | null>(null);
-  const previewUrlRef = useRef<string | null>(null);
+  const mimeTypeRef = useRef<string>(seededVoiceMessage?.mimeType ?? "");
+  const blobRef = useRef<Blob | null>(seededVoiceMessage?.blob ?? null);
+  const previewUrlRef = useRef<string | null>(seededVoiceMessage?.previewUrl ?? null);
+  const draftsRef = useRef(drafts);
+  const draftKeyRef = useRef(draftKey);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const segmentStartRef = useRef(0);
   const accumulatedMsRef = useRef(0);
@@ -159,6 +190,8 @@ export function useVoiceRecorder({
     targetRef.current = target;
     maxUploadBytesRef.current = maxUploadBytes;
     onUploadedRef.current = onUploaded;
+    draftsRef.current = drafts;
+    draftKeyRef.current = draftKey;
   });
 
   const supported =
@@ -197,6 +230,11 @@ export function useVoiceRecorder({
     blobRef.current = null;
     accumulatedMsRef.current = 0;
     setState(initialState);
+    // Discard, a confirmed send, or an explicit target change (issue #769)
+    // all mean this recording is genuinely gone — clear it from the draft
+    // too, not just from this hook's own state.
+    const key = draftKeyRef.current;
+    if (draftsRef.current && key) draftsRef.current.setVoiceMessage(key, null);
   }, [clearTimer, revokePreview, stopTracks]);
 
   const startTimer = useCallback(() => {
@@ -222,6 +260,28 @@ export function useVoiceRecorder({
     blobRef.current = blob;
     const url = URL.createObjectURL(blob);
     previewUrlRef.current = url;
+    // Issue #769: this is the one place a finished-but-unsent recording
+    // becomes real, and it can fire *after* this hook has already
+    // unmounted — see the unmount cleanup below, which stops the recorder
+    // but deliberately leaves finalizing the blob to this handler. Writing
+    // to the draft store here (rather than only from an effect that reacts
+    // to `state`) is what lets the recording survive a conversation switch
+    // instead of being silently dropped once nothing local is listening.
+    // abandonedRef, not mountedRef: the two mean the same thing here and
+    // abandonedRef is guaranteed already up to date at this instant (set
+    // synchronously by the unmount cleanup before the recorder ever gets a
+    // chance to stop), whereas mountedRef is a different ref this same
+    // hook does not otherwise use.
+    const key = draftKeyRef.current;
+    if (draftsRef.current && key) {
+      draftsRef.current.setVoiceMessage(key, {
+        blob,
+        previewUrl: url,
+        durationMs: finalElapsed,
+        mimeType: mimeTypeRef.current,
+      });
+    }
+    if (abandonedRef.current) return;
     setState({
       phase: "reviewing",
       elapsedMs: finalElapsed,
@@ -402,6 +462,26 @@ export function useVoiceRecorder({
     return () => {
       abandonedRef.current = true;
       clearTimer();
+      const phase = stateRef.current.phase;
+      const hasDraftTarget = Boolean(draftsRef.current && draftKeyRef.current);
+      if (hasDraftTarget && (phase === "recording" || phase === "paused")) {
+        // Issue #769 ("GRAVAÇÃO DE VOZ EM ANDAMENTO"): never send
+        // automatically and never lose the bytes already captured. The mic
+        // goes dark immediately; `recorder.stop()` is the standard, direct
+        // way to flush the final chunk and fire `onstop` — handleStop
+        // (still wired, its closures unaffected by this component being
+        // gone) finalizes the blob and writes it to the origin
+        // conversation's draft once that fires, however long that takes.
+        stopTracks();
+        recorderRef.current?.stop();
+        return;
+      }
+      if (hasDraftTarget && phase === "reviewing") {
+        // Already handed to the draft store the moment handleStop produced
+        // it — ownership of the preview URL/blob transferred there, so
+        // this unmount must not revoke or drop it.
+        return;
+      }
       stopTracks();
       revokePreview();
       uploadControllerRef.current?.abort();

@@ -90,6 +90,13 @@ type TransitionCallResult struct {
 	// (false) for every other TransitionCallResult producer; only
 	// LeaveResourceCall ever sets it true.
 	Released bool
+	// EventMessageID is the system message this transition wrote (issue
+	// #835 realtime follow-up), empty when the transition wrote none (an
+	// idempotent no-op, a timeout sweep, or a direct — non-resource — call).
+	// Callers broadcast it via PublishConversationEvent after commit so
+	// "chamada encerrada" appears live, the same way member/rename events
+	// already do.
+	EventMessageID string
 }
 
 type PGXCallStore struct {
@@ -190,13 +197,19 @@ func (s *PGXCallStore) CreateCall(ctx context.Context, input CreateCallInput) (d
 // never rotate again on replay, or a client that already started using the
 // original response's participation_id would be silently fenced out by its
 // own retry.
-func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResourceCallInput) (domain.Call, bool, string, error) {
+// The fifth return value is the call_started system message's id (issue
+// #835 realtime follow-up), empty on every path but the one that actually
+// created a new resource call — joining an existing one, or an idempotent
+// replay, writes no such message. Callers broadcast it via
+// PublishConversationEvent after this returns, never before: it is already
+// committed by the time it reaches them.
+func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResourceCallInput) (domain.Call, bool, string, string, error) {
 	if s == nil || s.pool == nil {
-		return domain.Call{}, false, "", errors.New("call store unavailable")
+		return domain.Call{}, false, "", "", errors.New("call store unavailable")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return domain.Call{}, false, "", fmt.Errorf("begin create resource call: %w", err)
+		return domain.Call{}, false, "", "", fmt.Errorf("begin create resource call: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -208,7 +221,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 	// lockCallKeys.
 	lockKey := input.WorkspaceID + ":" + string(input.TargetType) + ":" + input.TargetID
 	if err := lockCallKeys(ctx, tx, lockKey, input.CallerID); err != nil {
-		return domain.Call{}, false, "", err
+		return domain.Call{}, false, "", "", err
 	}
 	existing, err := scanCall(tx.QueryRow(ctx,
 		`SELECT `+callSelectColumns+` FROM chat.calls WHERE workspace_id = $1 AND caller_id = $2 AND request_id = $3`,
@@ -216,7 +229,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 	))
 	if err == nil {
 		if existing.TargetType != input.TargetType || existing.TargetID != input.TargetID || existing.Type != input.Type {
-			return domain.Call{}, false, "", domain.ErrConflict
+			return domain.Call{}, false, "", "", domain.ErrConflict
 		}
 		// Never rotates: this is a replay of the same command, not a new
 		// admission. Whatever participation_id the original call already
@@ -224,26 +237,26 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 		// no longer exists, fail closed: a replay is not a new admission.
 		replayParticipationID, err := currentParticipationID(ctx, tx, existing.ID, input.CallerID)
 		if err != nil {
-			return domain.Call{}, false, "", err
+			return domain.Call{}, false, "", "", err
 		}
 		if replayParticipationID == "" {
-			return domain.Call{}, false, "", domain.ErrCallParticipationStale
+			return domain.Call{}, false, "", "", domain.ErrCallParticipationStale
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return domain.Call{}, false, "", fmt.Errorf("commit idempotent resource call: %w", err)
+			return domain.Call{}, false, "", "", fmt.Errorf("commit idempotent resource call: %w", err)
 		}
-		return existing, false, replayParticipationID, nil
+		return existing, false, replayParticipationID, "", nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.Call{}, false, "", fmt.Errorf("find idempotent resource call: %w", err)
+		return domain.Call{}, false, "", "", fmt.Errorf("find idempotent resource call: %w", err)
 	}
 
 	authorized, err := authorizeResourceTarget(ctx, tx, input.WorkspaceID, input.CallerID, input.TargetType, input.TargetID)
 	if err != nil {
-		return domain.Call{}, false, "", err
+		return domain.Call{}, false, "", "", err
 	}
 	if !authorized {
-		return domain.Call{}, false, "", domain.ErrForbidden
+		return domain.Call{}, false, "", "", domain.ErrForbidden
 	}
 
 	// FOR UPDATE: without it, this SELECT can return an "active" row an
@@ -263,7 +276,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 		input.WorkspaceID, string(input.TargetType), input.TargetID,
 	))
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return domain.Call{}, false, "", fmt.Errorf("find active resource call: %w", err)
+		return domain.Call{}, false, "", "", fmt.Errorf("find active resource call: %w", err)
 	}
 	justCreated := errors.Is(err, pgx.ErrNoRows)
 	if justCreated {
@@ -272,7 +285,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 			input.WorkspaceID, input.RequestID, input.CallerID, string(input.TargetType), input.TargetID, string(input.Type), input.ExpiresAt,
 		))
 		if err != nil {
-			return domain.Call{}, false, "", fmt.Errorf("insert resource call: %w", err)
+			return domain.Call{}, false, "", "", fmt.Errorf("insert resource call: %w", err)
 		}
 	}
 
@@ -296,29 +309,31 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 	// no orphan call is left behind.
 	busy, err := callParticipantBusy(ctx, tx, input.WorkspaceID, input.CallerID, active.ID)
 	if err != nil {
-		return domain.Call{}, false, "", err
+		return domain.Call{}, false, "", "", err
 	}
 	if busy {
-		return domain.Call{}, false, "", domain.ErrCallParticipantBusy
+		return domain.Call{}, false, "", "", domain.ErrCallParticipantBusy
 	}
 
 	participationID, err := admitCallPresence(ctx, tx, active.ID, input.CallerID, input.ExpiresAt)
 	if err != nil {
-		return domain.Call{}, false, "", err
+		return domain.Call{}, false, "", "", err
 	}
 
 	// call_started only for the admission that actually created the call
 	// (issue #685) — joining an already-active resource call is not a new
 	// call starting, so it gets no second event.
+	var eventMessageID string
 	if justCreated {
-		if err := insertCallStartedEvent(ctx, tx, input.WorkspaceID, active); err != nil {
-			return domain.Call{}, false, "", err
+		eventMessageID, err = insertCallStartedEvent(ctx, tx, input.WorkspaceID, active)
+		if err != nil {
+			return domain.Call{}, false, "", "", err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return domain.Call{}, false, "", fmt.Errorf("commit resource call: %w", err)
+		return domain.Call{}, false, "", "", fmt.Errorf("commit resource call: %w", err)
 	}
-	return active, active.RequestID == input.RequestID && active.CallerID == input.CallerID, participationID, nil
+	return active, active.RequestID == input.RequestID && active.CallerID == input.CallerID, participationID, eventMessageID, nil
 }
 
 // insertCallEndedEvent records call_ended in the same transaction that ended
@@ -329,7 +344,7 @@ func (s *PGXCallStore) CreateResourceCall(ctx context.Context, input CreateResou
 // clock_timestamp() for this very transition. A call ended by
 // authorizeCallTransition's idempotent branch never reaches here, so
 // AcceptedAt/EndedAt are always both set.
-func insertCallEndedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, call domain.Call) error {
+func insertCallEndedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, call domain.Call) (string, error) {
 	input := ConversationEventInput{
 		WorkspaceID: workspaceID,
 		ActorID:     call.CallerID,
@@ -342,13 +357,16 @@ func insertCallEndedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, ca
 	case domain.CallTargetDM:
 		input.DMConversationID = call.TargetID
 	default:
-		return nil
+		return "", nil
 	}
 	if call.AcceptedAt != nil && call.EndedAt != nil {
 		input.Payload.CallDurationSeconds = int64(call.EndedAt.Sub(*call.AcceptedAt).Seconds())
 	}
-	_, err := InsertConversationEvent(ctx, tx, input)
-	return err
+	event, err := InsertConversationEvent(ctx, tx, input)
+	if err != nil {
+		return "", err
+	}
+	return event.ID, nil
 }
 
 // insertCallStartedEvent records call_started in the same transaction that
@@ -356,7 +374,7 @@ func insertCallEndedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, ca
 // chat.dm_conversations are conversation targets a system event can attach
 // to — a direct call has neither and is never a resource call to begin with,
 // so this is reached only for CallTargetChannel/CallTargetDM.
-func insertCallStartedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, call domain.Call) error {
+func insertCallStartedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, call domain.Call) (string, error) {
 	input := ConversationEventInput{
 		WorkspaceID: workspaceID,
 		ActorID:     call.CallerID,
@@ -369,10 +387,13 @@ func insertCallStartedEvent(ctx context.Context, tx pgx.Tx, workspaceID string, 
 	case domain.CallTargetDM:
 		input.DMConversationID = call.TargetID
 	default:
-		return nil
+		return "", nil
 	}
-	_, err := InsertConversationEvent(ctx, tx, input)
-	return err
+	event, err := InsertConversationEvent(ctx, tx, input)
+	if err != nil {
+		return "", err
+	}
+	return event.ID, nil
 }
 
 // lockCallKeys acquires a per-transaction advisory lock for each key, always
@@ -1025,15 +1046,17 @@ func (s *PGXCallStore) TransitionCall(ctx context.Context, input TransitionCallI
 	// only outcome that can arrive. The auto-end when the last participant
 	// leaves (LeaveResourceCall) and the timeout sweep (ExpireDueCalls) are
 	// deliberately excluded — neither is "the caller ended the call".
+	var eventMessageID string
 	if call.IsResource() {
-		if err := insertCallEndedEvent(ctx, tx, input.WorkspaceID, updated); err != nil {
+		eventMessageID, err = insertCallEndedEvent(ctx, tx, input.WorkspaceID, updated)
+		if err != nil {
 			return TransitionCallResult{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TransitionCallResult{}, fmt.Errorf("commit call transition: %w", err)
 	}
-	return TransitionCallResult{Call: updated, Changed: true}, nil
+	return TransitionCallResult{Call: updated, Changed: true, EventMessageID: eventMessageID}, nil
 }
 
 func authorizeCallTransition(call domain.Call, actorID string, action CallAction) (domain.CallStatus, bool, error) {

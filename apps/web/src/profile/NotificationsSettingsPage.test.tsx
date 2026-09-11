@@ -8,6 +8,7 @@ import { getSoundNotificationMode } from "../chat/soundPreference";
 import type { AppShellOutletContext } from "../chat/AppShell";
 import type { SidebarState } from "../chat/useChatSidebar";
 import type { Channel, DMConversation } from "../chat/chatTypes";
+import { noopConversationDrafts } from "../chat/useConversationDrafts";
 
 const { mockGetRingtoneEnabled, mockSetRingtoneEnabled, mockPlayRingtonePreview } = vi.hoisted(
   () => ({
@@ -71,6 +72,7 @@ function makeContext(
     leaveConversation: vi.fn(async () => {}),
     inAppAlert: null,
     dismissInAppAlert: vi.fn(),
+    drafts: noopConversationDrafts,
   };
 }
 

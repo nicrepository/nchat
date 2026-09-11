@@ -456,6 +456,13 @@ type AddMembersResult struct {
 	// signal out to the input would tell people about conversations they were
 	// already in, or were never added to. len(AddedUserIDs) == Added.
 	AddedUserIDs []string
+	// EventMessageID is the conversation_member_added system message this
+	// transaction wrote (issue #835 realtime follow-up), empty when nothing
+	// was actually added. The caller broadcasts it via
+	// PublishConversationEvent so the timeline updates live — mirroring
+	// call_started/call_ended and every other conversation event — instead
+	// of only being visible on the next reload.
+	EventMessageID string
 }
 
 // AddChannelMembers adds every user in userIDs to channelID, or none.
@@ -608,18 +615,21 @@ func (s *PGXMemberStore) AddChannelMembers(
 	// member — inserted is the RETURNING of the statement above, so a batch
 	// that was entirely "already a member" (inserted == 0) writes no event at
 	// all, matching AddedUserIDs' own doc comment about what actually changed.
+	var eventMessageID string
 	if len(addedUserIDs) > 0 {
 		targets, err := resolveConversationEventTargetUsers(ctx, tx, addedUserIDs)
 		if err != nil {
 			return AddMembersResult{}, err
 		}
-		if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		event, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
 			WorkspaceID: workspaceID, ChannelID: channelID, ActorID: callerID,
 			Event:   domain.ConversationEventMemberAdded,
 			Payload: domain.ConversationEventPayload{TargetUsers: targets},
-		}); err != nil {
+		})
+		if err != nil {
 			return AddMembersResult{}, err
 		}
+		eventMessageID = event.ID
 	}
 
 	var total int
@@ -647,6 +657,7 @@ func (s *PGXMemberStore) AddChannelMembers(
 		AlreadyMembers: eligible - inserted,
 		TotalCount:     total,
 		AddedUserIDs:   addedUserIDs,
+		EventMessageID: eventMessageID,
 	}, nil
 }
 

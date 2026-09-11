@@ -333,6 +333,11 @@ test.describe("sidebar — conversas fixadas", () => {
     await expect(section(page, "Grupos").getByRole("option")).toHaveCount(1);
     // Neither opening the menu nor running an action changed the conversation.
     await expect(page).toHaveURL(new RegExp(`/chat/dm/${targetId}$`));
+    // The first menu closes after its action, and the row's reorder settles,
+    // before the second one opens — otherwise the reopened trigger can be
+    // mid-reorder when clicked, an unrelated timing race this assertion
+    // makes deterministic rather than papering over with a longer timeout.
+    await expect(page.getByRole("menu")).toHaveCount(0);
 
     await rowMenu(page, `canal ${channel.display_name}`).click();
     await page.getByRole("menuitem", { name: "Desafixar" }).click();

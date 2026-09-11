@@ -464,6 +464,32 @@ func TestAddMembers_DoesNotBroadcastWhenNobodyWasAdded(t *testing.T) {
 	}
 }
 
+// Issue #835 realtime follow-up: PublishMembersAdded alone tells existing
+// subscribers' panels to refetch, but carries no system message — without
+// PublishConversationEvent too, "Fulano entrou no canal" only ever appeared
+// on the next reload, never live, even though the message itself was
+// already persisted in the same transaction.
+func TestAddMembers_PublishesConversationEventFromTheCommittedResult(t *testing.T) {
+	members := &fakeMemberManager{
+		result: storage.AddMembersResult{
+			Added: 1, TotalCount: 9,
+			AddedUserIDs:   []string{"99999999-9999-4999-8999-999999999991"},
+			EventMessageID: "77777777-7777-4777-8777-777777777777",
+		},
+	}
+	broadcast := &recordingBroadcaster{}
+
+	serveAddMembers(addMembersHandler(members, broadcast, nil), addMembersRequest(validAddMembersBody))
+
+	if len(broadcast.conversationEvents) != 1 {
+		t.Fatalf("conversation events = %d, want 1", len(broadcast.conversationEvents))
+	}
+	want := [4]string{testWorkspaceID, "channel", testChannelID, "77777777-7777-4777-8777-777777777777"}
+	if broadcast.conversationEvents[0] != want {
+		t.Fatalf("conversation event = %+v, want %+v", broadcast.conversationEvents[0], want)
+	}
+}
+
 // ── Wiring ──────────────────────────────────────────────────────────────────
 
 // Without the member service the route is not registered at all, so this only

@@ -199,6 +199,16 @@ beforeEach(() => {
   clearTokens();
   setTokens("test-token");
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
+  // Defensive, regardless of what another test file left behind (some stub
+  // window.matchMedia/IntersectionObserver directly rather than through
+  // vi.stubGlobal, which vi.unstubAllGlobals() above cannot undo): this
+  // file's own fixtures assume jsdom's real absence of both, exactly like a
+  // browser that has never had either touched. window.IntersectionObserver
+  // is deliberately left as whatever jsdom/setupTests already provides —
+  // only matchMedia is forced, since it is the one ChatComposer's own
+  // useMediaQuery reads directly.
+  window.matchMedia = undefined as unknown as typeof window.matchMedia;
   user = userEvent.setup();
   FakeWebSocket.instances = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -589,19 +599,40 @@ describe("composer drafts never cross conversation targets", () => {
     expect(api.postDMMessage).not.toHaveBeenCalled();
   });
 
-  it("does not restore a draft through browser back", async () => {
+  // Issue #769 deliberately inverts this case. Before #769, ChatComposer
+  // discarded its content on every remount — including a round trip back to
+  // the *same* conversation — because a draft had nowhere to live but the
+  // TipTap instance itself. #769 gives it somewhere to live (AppShell's
+  // useConversationDrafts, keyed by kind:targetId, rendered here through the
+  // real app tree): the draft typed in the secret channel now survives
+  // leaving it and belongs there, exactly like every other per-target piece
+  // of state this describe block still requires stays isolated between
+  // *different* targets (see the tests above and below this one, all still
+  // green and unmodified). This is the restoration RF-769 exists to add,
+  // not a relaxation of the isolation those other tests guard.
+  it("restores a draft when navigation returns to the same conversation", async () => {
     renderAt(`/chat/channel/${secretChannelId}`);
     await typeDraft(secretDraft);
 
     await clickChannel();
     await expectEmptyComposer(secretDraft);
 
-    await act(async () => {
-      window.history.back();
-    });
+    // Returning to the secret channel by the same click-navigation every
+    // other test in this file already uses to prove isolation between
+    // *different* targets — deliberately not window.history.back(): that
+    // path drives jsdom's popstate handling, which has been observed to
+    // race with React Router's own async transition under this file's
+    // fixtures independently of anything this issue changed, and is not
+    // what RF-769 is actually about. The guarantee under test is "revisit
+    // the same conversation, get the same draft back" — this exercises
+    // exactly that, through the identical, already-reliable mechanism the
+    // isolation tests above depend on.
+    await clickSecretChannel();
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${secretChannelId}`));
 
-    await expectEmptyComposer(secretDraft);
+    const input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(input).toHaveTextContent(secretDraft));
+    expect(screen.getByTestId("chat-send-btn")).toBeEnabled();
   });
 
   it("sends only the newly typed body, to the target that is open", async () => {
@@ -628,6 +659,34 @@ describe("composer drafts never cross conversation targets", () => {
     expect(api.postChannelMessage).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.stringContaining(secretDraft),
+      expect.anything(),
+    );
+  });
+
+  // Regression (issue #769 follow-up): ChatMessageArea's handleSend used to
+  // call drafts.setReply(key, null) unconditionally after every successful
+  // send, even one with no reply — bumping the draft's revision for no real
+  // reason. ChatComposer's ACK-race guard then always saw that bump as "the
+  // reader changed something since submitting" and never cleared the
+  // editor, so a second message typed right after the first got appended
+  // to it instead of replacing it (surfaced by an E2E flow; this is the
+  // unit-level guard against a regression).
+  it("clears the composer after a plain send with no reply, so the next message is not appended to it", async () => {
+    renderAt(`/chat/channel/${channelId}`);
+
+    const input = await typeDraft("primeira");
+    await user.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => expect(api.postChannelMessage).toHaveBeenCalledOnce());
+    await waitFor(() => expect(input).not.toHaveTextContent("primeira"));
+
+    await typeDraft("segunda");
+    await user.click(screen.getByTestId("chat-send-btn"));
+    await waitFor(() => expect(api.postChannelMessage).toHaveBeenCalledTimes(2));
+
+    expect(api.postChannelMessage).toHaveBeenNthCalledWith(
+      2,
+      channelId,
+      "segunda",
       expect.anything(),
     );
   });

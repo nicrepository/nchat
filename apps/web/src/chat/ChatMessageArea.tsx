@@ -12,11 +12,17 @@
  * - Line breaks preserved via CSS white-space: pre-wrap, never via HTML injection.
  * - Route :id is decoded via safeDecodeURIComponent before use and re-encoded on navigate.
  * - localStorage stores only allowlisted recent reaction emojis, scoped by user ID.
- * - No token or message content is written to localStorage or sessionStorage.
+ * - No token, attachment, or voice recording is ever written to localStorage or
+ *   sessionStorage. The one narrow exception (issue #769, reviewed for security):
+ *   a draft's text and the id of the message it replies to are mirrored to
+ *   sessionStorage, scoped by user, so an unsent draft survives an F5 — see
+ *   chatDraftPersistence.ts.
  * - AbortController in useMessages cancels in-flight requests on target change or unmount.
  * - author_id is never sent; sender identity comes from the server-side JWT.
- * - ChatComposer is keyed by `${kind}:${targetId}`, so an unsent draft can never
- *   survive a target switch and be posted to the wrong conversation.
+ * - ChatComposer is keyed by `${kind}:${targetId}`, so its TipTap instance, upload
+ *   queue and voice recorder never leak between conversations by construction —
+ *   but the *content* they hold now survives that remount via useConversationDrafts
+ *   (issue #769), the same way #492's viewport anchors already survive it below.
  *
  * WebSocket realtime delivery:
  * Implemented — see useMessages and useChatWebSocket.
@@ -42,6 +48,7 @@ import { useConversationDetailsPanel } from "./useConversationDetailsPanel";
 import { useResourceCallBar } from "./useResourceCallBar";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import ChatComposer from "./ChatComposer";
+import { noopConversationDrafts } from "./useConversationDrafts";
 import { senderLabel } from "./messageDisplay";
 import ConversationHeader from "./message-area/ConversationHeader";
 import ConversationCallBars from "./message-area/ConversationCallBars";
@@ -85,6 +92,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const navigate = useNavigate();
   const target = useConversationTarget(kind);
   const { ctx, targetId, focusMessageId, activeDM, resolvedName } = target;
+  // Issue #769: falls back to a no-op store when the outlet context has not
+  // reached AppShell's real one yet (mirrors emptyOutletContext), so a
+  // screen rendered before that is ready never behaves as if drafts exist.
+  const drafts = ctx.drafts ?? noopConversationDrafts;
   const pendingReference = usePendingReference(location.state, ctx.channels, ctx.dms);
   const [allowedReactionEmojis, setAllowedReactionEmojis] = useState<string[]>([]);
   const [editDisabledIds, setEditDisabledIds] = useState<Set<string>>(new Set());
@@ -157,8 +168,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     sendMessage,
     retry,
     loadMore,
-    selectReply,
-    cancelReply,
+    selectReply: selectReplyBase,
+    cancelReply: cancelReplyBase,
     toggleReaction,
     sendTyping,
     toggleFavorite,
@@ -197,6 +208,49 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onAttachmentStatus: reloadOpenDetails,
     onMessageRemoved: reloadPins,
   });
+
+  // Issue #769, "REPLY CONTEXT": selectReply/cancelReply already own the
+  // *live* reply used for sending — these two wrappers are the only place
+  // that also mirrors it into the conversation's draft, so it comes back
+  // after a conversation switch the same way the text does.
+  const selectReply = useCallback(
+    (message: Message) => {
+      selectReplyBase(message);
+      if (anchors.conversationKey) drafts.setReply(anchors.conversationKey, message.id);
+    },
+    [selectReplyBase, drafts, anchors.conversationKey],
+  );
+  const cancelReply = useCallback(() => {
+    cancelReplyBase();
+    if (anchors.conversationKey) drafts.setReply(anchors.conversationKey, null);
+  }, [cancelReplyBase, drafts, anchors.conversationKey]);
+
+  // Issue #769: historyReducer.applyLoaded unconditionally resets replyTo on
+  // every initial load, i.e. on every conversation switch (#492 review) —
+  // correct for a composer that used to lose its own draft the same way,
+  // wrong now that the reply is supposed to survive one. Restoring it here,
+  // once the messages a reply target could be found in have actually
+  // loaded, keeps that reset (nothing else here needs to know this ever
+  // happened) while still bringing the reply back for the reader.
+  //
+  // A reply whose message is not in the loaded page — deleted, or simply
+  // outside it — is dropped rather than guessed at: RF says "não apagar
+  // texto", not "restore at any cost", and a dangling replyTo the server
+  // would reject on send is worse than none.
+  useEffect(() => {
+    if (state.status !== "ready" || state.replyTo || !anchors.conversationKey) return;
+    const draftReplyId = drafts.getDraft(anchors.conversationKey)?.replyToMessageId;
+    if (!draftReplyId) return;
+    const message = state.messages.find((m) => m.id === draftReplyId);
+    if (message) {
+      selectReplyBase(message);
+    } else {
+      drafts.setReply(anchors.conversationKey, null);
+    }
+    // Runs once per conversation becoming ready, not on every message-list
+    // change (e.g. a realtime append must not re-trigger this).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.status, anchors.conversationKey]);
 
   const typing = useTypingIndicator({
     kind,
@@ -259,11 +313,25 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
         // not wait for the composer-cleared activity event or the inactivity
         // timeout to catch up.
         typingStop();
+        // Mirrors applySent's own replyTo: null (issue #769) — the reply
+        // this message answered is consumed, in the draft as much as in
+        // the live reducer state. Only when there actually was one: an
+        // unconditional setReply(null) would bump the draft's revision on
+        // every single send, even a plain one with no reply — and the
+        // send-vs-edit-race guard in ChatComposer (issue #769, "ACK
+        // ATRASADO") would then read that as "the reader changed something
+        // since submitting" and leave the just-sent text sitting in the
+        // editor instead of clearing it.
+        if (anchors.conversationKey && drafts.getDraft(anchors.conversationKey)?.replyToMessageId) {
+          drafts.setReply(anchors.conversationKey, null);
+        }
         navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
       }
       return result;
     },
     [
+      anchors.conversationKey,
+      drafts,
       location.pathname,
       location.search,
       navigate,
@@ -428,13 +496,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
 
         {/*
         The composer is keyed by the conversation identity so switching targets
-        destroys the TipTap instance and mounts an empty one. The editor body is
-        the only per-target state React Router's in-place route update would
-        otherwise carry over — every other piece of state here already resets
-        through useMessages/usePins. Without this key, a draft typed in channel A
-        stays in the composer for channel B (both are bodyFormat "v3", so
-        useEditor keeps the same instance) and the send button would post it to
-        the wrong conversation. Drafts are deliberately not persisted.
+        destroys the TipTap instance and mounts a fresh one, rather than one
+        editor silently carrying content from channel A into channel B (both
+        are bodyFormat "v3", so useEditor would otherwise keep the same
+        instance) and the send button posting it to the wrong conversation.
+        That isolation is still exactly why the key exists (issue #769
+        review) — what changed is that the content is no longer thrown away
+        on the way out: `drafts` (an AppShell-level store, keyed the same
+        way, unaffected by this remount) is what the fresh instance below
+        seeds itself from and writes back into, so the same content comes
+        back on returning to this target instead of finding it gone.
       */}
         <ChatComposer
           key={`${kind}:${targetId}`}
@@ -444,6 +515,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           disabled={state.status !== "ready"}
           replyPreview={replyPreview}
           onCancelReply={cancelReply}
+          drafts={drafts}
           referencePreview={pendingReference.preview}
           referenceTargetLabel={pendingReference.originLabel}
           onCancelReference={clearPendingReference}

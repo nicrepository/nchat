@@ -787,6 +787,10 @@ test.describe("emoji no composer", () => {
     await page.getByTestId("chat-send-btn").click();
 
     await expect(picker).toBeHidden();
-    await expect(page.getByText("oi😀")).toBeVisible();
+    // Scoped to the sent message bubble (issue #769 follow-up): "oi😀" now
+    // also matches the sidebar's "Rascunho" draft indicator transiently
+    // while the draft clears, and a bare getByText is a strict-mode
+    // violation the instant more than one match exists.
+    await expect(page.getByTestId("chat-msg-bubble").getByText("oi😀")).toBeVisible();
   });
 });

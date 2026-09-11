@@ -656,6 +656,13 @@ func (h *DMHandler) AddParticipants(w http.ResponseWriter, r *http.Request) {
 		h.broadcast.PublishConversationAvailable(
 			r.Context(), workspaceID, "dm", conversationID, result.AddedUserIDs,
 		)
+		// members.added tells existing participants' panels to refetch, but
+		// carries no system message — without this, "Fulano entrou no grupo"
+		// only ever showed up on the next reload (issue #835 realtime
+		// follow-up), same gap RemoveParticipant below already closed.
+		if result.EventMessageID != "" {
+			h.broadcast.PublishConversationEvent(r.Context(), workspaceID, "dm", conversationID, result.EventMessageID)
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
 		Added:          result.Added,
