@@ -556,6 +556,115 @@ O que **saiu** do browser: classificacao DM/mencao/reply (agora `sound_class` +
 nunca esteve la e continua fora: horario de trabalho, origem historica, silencio
 de reacao, prioridade, Web Push, `policy_version`.
 
+### Temporalidade e rajada no browser (#750)
+
+Depois dos gates de execucao, e antes de qualquer superficie rodar, o browser
+responde mais uma pergunta local em `apps/web/src/chat/notificationBurst.ts`.
+Como todo o resto desta fronteira, ela **so remove** — nao transforma um `deny`
+central em som, toast ou nativa, e nao toca em unread, persistencia ou
+`policy.web_push`.
+
+#### Novidade vs estado recuperado: fronteira, nao flag
+
+Nao existe campo `origin` no cliente. Se um evento e novidade nao e uma
+propriedade do evento — e **qual caminho de codigo o esta segurando**, e essa
+separacao e estrutural:
+
+| Caminho                                                      | Papel                          |
+| ------------------------------------------------------------ | ------------------------------ |
+| fan-out ao vivo (`onMessageCreated` em `useChatSidebar`)     | unico candidato a apresentacao |
+| hidratacao (`fetchSidebarData`, primeira pagina da conversa) | state ingestion only           |
+| paginacao (`loadMore`)                                       | state ingestion only           |
+| recovery de reconnect (refetch coalescido do sidebar)        | state ingestion only           |
+| resync (`ws_subscription_ready`)                             | state ingestion only           |
+
+A regra e **aplicada pelo build**: `apps/web/eslint.config.js` proibe qualquer
+modulo que nao seja `useChatSidebar.ts` de importar `notificationPresentation`,
+entao um caminho de recuperacao nao consegue passar a anunciar mensagens sem
+quebrar o lint. O nome do entry point diz o contrato:
+`presentLiveMessageNotification`.
+
+Os dois casos restantes ja estao resolvidos por contratos que existem:
+
+- **replay** nao existe para ser classificado. O chat-service declara entrega
+  best-effort in-process, sem durabilidade e sem replay (`ws/doc.go`), e um
+  evento de bus originado na propria instancia e descartado em vez de ecoado
+  (`SourceInstanceID`);
+- **import/migracao (#506)** chega ja decidido: `denyHistorical` nega todos os
+  canais para qualquer `Origin` que nao seja live. O cliente **consome** esse
+  `deny`; nao re-deriva a origem a partir de um sinal proprio.
+
+#### Dedupe: dois donos, semanticas distintas, ambos limitados
+
+| Estrutura                                            | Dono         | Pergunta                          |
+| ---------------------------------------------------- | ------------ | --------------------------------- |
+| `realtimeMessageLedger.admitRealtimeMessage`         | estado       | ja incorporei esta mensagem?      |
+| memoria do `BurstGate` em `notificationPresentation` | apresentacao | esta aba ja anunciou este evento? |
+
+Sao conjuntos diferentes de proposito: o ledger registra toda mensagem live
+recebida, tenha ou nao gerado alerta; a memoria de apresentacao registra so o
+que **esta aba** anunciou, porque uma aba que perdeu o claim multi-aba nao
+anunciou nada. Fundi-los faria unread depender de quem ganhou o Web Lock, que e
+exatamente o acoplamento que a #749 evita.
+
+Os dois usam `expiringKeySet` e sao limitados por TTL **e** por capacidade;
+nenhum varre nada (entrada cai na leitura apos expirar, ou quando a capacidade
+evicta a insercao mais antiga — `Map` itera em ordem de insercao, o que torna a
+eviccao um delete O(1)); nenhum agenda timer por mensagem; nenhum guarda corpo,
+remetente ou nome de conversa.
+
+| Contrato                     | Valor                                |
+| ---------------------------- | ------------------------------------ |
+| Retencao do ledger de estado | `REALTIME_LEDGER_TTL_MS` = 5 min     |
+| Capacidade do ledger         | `REALTIME_LEDGER_CAPACITY` = 1000    |
+| Retencao do dedupe de alerta | `PRESENTATION_MEMORY_TTL_MS` = 5 min |
+| Capacidade do dedupe         | `PRESENTATION_MEMORY_CAPACITY` = 500 |
+| Janela de som                | `SOUND_COOLDOWN_MS` = 3 s            |
+| Capacidade de cooldown       | `SOUND_COOLDOWN_CAPACITY` = 64       |
+| Chave do cooldown            | conversa + "nomeia o leitor ou nao"  |
+
+Limitar o ledger e seguro **contra o contrato real**, nao por otimismo: sem
+replay e sem eco da propria instancia, e com frames de geracao de socket
+superada descartados no cliente, uma segunda entrega do mesmo `message_id` e um
+duplicado quase simultaneo — e uma janela de minutos cobre isso com folga. Alem
+disso, `unreadCount` e o numero do proprio servidor em toda resposta do sidebar
+e `mergeUnread` o prefere ao valor local, entao qualquer deriva e corrigida pelo
+proximo refetch em vez de acumular.
+
+A identidade e `message_id`: estavel entre entregas e igual em toda aba. Nunca o
+`event_id` do envelope, que o hub gera novo a cada publish, e nunca horario de
+chegada.
+
+#### Chave do cooldown
+
+Por conversa, porque uma rajada e um fluxo em uma sala e silenciar o app inteiro
+esconderia atividade nao relacionada. E por classe, porque uma sala acelerada e
+exatamente quando uma mensagem que **nomeia** o leitor precisa continuar
+audivel — separacao que nao e prioridade nova: e `named_user_ids` /
+`names_everyone`, que o codec de mencao do servidor ja decide.
+
+#### Relacao com a #749 e com a sessao
+
+O claim por evento continua sendo o unico mecanismo multi-aba; a #750 nao
+introduz um segundo. A ordem e: ingestion -> memoria local -> policy/gates ->
+claim -> superficies. O cooldown e consumido **dentro** do claim, na aba que
+realmente apresentou: uma aba que perdeu o claim nao gasta janela por um som que
+nao tocou. Como a janela e por aba, uma rajada custa no maximo um som por aba
+que ganhou algo, nunca um som por mensagem.
+
+Ambas as memorias moram no modulo, nao no hook: precisam sobreviver a remount,
+troca de rota, StrictMode e nova geracao de WebSocket. A unica fronteira que
+respeitam e a de **identidade** — `sessionScoped` (`lib/sessionScoped.ts`) le a
+mesma geracao de sessao que `presence.ts` ja usa, entao logout, outra conta ou
+token substituido comecam memoria vazia. Sem listener e sem teardown: a
+verificacao e uma comparacao de inteiro no acesso.
+
+**O toast nao e silenciado, e substituido.** `InAppMessageAlert` ja mostra um
+alerta so, o mais recente (#744), entao uma rajada troca o conteudo em vez de
+empilhar: a pilha e limitada por construcao e o leitor continua com a atividade
+mais nova para abrir. A agregacao e visual e so visual — nenhuma mensagem sai da
+timeline, nenhum unread diminui, nada e marcado como lido.
+
 ### Preferencia local de som
 
 O modo de som (`off`/`all`/`mentions`/`mentions_and_dms`) mora em

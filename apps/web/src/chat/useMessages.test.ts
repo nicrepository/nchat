@@ -54,6 +54,21 @@ let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
 let capturedOnConversationEvent: ((evt: WSConversationEventMessage) => void) | null = null;
 const mockToggleReaction = vi.fn(() => true);
 
+/**
+ * The presentation entry point, spied rather than stubbed out (issue #750).
+ *
+ * Nothing under useMessages imports it — eslint.config.js forbids that — and
+ * these tests are what keeps the claim honest: if any load, page or resync path
+ * ever reached it, the spy would record the call.
+ */
+const { mockPresentLiveMessageNotification } = vi.hoisted(() => ({
+  mockPresentLiveMessageNotification: vi.fn(),
+}));
+
+vi.mock("./notificationPresentation", () => ({
+  presentLiveMessageNotification: mockPresentLiveMessageNotification,
+}));
+
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
     onMessageCreated,
@@ -5481,5 +5496,97 @@ describe("useMessages — page reads across a target change", () => {
 
     expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
     expect(result.current.state.nextCursor).toBe("");
+  });
+});
+
+// ── The timeline never announces (issue #750) ────────────────────────────────
+//
+// useMessages is the other side of the boundary: it loads a conversation, pages
+// backwards through its history and applies live frames to the timeline, and
+// none of that is an announcement. The rule is enforced by eslint.config.js —
+// this module may not import notificationPresentation at all — and these cases
+// prove the behaviour that rule exists to protect, at the real seam: a hundred
+// messages arriving as state make no sound and raise no OS notification.
+
+describe("useMessages does not announce anything it loads", () => {
+  function history(count: number, prefix: string): Message[] {
+    return Array.from({ length: count }, (_, index) =>
+      makeMessage({ id: `${prefix}-${index}`, bodyText: `mensagem ${index}` }),
+    );
+  }
+
+  it("announces nothing for the initial hydration of a conversation", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: history(100, "hydrated"),
+      nextCursor: "",
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    expect(result.current.state.messages).toHaveLength(100);
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("announces nothing for a page of older messages", async () => {
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: history(20, "recent"), nextCursor: "older-cursor" })
+      .mockResolvedValueOnce({ messages: history(100, "older"), nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.state.messages.length).toBe(120));
+
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The resync this hook really has: `subscribed` is acknowledged and the hook
+   * reconciles what it holds against the server. It recovers state and
+   * announces nothing — and a live frame applied to the timeline is not an
+   * announcement either, because announcing is the sidebar's handler's job and
+   * this module cannot reach it.
+   */
+  it("announces nothing on a subscription resync or a live frame", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: history(5, "loaded"),
+      nextCursor: "",
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+    act(() =>
+      capturedOnMessageCreated?.({
+        type: "message.created",
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-live",
+        event_id: "evt-live",
+        created_at: new Date().toISOString(),
+        payload: makePayload({ id: "msg-live" }),
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-live")).toBe(true),
+    );
+
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
   });
 });

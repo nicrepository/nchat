@@ -7,6 +7,9 @@ import type {
   ShowBrowserMessageNotificationInput,
   ShowBrowserMessageNotificationResult,
 } from "./browserNotification";
+import { clearTokens } from "../lib/authSession";
+import { REALTIME_LEDGER_CAPACITY, retainedRealtimeIdCount } from "./realtimeMessageLedger";
+import { SOUND_COOLDOWN_MS } from "./notificationBurst";
 import { parseInstant } from "./sidebarOrder";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
 import type { WSMessageCreatedEvent, WSNotificationPolicy } from "./useChatWebSocket";
@@ -98,6 +101,12 @@ vi.mock("./useChatWebSocket", () => ({
  * behaviour itself, are covered by that module's own suite.
  */
 beforeEach(() => {
+  // The realtime ledger and the presentation memory are module-scoped on
+  // purpose (issue #750): they must survive a remount, so they also survive a
+  // test. Both are scoped to the session, so ending one is what starts each
+  // test from a client that has ingested nothing and announced nothing — the
+  // same mechanism a logout uses, not a test-only reset hook.
+  clearTokens();
   Object.defineProperty(navigator, "locks", {
     value: {
       request: (_name: string, _options: unknown, callback: (lock: unknown) => unknown) => {
@@ -1695,8 +1704,385 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
   });
 });
 
-describe("useChatSidebar sound mode changes at runtime", () => {
+/**
+ * The boundary between "this just happened" and "this is state I recovered",
+ * proven at the seam that actually decides it (issue #750).
+ *
+ * These do not hand an origin to the presentation layer and check it obeys —
+ * that would test a value, not the architecture. They drive the hook's real
+ * inputs: the live socket handler, the hydrating fetch, and the coalescing
+ * refetch that a reconnect and a membership change both run. Only one of the
+ * three may ever announce anything, and the other two must not, whatever they
+ * carry.
+ */
+describe("useChatSidebar — only the live path announces (issue #750)", () => {
   beforeEach(() => {
+    websocket.onMessageCreated = null;
+    websocket.onConversationAvailable = null;
+    websocket.onConversationEvent = null;
+    mockFetchSidebarData.mockClear();
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  });
+
+  /** The sidebar as the server hands it back, unread already counted server-side. */
+  function sidebarResponse(unreadCount: number) {
+    return {
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, unreadCount },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], unreadCount }],
+      categories: [],
+    };
+  }
+
+  function presentationCount() {
+    return (
+      mockPlayMessageSound.mock.calls.length + mockShowBrowserMessageNotification.mock.calls.length
+    );
+  }
+
+  async function readySidebar(path = "/chat") {
+    const view = renderHook(() => useChatSidebar(), { wrapper: wrapper(path) });
+    await waitFor(() => expect(view.result.current.state.status).toBe("ready"));
+    return view;
+  }
+
+  // Hydration: the first load carries a hundred unread messages per
+  // conversation and announces none of them. It is not on the live path at all.
+  it("announces nothing for the hydrating load, however much unread it carries", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+
+    const { result } = await readySidebar();
+
+    expect(unreadCounts(result.current.state).channelA).toBe(100);
+    expect(presentationCount()).toBe(0);
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  /**
+   * Reconnect recovery. `conversation.available` is what the sidebar receives
+   * when the connection comes back with something it did not know about, and
+   * the response it triggers is the same coalescing refetch a resync runs.
+   * A hundred recovered unread messages, and not one alert.
+   */
+  it("announces nothing for the refetch a reconnect triggers", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(100));
+
+    expect(presentationCount()).toBe(0);
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  // The other recovery signal, a system message landing in a conversation:
+  // same refetch, same silence.
+  it("announces nothing for the refetch a conversation event triggers", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(40));
+    act(() => websocket.onConversationEvent?.());
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(40));
+
+    expect(presentationCount()).toBe(0);
+  });
+
+  /**
+   * A route-only live frame — one with no payload — is a recovery signal too:
+   * it says something happened without saying what, so the sidebar asks the
+   * server rather than guessing, and announces nothing on the way.
+   */
+  it("announces nothing for a live frame that carries no message", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    await readySidebar();
+
+    const routeOnly = messageCreated("route-only", channelA);
+    act(() => websocket.onMessageCreated?.({ ...routeOnly, payload: undefined }));
+
+    expect(presentationCount()).toBe(0);
+  });
+
+  /**
+   * Import and migration (#506) reach this client already decided: the policy
+   * engine denies every channel for an origin that is not live. The client
+   * consumes that rather than re-deriving it, so the real contract is what is
+   * exercised here — no client-side flag is involved.
+   */
+  it("announces nothing for a message the policy denied on every channel", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageWithPolicy("imported-1", channelA, plan("deny", "deny", "deny")),
+      ),
+    );
+
+    expect(presentationCount()).toBe(0);
+    // Suppressing the alert never suppresses the message: the badge still moves.
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  // The live path, for contrast: the same hook, the same session, one frame.
+  it("announces exactly once for a live message", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    act(() => websocket.onMessageCreated?.(messageCreated("live-1", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(result.current.inAppAlert?.messageId).toBe("live-1");
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  /**
+   * The composition, end to end: hydrate with unread, recover more over a
+   * reconnect, then receive one genuinely new live message. Everything
+   * recovered stays silent and the live one still announces — going quiet after
+   * a recovery is the failure that would make the whole gate unacceptable.
+   */
+  it("still announces the first live message after hydration and recovery", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+    const { result } = await readySidebar();
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+    expect(presentationCount()).toBe(0);
+
+    act(() => websocket.onMessageCreated?.(messageCreated("live-after-recovery", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(result.current.inAppAlert?.messageId).toBe("live-after-recovery");
+  });
+});
+
+/**
+ * State ingestion happens once per message id, and unread derives from it
+ * (issue #750). These are the cases that would pass with an unbounded Set and
+ * must keep passing without one.
+ */
+describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+  });
+
+  async function readySidebar() {
+    const view = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(view.result.current.state.status).toBe("ready"));
+    return view;
+  }
+
+  it("counts one message once, however many times it is delivered", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      for (let index = 0; index < 5; index += 1) {
+        websocket.onMessageCreated?.(messageCreated("delivered-again", channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A remount is what used to reopen this: the dedup set lived in a ref and
+   * died with the hook, so the same id could be counted a second time. The
+   * ledger is module-scoped and outlives the hook.
+   *
+   * The remount refetches, and the server's own unreadCount is the authority
+   * for the state that comes back — so the second sidebar starts at the 1 the
+   * server counted, and the redelivery must add nothing to it. A genuinely new
+   * message still does, which is what separates this from simply going deaf.
+   */
+  it("does not count a message again after a remount", async () => {
+    const first = await readySidebar();
+    act(() => websocket.onMessageCreated?.(messageCreated("across-remount", channelA)));
+    expect(unreadCounts(first.result.current.state).channelA).toBe(1);
+    first.unmount();
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 1 }],
+      dms: [],
+    });
+    const second = await readySidebar();
+    act(() => websocket.onMessageCreated?.(messageCreated("across-remount", channelA)));
+
+    expect(unreadCounts(second.result.current.state).channelA).toBe(1);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+
+    act(() => websocket.onMessageCreated?.(messageCreated("after-remount", channelA)));
+    expect(unreadCounts(second.result.current.state).channelA).toBe(2);
+  });
+
+  it("keeps counting genuinely new messages", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      websocket.onMessageCreated?.(messageCreated("new-1", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-1", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-2", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-3", channelA));
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(3);
+  });
+
+  /**
+   * High cardinality: a session that receives far more messages than any dedupe
+   * structure could hold must not leave one growing behind it. The ledger's
+   * bound is asserted directly — unread still counts every one of them.
+   */
+  it("keeps its dedupe state bounded through a very long session", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      for (let index = 0; index < 3_000; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`long-session-${index}`, channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(3_000);
+    expect(retainedRealtimeIdCount()).toBeLessThanOrEqual(REALTIME_LEDGER_CAPACITY);
+  });
+});
+
+describe("useChatSidebar burst suppression (issue #750)", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [],
+    });
+  });
+
+  /**
+   * The property the whole issue rests on: suppression is about what the reader
+   * *hears*, never about what they are owed. A rajada chimes once and still
+   * counts every message — the badge is decided by the reducer, from the same
+   * event, and it never consults the presentation layer's outcome.
+   */
+  it("counts every message of a rajada while chiming once", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(25);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The in-app surface stays bounded by its own design (issue #744): one alert,
+   * the newest. A rajada replaces it rather than stacking, so nothing
+   * accumulates and the reader is always offered the latest activity to open.
+   */
+  it("keeps exactly one in-app alert through a rajada, the newest", async () => {
+    // The toast is drawn in this window, and jsdom reports an unfocused
+    // document by default — so this case has to say someone is looking.
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+    });
+
+    expect(result.current.inAppAlert?.messageId).toBe("rajada-24");
+  });
+
+  /**
+   * Why the memory lives in the module and not in this hook: a remount — a
+   * route change, StrictMode's second mount, a new socket generation — builds a
+   * fresh hook with a fresh dedup set, and none of that means the reader
+   * stopped hearing what this tab already announced.
+   */
+  it("does not announce again after a remount an event it already announced", async () => {
+    const first = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(first.result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    const second = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(second.result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a rajada in one conversation from silencing another", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+      websocket.onMessageCreated?.(messageCreated("elsewhere", channelB));
+    });
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useChatSidebar sound mode changes at runtime", () => {
+  /**
+   * Moves past the burst window (issue #750) so the next assertion is about the
+   * preference that just changed and not about the cooldown: these events are
+   * milliseconds apart in the same conversation, which is a rajada, and a
+   * rajada is exactly what the sound gate collapses.
+   *
+   * Only Date is faked — scheduling stays real, so waitFor still works.
+   */
+  function leaveTheSoundBurstWindow() {
+    vi.setSystemTime(new Date(Date.now() + SOUND_COOLDOWN_MS));
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     websocket.onMessageCreated = null;
     mockPlayMessageSound.mockReset();
     mockGetSoundNotificationMode.mockReset();
@@ -1709,6 +2095,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -1733,6 +2120,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
     // Switched back to 'all' mid-session: the very next eligible event plays
     // immediately, and the badge keeps counting correctly across the flip.
     mockGetSoundNotificationMode.mockReturnValue("all");
+    leaveTheSoundBurstWindow();
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-2b", channelA)));
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
     expect(unreadCounts(result.current.state).channelA).toBe(3);
@@ -1743,6 +2131,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-3", channelA)));
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
 
+    leaveTheSoundBurstWindow();
     act(() =>
       websocket.onMessageCreated?.(
         messageCreated(

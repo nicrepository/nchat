@@ -2,7 +2,7 @@
  * The one client-side authority for *presenting* a notification (issue #749).
  *
  * Everything that interrupts the reader for an incoming message goes through
- * `presentMessageNotification`: the in-app toast, the chime, the OS-level
+ * `presentLiveMessageNotification`: the in-app toast, the chime, the OS-level
  * notification. No component plays audio, opens a channel, or decides on its
  * own whether an event deserves a surface — this module is the only importer of
  * messageSound.ts, and the only place the three surfaces are executed.
@@ -62,6 +62,52 @@
  *   - no state is kept between events, and nothing crosses a tab boundary but
  *     the lock name, which is the message id and nothing else.
  *
+ * ## Temporality: a boundary, not a flag (issue #750)
+ *
+ * "Is this news?" is not asked of the event — it is settled by which code path
+ * is holding it, and this module is reachable from exactly one:
+ * `presentLiveMessageNotification` is called only from useChatSidebar's
+ * `onMessageCreated`, the live WebSocket fan-out. That is enforced, not merely
+ * observed: eslint.config.js forbids every other module in the app from
+ * importing this one, so a hydration or pagination path cannot start
+ * announcing messages without the build failing.
+ *
+ * There is deliberately no `origin` field a caller could set. A value that only
+ * ever holds one production value is a contract in name only; the separation
+ * below is what actually holds, and each half is tested through its real seam:
+ *
+ *   - **live fan-out** — the only presentation candidate. One frame, one
+ *     message, delivered as it happens;
+ *   - **hydration** (fetchSidebarData, the first page of a conversation),
+ *     **pagination** (loadMore), **reconnect recovery** (the coalescing
+ *     refetch the sidebar runs when a conversation event arrives without a
+ *     payload) and **resync** (`ws_subscription_ready`, which reconciles link
+ *     safety) are *state ingestion only*. None of them imports this module;
+ *   - **replay** does not exist to be classified: chat-service states its
+ *     contract as best-effort in-process delivery with no durability and no
+ *     replay (ws/doc.go), and a bus event that originated on this instance is
+ *     discarded rather than echoed back;
+ *   - **import and migration** (#506) arrive already decided: the policy
+ *     engine's `denyHistorical` denies every channel for any origin that is
+ *     not live, so an imported message reaches this module as a `deny` and
+ *     authorises nothing. That is the trusted contract, server-side, and this
+ *     client consumes it rather than re-deriving it from a flag of its own.
+ *
+ * What remains local is the other half: **has this client said it already, or
+ * said something for this conversation a moment ago?** The first is dedupe by
+ * message id; the second is the sound cooldown. Both live in notificationBurst,
+ * both are bounded by TTL and by capacity, and neither stores anything but ids.
+ *
+ * Neither touches unread, message state, persistence or `policy.web_push`. A
+ * chime the cooldown swallowed changes nothing about the badge, and a toast
+ * that was replaced by a newer one removed no message from the timeline.
+ *
+ * The cooldown is per tab, which the claim makes almost moot: at most one tab
+ * presents each event, so a burst produces at most one chime per window per
+ * tab that happened to win something. A second cross-tab lock would close that
+ * gap and is deliberately not here — the difference is a handful of chimes in a
+ * window against a second coordination primitive on the hot path.
+ *
  * A claim is not a record of what has been shown, and does not need to be:
  * chat-service states its realtime contract as "in-process best-effort, no
  * durability, no replay" (hub.go, PublishMessageCreated), and a (re)subscribe
@@ -76,8 +122,11 @@ import { showBrowserMessageNotification } from "./browserNotification";
 import type { InAppAlert } from "./InAppMessageAlert";
 import { buildMessagePreview } from "./messagePreview";
 import { playMessageSound } from "./messageSound";
+import { sessionScoped } from "../lib/sessionScoped";
+import { createBurstGate } from "./notificationBurst";
 import { getSoundNotificationMode } from "./soundPreference";
 import {
+  isNamedRecipient,
   shouldExecuteInAppNotification,
   shouldExecuteNativeNotification,
   shouldExecuteSound,
@@ -256,6 +305,8 @@ function lockManager(): Pick<LockManager, "request"> | undefined {
 export type PresentationDisposition =
   /** No surface was authorised for this event; no claim was attempted. */
   | "suppressed"
+  /** This client already announced this event id; it is not announced twice. */
+  | "repeat"
   /** This tab holds the claim and presented. */
   | "acquired"
   /** Another tab holds the claim for this event; this tab presented nothing. */
@@ -271,6 +322,65 @@ function holdClaim(): Promise<void> {
   return new Promise<void>((resolve) => {
     globalThis.setTimeout(resolve, PRESENTATION_CLAIM_HOLD_MS);
   });
+}
+
+/**
+ * This client's memory of what it has recently announced, and of which
+ * conversations have chimed (issue #750).
+ *
+ * Module-scoped rather than held by the hook that feeds it, and that is the
+ * whole point: a remount, a route change, React StrictMode's double mount and a
+ * new WebSocket generation all replace the caller's state, and none of them
+ * means the reader has stopped hearing what this tab already said. Bounded by
+ * TTL and by capacity — see notificationBurst.
+ *
+ * The one boundary it does respect is identity. "This tab already announced
+ * that" is a statement about a reader, so it cannot survive the reader
+ * changing: a logout, a different account or a replaced token starts an empty
+ * memory, and the next session neither inherits a cooldown nor is silenced by
+ * what the previous one heard. `sessionScoped` reads the session generation the
+ * rest of the app already keys on — no listener, nothing to tear down.
+ */
+const presentationMemory = sessionScoped(() => createBurstGate());
+
+/**
+ * The key a chime is rate-limited under: **one conversation, one class**.
+ *
+ * Per conversation, because a burst is a stream in one room and silencing the
+ * rest of the app for it would hide unrelated activity — the cheapest way to
+ * turn a fix for noise into a fix for hearing anything at all.
+ *
+ * Split by whether the message names this recipient, because a room going fast
+ * is exactly when a message addressed to them personally must still be audible.
+ * That split is not a new priority: it is `named_user_ids`/`names_everyone`,
+ * decided by the server's own mention codec and already read by soundRules.
+ *
+ * Nothing else composes the key. Adding the sender would let one person per
+ * room chime freely; adding the message would be no cooldown at all.
+ */
+function soundCooldownKey(event: MessageNotificationEvent, currentUserId: string): string {
+  const named = isNamedRecipient(event.policy, currentUserId);
+  return `${event.targetKind}:${event.targetId}:${named ? "named" : "room"}`;
+}
+
+/**
+ * The whole of what happens on the tab that won the claim.
+ *
+ * The event is recorded as announced *here* rather than at the entry point, so
+ * a tab that lost the claim keeps no memory of an event it never presented —
+ * and the sound budget is consumed here for the same reason. A cooldown spent
+ * by a tab that stayed silent would silence that tab's next real chime.
+ */
+function presentOnce(
+  event: MessageNotificationEvent,
+  context: MessagePresentationContext,
+  surfaces: AuthorisedSurfaces,
+  sinks: MessagePresentationSinks,
+): void {
+  const memory = presentationMemory();
+  memory.markPresented(event.eventId);
+  const sound = surfaces.sound && memory.allowSound(soundCooldownKey(event, context.currentUserId));
+  executeSurfaces(event, { ...surfaces, sound }, sinks);
 }
 
 /**
@@ -316,22 +426,31 @@ async function claimAndPresent(
 }
 
 /**
- * Presents one incoming message, if any surface authorised it and this tab wins
- * the event's claim.
+ * Presents one **live** incoming message, if any surface authorised it and this
+ * tab wins the event's claim.
+ *
+ * "Live" is in the name because it is the contract, not a description: the only
+ * caller is the WebSocket fan-out handler, and eslint.config.js keeps it that
+ * way. Anything that recovers state — hydration, a page of history, the
+ * sidebar's reconnect refetch, a resync — ingests it and does not come here.
+ * See the module comment.
  *
  * Resolves with what the claim established, and never rejects — so a caller
  * that has no use for the outcome may ignore the promise. Unread, message state
  * and the socket are decided upstream from the same event and do not depend on
  * whether this tab was the one that announced it.
  */
-export async function presentMessageNotification(
+export async function presentLiveMessageNotification(
   event: MessageNotificationEvent,
   context: MessagePresentationContext,
   sinks: MessagePresentationSinks,
 ): Promise<PresentationDisposition> {
+  // This client's own memory first. Checked before the claim so a tab that
+  // already announced an event does not take it from one that has not.
+  if (presentationMemory().hasPresented(event.eventId)) return "repeat";
   const surfaces = authorisedSurfaces(event, context);
   // Nothing to present is not a claim: a tab with the conversation open must
   // not take the event away from a tab that would actually announce it.
   if (!surfaces.inApp && !surfaces.native && !surfaces.sound) return "suppressed";
-  return await claimAndPresent(event.eventId, () => executeSurfaces(event, surfaces, sinks));
+  return await claimAndPresent(event.eventId, () => presentOnce(event, context, surfaces, sinks));
 }

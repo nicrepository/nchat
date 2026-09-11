@@ -21,10 +21,11 @@ import {
 } from "./sidebarUnreadPersistence";
 import type { InAppAlert } from "./InAppMessageAlert";
 import {
-  presentMessageNotification,
+  presentLiveMessageNotification,
   type MessageNotificationEvent,
   type MessagePresentationSinks,
 } from "./notificationPresentation";
+import { admitRealtimeMessage } from "./realtimeMessageLedger";
 import { isNamedRecipient } from "./soundRules";
 import {
   useChatWebSocket,
@@ -392,7 +393,7 @@ function presentIncomingMessage(
   // rejects, and its outcome changes nothing here. Whether this tab won the
   // event's claim, lost it, or found no way to coordinate at all, the unread
   // badge and the message itself are decided by the lines that follow.
-  void presentMessageNotification(
+  void presentLiveMessageNotification(
     notificationEventFrom(event, payload, row.name),
     {
       currentUserId: state.currentUserId,
@@ -418,7 +419,6 @@ export function useChatSidebar() {
   const openedTarget = targetFromPath(pathname);
   const openedTargetKind = openedTarget?.kind;
   const openedTargetId = openedTarget?.targetId;
-  const seenRealtimeMessageIds = useRef(new Set<string>());
   const mountedRef = useRef(true);
   const loadPromiseRef = useRef<Promise<void> | null>(null);
 
@@ -609,8 +609,14 @@ export function useChatSidebar() {
     // same refetch settles it — and it is coalesced, so a burst costs one.
     onConversationEvent: refreshSidebar,
     onMessageCreated: (event: WSMessageCreatedEvent) => {
-      if (seenRealtimeMessageIds.current.has(event.message_id)) return;
-      seenRealtimeMessageIds.current.add(event.message_id);
+      // State ingestion, once per message and before anything derives from it
+      // (issue #750). `false` is a redelivery: this client already took the
+      // message in, so it must neither count again nor be offered for
+      // presentation. The ledger is bounded and session-scoped — it replaced an
+      // unbounded Set held here, which grew for the life of the tab. See
+      // realtimeMessageLedger for why bounding it is safe against the server's
+      // own delivery contract.
+      if (!admitRealtimeMessage(event.message_id)) return;
       // The message's own created_at, assigned when the row was written — not
       // the envelope's created_at (when the event was published), not the moment
       // it arrived here, and never a browser clock. It is absent on route-only
