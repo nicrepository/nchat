@@ -3243,3 +3243,66 @@
     padding-top: 8px;
   }
 }
+
+/* ── Acknowledgement (issue #824) ───────────────────────────────────────────
+   One row under the message body, never a card: #820's rendering rules keep
+   the request attached to the message rather than wrapping it, and a panel per
+   urgent message would make a busy channel unreadable. Every value is an
+   existing token, so this inherits both themes without declaring a palette. */
+.chat-msg-ack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  font-size: 12px;
+}
+
+.chat-msg-ack__action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 999px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-msg-ack__action:hover:not(:disabled) {
+  background: var(--color-surface-2, #f8fbfc);
+}
+
+.chat-msg-ack__action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* The resolved states carry their own words (see MessageAcknowledgement), so
+   the colour here is reinforcement and never the only signal. */
+.chat-msg-ack__state {
+  margin: 0;
+  color: var(--color-muted, #5c7380);
+}
+
+.chat-msg-ack__state[data-state="acknowledged"],
+.chat-msg-ack__state[data-state="responded"] {
+  color: var(--color-success, #1f7a4d);
+}
+
+.chat-msg-ack__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  color: var(--color-muted, #5c7380);
+}
+
+.chat-msg-ack__count {
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+}

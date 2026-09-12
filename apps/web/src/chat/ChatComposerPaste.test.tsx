@@ -499,6 +499,6 @@ describe("pasting text alongside an image", () => {
     expect(await screen.findByText("Pronto para enviar")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("chat-send-btn"));
 
-    expect(view.onSend).toHaveBeenCalledWith("legenda", ["a-1"]);
+    expect(view.onSend).toHaveBeenCalledWith("legenda", ["a-1"], false);
   });
 });

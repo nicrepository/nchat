@@ -69,29 +69,40 @@ type fakeMessageStore struct {
 	lastCountEligibleDMID           string
 	lastCountEligibleSender         string
 	lastCountEligibleLimit          int
-	editedMessage                   domain.Message
-	editErr                         error
-	deletedMessage                  domain.Message
-	deleteChanged                   bool
-	deleteErr                       error
-	editHistory                     []domain.MessageEditHistory
-	linkSafetyStates                []domain.MessageLinkSafetyState
-	admissionResult                 string
-	admittedWorkspace               string
-	admittedCapacity                storage.LinkScanCapacity
-	linkSafetyErr                   error
-	linkSafetyWorkspace             string
-	linkSafetySender                string
-	linkSafetyIDs                   []string
-	historyErr                      error
-	forwardedMessage                domain.Message
-	forwardReplayed                 bool
-	forwardErr                      error
-	forwardSnapshot                 storage.ForwardSnapshot
-	snapshotErr                     error
-	replayMessage                   domain.Message
-	replayErr                       error
-	createReplayMessage             domain.Message
+	// acknowledgementRecipients and acknowledgementRecipientsErr control
+	// CountAcknowledgementRecipientsUpTo (issue #824). The counters let a test
+	// assert the bound was consulted only for a send that asked for
+	// acknowledgement, and with which target.
+	acknowledgementRecipients    int
+	acknowledgementRecipientsErr error
+	countAcknowledgementCalls    int
+	lastAcknowledgementChannelID string
+	lastAcknowledgementDMID      string
+	lastAcknowledgementSender    string
+	lastAcknowledgementLimit     int
+	editedMessage                domain.Message
+	editErr                      error
+	deletedMessage               domain.Message
+	deleteChanged                bool
+	deleteErr                    error
+	editHistory                  []domain.MessageEditHistory
+	linkSafetyStates             []domain.MessageLinkSafetyState
+	admissionResult              string
+	admittedWorkspace            string
+	admittedCapacity             storage.LinkScanCapacity
+	linkSafetyErr                error
+	linkSafetyWorkspace          string
+	linkSafetySender             string
+	linkSafetyIDs                []string
+	historyErr                   error
+	forwardedMessage             domain.Message
+	forwardReplayed              bool
+	forwardErr                   error
+	forwardSnapshot              storage.ForwardSnapshot
+	snapshotErr                  error
+	replayMessage                domain.Message
+	replayErr                    error
+	createReplayMessage          domain.Message
 	// createReplayOnRetry is what the *second* lookup finds: the concurrent case,
 	// where the first lookup misses and the insert then collides.
 	createReplayOnRetry domain.Message
@@ -656,6 +667,26 @@ func (f *fakeMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Conte
 		return limit, nil
 	}
 	return f.eligibleAllMentionRecipients, nil
+}
+
+// CountAcknowledgementRecipientsUpTo saturates the same way, for the same
+// reason: a test setting acknowledgementRecipients far above the bound must see
+// the ceiling the real store would return, not the true size.
+func (f *fakeMessageStore) CountAcknowledgementRecipientsUpTo(
+	_ context.Context, _, channelID, dmConversationID, senderID string, limit int,
+) (int, error) {
+	f.countAcknowledgementCalls++
+	f.lastAcknowledgementChannelID = channelID
+	f.lastAcknowledgementDMID = dmConversationID
+	f.lastAcknowledgementSender = senderID
+	f.lastAcknowledgementLimit = limit
+	if f.acknowledgementRecipientsErr != nil {
+		return 0, f.acknowledgementRecipientsErr
+	}
+	if f.acknowledgementRecipients > limit {
+		return limit, nil
+	}
+	return f.acknowledgementRecipients, nil
 }
 
 func (f *fakeMessageStore) ListChannelMessages(_ context.Context, _ storage.ListChannelMessagesInput) (storage.ListMessagesResult, error) {

@@ -1053,6 +1053,85 @@ describe("useChatWebSocket", () => {
     expect(onConversationUpdated).not.toHaveBeenCalled();
   });
 
+  // ── message.acknowledgement_updated (issue #824) ─────────────────────────
+  //
+  // One message's acknowledgement changed. Route plus message id, so the
+  // handler re-reads the authorised summary rather than applying anything from
+  // the broadcast — which is also why there is nothing in the frame to apply.
+
+  it("routes message.acknowledgement_updated for a subscribed target exactly once", () => {
+    const onAcknowledgementUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onAcknowledgementUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "message.acknowledgement_updated",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-asked",
+      }),
+    );
+
+    expect(onAcknowledgementUpdated).toHaveBeenCalledOnce();
+    expect(onAcknowledgementUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({ target_id: "ch-1", message_id: "msg-asked" }),
+    );
+  });
+
+  // The subscription set is the boundary, exactly as it is for every other
+  // conversation-scoped hint: an acknowledgement in a conversation this client
+  // does not watch is none of its business.
+  it("ignores message.acknowledgement_updated for a target it does not watch", () => {
+    const onAcknowledgementUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onAcknowledgementUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "message.acknowledgement_updated",
+        target_type: "channel",
+        target_id: "ch-other",
+        message_id: "msg-asked",
+      }),
+    );
+
+    expect(onAcknowledgementUpdated).not.toHaveBeenCalled();
+  });
+
+  // A frame naming no message has nothing to re-read, and is dropped rather
+  // than forwarded as an event with an empty id.
+  it("drops message.acknowledgement_updated without a message id", () => {
+    const onAcknowledgementUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onAcknowledgementUpdated,
+      }),
+    );
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "message.acknowledgement_updated",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+
+    expect(onAcknowledgementUpdated).not.toHaveBeenCalled();
+  });
+
   // ── conversation.event (issue #527) ──────────────────────────────────────
   //
   // A system message landed — a rename, a departure. Route plus message id, so

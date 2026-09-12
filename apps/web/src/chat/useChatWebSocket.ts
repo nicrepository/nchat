@@ -404,6 +404,23 @@ export interface WSConversationEventMessage {
 }
 
 /**
+ * One message's acknowledgement changed (issue #824).
+ *
+ * An invalidation hint and nothing else: it names the message and the
+ * conversation, and the handler re-reads the authorised summary for exactly
+ * that message. The server deliberately puts no state on the wire — who
+ * answered and how many are outstanding are a per-reader answer, and a
+ * broadcast has no way to make one — so there is nothing here to apply
+ * directly, and nothing here that a subscriber was not already allowed to know.
+ */
+export interface WSAcknowledgementUpdatedEvent {
+  type: "message.acknowledgement_updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+}
+
+/**
  * An attachment's antimalware verdict changed (RF-22).
  *
  * Produced by file-service and relayed over the same bus and the same
@@ -463,6 +480,8 @@ interface UseChatWebSocketOptions {
   onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
   onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   onConversationEvent?: (event: WSConversationEventMessage) => void;
+  /** Issue #824: one message's acknowledgement changed; re-read just that one. */
+  onAcknowledgementUpdated?: (event: WSAcknowledgementUpdatedEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
   onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -511,6 +530,7 @@ export function useChatWebSocket({
   onConversationAvailable,
   onConversationUpdated,
   onConversationEvent,
+  onAcknowledgementUpdated,
   onReactionError,
   onSubscriptionError,
   onSubscribed,
@@ -544,6 +564,7 @@ export function useChatWebSocket({
   const onConversationAvailableRef = useRef(onConversationAvailable);
   const onConversationUpdatedRef = useRef(onConversationUpdated);
   const onConversationEventRef = useRef(onConversationEvent);
+  const onAcknowledgementUpdatedRef = useRef(onAcknowledgementUpdated);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
@@ -570,6 +591,7 @@ export function useChatWebSocket({
     onConversationAvailableRef.current = onConversationAvailable;
     onConversationUpdatedRef.current = onConversationUpdated;
     onConversationEventRef.current = onConversationEvent;
+    onAcknowledgementUpdatedRef.current = onAcknowledgementUpdated;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
@@ -773,7 +795,36 @@ export function useChatWebSocket({
         onAttachmentStatusRef.current?.(incoming.data as unknown as WSAttachmentStatusEvent);
         return true;
       }
+      if (routeAcknowledgementUpdated(d, incoming)) return true;
       return routeConversationEvent(d, incoming);
+    }
+
+    /**
+     * Issue #824. One message's acknowledgement changed; re-read that one.
+     *
+     * Its own router rather than another branch inside routeConversationEvent:
+     * that function is already at the complexity the project allows, and a hint
+     * that is neither a conversation update nor a system message does not belong
+     * in the function named for those two anyway.
+     *
+     * Gated on the message id for the same reason its neighbours are — a frame
+     * naming nothing to re-read is a frame with nothing to do.
+     */
+    function routeAcknowledgementUpdated(
+      d: Record<string, unknown>,
+      incoming: IncomingTarget,
+    ): boolean {
+      if (
+        d["type"] !== "message.acknowledgement_updated" ||
+        !incoming.type ||
+        typeof d["message_id"] !== "string"
+      ) {
+        return false;
+      }
+      onAcknowledgementUpdatedRef.current?.(
+        incoming.data as unknown as WSAcknowledgementUpdatedEvent,
+      );
+      return true;
     }
 
     // An event with no recognised target type is not one this protocol produces
