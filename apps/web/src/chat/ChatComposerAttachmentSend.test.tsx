@@ -145,7 +145,7 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("", ["att-1"]);
+    expect(onSend).toHaveBeenCalledWith("", ["att-1"], false);
     expect(mockDeleteAttachment).not.toHaveBeenCalled();
     // The bytes went up when the file was chosen. Pressing Enviar links a
     // reference; it must never upload anything again.
@@ -162,7 +162,7 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("veja isto", ["att-1"]);
+    expect(onSend).toHaveBeenCalledWith("veja isto", ["att-1"], false);
     expect(mockUploadAttachment).toHaveBeenCalledTimes(1);
   });
 
@@ -265,6 +265,6 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("nova conversa", undefined);
+    expect(onSend).toHaveBeenCalledWith("nova conversa", undefined, false);
   });
 });

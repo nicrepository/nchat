@@ -654,6 +654,9 @@ describe("composer drafts never cross conversation targets", () => {
         referencedMessageId: undefined,
         attachmentIds: undefined,
         idempotencyKey: expect.any(String),
+        // Issue #824: carried on every send and omitted from the wire when
+        // false, which chatApiAcknowledgement.test.ts asserts separately.
+        acknowledgementRequired: false,
       },
     );
     expect(api.postChannelMessage).not.toHaveBeenCalledWith(

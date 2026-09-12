@@ -5,6 +5,7 @@ import {
   useChatWebSocket,
   type WSAttachmentStatusEvent,
   type WSClientErrorEvent,
+  type WSAcknowledgementUpdatedEvent,
   type WSConversationEventMessage,
   type WSMembersAddedEvent,
   type WSMessageBlockedEvent,
@@ -53,6 +54,18 @@ interface Options {
   reads: AuthoritativeReads;
   reactions: ReactionEventHandlers;
   reconciliation: SecurityReconciliation;
+  /**
+   * Issue #824. Re-reads the acknowledgement summaries this view holds when the
+   * subscription comes back ready, so a reconnect reconciles against the server
+   * instead of trusting a cache that may have gone stale off-socket.
+   */
+  reconcileAcknowledgements?: () => void;
+  /**
+   * Issue #824. Re-reads one message's acknowledgement, because the server said
+   * that message changed. Targeted rather than conversation-wide: the event
+   * names the message, so exactly that message is asked about.
+   */
+  reconcileAcknowledgement?: (messageId: string) => void;
   /** Told when an event took a message out of the timeline. */
   notifyRemoved: () => void;
   listeners: RealtimeListeners;
@@ -84,6 +97,8 @@ export function useMessageRealtime({
   reads,
   reactions,
   reconciliation,
+  reconcileAcknowledgements,
+  reconcileAcknowledgement,
   notifyRemoved,
   listeners,
 }: Options): MessageRealtime {
@@ -218,12 +233,36 @@ export function useMessageRealtime({
     [dispatch],
   );
 
+  // Issue #824. One event, one message, one re-read. The handler applies nothing
+  // itself: the frame carries no acknowledgement state, so the only thing to do
+  // with it is ask the authorised endpoint — which is also what keeps a
+  // redelivered event idempotent, since two reads of the same message return the
+  // same answer.
+  const handleAcknowledgementUpdated = useCallback(
+    (event: WSAcknowledgementUpdatedEvent) => {
+      if (!event.message_id) return;
+      reconcileAcknowledgement?.(event.message_id);
+    },
+    [reconcileAcknowledgement],
+  );
+
   const { reconcilePendingLinkScans, refreshAuthoritativeMessageSecurity } = reconciliation;
   const handleSubscribed = useCallback(() => {
     dispatch({ type: "ws_subscription_ready" });
     reconcilePendingLinkScans();
     refreshAuthoritativeMessageSecurity();
-  }, [dispatch, reconcilePendingLinkScans, refreshAuthoritativeMessageSecurity]);
+    // Issue #824. A subscription that comes back ready is this client's only
+    // signal that it may have missed something, so acknowledgement re-reads the
+    // server's own summaries here rather than polling for them. It is the
+    // mechanism the two calls above already use; nothing new was invented for
+    // acknowledgement, and no event was added to the protocol.
+    reconcileAcknowledgements?.();
+  }, [
+    dispatch,
+    reconcileAcknowledgements,
+    reconcilePendingLinkScans,
+    refreshAuthoritativeMessageSecurity,
+  ]);
 
   // The timeline reconciles itself from the event (RF-32) while the caller
   // still gets to refresh whatever else lists this destination's files. No
@@ -289,6 +328,7 @@ export function useMessageRealtime({
     onMembersAdded: handleMembersAdded,
     onAttachmentStatus: handleAttachmentStatus,
     onConversationEvent: handleConversationEvent,
+    onAcknowledgementUpdated: handleAcknowledgementUpdated,
     onReactionError: reactions.handleReactionError,
     onSubscriptionError: handleSubscriptionError,
     onSubscribed: handleSubscribed,

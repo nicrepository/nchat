@@ -91,7 +91,11 @@ export interface ChatComposerProps {
    * pressing Enviar links them to the new message rather than sending them
    * again.
    */
-  onSend: (body: string, attachmentIds?: string[]) => Promise<SendResult>;
+  onSend: (
+    body: string,
+    attachmentIds?: string[],
+    acknowledgementRequired?: boolean,
+  ) => Promise<SendResult>;
   /**
    * Destination for attachments (RF-32, issue #458). One prop serves channels
    * and DMs — the composer is already the single place both render — so the
@@ -630,12 +634,17 @@ function ComposerBar({
   voice,
   canSend,
   onSend,
+  acknowledgementRequired,
+  onAcknowledgementRequiredChange,
 }: {
   editor: Editor | null;
   disabled: boolean;
   emoji?: ComposerEmojiOptions;
   pickerOpen: boolean;
   onPickerOpenChange: (open: boolean) => void;
+  /** Issue #824: whether the next send asks for confirmation, and its toggle. */
+  acknowledgementRequired: boolean;
+  onAcknowledgementRequiredChange: (required: boolean) => void;
   /** Absent when this composer has nowhere to put a file. */
   attach: ComposerAttachOptions | null;
   /** Absent when this composer has no destination, or the browser cannot record. */
@@ -651,6 +660,8 @@ function ComposerBar({
         emoji={emoji}
         pickerOpen={pickerOpen}
         onPickerOpenChange={onPickerOpenChange}
+        acknowledgementRequired={acknowledgementRequired}
+        onAcknowledgementRequiredChange={onAcknowledgementRequiredChange}
       />
       {attach && <ComposerAttachButton {...attach} />}
       {voice && (
@@ -805,6 +816,13 @@ export default function ChatComposer({
     draftKey,
   });
   const recording = recorder.phase !== "idle";
+  /**
+   * Whether the next send asks its recipients to confirm receipt (issue #824).
+   *
+   * Composer state, not conversation state: it describes the draft, so it
+   * resets with the draft and never outlives the message it was set for.
+   */
+  const [acknowledgementRequired, setAcknowledgementRequired] = useState(false);
   const pendingAttachments = upload.items
     .map((item) => item.attachment)
     .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
@@ -843,12 +861,17 @@ export default function ChatComposer({
     const result = await onSend(
       body,
       pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
+      acknowledgementRequired,
     );
     if (result.status === "sent") {
       shouldClearTextRef.current =
         (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
       upload.resetAfterPublish();
       setEmojiPickerOpen(false);
+      // The request belongs to the message that carried it, not to the
+      // composer: leaving it on would silently ask for confirmation of
+      // everything typed afterwards (issue #824).
+      setAcknowledgementRequired(false);
     }
     return result;
   };
@@ -970,6 +993,8 @@ export default function ChatComposer({
               // sending now would post a message without it.
               canSend={canSend && !uploading}
               onSend={handleSend}
+              acknowledgementRequired={acknowledgementRequired}
+              onAcknowledgementRequiredChange={setAcknowledgementRequired}
             />
           </>
         )}

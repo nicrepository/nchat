@@ -114,9 +114,17 @@ type MessageHandler struct {
 	favorites      favoriteProvider
 	pins           pinProvider
 	pinBroadcaster pinBroadcaster
-	settings       storage.WorkspaceSettingsStore
-	settingsAuth   workspaceSettingsAuthorizer
-	editLimiter    editRateLimiter
+	// acknowledgements serves the issue #824 endpoints. Nil until WithAcknowledgements
+	// is called, which is what makes those two routes answer 503 rather than
+	// panic in a deployment without a database.
+	acknowledgements acknowledgementProvider
+	// acknowledgementBroadcaster announces a committed acknowledgement to the
+	// conversation's subscribers (issue #824). Nil is a working deployment: the
+	// endpoint still records the change, and clients reconcile on reconnect.
+	acknowledgementBroadcaster acknowledgementBroadcaster
+	settings                   storage.WorkspaceSettingsStore
+	settingsAuth               workspaceSettingsAuthorizer
+	editLimiter                editRateLimiter
 	// linkReconcile answers "Verificar novamente" (issue #135). Nil is a working
 	// deployment: the route then answers 503 rather than pretending it looked.
 	linkReconcile linkReconcileProvider
@@ -173,6 +181,16 @@ func (h *MessageHandler) WithPins(pins pinProvider, broadcaster pinBroadcaster) 
 	return h
 }
 
+// WithAcknowledgements enables the issue #824 acknowledgement endpoints.
+// Returns the handler for chaining; when never called, those routes answer 503.
+func (h *MessageHandler) WithAcknowledgements(
+	acknowledgements acknowledgementProvider, broadcaster acknowledgementBroadcaster,
+) *MessageHandler {
+	h.acknowledgements = acknowledgements
+	h.acknowledgementBroadcaster = broadcaster
+	return h
+}
+
 // NewMessageHandler returns a MessageHandler. Missing dependencies produce 503
 // only on the endpoints that use them.
 func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, mentions mentionProvider) *MessageHandler {
@@ -213,6 +231,16 @@ type messageJSON struct {
 	// defaulting the server already did. It is descriptive: nothing a client may
 	// do is widened by it.
 	Priority string `json:"priority"`
+	// AcknowledgementRequired says this message asked its recipients to confirm
+	// receipt (issue #824). Always present, for the same reason Priority is:
+	// every message has an answer to this and it is not the client's job to
+	// default it.
+	//
+	// It says only that the request exists. Who was asked, who answered and what
+	// this caller's own state is are not here — they are a separate read, so the
+	// message list stays one query and a timeline of a hundred messages does not
+	// aggregate a hundred recipient sets it will not draw.
+	AcknowledgementRequired bool `json:"acknowledgement_required"`
 	// LinkSafetyState is the link-safety axis and is independent of Status
 	// (issue #135): a published message whose links could not all be verified is
 	// `active` and carries "inconclusive" here. It is what the client draws the
@@ -423,6 +451,19 @@ type createMessageRequest struct {
 	// carrying "priority" is a 400 — there is no payload that re-prioritises a
 	// message after it was sent.
 	Priority json.RawMessage `json:"priority"`
+	// AcknowledgementRequired asks this message's recipients to confirm receipt
+	// (issue #824).
+	//
+	// A plain bool, unlike Priority above, because here absence and false are
+	// the same request: a client that says nothing is asking for nothing, and
+	// there is no third value for the two to be confused with. A wrong JSON type
+	// is refused by decodeStrictJSON before this field is read.
+	//
+	// Accepted on create only. editMessageRequest has no counterpart and
+	// decodeStrictJSON rejects unknown fields, so a PATCH carrying it is a 400:
+	// editing a message neither adds a confirmation request nor withdraws one,
+	// and — the rule #824 states — never resets an answer already given.
+	AcknowledgementRequired bool `json:"acknowledgement_required"`
 	// AttachmentIDs binds already-uploaded files to this message (RF-32).
 	//
 	// A list, even though the product rule is one attachment per message, so
@@ -567,24 +608,25 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		editedAt = &m.EditedAt
 	}
 	j := messageJSON{
-		ID:                m.ID,
-		SenderID:          m.SenderID,
-		SenderDisplayName: m.SenderDisplayName,
-		SenderEmail:       m.SenderEmail,
-		SenderAvatarURL:   m.SenderAvatarURL,
-		Kind:              string(m.Kind),
-		BodyFormat:        string(m.BodyFormat),
-		Status:            string(m.Status),
-		Priority:          string(m.Priority.OrStandard()),
-		LinkSafetyState:   string(m.LinkSafety),
-		CreatedAt:         m.CreatedAt,
-		UpdatedAt:         m.UpdatedAt,
-		EditedAt:          editedAt,
-		EditCount:         m.EditCount,
-		IsEdited:          m.EditCount > 0,
-		Reactions:         make([]reactionJSON, len(m.Reactions)),
-		IsFavorited:       m.IsFavorited,
-		IsForwarded:       m.ForwardedFromMessageID != "",
+		ID:                      m.ID,
+		SenderID:                m.SenderID,
+		SenderDisplayName:       m.SenderDisplayName,
+		SenderEmail:             m.SenderEmail,
+		SenderAvatarURL:         m.SenderAvatarURL,
+		Kind:                    string(m.Kind),
+		BodyFormat:              string(m.BodyFormat),
+		Status:                  string(m.Status),
+		Priority:                string(m.Priority.OrStandard()),
+		AcknowledgementRequired: m.AcknowledgementRequired,
+		LinkSafetyState:         string(m.LinkSafety),
+		CreatedAt:               m.CreatedAt,
+		UpdatedAt:               m.UpdatedAt,
+		EditedAt:                editedAt,
+		EditCount:               m.EditCount,
+		IsEdited:                m.EditCount > 0,
+		Reactions:               make([]reactionJSON, len(m.Reactions)),
+		IsFavorited:             m.IsFavorited,
+		IsForwarded:             m.ForwardedFromMessageID != "",
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
@@ -1294,16 +1336,17 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	msg, err := h.messages.CreateChannelMessage(r.Context(), service.CreateChannelMessageInput{
-		WorkspaceID:         wsID,
-		ChannelID:           channelID,
-		SenderID:            userID, // always from auth context — never from body
-		BodyText:            req.BodyText,
-		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
-		IdempotencyKey:      idempotencyKey,
-		ParentMessageID:     req.ParentMessageID,
-		ReferencedMessageID: req.ReferencedMessageID,
-		AttachmentIDs:       req.AttachmentIDs,
-		Priority:            priority,
+		WorkspaceID:             wsID,
+		ChannelID:               channelID,
+		SenderID:                userID, // always from auth context — never from body
+		BodyText:                req.BodyText,
+		BodyFormat:              domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:          idempotencyKey,
+		ParentMessageID:         req.ParentMessageID,
+		ReferencedMessageID:     req.ReferencedMessageID,
+		AttachmentIDs:           req.AttachmentIDs,
+		Priority:                priority,
+		AcknowledgementRequired: req.AcknowledgementRequired,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1455,16 +1498,17 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 	}
 
 	msg, err := h.messages.CreateDMMessage(r.Context(), service.CreateDMMessageInput{
-		WorkspaceID:         wsID,
-		ConversationID:      convID,
-		SenderID:            userID,
-		BodyText:            req.BodyText,
-		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
-		IdempotencyKey:      idempotencyKey,
-		ParentMessageID:     req.ParentMessageID,
-		ReferencedMessageID: req.ReferencedMessageID,
-		AttachmentIDs:       req.AttachmentIDs,
-		Priority:            priority,
+		WorkspaceID:             wsID,
+		ConversationID:          convID,
+		SenderID:                userID,
+		BodyText:                req.BodyText,
+		BodyFormat:              domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:          idempotencyKey,
+		ParentMessageID:         req.ParentMessageID,
+		ReferencedMessageID:     req.ReferencedMessageID,
+		AttachmentIDs:           req.AttachmentIDs,
+		Priority:                priority,
+		AcknowledgementRequired: req.AcknowledgementRequired,
 	})
 	if err != nil {
 		mapServiceError(w, err)

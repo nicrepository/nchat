@@ -18,6 +18,7 @@ export default function ConversationNotices({
   actionError,
   openDMError,
   pinError,
+  acknowledgeError,
   typingLabel,
 }: {
   sendError: string | null;
@@ -25,9 +26,11 @@ export default function ConversationNotices({
   actionError: string | null;
   openDMError: string | null;
   pinError: string | null;
+  /** Issue #824: a confirmation that could not be recorded. */
+  acknowledgeError?: string | null;
   typingLabel: string | null;
 }) {
-  const refusal = actionError ?? openDMError ?? pinError;
+  const refusal = actionError ?? openDMError ?? pinError ?? acknowledgeError ?? null;
   return (
     <>
       {sendError && (

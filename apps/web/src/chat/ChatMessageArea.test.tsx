@@ -4190,6 +4190,9 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         referencedMessageId: undefined,
         attachmentIds: undefined,
         idempotencyKey: expect.any(String),
+        // Issue #824: carried on every send and omitted from the wire when
+        // false, which chatApiAcknowledgement.test.ts asserts separately.
+        acknowledgementRequired: false,
       },
     ]);
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
@@ -4518,6 +4521,9 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         referencedMessageId: rf09SourceMessageID,
         attachmentIds: undefined,
         idempotencyKey: expect.any(String),
+        // Issue #824: carried on every send and omitted from the wire when
+        // false, which chatApiAcknowledgement.test.ts asserts separately.
+        acknowledgementRequired: false,
       },
     ]);
     await waitFor(() =>

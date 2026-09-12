@@ -173,6 +173,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     toggleReaction,
     sendTyping,
     toggleFavorite,
+    acknowledgements,
+    acknowledgingId,
+    acknowledgeError,
+    acknowledge,
     reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,
@@ -302,11 +306,16 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   }, []);
 
   const handleSend = useCallback(
-    async (body: string, attachmentIds?: string[]): Promise<SendResult> => {
+    async (
+      body: string,
+      attachmentIds?: string[],
+      acknowledgementRequired?: boolean,
+    ): Promise<SendResult> => {
       const result = await sendMessage(
         body,
         pendingReference.messageId || undefined,
         attachmentIds,
+        acknowledgementRequired,
       );
       if (result.status === "sent") {
         // Sending is itself the clearest possible "stopped typing" signal — do
@@ -423,6 +432,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onEditForbidden: handleEditForbidden,
     onDeleteMessage: deleteMessageLocal,
     onTogglePin: togglePin,
+    onAcknowledge: acknowledge,
   };
 
   const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);
@@ -474,6 +484,8 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           editDisabledIds={editDisabledIds}
           pinnedIds={pinnedIds}
           openingAuthorDMIds={authorDM.openingAuthorDMIds}
+          acknowledgements={acknowledgements}
+          acknowledgingId={acknowledgingId}
           recentReactionEmojis={recentReactionEmojis}
           emojiUsage={emojiUsage}
           onEmojiToneChange={changeEmojiTone}
@@ -491,6 +503,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           actionError={state.actionError}
           openDMError={authorDM.openDMError}
           pinError={pinError}
+          acknowledgeError={acknowledgeError}
           typingLabel={typingIndicatorLabel}
         />
 

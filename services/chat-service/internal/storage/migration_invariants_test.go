@@ -1142,3 +1142,55 @@ func TestChatMigration_MessagePriorityCheckIsValidated(t *testing.T) {
 		}
 	}
 }
+
+// Issue #824. The acknowledgement schema's three load-bearing properties: a
+// flag that makes every pre-existing message mean "asked nobody", a primary key
+// that is the uniqueness guarantee rather than a second index next to one, and
+// a coherence check that refuses half a resolution.
+func TestChatMigration_AcknowledgementSchemaHoldsItsOwnInvariants(t *testing.T) {
+	up := readChatMigration(t, "000049_message_acknowledgement.up.sql")
+	for _, expected := range []string{
+		// The backfill is the column default; every message written before this
+		// migration asked for nothing, and the schema says so.
+		"ADD COLUMN acknowledgement_required BOOLEAN NOT NULL DEFAULT false",
+		// Identity, not a separate unique index: a recipient is their row, so a
+		// second acknowledgement cannot become a second row.
+		"PRIMARY KEY (message_id, recipient_id)",
+		// The five states of #820's machine, and no others.
+		"CHECK (state IN ('pending', 'acknowledged', 'responded', 'expired', 'cancelled'))",
+		// Resolution and its instant are one fact; the schema refuses half of it.
+		"CHECK ((state = 'pending') = (resolved_at IS NULL))",
+		// The rows belong to the message and disappear with it.
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000049 missing %q", expected)
+		}
+	}
+	// No backfill and no rewrite of the message table: a boolean column with a
+	// default is a catalogue change, and an UPDATE over chat.messages is exactly
+	// the long-running write this avoids.
+	if strings.Contains(up, "UPDATE chat.messages") {
+		t.Error("000049 must not rewrite chat.messages; the column default covers existing rows")
+	}
+	// No index beyond the primary key. Every query this feature has reads the
+	// full key or its message_id prefix, and an index nothing uses is write cost
+	// on the hot send path.
+	if strings.Contains(up, "CREATE INDEX") {
+		t.Error("000049 creates an index no query in this feature would use")
+	}
+}
+
+// The down reverses exactly what the up added, in the order that works: the
+// table first, because it references chat.messages.
+func TestChatMigration_AcknowledgementDownReversesTheUp(t *testing.T) {
+	down := readChatMigration(t, "000049_message_acknowledgement.down.sql")
+	table := strings.Index(down, "DROP TABLE IF EXISTS chat.message_acknowledgements")
+	column := strings.Index(down, "DROP COLUMN IF EXISTS acknowledgement_required")
+	if table < 0 || column < 0 {
+		t.Fatalf("000049 down must drop both the table and the column, got:\n%s", down)
+	}
+	if table > column {
+		t.Error("000049 down must drop the referencing table before the column it was added beside")
+	}
+}

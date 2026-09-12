@@ -12,22 +12,26 @@ import (
 )
 
 // priorityColumnIndex is where priority sits in the shared message column
-// contract: last of messageColumns, after the conversation event pair. Derived
-// rather than written down, because a row fixture is positional and a literal
-// here would start pointing at the wrong column the next time the projection
-// grows — which is a test that passes while asserting about event_payload.
-func priorityColumnIndex() int { return len(messageCols()) - 1 }
+// contract: second to last of messageColumns, before issue #824's
+// acknowledgement flag and after the conversation event pair. Derived rather
+// than written down, because a row fixture is positional and a literal here
+// would start pointing at the wrong column the next time the projection grows —
+// which is a test that passes while asserting about event_payload.
+func priorityColumnIndex() int { return len(messageCols()) - 2 }
 
 // expectCreateWithPriority is expectCreate with $23 pinned instead of matched
 // by AnyArg: this is the assertion that the validated value actually reaches
 // the statement, rather than being dropped somewhere between the service and
 // the bind list.
 func expectCreateWithPriority(mock pgxmock.PgxPoolIface, priority string, rows *pgxmock.Rows) {
-	args := make([]any, 0, 23)
+	args := make([]any, 0, 25)
 	for range 22 {
 		args = append(args, pgxmock.AnyArg())
 	}
-	args = append(args, priority)
+	// $23 is the priority this test is about; $24 is issue #824's
+	// acknowledgement flag, matched loosely because it is not what is under test
+	// here and pinning it would make this fixture fail for the wrong reason.
+	args = append(args, priority, pgxmock.AnyArg(), pgxmock.AnyArg())
 	mock.ExpectQuery(createMsgSQL).WithArgs(args...).WillReturnRows(rows)
 }
 

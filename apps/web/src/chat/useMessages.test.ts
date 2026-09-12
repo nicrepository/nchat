@@ -51,6 +51,7 @@ let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
 let capturedOnSubscriptionError: ((evt: WSClientErrorEvent) => void) | null = null;
 let capturedOnSubscribed: ((evt: WSSubscribedEvent) => void) | null = null;
 let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
+let capturedOnAcknowledgementUpdated: ((evt: { message_id: string }) => void) | null = null;
 let capturedOnConversationEvent: ((evt: WSConversationEventMessage) => void) | null = null;
 const mockToggleReaction = vi.fn(() => true);
 
@@ -78,6 +79,7 @@ vi.mock("./useChatWebSocket", () => ({
     onReactionUpdated,
     onPinUpdated,
     onConversationEvent,
+    onAcknowledgementUpdated,
     onReactionError,
     onSubscriptionError,
     onSubscribed,
@@ -91,6 +93,7 @@ vi.mock("./useChatWebSocket", () => ({
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
     onConversationEvent?: (evt: WSConversationEventMessage) => void;
+    onAcknowledgementUpdated?: (evt: { message_id: string }) => void;
     onReactionError?: (evt: WSClientErrorEvent) => void;
     onSubscriptionError?: (evt: WSClientErrorEvent) => void;
     onSubscribed?: (evt: WSSubscribedEvent) => void;
@@ -102,6 +105,7 @@ vi.mock("./useChatWebSocket", () => ({
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
     capturedOnConversationEvent = onConversationEvent ?? null;
+    capturedOnAcknowledgementUpdated = onAcknowledgementUpdated ?? null;
     capturedOnReactionError = onReactionError ?? null;
     capturedOnSubscriptionError = onSubscriptionError ?? null;
     capturedOnSubscribed = onSubscribed ?? null;
@@ -128,6 +132,9 @@ const {
   mockPostDMMessage,
   mockEditMessage,
   mockDeleteMessage,
+  mockFetchMessageAcknowledgement,
+  mockFetchMessageAcknowledgements,
+  mockAcknowledgeMessage,
 } = vi.hoisted(() => ({
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
@@ -137,6 +144,27 @@ const {
     vi.fn<(id: string, body: string, options?: { bodyFormat?: "v2" | "v3" }) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
+  mockFetchMessageAcknowledgements:
+    vi.fn<
+      (
+        messageIds: string[],
+        signal?: AbortSignal,
+      ) => Promise<Record<string, import("./chatTypes").MessageAcknowledgement>>
+    >(),
+  mockFetchMessageAcknowledgement:
+    vi.fn<
+      (
+        messageId: string,
+        signal?: AbortSignal,
+      ) => Promise<import("./chatTypes").MessageAcknowledgement>
+    >(),
+  mockAcknowledgeMessage:
+    vi.fn<
+      (
+        messageId: string,
+        signal?: AbortSignal,
+      ) => Promise<import("./chatTypes").MessageAcknowledgement>
+    >(),
   mockReconcileMessageLinkSafety: vi.fn<
     (
       messageId: string,
@@ -216,6 +244,15 @@ vi.mock("./chatApi", async (importOriginal) => ({
     mockFetchLinkSafetyStatuses(messageIds, signal),
   reconcileMessageLinkSafety: (messageId: string, signal?: AbortSignal) =>
     mockReconcileMessageLinkSafety(messageId, signal),
+  // Issue #824. Present so the acknowledgement hook has something to call; the
+  // fixtures here carry no message that asks for confirmation, so neither is
+  // reached unless a test says otherwise.
+  fetchMessageAcknowledgement: (messageId: string, signal?: AbortSignal) =>
+    mockFetchMessageAcknowledgement(messageId, signal),
+  fetchMessageAcknowledgements: (messageIds: string[], signal?: AbortSignal) =>
+    mockFetchMessageAcknowledgements(messageIds, signal),
+  acknowledgeMessage: (messageId: string, signal?: AbortSignal) =>
+    mockAcknowledgeMessage(messageId, signal),
 }));
 
 // ── filesApi mock (preview reconciliation) ────────────────────────────────────
@@ -5588,5 +5625,101 @@ describe("useMessages does not announce anything it loads", () => {
     );
 
     expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+});
+
+// ── acknowledgement realtime (issue #824) ────────────────────────────────────
+//
+// A committed acknowledgement elsewhere reaches this session as a hint naming
+// one message. What is asserted here is the wiring: the hint reaches the hook,
+// and it re-reads exactly the message it named.
+
+describe("useMessages acknowledgement realtime", () => {
+  function askingMessage(id: string): Message {
+    return makeMessage({ id, acknowledgementRequired: true });
+  }
+
+  function summaryFor(messageId: string, viewerState: "pending" | "acknowledged") {
+    return {
+      messageId,
+      required: true,
+      total: 2,
+      pending: viewerState === "pending" ? 2 : 1,
+      acknowledged: viewerState === "acknowledged" ? 1 : 0,
+      responded: 0,
+      expired: 0,
+      cancelled: 0,
+      viewerState,
+    };
+  }
+
+  it("re-reads only the message an acknowledgement event names", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1"), askingMessage("m-2")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    await waitFor(() => expect(Object.keys(result.current.acknowledgements)).toHaveLength(2));
+    mockFetchMessageAcknowledgement.mockClear();
+    mockFetchMessageAcknowledgement.mockImplementation((id: string) =>
+      Promise.resolve(summaryFor(id, "acknowledged")),
+    );
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "m-1" }));
+
+    await waitFor(() =>
+      expect(result.current.acknowledgements["m-1"]?.viewerState).toBe("acknowledged"),
+    );
+    expect(mockFetchMessageAcknowledgement).toHaveBeenCalledTimes(1);
+    expect(mockFetchMessageAcknowledgement).toHaveBeenCalledWith("m-1", expect.anything());
+    // The other asking message was not asked about.
+    expect(result.current.acknowledgements["m-2"]?.viewerState).toBe("pending");
+  });
+
+  // A hint that names nothing has nothing to re-read.
+  it("ignores an acknowledgement event with no message id", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["m-1"]).toBeDefined());
+    mockFetchMessageAcknowledgement.mockClear();
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "" }));
+    expect(mockFetchMessageAcknowledgement).not.toHaveBeenCalled();
+  });
+
+  // The hint never records an acknowledgement on this reader's behalf.
+  it("never confirms anything because an event arrived", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["m-1"]).toBeDefined());
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "m-1" }));
+    await waitFor(() => expect(mockFetchMessageAcknowledgement).toHaveBeenCalled());
+    expect(mockAcknowledgeMessage).not.toHaveBeenCalled();
   });
 });

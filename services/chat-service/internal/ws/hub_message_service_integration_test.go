@@ -153,6 +153,10 @@ func (s *integMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Cont
 	return 0, nil
 }
 
+func (s *integMessageStore) CountAcknowledgementRecipientsUpTo(_ context.Context, _, _, _, _ string, _ int) (int, error) {
+	return 0, nil
+}
+
 // CreateMessage records the input and returns a domain.Message derived from seed + input.
 func (s *integMessageStore) CreateMessage(_ context.Context, in storage.CreateMessageInput) (domain.Message, error) {
 	now := time.Now().UTC()

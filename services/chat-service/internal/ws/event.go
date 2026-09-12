@@ -152,6 +152,23 @@ const (
 	// nothing.
 	EventTypeConversationEvent EventType = "conversation.event"
 
+	// EventTypeAcknowledgementUpdated tells the subscribers of a conversation
+	// that one message's acknowledgement changed (issue #824).
+	//
+	// It is an invalidation hint and deliberately nothing more: it carries the
+	// route and the message id, and a subscriber that cares re-reads the
+	// authorised summary for exactly that message. The alternative — putting the
+	// summary on the wire — would broadcast who has and has not confirmed to
+	// every subscriber of the conversation, which is precisely the exposure
+	// #824's detail authorisation exists to prevent, and would give the client a
+	// second copy of a state machine the database already owns.
+	//
+	// Emitted for every transition that changes what a reader would be shown:
+	// an explicit acknowledgement, a reply that resolves one, and a deletion
+	// that withdraws the pending ones. Persistence is still the source of truth;
+	// a client that misses this event reconciles on its next subscription.
+	EventTypeAcknowledgementUpdated EventType = "message.acknowledgement_updated"
+
 	// EventTypeAttachmentStatus is emitted after an attachment's antimalware
 	// verdict has been persisted (RF-22).
 	//
@@ -294,6 +311,19 @@ type MessagePayload struct {
 	// not taking the decision: nothing in this package alerts, sounds or pushes
 	// because of this field.
 	Priority string `json:"priority"`
+	// AcknowledgementRequired says the message asked its recipients to confirm
+	// receipt (issue #824), mirroring the HTTP message contract's field of the
+	// same name.
+	//
+	// It is here because the payload is the message: a client that inserts a
+	// message from this event and one that reloads it over HTTP must render the
+	// same thing, and a flag carried by only one of the two paths is a
+	// confirmation request that appears after a refresh and not before.
+	//
+	// Only the flag. Who was asked, who answered and what this subscriber's own
+	// state is are a separate, authorised read — broadcasting a recipient list
+	// to a conversation's subscribers is exactly the exposure #824 refuses.
+	AcknowledgementRequired bool `json:"acknowledgement_required"`
 	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
 	// A subscriber uses it to decide whether to draw the "could not verify this
 	// link" notice on a message it is inserting. It authorises nothing — see
