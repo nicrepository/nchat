@@ -1,35 +1,12 @@
 import { useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
-import { anchorIsVisible, placeAgainstAnchor, type VisibleBounds } from "./emoji/useAnchoredPicker";
+import { anchorIsVisible, placeAgainstAnchor, visibleBounds } from "./emoji/useAnchoredPicker";
 import { reactionAccessibleDescription } from "./reactionAuthors";
 import type { MessageReaction } from "./chatTypes";
 
 /** Distance kept between the badge and the names floating above it. */
 const authorsGap = 6;
-
-/**
- * Where the badge can actually be seen.
- *
- * The message list clips vertically, so the window alone is the wrong answer: a
- * badge scrolled past the list's edge is invisible even while the window still
- * has room for it. The list is the one clipping ancestor a reaction badge ever
- * has — it is the only place they are rendered — so this asks for it by name
- * rather than walking the tree looking for scroll parents. Without it (a badge
- * somewhere else one day) the window is the boundary, which is still an
- * improvement on none.
- */
-function visibleBounds(anchor: Element): VisibleBounds {
-  const viewport = { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
-  const clip = anchor.closest(".chat-msg-area__list")?.getBoundingClientRect();
-  if (!clip) return viewport;
-  return {
-    top: Math.max(viewport.top, clip.top),
-    bottom: Math.min(viewport.bottom, clip.bottom),
-    left: Math.max(viewport.left, clip.left),
-    right: Math.min(viewport.right, clip.right),
-  };
-}
 
 /**
  * Who reacted, floating above the badge while it is hovered or focused.
@@ -75,6 +52,8 @@ function ReactionAuthors({
       }
       const box = tooltip.getBoundingClientRect();
       const centred = anchor.left + anchor.width / 2 - box.width / 2;
+      // With no room on either side of the badge the helper leaves the tooltip
+      // hidden, exactly as above: it is decorative, and has nothing to close.
       placeAgainstAnchor(tooltip, anchor, box, centred, authorsGap, authorsGap);
     };
     place();

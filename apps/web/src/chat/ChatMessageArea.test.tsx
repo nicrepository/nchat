@@ -509,6 +509,28 @@ function domRect(rect: Partial<DOMRect>): DOMRect {
   } as DOMRect;
 }
 
+/**
+ * The layout jsdom never gives the timeline. The hover toolbar is placed inside
+ * the band the list occupies, against a bubble the reader can see (issue
+ * #839); with no boxes there is no band, no visible bubble, and no toolbar
+ * would ever open. So the list fills the window here, every bubble sits inside
+ * it, and either picker's button sits inside the window — and a test that mocks
+ * rects of its own falls back to this rather than to a zero box.
+ */
+function layoutRect(this: Element): DOMRect {
+  if (this.classList.contains("chat-msg-area__list")) {
+    return domRect({ right: 1024, bottom: 768, width: 1024, height: 768 });
+  }
+  if (this.classList.contains("chat-msg-area__msg-bubble")) {
+    return domRect({ top: 300, bottom: 340, left: 100, right: 400, width: 300, height: 40 });
+  }
+  const label = this.getAttribute("aria-label");
+  if (label === "Mais reações" || label === "Inserir emoji") {
+    return domRect({ top: 260, bottom: 290, left: 300, right: 330, width: 30, height: 30 });
+  }
+  return domRect({});
+}
+
 async function openFullReactionPicker(messageIndex = 0) {
   const bubbles = await screen.findAllByTestId("chat-msg-bubble");
   fireEvent.mouseEnter(bubbles[messageIndex]);
@@ -517,9 +539,12 @@ async function openFullReactionPicker(messageIndex = 0) {
 
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
+let layoutSpy: ReturnType<typeof vi.spyOn>;
+
 beforeEach(() => {
   setTokens("test-at");
   localStorage.clear();
+  layoutSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(layoutRect);
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
@@ -592,6 +617,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  layoutSpy.mockRestore();
   clearTokens();
 });
 
@@ -2949,17 +2975,7 @@ describe("ChatMessageArea — message list", () => {
               toJSON: () => ({}),
             };
           }
-          return {
-            x: 0,
-            y: 0,
-            left: 0,
-            right: 0,
-            top: 0,
-            bottom: 0,
-            width: 0,
-            height: 0,
-            toJSON: () => ({}),
-          };
+          return layoutRect.call(this);
         });
       renderChannelArea();
 
@@ -2971,6 +2987,31 @@ describe("ChatMessageArea — message list", () => {
       rectSpy.mockRestore();
     },
   );
+
+  // A button with no room for the picker above it or below it (issue #839
+  // follow-up): the picker is not squeezed across its own button, it closes.
+  it("closes the picker when it fits on neither side of its button", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.getAttribute("aria-label") === "Mais reações") {
+          return domRect({ left: 450, right: 480, top: 100, bottom: 700, width: 30, height: 600 });
+        }
+        if (this.classList.contains("chat-emoji-surface")) {
+          return domRect({ right: 188, bottom: 150, width: 188, height: 150 });
+        }
+        return layoutRect.call(this);
+      });
+    renderChannelArea();
+
+    await openFullReactionPicker();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument(),
+    );
+    rectSpy.mockRestore();
+  });
 
   // The picker opens at the size of its Suspense fallback and grows when the
   // lazily-imported catalog lands. Without a second placement it would keep the
@@ -2987,7 +3028,7 @@ describe("ChatMessageArea — message list", () => {
         if (this.classList.contains("chat-emoji-surface")) {
           return domRect({ right: 188, bottom: pickerHeight, width: 188, height: pickerHeight });
         }
-        return domRect({});
+        return layoutRect.call(this);
       });
     renderChannelArea();
 
@@ -3082,17 +3123,7 @@ describe("ChatMessageArea — message list", () => {
             toJSON: () => ({}),
           };
         }
-        return {
-          x: 0,
-          y: 0,
-          left: 0,
-          right: 0,
-          top: 0,
-          bottom: 0,
-          width: 0,
-          height: 0,
-          toJSON: () => ({}),
-        };
+        return layoutRect.call(this);
       });
     renderChannelArea();
 
@@ -3106,12 +3137,27 @@ describe("ChatMessageArea — message list", () => {
 
   it("keeps the portaled reaction picker anchored when the message list scrolls", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    // The toolbar holding the picker closes when its bubble leaves the list's
+    // band on scroll (issue #839), and jsdom lays nothing out — so the bubble
+    // is given a box inside the list, as it would have in a browser.
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.classList.contains("chat-msg-area__list")) {
+          return domRect({ right: 800, bottom: 600, width: 800, height: 600 });
+        }
+        if (this.classList.contains("chat-msg-area__msg-bubble")) {
+          return domRect({ top: 200, bottom: 240, left: 100, right: 300, width: 200, height: 40 });
+        }
+        return layoutRect.call(this);
+      });
     renderChannelArea();
 
     await openFullReactionPicker();
     fireEvent.scroll(screen.getByRole("log", { name: "Mensagens" }));
 
     expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
+    rectSpy.mockRestore();
   });
 
   it("keeps only one message reaction picker open", async () => {

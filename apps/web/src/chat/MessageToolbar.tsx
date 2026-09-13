@@ -15,13 +15,34 @@ import type { Message } from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
 import ReactionBadge from "./ReactionBadge";
 import { useReactionPresence } from "./useReactionPresence";
-import { placeAgainstAnchor, useAnchoredPicker } from "./emoji/useAnchoredPicker";
+import { placeAgainstAnchor, useAnchoredPicker, visibleBounds } from "./emoji/useAnchoredPicker";
 
 /**
  * The full picker and its catalog are a chunk of their own (issue #496): a
  * conversation that never opens one never downloads a thousand emoji names.
  */
 const EmojiPicker = lazy(() => import("./emoji/EmojiPicker"));
+
+/**
+ * Whether this browser can put the toolbar in the top layer (issue #839).
+ *
+ * Decided once, not per render: the attribute must only ever be written where
+ * togglePopover exists to show it — the UA stylesheet hides a popover until it
+ * is shown, and a browser (or jsdom) that knows the attribute but not the
+ * method would never show it. Without it the toolbar stays where the DOM puts
+ * it, which is what it did before.
+ */
+const popoverSupported =
+  typeof HTMLElement !== "undefined" && "togglePopover" in HTMLElement.prototype;
+
+/**
+ * Distance kept between the toolbar and the bubble, above it and below it.
+ *
+ * The same six pixels the reaction-authors tooltip keeps from its badge: the
+ * toolbar reads as attached to the message without touching it, and the gap is
+ * the same wherever the timeline puts the bubble.
+ */
+const toolbarGap = 6;
 
 export interface MessageToolbarProps {
   message: Message;
@@ -190,6 +211,15 @@ interface Placement {
  * The toolbar floats outside the message's own box, so it cannot be placed by
  * CSS alone. The picker's placement is not written here: it is the same problem
  * the composer's picker has, and useAnchoredPicker owns it for both.
+ *
+ * Placement is derived from the bubble's *current* box on every commit and on
+ * every scroll or resize (issue #839). A prepend of older history re-keys the
+ * virtual rows, moves them, remeasures them and compensates the scrollport —
+ * any of which can happen while the toolbar is open — so nothing measured
+ * earlier is kept: the message id resolves to whatever bubble is mounted for it
+ * now, and that bubble's rect is the only input. A bubble that has left the
+ * band the reader can see has nothing for the toolbar to hang off, so the
+ * toolbar closes rather than float over the header or the composer.
  */
 function useReactionPickerPlacement({
   messageId,
@@ -203,23 +233,58 @@ function useReactionPickerPlacement({
   const menuRef = useRef<HTMLDivElement>(null);
   const anchorRef = useRef<HTMLButtonElement>(null);
 
+  const dismiss = useCallback(() => {
+    onPickerOpenChange(messageId, false);
+    onReactionMenuVisibleChange(messageId, false);
+  }, [messageId, onPickerOpenChange, onReactionMenuVisibleChange]);
+
   const positionMenu = useCallback(() => {
-    if (!reactionMenuVisible || !bubbleRef.current || !menuRef.current) return;
-    const bubble = bubbleRef.current.getBoundingClientRect();
-    if (bubble.bottom < 0 || bubble.top > window.innerHeight) return;
-    const menu = menuRef.current.getBoundingClientRect();
+    const anchor = bubbleRef.current;
+    const menu = menuRef.current;
+    if (!reactionMenuVisible || !anchor || !menu) return;
+    const bubble = anchor.getBoundingClientRect();
+    const box = menu.getBoundingClientRect();
     const midX = bubble.left + bubble.width / 2;
-    // gapAbove = 0: cola a borda da toolbar exatamente no início da mensagem
-    // (feedback de UX, issue #331).
-    placeAgainstAnchor(menuRef.current, bubble, menu, isMine ? midX - menu.width : midX, 6, 0);
-  }, [bubbleRef, isMine, reactionMenuVisible]);
+    const left = isMine ? midX - box.width : midX;
+    // Confined to what the reader can see of the list, so a bubble near its
+    // top edge gets the toolbar below it rather than over the header — and a
+    // bubble out of that band, or filling it with no room on either side, gets
+    // no toolbar rather than one drawn where its message is not. Validated
+    // here, on every commit, and not only when something scrolls: a row the
+    // virtualizer remounts past the edge never gets a toolbar to begin with.
+    const placed = placeAgainstAnchor(
+      menu,
+      bubble,
+      box,
+      left,
+      toolbarGap,
+      toolbarGap,
+      visibleBounds(anchor),
+    );
+    if (!placed) dismiss();
+  }, [bubbleRef, dismiss, isMine, reactionMenuVisible]);
 
-  useLayoutEffect(positionMenu, [positionMenu]);
+  // No dependency list on purpose: every commit of the toolbar is a moment the
+  // timeline may have moved its anchor, and re-reading one rect is cheaper than
+  // knowing why it rendered.
+  useLayoutEffect(() => {
+    // Into the top layer before measuring — see the toolbar's CSS. A no-op
+    // once shown.
+    if (popoverSupported) menuRef.current?.togglePopover(true);
+    positionMenu();
+  });
 
+  // The timeline or the window moving under an open toolbar moves its anchor
+  // too: the toolbar follows it, or closes when it has left the band the
+  // reader sees. The same placement, and the same verdict, as on a commit.
   useEffect(() => {
     if (!reactionMenuVisible) return;
     document.addEventListener("scroll", positionMenu, true);
-    return () => document.removeEventListener("scroll", positionMenu, true);
+    window.addEventListener("resize", positionMenu);
+    return () => {
+      document.removeEventListener("scroll", positionMenu, true);
+      window.removeEventListener("resize", positionMenu);
+    };
   }, [positionMenu, reactionMenuVisible]);
 
   /**
@@ -324,6 +389,11 @@ export default function MessageToolbar(props: MessageToolbarProps) {
           ref={menuRef}
           className="chat-msg-area__reaction-menu"
           role="toolbar"
+          // A manual popover is rendered in the top layer, where the transform
+          // that positions a virtualized row is not its containing block
+          // (issue #839) — while staying a DOM descendant of the message, so
+          // hover containment, Tab order and focus recovery are untouched.
+          popover={popoverSupported ? "manual" : undefined}
           aria-label="Reagir à mensagem"
           onMouseEnter={() => props.onReactionMenuVisibleChange(message.id, true)}
           style={{ visibility: "hidden" }}

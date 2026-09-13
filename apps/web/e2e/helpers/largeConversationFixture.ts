@@ -258,11 +258,18 @@ export interface MessageTracker {
   pagesInFlight: () => number;
 }
 
-/** Paginação por cursor sobre o histórico completo, que o mock partilhado não faz. */
+/**
+ * Paginação por cursor sobre o histórico completo, que o mock partilhado não faz.
+ *
+ * `kind` escolhe a rota: canais e conversas diretas/grupos são servidos por
+ * caminhos diferentes do chat-service, e o prepend (#839) tem de ser exercitado
+ * nos dois.
+ */
 export async function installPaginatedMessages(
   page: Page,
   targetId: string,
-  all: ReturnType<typeof buildHistory>,
+  all: ReturnType<typeof makeMessage>[],
+  kind: "channel" | "dm" = "channel",
 ): Promise<MessageTracker> {
   const served = new Set<string>();
   let pages = 0;
@@ -278,7 +285,8 @@ export async function installPaginatedMessages(
    */
   const abandoned = new WeakSet<Request>();
   page.on("requestfailed", (request) => abandoned.add(request));
-  await page.route(`**/api/chat/channels/${targetId}/messages*`, async (route) => {
+  const collection = kind === "channel" ? "channels" : "dm";
+  await page.route(`**/api/chat/${collection}/${targetId}/messages*`, async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;

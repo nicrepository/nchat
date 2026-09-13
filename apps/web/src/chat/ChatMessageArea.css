@@ -1220,8 +1220,21 @@
   opacity: 0.55;
 }
 
+/* The toolbar is a manual popover (issue #839). Shown, it is painted in the top
+   layer, whose containing block is the viewport no matter what sits above it in
+   the DOM — and what sits above it is a virtualized row positioned by
+   `transform`, which would otherwise capture `position: fixed` and offset every
+   viewport coordinate the placement computes by the row's own translation. It
+   also keeps the toolbar out of the row's box and the list's scrollable
+   overflow, so hovering can neither remeasure a row nor move the scrollbar.
+   The declarations after `position` undo the UA popover stylesheet, which
+   centres a popover and draws it in system colours. */
 .chat-msg-area__reaction-menu {
   position: fixed;
+  inset: auto;
+  margin: 0;
+  overflow: visible;
+  color: inherit;
   z-index: var(--z-overlay-emoji);
   display: flex;
   gap: 2px;

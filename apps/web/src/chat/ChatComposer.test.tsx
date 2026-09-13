@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockFetchMentionCandidates } = vi.hoisted(() => ({
   mockFetchMentionCandidates: vi.fn(),
@@ -47,6 +47,38 @@ function setup() {
   render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
   return onSend;
 }
+
+/**
+ * jsdom lays nothing out, and a picker is only placed against a button the
+ * reader can see (issue #839): the emoji button gets a box inside the window
+ * here, and nothing else changes.
+ */
+const emojiButtonBox = {
+  x: 300,
+  y: 500,
+  left: 300,
+  right: 330,
+  top: 500,
+  bottom: 530,
+  width: 30,
+  height: 30,
+  toJSON: () => ({}),
+} as DOMRect;
+const realGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+let anchorBoxSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  anchorBoxSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ) {
+    if (this.getAttribute("aria-label") === "Inserir emoji") return emojiButtonBox;
+    return realGetBoundingClientRect.call(this);
+  });
+});
+
+afterEach(() => {
+  anchorBoxSpy.mockRestore();
+});
 
 describe("ChatComposer focus", () => {
   it("focuses once when a desktop composer becomes writable without scrolling", async () => {

@@ -11,15 +11,42 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
-/** Distance kept from every edge of the viewport. */
+/** Distance kept from every edge of the band a floating element is placed in. */
 const viewportPadding = 8;
 
+/** The band of screen an anchor is actually painted in. */
+export interface VisibleBounds {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+}
+
+/** The window itself: the band a floating element is confined to by default. */
+function viewportBounds(): VisibleBounds {
+  return { top: 0, bottom: window.innerHeight, left: 0, right: window.innerWidth };
+}
+
 /**
- * Places a floating element against an anchor, whole inside the viewport.
+ * Places a floating element against an anchor, whole inside a band of screen.
  *
- * Above the anchor when it fits there, below when it does not, and horizontally
- * clamped either way. Exported because the reaction toolbar places itself with
- * the same rules against the message bubble rather than against a button.
+ * Only against an anchor the reader can see: one that has left the band — a
+ * row the virtualizer keeps mounted well past the list's edge, say — gets
+ * nothing, however well a box would fit beside where it is. Then above the
+ * anchor when it fits there, below when it fits there instead, and
+ * horizontally clamped either way. When it fits on neither side — an anchor as
+ * tall as the band — nothing is placed either: a box nudged into place would
+ * cross the anchor it belongs to, and a toolbar drawn over its own message
+ * misattributes every action on it. Not placed means left hidden, with no
+ * coordinate written; the caller decides what closing means for it, which is
+ * why this returns whether it placed.
+ *
+ * The band is the viewport unless the caller knows better: the reaction
+ * toolbar hangs off a bubble inside a scroll container that the header and the
+ * composer bound, so it passes that container's visible band (issue #839) and
+ * the toolbar is never drawn over either. Exported because the toolbar places
+ * itself with the same rules as a picker, against the message bubble rather
+ * than against a button.
  */
 export function placeAgainstAnchor(
   element: HTMLElement,
@@ -28,23 +55,21 @@ export function placeAgainstAnchor(
   left: number,
   gapBelow: number,
   gapAbove: number,
-): void {
+  bounds: VisibleBounds = viewportBounds(),
+): boolean {
   const above = anchor.top - box.height - gapAbove;
-  const top =
-    above >= viewportPadding
-      ? above
-      : Math.min(anchor.bottom + gapBelow, window.innerHeight - box.height - viewportPadding);
-  element.style.left = `${Math.min(Math.max(viewportPadding, left), window.innerWidth - box.width - viewportPadding)}px`;
-  element.style.top = `${top}px`;
+  const below = anchor.bottom + gapBelow;
+  const fitsAbove = above >= bounds.top + viewportPadding;
+  const fitsBelow = below + box.height <= bounds.bottom - viewportPadding;
+  if (!anchorIsVisible(anchor, bounds) || (!fitsAbove && !fitsBelow)) {
+    element.style.visibility = "hidden";
+    return false;
+  }
+  const leftLimit = bounds.right - box.width - viewportPadding;
+  element.style.left = `${Math.min(Math.max(bounds.left + viewportPadding, left), leftLimit)}px`;
+  element.style.top = `${fitsAbove ? above : below}px`;
   element.style.visibility = "visible";
-}
-
-/** The band of screen an anchor is actually painted in. */
-export interface VisibleBounds {
-  top: number;
-  bottom: number;
-  left: number;
-  right: number;
+  return true;
 }
 
 /**
@@ -64,6 +89,29 @@ export function anchorIsVisible(anchor: DOMRect, bounds: VisibleBounds): boolean
     anchor.right > bounds.left &&
     anchor.left < bounds.right
   );
+}
+
+/**
+ * Where an anchor inside the message list can actually be seen.
+ *
+ * The list clips vertically, so the window alone is the wrong answer: an anchor
+ * scrolled past the list's edge is invisible even while the window still has
+ * room for it. The list is the one clipping ancestor a message overlay ever
+ * has — a reaction badge, a message bubble — so this asks for it by name rather
+ * than walking the tree looking for scroll parents. Without it (an anchor
+ * somewhere else one day) the window is the boundary, which is still an
+ * improvement on none.
+ */
+export function visibleBounds(anchor: Element): VisibleBounds {
+  const viewport = viewportBounds();
+  const clip = anchor.closest(".chat-msg-area__list")?.getBoundingClientRect();
+  if (!clip) return viewport;
+  return {
+    top: Math.max(viewport.top, clip.top),
+    bottom: Math.min(viewport.bottom, clip.bottom),
+    left: Math.max(viewport.left, clip.left),
+    right: Math.min(viewport.right, clip.right),
+  };
 }
 
 export interface AnchoredPickerOptions {
@@ -111,7 +159,8 @@ export function useAnchoredPicker({
     }
     const picker = pickerRef.current.getBoundingClientRect();
     const left = align === "end" ? anchor.right - picker.width : anchor.left;
-    placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap);
+    // No room on either side of the button is as good as no button.
+    if (!placeAgainstAnchor(pickerRef.current, anchor, picker, left, gap, gap)) onDismiss(false);
   }, [align, anchorRef, gap, onDismiss, open]);
 
   useLayoutEffect(position, [position]);

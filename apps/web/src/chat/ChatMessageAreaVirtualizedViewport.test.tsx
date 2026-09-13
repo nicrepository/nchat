@@ -115,6 +115,12 @@ function heightFor(index: number): number {
 /** Dividers and system rows: one height, and not one a message ever has. */
 const NON_MESSAGE_ROW_HEIGHT = 40;
 
+/** The hover toolbar's box, as a browser would lay it out (#839). */
+const TOOLBAR_WIDTH_PX = 246;
+const TOOLBAR_HEIGHT_PX = 36;
+/** The gap it keeps from the bubble (MessageToolbar's toolbarGap). */
+const TOOLBAR_GAP_PX = 6;
+
 /**
  * The ordinal in a fixture message id, including the negative ids a prepended
  * page uses.
@@ -313,6 +319,15 @@ function installScrollport(): Scrollport {
   Element.prototype.getBoundingClientRect = function getBoundingClientRect(this: Element) {
     if (this instanceof HTMLElement) {
       if (this.classList.contains("chat-msg-area__list")) return rectAt(0, VIEWPORT_PX);
+      // The hover toolbar has a box of its own (#839): it sits inside a row but
+      // is not the row, and its placement is computed from its own size.
+      if (this.getAttribute("role") === "toolbar") {
+        return {
+          ...rectAt(0, TOOLBAR_HEIGHT_PX),
+          right: TOOLBAR_WIDTH_PX,
+          width: TOOLBAR_WIDTH_PX,
+        };
+      }
       const row = this.closest<HTMLElement>("[data-index]");
       if (row) return rectAt(rowStart(row) - scrollTop, rowHeight(row));
     }
@@ -667,6 +682,75 @@ describe("a virtualized timeline", { timeout: 30_000 }, () => {
     // And it is genuinely the anchor that was kept, not merely some message:
     // the page inserted above starts at m--20, and none of it is at the edge.
     expect(scrollport.topmostMessageId()).toBe(anchorId);
+  });
+
+  // #839: the hover toolbar is placed from the bubble's box as it is *now*. A
+  // prepend re-keys and moves every row and compensates the scrollport; what
+  // must survive it is the relation between toolbar and bubble, on a received
+  // and on an own message, read from the row the virtualizer mounts today —
+  // never from an index, an offset or a rect that predates the page.
+  it("keeps the reaction toolbar on the bubble's current box through repeated prepends", async () => {
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: history(), nextCursor: "older" })
+      .mockResolvedValueOnce({ messages: history(20, -20), nextCursor: "older" })
+      .mockResolvedValueOnce({ messages: history(20, -40), nextCursor: "" });
+    await openVirtualizedChannel();
+
+    /**
+     * The first message starting inside the viewport written by `mine`, or
+     * not — with room for the toolbar above it, since that placement is what
+     * is compared.
+     */
+    const visibleMessage = (mine: boolean): string => {
+      const row = mountedRows().find((candidate) => {
+        const id =
+          candidate.element.querySelector<HTMLElement>("[data-message-id]")?.dataset.messageId;
+        const top = candidate.start - scrollport.top();
+        const fits = top >= TOOLBAR_HEIGHT_PX + TOOLBAR_GAP_PX + 8 && top < VIEWPORT_PX;
+        return id !== undefined && fits && (messageOrdinal(id) % 4 === 0) === mine;
+      });
+      return row!.element.querySelector<HTMLElement>("[data-message-id]")!.dataset.messageId!;
+    };
+    /** Hovers a message and checks the toolbar against the bubble's live box. */
+    const expectToolbarOn = (messageId: string, mine: boolean) => {
+      const shell = document.querySelector<HTMLElement>(`[data-message-id="${messageId}"]`)!;
+      fireEvent.mouseEnter(shell);
+      const bubble = shell.querySelector(".chat-msg-area__msg-bubble")!.getBoundingClientRect();
+      const midX = bubble.left + bubble.width / 2;
+      expect(screen.getByRole("toolbar", { name: "Reagir à mensagem" })).toHaveStyle({
+        top: `${bubble.top - TOOLBAR_HEIGHT_PX - TOOLBAR_GAP_PX}px`,
+        left: `${mine ? midX - TOOLBAR_WIDTH_PX : midX}px`,
+        visibility: "visible",
+      });
+      // Only ever one: the row hovered before this one gave its toolbar up.
+      expect(screen.getAllByRole("toolbar", { name: "Reagir à mensagem" })).toHaveLength(1);
+    };
+    const rowStartOf = (messageId: string) =>
+      rowStart(
+        document
+          .querySelector<HTMLElement>(`[data-message-id="${messageId}"]`)!
+          .closest<HTMLElement>("[data-index]")!,
+      );
+
+    for (let page = 2; page <= 3; page += 1) {
+      // At the top edge, with the previous page on its way: the healthy state.
+      scrollport.scrollTo(0);
+      const received = visibleMessage(false);
+      const own = visibleMessage(true);
+      expectToolbarOn(received, false);
+      expectToolbarOn(own, true);
+      const startBefore = rowStartOf(received);
+
+      await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(page));
+      await settleUntil(() => expect(scrollport.top()).toBeGreaterThan(0));
+      await settleLayout();
+
+      // The rows moved by a page of history and the viewport was restored —
+      // and both toolbars land on the bubbles as they are mounted now.
+      expect(rowStartOf(received)).toBeGreaterThan(startBefore);
+      expectToolbarOn(received, false);
+      expectToolbarOn(own, true);
+    }
   });
 
   // ── The resize matrix ───────────────────────────────────────────────────────
