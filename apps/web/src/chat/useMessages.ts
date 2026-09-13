@@ -29,7 +29,7 @@
 
 import { useCallback, useEffect, useMemo, useReducer } from "react";
 
-import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import type { LinkSafetyRecheck, Message, MessageAcknowledgement } from "./chatTypes";
 import { messagesGateway } from "./messages/messagesGateway";
 import { reducer } from "./messages/reducer";
 import { initialState } from "./messages/types";
@@ -45,6 +45,7 @@ import { useReactionTimers } from "./messages/useReactionTimers";
 import { useReactionToggle } from "./messages/useReactionToggle";
 import { useReferenceRevalidation } from "./messages/useReferenceRevalidation";
 import { useRequestRegistry } from "./messages/useRequestRegistry";
+import { useAcknowledgements } from "./messages/useAcknowledgements";
 import { useSecurityReconciliation } from "./messages/useSecurityReconciliation";
 import type {
   WSAttachmentStatusEvent,
@@ -108,6 +109,8 @@ export interface UseMessagesResult {
     body: string,
     referencedMessageId?: string,
     attachmentIds?: string[],
+    /** Issue #824: ask this message's recipients to confirm receipt. */
+    acknowledgementRequired?: boolean,
   ) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
@@ -121,6 +124,24 @@ export interface UseMessagesResult {
    */
   sendTyping: (isTyping: boolean) => boolean;
   toggleFavorite: (messageId: string, isFavorited: boolean) => void;
+  /**
+   * Issue #824. The server's acknowledgement summary for each message that asked
+   * for confirmation, keyed by message id, and the action that records one.
+   *
+   * Sparse: a conversation with no such message carries an empty map and costs
+   * no requests. The map is the server's answer, never a local state machine —
+   * every entry is replaced only by a newer server answer.
+   */
+  acknowledgements: Record<string, MessageAcknowledgement>;
+  /** The message whose confirmation is in flight, if any. */
+  acknowledgingId: string | null;
+  /** Set when the last confirmation failed; cleared by the next attempt. */
+  acknowledgeError: string | null;
+  /**
+   * Confirms receipt of one message. Explicit by definition — nothing else in
+   * this hook calls it, so reading a message can never produce one.
+   */
+  acknowledge: (messageId: string) => void;
   /**
    * RF-21 "Verificar novamente" (issue #135): asks the server to re-read what it
    * already knows about one message's unverified links. It never starts a new
@@ -215,6 +236,17 @@ export function useMessages({
     { scope, gateway, dispatch, bodyFormat, notifyRemoved },
   );
 
+  // Issue #824. Its own module and its own cache, because what it holds is a
+  // different shape from the timeline: a sparse map of server summaries keyed by
+  // message, read from a separate authorised endpoint and replaced only by a
+  // newer server answer. Folding it into the message reducer would put four
+  // action types there for state no message carries.
+  const acknowledgements = useAcknowledgements({
+    scope,
+    messages: state.messages,
+    requests: fallbacks,
+  });
+
   const { toggleReaction: sendReactionToggle, sendTyping } = useMessageRealtime({
     scope,
     dispatch,
@@ -222,6 +254,8 @@ export function useMessages({
     reads,
     reactions: reactionEvents,
     reconciliation,
+    reconcileAcknowledgements: acknowledgements.reconcile,
+    reconcileAcknowledgement: acknowledgements.reconcileOne,
     notifyRemoved,
     listeners: { onPinUpdated, onMembersAdded, onAttachmentStatus, onTypingUpdated },
   });
@@ -251,6 +285,10 @@ export function useMessages({
     toggleReaction,
     sendTyping,
     toggleFavorite,
+    acknowledgements: acknowledgements.summaries,
+    acknowledgingId: acknowledgements.pendingId,
+    acknowledgeError: acknowledgements.error,
+    acknowledge: acknowledgements.acknowledge,
     reconcileLinkSafety: reconciliation.reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,

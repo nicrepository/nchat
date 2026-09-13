@@ -118,7 +118,10 @@ interface RawMessage {
   is_forwarded: boolean;
   /** Issue #527: structured conversation event, on system messages only. */
   event_type?: string;
-  event_payload?: Record<string, string>;
+  // unknown, not string: conversation_member_added/removed carry
+  // target_users as an array of {user_id, display_name} objects, not a flat
+  // string map (issue #835 realtime follow-up's e2e coverage).
+  event_payload?: Record<string, unknown>;
   quoted?: RawQuote;
   reference?: RawReference;
   /** RF-32 attachments, as the server embeds them in the message. */
@@ -787,6 +790,64 @@ export async function emitPresence(
       });
     },
     { kind: options.kind, targetId: options.targetId, user: options.user },
+  );
+}
+
+/**
+ * Simulates the server's conversation.event broadcast (issue #835 realtime
+ * follow-up) — a member added or removed, a rename, a departure, a call
+ * starting or ending. Unlike emitMessageCreated, the wire event carries only
+ * a message id ("the message id travels, the message does not"): the fixture
+ * message is added to the scenario's own store first, so the client's
+ * authorized read-back (GET .../messages/{id}, the same one a real
+ * reconnect-missed-event replay uses) finds it, exactly like the real
+ * backend after PublishConversationEvent.
+ */
+export async function emitConversationEvent(
+  page: Page,
+  scenario: MessagingScenario,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    message: RawMessage;
+    eventId?: string;
+  },
+) {
+  const messages = messagesFor(scenario, options.kind, options.targetId);
+  if (!messages.some((message) => message.id === options.message.id)) {
+    messages.push(options.message);
+  }
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, messageId, eventId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "conversation.event",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        message_id: messageId,
+        event_id: eventId,
+      });
+    },
+    {
+      kind: options.kind,
+      targetId: options.targetId,
+      messageId: options.message.id,
+      eventId: options.eventId ?? `${options.message.id}-event`,
+    },
   );
 }
 

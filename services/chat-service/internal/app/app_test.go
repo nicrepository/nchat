@@ -1227,3 +1227,35 @@ func TestDomainMessageToWSPayloadKeepsPriorityOnARemovedMessage(t *testing.T) {
 		t.Fatalf("removed message priority = %q, want urgent", got.Priority)
 	}
 }
+
+// Issue #824. message.created carries the flag, because the payload is the
+// message: a client that inserts from this event and one that reloads over HTTP
+// must render the same thing, and a request carried by only one path is a
+// confirmation button that appears after a refresh and not before.
+func TestDomainMessageToWSPayloadCarriesTheAcknowledgementRequest(t *testing.T) {
+	for _, required := range []bool{false, true} {
+		got := domainMessageToWSPayload(domain.Message{
+			ID: "message-1", SenderID: "user-1", BodyText: "confirm please",
+			AcknowledgementRequired: required,
+		})
+		if got.AcknowledgementRequired != required {
+			t.Fatalf("payload acknowledgement_required = %v, want %v", got.AcknowledgementRequired, required)
+		}
+	}
+}
+
+// Deleting a message does not change what it asked for. The removal path blanks
+// the body, the quote and the attachments; what the author requested is not
+// content and is not among them.
+func TestDomainMessageToWSPayloadKeepsTheAcknowledgementRequestOnARemovedMessage(t *testing.T) {
+	got := domainMessageToWSPayload(domain.Message{
+		ID: "message-1", SenderID: "user-1", BodyText: "hello",
+		AcknowledgementRequired: true, Status: domain.MessageStatusDeleted,
+	})
+	if !got.IsRemoved || got.BodyText != "" {
+		t.Fatalf("expected a removed message with no body: %+v", got)
+	}
+	if !got.AcknowledgementRequired {
+		t.Fatal("a removed message must still say what it had asked for")
+	}
+}

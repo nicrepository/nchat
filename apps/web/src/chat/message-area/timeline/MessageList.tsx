@@ -12,7 +12,7 @@
 import { useMemo } from "react";
 
 import AttachmentViewerHost from "../../AttachmentViewerHost";
-import type { MentionTarget, Message } from "../../chatTypes";
+import type { MentionTarget, Message, MessageAcknowledgement } from "../../chatTypes";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import type { SystemMessageScope } from "../../conversationSystemMessage";
 import type { EmojiUsage } from "../../emoji/emojiUsage";
@@ -46,6 +46,10 @@ export interface MessageListProps {
   presenceTarget?: string;
   pinnedIds?: Set<string>;
   openingAuthorDMIds?: Set<string>;
+  /** Issue #824: the server's acknowledgement summary per message, if any. */
+  acknowledgements?: Record<string, MessageAcknowledgement>;
+  /** Issue #824: the message whose confirmation is in flight, if any. */
+  acknowledgingId?: string | null;
   recentReactionEmojis: string[];
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
@@ -125,6 +129,8 @@ export default function MessageList(props: MessageListProps) {
     editDisabledIds: props.editDisabledIds,
     pinnedIds: props.pinnedIds,
     openingAuthorDMIds: props.openingAuthorDMIds,
+    acknowledgements: props.acknowledgements,
+    acknowledgingId: props.acknowledgingId,
     messagesById,
   };
 

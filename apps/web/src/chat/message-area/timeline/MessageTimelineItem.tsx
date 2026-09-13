@@ -13,7 +13,7 @@ import type { RefObject } from "react";
 
 import ConversationSystemMessage from "../../ConversationSystemMessage.tsx";
 import MessageBubble, { type MessageBubbleProps } from "../../MessageBubble";
-import type { MentionTarget, Message } from "../../chatTypes";
+import type { MentionTarget, Message, MessageAcknowledgement } from "../../chatTypes";
 import type { SystemMessageScope } from "../../conversationSystemMessage";
 import type { EmojiUsage } from "../../emoji/emojiUsage";
 import { senderLabel } from "../../messageDisplay";
@@ -37,6 +37,8 @@ export interface TimelineMessageActions {
   onDeleteMessage: MessageBubbleProps["onDeleteMessage"];
   /** RF-05: pin/unpin action for readable channels and DMs. */
   onTogglePin?: (messageId: string, pin: boolean) => void;
+  /** Issue #824: confirms receipt of one message. See MessageBubbleProps. */
+  onAcknowledge?: (messageId: string) => void;
 }
 
 /** The same actions, minus the one the viewport supplies (see MessageList). */
@@ -64,6 +66,14 @@ export interface TimelineRowContext {
   openingAuthorDMIds?: Set<string>;
   /** Every loaded message, so a quote can name its author and offer the jump. */
   messagesById: Map<string, Message>;
+  /**
+   * Issue #824. The server's summary for each message that asked for
+   * confirmation, keyed by message id. Sparse by design: a conversation with no
+   * such message carries an empty map and every row reads `undefined`.
+   */
+  acknowledgements?: Record<string, MessageAcknowledgement>;
+  /** The message whose confirmation is in flight, if any. */
+  acknowledgingId?: string | null;
 }
 
 interface Props {
@@ -163,6 +173,9 @@ function TimelineMessageRow({
       onReferenceMessage={actions.onReferenceMessage}
       onForwardMessage={actions.onForwardMessage}
       onToggleFavorite={actions.onToggleFavorite}
+      acknowledgement={context.acknowledgements?.[message.id]}
+      acknowledging={context.acknowledgingId === message.id}
+      onAcknowledge={actions.onAcknowledge}
       onReconcileLinkSafety={actions.onReconcileLinkSafety}
       onEditMessage={actions.onEditMessage}
       onEditForbidden={actions.onEditForbidden}

@@ -3,14 +3,15 @@
 #
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
 # outbox suite, issue #742's worker claim suite, issue #745's push subscription
-# suite, issue #746's Web Push delivery ledger and issue #821's message
-# priority column: all of them prove properties
-# only a database can hold —
+# suite, issue #746's Web Push delivery ledger, issue #821's message priority
+# column and issue #824's per-recipient acknowledgement: all of them prove
+# properties only a database can hold —
 # atomicity across one statement, a unique index deciding what counts as the same
 # event or the same subscription, an ON CONFLICT that refuses to move ownership,
 # FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows, and a
 # column default plus CHECK constraint deciding what a row written by an older
-# release means and which values may ever be stored.
+# release means and which values may ever be stored, and a conditional UPDATE
+# deciding which of two concurrent state transitions wins.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -102,6 +103,51 @@ case "$MODULE" in
       TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
+      # Issue #824. Per-recipient acknowledgement: a recipient set derived in
+      # the same statement as the INSERT, a primary key that is the reason two
+      # clicks cannot become two rows, conditional UPDATEs that make an
+      # acknowledgement racing a reply or a deletion converge, and two CHECK
+      # constraints deciding which states may ever be stored and whether a
+      # resolution may exist without its instant.
+      TestAcknowledgementAsksChannelMembersNotEveryReaderPostgreSQL
+      TestAcknowledgementAsksConversationMembersPostgreSQL
+      TestAcknowledgementAsksNobodyWhenItWasNotRequestedPostgreSQL
+      TestAcknowledgementSnapshotDoesNotFollowMembershipPostgreSQL
+      TestAcknowledgementIsUniquePerRecipientPostgreSQL
+      TestAcknowledgeIsIdempotentPostgreSQL
+      TestAcknowledgeConcurrentCallsConvergePostgreSQL
+      TestReplyResolvesOnlyTheReplierPostgreSQL
+      TestAcknowledgeAfterAReplyKeepsTheReplyPostgreSQL
+      TestDeleteCancelsPendingAndKeepsAnswersPostgreSQL
+      TestAcknowledgeRacingDeleteHasOneWinnerPostgreSQL
+      TestEditDoesNotResetAcknowledgementPostgreSQL
+      TestReadingAMessageDoesNotAcknowledgeItPostgreSQL
+      TestAcknowledgementSummaryAndDetailPostgreSQL
+      TestAcknowledgeRefusesSomebodyWhoWasNeverAskedPostgreSQL
+      TestAcknowledgeRefusesAfterLosingAccessPostgreSQL
+      TestAcknowledgementIsIsolatedByWorkspacePostgreSQL
+      TestAcknowledgementStateConstraintRefusesUndeclaredValuesPostgreSQL
+      TestAcknowledgementRefusesHalfAResolutionPostgreSQL
+      TestAcknowledgementCascadesWithItsMessagePostgreSQL
+      TestCountAcknowledgementRecipientsMatchesTheSnapshotPostgreSQL
+      # Issue #824 round two. The fan-out bound decided inside the creating
+      # statement, over the same snapshot the recipient rows are written from,
+      # and an acknowledgement racing a reply for the same row.
+      TestAcknowledgementBoundAdmitsExactlyTheLimitPostgreSQL
+      TestAcknowledgementBoundRefusesTheWholeMessagePostgreSQL
+      TestAcknowledgementBoundHoldsWhileMembershipGrowsPostgreSQL
+      TestAcknowledgementReplayIsUnaffectedByTheBoundPostgreSQL
+      TestAcknowledgeRacingReplyConvergesPostgreSQL
+      TestAcknowledgeAfterLosingTheRaceChangesNothingPostgreSQL
+      # Issue #824 round three. The page batch: one statement answering for a
+      # whole page, with authorization still decided per message inside it.
+      TestAcknowledgementBatchAnswersAWholePagePostgreSQL
+      TestAcknowledgementBatchOmitsWhatTheCallerMayNotReadPostgreSQL
+      TestAcknowledgementBatchGivesALateJoinerNoStatePostgreSQL
+      # Issue #824 round four. One read, one statement, one snapshot: the
+      # counts and the recipients they count can no longer be observed
+      # half-applied while a concurrent transition commits between them.
+      TestReadAcknowledgementNeverMixesSnapshotsPostgreSQL
     )
     ;;
   services/notification-service)

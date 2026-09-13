@@ -115,6 +115,24 @@ export interface ComposerToolbarProps {
   /** Controlled open state. Omitted, the toolbar manages its own. */
   pickerOpen?: boolean;
   onPickerOpenChange?: (open: boolean) => void;
+  /**
+   * Ask this message's recipients to confirm receipt (issue #824).
+   *
+   * A toggle rather than a checkbox inside a priority popover, because the
+   * popover does not exist yet: #822 owns the composer's priority control and
+   * #820 places "Solicitar confirmação" inside it. Until that lands this is the
+   * only way to reach a backend capability that is otherwise unusable, and when
+   * it lands this button is what that popover absorbs.
+   *
+   * #820 keeps acknowledgement independent of priority in the domain — it says
+   * the first UI *may* offer it only for Urgent, not that it must — so offering
+   * it on its own is within the stated policy rather than ahead of it.
+   *
+   * Omitted entirely by callers that do not support it (the inline editor), so
+   * the button simply is not drawn.
+   */
+  acknowledgementRequired?: boolean;
+  onAcknowledgementRequiredChange?: (required: boolean) => void;
 }
 
 const noEmojiUse = () => undefined;
@@ -205,6 +223,30 @@ export default function ComposerToolbar(props: ComposerToolbarProps) {
           </button>
         );
       })}
+
+      {/*
+        Issue #824. A toggle button, not a checkbox: it sits among the other
+        toolbar controls and carries its state in aria-pressed, so a screen
+        reader hears "Solicitar confirmação de recebimento, pressed" rather than
+        depending on the tint that marks it.
+      */}
+      {props.onAcknowledgementRequiredChange ? (
+        <button
+          type="button"
+          className={`composer-toolbar__btn${
+            props.acknowledgementRequired ? " composer-toolbar__btn--active" : ""
+          }`}
+          aria-label="Solicitar confirmação de recebimento"
+          aria-pressed={props.acknowledgementRequired ?? false}
+          disabled={disabled}
+          data-testid="toolbar-acknowledgement-btn"
+          onClick={() => props.onAcknowledgementRequiredChange?.(!props.acknowledgementRequired)}
+        >
+          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+            how_to_reg
+          </span>
+        </button>
+      ) : null}
 
       {/* ── Emoji button + picker ── */}
       <div className="composer-toolbar__wrap">

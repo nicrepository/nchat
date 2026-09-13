@@ -263,6 +263,7 @@ func scanFavoriteRow(rows pgx.Rows) (domain.FavoriteMessage, error) {
 		(*string)(&msg.LinkSafety),
 		&msg.EventType, &eventPayload,
 		(*string)(&msg.Priority),
+		&msg.AcknowledgementRequired,
 		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 		&msg.IsFavorited,
 		&fav.FavoritedAt,

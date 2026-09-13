@@ -88,6 +88,22 @@ export interface UseChatEditorOptions {
    * "started typing".
    */
   onActivity?: (hasContent: boolean) => void;
+  /**
+   * Issue #769: mirrors every content-changing edit into the conversation's
+   * draft, synchronously and on the same TipTap onUpdate as onActivity — so
+   * the draft is never behind the last keystroke by the time a conversation
+   * switch reads it.
+   */
+  onTextChange?: (doc: TTNode) => void;
+  /**
+   * Issue #769, "ACK ATRASADO": evaluated once the send this handleSend call
+   * started has resolved with `{status: "sent"}`, right before clearing the
+   * editor. If it returns false, the editor content is left exactly as it
+   * is — the reader has already written something new since pressing Enter,
+   * and clearing now would erase that, not the message that was actually
+   * sent. Absent, the pre-existing unconditional-clear behavior is kept.
+   */
+  shouldClearOnSent?: () => boolean;
 }
 
 // ── Shared extension factory ──────────────────────────────────────────────────
@@ -131,6 +147,8 @@ export function useChatEditor({
   canSendEmpty = false,
   onSend,
   onActivity,
+  onTextChange,
+  shouldClearOnSent,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
@@ -142,6 +160,14 @@ export function useChatEditor({
   const onActivityRef = useRef(onActivity);
   useEffect(() => {
     onActivityRef.current = onActivity;
+  });
+
+  // Same reasoning as onActivityRef — onUpdate is captured once per editor
+  // instance (issue #769: draft text must keep flowing to the store across
+  // renders that change the identity of onTextChange).
+  const onTextChangeRef = useRef(onTextChange);
+  useEffect(() => {
+    onTextChangeRef.current = onTextChange;
   });
 
   // Ref keeps the latest handleSend accessible to the submitOnEnter extension
@@ -186,6 +212,10 @@ export function useChatEditor({
         const hasContentNow = !e.isEmpty;
         setHasContent(hasContentNow);
         onActivityRef.current?.(hasContentNow);
+        // Issue #769: written synchronously, on the very same update that
+        // changes `hasContent` — never debounced — so a conversation switch
+        // immediately after the last keystroke can never race ahead of it.
+        onTextChangeRef.current?.(e.getJSON());
       },
       content: initialContent,
       onCreate: ({ editor: e }) => setHasContent(!e.isEmpty),
@@ -245,7 +275,9 @@ export function useChatEditor({
     setSending(true);
     try {
       const result = await onSend(body);
-      if (result.status === "sent" && clearOnSend) {
+      if (result.status === "sent" && clearOnSend && (shouldClearOnSent?.() ?? true)) {
+        // emitUpdate=true fires the onUpdate above, which is what mirrors
+        // the now-empty document back into the draft (issue #769).
         editor.commands.clearContent(true);
       }
       // result.status === "stale": target changed — editor content preserved

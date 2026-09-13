@@ -45,6 +45,8 @@ export interface MessageMutations {
     body: string,
     referencedMessageId?: string,
     attachmentIds?: string[],
+    /** Issue #824: ask this message's recipients to confirm receipt. */
+    acknowledgementRequired?: boolean,
   ) => Promise<SendResult>;
   editMessageLocal: (
     messageId: string,
@@ -91,6 +93,7 @@ export function useMessageMutations({
       body: string,
       referencedMessageId?: string,
       attachmentIds?: string[],
+      acknowledgementRequired?: boolean,
     ): Promise<SendResult> => {
       if (!scope.targetId || !hasContent(body, attachmentIds)) return stale;
 
@@ -111,12 +114,21 @@ export function useMessageMutations({
           parentMessageId,
           referencedMessageId,
           attachmentIds: attachmentIds ?? [],
+          // Part of the draft's identity (issue #824): the same text sent once
+          // plainly and once asking for confirmation are two different messages,
+          // and must not share a retry key. The server draws the same line in
+          // its own create fingerprint.
+          acknowledgementRequired: acknowledgementRequired ?? false,
         });
         const options: PostMessageOptions = {
           parentMessageId,
           referencedMessageId,
           attachmentIds,
           idempotencyKey: idempotencyKeyFor(signature),
+          // Passed unconditionally rather than spread behind a test: the request
+          // builder already omits a falsy flag from the payload, so a branch here
+          // would buy nothing and cost this function a decision point.
+          acknowledgementRequired,
           ...(scope.kind === "dm" ? { bodyFormat } : {}),
         };
 

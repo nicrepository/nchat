@@ -210,6 +210,7 @@ func New(cfg config.Config) (*App, error) {
 	var reactionSvc *service.ReactionService
 	var favoriteSvc *service.FavoriteService
 	var pinSvc *service.PinService
+	var acknowledgementSvc *service.AcknowledgementService
 	var sidebarPinStore *storage.PGXSidebarPinStore
 	var conversationReadStateStore *storage.PGXConversationReadStateStore
 	var notificationPrefStore *storage.PGXNotificationPrefStore
@@ -250,6 +251,7 @@ func New(cfg config.Config) (*App, error) {
 			reactionSvc = service.NewReactionService(storage.NewPGXReactionStore(pool))
 			favoriteSvc = service.NewFavoriteService(storage.NewPGXFavoriteStore(pool))
 			pinSvc = service.NewPinService(storage.NewPGXPinStore(pool))
+			acknowledgementSvc = service.NewAcknowledgementService(storage.NewPGXAcknowledgementStore(pool))
 			sidebarPinStore = storage.NewPGXSidebarPinStore(pool)
 			conversationReadStateStore = storage.NewPGXConversationReadStateStore(pool)
 			callSvc = service.NewCallService(storage.NewPGXCallStore(pool), time.Duration(cfg.CallRingTimeoutSeconds)*time.Second, nil, nil)
@@ -445,7 +447,12 @@ func New(cfg config.Config) (*App, error) {
 	var callWorkerCancel context.CancelFunc
 	var callWorkerWG *sync.WaitGroup
 	if callSvc != nil {
-		callSvc.SetPublisher(hub)
+		// hubBroadcaster, not hub directly: CallEventPublisher also needs
+		// PublishConversationEvent (issue #835 realtime follow-up), whose
+		// string targetType hubBroadcaster is what adapts to the hub's own
+		// typed ws.TargetType — the same adapter every other broadcaster
+		// below already goes through.
+		callSvc.SetPublisher(&hubBroadcaster{hub: hub})
 		workerCtx, cancel := context.WithCancel(context.Background())
 		callWorkerCancel = cancel
 		callWorkerWG = &sync.WaitGroup{}
@@ -509,6 +516,7 @@ func New(cfg config.Config) (*App, error) {
 	if pinSvc != nil {
 		messageHandler = messageHandler.WithPins(pinSvc, &hubBroadcaster{hub: hub})
 	}
+	messageHandler = wireAcknowledgements(messageHandler, acknowledgementSvc, hub)
 
 	// The channel-details panel (issue #435) reports member presence from the
 	// same tracker the hub feeds, so the HTTP layer never has to invent one.
@@ -776,6 +784,14 @@ func (p presenceReporter) OnlineUserIDs(workspaceID string) []string {
 // ws.MessagePayload, keeping the service package free of a direct ws import.
 type hubBroadcaster struct{ hub *ws.Hub }
 
+// PublishCall adapts the hub for service.CallEventPublisher (issue #835
+// realtime follow-up's CallEventPublisher now needs both this and
+// PublishConversationEvent below, and hub.PublishCall already matches this
+// signature exactly — no conversion needed, unlike the ws.TargetType one).
+func (b *hubBroadcaster) PublishCall(ctx context.Context, call domain.Call) {
+	b.hub.PublishCall(ctx, call)
+}
+
 type reactionHandlerAdapter struct{ service *service.ReactionService }
 
 func (a *reactionHandlerAdapter) ToggleReaction(ctx context.Context, workspaceID, userID, messageID, emoji string) (ws.ReactionUpdate, error) {
@@ -846,6 +862,15 @@ func domainMessageToWSUpdatedPayload(msg domain.Message) ws.MessageUpdatedPayloa
 	}
 }
 
+// PublishAcknowledgementUpdated adapts the hub for the issue #824 broadcaster,
+// converting the string targetType the HTTP layer speaks into the hub's own
+// typed one — the same conversion every other broadcaster here performs.
+func (b *hubBroadcaster) PublishAcknowledgementUpdated(
+	ctx context.Context, workspaceID, targetType, targetID, messageID string,
+) {
+	b.hub.PublishAcknowledgementUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID)
+}
+
 // PublishPinUpdated adapts the hub for the RF-05 pin broadcaster interface.
 func (b *hubBroadcaster) PublishPinUpdated(ctx context.Context, workspaceID, targetType, targetID, messageID, actorUserID string, pinned bool) {
 	b.hub.PublishPinUpdated(ctx, workspaceID, ws.TargetType(targetType), targetID, messageID, actorUserID, pinned)
@@ -884,6 +909,28 @@ func (b *hubBroadcaster) PublishConversationAvailable(ctx context.Context, works
 	b.hub.PublishConversationAvailable(ctx, workspaceID, ws.TargetType(targetType), targetID, userIDs)
 }
 
+// wireAcknowledgements attaches the issue #824 endpoints when a database was
+// available to build them from, and leaves them answering 503 when it was not.
+//
+// The nil test lives here rather than at the seam because the seam takes an
+// interface: handing it a nil *AcknowledgementService would produce a non-nil
+// interface holding a nil pointer, which passes the handler's readiness check
+// and then panics on the first request.
+//
+// Wired after the hub, beside the pins, because a committed acknowledgement is
+// announced to the conversation it happened in. Persistence remains the source
+// of truth — the event carries a route and a message id, and a subscriber that
+// cares re-reads the authorised summary — so a deployment whose bus is down
+// loses only the immediacy, not the state.
+func wireAcknowledgements(
+	handler *httpapi.MessageHandler, acknowledgements *service.AcknowledgementService, hub *ws.Hub,
+) *httpapi.MessageHandler {
+	if acknowledgements == nil {
+		return handler
+	}
+	return handler.WithAcknowledgements(acknowledgements, &hubBroadcaster{hub: hub})
+}
+
 func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 	var editedAt, deletedAt *time.Time
 	if !msg.EditedAt.IsZero() {
@@ -902,29 +949,32 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		body, quoted, attachments = "", nil, nil
 	}
 	return ws.MessagePayload{
-		ID:                 msg.ID,
-		WorkspaceID:        msg.WorkspaceID,
-		ChannelID:          msg.ChannelID,
-		DMConversationID:   msg.DMConversationID,
-		SenderID:           msg.SenderID,
-		SenderDisplayName:  msg.SenderDisplayName,
-		SenderAvatarURL:    msg.SenderAvatarURL,
-		Kind:               string(msg.Kind),
-		BodyText:           body,
-		BodyFormat:         string(msg.BodyFormat),
-		Status:             string(msg.Status),
-		Priority:           string(msg.Priority.OrStandard()),
-		LinkSafetyState:    string(msg.LinkSafety),
-		IsRemoved:          removed,
-		CreatedAt:          msg.CreatedAt,
-		UpdatedAt:          msg.UpdatedAt,
-		EditedAt:           editedAt,
-		DeletedAt:          deletedAt,
-		Quoted:             quoted,
-		Attachments:        attachments,
-		IsForwarded:        msg.ForwardedFromMessageID != "",
-		NotificationPolicy: notificationPolicyFor(msg, removed, recipientFacts{}),
-		HasReference:       msg.ReferencedMessageID != "",
+		ID:                msg.ID,
+		WorkspaceID:       msg.WorkspaceID,
+		ChannelID:         msg.ChannelID,
+		DMConversationID:  msg.DMConversationID,
+		SenderID:          msg.SenderID,
+		SenderDisplayName: msg.SenderDisplayName,
+		SenderAvatarURL:   msg.SenderAvatarURL,
+		Kind:              string(msg.Kind),
+		BodyText:          body,
+		BodyFormat:        string(msg.BodyFormat),
+		Status:            string(msg.Status),
+		Priority:          string(msg.Priority.OrStandard()),
+		// Carried on a removed message too, like Priority above: what a message
+		// asked for is not content, and the removal path blanks content.
+		AcknowledgementRequired: msg.AcknowledgementRequired,
+		LinkSafetyState:         string(msg.LinkSafety),
+		IsRemoved:               removed,
+		CreatedAt:               msg.CreatedAt,
+		UpdatedAt:               msg.UpdatedAt,
+		EditedAt:                editedAt,
+		DeletedAt:               deletedAt,
+		Quoted:                  quoted,
+		Attachments:             attachments,
+		IsForwarded:             msg.ForwardedFromMessageID != "",
+		NotificationPolicy:      notificationPolicyFor(msg, removed, recipientFacts{}),
+		HasReference:            msg.ReferencedMessageID != "",
 	}
 }
 

@@ -338,6 +338,23 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("DELETE "+RouteMessage, authMiddleware(
 		msgPostLimiter.Middleware(http.HandlerFunc(messages.DeleteMessage)),
 	))
+	// Issue #824. The POST spends the ordinary write budget rather than the
+	// tighter pin budget: confirming receipt is something a person legitimately
+	// does once per urgent message they are sent, and it reaches no third party.
+	// The GET spends the single-fetch budget for the same reason the
+	// single-message route does — a client reconciling after a reconnect asks
+	// about the few messages on screen, and that must not compete with scroll.
+	mux.Handle("POST "+RouteMessageAcknowledgement, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.AcknowledgeMessage)),
+	))
+	// The page-load batch spends the list budget: it is one request for the
+	// screen, which is what that budget is for.
+	mux.Handle("POST "+RouteMessageAcknowledgements, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageAcknowledgements)),
+	))
+	mux.Handle("GET "+RouteMessageAcknowledgement, authMiddleware(
+		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetMessageAcknowledgement)),
+	))
 	mux.Handle("GET "+RouteMessageEditHistory, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageEditHistory)),
 	))

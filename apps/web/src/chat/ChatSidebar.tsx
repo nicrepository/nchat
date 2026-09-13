@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
@@ -23,6 +23,7 @@ import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
 import { useSidebarSectionPreferences } from "./sidebarSectionPreferences";
 import type { SidebarState } from "./useChatSidebar";
+import type { DraftSummary } from "./useConversationDrafts";
 
 /**
  * The pinned indicator (issue #527).
@@ -371,6 +372,58 @@ function unreadBadgeLabel(count: number, hasMentionUnread?: boolean): string {
   return hasMentionUnread ? `${count} não lidas, incluindo menção` : `${count} não lidas`;
 }
 
+// ── Draft indicator (issue #769) ────────────────────────────────────────────
+
+/**
+ * Context rather than a prop threaded through ChannelList/ChannelsByCategory/
+ * DMList/DMRow: those already pass RowActionsProps down unchanged to every
+ * row, and a keystroke-driven value has no business widening that surface.
+ * Provided once at ChatSidebar's root; read only by the two row components
+ * that actually draw the indicator.
+ */
+const DraftSummariesContext = createContext<ReadonlyMap<string, DraftSummary>>(new Map());
+
+/**
+ * The draft-key convention ChatMessageArea/ChatComposer already use —
+ * "channel"/"dm" only, never "group": a group DM is still kind "dm" to the
+ * route and the composer, unlike ConversationTarget's three-way kind used
+ * for row actions above.
+ */
+function draftKeyFor(kind: "channel" | "dm", id: string): string {
+  return `${kind}:${id}`;
+}
+
+const maxDraftPreviewLength = 40;
+
+/**
+ * "Rascunho: …" (issue #769) — never the full text (privacy: "PRIVACIDADE DA
+ * SIDEBAR"), and never anything that reveals draft != unread semantics on its
+ * own; this is purely an additional, independent label.
+ */
+function draftLabel(summary: DraftSummary): string {
+  if (summary.kind === "voice") return "Rascunho: mensagem de voz";
+  if (summary.kind === "attachments") {
+    return summary.attachmentCount === 1
+      ? "Rascunho: 1 arquivo"
+      : `Rascunho: ${summary.attachmentCount} arquivos`;
+  }
+  if (summary.kind === "mixed" || !summary.text) return "Rascunho";
+  const truncated =
+    summary.text.length > maxDraftPreviewLength
+      ? `${summary.text.slice(0, maxDraftPreviewLength).trimEnd()}…`
+      : summary.text;
+  return `Rascunho: ${truncated}`;
+}
+
+function DraftIndicator({ summary }: { summary: DraftSummary | undefined }) {
+  if (!summary) return null;
+  return (
+    <span className="chat-sidebar__draft-badge" data-testid="chat-sidebar-draft-badge">
+      {draftLabel(summary)}
+    </span>
+  );
+}
+
 // ── Row actions ───────────────────────────────────────────────────────────────
 
 /**
@@ -451,6 +504,7 @@ interface ChannelListProps {
 }
 
 function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: ChannelListProps) {
+  const draftSummaries = useContext(DraftSummariesContext);
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -487,25 +541,33 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
               onClick={() => onSelect(ch.id)}
             >
               {ch.type === "private" ? <IconLock /> : <IconHash />}
-              <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-              {ch.type === "private" && (
-                <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                  privado
-                </span>
-              )}
-              {ch.unreadCount != null && ch.unreadCount > 0 && (
-                <span
-                  className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
-                  aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
-                >
-                  {ch.hasMentionUnread && (
-                    <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
-                      @
+              <span className="chat-sidebar__row-lines">
+                <span className="chat-sidebar__row-line">
+                  <span className="chat-sidebar__nav-item-name">{ch.name}</span>
+                  {ch.type === "private" && (
+                    <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
+                      privado
                     </span>
                   )}
-                  {ch.unreadCount}
+                  {ch.unreadCount != null && ch.unreadCount > 0 && (
+                    <span
+                      className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+                      aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
+                    >
+                      {ch.hasMentionUnread && (
+                        <span
+                          aria-hidden="true"
+                          className="chat-sidebar__unread-badge-mention-mark"
+                        >
+                          @
+                        </span>
+                      )}
+                      {ch.unreadCount}
+                    </span>
+                  )}
                 </span>
-              )}
+                <DraftIndicator summary={draftSummaries.get(draftKeyFor("channel", ch.id))} />
+              </span>
             </button>
             <RowActions target={target} {...actions} />
           </div>
@@ -548,6 +610,7 @@ function DMRow({
   actions: RowActionsProps;
 }) {
   const isGroup = dm.type === "group";
+  const draftSummaries = useContext(DraftSummariesContext);
   const counterpart = dm.counterpart;
   // Scoped to this conversation: the counterpart is one of its two participants,
   // so the server's roster for it is exactly the list that would have named them.
@@ -597,23 +660,28 @@ function DMRow({
             size="sm"
           />
         )}
-        <span className="chat-sidebar__dm-name">{dm.name}</span>
-        {isGroup && (
-          <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
-        )}
-        {dm.unreadCount != null && dm.unreadCount > 0 && (
-          <span
-            className={`chat-sidebar__unread-badge${dm.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
-            aria-label={unreadBadgeLabel(dm.unreadCount, dm.hasMentionUnread)}
-          >
-            {dm.hasMentionUnread && (
-              <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
-                @
+        <span className="chat-sidebar__row-lines">
+          <span className="chat-sidebar__row-line">
+            <span className="chat-sidebar__dm-name">{dm.name}</span>
+            {isGroup && (
+              <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
+            )}
+            {dm.unreadCount != null && dm.unreadCount > 0 && (
+              <span
+                className={`chat-sidebar__unread-badge${dm.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+                aria-label={unreadBadgeLabel(dm.unreadCount, dm.hasMentionUnread)}
+              >
+                {dm.hasMentionUnread && (
+                  <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
+                    @
+                  </span>
+                )}
+                {dm.unreadCount}
               </span>
             )}
-            {dm.unreadCount}
           </span>
-        )}
+          <DraftIndicator summary={draftSummaries.get(draftKeyFor("dm", dm.id))} />
+        </span>
       </button>
       <RowActions target={target} {...actions} />
     </div>
@@ -989,6 +1057,16 @@ interface ChatSidebarProps {
     targetId: string,
     trigger: HTMLButtonElement | null,
   ) => void;
+  /**
+   * Which conversations have a draft, and a coarse summary of what kind
+   * (issue #769) — keyed the same way as everywhere else in the chat
+   * shell: "channel:<id>" / "dm:<id>". Deliberately its own coarse piece of
+   * state (see useConversationDrafts' module doc): it changes on an
+   * empty<->non-empty or attachment-count/kind boundary, never on a single
+   * keystroke, which is what keeps typing in the composer from
+   * re-rendering this whole sidebar.
+   */
+  draftSummaries?: ReadonlyMap<string, DraftSummary>;
 }
 
 /**
@@ -1005,6 +1083,7 @@ export const chatNavigationId = "chat-navigation";
 const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
 const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
 const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
+const EMPTY_DRAFT_SUMMARIES: ReadonlyMap<string, DraftSummary> = new Map();
 
 export default function ChatSidebar({
   state,
@@ -1016,6 +1095,7 @@ export default function ChatSidebar({
   setMuted,
   leaveConversation,
   onOpenDetails,
+  draftSummaries = EMPTY_DRAFT_SUMMARIES,
 }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -1268,174 +1348,176 @@ export default function ChatSidebar({
   }
 
   return (
-    <aside
-      id={chatNavigationId}
-      className="chat-sidebar"
-      aria-label="Navegação do workspace Nchat"
-      data-testid="chat-sidebar"
-    >
-      {/* ── Brand ── */}
-      <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
-        <img
-          src="/assets/icononly_transparent.png"
-          alt=""
-          width={30}
-          height={34}
-          className="chat-sidebar__brand-img"
-        />
-        <div className="chat-sidebar__brand-copy">
-          <p className="chat-sidebar__brand-title">Nchat</p>
-          <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
-        </div>
-      </Link>
+    <DraftSummariesContext.Provider value={draftSummaries}>
+      <aside
+        id={chatNavigationId}
+        className="chat-sidebar"
+        aria-label="Navegação do workspace Nchat"
+        data-testid="chat-sidebar"
+      >
+        {/* ── Brand ── */}
+        <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
+          <img
+            src="/assets/icononly_transparent.png"
+            alt=""
+            width={30}
+            height={34}
+            className="chat-sidebar__brand-img"
+          />
+          <div className="chat-sidebar__brand-copy">
+            <p className="chat-sidebar__brand-title">Nchat</p>
+            <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
+          </div>
+        </Link>
 
-      {/* ── New conversation CTA ──
+        {/* ── New conversation CTA ──
           The sidebar's single creation entry point: the dialog behind it is
           where Pessoa/Grupo/Canal is chosen. The accessible name is the visible
           text, so it does not depend on a tooltip. Unavailable until the sidebar
           is ready because the dialog needs the current user id to exclude the
           actor from the search — never because of a role, which the server alone
           evaluates and which channel creation does not consider at all. */}
-      <button
-        ref={newConversationButtonRef}
-        type="button"
-        className="chat-sidebar__cta"
-        aria-haspopup="dialog"
-        disabled={state.status !== "ready"}
-        onClick={() => setNewConversationOpen(true)}
-      >
-        <IconAdd />
-        Nova conversa
-      </button>
+        <button
+          ref={newConversationButtonRef}
+          type="button"
+          className="chat-sidebar__cta"
+          aria-haspopup="dialog"
+          disabled={state.status !== "ready"}
+          onClick={() => setNewConversationOpen(true)}
+        >
+          <IconAdd />
+          Nova conversa
+        </button>
 
-      {/* ── Nav ──
+        {/* ── Nav ──
           Three product categories, three sections. Channels come from their own
           canonical list; 1:1 conversations and ad-hoc groups are split from the
           single DM list by the server-derived discriminator, so a conversation
           cannot show up twice or land in the wrong section. Nothing is
           classified while loading or on error: the sections only exist once the
           canonical data does. */}
-      <div className="chat-sidebar__nav">
-        {state.status === "loading" && <LoadingSkeleton />}
+        <div className="chat-sidebar__nav">
+          {state.status === "loading" && <LoadingSkeleton />}
 
-        {state.status === "error" && <ErrorState onRetry={retry} />}
+          {state.status === "error" && <ErrorState onRetry={retry} />}
 
-        {state.status === "ready" && (
-          <>
-            <Section
-              labelId={CHANNELS_LABEL_ID}
-              title="Canais"
-              collapsed={sectionPrefs.channels.collapsed}
-              onToggleCollapse={() => toggleSectionCollapsed("channels")}
-              showUnreadOnly={sectionPrefs.channels.showUnreadOnly}
-              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("channels")}
-              badgeCount={unreadChannelsCount}
-            >
-              {channelsSectionVisible && (
-                <ChannelsByCategory
-                  grouped={visibleChannelGroups}
-                  activeChannelId={activeChannelId}
-                  onSelect={handleChannelSelect}
-                  actions={rowActions}
-                  collapsed={collapsedCategories}
-                  onToggleCategory={toggleCategory}
-                  hideEmptyGroups={channelsShowUnreadOnly}
-                />
-              )}
-            </Section>
+          {state.status === "ready" && (
+            <>
+              <Section
+                labelId={CHANNELS_LABEL_ID}
+                title="Canais"
+                collapsed={sectionPrefs.channels.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("channels")}
+                showUnreadOnly={sectionPrefs.channels.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("channels")}
+                badgeCount={unreadChannelsCount}
+              >
+                {channelsSectionVisible && (
+                  <ChannelsByCategory
+                    grouped={visibleChannelGroups}
+                    activeChannelId={activeChannelId}
+                    onSelect={handleChannelSelect}
+                    actions={rowActions}
+                    collapsed={collapsedCategories}
+                    onToggleCategory={toggleCategory}
+                    hideEmptyGroups={channelsShowUnreadOnly}
+                  />
+                )}
+              </Section>
 
-            <Section
-              labelId={DIRECTS_LABEL_ID}
-              title="Mensagens diretas"
-              spaced
-              collapsed={sectionPrefs.directs.collapsed}
-              onToggleCollapse={() => toggleSectionCollapsed("directs")}
-              showUnreadOnly={sectionPrefs.directs.showUnreadOnly}
-              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("directs")}
-              badgeCount={unreadDirects.length}
-            >
-              {directsSectionVisible && (
-                <DMList
-                  dms={visibleDirects}
-                  activeDMId={activeDMId}
-                  onSelect={handleDMSelect}
-                  labelId={DIRECTS_LABEL_ID}
-                  emptyMessage="Nenhuma mensagem direta."
-                  actions={rowActions}
-                />
-              )}
-            </Section>
+              <Section
+                labelId={DIRECTS_LABEL_ID}
+                title="Mensagens diretas"
+                spaced
+                collapsed={sectionPrefs.directs.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("directs")}
+                showUnreadOnly={sectionPrefs.directs.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("directs")}
+                badgeCount={unreadDirects.length}
+              >
+                {directsSectionVisible && (
+                  <DMList
+                    dms={visibleDirects}
+                    activeDMId={activeDMId}
+                    onSelect={handleDMSelect}
+                    labelId={DIRECTS_LABEL_ID}
+                    emptyMessage="Nenhuma mensagem direta."
+                    actions={rowActions}
+                  />
+                )}
+              </Section>
 
-            <Section
-              labelId={GROUPS_LABEL_ID}
-              title="Grupos"
-              spaced
-              collapsed={sectionPrefs.groups.collapsed}
-              onToggleCollapse={() => toggleSectionCollapsed("groups")}
-              showUnreadOnly={sectionPrefs.groups.showUnreadOnly}
-              onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("groups")}
-              badgeCount={unreadGroups.length}
-            >
-              {groupsSectionVisible && (
-                <DMList
-                  dms={visibleGroups}
-                  activeDMId={activeDMId}
-                  onSelect={handleDMSelect}
-                  labelId={GROUPS_LABEL_ID}
-                  emptyMessage="Nenhum grupo."
-                  actions={rowActions}
-                />
-              )}
-            </Section>
-          </>
-        )}
-        {actionError && (
-          <p className="chat-sidebar__pin-error" role="alert">
-            {actionError}
-          </p>
-        )}
-      </div>
+              <Section
+                labelId={GROUPS_LABEL_ID}
+                title="Grupos"
+                spaced
+                collapsed={sectionPrefs.groups.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("groups")}
+                showUnreadOnly={sectionPrefs.groups.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("groups")}
+                badgeCount={unreadGroups.length}
+              >
+                {groupsSectionVisible && (
+                  <DMList
+                    dms={visibleGroups}
+                    activeDMId={activeDMId}
+                    onSelect={handleDMSelect}
+                    labelId={GROUPS_LABEL_ID}
+                    emptyMessage="Nenhum grupo."
+                    actions={rowActions}
+                  />
+                )}
+              </Section>
+            </>
+          )}
+          {actionError && (
+            <p className="chat-sidebar__pin-error" role="alert">
+              {actionError}
+            </p>
+          )}
+        </div>
 
-      {/* ── Footer ── */}
-      <div className="chat-sidebar__footer">
-        <Link to="/chat/search" className="chat-sidebar__footer-item" aria-label="Buscar">
-          <IconSearch />
-          <span>Buscar</span>
-        </Link>
-        <Link
-          to="/chat/favorites"
-          className="chat-sidebar__footer-item"
-          aria-label="Meus favoritos"
-        >
-          <IconStar />
-          <span>Favoritos</span>
-        </Link>
-        <SidebarUser />
-      </div>
-      <SidebarRenameDialog
-        channels={channels}
-        dms={dms}
-        targetId={renamingId}
-        onClose={() => setRenamingId(null)}
-        onRenameChannel={renameChannel}
-        onRenameGroup={renameGroup}
-      />
-      <SidebarLeaveDialog
-        channels={channels}
-        dms={dms}
-        targetId={leavingId}
-        onClose={() => setLeavingId(null)}
-        onLeave={leaveConversation}
-      />
-      {newConversationOpen && state.status === "ready" && (
-        <NewConversationDialog
-          currentUserId={state.currentUserId}
-          categories={categories || []}
-          onClose={closeNewConversation}
-          onOpened={handleDMOpened}
-          onChannelCreated={handleChannelCreated}
+        {/* ── Footer ── */}
+        <div className="chat-sidebar__footer">
+          <Link to="/chat/search" className="chat-sidebar__footer-item" aria-label="Buscar">
+            <IconSearch />
+            <span>Buscar</span>
+          </Link>
+          <Link
+            to="/chat/favorites"
+            className="chat-sidebar__footer-item"
+            aria-label="Meus favoritos"
+          >
+            <IconStar />
+            <span>Favoritos</span>
+          </Link>
+          <SidebarUser />
+        </div>
+        <SidebarRenameDialog
+          channels={channels}
+          dms={dms}
+          targetId={renamingId}
+          onClose={() => setRenamingId(null)}
+          onRenameChannel={renameChannel}
+          onRenameGroup={renameGroup}
         />
-      )}
-    </aside>
+        <SidebarLeaveDialog
+          channels={channels}
+          dms={dms}
+          targetId={leavingId}
+          onClose={() => setLeavingId(null)}
+          onLeave={leaveConversation}
+        />
+        {newConversationOpen && state.status === "ready" && (
+          <NewConversationDialog
+            currentUserId={state.currentUserId}
+            categories={categories || []}
+            onClose={closeNewConversation}
+            onOpened={handleDMOpened}
+            onChannelCreated={handleChannelCreated}
+          />
+        )}
+      </aside>
+    </DraftSummariesContext.Provider>
   );
 }

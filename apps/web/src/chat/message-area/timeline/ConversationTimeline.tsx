@@ -7,7 +7,7 @@
  * the page around it.
  */
 
-import type { MentionTarget } from "../../chatTypes";
+import type { MentionTarget, MessageAcknowledgement } from "../../chatTypes";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import { systemScopeFor } from "../../conversationSystemMessage";
 import type { EmojiUsage } from "../../emoji/emojiUsage";
@@ -33,6 +33,10 @@ export interface ConversationTimelineProps {
   editDisabledIds: Set<string>;
   pinnedIds: Set<string>;
   openingAuthorDMIds?: Set<string>;
+  /** Issue #824: the server's acknowledgement summary per message, if any. */
+  acknowledgements?: Record<string, MessageAcknowledgement>;
+  /** Issue #824: the message whose confirmation is in flight, if any. */
+  acknowledgingId?: string | null;
   recentReactionEmojis: string[];
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
@@ -72,6 +76,8 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
       pinnedIds={props.pinnedIds}
       openingAuthorDMIds={props.openingAuthorDMIds}
+      acknowledgements={props.acknowledgements}
+      acknowledgingId={props.acknowledgingId}
       recentReactionEmojis={props.recentReactionEmojis}
       emojiUsage={props.emojiUsage}
       onEmojiToneChange={props.onEmojiToneChange}

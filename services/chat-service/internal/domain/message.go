@@ -282,6 +282,17 @@ type Message struct {
 	// that later decides how to alert somebody reads this; it is not told what
 	// to do by it.
 	Priority MessagePriority
+	// AcknowledgementRequired is the author asking their recipients to confirm
+	// receipt explicitly (issue #824). Set once, when the message is created;
+	// no edit path changes it, and editing the body does not reset any answer
+	// already given.
+	//
+	// It is an axis of its own and not a consequence of Priority: #820 keeps
+	// the two independent in the domain even though the first release's UI only
+	// offers acknowledgement on an urgent message. Like Priority it authorises
+	// nothing — the per-recipient rows it causes to be written are derived in
+	// the database from membership, never from anything a client sends.
+	AcknowledgementRequired bool
 	// LinkSafety is the link-safety axis, independent of Status. See
 	// MessageLinkSafety: it is what a client needs to decide whether to draw the
 	// "could not verify" notice, and what nothing in this service may read as

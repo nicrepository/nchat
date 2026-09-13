@@ -1,8 +1,14 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
-import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
+import type {
+  LinkSafetyRecheck,
+  MentionTarget,
+  Message,
+  MessageAcknowledgement,
+} from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
+import MessageAcknowledgementStrip from "./MessageAcknowledgement";
 import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
 import MessageToolbar from "./MessageToolbar";
@@ -77,6 +83,20 @@ export interface MessageBubbleProps {
    * warning is the important half — the action is a convenience.
    */
   onReconcileLinkSafety?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
+  /**
+   * Issue #824. The server's own summary for this message, absent while it is
+   * still being read and for every message that asked nobody — which is almost
+   * all of them, so the strip below draws nothing at all in the common case.
+   */
+  acknowledgement?: MessageAcknowledgement;
+  /** True while this message's confirmation is in flight. */
+  acknowledging?: boolean;
+  /**
+   * Confirms receipt. Optional: without it the strip still reports the state,
+   * which is the half that matters — an action nobody wired is better absent
+   * than broken.
+   */
+  onAcknowledge?: (messageId: string) => void;
 }
 
 function MessageMeta({
@@ -278,6 +298,16 @@ function MessageBubbleBody({
           onReferenceJump={props.onReferenceJump}
           onReconcileLinkSafety={props.onReconcileLinkSafety}
         />
+        {props.onAcknowledge ? (
+          <MessageAcknowledgementStrip
+            messageId={message.id}
+            acknowledgement={props.acknowledgement}
+            senderId={message.senderId}
+            currentUserId={props.currentUserId}
+            submitting={props.acknowledging ?? false}
+            onAcknowledge={props.onAcknowledge}
+          />
+        ) : null}
       </div>
       <MessageToolbar
         message={message}

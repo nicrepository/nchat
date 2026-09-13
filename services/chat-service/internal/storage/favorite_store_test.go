@@ -254,6 +254,7 @@ func TestPGXFavoriteStore_ListFavorites_WithEditedAt_ScansTimestamps(t *testing.
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
 		"standard",
+		false,
 		"Test User", "test@example.com", "", true,
 		now.Add(-time.Hour),
 	}

@@ -116,7 +116,24 @@ const (
 	// credentials to look up arbitrary URLs.
 	RouteMessageLinkSafetyReconcile = "/api/chat/messages/{messageID}/link-safety/reconcile"
 	RouteMessageEditHistory         = "/api/chat/messages/{messageID}/history"
-	RouteWorkspaceSettings          = "/api/v1/workspaces/{workspaceID}/settings"
+	// Issue #824 recipient acknowledgement. Message-scoped and target-free, for
+	// the same reason RouteMessageFavorite is: the message is the aggregate, and
+	// the conversation it lives in is something the server resolves from it
+	// rather than something a client restates and could restate wrongly.
+	//
+	// There is deliberately no user segment. POST always acts on the caller —
+	// naming a recipient in the path would invite the belief that some other
+	// value belongs there — and GET answers with what the caller is authorised
+	// to see rather than with whoever they ask about.
+	RouteMessageAcknowledgement = "/api/chat/messages/{messageID}/acknowledgement"
+	// Issue #824 page load. A literal segment under the same prefix as
+	// {messageID}, on the same terms as RouteMessageLinkSafetyStatus above: Go's
+	// mux prefers the literal, and the two are served for different methods
+	// anyway. POST because the request carries a batch of ids, though it is a
+	// read — and it answers with summaries only, never the per-recipient detail,
+	// which stays on the message-scoped route.
+	RouteMessageAcknowledgements = "/api/chat/messages/acknowledgements"
+	RouteWorkspaceSettings       = "/api/v1/workspaces/{workspaceID}/settings"
 	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
 	// is the only prefix the gateways forward to chat-service (Traefik local and
 	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never

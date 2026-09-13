@@ -259,7 +259,7 @@ func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
 	expectCallStartedEvent(mock)
 	mock.ExpectCommit()
 
-	call, created, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	call, created, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -301,7 +301,7 @@ func TestPGXCallStoreCreateResourceReplayStaysIdempotentAndDetectsMismatch(t *te
 				mock.ExpectRollback()
 			}
 
-			call, created, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+			call, created, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 				WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 				TargetType: domain.CallTargetChannel, TargetID: test.targetID,
 				Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
@@ -338,7 +338,7 @@ func TestPGXCallStoreCreateResourceReplayWithoutCurrentFenceFailsClosed(t *testi
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
-	_, _, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	_, _, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
@@ -383,7 +383,7 @@ func TestPGXCallStoreCreateResourceRejectsBusyActorAndRollsBackTheNewCall(t *tes
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectRollback()
 
-	_, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	_, _, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -425,7 +425,7 @@ func TestPGXCallStoreCreateResourceExcludesTheSameCallFromItsOwnBusyCheck(t *tes
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	call, _, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	call, _, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -763,7 +763,7 @@ func TestPGXCallStoreCreateResource_RollsBackWhenCallStartedEventInsertFails(t *
 		WillReturnError(errors.New("event insert failed"))
 	mock.ExpectRollback()
 
-	if _, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	if _, _, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -801,7 +801,7 @@ func TestPGXCallStoreCreateResource_JoiningExistingCall_NoDuplicateEvent(t *test
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	_, created, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	_, created, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callOutsiderID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,

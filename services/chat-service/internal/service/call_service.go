@@ -14,7 +14,7 @@ type callStore interface {
 	// CreateResourceCall additionally returns the ParticipationID this
 	// admission holds (issue #622 round 3) — see
 	// storage.PGXCallStore.CreateResourceCall.
-	CreateResourceCall(context.Context, storage.CreateResourceCallInput) (domain.Call, bool, string, error)
+	CreateResourceCall(context.Context, storage.CreateResourceCallInput) (domain.Call, bool, string, string, error)
 	RenewCallPresence(context.Context, storage.RenewCallPresenceInput) error
 	TransitionCall(context.Context, storage.TransitionCallInput) (storage.TransitionCallResult, error)
 	LeaveResourceCall(context.Context, storage.LeaveResourceCallInput) (storage.TransitionCallResult, error)
@@ -32,6 +32,12 @@ type callStore interface {
 
 type CallEventPublisher interface {
 	PublishCall(context.Context, domain.Call)
+	// PublishConversationEvent announces the call_started/call_ended system
+	// message a resource-call admission or an explicit End just committed
+	// (issue #835 realtime follow-up) — the same signal
+	// ChannelHandler/DMHandler already send for a rename or a departure, so
+	// the timeline updates live instead of only on reload.
+	PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string)
 }
 
 type CallService struct {
@@ -85,7 +91,7 @@ func (s *CallService) Start(ctx context.Context, input StartCallInput) (domain.C
 		if targetErr != nil {
 			return domain.Call{}, "", domain.ErrInvalidInput
 		}
-		call, created, participationID, createErr := s.store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		call, created, participationID, eventMessageID, createErr := s.store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: workspaceID,
 			RequestID:   requestID,
 			CallerID:    callerID,
@@ -102,6 +108,7 @@ func (s *CallService) Start(ctx context.Context, input StartCallInput) (domain.C
 		if created || call.Status == domain.CallStatusActive {
 			s.publish(ctx, call)
 		}
+		s.publishConversationEvent(ctx, workspaceID, string(call.TargetType), call.TargetID, eventMessageID)
 		return call, participationID, nil
 	}
 	if input.TargetType != "" || input.TargetID != "" {
@@ -353,6 +360,7 @@ func (s *CallService) transition(ctx context.Context, workspaceID, actorID, call
 	if result.Changed {
 		s.publish(ctx, result.Call)
 	}
+	s.publishConversationEvent(ctx, workspaceID, string(result.Call.TargetType), result.Call.TargetID, result.EventMessageID)
 	return result.Call, transitionErr
 }
 
@@ -360,6 +368,17 @@ func (s *CallService) publish(ctx context.Context, call domain.Call) {
 	if s.publisher != nil {
 		s.publisher.PublishCall(ctx, call)
 	}
+}
+
+// publishConversationEvent announces a call_started/call_ended system message
+// (issue #835 realtime follow-up), a no-op when messageID is empty — the
+// idempotent-replay and join-an-existing-call paths, and every transition but
+// End, never produce one.
+func (s *CallService) publishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string) {
+	if s.publisher == nil || messageID == "" {
+		return
+	}
+	s.publisher.PublishConversationEvent(ctx, workspaceID, targetType, targetID, messageID)
 }
 
 func canonicalUUID(value string) (string, error) {

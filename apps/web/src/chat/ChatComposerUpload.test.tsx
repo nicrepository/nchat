@@ -411,7 +411,7 @@ describe("composer upload state", () => {
     await waitFor(() => expect(screen.getAllByText("Pronto para enviar")).toHaveLength(2));
     expect(screen.getByText("2 arquivos anexados")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("chat-send-btn"));
-    expect(view.onSend).toHaveBeenCalledWith("", ["a-id", "b-id"]);
+    expect(view.onSend).toHaveBeenCalledWith("", ["a-id", "b-id"], false);
     expect(view.container.querySelector('input[type="file"]')).toHaveAttribute("multiple");
   });
 

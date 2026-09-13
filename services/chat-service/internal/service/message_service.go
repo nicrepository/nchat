@@ -52,6 +52,14 @@ type messageUpdatedPublisher interface {
 	PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
 }
 
+// acknowledgementUpdatedPublisher announces that one message's acknowledgement
+// changed (issue #824). Optional, like messageUpdatedPublisher: a publisher
+// that does not implement it simply announces nothing, and clients reconcile on
+// their next subscription.
+type acknowledgementUpdatedPublisher interface {
+	PublishAcknowledgementUpdated(ctx context.Context, workspaceID, targetType, targetID, messageID string)
+}
+
 const maxMessageBodyRunes = 40_000
 const maxEditHistoryOffset = 10_000
 const MaxMessageReferenceBatchSize = 100
@@ -227,6 +235,10 @@ type CreateChannelMessageInput struct {
 	// spell out the default; anything outside the three declared values is
 	// refused rather than quietly demoted.
 	Priority domain.MessagePriority
+	// AcknowledgementRequired asks this message's recipients to confirm receipt
+	// explicitly (issue #824). Independent of Priority in the domain even though
+	// the first release's composer only offers it on an urgent message.
+	AcknowledgementRequired bool
 }
 
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
@@ -250,6 +262,9 @@ type CreateDMMessageInput struct {
 	// Priority is the author's stated message priority, on the same terms as the
 	// channel path's (issue #821).
 	Priority domain.MessagePriority
+	// AcknowledgementRequired asks for explicit confirmation, on the same terms
+	// as the channel path's (issue #824).
+	AcknowledgementRequired bool
 }
 
 type ForwardChannelMessageInput struct {
@@ -450,7 +465,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		WorkspaceID: workspaceID, TargetID: input.ChannelID, TargetField: "channel_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
-		Priority: input.Priority,
+		Priority: input.Priority, AcknowledgementRequired: input.AcknowledgementRequired,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -461,6 +476,11 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	// SQL-enforce channel visibility: workspace active + workspace member active +
 	// channel active + private-channel membership. Returns ErrNotFound for all
 	// invisible targets (non-enumerating).
+	//
+	// This is the authorization a replay needs too, which is why it stays here
+	// rather than moving below with the fan-out bound: a sender who has since
+	// lost access to the channel must not be able to read their old message back
+	// by presenting its key.
 	if _, err := s.channels.GetVisibleChannelByID(ctx, workspaceID, channelID, senderID); err != nil {
 		return domain.Message{}, err
 	}
@@ -471,7 +491,11 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	// Idempotency first, before anything external: a retry asks for the message
 	// that already exists, not for a second one.
 	replayInput := channelReplayInput(workspaceID, request, input)
-	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
+	existing, replayed, err := s.resolveCreateReplayOrAdmit(ctx, replayInput, acknowledgementFanout{
+		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
+		Required: request.AcknowledgementRequired,
+	})
+	if err != nil || replayed {
 		return existing, err
 	}
 	// RF-21 is asynchronous, so this yields one of three outcomes: publish now,
@@ -500,20 +524,21 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	parentID, forwardedID, referencedID := refs.ParentID, refs.ForwardedID, refs.ReferencedID
 
 	msg, err := s.persistMessage(ctx, storage.CreateMessageInput{
-		WorkspaceID:            workspaceID,
-		ChannelID:              channelID,
-		SenderID:               senderID,
-		Kind:                   domain.MessageKindUser,
-		BodyText:               body,
-		BodyFormat:             bodyFormat,
-		ParentMessageID:        parentID,
-		ForwardedFromMessageID: forwardedID,
-		ReferencedMessageID:    referencedID,
-		MentionedUserIDs:       mentionedUserIDs,
-		MentionedChannelIDs:    mentionedChannelIDs,
-		AttachmentIDs:          attachmentIDs,
-		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
-		Priority:               request.Priority,
+		WorkspaceID:             workspaceID,
+		ChannelID:               channelID,
+		SenderID:                senderID,
+		Kind:                    domain.MessageKindUser,
+		BodyText:                body,
+		BodyFormat:              bodyFormat,
+		ParentMessageID:         parentID,
+		ForwardedFromMessageID:  forwardedID,
+		ReferencedMessageID:     referencedID,
+		MentionedUserIDs:        mentionedUserIDs,
+		MentionedChannelIDs:     mentionedChannelIDs,
+		AttachmentIDs:           attachmentIDs,
+		MaxAttachmentBytes:      s.maxMessageAttachmentBytes,
+		Priority:                request.Priority,
+		AcknowledgementRequired: request.AcknowledgementRequired,
 	}, links, body, replayInput, "create channel message")
 	if err != nil {
 		return domain.Message{}, err
@@ -543,6 +568,10 @@ type createRequestInput struct {
 	BodyFormat    domain.MessageBodyFormat
 	AttachmentIDs []string
 	Priority      domain.MessagePriority
+	// AcknowledgementRequired is the author asking for explicit confirmation
+	// (issue #824), exactly as the request stated it. Nothing normalises it:
+	// absence and false are the same request.
+	AcknowledgementRequired bool
 }
 
 // createRequest is the same send after normalisation: trimmed, bounded, and with
@@ -554,6 +583,10 @@ type createRequest struct {
 	BodyFormat    domain.MessageBodyFormat
 	AttachmentIDs []string
 	Priority      domain.MessagePriority
+	// AcknowledgementRequired travels with the normalised send so the bound
+	// check and the replay fingerprint read it from one shape rather than from
+	// two differently-typed input structs.
+	AcknowledgementRequired bool
 }
 
 // normalizeCreateRequest applies the rules that hold for any send, before
@@ -592,7 +625,97 @@ func normalizeCreateRequest(input createRequestInput, maxAttachments int) (creat
 		return createRequest{}, err
 	}
 	request.AttachmentIDs, request.BodyFormat, request.Priority = attachmentIDs, bodyFormat, priority
+	request.AcknowledgementRequired = input.AcknowledgementRequired
 	return request, nil
+}
+
+// acknowledgementFanout names the conversation whose recipient bound a *new*
+// send must respect (issue #824). Exactly one of ChannelID and ConversationID
+// is set, which is what lets the two create paths describe their own target
+// without a second assertion function apiece.
+type acknowledgementFanout struct {
+	WorkspaceID    string
+	ChannelID      string
+	ConversationID string
+	SenderID       string
+	// Required is the send's own flag. When it is false there is no bound to
+	// check and no query to spend, which is almost every message.
+	Required bool
+}
+
+// resolveCreateReplayOrAdmit answers a retried send from what is already
+// persisted and, only when there is nothing to replay, checks the preconditions
+// that belong to creating a new message.
+//
+// The two live in one function because their order is the correctness property,
+// not a preference. A replay returns a message that already exists: it creates
+// nothing, asks nobody to confirm anything and writes no recipient rows, so
+// re-deciding whether a *new* fan-out would be allowed has nothing to decide.
+// Worse, it is a decision over mutable state — the conversation's membership —
+// so applying it to a replay makes a retry's success depend on who joined since
+// the original send. A message created when the conversation had 199 eligible
+// recipients would stop being retrievable the moment it had 201, which is
+// exactly the idempotency contract this path exists to keep.
+//
+// Writing it as two statements at each call site would leave that ordering to
+// whoever edits the function next. Writing it here makes the guard unreachable
+// on a replay by construction.
+//
+// Authorization is deliberately *not* part of this: whether the sender may
+// still reach the target at all is decided by the caller, before this runs, and
+// a replay is subject to it exactly as a new send is.
+func (s *MessageService) resolveCreateReplayOrAdmit(
+	ctx context.Context, replayInput storage.CreateReplayInput, fanout acknowledgementFanout,
+) (domain.Message, bool, error) {
+	existing, replayed, err := s.resolveCreateReplay(ctx, replayInput)
+	if err != nil || replayed {
+		return existing, replayed, err
+	}
+	return domain.Message{}, false, s.assertAcknowledgementFanoutAllowed(ctx, fanout)
+}
+
+// assertAcknowledgementFanoutAllowed refuses a send that would ask more than
+// domain.MaxAcknowledgementRecipients people to confirm receipt (issue #824).
+//
+// It is a precondition of creating a message and of nothing else. It runs after
+// authorization, so a caller who cannot post here cannot use it to measure a
+// conversation they have no access to, and after the replay lookup, so a retry
+// of a send that already succeeded is never judged against a membership that
+// has grown since — the same position #776's @all bound already occupies on the
+// DM path, and for the same reason.
+//
+// It costs a query only for a send that actually asked for something, and the
+// count stops one row past the bound rather than walking the roster — so an
+// oversized channel is judged as cheaply as a barely-oversized one and the
+// number that comes back is never its real size.
+//
+// It is a pre-flight and not the authority. CreateMessage re-applies the
+// identical, equally early-stopped rule inside the same statement as the INSERT
+// (invalid_acknowledgement_fanout), over the very snapshot that materialises the
+// rows — so a conversation that grows past the bound in the gap between this
+// call and that statement is caught there, and the count and the write can never
+// describe different sets. What this adds is the specific answer: a caller told
+// "too many" learns so from here, where the refusal can carry
+// ErrAcknowledgementRecipientsExceeded, rather than from the statement, whose
+// only vocabulary for "wrote nothing" is the non-enumerating ErrNotFound it owes
+// every other refusal. The same division of labour #776 uses for @all.
+func (s *MessageService) assertAcknowledgementFanoutAllowed(
+	ctx context.Context, fanout acknowledgementFanout,
+) error {
+	if !fanout.Required {
+		return nil
+	}
+	eligible, err := s.messages.CountAcknowledgementRecipientsUpTo(
+		ctx, fanout.WorkspaceID, fanout.ChannelID, fanout.ConversationID, fanout.SenderID,
+		domain.MaxAcknowledgementRecipients+1,
+	)
+	if err != nil {
+		return fmt.Errorf("count acknowledgement recipients: %w", err)
+	}
+	if eligible > domain.MaxAcknowledgementRecipients {
+		return domain.ErrAcknowledgementRecipientsExceeded
+	}
+	return nil
 }
 
 // outgoingMentions is a body with its mentions resolved: the ids the message
@@ -790,6 +913,11 @@ func (s *MessageService) announceCreatedMessage(
 		return msg
 	}
 	s.publishMessageCreated(ctx, workspaceID, targetType, targetID, msg)
+	// A published reply resolves its author's own pending request on the parent
+	// (issue #824), so the person who asked is exactly the one holding a summary
+	// that just went stale. Empty for a message that answers nothing, which the
+	// helper treats as nothing to announce.
+	s.publishAcknowledgementUpdated(ctx, msg, msg.ParentMessageID)
 	return msg
 }
 
@@ -815,6 +943,11 @@ type createIdentity struct {
 	// priority would replay as the original — the one case where a caller asked
 	// for something different and would be told nothing.
 	Priority domain.MessagePriority
+	// AcknowledgementRequired is part of the identity for the same reason
+	// Priority is (issue #824): the same text sent once plainly and once asking
+	// for confirmation are two different sends, and a key reused across them
+	// must conflict rather than replay the one that asked for nothing.
+	AcknowledgementRequired bool
 }
 
 // createIdentityVersion tags the fingerprint's construction, so adding a field
@@ -833,6 +966,15 @@ const orderedAttachmentIdentityVersion = "create.v2"
 // v1 fingerprint now provably means "standard", because anything else is v3.
 const priorityIdentityVersion = "create.v3"
 
+// acknowledgementIdentityVersion tags a send that asks for acknowledgement
+// (issue #824).
+//
+// Only such a send uses it, on exactly the terms v3 established: a send that
+// asks for nothing hashes as it did before this field existed, so keys already
+// in flight when this ships still replay. A v1, v2 or v3 fingerprint now
+// provably means "asked for no acknowledgement", because anything else is v4.
+const acknowledgementIdentityVersion = "create.v4"
+
 // fingerprint serialises the identity deterministically.
 //
 // Length-prefixed rather than delimited, so no combination of fields can be
@@ -840,8 +982,8 @@ const priorityIdentityVersion = "create.v3"
 // must not hash alike. Zero and one attachment retain create.v1 compatibility;
 // a multi-attachment message uses create.v2 and preserves order because that
 // order is rendered to every recipient; a send that states a non-default
-// priority uses create.v3 and appends it. Everything else is taken in a fixed
-// order.
+// priority uses create.v3 and appends it; one that asks for acknowledgement
+// uses create.v4 and appends that. Everything else is taken in a fixed order.
 func (i createIdentity) fingerprint() string {
 	fields := []string{
 		i.version(),
@@ -851,6 +993,9 @@ func (i createIdentity) fingerprint() string {
 	}
 	if i.statesPriority() {
 		fields = append(fields, string(i.Priority))
+	}
+	if i.AcknowledgementRequired {
+		fields = append(fields, "acknowledgement")
 	}
 	fields = append(fields, i.AttachmentIDs...)
 
@@ -869,10 +1014,13 @@ func (i createIdentity) statesPriority() bool {
 }
 
 // version names the construction this identity is hashed under, most specific
-// first. v3 implies v2's ordered attachments: it appends a field the earlier
-// versions do not have, so it already describes a distinct serialisation.
+// first. Each implies the ones below it: every version appends a field the
+// earlier ones do not have, so naming the outermost already describes a
+// distinct serialisation.
 func (i createIdentity) version() string {
 	switch {
+	case i.AcknowledgementRequired:
+		return acknowledgementIdentityVersion
 	case i.statesPriority():
 		return priorityIdentityVersion
 	case len(i.AttachmentIDs) > 1:
@@ -928,11 +1076,12 @@ func channelReplayInput(
 		RequestFingerprint: createIdentity{
 			DestinationType: "channel", DestinationID: request.TargetID,
 			BodyText: request.Body, BodyFormat: string(request.BodyFormat),
-			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
-			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
-			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
-			AttachmentIDs:       request.AttachmentIDs,
-			Priority:            request.Priority,
+			ParentMessageID:         strings.TrimSpace(input.ParentMessageID),
+			ForwardedFromID:         strings.TrimSpace(input.ForwardedFromMessageID),
+			ReferencedMessageID:     strings.TrimSpace(input.ReferencedMessageID),
+			AttachmentIDs:           request.AttachmentIDs,
+			Priority:                request.Priority,
+			AcknowledgementRequired: request.AcknowledgementRequired,
 		}.fingerprint(),
 	}
 }
@@ -949,11 +1098,12 @@ func dmReplayInput(
 		RequestFingerprint: createIdentity{
 			DestinationType: "dm", DestinationID: request.TargetID,
 			BodyText: request.Body, BodyFormat: string(request.BodyFormat),
-			ParentMessageID:     strings.TrimSpace(input.ParentMessageID),
-			ForwardedFromID:     strings.TrimSpace(input.ForwardedFromMessageID),
-			ReferencedMessageID: strings.TrimSpace(input.ReferencedMessageID),
-			AttachmentIDs:       request.AttachmentIDs,
-			Priority:            request.Priority,
+			ParentMessageID:         strings.TrimSpace(input.ParentMessageID),
+			ForwardedFromID:         strings.TrimSpace(input.ForwardedFromMessageID),
+			ReferencedMessageID:     strings.TrimSpace(input.ReferencedMessageID),
+			AttachmentIDs:           request.AttachmentIDs,
+			Priority:                request.Priority,
+			AcknowledgementRequired: request.AcknowledgementRequired,
 		}.fingerprint(),
 	}
 }
@@ -1142,7 +1292,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		WorkspaceID: workspaceID, TargetID: input.ConversationID, TargetField: "conversation_id",
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
-		Priority: input.Priority,
+		Priority: input.Priority, AcknowledgementRequired: input.AcknowledgementRequired,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -1152,7 +1302,9 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 
 	// SQL-enforce DM visibility: workspace active + workspace member active +
 	// DM conversation active + active DM membership. Returns ErrNotFound for all
-	// invisible targets (non-enumerating).
+	// invisible targets (non-enumerating). Before the replay for the same reason
+	// the channel path's is: leaving the conversation must close the door on
+	// reading an old message back through its key.
 	conversation, err := s.dms.GetVisibleConversationByID(ctx, workspaceID, conversationID, senderID)
 	if err != nil {
 		return domain.Message{}, err
@@ -1161,7 +1313,11 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	// persistence. A DM is the likelier phishing vector of the two, not the
 	// lesser one.
 	replayInput := dmReplayInput(workspaceID, request, input)
-	if existing, replayed, err := s.resolveCreateReplay(ctx, replayInput); err != nil || replayed {
+	existing, replayed, err := s.resolveCreateReplayOrAdmit(ctx, replayInput, acknowledgementFanout{
+		WorkspaceID: workspaceID, ConversationID: conversationID, SenderID: senderID,
+		Required: request.AcknowledgementRequired,
+	})
+	if err != nil || replayed {
 		return existing, err
 	}
 
@@ -1225,21 +1381,22 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	parentID, forwardedID, referencedID := refs.ParentID, refs.ForwardedID, refs.ReferencedID
 
 	msg, err := s.persistMessage(ctx, storage.CreateMessageInput{
-		WorkspaceID:            workspaceID,
-		DMConversationID:       conversationID,
-		SenderID:               senderID,
-		Kind:                   domain.MessageKindUser,
-		BodyText:               body,
-		BodyFormat:             bodyFormat,
-		ParentMessageID:        parentID,
-		ForwardedFromMessageID: forwardedID,
-		ReferencedMessageID:    referencedID,
-		MentionedUserIDs:       mentions.UserIDs,
-		MentionedChannelIDs:    mentions.ChannelIDs,
-		MentionAllGroupMembers: mentions.AllMention,
-		AttachmentIDs:          attachmentIDs,
-		MaxAttachmentBytes:     s.maxMessageAttachmentBytes,
-		Priority:               request.Priority,
+		WorkspaceID:             workspaceID,
+		DMConversationID:        conversationID,
+		SenderID:                senderID,
+		Kind:                    domain.MessageKindUser,
+		BodyText:                body,
+		BodyFormat:              bodyFormat,
+		ParentMessageID:         parentID,
+		ForwardedFromMessageID:  forwardedID,
+		ReferencedMessageID:     referencedID,
+		MentionedUserIDs:        mentions.UserIDs,
+		MentionedChannelIDs:     mentions.ChannelIDs,
+		MentionAllGroupMembers:  mentions.AllMention,
+		AttachmentIDs:           attachmentIDs,
+		MaxAttachmentBytes:      s.maxMessageAttachmentBytes,
+		Priority:                request.Priority,
+		AcknowledgementRequired: request.AcknowledgementRequired,
 	}, links, body, replayInput, "create dm message")
 	if err != nil {
 		return domain.Message{}, err
@@ -1268,6 +1425,37 @@ func (s *MessageService) publishMessageUpdated(ctx context.Context, msg domain.M
 	}
 	s.enqueuePublish(ctx, func(publishCtx context.Context) {
 		publisher.PublishMessageUpdated(publishCtx, msg.WorkspaceID, targetType, targetID, msg)
+	})
+}
+
+// publishAcknowledgementUpdated announces that acknowledgementID's summary may
+// have changed, to the conversation `in` belongs to (issue #824).
+//
+// Two messages, because the message that carries the route is not always the
+// message whose acknowledgement moved: a reply resolves its *parent's* request,
+// and travels in the same conversation. A deletion is the degenerate case where
+// the two are the same message.
+//
+// The whole "did it actually change" test is deliberately absent. This path
+// cannot know without a second query — the transition happened inside the
+// statement that wrote the message — and the event carries no state to be wrong
+// about: a subscriber re-reads the authorised summary and finds whatever is
+// true. The acknowledge endpoint, which *does* know, suppresses its own no-op
+// events; here the honest and cheap thing is to say "re-read this one".
+func (s *MessageService) publishAcknowledgementUpdated(
+	ctx context.Context, in domain.Message, acknowledgementID string,
+) {
+	publisher, ok := s.getPublisher().(acknowledgementUpdatedPublisher)
+	if !ok || acknowledgementID == "" {
+		return
+	}
+	targetType, targetID := "channel", in.ChannelID
+	if in.DMConversationID != "" {
+		targetType, targetID = "dm", in.DMConversationID
+	}
+	s.enqueuePublish(ctx, func(publishCtx context.Context) {
+		publisher.PublishAcknowledgementUpdated(
+			publishCtx, in.WorkspaceID, targetType, targetID, acknowledgementID)
 	})
 }
 
@@ -1431,6 +1619,9 @@ func (s *MessageService) DeleteMessage(ctx context.Context, input DeleteMessageI
 	deleted.Quoted = nil
 	if changed {
 		s.publishMessageUpdated(ctx, deleted)
+		// Deleting withdrew every pending request on this message (issue #824),
+		// which changes what its sender is shown.
+		s.publishAcknowledgementUpdated(ctx, deleted, deleted.ID)
 	}
 	return deleted, nil
 }
