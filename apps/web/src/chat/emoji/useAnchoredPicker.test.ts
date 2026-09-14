@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { anchorIsVisible, type VisibleBounds } from "./useAnchoredPicker";
+import { anchorIsVisible, placeAgainstAnchor, type VisibleBounds } from "./useAnchoredPicker";
 
 /** A 900×1280 band, as a list filling a desktop viewport would give. */
 const bounds: VisibleBounds = { top: 0, bottom: 900, left: 0, right: 1280 };
@@ -60,5 +60,91 @@ describe("anchorIsVisible", () => {
     const clipped: VisibleBounds = { top: 60, bottom: 400, left: 0, right: 1280 };
     expect(anchorIsVisible(rect({ top: 500, bottom: 530 }), clipped)).toBe(false);
     expect(anchorIsVisible(rect({ top: 380, bottom: 410 }), clipped)).toBe(true);
+  });
+});
+
+/**
+ * Where a floating box lands against its anchor (issue #839 follow-up).
+ *
+ * The property under test is that a placed box never crosses the anchor it
+ * belongs to: above it with the gap, below it with the gap, or not placed at
+ * all — a box "nudged" into the band by clamping would land over its own
+ * anchor, and a toolbar drawn across its message misattributes every action.
+ */
+describe("placeAgainstAnchor", () => {
+  /** The list's band: a 640px-tall list below a header, across the window. */
+  const band: VisibleBounds = { top: 60, bottom: 700, left: 0, right: 1280 };
+  const gap = 6;
+  const box = { width: 246, height: 36 } as DOMRect;
+
+  function place(anchor: DOMRect) {
+    const element = document.createElement("div");
+    const placed = placeAgainstAnchor(element, anchor, box, 300, gap, gap, band);
+    const top = Number.parseFloat(element.style.top);
+    return { placed, top, bottom: top + box.height, visibility: element.style.visibility };
+  }
+
+  /** Placed boxes sit wholly above or wholly below the anchor, gap included. */
+  function expectClearOf(anchor: DOMRect, result: ReturnType<typeof place>) {
+    const above = result.bottom <= anchor.top - gap;
+    const below = result.top >= anchor.bottom + gap;
+    expect(above || below).toBe(true);
+  }
+
+  it("goes above when there is room above", () => {
+    const anchor = rect({ top: 300, bottom: 340 });
+    const result = place(anchor);
+    expect(result).toMatchObject({ placed: true, top: 300 - 36 - gap, visibility: "visible" });
+    expect(anchor.top - result.bottom).toBe(gap);
+    expectClearOf(anchor, result);
+  });
+
+  it("goes below when there is room only below", () => {
+    const anchor = rect({ top: 70, bottom: 110 });
+    const result = place(anchor);
+    expect(result).toMatchObject({ placed: true, top: 110 + gap, visibility: "visible" });
+    expect(result.top).toBeGreaterThanOrEqual(anchor.bottom + gap);
+    expectClearOf(anchor, result);
+  });
+
+  // An anchor spanning the band: neither side has 36 + 6 + 8 pixels to spare.
+  it("places nothing when the box fits on neither side", () => {
+    const anchor = rect({ top: 70, bottom: 690 });
+    const element = document.createElement("div");
+    expect(placeAgainstAnchor(element, anchor, box, 300, gap, gap, band)).toBe(false);
+    expect(element.style.visibility).toBe("hidden");
+    expect(element.style.top).toBe("");
+  });
+
+  // An anchor outside the band is not one the reader is looking at, however
+  // well a box would fit beside where it is: nothing is written, nothing shown.
+  it.each([
+    ["below the band", rect({ top: 710, bottom: 750 })],
+    ["above the band", rect({ top: 10, bottom: 50 })],
+  ])("places nothing against an anchor %s", (_where, anchor) => {
+    const element = document.createElement("div");
+    element.style.top = "100px";
+    element.style.left = "100px";
+    expect(placeAgainstAnchor(element, anchor, box, 300, gap, gap, band)).toBe(false);
+    expect(element.style.visibility).toBe("hidden");
+    expect(element.style.top).toBe("100px");
+    expect(element.style.left).toBe("100px");
+  });
+
+  // Half past an edge is still an anchor the reader is looking at.
+  it("still places against an anchor crossing an edge of the band", () => {
+    const anchor = rect({ top: 40, bottom: 80 });
+    const result = place(anchor);
+    expect(result).toMatchObject({ placed: true, top: 80 + gap, visibility: "visible" });
+    expectClearOf(anchor, result);
+  });
+
+  it("stays clear of the anchor wherever the anchor sits in the band", () => {
+    for (let top = 60; top <= 660; top += 20) {
+      const anchor = rect({ top, bottom: top + 40 });
+      const result = place(anchor);
+      expect(result.placed).toBe(true);
+      expectClearOf(anchor, result);
+    }
   });
 });
