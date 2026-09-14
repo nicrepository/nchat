@@ -12,7 +12,13 @@ import {
 } from "./chatApi";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
-import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
+import {
+  normalizeMessagePriority,
+  type Channel,
+  type ChannelCategory,
+  type ConversationActivity,
+  type DMConversation,
+} from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
 import {
   loadPersistedUnread,
@@ -363,6 +369,9 @@ function notificationEventFrom(
       typeof payload.sender_avatar_url === "string" ? payload.sender_avatar_url : undefined,
     bodyText: payload.body_text ?? "",
     conversationName,
+    // Narrowed here, at the wire's edge, so the presentation layer receives one
+    // of three values and never a server string it has to interpret (#826).
+    priority: normalizeMessagePriority(payload.priority),
     policy: payload.notification_policy,
   };
 }

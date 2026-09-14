@@ -193,6 +193,36 @@ export type MessageKind = "user" | "system";
 export type MessageStatus = "active" | "deleted" | "pending_link_scan";
 
 /**
+ * How urgently a message asks to be attended to (issue #821), as the author
+ * stated it and the server persisted it.
+ *
+ * It is the author's claim and nothing else: `urgent` grants no authority, and
+ * no rule here may read it as one. The client renders and classifies this
+ * value; it never infers it and never raises it.
+ */
+export type MessagePriority = "standard" | "important" | "urgent";
+
+/** The three values the server persists; anything else is not one of them. */
+const persistedMessagePriorities = ["standard", "important", "urgent"] as const;
+
+/**
+ * Narrows an unknown server value to a MessagePriority.
+ *
+ * Absent means a chat-service that predates the axis, which is `standard` —
+ * the behaviour every message had before it existed.
+ *
+ * An unrecognised value becomes `standard` too, and that is the fail-closed
+ * direction here rather than a separate `unknown` state: the only thing this
+ * axis can do is escalate an alert, so a value this build does not understand
+ * must never be the one that escalates it. A future server that adds a fourth
+ * priority is then heard as an ordinary message by this build, never as an
+ * alarm nobody here has reasoned about.
+ */
+export function normalizeMessagePriority(raw?: unknown): MessagePriority {
+  return persistedMessagePriorities.find((priority) => priority === raw) ?? "standard";
+}
+
+/**
  * RF-21 link-safety axis, independent of MessageStatus (issue #135).
  *
  * `status` answers "does this message exist for readers". This answers "what is

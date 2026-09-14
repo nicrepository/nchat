@@ -226,6 +226,15 @@ function messageCreated(
 }
 
 /**
+ * The same event with the author's priority set, as a chat-service that carries
+ * the axis publishes it (#840). A raw wire value on purpose: what the client
+ * does with one it does not recognise is part of what these tests own.
+ */
+function withPriority(event: WSMessageCreatedEvent, priority: unknown): WSMessageCreatedEvent {
+  return { ...event, payload: { ...event.payload, priority } } as WSMessageCreatedEvent;
+}
+
+/**
  * Stands in for the decision chat-service publishes with the event (issue
  * #744): the central policy's answer plus the authoritative classification.
  *
@@ -1368,6 +1377,50 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("standard-unfocused", channelA)));
 
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  // The wire carries the author's priority (#821/#840) and the notification
+  // class is resolved from it (#826). What this owns is the edge: the field
+  // actually reaches the classification instead of being dropped on the way.
+  // The observable consequence is the sound budget, which urgent does not
+  // share with the room's ordinary traffic.
+  it("carries the author's priority from the wire into the notification class", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // Another channel, so nothing here is suppressed for being on screen.
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-2", channelB)));
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+
+    act(() =>
+      websocket.onMessageCreated?.(withPriority(messageCreated("urgent-1", channelB), "urgent")),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+  });
+
+  // A priority this build does not know must never be the one that escalates.
+  it("treats an unrecognised wire priority as an ordinary message", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
+    act(() =>
+      websocket.onMessageCreated?.(withPriority(messageCreated("unknown-1", channelB), "critical")),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
   });
 
   // Combines the two rules directly above into one session: badge

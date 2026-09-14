@@ -554,7 +554,59 @@ apareceu. As duas condicoes apenas removem um efeito.
 O que **saiu** do browser: classificacao DM/mencao/reply (agora `sound_class` +
 `named_*`), a gramatica de mencao em regex, e a decisao de "pode alertar". O que
 nunca esteve la e continua fora: horario de trabalho, origem historica, silencio
-de reacao, prioridade, Web Push, `policy_version`.
+de reacao, Web Push, `policy_version` e qualquer leitura de prioridade como
+autorizacao — ver a secao seguinte para o unico uso que a prioridade tem no
+cliente.
+
+### Classe de notificacao no cliente (#826)
+
+`apps/web/src/chat/notificationClass.ts` responde uma pergunta diferente das
+anteriores: **quao forte** um evento pede atencao, dado que ele ja foi
+autorizado. Nao e autorizacao e nao pode virar uma: nenhum gate acima le a
+classe, ela e resolvida depois deles, e um `deny` central continua encerrando o
+assunto.
+
+A precedencia e a da #826, do mais forte ao mais discreto:
+
+```text
+URGENT > MENTION > IMPORTANT/NORMAL > IN-CONVERSATION
+```
+
+`in-conversation` **substitui** `message` quando o leitor esta de fato
+acompanhando a conversa — e a regra da #819 ("conversa aberta/ativa -> Lumen
+In-Conversation; conversa nao aberta -> Lumen Message"), nao um degrau que
+`message` vence no mesmo contexto. `important` resolve exatamente como
+`standard`: a #826 e explicita que ele nao introduz sound class nova nesta
+etapa.
+
+Os tres fatos que compoem o attention context sao separados de proposito:
+
+```text
+conversationOpen && documentVisible && windowFocused
+```
+
+Uma conversa cujo id e o `currentConversationId` nao e uma conversa que o leitor
+esta olhando quando a aba esta em background ou a janela perdeu o foco. Colapsar
+os tres em um unico booleano "conversa ativa" e exatamente o defeito que a #826
+existe para remover.
+
+Duas fronteiras que a policy nao atravessa:
+
+- **estado do browser** e lido na borda (`readAttentionContext`, em
+  notificationPresentation) e entregue ja resolvido. A funcao e pura,
+  deterministica e sem `document`, `window`, audio, toast ou Service Worker —
+  e por isso a matriz de precedencia e testavel como matriz;
+- **idempotencia de delivery** nao mora nela. Reprocessar o mesmo evento
+  resolve a mesma classe, sempre; o que impede uma segunda entrega e
+  notificationBurst (memoria por `message_id`) mais o claim entre abas — ver a
+  secao abaixo. Uma memoria dentro da policy faria o mesmo evento resolver
+  diferente na segunda vez, que e o oposto de uma decisao estavel.
+
+A prioridade chega pelo payload (`priority`, #821/#840) e e estreitada em
+`normalizeMessagePriority` antes de entrar: ausente ou desconhecida vira
+`standard`. A direcao fail-closed aqui e essa — o unico efeito possivel desse
+eixo e escalar um alerta, entao um valor que este build nao conhece nunca pode
+ser o que escala.
 
 ### Temporalidade e rajada no browser (#750)
 

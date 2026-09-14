@@ -96,6 +96,14 @@ export interface WSMessagePayload {
    * the client that reads it.
    */
   link_safety_state?: unknown;
+  /**
+   * The author's stated priority (issue #821): standard, important or urgent.
+   * Typed unknown because it is a value this client classifies rather than
+   * trusts a shape of — normalizeMessagePriority narrows it, and anything it
+   * does not recognise is read as an ordinary message. Absent on a pre-#840
+   * server.
+   */
+  priority?: unknown;
   /** The central delivery decision. See WSNotificationPolicy. */
   notification_policy?: WSNotificationPolicy;
   is_removed: boolean;

@@ -46,6 +46,7 @@ function event(overrides: Partial<MessageNotificationEvent> = {}): MessageNotifi
     senderDisplayName: "Ana",
     bodyText: "bom dia",
     conversationName: "geral",
+    priority: "standard",
     policy: policy(),
     ...overrides,
   };
@@ -819,6 +820,61 @@ describe("notificationPresentation — sound burst suppression", () => {
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(5);
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  // The resolved notification class is what splits the budget (#826), so an
+  // event the author marked urgent is not spent by the room's ordinary traffic.
+  it("still chimes for an urgent message in the same busy room", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    await burst(presentLiveMessageNotification, surfaces, 20);
+    void presentLiveMessageNotification(
+      event({ eventId: "urgent", priority: "urgent" }),
+      context(),
+      surfaces,
+    );
+    await flush();
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+  });
+
+  // #826 is explicit that `important` introduces no class of its own, and the
+  // budget is the observable consequence: it shares the ordinary message's.
+  it("does not give an important message a sound budget of its own", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    await burst(presentLiveMessageNotification, surfaces, 20);
+    void presentLiveMessageNotification(
+      event({ eventId: "important", priority: "important" }),
+      context(),
+      surfaces,
+    );
+    await flush();
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  // The class says how loud an event would be, never whether it may be heard.
+  // A central deny ends the matter, and the strongest class cannot reopen it.
+  it("does not let an urgent class execute a surface the policy denied", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    const disposition = await presentLiveMessageNotification(
+      event({
+        eventId: "denied",
+        priority: "urgent",
+        policy: policy({ in_app: "deny", sound: "deny" }),
+      }),
+      context(),
+      surfaces,
+    );
+
+    expect(disposition).toBe("suppressed");
+    expect(surfaces.showInApp).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
   });
 });
 

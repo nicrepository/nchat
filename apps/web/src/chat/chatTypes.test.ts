@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { parseDMConversationType, partitionDMs, type DMConversation } from "./chatTypes";
+import {
+  normalizeMessagePriority,
+  parseDMConversationType,
+  partitionDMs,
+  type DMConversation,
+} from "./chatTypes";
 
 function dm(id: string, type: DMConversation["type"], name = id): DMConversation {
   return { id, type, name, participants: [] };
@@ -121,6 +126,45 @@ describe("parseDMConversationType", () => {
       { type: "direct" },
     ]) {
       expect(parseDMConversationType(value)).toBeUndefined();
+    }
+  });
+});
+
+describe("normalizeMessagePriority", () => {
+  it("keeps each of the three values the server persists", () => {
+    expect(normalizeMessagePriority("standard")).toBe("standard");
+    expect(normalizeMessagePriority("important")).toBe("important");
+    expect(normalizeMessagePriority("urgent")).toBe("urgent");
+  });
+
+  // Absent is a chat-service that predates the axis (#840), which is the
+  // behaviour every message had before it existed.
+  it("reads an absent priority as standard", () => {
+    expect(normalizeMessagePriority()).toBe("standard");
+    expect(normalizeMessagePriority(undefined)).toBe("standard");
+    expect(normalizeMessagePriority(null)).toBe("standard");
+  });
+
+  // The fail-closed direction for this axis: the only thing a priority can do
+  // is escalate an alert, so a value this build does not understand must never
+  // be the one that escalates it.
+  it("refuses to escalate on anything it does not recognise", () => {
+    for (const value of [
+      "URGENT",
+      " urgent",
+      "urgent ",
+      "critical",
+      "",
+      "  ",
+      0,
+      1,
+      true,
+      {},
+      [],
+      ["urgent"],
+      { priority: "urgent" },
+    ]) {
+      expect(normalizeMessagePriority(value)).toBe("standard");
     }
   });
 });
