@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  conversationNotificationMode,
   normalizeMessagePriority,
   parseDMConversationType,
   partitionDMs,
@@ -165,6 +166,36 @@ describe("normalizeMessagePriority", () => {
       { priority: "urgent" },
     ]) {
       expect(normalizeMessagePriority(value)).toBe("standard");
+    }
+  });
+});
+
+// The one shared derivation both surfaces read (issue #136). It has to live in
+// exactly one place: the profile select and the sidebar row menu would
+// otherwise be two answers to "what is this conversation set to".
+describe("conversationNotificationMode", () => {
+  it("reads the level when nothing is silenced", () => {
+    expect(conversationNotificationMode({ notificationLevel: "all" })).toBe("all");
+    expect(conversationNotificationMode({ notificationLevel: "mentions_replies" })).toBe(
+      "mentions_replies",
+    );
+  });
+
+  it("lets the mute win over whatever level it is hiding", () => {
+    expect(conversationNotificationMode({ muted: true, notificationLevel: "all" })).toBe("muted");
+    expect(
+      conversationNotificationMode({ muted: true, notificationLevel: "mentions_replies" }),
+    ).toBe("muted");
+  });
+
+  it("reads a conversation nobody configured as the product default", () => {
+    expect(conversationNotificationMode({})).toBe("all");
+    expect(conversationNotificationMode({ muted: false })).toBe("all");
+  });
+
+  it("never invents silence out of a level it cannot interpret", () => {
+    for (const level of ["", "mentions_only", "MUTED", "muted", "all "]) {
+      expect(conversationNotificationMode({ notificationLevel: level })).toBe("all");
     }
   });
 });

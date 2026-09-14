@@ -21,6 +21,7 @@ const {
   mockSetSidebarConversationPinned,
   mockRenameChannel,
   mockSetConversationMuted,
+  mockSetConversationNotificationMode,
   mockLeaveConversation,
   mockPlayMessageSound,
   mockGetSoundNotificationMode,
@@ -32,6 +33,7 @@ const {
   mockSetSidebarConversationPinned: vi.fn(),
   mockRenameChannel: vi.fn(),
   mockSetConversationMuted: vi.fn(),
+  mockSetConversationNotificationMode: vi.fn(),
   mockLeaveConversation: vi.fn(),
   mockPlayMessageSound: vi.fn(),
   mockGetSoundNotificationMode: vi.fn(
@@ -57,6 +59,7 @@ vi.mock("./chatApi", () => ({
   setSidebarConversationPinned: mockSetSidebarConversationPinned,
   renameChannel: mockRenameChannel,
   setConversationMuted: mockSetConversationMuted,
+  setConversationNotificationMode: mockSetConversationNotificationMode,
   leaveConversation: mockLeaveConversation,
 }));
 vi.mock("./messageSound", () => ({
@@ -254,7 +257,7 @@ function serverDecision(
   // contract", which is a different thing entirely.
   if (kind !== "user") {
     return {
-      policy_version: 1,
+      policy_version: 2,
       in_app: "deny",
       sound: "deny",
       web_push: "deny",
@@ -263,7 +266,7 @@ function serverDecision(
   }
   const named = [...bodyText.matchAll(/\(mention:user:([^)]+)\)/g)].map(([, id]) => id);
   return {
-    policy_version: 1,
+    policy_version: 2,
     // Allowed on this path: the realtime evaluation runs on the foreground
     // surface, which is the one the toast lives on.
     in_app: "allow",
@@ -304,7 +307,7 @@ function plan(
   webPush: "allow" | "deny",
 ): WSNotificationPolicy {
   return {
-    policy_version: 1,
+    policy_version: 2,
     in_app: inApp,
     sound,
     web_push: webPush,
@@ -1006,7 +1009,7 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     const muted = messageWithPolicy("native-muted", channelA, {
-      policy_version: 1,
+      policy_version: 2,
       in_app: "deny",
       sound: "deny",
       web_push: "deny",
@@ -3227,8 +3230,10 @@ describe("useChatSidebar conversation preferences", () => {
     mockFetchSidebarData.mockReset();
     mockSetSidebarConversationPinned.mockReset();
     mockSetConversationMuted.mockReset();
+    mockSetConversationNotificationMode.mockReset();
     mockSetSidebarConversationPinned.mockResolvedValue(undefined);
     mockSetConversationMuted.mockResolvedValue(undefined);
+    mockSetConversationNotificationMode.mockResolvedValue(undefined);
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
       channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
@@ -3457,6 +3462,345 @@ describe("useChatSidebar conversation preferences", () => {
     });
   });
 
+  // Issue #136: the level and the mute are two dimensions, and the sidebar's
+  // shortcut owns only one of them. These are the client half of the invariant
+  // the whole issue is named for.
+
+  it("silences a conversation without touching the level it had", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        {
+          id: channelA,
+          name: "A",
+          type: "public",
+          canWrite: true,
+          notificationLevel: "mentions_replies",
+        },
+      ],
+      dms: [],
+    });
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+    // The optimistic write said nothing about the level, which is exactly what
+    // makes turning notifications back on restore it.
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+    // ...and the request carried nothing about it either.
+    expect(mockSetConversationMuted).toHaveBeenCalledExactlyOnceWith("channel", channelA, true);
+
+    persisted.resolve();
+    await act(async () => operation);
+  });
+
+  it("restores the level a mute was hiding as soon as the mute is lifted", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        {
+          id: channelA,
+          name: "A",
+          type: "public",
+          canWrite: true,
+          muted: true,
+          notificationLevel: "mentions_replies",
+        },
+      ],
+      dms: [],
+    });
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "channel", targetId: channelA }, false);
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    // The level was never overwritten, so the row shows it immediately rather
+    // than after the refetch — and the client never had to predict it.
+    expect(result.current.state.channels[0]?.muted).toBe(false);
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+
+    persisted.resolve();
+    await act(async () => operation);
+  });
+
+  it("writes each mode through the canonical endpoint", async () => {
+    const result = await readyHook();
+
+    for (const mode of ["all", "mentions_replies", "muted"] as const) {
+      await act(async () => {
+        await result.current.setNotificationMode({ kind: "channel", targetId: channelA }, mode);
+      });
+      expect(mockSetConversationNotificationMode).toHaveBeenLastCalledWith(
+        "channel",
+        channelA,
+        mode,
+      );
+    }
+    expect(mockSetConversationMuted).not.toHaveBeenCalled();
+  });
+
+  it("applies a level optimistically and lifts any mute with it", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, muted: true }],
+      dms: [],
+    });
+    const persisted = deferredValue<void>();
+    mockSetConversationNotificationMode.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setNotificationMode(
+        { kind: "channel", targetId: channelA },
+        "mentions_replies",
+      );
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    // Choosing what to hear is choosing to hear something, which is what the
+    // server does too.
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+    expect(result.current.state.channels[0]?.muted).toBe(false);
+
+    persisted.resolve();
+    await act(async () => operation);
+  });
+
+  it("selecting the silenced mode leaves the level alone, exactly like the shortcut", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        {
+          id: channelA,
+          name: "A",
+          type: "public",
+          canWrite: true,
+          notificationLevel: "mentions_replies",
+        },
+      ],
+      dms: [],
+    });
+    const persisted = deferredValue<void>();
+    mockSetConversationNotificationMode.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setNotificationMode(
+        { kind: "channel", targetId: channelA },
+        "muted",
+      );
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+
+    persisted.resolve();
+    await act(async () => operation);
+  });
+
+  it("rolls both dimensions back to what they were when a mode is refused", async () => {
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        {
+          id: channelA,
+          name: "A",
+          type: "public",
+          canWrite: true,
+          muted: true,
+          notificationLevel: "mentions_replies",
+        },
+      ],
+      dms: [],
+    });
+    mockSetConversationNotificationMode.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(
+        result.current.setNotificationMode({ kind: "channel", targetId: channelA }, "all"),
+      ).rejects.toThrow("offline");
+    });
+
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+  });
+
+  it("refetches the canonical list once a mode is confirmed", async () => {
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+    // What the server holds afterwards, which is what must end up on screen.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        {
+          id: channelA,
+          name: "A",
+          type: "public",
+          canWrite: true,
+          notificationLevel: "mentions_replies",
+        },
+      ],
+      dms: [],
+    });
+
+    await act(async () => {
+      await result.current.setNotificationMode(
+        { kind: "channel", targetId: channelA },
+        "mentions_replies",
+      );
+    });
+
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBefore),
+    );
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+    });
+  });
+
+  it("does not refetch when the mode is refused", async () => {
+    mockSetConversationNotificationMode.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    await act(async () => {
+      await expect(
+        result.current.setNotificationMode({ kind: "dm", targetId: dmC }, "muted"),
+      ).rejects.toThrow("offline");
+    });
+
+    expect(mockFetchSidebarData.mock.calls.length).toBe(fetchesBefore);
+  });
+
+  // The interleaving neither surface can police on its own: the settings page's
+  // select and the sidebar row menu's shortcut, on the same conversation, at the
+  // same time. One coordination primitive is what makes this hold.
+  it("drops a mute for a conversation whose mode write is still in flight", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationNotificationMode.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.setNotificationMode(
+        { kind: "channel", targetId: channelA },
+        "mentions_replies",
+      );
+    });
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    expect(mockSetConversationMuted).not.toHaveBeenCalled();
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    // The row still shows the write that is actually on its way.
+    expect(result.current.state.channels[0]?.notificationLevel).toBe("mentions_replies");
+    expect(result.current.state.channels[0]?.muted).toBe(false);
+
+    persisted.resolve();
+    await act(async () => first);
+
+    // Once it is finished the conversation is writable from either surface.
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a mode write for a conversation whose mute is still in flight", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    await act(async () => {
+      await result.current.setNotificationMode({ kind: "channel", targetId: channelA }, "all");
+    });
+
+    expect(mockSetConversationNotificationMode).not.toHaveBeenCalled();
+
+    persisted.resolve();
+    await act(async () => first);
+
+    await act(async () => {
+      await result.current.setNotificationMode({ kind: "channel", targetId: channelA }, "all");
+    });
+    expect(mockSetConversationNotificationMode).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a different conversation take a mode write while another is in flight", async () => {
+    const channelWrite = deferredValue<void>();
+    mockSetConversationNotificationMode.mockReturnValueOnce(channelWrite.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.setNotificationMode({ kind: "channel", targetId: channelA }, "muted");
+    });
+
+    await act(async () => {
+      await result.current.setNotificationMode(
+        { kind: "dm", targetId: groupD },
+        "mentions_replies",
+      );
+    });
+
+    expect(mockSetConversationNotificationMode).toHaveBeenCalledTimes(2);
+    expect(mockSetConversationNotificationMode).toHaveBeenLastCalledWith(
+      "dm",
+      groupD,
+      "mentions_replies",
+    );
+    // The second conversation was never made to wait on the first: its write
+    // reached the server, and the refetch that followed it has already
+    // reconciled the row with what the server actually holds.
+
+    channelWrite.resolve();
+    await act(async () => first);
+  });
+
+  it("writes a group's mode as a dm target and leaves the channel list alone", async () => {
+    const result = await readyHook();
+
+    await act(async () => {
+      await result.current.setNotificationMode(
+        { kind: "dm", targetId: groupD },
+        "mentions_replies",
+      );
+    });
+
+    expect(mockSetConversationNotificationMode).toHaveBeenCalledExactlyOnceWith(
+      "dm",
+      groupD,
+      "mentions_replies",
+    );
+    expect(dmRow(result, dmC)?.notificationLevel).toBeFalsy();
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.notificationLevel).toBeFalsy();
+  });
   it("pins a direct conversation optimistically, then reconciles with the server", async () => {
     const persisted = deferredValue<void>();
     mockSetSidebarConversationPinned.mockReturnValueOnce(persisted.promise);

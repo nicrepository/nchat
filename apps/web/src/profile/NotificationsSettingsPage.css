@@ -76,6 +76,13 @@
   cursor: pointer;
 }
 
+/* The conversation rows are a label plus a select rather than one clickable
+   label (issue #136), so the pointer belongs to the two things that are
+   actually actionable and not to the whole strip. */
+.notifications-settings__row:has(.notifications-settings__select) {
+  cursor: default;
+}
+
 /* The permission block is a status plus an action, not a labelled control, so it
    is not a pointer target and its button may wrap below the text on a phone. */
 .notifications-settings__row--stacked {
@@ -107,6 +114,11 @@
   overflow-wrap: anywhere;
 }
 
+/* Only where the title is a <label> for a control beside it. */
+label.notifications-settings__row-title {
+  cursor: pointer;
+}
+
 .notifications-settings__row-sub {
   font-size: 13px;
   line-height: 1.5;
@@ -136,6 +148,38 @@
 }
 
 /* ── Switch (real booleans only) ───────────────────────────────────────────── */
+
+/* The per-conversation notification mode (issue #136).
+   Borrowed from __choice and __time rather than restyled: the same border,
+   radius, surface and 44px target the rest of this page already uses, so the
+   control reads as part of it. The native select keeps the platform's own
+   keyboard handling and its focus ring, which is why it is not rebuilt out of
+   buttons. */
+.notifications-settings__select {
+  flex: 0 1 auto;
+  max-width: 220px;
+  min-height: 44px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  font: inherit;
+  font-size: 14px;
+  color: var(--color-ink, #16121f);
+  cursor: pointer;
+}
+
+.notifications-settings__select:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* Unavailable only while this row's own write is in flight; the text beside it
+   says so, so the state never rests on the dimming alone. */
+.notifications-settings__select:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
 
 .notifications-settings__switch {
   position: relative;

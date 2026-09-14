@@ -54,6 +54,13 @@ export interface Channel extends ConversationActivity {
   isGeneral?: boolean;
   /** This viewer's own notification preference (issue #527). */
   muted?: boolean;
+  /**
+   * The other, independent half of that preference (issue #136): which events
+   * this viewer wants alerts for here. Optional so a payload from a server that
+   * predates the field parses unchanged, and anything unrecognised is read as
+   * the product default — see {@link conversationNotificationMode}.
+   */
+  notificationLevel?: ConversationNotificationLevel;
   unreadCount?: number;
   /** True once the unread count includes a message that mentions the current user. */
   hasMentionUnread?: boolean;
@@ -127,6 +134,48 @@ export interface DMConversation extends ConversationActivity {
   hasMentionUnread?: boolean;
   /** This viewer's own notification preference (issue #527). */
   muted?: boolean;
+  /** The level half of that preference (issue #136). Same contract as Channel's. */
+  notificationLevel?: ConversationNotificationLevel;
+}
+
+/**
+ * The level a conversation's alerts are narrowed to, as the server stores it
+ * (issue #136). Orthogonal to `muted`.
+ */
+export type ConversationNotificationLevel = "all" | "mentions_replies";
+
+/**
+ * The single state a settings control shows, and the value the canonical
+ * endpoint accepts (issue #136).
+ *
+ * Three modes over two stored dimensions, which is why it is a separate type:
+ * `muted` is not a level, and a level is not a mute.
+ */
+export type ConversationNotificationMode = ConversationNotificationLevel | "muted";
+
+/**
+ * Renders one conversation's stored preference as the mode to display.
+ *
+ * The precedence is the product rule and the server documents it the same way:
+ * a mute silences everything, so it wins over whatever level it is hiding.
+ *
+ * It lives here, in one exported function, because both surfaces need it and
+ * the server deliberately does not send the derived value. The sidebar's mute
+ * shortcut updates `muted` optimistically and must leave `notificationLevel`
+ * alone — that non-destructiveness is the whole point of the issue — so a
+ * server-sent mode would be stale the instant a row was toggled, while
+ * recomputing it locally on top of one the server also sent would be two
+ * authorities for one value.
+ *
+ * Anything unrecognised, including a missing level from an older server, reads
+ * as "all": a level nobody can interpret must not silence a conversation.
+ */
+export function conversationNotificationMode(conversation: {
+  muted?: boolean;
+  notificationLevel?: string;
+}): ConversationNotificationMode {
+  if (conversation.muted) return "muted";
+  return conversation.notificationLevel === "mentions_replies" ? "mentions_replies" : "all";
 }
 
 /**

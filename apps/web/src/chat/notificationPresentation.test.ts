@@ -28,7 +28,7 @@ const channelId = "11111111-1111-4111-8111-111111111111";
 
 function policy(overrides: Partial<WSNotificationPolicy> = {}): WSNotificationPolicy {
   return {
-    policy_version: 1,
+    policy_version: 2,
     in_app: "allow",
     sound: "allow",
     web_push: "deny",

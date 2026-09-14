@@ -1749,6 +1749,139 @@ After this, rollback needs a redeploy — it is no longer instant.
 
 ---
 
+## 16b. Conversation notification levels (issue #136)
+
+Granular per-conversation notification levels ship behind a **runtime capability
+that is off in production**, because the writer and the readers cannot be
+released together.
+
+Two release slots share one database, and a slot from before #136 reads **any**
+row of `chat.conversation_notification_prefs` as a mute. A row saying "mentions
+and replies, not silenced" would therefore silence that person on the old slot.
+So the reader half ships first and understands the new shape; the writer half
+stays shut until no such reader is left.
+
+```text
+CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=false   # committed default
+```
+
+### Why a ConfigMap edit is not enough
+
+chat-service reads the key through `envFrom: configMapRef`, which Kubernetes
+resolves **once, when a container starts**. Editing `nchat-config` changes what
+the _next_ pod will read and nothing about the pods already serving. The
+operation is therefore the whole sequence — patch, restart, wait, and prove what
+the new pods actually loaded:
+
+```bash
+make prod-notification-levels ARGS="--status"
+make prod-notification-levels ARGS="--set true"
+make prod-notification-levels ARGS="--set false"
+```
+
+It validates the kube context and the namespace like every other production
+mutation, refuses anything but `true`/`false`, patches `nchat-config`, reads the
+value back, restarts `chat-service` in **both** slots, waits for each rollout,
+and then execs into a Ready pod of each slot and reads
+`CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED` out of its environment. Any step
+failing stops it non-zero.
+
+Both slots, because a cutover promotes whichever one is idle: restarting only
+the active slot would leave the next cutover moving production back to the
+previous behaviour with nothing reporting it. A slot scaled to zero has no pod
+to verify and is reported as such — it reads the ConfigMap when it is scaled up.
+A run that could verify no slot at all fails rather than claiming success.
+
+Only chat-service is restarted. It is the only service that reads the key, and
+the web app learns the capability from chat-service's own sidebar payload.
+
+### Phase 1 — reader-first (this is the shipped state)
+
+1. `make prod-blue-green-deploy` — applies migrations `000050`/`000051` as part
+   of the release, then brings the candidate up with the committed
+   `false`.
+2. `make prod-notification-levels ARGS="--status"` — expect
+   `nchat-config.CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=false` and
+   `false` on every slot that has pods.
+3. `make prod-blue-green-smoke ARGS="--target <candidate>"`, the manual
+   authenticated smoke, then `make prod-blue-green-cutover ARGS="--target
+<candidate>"`.
+4. Observation window (section 13).
+5. `make prod-blue-green-drain-old ARGS="--target <old>"` — scales the old slot
+   to zero, which is what closes its WebSockets through the application's own
+   shutdown path (section 16).
+
+Before considering Phase 2, confirm **no reader from before #136 is left**:
+
+```bash
+# 1. Every Ready pod of every slot is on the current release. `status` prints
+#    CONSISTENT <sha>:<id> per slot and exits non-zero on a mixed one.
+make prod-blue-green-status
+
+# 2. The old slot has no pods at all — this is what proves its HTTP handlers and
+#    its realtime hub are gone, not just idle.
+kubectl get pods -n nchat-prod -l nchat.io/release-slot=<old> -o wide
+
+# 3. notification-service is on the same release. It reads the preference
+#    columns through the outbox projection, so an old worker is a reader too.
+kubectl get pods -n nchat-prod \
+  -l app.kubernetes.io/component=notification \
+  -o 'custom-columns=POD:.metadata.name,SLOT:.metadata.labels.nchat\.io/release-slot,SHA:.metadata.annotations.nchat\.io/release-sha'
+```
+
+Step 2 is the one that covers live WebSocket connections: a realtime reader is a
+process, so a slot with zero pods has none. `drain-old.sh` is what gets it
+there, and it refuses while the active slot is not fully Ready.
+
+### Phase 2 — enabling the writer
+
+Precondition: the three checks above show only the current release.
+
+```bash
+make prod-notification-levels ARGS="--set true"
+```
+
+The command waits for both rollouts and prints the value each slot's pods
+actually loaded. Then:
+
+- smoke the granular write: as a normal user, set a channel to **Menções e
+  respostas** in Perfil > Notificações and reload the page;
+- a browser session that was already open keeps the capability it was served
+  with, because the web app reads it from the sidebar payload it fetched. A
+  reload — or any refetch of the sidebar — is what makes the select appear. The
+  frontend is never the authority: with the gate shut the server refuses the
+  granular mode with `503 notification_levels_unavailable` whatever the page
+  offers.
+
+### Rollback
+
+The supported rollback of this feature is the **reader-compatible build with the
+capability shut**:
+
+```bash
+make prod-notification-levels ARGS="--set false"
+make prod-notification-levels ARGS="--status"   # expect false on every slot
+```
+
+The second command is the proof that no process is still running with `true`:
+it reads the environment of a Ready pod of each slot, so a slot that was not
+restarted shows its stale value and the command fails.
+
+Rows already written as `mentions_replies` stay correct. Every reader in this
+build understands them with the capability in either position — the gate stops
+new granular writes, it never reinterprets an existing row — so unmuting such a
+conversation still restores its level.
+
+**Rolling back the release to a build from before #136 is not a supported
+rollback of this feature.** Once Phase 2 has written `mentions_replies` rows,
+such a build reads them as mutes and silences people who silenced nothing.
+Recovering from that would need the data converting first — deleting the rows
+whose `muted_at` is NULL, which is what migration `000050`'s down migration
+does — and that is a data operation, not a slot switch. Roll back to the
+reader-compatible build instead.
+
+---
+
 ## 17. Troubleshooting
 
 | Symptom                                | What it means                                                              | Action                                                                                                                        |

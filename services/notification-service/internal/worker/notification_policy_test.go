@@ -459,3 +459,127 @@ func TestWorkerLogsTheMuteDecision(t *testing.T) {
 		}
 	}
 }
+
+// Issue #136: the conversation level has to reach the engine through the same
+// assembly the mute does, or push would disagree with the in-app decision for
+// the same event.
+
+// The adapter carries both halves of the preference into the context. Asserted
+// on the adapter's own output rather than on a verdict, because what can break
+// here is a field left behind — and a dropped level scans as the default, which
+// silently re-alerts everybody who narrowed a conversation.
+func TestPolicyContextCarriesTheConversationLevel(t *testing.T) {
+	notification := liveNotification()
+	notification.NotificationLevel = string(notificationpolicy.ConversationLevelMentionsReplies)
+	notification.Muted = true
+
+	ctx := policyContext(notification)
+	if ctx.Preferences.ConversationLevel != notificationpolicy.ConversationLevelMentionsReplies {
+		t.Fatalf("ConversationLevel = %q, want the recipient's own level",
+			ctx.Preferences.ConversationLevel)
+	}
+	if !ctx.Preferences.Muted {
+		t.Fatal("the mute stopped travelling once the level did")
+	}
+}
+
+// The level decides push the way the matrix says, through the production
+// evaluator: an ordinary message is suppressed for a narrowed conversation and
+// a mention in the same conversation is not.
+func TestPolicyEvaluatorAppliesTheConversationLevelToPush(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		kind        notificationevent.EventType
+		wantDeliver bool
+	}{
+		{name: "ordinary channel message", kind: notificationevent.EventTypeChannelMessage},
+		{name: "ordinary direct message", kind: notificationevent.EventTypeDirectMessage},
+		{name: "mention", kind: notificationevent.EventTypeMention, wantDeliver: true},
+		{name: "reply", kind: notificationevent.EventTypeReply, wantDeliver: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			notification := liveNotification()
+			notification.EventType = string(test.kind)
+			notification.NotificationLevel = string(notificationpolicy.ConversationLevelMentionsReplies)
+
+			verdict := evaluate(t, notification)
+			if verdict.Deliver != test.wantDeliver {
+				t.Fatalf("Deliver = %v, want %v", verdict.Deliver, test.wantDeliver)
+			}
+			if test.wantDeliver {
+				if verdict.SuppressedReason != "" {
+					t.Fatalf("an eligible verdict explained itself: %q", verdict.SuppressedReason)
+				}
+				return
+			}
+			if verdict.SuppressedReason != string(notificationpolicy.ReasonConversationLevel) {
+				t.Fatalf("reason = %q, want %q",
+					verdict.SuppressedReason, notificationpolicy.ReasonConversationLevel)
+			}
+		})
+	}
+}
+
+// A level this build does not recognise is a preference nobody can act on, and
+// the answer is the product default rather than silence: an unreadable
+// preference is a different field, with a different rule.
+func TestPolicyEvaluatorDeliversForAnUnrecognisedLevel(t *testing.T) {
+	notification := liveNotification()
+	notification.EventType = string(notificationevent.EventTypeChannelMessage)
+	notification.NotificationLevel = "somente_mencoes"
+
+	if !evaluate(t, notification).Deliver {
+		t.Fatal("an unrecognised level silenced a notification nobody asked to silence")
+	}
+}
+
+// The real path, end to end, for the level: the row's level survives
+// storage.NotificationEvent, notificationFrom, policyContext and Evaluate, and
+// arrives in the column an operator queries — and the recipient who narrowed
+// one conversation still receives the mention that names them.
+func TestWorkerAppliesTheConversationLevelEndToEnd(t *testing.T) {
+	outbox := newFakeOutbox()
+	outbox.seedPendingWithLevel("narrowed-message",
+		string(notificationpolicy.ConversationLevelMentionsReplies),
+		notificationevent.EventTypeChannelMessage)
+	outbox.seedPendingWithLevel("narrowed-mention",
+		string(notificationpolicy.ConversationLevelMentionsReplies),
+		notificationevent.EventTypeMention)
+	deliverer := &recordingDeliverer{}
+	worker := newTestWorker(t, outbox, deliverer, nil)
+
+	worker.runPass()
+	worker.runPass()
+
+	suppressed := outbox.snapshot("narrowed-message")
+	if suppressed.state != notificationevent.StateSuppressed {
+		t.Fatalf("state = %q, want %q", suppressed.state, notificationevent.StateSuppressed)
+	}
+	if suppressed.reason != string(notificationpolicy.ReasonConversationLevel) {
+		t.Fatalf("reason = %q, want %q", suppressed.reason, notificationpolicy.ReasonConversationLevel)
+	}
+	if got := outbox.snapshot("narrowed-mention").state; got != notificationevent.StateSent {
+		t.Fatalf("the mention's state = %q, want %q", got, notificationevent.StateSent)
+	}
+	if keys := deliverer.delivered(); len(keys) != 1 || keys[0] != "narrowed-mention" {
+		t.Fatalf("delivered %v, want exactly [narrowed-mention]", keys)
+	}
+}
+
+// Mute keeps precedence through the assembly too: an event both silenced and
+// narrowed is recorded as a mute, because that is the decision the recipient
+// made about the whole conversation.
+func TestWorkerRecordsAMuteRatherThanALevelWhenBothApply(t *testing.T) {
+	notification := liveNotification()
+	notification.EventType = string(notificationevent.EventTypeChannelMessage)
+	notification.Muted = true
+	notification.NotificationLevel = string(notificationpolicy.ConversationLevelMentionsReplies)
+
+	verdict := evaluate(t, notification)
+	if verdict.Deliver {
+		t.Fatal("a muted conversation was still eligible for push")
+	}
+	if verdict.SuppressedReason != string(notificationpolicy.ReasonMuted) {
+		t.Fatalf("reason = %q, want %q", verdict.SuppressedReason, notificationpolicy.ReasonMuted)
+	}
+}

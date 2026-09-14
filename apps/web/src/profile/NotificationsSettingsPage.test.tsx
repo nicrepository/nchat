@@ -45,6 +45,17 @@ function makeContext(
     dms?: DMConversation[];
     retry?: AppShellOutletContext["retry"];
     setMuted?: AppShellOutletContext["setMuted"];
+    setNotificationMode?: AppShellOutletContext["setNotificationMode"];
+    /**
+     * The issue #136 rollout gate, as the server would have published it.
+     *
+     * Defaulted to `true` here because most of this file is about the granular
+     * control. The production default is `false` — proved where it is decided,
+     * in chat-service's config and service suites, and in chatApi's parsing of
+     * the payload — and the suite at the bottom of this file covers what this
+     * page renders when the gate is shut.
+     */
+    notificationLevelsEnabled?: boolean;
   } = {},
 ): AppShellOutletContext {
   const status = overrides.status ?? "ready";
@@ -54,6 +65,10 @@ function makeContext(
           status: "ready",
           currentUserId: "user-1",
           workspaceId: "workspace-1",
+          // `in` rather than `??`, so a case can state an explicitly absent
+          // capability — a payload that never carried the field — and get it.
+          notificationLevelsEnabled:
+            "notificationLevelsEnabled" in overrides ? overrides.notificationLevelsEnabled : true,
           channels: overrides.channels ?? [],
           dms: overrides.dms ?? [],
           categories: [],
@@ -69,6 +84,7 @@ function makeContext(
     renameChannel: vi.fn(async () => {}),
     renameGroup: vi.fn(async () => {}),
     setMuted: overrides.setMuted ?? vi.fn(async () => {}),
+    setNotificationMode: overrides.setNotificationMode ?? vi.fn(async () => {}),
     leaveConversation: vi.fn(async () => {}),
     inAppAlert: null,
     dismissInAppAlert: vi.fn(),
@@ -544,101 +560,206 @@ describe("NotificationsSettingsPage — page composition (issue #729)", () => {
   });
 });
 
+/**
+ * The mode select of one conversation (issue #136).
+ *
+ * Queried by its accessible name, which contains the conversation's own name —
+ * so a channel assertion can never pass on a group row, and neither can pass on
+ * the sound-mode radios elsewhere on the page.
+ */
+const selectFor = (name: string) =>
+  screen.getByRole("combobox", { name: `Notificações de ${name}` });
+
 describe("NotificationsSettingsPage — per-channel notifications", () => {
-  it("lists only the channels the sidebar state holds, each as a switch", () => {
+  it("lists only the channels the sidebar state holds, each as a mode select", () => {
     renderPage(makeContext({ channels: [channel("geral"), channel("infra")] }));
 
     const channels = card("Notificações por canal");
-    expect(within(channels).getByRole("checkbox", { name: "Notificações de geral" })).toBeChecked();
-    expect(within(channels).getByRole("checkbox", { name: "Notificações de infra" })).toBeChecked();
-    expect(within(channels).getAllByRole("checkbox")).toHaveLength(2);
+    expect(within(channels).getByRole("combobox", { name: "Notificações de geral" })).toHaveValue(
+      "all",
+    );
+    expect(within(channels).getByRole("combobox", { name: "Notificações de infra" })).toHaveValue(
+      "all",
+    );
+    expect(within(channels).getAllByRole("combobox")).toHaveLength(2);
   });
 
-  it("reflects an already muted channel as off", () => {
-    renderPage(makeContext({ channels: [channel("infra", { muted: true })] }));
+  it("offers exactly the three modes of the first version, in the prototype's order", () => {
+    renderPage(makeContext({ channels: [channel("infra")] }));
 
-    expect(screen.getByRole("checkbox", { name: "Notificações de infra" })).not.toBeChecked();
+    expect(
+      within(selectFor("infra"))
+        .getAllByRole("option")
+        .map((option) => [option.getAttribute("value"), option.textContent]),
+    ).toEqual([
+      ["all", "Todas as mensagens"],
+      ["mentions_replies", "Menções e respostas"],
+      ["muted", "Silenciado"],
+    ]);
   });
 
-  it("muting goes through the canonical setMuted flow with the conversation's own target", async () => {
+  it("shows the persisted value for each mode", () => {
+    renderPage(
+      makeContext({
+        channels: [
+          channel("todas"),
+          channel("mencoes", { notificationLevel: "mentions_replies" }),
+          channel("silenciado", { muted: true }),
+          // A mute with a level underneath it still reads as silenced: the mute
+          // wins, and the level is what a later unmute restores.
+          channel("silenciado-com-nivel", { muted: true, notificationLevel: "mentions_replies" }),
+        ],
+      }),
+    );
+
+    expect(selectFor("todas")).toHaveValue("all");
+    expect(selectFor("mencoes")).toHaveValue("mentions_replies");
+    expect(selectFor("silenciado")).toHaveValue("muted");
+    expect(selectFor("silenciado-com-nivel")).toHaveValue("muted");
+  });
+
+  it("a level a newer server added reads as the default rather than silencing anything", () => {
+    renderPage(
+      makeContext({
+        // Deliberately not a ConversationNotificationLevel this build knows.
+        channels: [channel("infra", { notificationLevel: "mentions_only" as never })],
+      }),
+    );
+
+    expect(selectFor("infra")).toHaveValue("all");
+  });
+
+  it("each mode is written through the canonical flow with the conversation's own target", async () => {
+    for (const mode of ["mentions_replies", "muted", "all"] as const) {
+      const user = userEvent.setup();
+      const setNotificationMode = vi.fn(async () => {});
+      const { unmount } = renderPage(
+        makeContext({
+          // Starting from a different mode each time, so selecting is a real
+          // change rather than a no-op the browser would swallow.
+          channels: [channel("infra", { muted: mode !== "muted" })],
+          setNotificationMode,
+        }),
+      );
+
+      await user.selectOptions(selectFor("infra"), mode);
+
+      expect(setNotificationMode).toHaveBeenCalledExactlyOnceWith(
+        { kind: "channel", targetId: "infra" },
+        mode,
+      );
+      unmount();
+    }
+  });
+
+  it("a refused mutation reports the failure and leaves the select on the persisted value", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {});
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
-
-    await user.click(screen.getByRole("checkbox", { name: "Notificações de infra" }));
-
-    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "channel", targetId: "infra" }, true);
-  });
-
-  it("unmuting sends muted:false through the same flow", async () => {
-    const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {});
-    renderPage(makeContext({ channels: [channel("infra", { muted: true })], setMuted }));
-
-    await user.click(screen.getByRole("checkbox", { name: "Notificações de infra" }));
-
-    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "channel", targetId: "infra" }, false);
-  });
-
-  it("a refused mutation reports the failure and leaves the switch on the persisted value", async () => {
-    const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {
+    const setNotificationMode = vi.fn(async () => {
       throw new Error("403");
     });
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    await user.click(screen.getByRole("checkbox", { name: "Notificações de infra" }));
+    await user.selectOptions(selectFor("infra"), "muted");
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Não foi possível atualizar as notificações de infra. Tente novamente.",
     );
     // The sidebar rolls its own optimistic write back, so the row keeps showing
     // what the server actually holds rather than what the click asked for.
-    expect(screen.getByRole("checkbox", { name: "Notificações de infra" })).toBeChecked();
+    expect(selectFor("infra")).toHaveValue("all");
+  });
+
+  it("ties the failure to the row that produced it", async () => {
+    const user = userEvent.setup();
+    const setNotificationMode = vi.fn(async () => {
+      throw new Error("503");
+    });
+    renderPage(
+      makeContext({ channels: [channel("infra"), channel("avisos")], setNotificationMode }),
+    );
+
+    await user.selectOptions(selectFor("infra"), "muted");
+
+    await waitFor(() =>
+      expect(selectFor("infra")).toHaveAccessibleDescription(
+        /Não foi possível atualizar as notificações de infra/,
+      ),
+    );
+    // The other row is untouched by somebody else's failure.
+    expect(selectFor("avisos")).not.toHaveAccessibleDescription();
   });
 
   it("clears a previous failure when the next attempt starts", async () => {
     const user = userEvent.setup();
-    const setMuted = vi
-      .fn<AppShellOutletContext["setMuted"]>()
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
       .mockRejectedValueOnce(new Error("503"))
       .mockResolvedValueOnce(undefined);
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    const toggle = () => screen.getByRole("checkbox", { name: "Notificações de infra" });
-    await user.click(toggle());
+    await user.selectOptions(selectFor("infra"), "muted");
     expect(await screen.findByRole("alert")).toBeInTheDocument();
 
-    await user.click(toggle());
+    await user.selectOptions(selectFor("infra"), "mentions_replies");
 
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 
-  it("shows the general channel as unavailable, in words, and never calls setMuted for it", async () => {
+  it("never offers the forbidden mode for the general channel, and says why in words", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {});
-    renderPage(makeContext({ channels: [channel("geral", { isGeneral: true })], setMuted }));
+    const setNotificationMode = vi.fn(async () => {});
+    renderPage(
+      makeContext({ channels: [channel("geral", { isGeneral: true })], setNotificationMode }),
+    );
 
-    const toggle = screen.getByRole("checkbox", { name: "Notificações de geral" });
-    expect(toggle).toBeDisabled();
-    expect(screen.getByText("O canal geral não pode ser silenciado.")).toBeInTheDocument();
-    expect(toggle).toHaveAccessibleDescription("O canal geral não pode ser silenciado.");
+    const select = selectFor("geral");
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["all", "mentions_replies"]);
+    expect(
+      screen.getByText(
+        "O canal geral não pode ser silenciado. Você ainda pode receber apenas menções e respostas.",
+      ),
+    ).toBeInTheDocument();
+    expect(select).toHaveAccessibleDescription(/O canal geral não pode ser silenciado/);
+    // Restricted, not frozen: the two levels it does allow stay operable.
+    expect(select).toBeEnabled();
 
-    await user.click(toggle);
+    await user.selectOptions(select, "mentions_replies");
 
-    expect(setMuted).not.toHaveBeenCalled();
+    expect(setNotificationMode).toHaveBeenCalledExactlyOnceWith(
+      { kind: "channel", targetId: "geral" },
+      "mentions_replies",
+    );
   });
 
   it("is operable from the keyboard", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {});
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    const setNotificationMode = vi.fn(async () => {});
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    const toggle = screen.getByRole("checkbox", { name: "Notificações de infra" });
-    toggle.focus();
-    await user.keyboard(" ");
+    const select = selectFor("infra");
+    select.focus();
+    expect(select).toHaveFocus();
+    // The keyboard path through a native select: focus it, move the selection,
+    // and the change is committed the same way a click would commit it.
+    await user.selectOptions(select, "mentions_replies");
 
-    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "channel", targetId: "infra" }, true);
+    expect(setNotificationMode).toHaveBeenCalledExactlyOnceWith(
+      { kind: "channel", targetId: "infra" },
+      "mentions_replies",
+    );
+  });
+
+  it("is reachable by clicking the conversation's visible name", async () => {
+    const user = userEvent.setup();
+    renderPage(makeContext({ channels: [channel("infra")] }));
+
+    await user.click(within(card("Notificações por canal")).getByText("infra"));
+
+    expect(selectFor("infra")).toHaveFocus();
   });
 });
 
@@ -652,53 +773,82 @@ describe("NotificationsSettingsPage — per-group notifications", () => {
     );
 
     const groups = card("Notificações por grupos");
-    expect(within(groups).getByRole("checkbox", { name: "Notificações de grupo-a" })).toBeChecked();
-    expect(within(groups).getByRole("checkbox", { name: "Notificações de grupo-b" })).toBeChecked();
-    expect(within(groups).getAllByRole("checkbox")).toHaveLength(2);
-    expect(screen.queryByRole("checkbox", { name: "Notificações de ana" })).toBeNull();
+    expect(within(groups).getByRole("combobox", { name: "Notificações de grupo-a" })).toHaveValue(
+      "all",
+    );
+    expect(within(groups).getByRole("combobox", { name: "Notificações de grupo-b" })).toHaveValue(
+      "all",
+    );
+    expect(within(groups).getAllByRole("combobox")).toHaveLength(2);
+    expect(screen.queryByRole("combobox", { name: "Notificações de ana" })).toBeNull();
   });
 
   it("keeps channels out of the groups card and groups out of the channels card", () => {
     renderPage(makeContext({ channels: [channel("geral")], dms: [dm("grupo-a", "group")] }));
 
     expect(
-      within(card("Notificações por canal")).queryByRole("checkbox", {
+      within(card("Notificações por canal")).queryByRole("combobox", {
         name: "Notificações de grupo-a",
       }),
     ).toBeNull();
     expect(
-      within(card("Notificações por grupos")).queryByRole("checkbox", {
+      within(card("Notificações por grupos")).queryByRole("combobox", {
         name: "Notificações de geral",
       }),
     ).toBeNull();
   });
 
-  it("mutes a group through the same canonical flow, as a dm target", async () => {
+  it("writes a group through the same canonical flow, as a dm target", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {});
-    renderPage(makeContext({ dms: [dm("grupo-a", "group")], setMuted }));
+    const setNotificationMode = vi.fn(async () => {});
+    renderPage(makeContext({ dms: [dm("grupo-a", "group")], setNotificationMode }));
 
-    await user.click(screen.getByRole("checkbox", { name: "Notificações de grupo-a" }));
+    await user.selectOptions(selectFor("grupo-a"), "mentions_replies");
 
-    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "dm", targetId: "grupo-a" }, true);
+    expect(setNotificationMode).toHaveBeenCalledExactlyOnceWith(
+      { kind: "dm", targetId: "grupo-a" },
+      "mentions_replies",
+    );
   });
 
-  it("reflects an already muted group as off", () => {
-    renderPage(makeContext({ dms: [dm("grupo-a", "group", { muted: true })] }));
+  it("shows the persisted value for a group, including a mute", () => {
+    renderPage(
+      makeContext({
+        dms: [
+          dm("grupo-a", "group", { muted: true }),
+          dm("grupo-b", "group", { notificationLevel: "mentions_replies" }),
+        ],
+      }),
+    );
 
-    expect(screen.getByRole("checkbox", { name: "Notificações de grupo-a" })).not.toBeChecked();
+    expect(selectFor("grupo-a")).toHaveValue("muted");
+    expect(selectFor("grupo-b")).toHaveValue("mentions_replies");
+  });
+
+  it("offers the silenced mode for a group, unlike the general channel", () => {
+    renderPage(makeContext({ dms: [dm("grupo-a", "group")] }));
+
+    expect(
+      within(selectFor("grupo-a"))
+        .getAllByRole("option")
+        .map((option) => option.getAttribute("value")),
+    ).toEqual(["all", "mentions_replies", "muted"]);
   });
 
   it("keeps its failure separate from the channels card", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn(async () => {
+    const setNotificationMode = vi.fn(async () => {
       throw new Error("503");
     });
     renderPage(
-      makeContext({ channels: [channel("infra")], dms: [dm("grupo-a", "group")], setMuted }),
+      makeContext({
+        channels: [channel("infra")],
+        dms: [dm("grupo-a", "group")],
+        setNotificationMode,
+      }),
     );
 
-    await user.click(screen.getByRole("checkbox", { name: "Notificações de grupo-a" }));
+    await user.selectOptions(selectFor("grupo-a"), "muted");
 
     await waitFor(() =>
       expect(within(card("Notificações por grupos")).getByRole("alert")).toBeInTheDocument(),
@@ -706,7 +856,6 @@ describe("NotificationsSettingsPage — per-group notifications", () => {
     expect(within(card("Notificações por canal")).queryByRole("alert")).toBeNull();
   });
 });
-
 describe("NotificationsSettingsPage — conversation list states", () => {
   it("reports loading per card without blocking the preferences that already work", () => {
     renderPage(makeContext({ status: "loading" }));
@@ -793,102 +942,114 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-describe("NotificationsSettingsPage — one write per conversation at a time (issue #729)", () => {
-  const toggleFor = (name: string) =>
-    screen.getByRole("checkbox", { name: `Notificações de ${name}` });
-
+describe("NotificationsSettingsPage — one write per conversation at a time (issues #729/#136)", () => {
   it("holds the row unavailable while its own write is in flight and starts no second request", async () => {
     const user = userEvent.setup();
     const pending = deferred();
-    const setMuted = vi.fn<AppShellOutletContext["setMuted"]>().mockReturnValue(pending.promise);
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
+      .mockReturnValue(pending.promise);
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    await user.click(toggleFor("infra"));
+    await user.selectOptions(selectFor("infra"), "muted");
 
-    expect(setMuted).toHaveBeenCalledOnce();
-    await waitFor(() => expect(toggleFor("infra")).toBeDisabled());
-    expect(toggleFor("infra")).toHaveAttribute("aria-busy", "true");
+    expect(setNotificationMode).toHaveBeenCalledOnce();
+    await waitFor(() => expect(selectFor("infra")).toBeDisabled());
+    expect(selectFor("infra")).toHaveAttribute("aria-busy", "true");
     // Unavailability is stated in words, not only by a dimmed control.
     expect(screen.getByText("Salvando…")).toBeInTheDocument();
 
-    await user.click(toggleFor("infra"));
-
-    expect(setMuted).toHaveBeenCalledOnce();
+    // A disabled select cannot be changed, so the second request is impossible
+    // rather than merely discouraged: pointer events do not reach it and no
+    // change event is dispatched. The hook holds the same property for the
+    // interleaving this page cannot prevent — a click in the sidebar's own row
+    // menu while this write is open.
+    await user.selectOptions(selectFor("infra"), "all");
+    expect(setNotificationMode).toHaveBeenCalledOnce();
 
     pending.resolve();
 
-    await waitFor(() => expect(toggleFor("infra")).toBeEnabled());
+    await waitFor(() => expect(selectFor("infra")).toBeEnabled());
     expect(screen.queryByText("Salvando…")).toBeNull();
-    expect(toggleFor("infra")).toHaveAttribute("aria-busy", "false");
+    expect(selectFor("infra")).toHaveAttribute("aria-busy", "false");
   });
 
   it("leaves every other channel and group operable while one write is pending", async () => {
     const user = userEvent.setup();
     const pending = deferred();
-    const setMuted = vi
-      .fn<AppShellOutletContext["setMuted"]>()
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
       .mockReturnValueOnce(pending.promise)
       .mockResolvedValue(undefined);
     renderPage(
       makeContext({
         channels: [channel("infra"), channel("avisos")],
         dms: [dm("grupo-a", "group")],
-        setMuted,
+        setNotificationMode,
       }),
     );
 
-    await user.click(toggleFor("infra"));
-    await waitFor(() => expect(toggleFor("infra")).toBeDisabled());
+    await user.selectOptions(selectFor("infra"), "muted");
+    await waitFor(() => expect(selectFor("infra")).toBeDisabled());
 
-    expect(toggleFor("avisos")).toBeEnabled();
-    expect(toggleFor("grupo-a")).toBeEnabled();
+    expect(selectFor("avisos")).toBeEnabled();
+    expect(selectFor("grupo-a")).toBeEnabled();
 
-    await user.click(toggleFor("grupo-a"));
+    await user.selectOptions(selectFor("grupo-a"), "mentions_replies");
 
-    expect(setMuted).toHaveBeenCalledTimes(2);
-    expect(setMuted).toHaveBeenLastCalledWith({ kind: "dm", targetId: "grupo-a" }, true);
+    expect(setNotificationMode).toHaveBeenCalledTimes(2);
+    expect(setNotificationMode).toHaveBeenLastCalledWith(
+      { kind: "dm", targetId: "grupo-a" },
+      "mentions_replies",
+    );
     // The channel is still the only row waiting on anything.
     expect(screen.getAllByText("Salvando…")).toHaveLength(1);
-    expect(toggleFor("grupo-a")).toBeEnabled();
+    expect(selectFor("grupo-a")).toBeEnabled();
 
     pending.resolve();
-    await waitFor(() => expect(toggleFor("infra")).toBeEnabled());
+    await waitFor(() => expect(selectFor("infra")).toBeEnabled());
   });
 
   it("shows the canonical value after a confirmed write, never a local copy of the click", async () => {
     const user = userEvent.setup();
-    const setMuted = vi.fn<AppShellOutletContext["setMuted"]>().mockResolvedValue(undefined);
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
+      .mockResolvedValue(undefined);
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    await user.click(toggleFor("infra"));
+    await user.selectOptions(selectFor("infra"), "muted");
 
-    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "channel", targetId: "infra" }, true);
+    expect(setNotificationMode).toHaveBeenCalledExactlyOnceWith(
+      { kind: "channel", targetId: "infra" },
+      "muted",
+    );
     // The sidebar state this page renders from is what it renders: the page
-    // keeps no preference of its own that could outlive a refused write.
-    await waitFor(() => expect(toggleFor("infra")).toBeEnabled());
-    expect(toggleFor("infra")).toBeChecked();
+    // keeps no preference of its own that could outlive a refused write. The
+    // fake context never changed, so the select is back on the server's value.
+    await waitFor(() => expect(selectFor("infra")).toBeEnabled());
+    expect(selectFor("infra")).toHaveValue("all");
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("frees the row again after a refusal, and the next attempt goes through", async () => {
     const user = userEvent.setup();
-    const setMuted = vi
-      .fn<AppShellOutletContext["setMuted"]>()
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
       .mockRejectedValueOnce(new Error("503"))
       .mockResolvedValueOnce(undefined);
-    renderPage(makeContext({ channels: [channel("infra")], setMuted }));
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
 
-    await user.click(toggleFor("infra"));
+    await user.selectOptions(selectFor("infra"), "muted");
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Não foi possível atualizar as notificações de infra. Tente novamente.",
     );
-    await waitFor(() => expect(toggleFor("infra")).toBeEnabled());
-    expect(toggleFor("infra")).toBeChecked();
+    await waitFor(() => expect(selectFor("infra")).toBeEnabled());
+    expect(selectFor("infra")).toHaveValue("all");
 
-    await user.click(toggleFor("infra"));
+    await user.selectOptions(selectFor("infra"), "muted");
 
-    expect(setMuted).toHaveBeenCalledTimes(2);
+    expect(setNotificationMode).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 
@@ -896,30 +1057,155 @@ describe("NotificationsSettingsPage — one write per conversation at a time (is
     const user = userEvent.setup();
     const channelWrite = deferred();
     const groupWrite = deferred();
-    const setMuted = vi
-      .fn<AppShellOutletContext["setMuted"]>()
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
       .mockReturnValueOnce(channelWrite.promise)
       .mockReturnValueOnce(groupWrite.promise);
     renderPage(
-      makeContext({ channels: [channel("infra")], dms: [dm("grupo-a", "group")], setMuted }),
+      makeContext({
+        channels: [channel("infra")],
+        dms: [dm("grupo-a", "group")],
+        setNotificationMode,
+      }),
     );
 
-    await user.click(toggleFor("infra"));
-    await waitFor(() => expect(toggleFor("infra")).toBeDisabled());
-    await user.click(toggleFor("grupo-a"));
-    await waitFor(() => expect(toggleFor("grupo-a")).toBeDisabled());
+    await user.selectOptions(selectFor("infra"), "muted");
+    await waitFor(() => expect(selectFor("infra")).toBeDisabled());
+    await user.selectOptions(selectFor("grupo-a"), "muted");
+    await waitFor(() => expect(selectFor("grupo-a")).toBeDisabled());
 
-    expect(setMuted.mock.calls.map(([target]) => target)).toEqual([
+    expect(setNotificationMode.mock.calls.map(([target]) => target)).toEqual([
       { kind: "channel", targetId: "infra" },
       { kind: "dm", targetId: "grupo-a" },
     ]);
 
     // Each row is released by its own write, independently of the other's.
     groupWrite.resolve();
-    await waitFor(() => expect(toggleFor("grupo-a")).toBeEnabled());
-    expect(toggleFor("infra")).toBeDisabled();
+    await waitFor(() => expect(selectFor("grupo-a")).toBeEnabled());
+    expect(selectFor("infra")).toBeDisabled();
 
     channelWrite.resolve();
-    await waitFor(() => expect(toggleFor("infra")).toBeEnabled());
+    await waitFor(() => expect(selectFor("infra")).toBeEnabled());
+  });
+
+  it("never writes a conversation preference to local storage", async () => {
+    const user = userEvent.setup();
+    localStorage.clear();
+    const setNotificationMode = vi
+      .fn<AppShellOutletContext["setNotificationMode"]>()
+      .mockResolvedValue(undefined);
+    renderPage(makeContext({ channels: [channel("infra")], setNotificationMode }));
+
+    await user.selectOptions(selectFor("infra"), "mentions_replies");
+
+    await waitFor(() => expect(setNotificationMode).toHaveBeenCalledOnce());
+    expect(localStorage.length).toBe(0);
+  });
+});
+
+describe("NotificationsSettingsPage — the rollout gate (issue #136)", () => {
+  const gated = (overrides: Parameters<typeof makeContext>[0] = {}) =>
+    makeContext({ ...overrides, notificationLevelsEnabled: false });
+
+  it("renders the binary control #729 shipped while the gate is shut", () => {
+    renderPage(gated({ channels: [channel("infra")], dms: [dm("grupo-a", "group")] }));
+
+    // No select anywhere: offering the three modes would offer one the server
+    // refuses with a 503.
+    expect(screen.queryByRole("combobox", { name: "Notificações de infra" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Notificações de grupo-a" })).toBeNull();
+    expect(screen.getByRole("checkbox", { name: "Notificações de infra" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Notificações de grupo-a" })).toBeChecked();
+  });
+
+  it("shows a silenced conversation as off, whatever level is underneath it", () => {
+    renderPage(
+      gated({
+        channels: [
+          channel("silenciado", { muted: true }),
+          // A row written while the gate was open, read back with it shut: the
+          // binary control shows it as on, because it is not silenced. It must
+          // not be read as a mute.
+          channel("mencoes", { notificationLevel: "mentions_replies" }),
+        ],
+      }),
+    );
+
+    expect(screen.getByRole("checkbox", { name: "Notificações de silenciado" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Notificações de mencoes" })).toBeChecked();
+  });
+
+  it("writes through the mute shortcut and never the granular endpoint", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn(async () => {});
+    const setNotificationMode = vi.fn(async () => {});
+    renderPage(gated({ channels: [channel("infra")], setMuted, setNotificationMode }));
+
+    await user.click(screen.getByRole("checkbox", { name: "Notificações de infra" }));
+
+    expect(setMuted).toHaveBeenCalledExactlyOnceWith({ kind: "channel", targetId: "infra" }, true);
+    expect(setNotificationMode).not.toHaveBeenCalled();
+  });
+
+  it("keeps the general channel unavailable, in words", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn(async () => {});
+    renderPage(gated({ channels: [channel("geral", { isGeneral: true })], setMuted }));
+
+    const toggle = screen.getByRole("checkbox", { name: "Notificações de geral" });
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAccessibleDescription(/O canal geral não pode ser silenciado/);
+
+    await user.click(toggle);
+
+    expect(setMuted).not.toHaveBeenCalled();
+  });
+
+  it("reports a refused write on the row that asked for it, like the select does", async () => {
+    const user = userEvent.setup();
+    const setMuted = vi.fn(async () => {
+      throw new Error("503");
+    });
+    renderPage(gated({ channels: [channel("infra")], setMuted }));
+
+    await user.click(screen.getByRole("checkbox", { name: "Notificações de infra" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Não foi possível atualizar as notificações de infra. Tente novamente.",
+    );
+    // Rolled back by the sidebar, so the row keeps the persisted value.
+    expect(screen.getByRole("checkbox", { name: "Notificações de infra" })).toBeChecked();
+  });
+
+  it("holds one row while its own write is in flight and leaves the others alone", async () => {
+    const user = userEvent.setup();
+    const pending = deferred();
+    const setMuted = vi.fn<AppShellOutletContext["setMuted"]>().mockReturnValue(pending.promise);
+    renderPage(gated({ channels: [channel("infra"), channel("avisos")], setMuted }));
+
+    const infra = () => screen.getByRole("checkbox", { name: "Notificações de infra" });
+    await user.click(infra());
+
+    await waitFor(() => expect(infra()).toBeDisabled());
+    expect(screen.getByText("Salvando…")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Notificações de avisos" })).toBeEnabled();
+
+    pending.resolve();
+    await waitFor(() => expect(infra()).toBeEnabled());
+  });
+
+  it("renders the select again once the gate is open, from the same state", () => {
+    renderPage(makeContext({ channels: [channel("infra")], notificationLevelsEnabled: true }));
+
+    expect(screen.getByRole("combobox", { name: "Notificações de infra" })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Notificações de infra" })).toBeNull();
+  });
+
+  it("treats a state that says nothing about the gate as shut", () => {
+    // A server that predates the field, or a payload that did not carry it.
+    renderPage(makeContext({ channels: [channel("infra")], notificationLevelsEnabled: undefined }));
+
+    expect(screen.getByRole("checkbox", { name: "Notificações de infra" })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Notificações de infra" })).toBeNull();
   });
 });

@@ -29,6 +29,26 @@ type sidebarMuteProvider interface {
 	UnmuteConversation(ctx context.Context, userID, targetType, targetID string) error
 }
 
+// sidebarNotificationPrefProvider is the canonical whole-preference write
+// (issue #136), declared as its own narrow surface next to the mute shortcut
+// above rather than folded into it: they are two routes with two contracts, and
+// a build that wires one and not the other must answer 503 for exactly the one
+// it is missing.
+type sidebarNotificationPrefProvider interface {
+	SetConversationNotificationPreference(ctx context.Context, userID, targetType, targetID, mode string) error
+}
+
+// sidebarCapabilityProvider is the service's answer to "may granular levels be
+// written in this deployment" (issue #136).
+//
+// Declared separately from the write surface above so the payload can publish
+// the capability for a build that has the service and report `false` for one
+// that does not — which is the honest answer for a deployment where the write
+// route answers 503 anyway.
+type sidebarCapabilityProvider interface {
+	ConversationNotificationLevelsEnabled() bool
+}
+
 type sidebarReadProvider interface {
 	MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error
 }
@@ -84,6 +104,19 @@ type sidebarChannelJSON struct {
 	// property of the channel. Always false for the general channel, which is
 	// not silenceable. Never omitempty: absent must read as "not muted".
 	Muted bool `json:"muted"`
+	// NotificationLevel is the other half of that preference (issue #136):
+	// which events this viewer wants alerts for here, independently of the mute.
+	//
+	// Both fields travel, and the single mode a settings page shows is the
+	// precedence between them — a mute wins. The derived value is deliberately
+	// not a third field: the client updates this pair optimistically when the
+	// sidebar's mute shortcut is used, and a server-sent mode would be stale
+	// the moment it did. `muted` stays because the sidebar row menu, the older
+	// clients and the realtime payload all already read it.
+	//
+	// Never omitempty: absent must read as the default level, which is what a
+	// client that predates the field assumes anyway.
+	NotificationLevel string `json:"notification_level"`
 	// RFC 3339 UTC, with the sub-second fraction kept — see formatSidebarTime
 	// for why these two keep a precision the detail endpoints do not need.
 	CreatedAt     string  `json:"created_at"`
@@ -122,8 +155,11 @@ type sidebarDMJSON struct {
 	LastMessageAt *string                   `json:"last_message_at"`
 	PinnedAt      *string                   `json:"pinned_at"`
 	UnreadCount   int                       `json:"unread_count"`
-	// Muted is this viewer's own notification preference (issue #527).
-	Muted bool `json:"muted"`
+	// Muted is this viewer's own notification preference (issue #527), and
+	// NotificationLevel its other, independent half (issue #136). Same contract
+	// and same reasoning as sidebarChannelJSON's pair.
+	Muted             bool   `json:"muted"`
+	NotificationLevel string `json:"notification_level"`
 }
 
 // sidebarResponseBody is the top-level JSON data object for the sidebar endpoint.
@@ -132,6 +168,20 @@ type sidebarResponseBody struct {
 	Workspace     sidebarWorkspaceJSON `json:"workspace"`
 	Channels      []sidebarChannelJSON `json:"channels"`
 	DMConvs       []sidebarDMJSON      `json:"dm_conversations"`
+	// ConversationNotificationLevelsEnabled publishes the issue #136 rollout
+	// gate to the client, in the same payload that already hydrates the sidebar
+	// and the notification settings page.
+	//
+	// It is an affordance and never the control: the write route re-derives the
+	// same answer from the same configuration on every call, so a client that
+	// ignores or edits this value changes only which error it receives. What it
+	// buys is a settings page that offers the binary control while the gate is
+	// closed instead of a select whose third option would 503.
+	//
+	// Never omitempty: a client that predates the field reads a missing value as
+	// "off", which is the compatible behaviour rather than an offer the server
+	// would refuse.
+	ConversationNotificationLevelsEnabled bool `json:"conversation_notification_levels_enabled"`
 	// Deprecated: retained for compatibility with older clients. Active
 	// workspace members can create channels (BUG #393), so a 200 here already
 	// implies true. Never omitempty — a client that predates the change reads a
@@ -165,6 +215,16 @@ func (h *SidebarHandler) WithMessageAttachmentLimits(count int, bytes int64) *Si
 		h.maxMessageAttachmentBytes = bytes
 	}
 	return h
+}
+
+// conversationNotificationLevelsEnabled asks the service for the rollout gate,
+// and answers false for a service that cannot be asked.
+//
+// False for an unwired or older service is the compatible direction: it offers
+// the binary control, which every build of this product has always supported.
+func (h *SidebarHandler) conversationNotificationLevelsEnabled() bool {
+	capabilities, ok := h.svc.(sidebarCapabilityProvider)
+	return ok && capabilities.ConversationNotificationLevelsEnabled()
 }
 
 // Ready reports whether the handler is wired to a real sidebar service.
@@ -208,9 +268,10 @@ func (h *SidebarHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			MaxMessageAttachments:     h.maxMessageAttachments,
 			MaxMessageAttachmentBytes: h.maxMessageAttachmentBytes,
 		},
-		Channels:         mapChannels(data.Channels),
-		DMConvs:          mapDMs(data.DMs),
-		CanCreateChannel: data.CanCreateChannel,
+		Channels:                              mapChannels(data.Channels),
+		DMConvs:                               mapDMs(data.DMs),
+		CanCreateChannel:                      data.CanCreateChannel,
+		ConversationNotificationLevelsEnabled: h.conversationNotificationLevelsEnabled(),
 	}
 	// Ensure arrays are never null in JSON output.
 	if body.Channels == nil {
@@ -229,18 +290,19 @@ func mapChannels(channels []service.SidebarChannel) []sidebarChannelJSON {
 		ch := sidebarChannel.Channel
 		unreadCount := sidebarChannel.UnreadCount
 		out = append(out, sidebarChannelJSON{
-			ID:            ch.ID,
-			Slug:          ch.Slug,
-			DisplayName:   ch.DisplayName,
-			Type:          string(ch.Type),
-			IsGeneral:     ch.IsGeneral,
-			CanWrite:      sidebarChannel.CanWrite,
-			CanRename:     sidebarChannel.CanRename,
-			CreatedAt:     formatSidebarTime(ch.CreatedAt),
-			LastMessageAt: formatSidebarTimePtr(sidebarChannel.LastMessageAt),
-			PinnedAt:      formatSidebarTimePtr(sidebarChannel.PinnedAt),
-			UnreadCount:   &unreadCount,
-			Muted:         sidebarChannel.Muted,
+			ID:                ch.ID,
+			Slug:              ch.Slug,
+			DisplayName:       ch.DisplayName,
+			Type:              string(ch.Type),
+			IsGeneral:         ch.IsGeneral,
+			CanWrite:          sidebarChannel.CanWrite,
+			CanRename:         sidebarChannel.CanRename,
+			CreatedAt:         formatSidebarTime(ch.CreatedAt),
+			LastMessageAt:     formatSidebarTimePtr(sidebarChannel.LastMessageAt),
+			PinnedAt:          formatSidebarTimePtr(sidebarChannel.PinnedAt),
+			UnreadCount:       &unreadCount,
+			Muted:             sidebarChannel.Muted,
+			NotificationLevel: sidebarChannel.NotificationLevel,
 		})
 	}
 	return out
@@ -252,15 +314,16 @@ func mapDMs(dms []domain.DMConversationWithParticipantIDs) []sidebarDMJSON {
 	for _, dm := range dms {
 		name := computeDMName(dm.Type, dm.Title, dm.CounterpartDisplayName)
 		out = append(out, sidebarDMJSON{
-			ID:            dm.ID,
-			Type:          string(dm.Type),
-			Name:          name,
-			Counterpart:   mapDMCounterpart(dm, name),
-			CreatedAt:     formatSidebarTime(dm.CreatedAt),
-			LastMessageAt: formatSidebarTimePtr(dm.LastMessageAt),
-			PinnedAt:      formatSidebarTimePtr(dm.PinnedAt),
-			UnreadCount:   dm.UnreadCount,
-			Muted:         dm.Muted,
+			ID:                dm.ID,
+			Type:              string(dm.Type),
+			Name:              name,
+			Counterpart:       mapDMCounterpart(dm, name),
+			CreatedAt:         formatSidebarTime(dm.CreatedAt),
+			LastMessageAt:     formatSidebarTimePtr(dm.LastMessageAt),
+			PinnedAt:          formatSidebarTimePtr(dm.PinnedAt),
+			UnreadCount:       dm.UnreadCount,
+			Muted:             dm.Muted,
+			NotificationLevel: dm.NotificationLevel,
 		})
 	}
 	return out
@@ -324,6 +387,69 @@ func (h *SidebarHandler) muteConversation(w http.ResponseWriter, r *http.Request
 		err = mutes.UnmuteConversation(r.Context(), userID, targetType, targetID)
 	}
 	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// setNotificationPreferenceRequest is the whole body of the canonical write.
+//
+// One field, and nothing that could name an actor, a workspace or another user:
+// the principal is the session and the workspace is resolved server-side, so
+// there is no value here a client could use to aim the write at somebody else.
+type setNotificationPreferenceRequest struct {
+	Mode string `json:"mode"`
+}
+
+func (h *SidebarHandler) SetChannelNotificationPreference(w http.ResponseWriter, r *http.Request) {
+	h.setNotificationPreference(w, r, service.ReadTargetChannel, r.PathValue("channelID"), "channel_id")
+}
+
+func (h *SidebarHandler) SetDMNotificationPreference(w http.ResponseWriter, r *http.Request) {
+	h.setNotificationPreference(w, r, service.ReadTargetDM, r.PathValue("conversationID"), "conversation_id")
+}
+
+// setNotificationPreference applies one of the three public modes to one
+// conversation (issue #136).
+//
+// The same shape muteConversation has — target from the path, actor from the
+// session, workspace resolved server-side — plus a strictly decoded one-field
+// body. decodeStrictJSON refuses an unknown field, and the closed set of modes
+// is checked by the service before anything is written, so an invalid or
+// creative payload is a 400 and never a partial write.
+//
+// A target the caller may not configure answers exactly as a target that does
+// not exist: the store returns the same non-enumerating refusal for "no such
+// conversation", "you cannot see it" and "that is the general channel, which
+// cannot be silenced".
+func (h *SidebarHandler) setNotificationPreference(
+	w http.ResponseWriter, r *http.Request, targetType, targetID, targetParam string,
+) {
+	prefs, ok := h.svc.(sidebarNotificationPrefProvider)
+	if h.svc == nil || !ok {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "sidebar not available")
+		return
+	}
+	if !validateTargetID(w, targetID, targetParam) {
+		return
+	}
+	userID := GetContextUserID(r)
+	if userID == "" {
+		httputil.WriteError(w, http.StatusUnauthorized, httputil.ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+	var body setNotificationPreferenceRequest
+	if !decodeStrictJSON(w, r, &body) {
+		return
+	}
+	if !service.ValidNotificationMode(body.Mode) {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "mode must be one of all, mentions_replies, muted")
+		return
+	}
+	if err := prefs.SetConversationNotificationPreference(
+		r.Context(), userID, targetType, targetID, body.Mode,
+	); err != nil {
 		mapServiceError(w, err)
 		return
 	}

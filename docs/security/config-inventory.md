@@ -128,6 +128,7 @@ inventario e do NChat, nao do console.
 
 | Variavel                                                                                           | Servico dono         | Impacto                                      |
 | -------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------- |
+| `CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED`                                                    | chat-service         | #136; gate de rollout do writer granular     |
 | `CHAT_LINK_SAFETY_ENABLED`                                                                         | chat-service         | RF-21; sem credencial o servico nao sobe     |
 | `CHAT_LINK_SAFETY_WORKSPACE_BUDGET`                                                                | chat-service         | Orcamento de URLs novas por janela           |
 | `CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS`                                                           | chat-service         | Janela do orcamento                          |

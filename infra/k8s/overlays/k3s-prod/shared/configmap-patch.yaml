@@ -122,4 +122,17 @@ data:
   CHAT_LINK_SAFETY_ENABLED: "false"
   FILE_LINK_SAFETY_ENABLED: "false"
 
+  # --- conversation notification levels (issue #136) ---------------------
+  # Written out for the same reason as the keys above: the application default
+  # is also false, so a missing key and a deliberate "no" would look identical.
+  #
+  # This one is a rollout gate, not a provider switch. Two release slots share
+  # one database, and a slot from before #136 reads any row of
+  # chat.conversation_notification_prefs as a mute — so a row saying "mentions
+  # and replies, not silenced" would silence that person on the old slot. The
+  # reader half ships first and understands the new shape; this opens the writer
+  # half, and only once no such reader is left. See
+  # docs/architecture/notification-policy.md, "Rollout".
+  CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED: "false"
+
   SMTP_WORKER_ENABLED: "true"

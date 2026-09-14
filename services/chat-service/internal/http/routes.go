@@ -15,6 +15,18 @@ const (
 	// SQL, not by omitting the route.
 	RouteChannelMute = "/api/chat/channels/{channelID}/mute"
 	RouteDMMute      = "/api/chat/dm/{conversationID}/mute"
+	// Issue #136 notification preference: the canonical surface for the whole
+	// per-conversation preference, where /mute above is the sidebar's shortcut
+	// for one dimension of it.
+	//
+	// PUT and not POST, because the request states the complete desired state of
+	// one named sub-resource rather than appending anything: sending the same
+	// body twice is the same preference, which is what the settings page needs
+	// when a user clicks around a select. The same prefixes and the same absence
+	// of a workspace segment as every other chat route — the workspace and the
+	// actor come from the session.
+	RouteChannelNotificationPreference = "/api/chat/channels/{channelID}/notification-preference"
+	RouteDMNotificationPreference      = "/api/chat/dm/{conversationID}/notification-preference"
 	// Issue #527 self-leave. DELETE on the actor's own membership, and the path
 	// names no user precisely because it cannot affect anyone else's: the actor
 	// is the session. The administrative removal of *another* member keeps its

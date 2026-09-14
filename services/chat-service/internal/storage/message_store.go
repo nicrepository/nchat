@@ -724,10 +724,22 @@ type quoteOptionals struct {
 // LEFT JOIN produced no row and every column came back COALESCEd. The three
 // instants are only meaningful once there is a quote, which is why they are
 // applied here rather than at scan time.
+//
+// It also records the canonical reply fact (issue #136), and this is the one
+// place that can: every projection that joins the parent reaches this helper, so
+// a reader answering somebody is recorded as such whether the row came from a
+// single read or from a listing. Before this helper existed the assignment lived
+// in one of the two scanners and not the other, which made the fact depend on
+// which query happened to produce the message.
 func (o *quoteOptionals) attach(msg *domain.Message, quote domain.QuotedMessage) {
 	if quote.ID == "" {
 		return
 	}
+	// Taken before any presentation rule touches the preview: the parent joined,
+	// so this message answers its author. Assigned outside the DTO on purpose —
+	// msg.Quoted is blanked for a removed message and withheld for a condemned
+	// body, and neither of those changes who was answered.
+	msg.ReplyToSenderID = quote.AuthorID
 	if o.deletedAt != nil {
 		quote.DeletedAt = *o.deletedAt
 	}

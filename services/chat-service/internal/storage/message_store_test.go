@@ -1553,6 +1553,59 @@ func TestPGXMessageStore_ListChannelMessages_JoinsQuotedParent(t *testing.T) {
 	checkExpectations(t, mock)
 }
 
+// The canonical reply fact is filled on every projection that joins the parent,
+// not only on the single-message read (issue #136).
+//
+// It is asserted on the listing specifically because that is the path where the
+// two used to disagree: the assignment lived in scanMessageWithSenderAndQuote
+// and not in the listing's collector, so whether a message "answered somebody"
+// depended on which query produced it. Both now go through quoteOptionals.attach
+// and there is one answer.
+//
+// ReplyToSenderID is the parent's author, and deliberately not read off
+// msg.Quoted: that preview is blanked for a removed parent and withheld for a
+// condemned body, and neither changes who was answered.
+func TestPGXMessageStore_ListChannelMessages_CarriesTheCanonicalReplyFact(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageRowWithQuote(
+				"msg-child", "ws-1", "ch-1", "", now,
+				quoteRow("msg-parent", "user-parent", "parent body", "v1", "active", nil, now),
+			)...).
+			AddRow(listMessageWithQuoteRow("msg-orphan", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows())
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	result, err := storage.NewPGXMessageStore(mock).ListChannelMessages(
+		context.Background(), storage.ListChannelMessagesInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+		})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	if len(result.Messages) != 2 {
+		t.Fatalf("listed %d messages, want 2", len(result.Messages))
+	}
+	// Addressed by id rather than by position: the listing owns its own order,
+	// and this test is about the fact each row carries, not about where it lands.
+	byID := map[string]domain.Message{}
+	for _, msg := range result.Messages {
+		byID[msg.ID] = msg
+	}
+	if got := byID["msg-child"].ReplyToSenderID; got != "user-parent" {
+		t.Fatalf("ReplyToSenderID = %q, want the parent's author", got)
+	}
+	// A message that quotes nothing answered nobody, and must not borrow another
+	// row's fact.
+	if got := byID["msg-orphan"].ReplyToSenderID; got != "" {
+		t.Fatalf("a message with no parent reported ReplyToSenderID = %q", got)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).

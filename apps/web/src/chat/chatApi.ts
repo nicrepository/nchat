@@ -25,6 +25,8 @@ import {
   type ChannelCategory,
   type ChannelDetails,
   type ChannelMemberProfile,
+  type ConversationNotificationLevel,
+  type ConversationNotificationMode,
   type GroupDetails,
   type GroupParticipantProfile,
   type DMCandidate,
@@ -69,6 +71,8 @@ interface SidebarChannelResponse {
   can_rename?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -96,6 +100,8 @@ interface SidebarDMResponse {
   unread_count?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
 }
 
 interface SidebarResponse {
@@ -110,6 +116,11 @@ interface SidebarResponse {
   };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
+  /**
+   * The issue #136 rollout gate, as the server reports it. Absent on a server
+   * that predates the field, which is read as "off" — the compatible answer.
+   */
+  conversation_notification_levels_enabled?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -227,11 +238,25 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     // the capabilities above: anything that is not an explicit `true` is "no".
     isGeneral: ch.is_general === true,
     muted: ch.muted === true,
+    notificationLevel: parseNotificationLevel(ch.notification_level),
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
   };
+}
+
+/**
+ * Reads the conversation notification level off the wire (issue #136).
+ *
+ * Only the one non-default value is recognised; everything else — absent, null,
+ * a level a newer server added, a string a proxy rewrote — becomes "all". That
+ * is the same strictness `muted` and `can_write` are parsed with, and it fails
+ * in the direction that keeps a conversation audible: a level this build cannot
+ * interpret must not silence anything.
+ */
+function parseNotificationLevel(value: unknown): ConversationNotificationLevel {
+  return value === "mentions_replies" ? "mentions_replies" : "all";
 }
 
 function isUnreadCount(value: unknown): value is number {
@@ -343,6 +368,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     muted: dm.muted === true,
+    notificationLevel: parseNotificationLevel(dm.notification_level),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
@@ -433,6 +459,9 @@ export async function fetchSidebarData(): Promise<{
   maxUploadBytes?: number | null;
   maxFiles?: number;
   maxBytes?: number;
+  // Optional in the signature for the same reason the limits above are: a
+  // caller with a partial fixture reads it as absent, and absent is "off".
+  notificationLevelsEnabled?: boolean;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -490,6 +519,12 @@ export async function fetchSidebarData(): Promise<{
       typeof rawMaxBytes === "number" && Number.isSafeInteger(rawMaxBytes) && rawMaxBytes > 0
         ? rawMaxBytes
         : Number.MAX_SAFE_INTEGER,
+    // Strict equality, like every other capability on this payload: anything
+    // that is not an explicit `true` — absent, null, a truthy string from a
+    // proxy that rewrote the response — is "off". The server re-derives the
+    // same answer on every write, so a client that got this wrong would only
+    // change which error it receives (issue #136).
+    notificationLevelsEnabled: sidebar.conversation_notification_levels_enabled === true,
     channels,
     dms,
     categories,
@@ -754,6 +789,38 @@ export async function setConversationMuted(
       ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/mute`
       : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/mute`;
   await authenticatedFetch(target, { method: muted ? "POST" : "DELETE" });
+}
+
+/**
+ * Sets the whole notification preference of one conversation (issue #136).
+ *
+ * The canonical surface, where the two `/mute` calls above are the sidebar's
+ * shortcut for one dimension of it. A per-user preference, so the request
+ * carries no user: the actor is the session and the workspace is resolved
+ * server-side.
+ *
+ * PUT with the complete desired state, so sending the same mode twice is the
+ * same preference — what a settings select needs when somebody clicks around.
+ * The server owns the translation into storage: this client never sends a level
+ * and a mute separately, and never learns that a mute is a timestamp.
+ *
+ * The general channel refuses `muted` server-side, in SQL; this client never
+ * decides that.
+ */
+export async function setConversationNotificationMode(
+  targetType: "channel" | "dm",
+  targetId: string,
+  mode: ConversationNotificationMode,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/notification-preference`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/notification-preference`;
+  await authenticatedFetch(target, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
 }
 
 /**

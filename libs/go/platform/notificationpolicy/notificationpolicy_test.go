@@ -132,6 +132,7 @@ var declaredReasons = []notificationpolicy.Reason{
 	notificationpolicy.ReasonSilentEventType,
 	notificationpolicy.ReasonConversationOpen,
 	notificationpolicy.ReasonMuted,
+	notificationpolicy.ReasonConversationLevel,
 	notificationpolicy.ReasonUserPreference,
 	notificationpolicy.ReasonUnsupportedChannel,
 	notificationpolicy.ReasonDuplicate,
@@ -216,7 +217,8 @@ func everyContext() []notificationpolicy.Context {
 			notificationevent.OriginLive, notificationevent.OriginImport, ""),
 		set(func(c *notificationpolicy.Context, v notificationevent.EventType) { c.EventType = v },
 			notificationevent.EventTypeDirectMessage, notificationevent.EventTypeMention,
-			notificationevent.EventTypeChannelMessage, notificationevent.EventTypeReaction),
+			notificationevent.EventTypeReply, notificationevent.EventTypeChannelMessage,
+			notificationevent.EventTypeReaction),
 		set(func(c *notificationpolicy.Context, v notificationpolicy.ConversationKind) { c.Conversation = v },
 			notificationpolicy.ConversationDirect, notificationpolicy.ConversationGroup,
 			notificationpolicy.ConversationChannel),
@@ -230,6 +232,11 @@ func everyContext() []notificationpolicy.Context {
 			notificationpolicy.SoundModeAll, notificationpolicy.SoundModeOff,
 			notificationpolicy.SoundModeMentionsAndDMs),
 		set(func(c *notificationpolicy.Context, v bool) { c.Preferences.Muted = v }, false, true),
+		set(func(c *notificationpolicy.Context, v notificationpolicy.ConversationLevel) {
+			c.Preferences.ConversationLevel = v
+		},
+			notificationpolicy.ConversationLevelAll,
+			notificationpolicy.ConversationLevelMentionsReplies, ""),
 		set(func(c *notificationpolicy.Context, v bool) { c.Preferences.Disabled = v }, false, true),
 		set(func(c *notificationpolicy.Context, v bool) { c.ConversationOpen = v }, false, true),
 		set(func(c *notificationpolicy.Context, v bool) { c.WebPushAvailable = v }, false, true),
@@ -301,12 +308,53 @@ func TestWorkScheduleOverridesEveryPersonalPreference(t *testing.T) {
 // TestPreferencesOnlyEverRemoveChannels proves the engine has no path that
 // re-enables anything: relaxing a preference can never take a channel away, so
 // tightening one can never grant it back.
+//
+// The relaxed preference is the most permissive one this contract has — every
+// message, nothing silenced, chime for anything — so the conversation level
+// added by issue #136 is covered by it: a level can only ever subtract.
 func TestPreferencesOnlyEverRemoveChannels(t *testing.T) {
 	for _, c := range everyContext() {
 		relaxed := c
-		relaxed.Preferences = notificationpolicy.Preferences{SoundMode: notificationpolicy.SoundModeAll}
+		relaxed.Preferences = notificationpolicy.Preferences{
+			SoundMode:         notificationpolicy.SoundModeAll,
+			ConversationLevel: notificationpolicy.ConversationLevelAll,
+		}
 		if grew := granted(notificationpolicy.Evaluate(c), notificationpolicy.Evaluate(relaxed)); grew != "" {
 			t.Fatalf("%+v: %s is denied with no preferences but allowed with them", c, grew)
+		}
+	}
+}
+
+// The same property stated for the one axis issue #136 adds, and stated the
+// other way round: narrowing a conversation to mentions and replies must only
+// ever take channels away, never hand one back.
+//
+// It is the guarantee that a personal preference cannot reopen a delivery a
+// corporate rule closed — the burst cooldown, the duplicate, the working-hours
+// window — and it is proved over the whole input space rather than by example.
+func TestTheConversationLevelOnlyEverRemovesChannels(t *testing.T) {
+	for _, c := range everyContext() {
+		narrowed := c
+		narrowed.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+		if grew := granted(notificationpolicy.Evaluate(narrowed), notificationpolicy.Evaluate(c)); grew != "" {
+			t.Fatalf("%+v: narrowing the conversation level granted %s", c, grew)
+		}
+	}
+}
+
+// A mute has precedence over the level, and the reason recorded says so: an
+// event suppressed by both is a mute, because that is the choice the recipient
+// made about the whole conversation.
+func TestMuteOutranksTheConversationLevel(t *testing.T) {
+	for _, c := range everyContext() {
+		c.Preferences.Muted = true
+		c.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+		decision := notificationpolicy.Evaluate(c)
+		if decision.Eligible() {
+			t.Fatalf("%+v: channels = %+v, want nothing for a muted conversation", c, decision.Channels)
+		}
+		if slices.Contains(decision.Reasons, notificationpolicy.ReasonConversationLevel) {
+			t.Fatalf("%+v: reasons = %v, want the mute to own the explanation", c, decision.Reasons)
 		}
 	}
 }

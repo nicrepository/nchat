@@ -54,8 +54,8 @@ func notificationPolicyFor(
 	if removed || msg.Kind != domain.MessageKindUser {
 		return notNotifiable(msg)
 	}
-	decision := notificationpolicy.Evaluate(realtimeContext(msg, recipient))
 	named, everyone := service.NamedRecipients(msg.BodyText)
+	decision := notificationpolicy.Evaluate(realtimeContext(msg, recipient, named, everyone))
 	inApp, sound, webPush := channelsOnTheWire(decision.Channels)
 	return &ws.NotificationPolicyPayload{
 		PolicyVersion: decision.PolicyVersion,
@@ -88,30 +88,38 @@ func notificationPolicyFor(
 //     an observed focus, which Connected is precisely the absence of. The
 //     browser applies "I am looking at this one" locally, and may only remove a
 //     surface by doing so.
-//   - RecipientID and Preferences.Muted are this recipient's own, resolved by
-//     the fan-out from chat.conversation_notification_prefs — the same source of
-//     truth the notification worker reads. Two members of one channel with
-//     opposite preferences get opposite decisions.
+//   - RecipientID, Preferences.Muted and Preferences.ConversationLevel are this
+//     recipient's own, resolved by the fan-out from
+//     chat.conversation_notification_prefs — the same source of truth the
+//     notification worker reads. Two members of one channel with opposite
+//     preferences get opposite decisions.
+//   - EventType is classified per recipient, because with a conversation level
+//     the answer depends on who is being told. The classification itself is
+//     service.NotificationEventTypeFor, which is where the storage suite can
+//     compare it against the outbox's own SQL for the same message.
 //   - Preferences.SoundMode is unset because no server-side source of truth
 //     exists for it: it lives in the browser (#136/#729), where it stays a local
 //     execution preference that can only take a permitted chime away.
 //   - WebPushAvailable is false. This is the in-app path; push is decided by
 //     notification-service against the outbox, and claiming it here would put a
 //     channel in a plan nothing on this path can deliver.
-func realtimeContext(msg domain.Message, recipient recipientFacts) notificationpolicy.Context {
+func realtimeContext(
+	msg domain.Message, recipient recipientFacts, named []string, everyone bool,
+) notificationpolicy.Context {
 	return notificationpolicy.Context{
 		EventID:      msg.ID,
 		WorkspaceID:  msg.WorkspaceID,
 		RecipientID:  recipient.id,
-		EventType:    eventTypeFor(msg),
+		EventType:    service.NotificationEventTypeFor(msg, recipient.id, named, everyone),
 		Priority:     notificationevent.PriorityNormal,
 		Origin:       notificationevent.OriginLive,
 		Conversation: conversationKindFor(msg),
 		WorkSchedule: workschedule.StateNotConfigured,
 		Presence:     notificationpolicy.PresenceConnected,
 		Preferences: notificationpolicy.Preferences{
-			Status: recipient.status,
-			Muted:  recipient.muted,
+			Status:            recipient.status,
+			Muted:             recipient.muted,
+			ConversationLevel: recipient.level,
 		},
 	}
 }
@@ -125,19 +133,13 @@ func realtimeContext(msg domain.Message, recipient recipientFacts) notificationp
 type recipientFacts struct {
 	id    string
 	muted bool
+	// level is this recipient's conversation level (issue #136). The zero value
+	// is the unset one, which the engine normalises to "every message" — the
+	// same answer the absence of a preference row means.
+	level notificationpolicy.ConversationLevel
 	// status is the engine's own answer to "were these readable at all". The
 	// zero value is resolved, so only a caller whose read failed says otherwise.
 	status notificationpolicy.PreferenceStatus
-}
-
-// eventTypeFor classifies the event from its target, which is the only
-// classification that is the same for every recipient. Priority and the mention
-// kind are per recipient and are not asserted here.
-func eventTypeFor(msg domain.Message) notificationevent.EventType {
-	if msg.ChannelID != "" {
-		return notificationevent.EventTypeChannelMessage
-	}
-	return notificationevent.EventTypeDirectMessage
 }
 
 // conversationKindFor reports where the event happened. A group reads as
@@ -226,18 +228,44 @@ type recipientPolicy struct {
 	prefs storage.NotificationPrefStore
 }
 
-// MutedUsers reports which of the given recipients silenced this target.
-func (p recipientPolicy) MutedUsers(
+// RecipientPreferences reports what each of the given recipients asked for
+// about this target.
+//
+// One statement for the whole list, and the collapse from the two stored columns
+// into the fan-out's single state happens here rather than in the store: the
+// store's job is to report what is persisted, and which of a level and a mute
+// wins is a rule — the one denyMuted and denyConversationLevel encode by their
+// order. Muted is therefore returned as muted whatever level it hides, which is
+// also what makes the restore work: the level is still in the row, untouched.
+func (p recipientPolicy) RecipientPreferences(
 	ctx context.Context, workspaceID string, targetType ws.TargetType, targetID string, userIDs []string,
-) ([]string, error) {
+) (map[string]ws.RecipientPreference, error) {
 	kind, ok := prefTargetKind(targetType)
 	if !ok {
-		// A target kind this preference table does not describe. Reporting
-		// nobody muted is the honest answer, not a failure: there is no
-		// preference for a target that cannot carry one.
+		// A target kind this preference table does not describe. Reporting that
+		// nobody expressed anything is the honest answer, not a failure: there
+		// is no preference for a target that cannot carry one.
 		return nil, nil
 	}
-	return p.prefs.FilterMutedUsers(ctx, workspaceID, kind, targetID, userIDs)
+	stored, err := p.prefs.PreferencesForUsers(ctx, workspaceID, kind, targetID, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	preferences := make(map[string]ws.RecipientPreference, len(stored))
+	for _, pref := range stored {
+		switch {
+		case pref.Muted:
+			preferences[pref.UserID] = ws.RecipientPreferenceMuted
+		case pref.Level == storage.NotificationLevelMentionsReplies:
+			preferences[pref.UserID] = ws.RecipientPreferenceMentionsReplies
+		default:
+			// A row that says nothing this build acts on — the default level,
+			// unsilenced. It is left out, which is the same thing the absence of
+			// a row means, so no decision changes because a row happens to exist.
+			continue
+		}
+	}
+	return preferences, nil
 }
 
 // PolicyFor is the central decision for one recipient, from the same engine and
@@ -263,6 +291,8 @@ func recipientFactsFrom(recipientID string, preference ws.RecipientPreference) r
 	switch preference {
 	case ws.RecipientPreferenceMuted:
 		facts.muted = true
+	case ws.RecipientPreferenceMentionsReplies:
+		facts.level = notificationpolicy.ConversationLevelMentionsReplies
 	case ws.RecipientPreferenceUnavailable:
 		facts.status = notificationpolicy.PreferenceStatusUnavailable
 	case ws.RecipientPreferenceNone:
@@ -292,7 +322,7 @@ func prefTargetKind(targetType ws.TargetType) (string, bool) {
 // second source for them. The body is carried because the naming codec reads it,
 // and it is the same body the payload already holds.
 func wsPayloadToDomainMessage(payload ws.MessagePayload) domain.Message {
-	return domain.Message{
+	message := domain.Message{
 		ID:               payload.ID,
 		WorkspaceID:      payload.WorkspaceID,
 		ChannelID:        payload.ChannelID,
@@ -300,7 +330,12 @@ func wsPayloadToDomainMessage(payload ws.MessagePayload) domain.Message {
 		SenderID:         payload.SenderID,
 		Kind:             domain.MessageKind(payload.Kind),
 		BodyText:         payload.BodyText,
+		// The canonical reply fact, not the preview beside it (issue #136).
+		// The preview is deliberately absent from this projection: nothing in
+		// the policy reads it, and carrying it would invite a later rule to.
+		ReplyToSenderID: payload.ReplyToSenderID,
 	}
+	return message
 }
 
 // withRecipientPolicyOption adds the per-recipient decision to the hub's

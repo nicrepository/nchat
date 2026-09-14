@@ -66,6 +66,11 @@ type Notification struct {
 	// because the policy does, and the policy is the only thing that may decide
 	// what a mute means.
 	Muted bool
+	// NotificationLevel is the other half of that preference (issue #136), from
+	// the same projection and carried for the same reason: the policy reads it,
+	// nothing here does, and the empty string is a recipient who expressed no
+	// level at all.
+	NotificationLevel string
 }
 
 // IdempotencyKey is what an adapter must present to a provider that supports
@@ -86,18 +91,19 @@ func (n Notification) IdempotencyKey() string { return n.ID }
 // notificationFrom converts a claimed row into what the ports are given.
 func notificationFrom(event storage.NotificationEvent) Notification {
 	return Notification{
-		ID:          event.ID,
-		WorkspaceID: event.WorkspaceID,
-		RecipientID: event.RecipientID,
-		EventType:   event.EventType,
-		Priority:    event.Priority,
-		SourceType:  event.SourceType,
-		SourceID:    event.SourceID,
-		Origin:      event.Origin,
-		DedupeKey:   event.DedupeKey,
-		Attempt:     event.Attempts,
-		OccurredAt:  event.OccurredAt,
-		Muted:       event.Muted,
+		ID:                event.ID,
+		WorkspaceID:       event.WorkspaceID,
+		RecipientID:       event.RecipientID,
+		EventType:         event.EventType,
+		Priority:          event.Priority,
+		SourceType:        event.SourceType,
+		SourceID:          event.SourceID,
+		Origin:            event.Origin,
+		DedupeKey:         event.DedupeKey,
+		Attempt:           event.Attempts,
+		OccurredAt:        event.OccurredAt,
+		Muted:             event.Muted,
+		NotificationLevel: event.NotificationLevel,
 	}
 }
 

@@ -15,7 +15,7 @@ const ME = "user-me";
 
 function policy(overrides: Partial<WSNotificationPolicy> = {}): WSNotificationPolicy {
   return {
-    policy_version: 1,
+    policy_version: 2,
     // Allowed on the realtime path today: the evaluation runs on the foreground
     // surface, which is exactly the one the toast and the chime live on.
     in_app: "allow",

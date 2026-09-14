@@ -264,7 +264,11 @@ func New(cfg config.Config) (*App, error) {
 			sidebarSvc = service.NewSidebarService(workspaceStore, channelStore, memberStore, dmStore).
 				WithPins(sidebarPinStore).
 				WithReadState(conversationReadStateStore).
-				WithNotificationPrefs(notificationPrefStore)
+				WithNotificationPrefs(notificationPrefStore).
+				// Issue #136's rollout gate. Off unless a deployment asks, and
+				// asked for in one place so the write path and the capability
+				// the payload publishes cannot disagree.
+				WithConversationNotificationLevels(cfg.ConversationNotificationLevelsEnabled)
 			messageSvc = service.NewMessageService(channelStore, dmStore, messages).
 				WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
 			// RF-21. Wired here, where the message service exists, and fatal:
@@ -971,10 +975,14 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		EditedAt:                editedAt,
 		DeletedAt:               deletedAt,
 		Quoted:                  quoted,
-		Attachments:             attachments,
-		IsForwarded:             msg.ForwardedFromMessageID != "",
-		NotificationPolicy:      notificationPolicyFor(msg, removed, recipientFacts{}),
-		HasReference:            msg.ReferencedMessageID != "",
+		// Carried whatever `removed` did to the preview above: who was answered
+		// is not a presentation detail, and a deleted message still answered
+		// somebody (issue #136).
+		ReplyToSenderID:    msg.ReplyToSenderID,
+		Attachments:        attachments,
+		IsForwarded:        msg.ForwardedFromMessageID != "",
+		NotificationPolicy: notificationPolicyFor(msg, removed, recipientFacts{}),
+		HasReference:       msg.ReferencedMessageID != "",
 	}
 }
 
