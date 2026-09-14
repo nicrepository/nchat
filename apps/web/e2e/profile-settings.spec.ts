@@ -379,9 +379,23 @@ async function mockSessionsApi(page: Page, initial: MockSession[]) {
   };
 }
 
-function sessionRow(page: Page, userAgent: string) {
-  return page.getByTestId("session-row").filter({ hasText: userAgent });
+/**
+ * Rows are addressed by the friendly browser label the UI derives from the
+ * User-Agent (issue #854), not by the raw string, which is no longer shown.
+ */
+function sessionRow(page: Page, browserLabel: string) {
+  return page.getByTestId("session-row").filter({ hasText: browserLabel });
 }
+
+const UA = {
+  firefoxLinux: "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
+  chromeWindows:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+  safariIphone:
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Mobile/15E148 Safari/604.1",
+  edgeWindows:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0",
+} as const;
 
 test.describe("Profile & account settings (#672)", () => {
   test.beforeEach(async ({ page }) => {
@@ -888,23 +902,21 @@ test.describe("Profile & account settings (#672)", () => {
     page,
   }) => {
     await mockSessionsApi(page, [
-      makeSession({ id: "current", current: true, user_agent: "Firefox on Linux" }),
-      makeSession({ id: "s2", user_agent: "Chrome on Windows" }),
-      makeSession({ id: "s3", user_agent: "Safari on iPhone" }),
+      makeSession({ id: "current", current: true, user_agent: UA.firefoxLinux }),
+      makeSession({ id: "s2", user_agent: UA.chromeWindows }),
+      makeSession({ id: "s3", user_agent: UA.safariIphone }),
     ]);
     await page.goto("/profile/sessions");
     await expect(page.getByTestId("session-row")).toHaveCount(3);
     await expect(page.getByText("Sessão atual")).toHaveCount(1);
 
-    await sessionRow(page, "Chrome on Windows")
-      .getByRole("button", { name: "Revogar sessão" })
-      .click();
+    await sessionRow(page, "Chrome 152").getByRole("button", { name: "Revogar sessão" }).click();
     const revokeOneDialog = page.getByRole("dialog", { name: "Revogar sessão?" });
     await expect(revokeOneDialog).toBeVisible();
     await revokeOneDialog.getByRole("button", { name: "Revogar sessão" }).click();
     await expect(revokeOneDialog).toBeHidden();
     await expect(page.getByTestId("session-row")).toHaveCount(2);
-    await expect(sessionRow(page, "Chrome on Windows")).toHaveCount(0);
+    await expect(sessionRow(page, "Chrome 152")).toHaveCount(0);
 
     await page.getByRole("button", { name: "Revogar todas as outras" }).click();
     const revokeAllDialog = page.getByRole("dialog", { name: "Revogar outras sessões?" });
@@ -924,7 +936,7 @@ test.describe("Profile & account settings (#672)", () => {
     const currentSession = makeSession({
       id: "session-current",
       current: true,
-      user_agent: "Firefox after refresh",
+      user_agent: UA.firefoxLinux,
     });
 
     await page.route("**/api/auth/refresh", async (route) => {
@@ -969,7 +981,7 @@ test.describe("Profile & account settings (#672)", () => {
 
     await page.goto("/profile/sessions");
 
-    await expect(sessionRow(page, "Firefox after refresh")).toBeVisible();
+    await expect(sessionRow(page, "Firefox 142")).toBeVisible();
     await expect(page.getByText("Sessão atual")).toBeVisible();
     await expect(page.getByText("Não foi possível carregar suas sessões.")).toHaveCount(0);
     expect(sequence).toEqual(["sessions 401", "refresh 200", "sessions 200"]);
@@ -979,21 +991,21 @@ test.describe("Profile & account settings (#672)", () => {
     page,
   }) => {
     const sessionState = await mockSessionsApi(page, [
-      makeSession({ id: "current", current: true, user_agent: "Firefox on Linux" }),
-      makeSession({ id: "stale-session-id", user_agent: "Dispositivo antigo" }),
+      makeSession({ id: "current", current: true, user_agent: UA.firefoxLinux }),
+      makeSession({ id: "stale-session-id", user_agent: UA.edgeWindows }),
     ]);
     await page.goto("/profile/sessions");
-    await expect(sessionRow(page, "Dispositivo antigo")).toBeVisible();
+    await expect(sessionRow(page, "Microsoft Edge 153")).toBeVisible();
 
     sessionState.remove("stale-session-id");
-    await sessionRow(page, "Dispositivo antigo")
+    await sessionRow(page, "Microsoft Edge 153")
       .getByRole("button", { name: "Revogar sessão" })
       .click();
     const dialog = page.getByRole("dialog", { name: "Revogar sessão?" });
     await dialog.getByRole("button", { name: "Revogar sessão" }).click();
 
     await expect(dialog).toBeHidden();
-    await expect(sessionRow(page, "Dispositivo antigo")).toHaveCount(0);
+    await expect(sessionRow(page, "Microsoft Edge 153")).toHaveCount(0);
     await expect(page.getByTestId("session-row")).toHaveCount(1);
   });
 

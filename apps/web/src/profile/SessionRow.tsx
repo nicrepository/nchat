@@ -7,6 +7,7 @@
 
 import "./SessionRow.css";
 import type { Session } from "./sessionsApi";
+import { describeUserAgent } from "./userAgentLabel";
 
 export default function SessionRow({
   session,
@@ -15,10 +16,12 @@ export default function SessionRow({
   session: Session;
   onRevoke: (id: string) => void;
 }) {
+  const { browser, platform } = describeUserAgent(session.userAgent);
   return (
     <li className="session-row" data-testid="session-row">
       <div className="session-row__info">
-        <p className="session-row__agent">{session.userAgent || "Dispositivo desconhecido"}</p>
+        <p className="session-row__agent">{browser}</p>
+        {platform && <p className="session-row__platform">{platform}</p>}
         <p className="session-row__meta">
           {session.ipAddress && (
             <span>
