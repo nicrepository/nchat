@@ -55,6 +55,8 @@ import {
   searchDMCandidates,
   searchGroupParticipantCandidates,
   renameChannel,
+  setConversationMuted,
+  setConversationNotificationMode,
   setSidebarConversationPinned,
   unfavoriteMessage,
   unpinMessage,
@@ -349,6 +351,10 @@ describe("fetchChannels", () => {
       // mute and leave (issue #527).
       isGeneral: true,
       muted: false,
+      // The level half of the preference (issue #136). Absent from the
+      // payload, and absent is read as the product default rather than as a
+      // level nothing can interpret.
+      notificationLevel: "all",
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -362,6 +368,10 @@ describe("fetchChannels", () => {
       canRename: false,
       isGeneral: false,
       muted: false,
+      // The level half of the preference (issue #136). Absent from the
+      // payload, and absent is read as the product default rather than as a
+      // level nothing can interpret.
+      notificationLevel: "all",
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -474,6 +484,10 @@ describe("fetchDMs", () => {
       name: "Juliane Lino",
       participants: [],
       muted: false,
+      // The level half of the preference (issue #136). Absent from the
+      // payload, and absent is read as the product default rather than as a
+      // level nothing can interpret.
+      notificationLevel: "all",
       createdAt: null,
       lastMessageAt: null,
     });
@@ -753,6 +767,10 @@ describe("fetchSidebarData", () => {
       canRename: false,
       isGeneral: true,
       muted: false,
+      // The level half of the preference (issue #136). Absent from the
+      // payload, and absent is read as the product default rather than as a
+      // level nothing can interpret.
+      notificationLevel: "all",
       createdAt: null,
       lastMessageAt: null,
       categoryId: undefined,
@@ -765,6 +783,10 @@ describe("fetchSidebarData", () => {
       name: "Juliane",
       participants: [],
       muted: false,
+      // The level half of the preference (issue #136). Absent from the
+      // payload, and absent is read as the product default rather than as a
+      // level nothing can interpret.
+      notificationLevel: "all",
       createdAt: null,
       lastMessageAt: null,
     });
@@ -1238,6 +1260,9 @@ describe("partial sidebar compatibility", () => {
       maxUploadBytes: null,
       maxFiles: 1,
       maxBytes: Number.MAX_SAFE_INTEGER,
+      // The issue #136 capability: absent from the payload, so the gate reads
+      // as shut and the settings page offers the binary control.
+      notificationLevelsEnabled: false,
       channels: [],
       dms: [],
       categories: [],
@@ -2692,6 +2717,7 @@ describe("fetchSidebarData", () => {
         maxUploadBytes: null,
         maxFiles: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
+        notificationLevelsEnabled: false,
         channels: [],
         dms: [],
         categories: [],
@@ -2707,6 +2733,9 @@ describe("fetchSidebarData", () => {
       maxUploadBytes: null,
       maxFiles: 1,
       maxBytes: Number.MAX_SAFE_INTEGER,
+      // The issue #136 capability: absent from the payload, so the gate reads
+      // as shut and the settings page offers the binary control.
+      notificationLevelsEnabled: false,
       channels: [],
       dms: [],
       categories: [],
@@ -3585,5 +3614,162 @@ describe("fetchSidebarData attachment limits", () => {
       maxFiles: 1,
       maxBytes: Number.MAX_SAFE_INTEGER,
     });
+  });
+});
+
+describe("conversation notification preference (issue #136)", () => {
+  it("PUTs the mode to the channel's own canonical path, with no actor in the body", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await setConversationNotificationMode("channel", "ch 1", "mentions_replies");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/chat/channels/ch%201/notification-preference",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "mentions_replies" }),
+      },
+    );
+  });
+
+  it("PUTs a group or DM to the dm prefix", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await setConversationNotificationMode("dm", "dm-1", "muted");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/dm-1/notification-preference", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "muted" }),
+    });
+  });
+
+  it("carries only the mode, so nothing in the request could name a user or a workspace", async () => {
+    for (const mode of ["all", "mentions_replies", "muted"] as const) {
+      mockAuthFetch.mockResolvedValueOnce(undefined);
+      await setConversationNotificationMode("channel", "ch-1", mode);
+      const [, init] = mockAuthFetch.mock.calls.at(-1) as [string, RequestInit];
+      expect(JSON.parse(String(init.body))).toEqual({ mode });
+    }
+  });
+
+  it("leaves the mute shortcut on its own endpoint and its own verbs", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    await setConversationMuted("channel", "ch-1", true);
+    expect(mockAuthFetch).toHaveBeenLastCalledWith("/api/chat/channels/ch-1/mute", {
+      method: "POST",
+    });
+
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    await setConversationMuted("dm", "dm-1", false);
+    expect(mockAuthFetch).toHaveBeenLastCalledWith("/api/chat/dm/dm-1/mute", { method: "DELETE" });
+  });
+
+  it("propagates a refusal instead of reporting a write that did not happen", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(
+      setConversationNotificationMode("channel", "ch-1", "muted"),
+    ).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("sidebar notification level parsing (issue #136)", () => {
+  function sidebarPayload(level: unknown, muted: unknown) {
+    return {
+      data: {
+        current_user_id: "u1",
+        workspace: { id: "w1", name: "W", slug: "w" },
+        channels: [
+          {
+            id: "ch-1",
+            slug: "geral",
+            display_name: "geral",
+            type: "public",
+            is_general: true,
+            can_write: true,
+            muted,
+            notification_level: level,
+          },
+        ],
+        dm_conversations: [
+          { id: "dm-1", type: "direct", name: "Juliane", muted, notification_level: level },
+        ],
+      },
+    };
+  }
+
+  it("reads the one non-default level off the wire, for both target kinds", async () => {
+    mockAuthFetch.mockResolvedValueOnce(sidebarPayload("mentions_replies", false));
+
+    const channels = await fetchChannels();
+    expect(channels[0]?.notificationLevel).toBe("mentions_replies");
+
+    mockAuthFetch.mockResolvedValueOnce(sidebarPayload("mentions_replies", false));
+    const dms = await fetchDMs();
+    expect(dms[0]?.notificationLevel).toBe("mentions_replies");
+  });
+
+  it("reads the two dimensions independently, so a mute never overwrites the level", async () => {
+    mockAuthFetch.mockResolvedValueOnce(sidebarPayload("mentions_replies", true));
+
+    const channels = await fetchChannels();
+    expect(channels[0]?.muted).toBe(true);
+    // Both travel, which is what lets a later unmute show the level again
+    // without a round trip.
+    expect(channels[0]?.notificationLevel).toBe("mentions_replies");
+  });
+
+  it("reads anything it cannot interpret as the default, never as silence", async () => {
+    for (const level of [
+      undefined,
+      null,
+      "",
+      "mentions_only",
+      "MENTIONS_REPLIES",
+      42,
+      { level: "mentions_replies" },
+    ]) {
+      mockAuthFetch.mockResolvedValueOnce(sidebarPayload(level, false));
+      const channels = await fetchChannels();
+      expect(channels[0]?.notificationLevel).toBe("all");
+      expect(channels[0]?.muted).toBe(false);
+    }
+  });
+});
+
+describe("sidebar notification-level capability (issue #136)", () => {
+  function payload(capability: unknown) {
+    const body: Record<string, unknown> = {
+      current_user_id: "u1",
+      workspace: { id: "w1", name: "W", slug: "w" },
+      channels: [],
+      dm_conversations: [],
+    };
+    if (capability !== "absent") {
+      body.conversation_notification_levels_enabled = capability;
+    }
+    return { data: body };
+  }
+
+  async function capabilityFor(capability: unknown) {
+    mockAuthFetch.mockResolvedValueOnce(payload(capability));
+    mockAuthFetch.mockResolvedValueOnce({ data: { groups: [] } });
+    const { notificationLevelsEnabled } = await fetchSidebarData();
+    return notificationLevelsEnabled;
+  }
+
+  it("reads an explicit true as the gate being open", async () => {
+    expect(await capabilityFor(true)).toBe(true);
+  });
+
+  // Strict equality, like every other capability on this payload. Anything that
+  // is not an explicit `true` is "off", which is the compatible control rather
+  // than an offer the server would refuse with a 503.
+  it("reads anything else as the gate being shut", async () => {
+    for (const capability of ["absent", false, null, "true", 1, {}]) {
+      expect(await capabilityFor(capability)).toBe(false);
+    }
   });
 });

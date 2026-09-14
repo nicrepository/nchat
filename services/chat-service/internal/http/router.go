@@ -158,6 +158,16 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("DELETE "+RouteDMMute, authMiddleware(
 		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.UnmuteDM)),
 	))
+	// The canonical whole-preference write (issue #136) shares the pin-action
+	// budget with the mute shortcut above, deliberately: they change the same
+	// row, so giving the newer route its own budget would only mean a caller
+	// could spend twice as much by alternating between them.
+	mux.Handle("PUT "+RouteChannelNotificationPreference, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.SetChannelNotificationPreference)),
+	))
+	mux.Handle("PUT "+RouteDMNotificationPreference, authMiddleware(
+		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.SetDMNotificationPreference)),
+	))
 	mux.Handle("POST "+RouteChannelRead, authMiddleware(
 		pinActionLimiter.Middleware(http.HandlerFunc(sidebar.MarkChannelRead)),
 	))

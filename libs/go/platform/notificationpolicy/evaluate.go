@@ -104,7 +104,8 @@ type rule struct {
 //
 //	corporate policy      outside working hours
 //	event and context     historical origin, silent event type, open conversation
-//	personal preference   unreadable preferences, muted conversation, globals
+//	personal preference   unreadable preferences, muted conversation,
+//	                      conversation level, globals
 //	channel availability  no usable push subscription
 //	coordinator state     already delivered, inside a burst cooldown
 //
@@ -119,6 +120,7 @@ var rules = []rule{
 	{ReasonConversationOpen, denyConversationOpen},
 	{ReasonPreferencesUnavailable, denyUnresolvedPreferences},
 	{ReasonMuted, denyMuted},
+	{ReasonConversationLevel, denyConversationLevel},
 	{ReasonUserPreference, denyUserPreference},
 	{ReasonUnsupportedChannel, denyUnavailablePush},
 	{ReasonDuplicate, denyDuplicate},
@@ -228,6 +230,49 @@ func denyMuted(c Context) channelSet {
 		return setAll
 	}
 	return 0
+}
+
+// denyConversationLevel applies the recipient's per-conversation level: with
+// mentions_replies, an ordinary message in that conversation does not interrupt
+// (issue #136).
+//
+// It reads the event type the producer already classified server-side. There is
+// no body inspection here and none anywhere else in the path: "was this person
+// named" and "does this answer something they wrote" are decided where the
+// message is written — chat.notification_outbox's kind column, and the
+// per-recipient classification the realtime fan-out derives from the same facts
+// — so this rule only applies an answer it was handed.
+//
+// The two plain-message kinds are named explicitly rather than mention and
+// reply being excluded from everything else, and the difference matters for the
+// kinds that are neither:
+//
+//	channel_message, direct_message  an ordinary message. Suppressed.
+//	mention, reply                   what this level exists to keep. Allowed.
+//	reaction                         already suppressed outright, by
+//	                                 denySilentEventType.
+//	call                             not a message. A conversation level is a
+//	                                 statement about which messages are worth
+//	                                 an interruption, and reading it as "do not
+//	                                 ring me" would silence something the
+//	                                 recipient never asked to silence. Muting
+//	                                 the conversation still does.
+//
+// An event kind a later release adds is therefore allowed rather than silently
+// suppressed, which is the same direction ConversationLevel.Effective takes for
+// an unrecognised level: this is a preference, and guessing must not invent
+// silence. Mute — the rule above this one, and the one people reach for when
+// they want everything to stop — is where the opposite direction lives.
+func denyConversationLevel(c Context) channelSet {
+	if c.Preferences.ConversationLevel.Effective() != ConversationLevelMentionsReplies {
+		return 0
+	}
+	switch c.EventType {
+	case notificationevent.EventTypeChannelMessage, notificationevent.EventTypeDirectMessage:
+		return setAll
+	default:
+		return 0
+	}
 }
 
 // denyUserPreference applies the recipient's global preferences: the off

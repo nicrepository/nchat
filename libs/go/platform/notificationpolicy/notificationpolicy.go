@@ -70,7 +70,13 @@ import (
 // choose the policy version could choose a lenient one, and an audit record
 // naming a version the caller supplied proves nothing about what actually ran.
 // It changes when the outcome of an unchanged Context could change.
-const Version = 1
+//
+//	1  issue #744: the original rule set.
+//	2  issue #136: denyConversationLevel joined the rules. A Context carrying
+//	   ConversationLevelMentionsReplies and an ordinary message now produces a
+//	   suppression where version 1 produced a delivery, so an audit record from
+//	   before this change must not be read as though these rules decided it.
+const Version = 2
 
 // ConversationKind is the kind of conversation the event happened in.
 //
@@ -218,6 +224,64 @@ func (m SoundMode) Effective() SoundMode {
 	return SoundModeAll
 }
 
+// ConversationLevel is which events of one conversation the recipient wants to
+// be alerted about (issue #136).
+//
+// It is a separate axis from the mute, and keeping the two apart is the whole
+// point of the pair. A mute is "silence this for now"; a level is "this is what
+// I care about here". Silencing a conversation from the sidebar and then turning
+// it back on has to restore the level the person had chosen, which one
+// destructive enum holding all three states could not do. The storage mirrors
+// that — chat.conversation_notification_prefs holds notification_level and
+// muted_at as two columns — and so does this struct.
+//
+// Two values in this release. A third — mentions only, without replies — is an
+// ordinary addition here and in the CHECK constraint behind it, which is one
+// reason neither is an enum type.
+type ConversationLevel string
+
+const (
+	// ConversationLevelAll alerts for anything that happens in the conversation.
+	// It is the product default, and the state the absence of a preference row
+	// means.
+	ConversationLevelAll ConversationLevel = "all"
+	// ConversationLevelMentionsReplies alerts only when the recipient was named
+	// or answered. An ordinary message in the conversation is still delivered,
+	// still stored and still counted unread — it just does not interrupt.
+	ConversationLevelMentionsReplies ConversationLevel = "mentions_replies"
+)
+
+var conversationLevels = map[ConversationLevel]struct{}{
+	ConversationLevelAll:             {},
+	ConversationLevelMentionsReplies: {},
+}
+
+// Valid reports whether l is one of the declared levels. The zero value is the
+// empty string and is not one of them; see Effective for why that is not an
+// error.
+func (l ConversationLevel) Valid() bool {
+	_, ok := conversationLevels[l]
+	return ok
+}
+
+// Effective normalises a level into a value safe to decide with.
+//
+// The zero value is the common case and not an error: the absence of a
+// preference row is how this product records "all messages, not muted", so most
+// contexts carry no level at all. A value this build does not recognise gets the
+// same answer, exactly like SoundMode.Effective — a level is a preference and
+// not a permission, so an unreadable one falls back to the product default
+// rather than silencing a conversation nobody asked to silence.
+//
+// The fail-closed direction, for a read that did not happen at all, is a
+// different field: Preferences.Status, applied by denyUnresolvedPreferences.
+func (l ConversationLevel) Effective() ConversationLevel {
+	if l.Valid() {
+		return l
+	}
+	return ConversationLevelAll
+}
+
 // PreferenceStatus says whether a recipient's own preferences were readable.
 //
 // Two states, and the distinction between them is the whole point:
@@ -277,6 +341,14 @@ type Preferences struct {
 	// silences alerts and nothing else — a muted conversation still counts
 	// unread, which this engine does not touch.
 	Muted bool
+	// ConversationLevel is which events of this one conversation the recipient
+	// wants alerts for (issue #136).
+	//
+	// Read independently of Muted, and Muted wins: the two rules that consume
+	// this pair are denyMuted and denyConversationLevel, in that order. The zero
+	// value is ConversationLevelAll, which is what the absence of a preference
+	// row means.
+	ConversationLevel ConversationLevel
 	// SoundMode is the global chime preference. See Effective for the unset and
 	// unrecognised cases.
 	SoundMode SoundMode
@@ -377,6 +449,15 @@ const (
 	ReasonPreferencesUnavailable Reason = "preferences_unavailable"
 	// ReasonMuted is this conversation silenced by this recipient.
 	ReasonMuted Reason = "muted"
+	// ReasonConversationLevel is an event this recipient does not want alerts
+	// for in this conversation — an ordinary message, where they asked to hear
+	// only about mentions and replies (issue #136).
+	//
+	// Its own code rather than ReasonUserPreference, which is the *global*
+	// preference: an operator reading this months later is being told the
+	// recipient narrowed this one conversation, not that they turned something
+	// off everywhere.
+	ReasonConversationLevel Reason = "conversation_level"
 	// ReasonUserPreference is a global preference of the recipient.
 	ReasonUserPreference Reason = "user_preference"
 	// ReasonUnsupportedChannel is a channel that cannot be attempted at all.

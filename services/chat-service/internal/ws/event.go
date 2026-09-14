@@ -336,7 +336,22 @@ type MessagePayload struct {
 	EditedAt        *time.Time    `json:"edited_at,omitempty"`
 	DeletedAt       *time.Time    `json:"deleted_at,omitempty"`
 	Quoted          *QuotePayload `json:"quoted,omitempty"`
-	IsForwarded     bool          `json:"is_forwarded"`
+	// ReplyToSenderID is the author of the message this one answers, as the
+	// server read it from the persisted parent (issue #136).
+	//
+	// It is carried beside Quoted rather than taken from it because the two are
+	// different kinds of thing: Quoted is the preview a reader is allowed to
+	// see, and this is the fact a delivery decision is made from.
+	// RecipientPolicy.PolicyFor reads it to tell "this answers you" from "this
+	// was posted here", which is what a conversation level turns on — so a
+	// payload that inferred it from the preview would lose the classification
+	// for exactly the messages whose preview is withheld.
+	//
+	// It grants nothing and identifies nobody a subscriber is not already
+	// reading messages beside. Omitted for the overwhelming majority of
+	// messages, which answer nothing.
+	ReplyToSenderID string `json:"reply_to_sender_id,omitempty"`
+	IsForwarded     bool   `json:"is_forwarded"`
 	// Attachments lets a subscriber render a message that carries a file without
 	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
 	// metadata the list endpoints publish and grants nothing: content and preview

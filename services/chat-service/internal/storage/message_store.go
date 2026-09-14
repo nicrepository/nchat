@@ -720,6 +720,12 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		msg.DeletedAt = *deletedAt
 	}
 	if quote.ID != "" {
+		// The canonical reply fact, taken before any presentation rule touches
+		// the preview: the parent joined, so this message answers its author
+		// (issue #136). Assigned outside the DTO on purpose — msg.Quoted is
+		// blanked for a removed message and withheld for a condemned body, and
+		// neither of those changes who was answered.
+		msg.ReplyToSenderID = quote.AuthorID
 		if quoteDeletedAt != nil {
 			quote.DeletedAt = *quoteDeletedAt
 		}

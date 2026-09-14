@@ -6,36 +6,44 @@ import (
 	"errors"
 	"slices"
 	"testing"
+
+	"github.com/nicrepository/nchat/libs/go/platform/notificationpolicy"
 )
 
 // Issue #744, review round 6: the fan-out is where a recipient exists, so it is
 // where the decision is personalised. What is proved here is the delivery, not
 // the rule — the rule belongs to libs/go/platform/notificationpolicy.
 
-// fakeRecipientPolicy answers from a fixed muted set and denies every surface
-// for a muted recipient, which is the shape the real engine produces. It
-// restates no rule: the test asserts routing, not policy.
+// fakeRecipientPolicy answers from a fixed set of expressed preferences and
+// denies the surfaces the real engine would for each of them. It restates no
+// rule: the test asserts routing, not policy.
 type fakeRecipientPolicy struct {
 	muted map[string]bool
-	err   error
-	calls int
+	// mentionsReplies are the recipients who asked to hear only about mentions
+	// and replies here (issue #136).
+	mentionsReplies map[string]bool
+	err             error
+	calls           int
 	// asked is the recipient list the fan-out resolved, exactly as it was
 	// handed over: deduplicated and in first-seen order.
 	asked []string
 }
 
-func (f *fakeRecipientPolicy) MutedUsers(
+func (f *fakeRecipientPolicy) RecipientPreferences(
 	_ context.Context, _ string, _ TargetType, _ string, userIDs []string,
-) ([]string, error) {
+) (map[string]RecipientPreference, error) {
 	f.calls++
 	f.asked = append([]string(nil), userIDs...)
 	if f.err != nil {
 		return nil, f.err
 	}
-	var out []string
+	out := map[string]RecipientPreference{}
 	for _, id := range userIDs {
-		if f.muted[id] {
-			out = append(out, id)
+		switch {
+		case f.muted[id]:
+			out[id] = RecipientPreferenceMuted
+		case f.mentionsReplies[id]:
+			out[id] = RecipientPreferenceMentionsReplies
 		}
 	}
 	return out, nil
@@ -47,13 +55,19 @@ func (f *fakeRecipientPolicy) PolicyFor(
 	_ MessagePayload, _ string, preference RecipientPreference,
 ) *NotificationPolicyPayload {
 	decision := &NotificationPolicyPayload{
-		PolicyVersion: 1, InApp: NotificationAllow, Sound: NotificationAllow,
+		PolicyVersion: notificationpolicy.Version, InApp: NotificationAllow, Sound: NotificationAllow,
 		WebPush: NotificationDeny, SoundClass: SoundClassGeneral,
 	}
 	switch preference {
 	case RecipientPreferenceMuted:
 		decision.InApp, decision.Sound = NotificationDeny, NotificationDeny
 		decision.Reasons = []string{"muted"}
+	case RecipientPreferenceMentionsReplies:
+		// The fixture's message is an ordinary channel message, which is what
+		// this level takes away. A mention or a reply would keep its surfaces,
+		// and that decision belongs to the engine, not here.
+		decision.InApp, decision.Sound = NotificationDeny, NotificationDeny
+		decision.Reasons = []string{"conversation_level"}
 	case RecipientPreferenceUnavailable:
 		decision.InApp, decision.Sound = NotificationDeny, NotificationDeny
 		decision.WebPush = NotificationDeny
@@ -70,7 +84,7 @@ func broadcastFixture(t *testing.T, policy RecipientPolicy) (*Hub, broadcastReq)
 		ID: "msg-1", WorkspaceID: "ws-1", ChannelID: "chan-1", Kind: "user",
 		BodyText: "hello",
 		NotificationPolicy: &NotificationPolicyPayload{
-			PolicyVersion: 1, InApp: NotificationAllow, Sound: NotificationAllow,
+			PolicyVersion: notificationpolicy.Version, InApp: NotificationAllow, Sound: NotificationAllow,
 			WebPush: NotificationDeny, SoundClass: SoundClassGeneral,
 		},
 	}
@@ -359,7 +373,7 @@ func TestRouteOnlyEventsAreNotPersonalised(t *testing.T) {
 func TestSamePolicyComparesTheWholeDecision(t *testing.T) {
 	base := func() *NotificationPolicyPayload {
 		return &NotificationPolicyPayload{
-			PolicyVersion: 1, InApp: NotificationAllow, Sound: NotificationAllow,
+			PolicyVersion: notificationpolicy.Version, InApp: NotificationAllow, Sound: NotificationAllow,
 			WebPush: NotificationDeny, SoundClass: SoundClassGeneral,
 			Reasons: []string{"muted"}, NamedUserIDs: []string{"user-1"},
 		}
@@ -377,7 +391,9 @@ func TestSamePolicyComparesTheWholeDecision(t *testing.T) {
 		func(p *NotificationPolicyPayload) { p.InApp = NotificationDeny },
 		func(p *NotificationPolicyPayload) { p.Sound = NotificationDeny },
 		func(p *NotificationPolicyPayload) { p.WebPush = NotificationAllow },
-		func(p *NotificationPolicyPayload) { p.PolicyVersion = 2 },
+		// Any version but the one the base carries: pinning a literal here
+		// stopped being a difference the moment the engine's version reached it.
+		func(p *NotificationPolicyPayload) { p.PolicyVersion = notificationpolicy.Version + 1 },
 		func(p *NotificationPolicyPayload) { p.SoundClass = SoundClassDirect },
 		func(p *NotificationPolicyPayload) { p.Reasons = []string{"outside_work_hours"} },
 		func(p *NotificationPolicyPayload) { p.NamedUserIDs = nil },

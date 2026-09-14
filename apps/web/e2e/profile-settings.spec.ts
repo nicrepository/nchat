@@ -109,6 +109,8 @@ interface MockSidebarChannel {
   can_write: boolean;
   is_general?: boolean;
   muted?: boolean;
+  /** The level half of the preference (issue #136), independent of `muted`. */
+  notification_level?: MockNotificationLevel;
 }
 
 interface MockSidebarDM {
@@ -117,11 +119,26 @@ interface MockSidebarDM {
   type: "direct" | "group";
   name: string;
   muted?: boolean;
+  notification_level?: MockNotificationLevel;
 }
+
+type MockNotificationLevel = "all" | "mentions_replies";
+type MockNotificationMode = MockNotificationLevel | "muted";
 
 async function mockChatSidebarApi(
   page: Page,
-  conversations: { channels?: MockSidebarChannel[]; dms?: MockSidebarDM[] } = {},
+  conversations: {
+    channels?: MockSidebarChannel[];
+    dms?: MockSidebarDM[];
+    /**
+     * The issue #136 rollout gate, as the server publishes it on this payload.
+     *
+     * Defaulted to `true` so the scenarios below exercise the granular control.
+     * Production defaults to `false`; the gated scenario at the end of this
+     * block covers what the page renders then.
+     */
+    notificationLevelsEnabled?: boolean;
+  } = {},
 ) {
   // Mutable so the refetch that follows a confirmed mute returns what the
   // server now holds — which is what makes "reload and it is still there" a
@@ -137,6 +154,7 @@ async function mockChatSidebarApi(
         data: {
           current_user_id: CURRENT_USER_ID,
           workspace: { id: "e2e-workspace", name: "E2E", slug: "e2e" },
+          conversation_notification_levels_enabled: conversations.notificationLevelsEnabled ?? true,
           channels,
           dm_conversations: dms,
         },
@@ -157,55 +175,119 @@ async function mockChatSidebarApi(
   return { channels, dms };
 }
 
-interface MuteRequest {
+interface PreferenceRequest {
   method: string;
   pathname: string;
+  /** The body of a PUT to the canonical route; absent for the mute shortcut. */
+  mode?: string;
 }
 
 /**
- * POST/DELETE /api/chat/{channels|dm}/{id}/mute, per chatApi.ts's
- * setConversationMuted: no body at all, the actor is the session.
+ * The two preference surfaces chat-service actually serves, over one store:
  *
- * Writes straight into the same arrays the sidebar route serves, so the refetch
- * the hook performs after a confirmed write observes the persisted value.
+ *   POST/DELETE /api/chat/{channels|dm}/{id}/mute
+ *     the sidebar's shortcut (chatApi.ts's setConversationMuted). No body at
+ *     all, and — this is the contract issue #136 adds — it writes `muted` and
+ *     leaves `notification_level` exactly as it was.
+ *
+ *   PUT /api/chat/{channels|dm}/{id}/notification-preference
+ *     the canonical write (setConversationNotificationMode), `{"mode": ...}`,
+ *     where `all` and `mentions_replies` set the level and clear the mute, and
+ *     `muted` sets the mute and preserves the level.
+ *
+ * Both write straight into the arrays the sidebar route serves, so the refetch
+ * the hook performs after a confirmed write — and a reload — observe the
+ * persisted value rather than the optimistic guess. The translation here is the
+ * server's own, so what the spec asserts is the real contract and not a shape
+ * invented for the test.
  */
-async function mockMuteApi(
+async function mockNotificationPreferenceApi(
   page: Page,
   store: { channels: MockSidebarChannel[]; dms: MockSidebarDM[] },
 ) {
-  const requests: MuteRequest[] = [];
+  const requests: PreferenceRequest[] = [];
   let failNext = false;
 
-  const handle = (kind: "channel" | "dm") => async (route: import("@playwright/test").Route) => {
-    const method = route.request().method();
-    const { pathname } = new URL(route.request().url());
-    requests.push({ method, pathname });
-    if (failNext) {
-      failNext = false;
-      await route.fulfill({
-        status: 500,
-        contentType: "application/json",
-        body: JSON.stringify({ error: { code: "internal", message: "boom" } }),
-      });
-      return;
-    }
-    const id = decodeURIComponent(pathname.split("/").slice(-2, -1)[0] ?? "");
-    const muted = method === "POST";
-    const row =
-      kind === "channel"
-        ? store.channels.find((channel) => channel.id === id)
-        : store.dms.find((dm) => dm.id === id);
-    if (row) row.muted = muted;
-    await route.fulfill({ status: 204 });
+  const rowFor = (kind: "channel" | "dm", id: string) =>
+    kind === "channel"
+      ? store.channels.find((channel) => channel.id === id)
+      : store.dms.find((dm) => dm.id === id);
+
+  const refuse = async (route: import("@playwright/test").Route) => {
+    failNext = false;
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "internal", message: "boom" } }),
+    });
   };
 
-  await page.route("**/api/chat/channels/*/mute", handle("channel"));
-  await page.route("**/api/chat/dm/*/mute", handle("dm"));
+  const targetIdFrom = (pathname: string, segmentsFromEnd: number) =>
+    decodeURIComponent(
+      pathname.split("/").slice(-segmentsFromEnd, -(segmentsFromEnd - 1))[0] ?? "",
+    );
+
+  const handleMute =
+    (kind: "channel" | "dm") => async (route: import("@playwright/test").Route) => {
+      const method = route.request().method();
+      const { pathname } = new URL(route.request().url());
+      requests.push({ method, pathname });
+      if (failNext) {
+        await refuse(route);
+        return;
+      }
+      const row = rowFor(kind, targetIdFrom(pathname, 2));
+      // The level is untouched, which is the whole invariant: the shortcut owns
+      // one dimension and the profile owns the other.
+      if (row) row.muted = method === "POST";
+      await route.fulfill({ status: 204 });
+    };
+
+  const handlePreference =
+    (kind: "channel" | "dm") => async (route: import("@playwright/test").Route) => {
+      const method = route.request().method();
+      const { pathname } = new URL(route.request().url());
+      const body = route.request().postDataJSON() as { mode?: string } | null;
+      requests.push({ method, pathname, mode: body?.mode });
+      if (failNext) {
+        await refuse(route);
+        return;
+      }
+      const mode = body?.mode as MockNotificationMode | undefined;
+      if (mode !== "all" && mode !== "mentions_replies" && mode !== "muted") {
+        await route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "bad_request", message: "mode is invalid" } }),
+        });
+        return;
+      }
+      const row = rowFor(kind, targetIdFrom(pathname, 2));
+      if (row) {
+        if (mode === "muted") {
+          row.muted = true;
+        } else {
+          row.muted = false;
+          row.notification_level = mode;
+        }
+      }
+      await route.fulfill({ status: 204 });
+    };
+
+  await page.route("**/api/chat/channels/*/mute", handleMute("channel"));
+  await page.route("**/api/chat/dm/*/mute", handleMute("dm"));
+  await page.route("**/api/chat/channels/*/notification-preference", handlePreference("channel"));
+  await page.route("**/api/chat/dm/*/notification-preference", handlePreference("dm"));
 
   return {
     requests,
     failOnce() {
       failNext = true;
+    },
+    /** What the "server" holds, so a test can state the persisted end state. */
+    stored(kind: "channel" | "dm", id: string) {
+      const row = rowFor(kind, id);
+      return { muted: Boolean(row?.muted), level: row?.notification_level ?? "all" };
     },
   };
 }
@@ -434,16 +516,35 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(mentionsOnly).toBeChecked(); // untouched by the ringtone change
   });
 
-  test("notifications: channels and groups are separate blocks, and a mute is really persisted", async ({
-    page,
-  }) => {
-    const store = await mockChatSidebarApi(page, {
+  /** The mode select of one conversation, by the accessible name the page gives it. */
+  const modeSelect = (page: Page, name: string) =>
+    page.getByRole("combobox", { name: `Notificações de ${name}` });
+
+  /**
+   * The sidebar's own quick action on a channel row, reached exactly as a person
+   * reaches it: open the row's menu, then pick the item.
+   *
+   * The sidebar is mounted on /profile as well — ProfileSettingsShell is nested
+   * inside AppShell and forwards its context — so this is the real shortcut
+   * running beside the settings page, which is what makes the convergence
+   * assertions below about two surfaces rather than about one.
+   *
+   * Labels read from conversationActions.ts: "Silenciar notificações" and, once
+   * silenced, "Ativar notificações".
+   */
+  async function useSidebarMuteShortcut(page: Page, channelName: string, item: string) {
+    await page.getByRole("button", { name: `Mais opções para canal ${channelName}` }).click();
+    await page.getByRole("menuitem", { name: item }).click();
+  }
+
+  function conversationFixture() {
+    return {
       channels: [
         {
           id: "ch-general",
           slug: "geral",
           display_name: "geral",
-          type: "public",
+          type: "public" as const,
           can_write: true,
           is_general: true,
         },
@@ -451,97 +552,317 @@ test.describe("Profile & account settings (#672)", () => {
           id: "ch-infra",
           slug: "infraestrutura",
           display_name: "infraestrutura",
-          type: "public",
+          type: "public" as const,
           can_write: true,
         },
       ],
       dms: [
-        { id: "dm-1on1", type: "direct", name: "Juliane" },
-        { id: "dm-group", type: "group", name: "Squad" },
+        { id: "dm-1on1", type: "direct" as const, name: "Juliane" },
+        { id: "dm-group", type: "group" as const, name: "Squad" },
       ],
-    });
-    const mute = await mockMuteApi(page, store);
+    };
+  }
+
+  // Structure first, because it is what the two cards are for: channels and
+  // groups are separate blocks, a 1:1 is in neither, and the general channel
+  // does not offer the state the server refuses.
+  test("notifications: channels and groups are separate blocks, and #geral offers no forbidden state", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    await mockNotificationPreferenceApi(page, store);
     await page.goto("/profile/notifications");
 
     const channelsCard = page.getByRole("region", { name: "Notificações por canal" });
     const groupsCard = page.getByRole("region", { name: "Notificações por grupos" });
-    const infra = channelsCard.getByRole("checkbox", { name: "Notificações de infraestrutura" });
-    const squad = groupsCard.getByRole("checkbox", { name: "Notificações de Squad" });
 
-    await expect(infra).toBeVisible();
-    await expect(squad).toBeVisible();
-    // A 1:1 conversation is not a group, and is in neither block.
-    await expect(page.getByRole("checkbox", { name: "Notificações de Juliane" })).toHaveCount(0);
-    await expect(groupsCard.getByRole("checkbox")).toHaveCount(1);
-    // The general channel is listed but not silenceable — the server refuses it.
     await expect(
-      channelsCard.getByRole("checkbox", { name: "Notificações de geral" }),
-    ).toBeDisabled();
-
-    await infra.click();
-    await expect
-      .poll(() => mute.requests)
-      .toContainEqual({ method: "POST", pathname: "/api/chat/channels/ch-infra/mute" });
-
-    await squad.click();
-    await expect
-      .poll(() => mute.requests)
-      .toContainEqual({ method: "POST", pathname: "/api/chat/dm/dm-group/mute" });
-
-    // What comes back from the server after a reload is what is on screen.
-    await page.reload();
-    await expect(infra).not.toBeChecked();
-    await expect(squad).not.toBeChecked();
-
-    await infra.click();
-    await expect
-      .poll(() => mute.requests)
-      .toContainEqual({ method: "DELETE", pathname: "/api/chat/channels/ch-infra/mute" });
-    await page.reload();
-    await expect(infra).toBeChecked();
-    await expect(squad).not.toBeChecked();
+      channelsCard.getByRole("combobox", { name: "Notificações de infraestrutura" }),
+    ).toBeVisible();
+    await expect(groupsCard.getByRole("combobox", { name: "Notificações de Squad" })).toBeVisible();
+    // A 1:1 conversation is not a group, and is in neither block.
+    await expect(page.getByRole("combobox", { name: "Notificações de Juliane" })).toHaveCount(0);
+    await expect(groupsCard.getByRole("combobox")).toHaveCount(1);
+    // The general channel is listed and configurable, but never silenceable —
+    // the server refuses that in SQL, so the option is not offered either.
+    const general = channelsCard.getByRole("combobox", { name: "Notificações de geral" });
+    await expect(general).toBeEnabled();
+    await expect(general.locator("option")).toHaveCount(2);
+    await expect(general.locator('option[value="muted"]')).toHaveCount(0);
+    await expect(channelsCard.getByText(/O canal geral não pode ser silenciado/)).toBeVisible();
+    // A group is an ordinary conversation and does offer it.
+    await expect(
+      groupsCard
+        .getByRole("combobox", { name: "Notificações de Squad" })
+        .locator('option[value="muted"]'),
+    ).toHaveCount(1);
   });
 
-  test("notifications: a refused mute never leaves the switch lying, and can be retried", async ({
+  // Scenario A of issue #136, end to end and in the order the issue states it:
+  // the profile narrows a channel, the sidebar silences it, and turning
+  // notifications back on returns the profile to the level that was chosen.
+  test("notifications: a channel goes all -> mentions_replies -> muted -> the level it had", async ({
     page,
   }) => {
-    const store = await mockChatSidebarApi(page, {
-      channels: [
-        {
-          id: "ch-infra",
-          slug: "infraestrutura",
-          display_name: "infraestrutura",
-          type: "public",
-          can_write: true,
-        },
-      ],
-    });
-    const mute = await mockMuteApi(page, store);
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    const api = await mockNotificationPreferenceApi(page, store);
     await page.goto("/profile/notifications");
 
-    const infra = page.getByRole("checkbox", { name: "Notificações de infraestrutura" });
-    await expect(infra).toBeChecked();
+    const infra = modeSelect(page, "infraestrutura");
+    await expect(infra).toHaveValue("all");
 
-    mute.failOnce();
-    await infra.click();
+    // 1. Profile: mentions and replies.
+    await infra.selectOption("mentions_replies");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({
+        method: "PUT",
+        pathname: "/api/chat/channels/ch-infra/notification-preference",
+        mode: "mentions_replies",
+      });
+    // 2. A reload keeps it, so what is on screen is what the server holds.
+    await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("mentions_replies");
+
+    // 3. The sidebar's shortcut silences it. Its own contract: POST /mute, no
+    //    body, and it must not overwrite the level.
+    await useSidebarMuteShortcut(page, "infraestrutura", "Silenciar notificações");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({ method: "POST", pathname: "/api/chat/channels/ch-infra/mute" });
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("muted");
+    await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("muted");
+    // The level survived the mute, which is what the restore below rests on.
+    expect(api.stored("channel", "ch-infra")).toEqual({ muted: true, level: "mentions_replies" });
+
+    // 4. Turning notifications back on restores the level, never the default.
+    await useSidebarMuteShortcut(page, "infraestrutura", "Ativar notificações");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({ method: "DELETE", pathname: "/api/chat/channels/ch-infra/mute" });
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("mentions_replies");
+    await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("mentions_replies");
+  });
+
+  // The same round trip starting from the default, which is the other case the
+  // issue names: silencing and restoring must land back on "all" rather than on
+  // whatever was last selected somewhere else.
+  test("notifications: silencing and restoring a channel left on all returns it to all", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    const api = await mockNotificationPreferenceApi(page, store);
+    await page.goto("/profile/notifications");
+
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("all");
+
+    await useSidebarMuteShortcut(page, "infraestrutura", "Silenciar notificações");
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("muted");
+    await useSidebarMuteShortcut(page, "infraestrutura", "Ativar notificações");
+
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("all");
+    await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("all");
+    expect(api.stored("channel", "ch-infra")).toEqual({ muted: false, level: "all" });
+  });
+
+  // Scenario B: a group proves the same contract on the dm prefix, which is the
+  // path a copy-paste gets wrong silently.
+  test("notifications: a group follows the same contract under the dm prefix", async ({ page }) => {
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    const api = await mockNotificationPreferenceApi(page, store);
+    await page.goto("/profile/notifications");
+
+    const squad = modeSelect(page, "Squad");
+    await expect(squad).toHaveValue("all");
+
+    await squad.selectOption("mentions_replies");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({
+        method: "PUT",
+        pathname: "/api/chat/dm/dm-group/notification-preference",
+        mode: "mentions_replies",
+      });
+    await page.reload();
+    await expect(modeSelect(page, "Squad")).toHaveValue("mentions_replies");
+
+    await modeSelect(page, "Squad").selectOption("muted");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({
+        method: "PUT",
+        pathname: "/api/chat/dm/dm-group/notification-preference",
+        mode: "muted",
+      });
+    await page.reload();
+    await expect(modeSelect(page, "Squad")).toHaveValue("muted");
+    // Selecting "silenced" from the profile preserves the level too, exactly
+    // like the sidebar's shortcut does.
+    expect(api.stored("dm", "dm-group")).toEqual({ muted: true, level: "mentions_replies" });
+
+    await modeSelect(page, "Squad").selectOption("all");
+    await page.reload();
+    await expect(modeSelect(page, "Squad")).toHaveValue("all");
+    expect(api.stored("dm", "dm-group")).toEqual({ muted: false, level: "all" });
+  });
+
+  test("notifications: a refused mutation never leaves the select lying, and can be retried", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    const api = await mockNotificationPreferenceApi(page, store);
+    await page.goto("/profile/notifications");
+
+    const infra = modeSelect(page, "infraestrutura");
+    await expect(infra).toHaveValue("all");
+
+    api.failOnce();
+    await infra.selectOption("muted");
 
     await expect(page.getByRole("alert")).toContainText(
       "Não foi possível atualizar as notificações de infraestrutura",
     );
     // Rolled back to the persisted value: a refusal must not leave the row
     // showing something the server never accepted.
-    await expect(infra).toBeChecked();
-
-    await infra.click();
-
-    await expect(page.getByRole("alert")).toHaveCount(0);
-    await expect(infra).not.toBeChecked();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("all");
     await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("all");
+
+    // The retry goes through, and the row stops claiming a failure.
+    await modeSelect(page, "infraestrutura").selectOption("muted");
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("muted");
+    await page.reload();
+    await expect(modeSelect(page, "infraestrutura")).toHaveValue("muted");
+  });
+
+  // One write per conversation, and only for that conversation: a pending write
+  // must not freeze the rest of the page.
+  test("notifications: one conversation's pending write leaves the others operable", async ({
+    page,
+  }) => {
+    const store = await mockChatSidebarApi(page, conversationFixture());
+    const api = await mockNotificationPreferenceApi(page, store);
+    // Hold the first canonical write open, so the row can be observed mid-flight.
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let firstSeen = false;
+    await page.route("**/api/chat/channels/ch-infra/notification-preference", async (route) => {
+      if (!firstSeen) {
+        firstSeen = true;
+        await held;
+      }
+      await route.fallback();
+    });
+    await page.goto("/profile/notifications");
+
+    await modeSelect(page, "infraestrutura").selectOption("muted");
+
+    await expect(modeSelect(page, "infraestrutura")).toBeDisabled();
+    await expect(page.getByText("Salvando…")).toBeVisible();
+    // The other rows never waited on it.
+    await expect(modeSelect(page, "Squad")).toBeEnabled();
+    await modeSelect(page, "Squad").selectOption("mentions_replies");
+    // The group's write reached the server while the channel's was still held
+    // open, which is the property: the key is the conversation, so nothing
+    // queues behind anything else.
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({
+        method: "PUT",
+        pathname: "/api/chat/dm/dm-group/notification-preference",
+        mode: "mentions_replies",
+      });
+
+    release?.();
+    await expect(modeSelect(page, "infraestrutura")).toBeEnabled();
+    // And the held one did arrive, once it was let through.
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({
+        method: "PUT",
+        pathname: "/api/chat/channels/ch-infra/notification-preference",
+        mode: "muted",
+      });
+  });
+  // Phase one of the rollout: the schema and every reader understand the
+  // granular model, and the writer is shut. What the page must offer then is the
+  // binary control this product has always had — and it must never call the
+  // granular endpoint, which would answer 503.
+  test("notifications: with the rollout gate shut, the page falls back to the binary control", async ({
+    page,
+  }) => {
+    const fixture = conversationFixture();
+    const store = await mockChatSidebarApi(page, {
+      ...fixture,
+      notificationLevelsEnabled: false,
+    });
+    const api = await mockNotificationPreferenceApi(page, store);
+    await page.goto("/profile/notifications");
+
+    const channelsCard = page.getByRole("region", { name: "Notificações por canal" });
+    const groupsCard = page.getByRole("region", { name: "Notificações por grupos" });
+
+    // No select at all, in either card.
+    await expect(channelsCard.getByRole("combobox")).toHaveCount(0);
+    await expect(groupsCard.getByRole("combobox")).toHaveCount(0);
+    const infra = channelsCard.getByRole("checkbox", { name: "Notificações de infraestrutura" });
+    await expect(infra).toBeChecked();
+    // The general channel stays unavailable, and says why.
+    await expect(
+      channelsCard.getByRole("checkbox", { name: "Notificações de geral" }),
+    ).toBeDisabled();
+
+    // Silencing goes through the mute shortcut, and it really persists.
+    await infra.click();
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({ method: "POST", pathname: "/api/chat/channels/ch-infra/mute" });
+    await page.reload();
+    await expect(
+      channelsCard.getByRole("checkbox", { name: "Notificações de infraestrutura" }),
+    ).not.toBeChecked();
+
+    // ...and back on again.
+    await channelsCard.getByRole("checkbox", { name: "Notificações de infraestrutura" }).click();
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({ method: "DELETE", pathname: "/api/chat/channels/ch-infra/mute" });
+
+    // Nothing ever reached the granular endpoint.
+    expect(api.requests.filter((request) => request.method === "PUT")).toEqual([]);
+  });
+
+  // The sidebar's own shortcut is not gated either: it is the same capability,
+  // and phase one depends on it.
+  test("notifications: the sidebar mute shortcut works with the gate shut", async ({ page }) => {
+    const fixture = conversationFixture();
+    const store = await mockChatSidebarApi(page, {
+      ...fixture,
+      notificationLevelsEnabled: false,
+    });
+    const api = await mockNotificationPreferenceApi(page, store);
+    await page.goto("/profile/notifications");
+
+    await useSidebarMuteShortcut(page, "infraestrutura", "Silenciar notificações");
+    await expect
+      .poll(() => api.requests)
+      .toContainEqual({ method: "POST", pathname: "/api/chat/channels/ch-infra/mute" });
     await expect(
       page.getByRole("checkbox", { name: "Notificações de infraestrutura" }),
     ).not.toBeChecked();
-  });
 
+    await useSidebarMuteShortcut(page, "infraestrutura", "Ativar notificações");
+    await expect(
+      page.getByRole("checkbox", { name: "Notificações de infraestrutura" }),
+    ).toBeChecked();
+    expect(api.requests.filter((request) => request.method === "PUT")).toEqual([]);
+  });
   test("security: no local password/MFA form exists, and the Keycloak link is present when configured", async ({
     page,
   }) => {

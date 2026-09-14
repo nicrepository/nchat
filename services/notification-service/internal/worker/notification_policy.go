@@ -43,21 +43,31 @@ func NewPolicyEvaluator() Evaluator {
 //   - Presence is Unknown, because an outbox row carries no session and this
 //     process has no registry of them. The engine's surface for an unknown
 //     presence is push only, which is exactly what this worker delivers.
+//
 //   - WorkSchedule is NotConfigured, because it is: issue #743 shipped the
 //     temporal domain and deliberately shipped no writer, so there is no
 //     schedule to read. It is the real current state, not a default invented
 //     here, and the engine's documented answer for it is that it does not
 //     suppress.
-//   - Preferences.Muted is the recipient's own mute preference, resolved from
+//
+//   - Preferences.Muted and Preferences.ConversationLevel are the recipient's
+//     own preference for this conversation, resolved from
 //     chat.conversation_notification_prefs by the outbox projection that read
 //     this row — one statement per batch, never one per event. The engine still
-//     owns what a mute *does*: nothing in this package or in storage suppresses
+//     owns what they *do*: nothing in this package or in storage suppresses
 //     anything, they only report the state. Absence of a preference row is
-//     false, which is what that table already means by it.
+//     "not silenced, every message", which is what that table means by it.
+//
+//     Both are passed, and passing only one would have been the divergence
+//     issue #136 forbids: the realtime consumer in chat-service reads the same
+//     pair from the same table, so a worker that knew about the mute and not
+//     the level would make push disagree with the toast for the same event.
+//
 //   - Preferences.Disabled and Preferences.SoundMode are unset, because neither
 //     has a server-side source of truth: the chime preference lives in the
 //     browser, and there is no global off switch. Both are inert here anyway —
 //     the chime is never on the surface an unknown presence admits.
+//
 //   - Conversation is unset, and is provably inert for this consumer: the only
 //     rule that reads it is the chime preference, and the chime is never on the
 //     surface an unknown presence admits.
@@ -67,15 +77,18 @@ func NewPolicyEvaluator() Evaluator {
 // worker that is evaluating anything has a channel to deliver through.
 func policyContext(notification Notification) notificationpolicy.Context {
 	return notificationpolicy.Context{
-		EventID:          notification.ID,
-		WorkspaceID:      notification.WorkspaceID,
-		RecipientID:      notification.RecipientID,
-		EventType:        notificationevent.EventType(notification.EventType),
-		Priority:         notificationevent.Priority(notification.Priority),
-		Origin:           notificationevent.Origin(notification.Origin),
-		WorkSchedule:     workschedule.StateNotConfigured,
-		Presence:         notificationpolicy.PresenceUnknown,
-		Preferences:      notificationpolicy.Preferences{Muted: notification.Muted},
+		EventID:      notification.ID,
+		WorkspaceID:  notification.WorkspaceID,
+		RecipientID:  notification.RecipientID,
+		EventType:    notificationevent.EventType(notification.EventType),
+		Priority:     notificationevent.Priority(notification.Priority),
+		Origin:       notificationevent.Origin(notification.Origin),
+		WorkSchedule: workschedule.StateNotConfigured,
+		Presence:     notificationpolicy.PresenceUnknown,
+		Preferences: notificationpolicy.Preferences{
+			Muted:             notification.Muted,
+			ConversationLevel: notificationpolicy.ConversationLevel(notification.NotificationLevel),
+		},
 		WebPushAvailable: true,
 	}
 }

@@ -68,6 +68,21 @@ func (f *fakeOutbox) seedPendingMuted(id string) *fakeRow {
 	return row
 }
 
+// seedPendingWithLevel adds an event whose recipient narrowed the conversation
+// to a level (issue #136), with the event kind the level is judged against.
+//
+// The kind is a parameter because that is the whole of what the level decides
+// on: the same preference allows a mention and suppresses an ordinary message,
+// and a fixture that fixed the kind could only ever prove one of the two.
+func (f *fakeOutbox) seedPendingWithLevel(id, level string, kind notificationevent.EventType) *fakeRow {
+	row := f.seedPending(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row.event.NotificationLevel = level
+	row.event.EventType = string(kind)
+	return row
+}
+
 // seedEligible adds an event a policy has already approved.
 //
 // It carries an availability instant, because every claimable row does: that is

@@ -103,6 +103,21 @@ case "$MODULE" in
       TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
+      # Issue #136. The first three read the migrated schema and the fixture the
+      # outbox suite above already seeds; the fourth creates and drops a database
+      # of its own, exactly like the #741 round trip two lines up.
+      TestRealtimeAndOutboxClassifyTheSameMessageIdenticallyPostgreSQL
+      TestAReplyStaysAReplyWithoutAVisibleQuotePostgreSQL
+      TestAnOrdinaryGroupMessageClassifiesIdenticallyPostgreSQL
+      TestConversationNotificationLevelMigrationRoundTripPostgreSQL
+      # Mute and Unmute racing on one row, from two connections, plus the
+      # database's own refusal of the state the race used to produce. Only a
+      # real PostgreSQL can hold either property: one is an interleaving and the
+      # other is a CHECK constraint.
+      TestPGXNotificationPrefStoreMuteUnmuteRacePostgreSQL
+      TestPGXNotificationPrefStoreRacePreservesTheLevelPostgreSQL
+      TestConversationNotificationPrefsRefuseTheSparseDefaultPostgreSQL
+      TestConversationNotificationPrefsAllowAnUnsilencedLevelPostgreSQL
       # Issue #824. Per-recipient acknowledgement: a recipient set derived in
       # the same statement as the INSERT, a primary key that is the reason two
       # clicks cannot become two rows, conditional UPDATEs that make an

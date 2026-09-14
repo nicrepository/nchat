@@ -72,11 +72,19 @@ type NotificationEvent struct {
 	//
 	// It is a resolved fact and not a decision: what a mute *does* is decided by
 	// libs/go/platform/notificationpolicy, which is the only place that may
-	// suppress. False means "no preference row reaches this event", which is
-	// exactly what chat.conversation_notification_prefs encodes as not muted —
-	// unmuting deletes the row rather than writing false, so absence is the
-	// product's own default and not a guess made here.
+	// suppress. False means "this recipient has not silenced this conversation",
+	// which covers both the absence of a row and a row that expresses only a
+	// level — see mutedProjection for why the test is the timestamp and no
+	// longer the row.
 	Muted bool
+	// NotificationLevel is the other half of that preference (issue #136): which
+	// events of this conversation the recipient wants alerts for, from the same
+	// row and the same single statement.
+	//
+	// Also a resolved fact and also not a decision. The empty string is what a
+	// recipient with no preference row has, and the engine normalises it to the
+	// product default rather than guessing here.
+	NotificationLevel string
 }
 
 // NotificationOutboxStore is every persistent operation the notification worker
@@ -151,9 +159,10 @@ func NewPGXNotificationOutboxStore(pool Pool) *PGXNotificationOutboxStore {
 // it — NotificationPrefStore.Mute admits only a conversation the user could see
 // — and re-applying visibility on read would make a revoked membership *undo* a
 // mute, which is the direction that alerts someone who asked not to be.
-const mutedProjection = `
-	EXISTS (
-		SELECT 1
+// preferenceRowJoin is the correlated lookup both projections below are built
+// from, written once so the scoping predicates above cannot drift apart between
+// them.
+const preferenceRowJoin = `
 		FROM chat.messages m
 		JOIN chat.conversation_notification_prefs p
 		  ON p.user_id = o.recipient_user_id
@@ -161,15 +170,46 @@ const mutedProjection = `
 		 AND ((p.channel_id IS NOT NULL AND p.channel_id = m.channel_id)
 		   OR (p.dm_conversation_id IS NOT NULL AND p.dm_conversation_id = m.dm_conversation_id))
 		WHERE m.id = o.message_id
-		  AND m.workspace_id = o.workspace_id
+		  AND m.workspace_id = o.workspace_id`
+
+// mutedProjection asks whether the recipient has *silenced* this conversation,
+// which since issue #136 is the timestamp and no longer the existence of the
+// row.
+//
+// That change is the load-bearing part of this migration for delivery. A row
+// with a NULL muted_at is "mentions and replies, not silenced" — a preference
+// somebody expressed in order to keep hearing about mentions — and reading its
+// presence as a mute would have silenced every one of those recipients the
+// moment 000050 shipped.
+const mutedProjection = `
+	EXISTS (
+		SELECT 1` + preferenceRowJoin + `
+		  AND p.muted_at IS NOT NULL
 	)`
+
+// levelProjection reads the level from the same row.
+//
+// A second correlated subquery over the same join rather than one returning a
+// composite, because PostgreSQL has no way to spread a single subselect across
+// two output columns. Both resolve through the (user_id, target) partial unique
+// index, so this is one extra index lookup per row of the batch and still no
+// query per event.
+//
+// COALESCE to the default level, so a recipient with no preference row at all
+// reads as the product default rather than as an empty string the engine would
+// have to interpret.
+const levelProjection = `
+	COALESCE((
+		SELECT p.notification_level` + preferenceRowJoin + `
+		LIMIT 1
+	), 'all')`
 
 // notificationColumns is the projection both reads share, so a column added to
 // one can never be forgotten in the other.
 const notificationColumns = `
 	o.id::text, o.workspace_id::text, o.recipient_user_id::text,
 	o.kind, o.priority, o.source_type, o.message_id::text, o.origin,
-	COALESCE(o.dedupe_key, ''), o.attempts, o.occurred_at,` + mutedProjection
+	COALESCE(o.dedupe_key, ''), o.attempts, o.occurred_at,` + mutedProjection + `,` + levelProjection
 
 // listPendingQuery reads events no policy has looked at yet.
 //
@@ -543,7 +583,7 @@ func scanNotificationEvents(rows pgx.Rows, operation string) ([]NotificationEven
 		if err := rows.Scan(&event.ID, &event.WorkspaceID, &event.RecipientID,
 			&event.EventType, &event.Priority, &event.SourceType, &event.SourceID,
 			&event.Origin, &event.DedupeKey, &event.Attempts, &event.OccurredAt,
-			&event.Muted); err != nil {
+			&event.Muted, &event.NotificationLevel); err != nil {
 			return nil, fmt.Errorf("%s: %w", operation, err)
 		}
 		events = append(events, event)

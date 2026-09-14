@@ -21,6 +21,15 @@
 #   deny-cluster-wide    "1" refuses `get nodes` and `get pods --all-namespaces`,
 #                        as the namespaced production deploy identity is refused
 #   cluster-wide-log     every attempt at either, refused or not
+#   configmap/<KEY>      the value `get configmap -o jsonpath={.data.<KEY>}`
+#                        returns, and `patch configmap` writes — so a patch
+#                        really does change what the next read sees
+#   configmap-patch-fails "1" makes `patch configmap` fail, as a refused write
+#   configmap-patch-log  appended to on every successful configmap patch
+#   pod-env/<KEY>        what `exec ... printenv <KEY>` answers, shared by every
+#                        pod; a pod-env-<slot>/<KEY> overrides it for one slot,
+#                        which is how a stale slot is modelled
+#   exec-log             every exec attempt
 set -Eeuo pipefail
 
 STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
@@ -119,6 +128,54 @@ if [[ "${1:-}" == "patch" && "${2:-}" == "service" ]]; then
   exit 0
 fi
 
+# kubectl patch configmap <name> ...
+#
+# Stateful on purpose: the operation under test patches and then reads the value
+# back, so a fake that acknowledged the patch without storing it would let a
+# no-op merge pass as a successful one.
+if [[ "${1:-}" == "patch" && "${2:-}" == "configmap" ]]; then
+  printf '%s\n' "$*" >>"$STATE/configmap-patch-log"
+  if [[ "$(read_state configmap-patch-fails)" == "1" ]]; then
+    echo "fake: configmap patch refused" >&2
+    exit 1
+  fi
+  mkdir -p "$STATE/configmap"
+  # The merge payload is {"data":{"KEY":"VALUE"}}; both are extracted rather
+  # than assumed so a script that patched the wrong key fails these tests.
+  key="$(grep -o '"[A-Z_]\{3,\}"[[:space:]]*:' <<<"$*" | head -1 | tr -d '":' | tr -d ' ')"
+  value="$(sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$*" | head -1)"
+  [[ -z "$key" ]] || printf '%s' "$value" >"$STATE/configmap/$key"
+  echo "configmap/$3 patched"
+  exit 0
+fi
+
+# kubectl exec -n <ns> <pod> -- printenv <KEY>
+#
+# The only check that distinguishes "the ConfigMap says X" from "the process
+# loaded X", which is the whole reason the operation restarts anything.
+if [[ "${1:-}" == "exec" ]]; then
+  printf '%s\n' "$*" >>"$STATE/exec-log"
+  # The variable printenv was asked for: the last positional parameter.
+  # `${*##* }` would not do it — prefix removal on $* applies to each argument
+  # separately and then joins, so it returns the whole command line unchanged.
+  key="${*: -1}"
+  pod_slot=""
+  case "$*" in
+    *-blue-*) pod_slot=blue ;;
+    *-green-*) pod_slot=green ;;
+  esac
+  if [[ -n "$pod_slot" && -f "$STATE/pod-env-$pod_slot/$key" ]]; then
+    cat "$STATE/pod-env-$pod_slot/$key"
+    exit 0
+  fi
+  if [[ -f "$STATE/pod-env/$key" ]]; then
+    cat "$STATE/pod-env/$key"
+    exit 0
+  fi
+  # An unset variable: printenv exits non-zero and prints nothing.
+  exit 1
+fi
+
 # kubectl scale deployment/<name> ...
 if [[ "${1:-}" == "scale" ]]; then
   printf '%s\n' "$2" >>"$STATE/scale-log"
@@ -157,6 +214,29 @@ if [[ "${1:-}" == "get" && "${2:-}" == "deployment" ]]; then
     *"containers[0].image"*) read_state "image/$deployment" ;;
     *) printf '' ;;
   esac
+  exit 0
+fi
+
+# Ready pod NAMES of a workload, which is what an operation needing to exec into
+# one asks for. One synthetic name per Ready pod recorded in
+# observed/<component>-<slot>, so a slot with no Ready pods answers nothing and
+# a caller cannot mistake a listing for a pod.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" && "$*" == *"metadata.name"* ]]; then
+  selector=""
+  for arg in "$@"; do
+    [[ "$prev" == "-l" ]] && selector="$arg"
+    prev="$arg"
+  done
+  component="${selector#*component=}"
+  component="${component%%,*}"
+  slot="${selector##*release-slot=}"
+  slot="${slot%%,*}"
+  index=0
+  while IFS= read -r release; do
+    [[ -n "$release" ]] || continue
+    printf '%s-%s-%s\n' "$component" "$slot" "$index"
+    index=$((index + 1))
+  done < <(read_state "observed/$component-$slot")
   exit 0
 fi
 
@@ -401,6 +481,15 @@ if [[ "${1:-}" == "rollout" ]]; then
 fi
 
 if [[ "${1:-}" == "get" && "${2:-}" == "configmap" ]]; then
+  # A value a fixture (or a patch) wrote wins over the static answers below, so
+  # a read-after-patch sees the patch.
+  for key in "$STATE"/configmap/*; do
+    [[ -e "$key" ]] || break
+    if [[ "$*" == *"$(basename "$key")"* ]]; then
+      cat "$key"
+      exit 0
+    fi
+  done
   case "$*" in
     *VALKEY_WS_BROADCAST_ENABLED* | *FILE_UPLOADS_ENABLED* | *LIVEKIT_ENABLED*) printf 'true' ;;
     *FILE_MALWARE_SCANNER_ADDRESS*) printf 'clamav:3310' ;;

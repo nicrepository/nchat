@@ -330,7 +330,28 @@ type Message struct {
 
 	// Quoted is the immediate parent message preview for quote-reply.
 	// It is intentionally one level only; nested parent quotes are not populated.
+	//
+	// It is a *presentation* DTO and must not be read as a semantic authority:
+	// it is blanked for a removed message, withheld for a condemned body, and
+	// absent from every projection that does not join the parent. Whether this
+	// message answers somebody is ReplyToSenderID, below.
 	Quoted *QuotedMessage
+
+	// ReplyToSenderID is the author of the message this one replies to, read
+	// from the persisted parent row (issue #136).
+	//
+	// It exists because a notification policy has to know "does this answer
+	// somebody" and Quoted cannot be asked: it is shaped by what a reader may
+	// see, so a deleted parent or a condemned body would silently turn a reply
+	// into an ordinary message. This field is the fact, and survives every rule
+	// that governs the preview.
+	//
+	// The same fact chat.notification_outbox's recipient CTE reads as
+	// parent.sender_id, so the realtime path and the push path classify one
+	// message identically. Empty when this message replies to nothing, or when
+	// the projection that produced it did not join the parent — never derived
+	// from anything a client sent.
+	ReplyToSenderID string
 
 	// Reference is the caller-authorized RF-09 preview. When the message has a
 	// reference but the caller cannot currently read its origin, Available is false

@@ -94,9 +94,10 @@ Vem da propria linha de `chat.notification_outbox`, sem join nenhum:
 
 E mais um, resolvido na mesma leitura:
 
-| Campo do `Context`  | Fonte                                                                    |
-| ------------------- | ------------------------------------------------------------------------ |
-| `Preferences.Muted` | `chat.conversation_notification_prefs`, via `chat.messages` — ver abaixo |
+| Campo do `Context`              | Fonte                                                                    |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `Preferences.Muted`             | `chat.conversation_notification_prefs`, via `chat.messages` — ver abaixo |
+| `Preferences.ConversationLevel` | a mesma linha, na mesma leitura (#136)                                   |
 
 `origin` passou a ser projetado nesta correcao. Era persistido desde a #741 e
 nao era lido, entao um import de um ano de mensagens era entregue como se
@@ -119,11 +120,22 @@ engine tem resposta documentada.
 `app.startNotificationWorker` recusa iniciar um worker sem `Deliverer`, entao um
 worker que esta avaliando tem canal por onde entregar.
 
-### Mute: onde e resolvido, e por que nao no engine
+### Mute e nivel: onde sao resolvidos, e por que nao no engine
 
-`Preferences.Muted` vem de `chat.conversation_notification_prefs` — o mesmo
-source of truth que o endpoint de mute escreve e que a sidebar le por
-`ListMuted`. **Nenhuma tabela, coluna, migration ou cache novo foi criado.**
+`Preferences.Muted` e `Preferences.ConversationLevel` vem de
+`chat.conversation_notification_prefs` — o mesmo source of truth que os
+endpoints de preferencia escrevem e que a sidebar le por `ListPreferences`.
+
+A #136 acrescentou a coluna `notification_level` e tornou `muted_at` nullable
+(migrations `000050`/`000051`); nenhuma tabela nova, nenhum cache novo. Os dois
+campos saem da **mesma linha, na mesma leitura**: `mutedProjection` e
+`levelProjection` compartilham o join (`preferenceRowJoin`), entao continua
+sendo uma statement por batch.
+
+O `EXISTS` do mute passou a testar `p.muted_at IS NOT NULL` em vez da existencia
+da linha, e essa e a parte crucial da migration para a entrega: uma linha com
+`muted_at` nulo e alguem que pediu para continuar ouvindo mencoes, e ler a
+presenca dela como mute silenciaria todos eles.
 
 A resolucao acontece **antes** de `Evaluate`, na projecao que a propria leitura
 da outbox ja fazia (`notificationColumns`, em
@@ -139,8 +151,9 @@ Consequencias que importam:
   banco. Uma busca por evento seria uma query por notificacao, que e justamente
   o que a #744 proibe.
 - **O engine continua puro.** Storage resolve estado; a policy decide
-  consequencia. Nem `storage` nem `worker` contem `if muted { suppress }` — a
-  unica regra que le o campo e `denyMuted`, no pacote central.
+  consequencia. Nem `storage` nem `worker` contem `if muted { suppress }` — as
+  unicas regras que leem esses campos sao `denyMuted` e
+  `denyConversationLevel`, no pacote central.
 - **Escopo.** Tres predicados, todos obrigatorios: `p.user_id =
 o.recipient_user_id` (o mute e individual — a tabela e chaveada por usuario
   exatamente por isso), `p.workspace_id = o.workspace_id` e `m.workspace_id =
@@ -191,18 +204,19 @@ explicito.
 
 ### Classificacao dos inputs do realtime
 
-| Input                      | Classificacao    | Origem                                            |
-| -------------------------- | ---------------- | ------------------------------------------------- |
-| `RecipientID`              | `AUTHORITATIVE`  | a assinatura que esta recebendo (`client.userID`) |
-| `WorkspaceID`, `EventType` | `AUTHORITATIVE`  | a mensagem                                        |
-| `Conversation`             | `AUTHORITATIVE`  | alvo da mensagem                                  |
-| `Origin`                   | `AUTHORITATIVE`  | `live` — e a publicacao de um commit              |
-| `Preferences.Muted`        | `AUTHORITATIVE`  | `chat.conversation_notification_prefs`            |
-| `Presence`                 | `AUTHORITATIVE`  | `PresenceConnected` — ha socket aberto            |
-| `WorkSchedule`             | `NOT_CONFIGURED` | #743 nao entregou escritor                        |
-| `ConversationOpen`         | `LOCAL_ONLY`     | inerte aqui; o browser aplica                     |
-| `Preferences.SoundMode`    | `LOCAL_ONLY`     | sem source of truth server-side                   |
-| `WebPushAvailable`         | `AUTHORITATIVE`  | falso: este e o caminho in-app                    |
+| Input                           | Classificacao    | Origem                                            |
+| ------------------------------- | ---------------- | ------------------------------------------------- |
+| `RecipientID`                   | `AUTHORITATIVE`  | a assinatura que esta recebendo (`client.userID`) |
+| `WorkspaceID`, `EventType`      | `AUTHORITATIVE`  | a mensagem                                        |
+| `Conversation`                  | `AUTHORITATIVE`  | alvo da mensagem                                  |
+| `Origin`                        | `AUTHORITATIVE`  | `live` — e a publicacao de um commit              |
+| `Preferences.Muted`             | `AUTHORITATIVE`  | `chat.conversation_notification_prefs`            |
+| `Preferences.ConversationLevel` | `AUTHORITATIVE`  | a mesma linha, na mesma leitura em lote (#136)    |
+| `Presence`                      | `AUTHORITATIVE`  | `PresenceConnected` — ha socket aberto            |
+| `WorkSchedule`                  | `NOT_CONFIGURED` | #743 nao entregou escritor                        |
+| `ConversationOpen`              | `LOCAL_ONLY`     | inerte aqui; o browser aplica                     |
+| `Preferences.SoundMode`         | `LOCAL_ONLY`     | sem source of truth server-side                   |
+| `WebPushAvailable`              | `AUTHORITATIVE`  | falso: este e o caminho in-app                    |
 
 ### Preferencia que nao pode ser lida
 
@@ -268,16 +282,32 @@ Ordem declarada das regras:
 | 4   | evento/contexto       | conversa aberta e visivel em foreground | `conversation_open`                  |
 | 5   | preferencia pessoal   | preferencias do destinatario ilegiveis  | `preferences_unavailable`            |
 | 6   | preferencia pessoal   | conversa silenciada                     | `muted`                              |
-| 7   | preferencia pessoal   | preferencia global (off / modo de som)  | `user_preference`                    |
-| 8   | disponibilidade       | sem subscription de push utilizavel     | `unsupported_or_unavailable_channel` |
-| 9   | estado do coordenador | evento ja entregue                      | `duplicate`                          |
-| 10  | estado do coordenador | cooldown de burst                       | `burst_cooldown`                     |
+| 7   | preferencia pessoal   | nivel da conversa (mensagem comum)      | `conversation_level`                 |
+| 8   | preferencia pessoal   | preferencia global (off / modo de som)  | `user_preference`                    |
+| 9   | disponibilidade       | sem subscription de push utilizavel     | `unsupported_or_unavailable_channel` |
+| 10  | estado do coordenador | evento ja entregue                      | `duplicate`                          |
+| 11  | estado do coordenador | cooldown de burst                       | `burst_cooldown`                     |
 
 A ordem **nao muda o resultado** — toda regra subtrai, entao o conjunto final
 independe da ordem. Ela decide qual reason e registrado quando duas regras
 tirariam o mesmo canal, e a leitura util para o operador e essa: um evento fora
 do expediente **e** em conversa silenciada e registrado como
 `outside_work_hours`, porque e a regra que o destinatario nao pode desfazer.
+
+### Versao da policy
+
+`notificationpolicy.Version` e **2** desde a #136.
+
+Ela mudou porque o proprio contrato manda mudar quando um mesmo `Context` pode
+produzir resultado diferente: um `Context` com `ConversationLevelMentionsReplies`
+e uma mensagem comum agora produz supressao onde a versao 1 produzia entrega. Um
+registro de auditoria anterior a esta mudanca nao pode ser lido como se estas
+regras o tivessem decidido.
+
+| Versao | Issue | O que mudou                             |
+| ------ | ----- | --------------------------------------- |
+| 1      | #744  | conjunto de regras original             |
+| 2      | #136  | `denyConversationLevel` entrou na lista |
 
 `preferences_unavailable` (#5) vem antes de `muted` e `user_preference` porque
 substitui as duas: nenhuma delas pode responder por um destinatario cujas
@@ -287,6 +317,269 @@ continua registrada sob aquela razao, e nao sob uma falha que nao mudou nada.
 Falha ao resolver preferencias **nao** bloqueia a mensagem: ela e entregue
 normalmente, apenas as superficies de alerta ficam fail-closed. Ver
 "Preferencia que nao pode ser lida".
+
+`muted` (#6) vem antes de `conversation_level` (#7) porque **mute tem
+precedencia sobre nivel**: um evento silenciado **e** fora do nivel e registrado
+como `muted`, que e a decisao que a pessoa tomou sobre a conversa inteira. O
+nivel tem reason proprio e nao reusa `user_preference`, que e a preferencia
+**global**: o operador precisa distinguir "estreitou esta conversa" de
+"desligou tudo".
+
+## Preferencia por conversa: nivel + mute (#136)
+
+### O modelo, e por que sao duas dimensoes
+
+`chat.conversation_notification_prefs` guarda **duas** coisas independentes:
+
+| Coluna               | Significado                                       |
+| -------------------- | ------------------------------------------------- |
+| `notification_level` | `all` \| `mentions_replies` — o que merece alerta |
+| `muted_at`           | `NULL` = ativa; timestamp = silenciada            |
+
+O modo que a UI mostra e **derivado**, nunca armazenado:
+
+```text
+muted_at IS NOT NULL        -> Silenciado
+notification_level =
+  'mentions_replies'        -> Mencoes e respostas
+caso contrario              -> Todas as mensagens
+```
+
+Um enum unico com os tres valores foi recusado: ele **apaga** a escolha
+anterior. Silenciar `#infraestrutura` pelo menu da sidebar nao pode esquecer que
+a pessoa havia escolhido "Mencoes e respostas" no Perfil, e reativar tem de
+devolver essa escolha — nao o default. Duas colunas fazem o restore sair de
+graca, porque nada nunca sobrescreve a outra.
+
+### Defaults e representacao esparsa
+
+Ausencia de linha significa `all` + nao silenciada. Isso continua valendo:
+
+| Estado                          | Linha        |
+| ------------------------------- | ------------ |
+| `all` + nao silenciada          | **removida** |
+| `mentions_replies` + ativa      | existe       |
+| `all` + silenciada              | existe       |
+| `mentions_replies` + silenciada | existe       |
+
+Uma linha **nao e mais** prova de mute. Toda leitura testa
+`muted_at IS NOT NULL`, e essa e a mudanca que a migration exige de cada
+consumidor: ler a existencia da linha como silencio silenciaria justamente quem
+pediu para continuar ouvindo mencoes.
+
+### Semantica das operacoes
+
+| Operacao          | `notification_level` | `muted_at` |
+| ----------------- | -------------------- | ---------- |
+| `Mute`            | **intocado**         | `now()`    |
+| `Unmute`          | **intocado**         | `NULL`     |
+| `SetLevel(l)`     | `l`                  | `NULL`     |
+| `SetLevel('all')` | linha removida       | —          |
+
+`Mute` nao nomeia `notification_level` na lista de colunas do upsert: a omissao
+**e** a garantia, em SQL. `SetLevel` limpa o mute de proposito — escolher o que
+ouvir e escolher ouvir algo.
+
+### API
+
+Os endpoints de mute da sidebar continuam intactos e com a semantica acima:
+
+```text
+POST   /api/chat/channels/{id}/mute     -> silencia, preserva o nivel
+DELETE /api/chat/channels/{id}/mute     -> reativa, preserva o nivel
+POST   /api/chat/dm/{id}/mute
+DELETE /api/chat/dm/{id}/mute
+```
+
+E ha um contrato canonico para a preferencia completa:
+
+```text
+PUT /api/chat/channels/{id}/notification-preference
+PUT /api/chat/dm/{id}/notification-preference
+
+{ "mode": "all" | "mentions_replies" | "muted" }
+```
+
+`PUT` porque o corpo declara o estado desejado completo: enviar o mesmo modo
+duas vezes e a mesma preferencia. O servidor traduz modo -> colunas; o cliente
+nunca aprende que mute e um timestamp nem que o default e a ausencia de linha.
+O ator vem da sessao e o workspace do contexto server-side — o payload tem um
+unico campo e decodificacao estrita, entao nao existe `user_id` nem
+`workspace_id` para um cliente tentar nomear.
+
+### `#geral`
+
+A regra final e a **opcao A** da issue, e vale server-side:
+
+| Modo               | `#geral`     |
+| ------------------ | ------------ |
+| `all`              | permitido    |
+| `mentions_replies` | permitido    |
+| `muted`            | **proibido** |
+
+O invariante que `#geral` protege e "todo mundo continua alcancavel por nome", e
+`mentions_replies` preserva exatamente isso; silencio nao. A recusa e a mesma de
+antes — `c.is_general = false` na statement de mute — e o statement de nivel
+nao a carrega. A recusa e indistinguivel de "conversa inexistente" e "sem
+acesso": um unico `404` sem enumeracao.
+
+### Rollout: reader-first, writer depois
+
+Producao roda **dois slots** contra **um** banco, e um slot anterior a #136 le
+**qualquer** linha de `chat.conversation_notification_prefs` como mute. Uma
+linha dizendo "mencoes e respostas, nao silenciada" silenciaria essa pessoa no
+slot antigo — uma notificacao perdida por um schema que ela nao conhece.
+
+Entao a entrega e dividida, e a metade que escreve e **desabilitada por
+padrao**:
+
+```text
+CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=false
+```
+
+#### O que a capability faz, e o que ela nao faz
+
+|                               | capability false       | capability true      |
+| ----------------------------- | ---------------------- | -------------------- |
+| leitura de linha granular     | **entende**            | entende              |
+| policy aplica nivel existente | **sim**                | sim                  |
+| `PUT` com `all`               | aceita                 | aceita               |
+| `PUT` com `muted`             | aceita                 | aceita               |
+| `PUT` com `mentions_replies`  | **503**                | aceita               |
+| `/mute` e `/unmute`           | funcionam              | funcionam            |
+| Perfil                        | switch binario da #729 | select de tres modos |
+
+Ela gateia **somente escrita granular**. Todo reader deste build entende o
+modelo novo com a flag em qualquer posicao — e isso e o que torna seguro
+habilitar e depois voltar para o mesmo build: uma linha escrita com o gate
+aberto **mantem** seu significado depois que ele fecha. O gate impede
+_mudancas_ novas; ele nunca reinterpreta uma linha existente como mute.
+
+`all` e `muted` continuam aceitos com o gate fechado porque **ambos sao
+representaveis no modelo antigo**: o default e a ausencia de linha e o mute e
+uma linha. Nenhum dos dois produz algo que o slot antigo leria errado.
+
+#### Onde a recusa mora
+
+`SidebarService.SetConversationNotificationPreference`, antes de resolver o
+workspace e antes de qualquer escrita:
+
+```go
+if mode == NotificationModeMentionsReplies && !s.notificationLevelsEnabled {
+    return domain.ErrConversationNotificationLevelsDisabled
+}
+```
+
+Server-side e estrutural: **nao existe caminho** ate o store para
+`mentions_replies` com o gate fechado. O frontend nao e a protecao — ele le a
+mesma capability pelo payload da sidebar
+(`conversation_notification_levels_enabled`) apenas para nao oferecer um controle
+que o servidor recusaria com 503.
+
+#### FASE 1 — reader-first
+
+1. aplicar `000050` e `000051`;
+2. deployar o build reader-compatible;
+3. `CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=false` (default);
+4. drenar o build anterior;
+5. confirmar que nao resta reader antigo de
+   `chat.conversation_notification_prefs`: slot HTTP, worker de notificacao,
+   conexao WebSocket viva.
+
+Nesse estado: old reader + new reader coexistindo, **nenhum writer granular**,
+portanto nenhuma linha nova que o old reader leia errado.
+
+#### FASE 2 — writer enablement
+
+1. mesmo schema, mesmo build;
+2. `CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED=true`;
+3. validar escrita de `mentions_replies`;
+4. rollback seguro = voltar a flag para `false` **no mesmo build**, que continua
+   lendo corretamente tudo que ja foi persistido.
+
+### Matriz do policy engine
+
+| Preferencia        | Mensagem comum | Mencao  | Resposta | Chamada |
+| ------------------ | -------------- | ------- | -------- | ------- |
+| `all`              | permite        | permite | permite  | permite |
+| `mentions_replies` | **suprime**    | permite | permite  | permite |
+| `muted`            | **suprime**    | suprime | suprime  | suprime |
+
+"Mensagem comum" e `channel_message` ou `direct_message` — os dois tipos sao
+nomeados explicitamente, em vez de mencao/resposta serem excluidas de tudo o
+mais. A diferenca importa para o que nao e nenhum dos dois: uma **chamada** nao
+e mensagem, e um nivel que decide quais mensagens interrompem nao pode calar o
+telefone. Mute, que e o que se usa quando se quer que tudo pare, cala. Uma
+reacao ja e suprimida antes, por `denySilentEventType`.
+
+Um nivel que este build nao reconhece cai no default (`all`), como
+`SoundMode.Effective`: preferencia ilegivel nao pode inventar silencio. A
+direcao fail-closed e outro campo — `Preferences.Status`.
+
+**A preferencia so remove canais.** `TestTheConversationLevelOnlyEverRemoveChannels`
+e `TestConversationLevelNeverReopensADeniedChannel` provam sobre todo o espaco
+de entrada que estreitar uma conversa nunca devolve um canal negado por horario
+de trabalho, duplicata, burst ou conversa aberta.
+
+### Classificacao do evento, e por que ela e por destinatario
+
+O nivel divide "fui nomeado ou respondido" de "alguem postou", e de que lado uma
+mensagem cai **muda por pessoa**: a mesma mensagem e mencao para quem ela nomeia
+e mensagem comum para todos os outros.
+
+No worker de push isso ja vinha resolvido: `chat.notification_outbox.kind` e
+escrito pela propria statement que cria a mensagem (`mention` rank 1, `reply`
+rank 2, `direct_message` rank 3).
+
+No realtime a classificacao e **a mesma funcao**, nao uma segunda
+implementacao: `service.NotificationEventTypeFor` (chat-service,
+`internal/service/notification_event_type.go`). Ela mora ao lado do codec de
+mencao que le, e fora do pacote `app`, precisamente para que a suite de storage
+possa compara-la com o SQL da outbox contra um PostgreSQL real.
+
+Precedencia identica a do CTE da outbox — nomeado, respondido, presente — e
+fatos identicos:
+
+- **mencao**: `service.NamedRecipients`, o codec que decide quem recebe linha em
+  `chat.message_mentions`. Nenhuma busca por `@` em texto, aqui ou no browser;
+- **resposta**: `domain.Message.ReplyToSenderID`, o autor do **parent
+  persistido**. O store o preenche de `parent.sender_id` no mesmo join que a
+  projecao de mensagem ja fazia, antes de qualquer regra de apresentacao tocar o
+  preview — e e o mesmo fato que a outbox le como `parent.sender_id`;
+- `@all` conta como mencao **somente** em grupo/DM, que e o escopo da #776 e o
+  que `all_mention_recipients` aplica com `dc.type = 'group'`.
+
+#### `Quoted` nao decide policy
+
+`domain.Message.Quoted` / `MessagePayload.quoted` e **projecao visual** e nada
+mais: e apagado para mensagem removida, tem o corpo retido para link condenado,
+e esta ausente de toda projecao que nao faz join do parent.
+
+Se a classificacao o lesse, uma resposta cujo parent foi apagado deixaria de ser
+resposta **no realtime** enquanto a outbox continuaria chamando de `reply` — a
+divergencia entre consumidores que este desenho existe para evitar. Por isso o
+fato semantico e `ReplyToSenderID`, que sobrevive a todas essas regras.
+
+**Ausencia de `Quoted` nao muda classificacao.**
+`TestAReplyStaysAReplyWithoutAVisibleQuotePostgreSQL` prova exatamente isso
+contra PostgreSQL real: parent real, DTO visual removido, `reply` nas duas vias.
+Com o fato canonico tambem ausente a mensagem volta a ser comum — o
+classificador le uma autoridade e nao adivinha.
+
+Tratar um `@all` de canal como mencao pessoal aqui faria o realtime permitir um
+alerta que o push classifica como mensagem comum, pelo mesmo motivo.
+
+A equivalencia inteira e contratual, nao presumida:
+`TestRealtimeAndOutboxClassifyTheSameMessageIdenticallyPostgreSQL` e
+`TestAnOrdinaryGroupMessageClassifiesIdenticallyPostgreSQL` executam a statement
+real e comparam, por destinatario, com o que a funcao Go responde.
+
+### Unread nao muda
+
+A preferencia e politica de **alerta**. Uma mensagem comum recebida em
+`mentions_replies` continua persistida, continua contando unread, continua no
+historico e continua visivel. Nada em `notificationpolicy` toca unread, read
+cursor, read receipts, membership ou visibilidade — ver o comentario de pacote.
 
 ## Presenca: qual superficie existe
 
@@ -432,7 +725,7 @@ viaja como dado que o servidor derivou, nao como regra que o cliente reexecuta:
 
 ```json
 "notification_policy": {
-  "policy_version": 1,
+  "policy_version": 2,
   "in_app": "allow",
   "sound": "allow",
   "web_push": "deny",

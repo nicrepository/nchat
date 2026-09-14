@@ -1181,6 +1181,203 @@ require_kustomize() {
   command -v kustomize >/dev/null 2>&1
 }
 
+echo
+echo "--- conversation notification levels (issue #136) ---"
+
+LEVELS_KEY=CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED
+
+# The gate's starting state, and what the pods of each slot currently carry.
+# Separate knobs on purpose: "the ConfigMap says X" and "the running process
+# loaded X" are exactly the two facts this operation exists to reconcile.
+set_levels_state() {
+  local state="$1" configured="$2" blue_env="$3" green_env="$4"
+  mkdir -p "$state/configmap" "$state/pod-env-blue" "$state/pod-env-green"
+  printf '%s' "$configured" >"$state/configmap/$LEVELS_KEY"
+  [[ "$blue_env" == "unset" ]] || printf '%s' "$blue_env" >"$state/pod-env-blue/$LEVELS_KEY"
+  [[ "$green_env" == "unset" ]] || printf '%s' "$green_env" >"$state/pod-env-green/$LEVELS_KEY"
+}
+
+# What the ConfigMap holds after the run.
+configured_level() {
+  cat "$1/configmap/$LEVELS_KEY" 2>/dev/null || printf ''
+}
+
+# Restart requests, one per line, so a case can state which slots were restarted
+# rather than only that something was.
+restarted_deployments() {
+  grep -o 'restart deployment/[a-z-]*' "$1/rollout-log" 2>/dev/null |
+    awk '{ print $2 }' | sort -u
+}
+
+begin "notification-levels reports the configured value and what each slot loaded"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --status || status=$?
+expect_exit 0 "$status"
+grep -q "$LEVELS_KEY=false" "$WORK/out.txt" || fail "the configured value was not reported"
+grep -q "slot blue pods: false" "$WORK/out.txt" || fail "slot blue's loaded value was not reported"
+grep -q "slot green pods: false" "$WORK/out.txt" || fail "slot green's loaded value was not reported"
+# --status is a read: it must change nothing.
+[[ ! -s "$state/rollout-log" ]] || fail "--status restarted something"
+[[ ! -s "$state/configmap-patch-log" ]] || fail "--status patched the ConfigMap"
+pass
+
+begin "notification-levels enables the gate and restarts both slots"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false true true
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+expect_exit 0 "$status"
+assert_equals "configured value" true "$(configured_level "$state")"
+# Both slots, because a cutover promotes whichever one is idle: restarting only
+# the active one would leave the next cutover moving production back.
+assert_equals "restarted deployments" "deployment/chat-service-blue
+deployment/chat-service-green" "$(restarted_deployments "$state")"
+# Only chat-service reads the key.
+grep -q 'restart deployment/auth-service' "$state/rollout-log" && fail "restarted a service that does not read the key"
+# Readiness was waited for, not assumed.
+grep -q 'rollout status deployment/chat-service-blue' "$state/rollout-log" ||
+  fail "did not wait for blue's rollout"
+grep -q 'rollout status deployment/chat-service-green' "$state/rollout-log" ||
+  fail "did not wait for green's rollout"
+pass
+
+begin "notification-levels disables the gate the same way"
+state="$(new_state green "blue green")"
+set_levels_state "$state" true false false
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set false || status=$?
+expect_exit 0 "$status"
+assert_equals "configured value" false "$(configured_level "$state")"
+assert_equals "restarted deployments" "deployment/chat-service-blue
+deployment/chat-service-green" "$(restarted_deployments "$state")"
+pass
+
+# A third value would be written into production and then refused by
+# Config.Validate at the next restart, taking the service down instead of
+# failing the command.
+begin "notification-levels refuses a value that is not a boolean"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+for bad in maybe TRUE 1 ""; do
+  status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set "$bad" || status=$?
+  [[ "$status" -ne 0 ]] || fail "accepted '$bad'"
+done
+assert_equals "configured value" false "$(configured_level "$state")"
+[[ ! -s "$state/rollout-log" ]] || fail "a refused value still restarted something"
+pass
+
+begin "notification-levels requires a mode"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" || status=$?
+[[ "$status" -ne 0 ]] || fail "ran with no mode"
+pass
+
+begin "notification-levels refuses an unexpected kube context"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+printf 'some-other-cluster' >"$state/context"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "ran against the wrong context"
+assert_equals "configured value" false "$(configured_level "$state")"
+[[ ! -s "$state/rollout-log" ]] || fail "restarted something against the wrong context"
+pass
+
+begin "notification-levels refuses a namespace it cannot read"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+printf 'not-found' >"$state/services-list-result"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "ran against an unreadable namespace"
+[[ ! -s "$state/rollout-log" ]] || fail "restarted something without a namespace"
+pass
+
+# Nothing may be restarted after a refused patch: a restart would reload the
+# unchanged value and the run would look successful.
+begin "notification-levels stops, without restarting, when the ConfigMap patch fails"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+printf '1' >"$state/configmap-patch-fails"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "a refused patch was reported as success"
+[[ ! -s "$state/rollout-log" ]] || fail "restarted something after a refused patch"
+pass
+
+begin "notification-levels fails when a rollout does not become Ready"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false true true
+printf '1' >"$state/rollout-fails"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "a failed rollout was reported as success"
+# The ConfigMap already carries the new value, which the message has to say so
+# the operator knows to re-run rather than re-patch.
+assert_equals "configured value" true "$(configured_level "$state")"
+grep -q 're-run this command' "$WORK/err.txt" || fail "the failure does not tell the operator what to do"
+pass
+
+# The stale-slot case: the ConfigMap and the rollout both succeed, but one
+# slot's pods still carry the previous value. A later cutover to that slot would
+# change behaviour with nothing reporting it.
+begin "notification-levels fails when a slot's pods still carry the old value"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false true false
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "a stale slot was reported as success"
+grep -q "stale value" "$WORK/err.txt" || fail "the failure does not name the stale slot problem"
+pass
+
+# A slot scaled to zero has no pod to exec into. That is not a failure — it
+# reads the ConfigMap when it starts — but it must be said, and the other slot
+# must still have been verified.
+begin "notification-levels accepts a slot with no Ready pod and says so"
+state="$(new_state blue blue)"
+set_levels_state "$state" false true unset
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+expect_exit 0 "$status"
+grep -q 'slot green : no Ready pod' "$WORK/out.txt" || fail "the empty slot was not reported"
+grep -q "slot blue : pods carry $LEVELS_KEY=true" "$WORK/out.txt" || fail "the serving slot was not verified"
+pass
+
+# ...but a run that could verify nothing at all proves nothing.
+begin "notification-levels fails when no slot has a Ready pod to verify"
+state="$(new_state blue none)"
+set_levels_state "$state" false unset unset
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+[[ "$status" -ne 0 ]] || fail "reported success with nothing verified"
+grep -q 'nothing was proved to have loaded it' "$WORK/err.txt" ||
+  fail "the failure does not say that nothing was verified"
+pass
+
+# The state between bootstrap and the first release into the other slot: one
+# slot has no Deployment at all. There is nothing there holding a stale value,
+# so the run must succeed and say so rather than failing on a slot that does
+# not exist.
+begin "notification-levels reports a slot that is not deployed and still succeeds"
+state="$(new_state blue blue)"
+set_levels_state "$state" false true unset
+# Undeploy green entirely: no rollout record, no component and no pods, which is
+# what a slot that was never released into looks like.
+rm -f "$state/ready/chat-service-green" "$state/component/chat-service-green" "$state/observed/chat-green"
+status=0; run "$state" "$SCRIPTS/notification-levels.sh" --set true || status=$?
+expect_exit 0 "$status"
+grep -q 'slot green : not deployed' "$WORK/out.txt" || fail "the undeployed slot was not reported"
+assert_equals "restarted deployments" "deployment/chat-service-blue" "$(restarted_deployments "$state")"
+grep -q "slot blue : pods carry $LEVELS_KEY=true" "$WORK/out.txt" || fail "the deployed slot was not verified"
+pass
+
+# The ordinary release path must not touch the gate: enabling it is an
+# operator's separate decision, never a side effect of shipping.
+begin "the ordinary deploy and cutover never touch the notification-levels key"
+state="$(new_state blue "blue green")"
+set_levels_state "$state" false false false
+SMOKE="$(evidence green "$RELEASE_A" "$RELEASE_ID_A")" MANIFEST_DIR="$MANIFEST_A" \
+  run "$state" "$SCRIPTS/cutover.sh" --target green || fail "cutover failed"
+assert_equals "configured value after cutover" false "$(configured_level "$state")"
+[[ ! -s "$state/configmap-patch-log" ]] || fail "cutover patched the ConfigMap"
+pass
+
+# Placed before the Kustomize gate below on purpose: these cases drive only the
+# fake kubectl, so they run wherever the suite runs rather than only where the
+# pinned Kustomize build can be installed.
 if ! require_kustomize; then
   echo "Kustomize is required for production Blue/Green operational tests." >&2
   echo "Install it, or make scripts/deploy/nchat-dev/install-kustomize.sh usable here." >&2

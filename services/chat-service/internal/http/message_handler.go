@@ -32,6 +32,11 @@ const maxBodyBytes = 1 << 16 // 64 KiB
 const (
 	errCodeMaliciousURL         = "malicious_url"
 	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// Its own code, so a client can tell "this deployment has not enabled
+	// granular notification levels yet" from "the sidebar service is missing"
+	// (issue #136). Both are 503; only one of them changes when an operator
+	// opens the rollout gate.
+	errCodeNotificationLevelsUnavailable = "notification_levels_unavailable"
 	// errCodeLinkCheckPending says the links are being scanned right now and
 	// the operation should be retried shortly. It is only ever returned by
 	// editing: creating and forwarding accept the message and withhold it
@@ -1935,6 +1940,12 @@ func mapServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrURLCheckUnavailable):
 		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
 			"the link could not be checked for safety, try again")
+	case errors.Is(err, domain.ErrConversationNotificationLevelsDisabled):
+		// 503 and not 400: the mode is valid and the caller did nothing wrong —
+		// this deployment has not opened the rollout gate yet. The body names
+		// neither the flag nor the environment variable behind it.
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeNotificationLevelsUnavailable,
+			"granular notification levels are not available in this deployment")
 	case errors.Is(err, domain.ErrURLCheckPending):
 		// 409 and not 503: nothing is broken, the scan this request queued is
 		// simply not finished. The already-published version of the message is
