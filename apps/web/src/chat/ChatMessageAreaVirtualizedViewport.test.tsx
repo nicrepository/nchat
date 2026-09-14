@@ -119,7 +119,7 @@ const NON_MESSAGE_ROW_HEIGHT = 40;
 const TOOLBAR_WIDTH_PX = 246;
 const TOOLBAR_HEIGHT_PX = 36;
 /** The gap it keeps from the bubble (MessageToolbar's toolbarGap). */
-const TOOLBAR_GAP_PX = 6;
+const TOOLBAR_GAP_PX = 3;
 
 /**
  * The ordinal in a fixture message id, including the negative ids a prepended
@@ -316,6 +316,16 @@ function installScrollport(): Scrollport {
       y: top,
       toJSON: () => ({}),
     }) as DOMRect;
+  // The bubble sits inside its row, not flush with it: an avatar/sender line
+  // reserves space above it and the row keeps a little below it too, the way
+  // the real CSS does. Real rows stack back to back with no gap between them
+  // (that is what the virtualizer's own translateY offsets do), so without
+  // this a message and the one right after it would report bubbles that
+  // touch exactly — a geometry no real conversation produces, and one the
+  // toolbar's placement (issue #852) would read as no room to sit above the
+  // second one at all.
+  const BUBBLE_INSET_TOP_PX = 34;
+  const BUBBLE_INSET_BOTTOM_PX = 18;
   Element.prototype.getBoundingClientRect = function getBoundingClientRect(this: Element) {
     if (this instanceof HTMLElement) {
       if (this.classList.contains("chat-msg-area__list")) return rectAt(0, VIEWPORT_PX);
@@ -329,7 +339,17 @@ function installScrollport(): Scrollport {
         };
       }
       const row = this.closest<HTMLElement>("[data-index]");
-      if (row) return rectAt(rowStart(row) - scrollTop, rowHeight(row));
+      if (row) {
+        const top = rowStart(row) - scrollTop;
+        const height = rowHeight(row);
+        if (this.classList.contains("chat-msg-area__msg-bubble")) {
+          return rectAt(
+            top + BUBBLE_INSET_TOP_PX,
+            Math.max(0, height - BUBBLE_INSET_TOP_PX - BUBBLE_INSET_BOTTOM_PX),
+          );
+        }
+        return rectAt(top, height);
+      }
     }
     return originalRect.call(this);
   };

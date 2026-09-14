@@ -76,11 +76,31 @@ const messageShell = (page: Page, id: string) => page.locator(`[data-message-id=
 /** Um gap maior do que isto já não lê como "colado à mensagem". */
 const SMALL_GAP_PX = 10;
 
+/**
+ * Onde a toolbar acabou, relativo à própria bolha (issue #852): acima e
+ * abaixo continuam preferidos quando cabem sem tocar a mensagem vizinha: ao
+ * lado é o que sobra quando nenhum dos dois cabe — comum em mensagens de uma
+ * linha, cujo espaço natural até a vizinha costuma ser menor que a toolbar.
+ */
+type PlacementMode = "above" | "below" | "beside";
+
 interface Placement {
-  /** bubble.top - toolbar.bottom: pequeno e estritamente positivo. */
+  mode: PlacementMode;
+  /** Distância até a própria bolha na direção do placement: pequena e > 0. */
   gap: number;
-  /** A relação horizontal com a bolha, medida da mesma forma antes e depois. */
-  horizontal: number;
+  /**
+   * Acima/abaixo: relação horizontal com a bolha. Ao lado: relação vertical
+   * com o centro da bolha. Medida da mesma forma antes e depois de um
+   * prepend, não contra uma regra escrita aqui.
+   */
+  align: number;
+}
+
+/** Classifica onde a toolbar caiu a partir das duas caixas medidas. */
+function classifyPlacement(bubble: Boxes["bubble"], bar: Boxes["bar"]): PlacementMode {
+  if (bar.y + bar.height <= bubble.y + 1) return "above";
+  if (bar.y >= bubble.y + bubble.height - 1) return "below";
+  return "beside";
 }
 
 interface VisibleMessage {
@@ -159,18 +179,30 @@ async function hoverAndRead(page: Page, id: string): Promise<Boxes> {
 }
 
 /**
- * A vertical é um invariante absoluto: a toolbar termina um pouco acima de
- * onde a bolha começa — sem cobrir, sem encostar, sem se afastar. A horizontal
- * é devolvida para ser comparada com a leitura saudável, não com uma regra
- * escrita aqui.
+ * A distância até a própria bolha é um invariante absoluto qualquer que seja
+ * o modo: pequena e estritamente positiva, nunca cobrindo nem se afastando.
+ * O alinhamento é devolvido para ser comparado com a leitura saudável, não
+ * contra uma regra escrita aqui.
  */
 async function hoverAndMeasure(page: Page, id: string, mine: boolean): Promise<Placement> {
   const { bubble, bar } = await hoverAndRead(page, id);
-  const gap = bubble.y - (bar.y + bar.height);
-  expect(gap, `toolbar acima da bolha ${id}, sem encostar`).toBeGreaterThan(0);
+  const mode = classifyPlacement(bubble, bar);
+  if (mode === "beside") {
+    const gap = mine ? bubble.x - (bar.x + bar.width) : bar.x - (bubble.x + bubble.width);
+    expect(gap, `toolbar ao lado da bolha ${id}, sem encostar`).toBeGreaterThan(0);
+    expect(gap, `toolbar próxima da bolha ${id}`).toBeLessThanOrEqual(SMALL_GAP_PX);
+    const midY = bubble.y + bubble.height / 2;
+    return { mode, gap, align: bar.y + bar.height / 2 - midY };
+  }
+  const gap =
+    mode === "above" ? bubble.y - (bar.y + bar.height) : bar.y - (bubble.y + bubble.height);
+  expect(
+    gap,
+    `toolbar ${mode === "above" ? "acima" : "abaixo"} da bolha ${id}, sem encostar`,
+  ).toBeGreaterThan(0);
   expect(gap, `toolbar próxima da bolha ${id}`).toBeLessThanOrEqual(SMALL_GAP_PX);
   const midX = bubble.x + bubble.width / 2;
-  return { gap, horizontal: mine ? bar.x + bar.width - midX : bar.x - midX };
+  return { mode, gap, align: mine ? bar.x + bar.width - midX : bar.x - midX };
 }
 
 /**
@@ -187,10 +219,12 @@ async function scrollBubbleNearTop(page: Page, id: string) {
 }
 
 function expectSamePlacement(actual: Placement, healthy: Placement, label: string) {
-  expect(
-    Math.abs(actual.horizontal - healthy.horizontal),
-    `${label}: horizontal`,
-  ).toBeLessThanOrEqual(1);
+  // The geometry that decides above/below/beside for a given pair of
+  // messages does not change across a prepend (issue #852): only rows
+  // further up the timeline move, never the relation between a message and
+  // its own neighbors, so the mode itself is as stable an invariant as gap.
+  expect(actual.mode, `${label}: mode`).toBe(healthy.mode);
+  expect(Math.abs(actual.align - healthy.align), `${label}: align`).toBeLessThanOrEqual(1);
   expect(Math.abs(actual.gap - healthy.gap), `${label}: gap`).toBeLessThanOrEqual(1);
 }
 
@@ -202,16 +236,13 @@ async function expectPlacementAfterPrepend(
   label: string,
 ) {
   const near = await visibleMessages(page);
-  expectSamePlacement(
-    await hoverAndMeasure(page, pick(near, false), false),
-    healthy.received,
-    `${label}, recebida recém-carregada`,
-  );
-  expectSamePlacement(
-    await hoverAndMeasure(page, pick(near, true), true),
-    healthy.mine,
-    `${label}, própria recém-carregada`,
-  );
+  // A newly-loaded message is not the one `healthy` was measured on, so its
+  // own neighbors decide its mode (issue #852) — comparing it against a
+  // different message's placement would compare geometry that was never
+  // meant to match. `hoverAndMeasure` already proves it is a sane placement
+  // on its own (a small, positive gap, whichever side it landed on).
+  await hoverAndMeasure(page, pick(near, false), false);
+  await hoverAndMeasure(page, pick(near, true), true);
 
   // As mesmas mensagens do começo, agora no fim de uma timeline virtualizada
   // — linhas com `translateY` alto, que é onde o deslocamento era maior.
@@ -250,7 +281,16 @@ async function expectKeyboardReach(page: Page, id: string) {
     .locator(".chat-msg-area__msg-bubble")
     .boundingBox())!;
   const bar = (await toolbar(page).boundingBox())!;
-  expect(bubble.y - (bar.y + bar.height)).toBeGreaterThanOrEqual(0);
+  // Whichever side keyboard focus lands the toolbar on (issue #852), it must
+  // not cover the bubble whose actions it exposes.
+  const mode = classifyPlacement(bubble, bar);
+  if (mode === "above") {
+    expect(bubble.y - (bar.y + bar.height), "sem sobrepor a bolha").toBeGreaterThanOrEqual(0);
+  } else if (mode === "below") {
+    expect(bar.y - (bubble.y + bubble.height), "sem sobrepor a bolha").toBeGreaterThanOrEqual(0);
+  } else {
+    expect(bar.x < bubble.x || bar.x >= bubble.x + bubble.width, "sem sobrepor a bolha").toBe(true);
+  }
 }
 
 interface Conversation {
@@ -286,10 +326,13 @@ async function openConversation(page: Page, testInfo: TestInfo, conversation: Co
 }
 
 test.describe("toolbar de reações após carregar mensagens anteriores (#839)", () => {
-  // Sem espaço acima dentro da lista, a toolbar vai para baixo da bolha — e
-  // continua dentro da lista, nunca sobre o header. A regra é a mesma nos três
-  // tipos de conversa (é o helper compartilhado), então um navegador basta.
-  test("canal: coloca a toolbar abaixo de uma bolha encostada ao topo da lista", async ({
+  // Sem espaço acima dentro da lista, a toolbar não vai para cima da bolha —
+  // e continua dentro da lista, nunca sobre o header. Ela cai para baixo da
+  // bolha quando a mensagem seguinte deixa espaço, ou para o lado quando não
+  // deixa (issue #852); os dois são "não usar a posição superior inválida",
+  // então qualquer um prova a regra. A regra é a mesma nos três tipos de
+  // conversa (é o helper compartilhado), então um navegador basta.
+  test("canal: não coloca a toolbar acima de uma bolha encostada ao topo da lista", async ({
     page,
   }, testInfo) => {
     await openConversation(page, testInfo, conversations[0]);
@@ -304,8 +347,18 @@ test.describe("toolbar de reações após carregar mensagens anteriores (#839)",
 
     const { bubble, bar } = await hoverAndRead(page, id);
     expect(bubble.y - band.y, "bolha visível, encostada ao topo da lista").toBeLessThan(40);
-    expect(bar.y, "toolbar abaixo da bolha").toBeGreaterThan(bubble.y + bubble.height);
-    expect(bar.y - (bubble.y + bubble.height), "perto da bolha").toBeLessThanOrEqual(SMALL_GAP_PX);
+    const mode = classifyPlacement(bubble, bar);
+    expect(mode, "toolbar não fica acima da bolha").not.toBe("above");
+    if (mode === "below") {
+      expect(bar.y - (bubble.y + bubble.height), "perto da bolha").toBeLessThanOrEqual(
+        SMALL_GAP_PX,
+      );
+    } else {
+      expect(
+        bar.y < bubble.y + bubble.height && bar.y + bar.height > bubble.y,
+        "toolbar ao lado, na altura da bolha",
+      ).toBe(true);
+    }
     expect(bar.y, "toolbar dentro da lista").toBeGreaterThanOrEqual(band.y);
     expect(bar.y + bar.height, "toolbar dentro da lista").toBeLessThanOrEqual(band.y + band.height);
   });
@@ -313,10 +366,11 @@ test.describe("toolbar de reações após carregar mensagens anteriores (#839)",
   // Dois prepends com latência de servidor deliberada, por conversa.
   test.setTimeout(120_000);
 
-  // A bubble filling the list has no room for the toolbar above or below it,
-  // and a toolbar squeezed across the message would misattribute its actions:
-  // there is none, and the timeline does not move for the attempt.
-  test("canal: não mostra a toolbar numa mensagem mais alta do que a lista", async ({
+  // A bubble filling the list has no room for the toolbar above or below it —
+  // squeezed across the message, it would misattribute its actions — so it
+  // goes beside it instead (issue #852), clamped within the list and never
+  // crossing the bubble it belongs to.
+  test("canal: coloca a toolbar ao lado de uma mensagem mais alta do que a lista", async ({
     page,
   }, testInfo) => {
     const { targetId } = await openConversation(page, testInfo, conversations[0]);
@@ -331,7 +385,11 @@ test.describe("toolbar de reações após carregar mensagens anteriores (#839)",
     const before = await scrollMetrics(page);
     await page.mouse.move(0, 0);
     await page.mouse.move(bubble.x + bubble.width / 2, band.y + band.height / 2);
-    await expect(toolbar(page)).toHaveCount(0);
+    const bar = (await toolbar(page).boundingBox())!;
+    expect(classifyPlacement(bubble, bar), "toolbar ao lado, não sobre a bolha").toBe("beside");
+    expect(bar.x < bubble.x || bar.x >= bubble.x + bubble.width, "sem sobrepor a bolha").toBe(true);
+    expect(bar.y, "toolbar dentro da lista").toBeGreaterThanOrEqual(band.y);
+    expect(bar.y + bar.height, "toolbar dentro da lista").toBeLessThanOrEqual(band.y + band.height);
     const after = await scrollMetrics(page);
     expect(Math.abs(after.top - before.top), "scrollTop estável").toBeLessThanOrEqual(1);
     expect(Math.abs(after.height - before.height), "scrollHeight estável").toBeLessThanOrEqual(1);
