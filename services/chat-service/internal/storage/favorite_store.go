@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -245,39 +244,22 @@ func (s *PGXFavoriteStore) ListFavorites(ctx context.Context, input ListFavorite
 //
 // Its own function because the row carries the full message column contract —
 // the same one every other message query produces, event columns included — and
-// reading fifteen destinations inline is what pushed ListFavorites over the
-// complexity gate the quality review holds this branch to.
+// reading it inline is what pushed ListFavorites over the complexity gate this
+// branch is held to. The destinations come from messageScanTargets, so the
+// order lives beside messageColumns rather than in a copy here.
 func scanFavoriteRow(rows pgx.Rows) (domain.FavoriteMessage, error) {
 	var fav domain.FavoriteMessage
-	var editedAt, deletedAt *time.Time
-	var eventPayload []byte
+	var opt messageOptionals
 	msg := &fav.Message
-	if err := rows.Scan(
-		&msg.ID, &msg.WorkspaceID,
-		&msg.ChannelID, &msg.DMConversationID,
-		&msg.SenderID,
-		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
-		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-		&editedAt, &msg.EditCount, &deletedAt,
-		&msg.CreatedAt, &msg.UpdatedAt,
-		(*string)(&msg.LinkSafety),
-		&msg.EventType, &eventPayload,
-		(*string)(&msg.Priority),
-		&msg.AcknowledgementRequired,
-		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
-		&msg.IsFavorited,
-		&fav.FavoritedAt,
-	); err != nil {
+
+	dest := messageScanTargets(msg, &opt)
+	dest = append(dest, senderScanTargets(msg)...)
+	dest = append(dest, &fav.FavoritedAt)
+	if err := rows.Scan(dest...); err != nil {
 		return domain.FavoriteMessage{}, fmt.Errorf("scan favorite row: %w", err)
 	}
-	if err := decodeConversationEvent(msg, eventPayload); err != nil {
+	if err := opt.apply(msg); err != nil {
 		return domain.FavoriteMessage{}, err
-	}
-	if editedAt != nil {
-		msg.EditedAt = *editedAt
-	}
-	if deletedAt != nil {
-		msg.DeletedAt = *deletedAt
 	}
 	return fav, nil
 }

@@ -224,87 +224,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	mux.Handle("GET "+RouteDMMentions, authMiddleware(
 		mentionSearchLimiter.Middleware(http.HandlerFunc(messages.SearchDMMentions)),
 	))
-	// Channel creation (RF-01). Registered only when wired, exactly like the DM
-	// routes, so a build without the handler answers 404 rather than a misleading
-	// 503 on a route that does not exist.
-	if channels != nil {
-		mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
-		// Rename (issue #527). PATCH only, and only under the {channelID} segment:
-		// the literal /details, /members and /call-participants below sit under the
-		// same prefix and Go's mux prefers them. Authorization is enforced inside
-		// ChannelService.UpdateChannel — registration grants nothing on its own —
-		// and the write budget is applied in the handler, like the other channel
-		// mutations, so it holds per user rather than per replica.
-		mux.Handle("PATCH "+RouteChannel, authMiddleware(http.HandlerFunc(channels.Rename)))
-		// Self-leave (issue #527). DELETE on the caller's own membership; the
-		// budget is applied inside the handler like the other channel mutations.
-		mux.Handle("DELETE "+RouteChannelMembership, authMiddleware(http.HandlerFunc(channels.Leave)))
-		// Channel details (issue #435) is a read, so it shares the listing budget
-		// rather than the write one: the panel refetches on every channel switch.
-		mux.Handle("GET "+RouteChannelDetails, authMiddleware(
-			msgListLimiter.Middleware(http.HandlerFunc(channels.Details)),
-		))
-		// Call-participant identity resolution (issue #612) carries its own
-		// budget inside the handler, like add-members.
-		mux.Handle("POST "+RouteChannelCallParticipants, authMiddleware(http.HandlerFunc(channels.CallParticipants)))
-		// Add members (issue #398) carries its own budget inside the handler, like
-		// the category mutations. Registered only when the member service is wired
-		// so a partially built service answers 404 for a route it cannot honour.
-		if channels.HasMembers() {
-			mux.Handle("POST "+RouteChannelMembers, authMiddleware(http.HandlerFunc(channels.AddMembers)))
-			// Contextual candidate search (issue #398): its own budget inside the
-			// handler, shared with the workspace-wide search.
-			mux.Handle("GET "+RouteChannelMemberCandidates, authMiddleware(http.HandlerFunc(channels.MemberCandidates)))
-			// Admin removal (issue #685), the counterpart to self-leave above; its own
-			// budget inside the handler, like add-members.
-			mux.Handle("DELETE "+RouteChannelMember, authMiddleware(http.HandlerFunc(channels.RemoveMember)))
-		}
-	}
-	// RF-17 channel categories. Registered only when wired, like the channel and
-	// DM routes, so a build without the handler answers 404 on a route that does
-	// not exist rather than a misleading 503. The listing shares the read budget;
-	// the four mutations carry their own budget inside the handler.
-	if channelCategories != nil {
-		mux.Handle("GET "+RouteChannelCategories, authMiddleware(
-			msgListLimiter.Middleware(http.HandlerFunc(channelCategories.List)),
-		))
-		mux.Handle("POST "+RouteChannelCategories, authMiddleware(http.HandlerFunc(channelCategories.Create)))
-		mux.Handle("PUT "+RouteChannelCategoriesOrder, authMiddleware(http.HandlerFunc(channelCategories.Reorder)))
-		mux.Handle("PATCH "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Rename)))
-		mux.Handle("DELETE "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Delete)))
-	}
-	if directMessages != nil {
-		mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
-		mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
-		mux.Handle("POST "+RouteDMGroupConversations, authMiddleware(http.HandlerFunc(directMessages.CreateGroup)))
-		// Adding participants to an existing group (issue #398). Same shared
-		// add-members budget as the channel route, applied inside the handler.
-		mux.Handle("POST "+RouteDMMembers, authMiddleware(http.HandlerFunc(directMessages.AddParticipants)))
-		// Group rename and self-leave (issue #527). Both are group-only: the
-		// statements behind them require type = 'group', so a 1:1 conversation
-		// ID reaches nothing. Registration grants neither on its own —
-		// participation is re-derived inside each write transaction.
-		mux.Handle("PATCH "+RouteDMConversation, authMiddleware(http.HandlerFunc(directMessages.RenameGroup)))
-		mux.Handle("DELETE "+RouteDMMembership, authMiddleware(http.HandlerFunc(directMessages.LeaveGroup)))
-		// Admin removal (issue #685), the counterpart to self-leave above; its own
-		// budget inside the handler, shared with rename and leave.
-		mux.Handle("DELETE "+RouteDMParticipant, authMiddleware(http.HandlerFunc(directMessages.RemoveParticipant)))
-		mux.Handle("GET "+RouteDMMemberCandidates, authMiddleware(http.HandlerFunc(directMessages.ParticipantCandidates)))
-		// Group details (issue #441) is a read, so it shares the listing budget
-		// rather than the write one: the panel refetches on every conversation
-		// switch.
-		mux.Handle("GET "+RouteDMDetails, authMiddleware(
-			msgListLimiter.Middleware(http.HandlerFunc(directMessages.GroupDetails)),
-		))
-		// The 1:1 profile panel (issue #443) is the same kind of read on the same
-		// resource, so it shares the same budget.
-		mux.Handle("GET "+RouteDMProfile, authMiddleware(
-			msgListLimiter.Middleware(http.HandlerFunc(directMessages.DirectProfile)),
-		))
-		// Call-participant identity resolution (issue #612), group-DM side.
-		// Same budget shape as the channel route above.
-		mux.Handle("POST "+RouteDMCallParticipants, authMiddleware(http.HandlerFunc(directMessages.GroupCallParticipants)))
-	}
+	registerChannelRoutes(mux, authMiddleware, msgListLimiter, channels)
+	registerChannelCategoryRoutes(mux, authMiddleware, msgListLimiter, channelCategories)
+	registerDMRoutes(mux, authMiddleware, msgListLimiter, directMessages)
 
 	// DM message endpoints: GET list, POST create, GET single.
 	mux.Handle("GET "+RouteDMMessages, authMiddleware(
@@ -354,6 +276,14 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 	))
 	mux.Handle("GET "+RouteMessageAcknowledgement, authMiddleware(
 		msgGetSingleLimiter.Middleware(http.HandlerFunc(messages.GetMessageAcknowledgement)),
+	))
+	// Issue #825. The ordinary write budget, like the acknowledgement POST
+	// beside it: stopping one's own reminders is something a sender legitimately
+	// does once per urgent message they sent, it reaches no third party, and it
+	// only ever removes notifications — a budget tight enough to refuse it would
+	// be a budget that keeps people being paged.
+	mux.Handle("DELETE "+RouteMessagePersistentNotifications, authMiddleware(
+		msgPostLimiter.Middleware(http.HandlerFunc(messages.CancelPersistentNotifications)),
 	))
 	mux.Handle("GET "+RouteMessageEditHistory, authMiddleware(
 		msgListLimiter.Middleware(http.HandlerFunc(messages.GetMessageEditHistory)),
@@ -451,6 +381,124 @@ func NewRouter(cfg config.Config, logger *slog.Logger, state ReadinessState, val
 
 	obs := observability.HTTPMiddleware(obsCfg, metrics)
 	return httputil.Recover(httputil.RequestID(httputil.SecurityHeaders(obs(mux))))
+}
+
+// registerChannelRoutes wires the channel surface (RF-01, issues #398, #435,
+// #527, #612, #685).
+//
+// Its own function, like the two below, because the router is a list of route
+// groups and each of these is already one: a self-contained set guarded by
+// whether its handler was wired at all. Keeping them inline made NewRouter's
+// branching the sum of every handler's optionality rather than a description of
+// the service's surface.
+//
+// Registered only when wired, so a build without the handler answers 404 rather
+// than a misleading 503 on a route that does not exist.
+func registerChannelRoutes(
+	mux *http.ServeMux, authMiddleware func(http.Handler) http.Handler,
+	msgListLimiter *UserRateLimiter, channels *ChannelHandler,
+) {
+	if channels == nil {
+		return
+	}
+	// Channel creation (RF-01). Registered only when wired, exactly like the DM
+	// routes, so a build without the handler answers 404 rather than a misleading
+	// 503 on a route that does not exist.
+	mux.Handle("POST "+RouteChannels, authMiddleware(http.HandlerFunc(channels.Create)))
+	// Rename (issue #527). PATCH only, and only under the {channelID} segment:
+	// the literal /details, /members and /call-participants below sit under the
+	// same prefix and Go's mux prefers them. Authorization is enforced inside
+	// ChannelService.UpdateChannel — registration grants nothing on its own —
+	// and the write budget is applied in the handler, like the other channel
+	// mutations, so it holds per user rather than per replica.
+	mux.Handle("PATCH "+RouteChannel, authMiddleware(http.HandlerFunc(channels.Rename)))
+	// Self-leave (issue #527). DELETE on the caller's own membership; the
+	// budget is applied inside the handler like the other channel mutations.
+	mux.Handle("DELETE "+RouteChannelMembership, authMiddleware(http.HandlerFunc(channels.Leave)))
+	// Channel details (issue #435) is a read, so it shares the listing budget
+	// rather than the write one: the panel refetches on every channel switch.
+	mux.Handle("GET "+RouteChannelDetails, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(channels.Details)),
+	))
+	// Call-participant identity resolution (issue #612) carries its own
+	// budget inside the handler, like add-members.
+	mux.Handle("POST "+RouteChannelCallParticipants, authMiddleware(http.HandlerFunc(channels.CallParticipants)))
+	// Add members (issue #398) carries its own budget inside the handler, like
+	// the category mutations. Registered only when the member service is wired
+	// so a partially built service answers 404 for a route it cannot honour.
+	if channels.HasMembers() {
+		mux.Handle("POST "+RouteChannelMembers, authMiddleware(http.HandlerFunc(channels.AddMembers)))
+		// Contextual candidate search (issue #398): its own budget inside the
+		// handler, shared with the workspace-wide search.
+		mux.Handle("GET "+RouteChannelMemberCandidates, authMiddleware(http.HandlerFunc(channels.MemberCandidates)))
+		// Admin removal (issue #685), the counterpart to self-leave above; its own
+		// budget inside the handler, like add-members.
+		mux.Handle("DELETE "+RouteChannelMember, authMiddleware(http.HandlerFunc(channels.RemoveMember)))
+	}
+}
+
+// registerChannelCategoryRoutes wires RF-17's category surface. The listing
+// shares the read budget; the four mutations carry their own budget inside the
+// handler.
+func registerChannelCategoryRoutes(
+	mux *http.ServeMux, authMiddleware func(http.Handler) http.Handler,
+	msgListLimiter *UserRateLimiter, channelCategories *ChannelCategoryHandler,
+) {
+	if channelCategories == nil {
+		return
+	}
+	// RF-17 channel categories. Registered only when wired, like the channel and
+	// DM routes, so a build without the handler answers 404 on a route that does
+	// not exist rather than a misleading 503. The listing shares the read budget;
+	// the four mutations carry their own budget inside the handler.
+	mux.Handle("GET "+RouteChannelCategories, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(channelCategories.List)),
+	))
+	mux.Handle("POST "+RouteChannelCategories, authMiddleware(http.HandlerFunc(channelCategories.Create)))
+	mux.Handle("PUT "+RouteChannelCategoriesOrder, authMiddleware(http.HandlerFunc(channelCategories.Reorder)))
+	mux.Handle("PATCH "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Rename)))
+	mux.Handle("DELETE "+RouteChannelCategory, authMiddleware(http.HandlerFunc(channelCategories.Delete)))
+}
+
+// registerDMRoutes wires the direct-message and group surface (issues #398,
+// #443, #527, #612, #685).
+func registerDMRoutes(
+	mux *http.ServeMux, authMiddleware func(http.Handler) http.Handler,
+	msgListLimiter *UserRateLimiter, directMessages *DMHandler,
+) {
+	if directMessages == nil {
+		return
+	}
+	mux.Handle("GET "+RouteDMCandidates, authMiddleware(http.HandlerFunc(directMessages.SearchCandidates)))
+	mux.Handle("POST "+RouteDMConversations, authMiddleware(http.HandlerFunc(directMessages.GetOrCreateDirect)))
+	mux.Handle("POST "+RouteDMGroupConversations, authMiddleware(http.HandlerFunc(directMessages.CreateGroup)))
+	// Adding participants to an existing group (issue #398). Same shared
+	// add-members budget as the channel route, applied inside the handler.
+	mux.Handle("POST "+RouteDMMembers, authMiddleware(http.HandlerFunc(directMessages.AddParticipants)))
+	// Group rename and self-leave (issue #527). Both are group-only: the
+	// statements behind them require type = 'group', so a 1:1 conversation
+	// ID reaches nothing. Registration grants neither on its own —
+	// participation is re-derived inside each write transaction.
+	mux.Handle("PATCH "+RouteDMConversation, authMiddleware(http.HandlerFunc(directMessages.RenameGroup)))
+	mux.Handle("DELETE "+RouteDMMembership, authMiddleware(http.HandlerFunc(directMessages.LeaveGroup)))
+	// Admin removal (issue #685), the counterpart to self-leave above; its own
+	// budget inside the handler, shared with rename and leave.
+	mux.Handle("DELETE "+RouteDMParticipant, authMiddleware(http.HandlerFunc(directMessages.RemoveParticipant)))
+	mux.Handle("GET "+RouteDMMemberCandidates, authMiddleware(http.HandlerFunc(directMessages.ParticipantCandidates)))
+	// Group details (issue #441) is a read, so it shares the listing budget
+	// rather than the write one: the panel refetches on every conversation
+	// switch.
+	mux.Handle("GET "+RouteDMDetails, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(directMessages.GroupDetails)),
+	))
+	// The 1:1 profile panel (issue #443) is the same kind of read on the same
+	// resource, so it shares the same budget.
+	mux.Handle("GET "+RouteDMProfile, authMiddleware(
+		msgListLimiter.Middleware(http.HandlerFunc(directMessages.DirectProfile)),
+	))
+	// Call-participant identity resolution (issue #612), group-DM side.
+	// Same budget shape as the channel route above.
+	mux.Handle("POST "+RouteDMCallParticipants, authMiddleware(http.HandlerFunc(directMessages.GroupCallParticipants)))
 }
 
 func unavailableWSHandler() http.Handler {

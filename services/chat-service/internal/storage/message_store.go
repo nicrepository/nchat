@@ -136,6 +136,21 @@ type CreateMessageInput struct {
 	// same commit as the message — a caller cannot name them, add one or leave
 	// one out.
 	AcknowledgementRequired bool
+	// PersistentNotifications asks this urgent message to keep reminding every
+	// recipient who has neither confirmed nor answered it (issue #825).
+	//
+	// Like AcknowledgementRequired it is the whole of the caller's say: the
+	// recipients are derived by the statement below from membership, and the
+	// schedule — when the first reminder is due, how far apart they are and how
+	// many there may be — is decided by the server from
+	// notificationevent.UrgentReminderInterval and MaxUrgentReminders. There is
+	// no field here for an interval, a deadline or an attempt count, so none of
+	// them is a value a request can carry.
+	//
+	// The service refuses it on a message that is not urgent
+	// (domain.ValidatePersistentNotifications) and
+	// messages_persistent_notifications_priority_check refuses it again.
+	PersistentNotifications bool
 
 	// LinkSafetyState is derived by the service from the same verdict snapshot as
 	// Status. Empty is correct for linkless and withheld messages; a cached-safe
@@ -629,7 +644,110 @@ func messageColumns(alias string) string {
 	COALESCE(` + p + `event_type, ''),
 	COALESCE(` + p + `event_payload, '{}'::jsonb),
 	` + p + `priority,
-	` + p + `acknowledgement_required`
+	` + p + `acknowledgement_required,
+	` + p + `persistent_notifications`
+}
+
+// ── the Go side of the column contract ──────────────────────────────────────
+//
+// messageColumns states the column order in SQL; these state the same order in
+// Go. Four readers scan that projection — the single-row read, the batch read,
+// the favourites listing and the pins listing — and before this they each
+// carried their own copy of the destination list, so every column added to the
+// contract had to be added, in the right position, in four places. Adding
+// issue #825's flag is what made that concrete: four edits, in lockstep, none of
+// which the compiler could check.
+//
+// Reading them beside messageColumns is the whole point: one function per SQL
+// fragment, in the same order, so a column added to one has an obvious home in
+// the other and a mismatch is a short diff rather than an archaeology exercise.
+
+// messageOptionals holds the columns that arrive nullable or encoded and cannot
+// be scanned straight into domain.Message.
+type messageOptionals struct {
+	editedAt     *time.Time
+	deletedAt    *time.Time
+	eventPayload []byte
+}
+
+// apply moves them onto the message once the row has been scanned.
+func (o *messageOptionals) apply(msg *domain.Message) error {
+	if err := decodeConversationEvent(msg, o.eventPayload); err != nil {
+		return err
+	}
+	if o.editedAt != nil {
+		msg.EditedAt = *o.editedAt
+	}
+	if o.deletedAt != nil {
+		msg.DeletedAt = *o.deletedAt
+	}
+	return nil
+}
+
+// messageScanTargets is the Go side of messageColumns: one destination per
+// column, in the same order.
+func messageScanTargets(msg *domain.Message, opt *messageOptionals) []any {
+	return []any{
+		&msg.ID, &msg.WorkspaceID,
+		&msg.ChannelID, &msg.DMConversationID,
+		&msg.SenderID,
+		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
+		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
+		&opt.editedAt, &msg.EditCount, &opt.deletedAt,
+		&msg.CreatedAt, &msg.UpdatedAt,
+		(*string)(&msg.LinkSafety),
+		&msg.EventType, &opt.eventPayload,
+		(*string)(&msg.Priority),
+		&msg.AcknowledgementRequired,
+		&msg.PersistentNotifications,
+	}
+}
+
+// senderScanTargets is the Go side of the four columns listMessageColumns adds.
+func senderScanTargets(msg *domain.Message) []any {
+	return []any{
+		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
+		&msg.IsFavorited,
+	}
+}
+
+// quoteOptionals is messageOptionals for the quoted message.
+type quoteOptionals struct {
+	deletedAt *time.Time
+	createdAt *time.Time
+	updatedAt *time.Time
+}
+
+// attach folds the quote onto the message, or leaves it absent.
+//
+// An empty id is how the projection reports "this message quotes nothing": the
+// LEFT JOIN produced no row and every column came back COALESCEd. The three
+// instants are only meaningful once there is a quote, which is why they are
+// applied here rather than at scan time.
+func (o *quoteOptionals) attach(msg *domain.Message, quote domain.QuotedMessage) {
+	if quote.ID == "" {
+		return
+	}
+	if o.deletedAt != nil {
+		quote.DeletedAt = *o.deletedAt
+	}
+	if o.createdAt != nil {
+		quote.CreatedAt = *o.createdAt
+	}
+	if o.updatedAt != nil {
+		quote.UpdatedAt = *o.updatedAt
+	}
+	msg.Quoted = &quote
+}
+
+// quoteScanTargets is the Go side of quotedMessageColumns.
+func quoteScanTargets(quote *domain.QuotedMessage, opt *quoteOptionals) []any {
+	return []any{
+		&quote.ID, &quote.AuthorID, &quote.BodyText,
+		(*string)(&quote.BodyFormat), (*string)(&quote.Status),
+		&opt.deletedAt, &opt.createdAt, &opt.updatedAt,
+		(*string)(&quote.LinkSafety),
+	}
 }
 
 // listMessageColumns returns messageColumns plus sender display info from
@@ -684,53 +802,21 @@ func scanMessageWithSenderAndQuote(row pgx.Row) (domain.Message, error) {
 
 func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Message, error) {
 	var msg domain.Message
-	var editedAt, deletedAt *time.Time
 	var quote domain.QuotedMessage
-	var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
-	var eventPayload []byte
-	destinations := []any{
-		&msg.ID, &msg.WorkspaceID,
-		&msg.ChannelID, &msg.DMConversationID,
-		&msg.SenderID,
-		(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
-		&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-		&editedAt, &msg.EditCount, &deletedAt,
-		&msg.CreatedAt, &msg.UpdatedAt,
-		(*string)(&msg.LinkSafety),
-		&msg.EventType, &eventPayload,
-		(*string)(&msg.Priority),
-		&msg.AcknowledgementRequired,
-		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
-		&msg.IsFavorited,
-		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
-		&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
-	}
+	var opt messageOptionals
+	var quoteOpt quoteOptionals
+
+	destinations := messageScanTargets(&msg, &opt)
+	destinations = append(destinations, senderScanTargets(&msg)...)
+	destinations = append(destinations, quoteScanTargets(&quote, &quoteOpt)...)
 	destinations = append(destinations, extra...)
-	err := row.Scan(destinations...)
-	if err != nil {
+	if err := row.Scan(destinations...); err != nil {
 		return domain.Message{}, err
 	}
-	if err := decodeConversationEvent(&msg, eventPayload); err != nil {
+	if err := opt.apply(&msg); err != nil {
 		return domain.Message{}, err
 	}
-	if editedAt != nil {
-		msg.EditedAt = *editedAt
-	}
-	if deletedAt != nil {
-		msg.DeletedAt = *deletedAt
-	}
-	if quote.ID != "" {
-		if quoteDeletedAt != nil {
-			quote.DeletedAt = *quoteDeletedAt
-		}
-		if quoteCreatedAt != nil {
-			quote.CreatedAt = *quoteCreatedAt
-		}
-		if quoteUpdatedAt != nil {
-			quote.UpdatedAt = *quoteUpdatedAt
-		}
-		msg.Quoted = &quote
-	}
+	quoteOpt.attach(&msg, quote)
 	return msg, nil
 }
 
@@ -1106,7 +1192,13 @@ var createMessageQuery = `
 			FROM eligible_all_mention_recipients
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_all_mention_fanout)
 		),
-		-- The recipients this send would ask, taken once (issue #824).
+		-- The recipients this send would ask, taken once (issues #824, #825).
+		--
+		-- One set for two features. A message asks for confirmation, or it asks
+		-- to keep reminding, or both, and in every case the people concerned are
+		-- the same: the conversation's eligible members at the instant of the
+		-- send. Deriving them twice would be two snapshots of one fact, and the
+		-- bound below would be applied to one of them and not the other.
 		--
 		-- This CTE is the whole of the bound's atomicity. Everything downstream
 		-- reads it — the refusal below and the rows that materialise the request —
@@ -1121,11 +1213,13 @@ var createMessageQuery = `
 		-- only two answers either decision needs, so an enormous channel costs the
 		-- same to judge as a barely-oversized one.
 		--
-		-- A send that asks for nothing produces no rows here at all: the guard is
-		-- inside the scan, so an ordinary message never walks a member list.
+		-- A send that asks for nothing — neither confirmation nor reminders —
+		-- produces no rows here at all: the guard is inside the scan, so an
+		-- ordinary message never walks a member list.
 		eligible_acknowledgement_recipients AS (
 			SELECT recipient_id
-			FROM (` + acknowledgementRecipientsSQL("$24::boolean", "$1", "$2", "$3", "$4") + `
+			FROM (` + acknowledgementRecipientsSQL(
+	"($24::boolean OR $26::boolean)", "$1", "$2", "$3", "$4") + `
 			) candidate
 			LIMIT $25::int + 1
 		),
@@ -1155,10 +1249,11 @@ var createMessageQuery = `
 				 parent_message_id, forwarded_from_message_id, referenced_message_id,
 				 create_idempotency_key, create_request_fingerprint, link_safety_state,
 				 link_safety_fingerprint,
-				 link_safety_projection_version, priority, acknowledgement_required)
+				 link_safety_projection_version, priority, acknowledgement_required,
+				 persistent_notifications)
 			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
 			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), $19::text,
-			       NULLIF($17, ''), 1, $23::text, $24::boolean
+			       NULLIF($17, ''), 1, $23::text, $24::boolean, $26::boolean
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -1198,9 +1293,23 @@ var createMessageQuery = `
 			          -- are still projected because the outer SELECT reads this CTE
 			          -- through messageColumns, which names them (issue #527).
 			          event_type, event_payload,
-			          priority, acknowledgement_required
+			          priority, acknowledgement_required, persistent_notifications
 		),
-		-- The recipients this message asks to confirm receipt (issue #824).
+		-- The per-recipient state of everything this message asks for
+		-- (issues #824, #825).
+		--
+		-- One row per person, carrying the state machine #820 specifies:
+		-- pending until they confirm, answer, are cancelled, or their reminders
+		-- run out. A message that asked for confirmation and a message that asked
+		-- to keep reminding write the same rows, because "is this person still
+		-- waiting" is one question and a second table would be a second answer to
+		-- it — one that every transition #824 already writes would have to be
+		-- mirrored into.
+		--
+		-- The counts #824 reports are gated on acknowledgement_required at read
+		-- time (see acknowledgement_store.go), so a message that only asked for
+		-- reminders still answers that endpoint with zeros and no viewer state,
+		-- exactly as it did before this column existed.
 		--
 		-- Written in the statement that writes the message, so "the message
 		-- exists" and "these people were asked" are one commit: there is no
@@ -1229,16 +1338,44 @@ var createMessageQuery = `
 		-- mutually exclusive, since a message has either a channel or a
 		-- conversation and never both.
 		acknowledgement_rows AS (
-			INSERT INTO chat.message_acknowledgements (message_id, recipient_id)
-			SELECT inserted.id, r.recipient_id
+			INSERT INTO chat.message_acknowledgements
+				(message_id, recipient_id, next_reminder_at)
+			SELECT inserted.id, r.recipient_id,
+			       -- The first reminder, and the only one this statement
+			       -- schedules (issue #825). Everything after it is decided by
+			       -- the notification worker, which advances this column as it
+			       -- goes; the send's job is to start the clock.
+			       --
+			       -- NULL unless the author asked for reminders, which is what
+			       -- keeps this column's index the size of the live reminders
+			       -- rather than the size of every acknowledgement ever recorded.
+			       --
+			       -- NULL for a withheld message too, on the same terms as
+			       -- notification_outbox_rows below: a message nobody may see yet
+			       -- must produce no side effect aimed at its recipients, and a
+			       -- reminder is the loudest one there is. ResolveDecidedMessages
+			       -- starts the clock when the message is published, so the five
+			       -- minutes are counted from the moment it became visible rather
+			       -- than from the moment it was typed.
+			       CASE WHEN $26::boolean AND inserted.status = 'active'
+			            THEN inserted.created_at + ($27 * interval '1 second') END
 			FROM inserted
 			CROSS JOIN acknowledgement_recipients r
 			ON CONFLICT DO NOTHING
 			RETURNING recipient_id
 		),
-		-- A reply resolves the replier's own pending request (issue #824,
-		-- policy from #820): somebody who wrote back has answered, and
-		-- continuing to ask them is the reminder loop #825 exists to stop.
+		-- A reply resolves the replier's own pending request (issues #824 and
+		-- #825, policy from #820): somebody who wrote back has answered, and
+		-- continuing to ask them is the reminder loop this ends.
+		--
+		-- It ends that one recipient's reminders and nobody else's, which is
+		-- what the primary key already guarantees: the predicate names the
+		-- replier's own row, so the other recipients of a group message are not
+		-- reached by this statement at all and keep being reminded.
+		--
+		-- next_reminder_at is cleared in the same write as the state, so the row
+		-- leaves idx_message_acknowledgements_due at the instant it stops being
+		-- pending rather than at the scheduler's next pass.
 		--
 		-- state = 'pending' is the whole guard. It is a compare-and-set against
 		-- the row this statement locks, so a reply racing an acknowledgement or
@@ -1254,7 +1391,7 @@ var createMessageQuery = `
 		-- recorded as having answered costs the sender the truth.
 		answered_acknowledgement AS (
 			UPDATE chat.message_acknowledgements a
-			SET state = 'responded', resolved_at = now()
+			SET state = 'responded', resolved_at = now(), next_reminder_at = NULL
 			FROM inserted
 			WHERE inserted.status = 'active'
 			  AND a.message_id = $8::uuid
@@ -1522,6 +1659,13 @@ func createMessageArgs(input CreateMessageInput) []any {
 		string(input.Priority),
 		input.AcknowledgementRequired,
 		domain.MaxAcknowledgementRecipients,
+		input.PersistentNotifications,
+		// The reminder interval, in seconds, so the Go constant stays the only
+		// place five minutes is written down. Bound rather than inlined for the
+		// same reason MaxAcknowledgementRecipients above is: a literal in the
+		// statement would be a second definition, and the one that drifts is
+		// whichever nobody is looking at.
+		notificationevent.UrgentReminderInterval.Seconds(),
 	}
 }
 
@@ -1730,6 +1874,12 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          -- anyone, and would create their rows from a forward the
 			          -- original sender cannot see.
 			          acknowledgement_required,
+			          -- Never copied, on exactly the terms above: reminders are a
+			          -- policy the original author chose for the people they sent
+			          -- to, and inheriting it would make forwarding a way to start
+			          -- a reminder loop against a second audience in somebody
+			          -- else's name.
+			          persistent_notifications,
 			          (xmax <> 0) AS replayed
 		),
 		-- RF-21, same atomicity argument as CreateMessage's: the withheld
@@ -2044,7 +2194,10 @@ func applyMessageDeletion(
 	if tag.RowsAffected() != 1 {
 		return domain.ErrNotFound
 	}
-	// Withdrawing the message withdraws the question (issue #824).
+	// Withdrawing the message withdraws the question (issue #824) and stops the
+	// reminders that were asking it (issue #825). next_reminder_at is cleared in
+	// the same statement as the state, so a deleted message cannot leave a row
+	// in the due-reminder index for the scheduler to find.
 	// state = 'pending' keeps this a compare-and-set: an acknowledgement or a
 	// reply that committed first stands, and is not rewritten into a
 	// cancellation that would tell the sender nobody answered.
@@ -2054,7 +2207,7 @@ func applyMessageDeletion(
 	// four people had already confirmed it.
 	if _, err := tx.Exec(ctx, `
 		UPDATE chat.message_acknowledgements
-		SET state = 'cancelled', resolved_at = $2
+		SET state = 'cancelled', resolved_at = $2, next_reminder_at = NULL
 		WHERE message_id = $1 AND state = 'pending'`,
 		input.MessageID, databaseNow,
 	); err != nil {
@@ -2909,55 +3062,9 @@ func doCollectMessagesResult(rows messageRows, limit int, withSender bool) (List
 func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]domain.Message, error) {
 	var messages []domain.Message
 	for rows.Next() {
-		var msg domain.Message
-		var editedAt, deletedAt *time.Time
-		var quote domain.QuotedMessage
-		var quoteDeletedAt, quoteCreatedAt, quoteUpdatedAt *time.Time
-		var eventPayload []byte
-		dest := []any{
-			&msg.ID, &msg.WorkspaceID,
-			&msg.ChannelID, &msg.DMConversationID,
-			&msg.SenderID,
-			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
-			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-			&editedAt, &msg.EditCount, &deletedAt,
-			&msg.CreatedAt, &msg.UpdatedAt,
-			(*string)(&msg.LinkSafety),
-			&msg.EventType, &eventPayload,
-			(*string)(&msg.Priority),
-			&msg.AcknowledgementRequired,
-		}
-		if withSender {
-			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL, &msg.IsFavorited)
-			dest = append(dest,
-				&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
-				&quoteDeletedAt, &quoteCreatedAt, &quoteUpdatedAt, (*string)(&quote.LinkSafety),
-			)
-		}
-		err := rows.Scan(dest...)
+		msg, err := scanListedMessage(rows, withSender)
 		if err != nil {
-			return nil, fmt.Errorf("scan message row: %w", err)
-		}
-		if err := decodeConversationEvent(&msg, eventPayload); err != nil {
 			return nil, err
-		}
-		if editedAt != nil {
-			msg.EditedAt = *editedAt
-		}
-		if deletedAt != nil {
-			msg.DeletedAt = *deletedAt
-		}
-		if quote.ID != "" {
-			if quoteDeletedAt != nil {
-				quote.DeletedAt = *quoteDeletedAt
-			}
-			if quoteCreatedAt != nil {
-				quote.CreatedAt = *quoteCreatedAt
-			}
-			if quoteUpdatedAt != nil {
-				quote.UpdatedAt = *quoteUpdatedAt
-			}
-			msg.Quoted = &quote
 		}
 		messages = append(messages, msg)
 	}
@@ -2965,4 +3072,31 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 		return nil, fmt.Errorf("iterate message rows: %w", err)
 	}
 	return messages, nil
+}
+
+// scanListedMessage reads one row of a listing.
+//
+// withSender says which projection produced the row: listMessageWithQuoteColumns
+// when true, the bare messageColumns when false. The two destination lists are
+// the same prefix, which is why the branch is one append rather than two
+// separate scans.
+func scanListedMessage(rows messageRows, withSender bool) (domain.Message, error) {
+	var msg domain.Message
+	var quote domain.QuotedMessage
+	var opt messageOptionals
+	var quoteOpt quoteOptionals
+
+	dest := messageScanTargets(&msg, &opt)
+	if withSender {
+		dest = append(dest, senderScanTargets(&msg)...)
+		dest = append(dest, quoteScanTargets(&quote, &quoteOpt)...)
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return domain.Message{}, fmt.Errorf("scan message row: %w", err)
+	}
+	if err := opt.apply(&msg); err != nil {
+		return domain.Message{}, err
+	}
+	quoteOpt.attach(&msg, quote)
+	return msg, nil
 }

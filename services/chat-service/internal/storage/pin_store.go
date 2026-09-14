@@ -3,7 +3,8 @@ package storage
 import (
 	"context"
 	"fmt"
-	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
@@ -205,49 +206,18 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 	sawRow := false
 	for rows.Next() {
 		sawRow = true
-		var pin domain.PinnedMessage
-		var allowed, hasPin bool
-		var editedAt, deletedAt *time.Time
-		var eventPayload []byte
-		var rowTotal int
-		msg := &pin.Message
-		if err := rows.Scan(
-			&allowed, &hasPin,
-			&msg.ID, &msg.WorkspaceID,
-			&msg.ChannelID, &msg.DMConversationID,
-			&msg.SenderID,
-			(*string)(&msg.Kind), &msg.BodyText, (*string)(&msg.BodyFormat), (*string)(&msg.Status),
-			&msg.ParentMessageID, &msg.ForwardedFromMessageID, &msg.ReferencedMessageID,
-			&editedAt, &msg.EditCount, &deletedAt,
-			&msg.CreatedAt, &msg.UpdatedAt,
-			(*string)(&msg.LinkSafety),
-			&msg.EventType, &eventPayload,
-			(*string)(&msg.Priority),
-			&msg.AcknowledgementRequired,
-			&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
-			&msg.IsFavorited,
-			&pin.PinnedAt, &pin.PinnedByUserID,
-			&rowTotal,
-		); err != nil {
-			return ListPinsResult{}, fmt.Errorf("scan pin row: %w", err)
-		}
-		if err := decodeConversationEvent(msg, eventPayload); err != nil {
+		row, err := scanPinRow(rows)
+		if err != nil {
 			return ListPinsResult{}, err
 		}
-		if !allowed {
+		if !row.allowed {
 			return ListPinsResult{}, domain.ErrNotFound
 		}
-		if !hasPin {
+		if !row.hasPin {
 			continue
 		}
-		total = rowTotal
-		if editedAt != nil {
-			msg.EditedAt = *editedAt
-		}
-		if deletedAt != nil {
-			msg.DeletedAt = *deletedAt
-		}
-		pins = append(pins, pin)
+		total = row.total
+		pins = append(pins, row.pin)
 	}
 	if err := rows.Err(); err != nil {
 		return ListPinsResult{}, fmt.Errorf("iterate pin rows: %w", err)
@@ -256,4 +226,41 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 		return ListPinsResult{}, domain.ErrNotFound
 	}
 	return ListPinsResult{Pins: pins, TotalCount: total}, nil
+}
+
+// pinRow is one row of the pins listing: the authorization answer the statement
+// carries on every row, whether this particular row is a pin at all, the pin
+// itself, and the total the window function computed.
+//
+// The three flags travel together because the statement emits them together —
+// a caller that may not read the target still gets a row, and that is how the
+// refusal is reported without a second query.
+type pinRow struct {
+	allowed bool
+	hasPin  bool
+	pin     domain.PinnedMessage
+	total   int
+}
+
+// scanPinRow reads one row of the pins listing.
+//
+// The message destinations come from messageScanTargets, so the column order
+// lives once beside messageColumns rather than in a copy here; this function
+// adds only the columns the pins projection puts around it.
+func scanPinRow(rows pgx.Rows) (pinRow, error) {
+	var row pinRow
+	var opt messageOptionals
+	msg := &row.pin.Message
+
+	dest := []any{&row.allowed, &row.hasPin}
+	dest = append(dest, messageScanTargets(msg, &opt)...)
+	dest = append(dest, senderScanTargets(msg)...)
+	dest = append(dest, &row.pin.PinnedAt, &row.pin.PinnedByUserID, &row.total)
+	if err := rows.Scan(dest...); err != nil {
+		return pinRow{}, fmt.Errorf("scan pin row: %w", err)
+	}
+	if err := opt.apply(msg); err != nil {
+		return pinRow{}, err
+	}
+	return row, nil
 }

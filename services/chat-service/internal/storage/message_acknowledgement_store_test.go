@@ -19,22 +19,24 @@ import (
 // against a real database.
 
 // acknowledgementColumnIndex is where the flag sits in the shared message
-// column contract: last of messageColumns, after issue #821's priority. Derived
-// rather than written down, so a projection that grows again moves this with it.
-func acknowledgementColumnIndex() int { return len(messageCols()) - 1 }
+// column contract: after issue #821's priority and before issue #825's
+// persistent-notifications flag. Derived rather than written down, so a
+// projection that grows again moves this with it.
+func acknowledgementColumnIndex() int { return len(messageCols()) - 2 }
 
 // expectCreateWithAcknowledgement is expectCreate with $24 pinned instead of
 // matched loosely: this is the assertion that the author's request actually
 // reaches the statement rather than being dropped between the service and the
 // bind list.
 func expectCreateWithAcknowledgement(mock pgxmock.PgxPoolIface, required bool, rows *pgxmock.Rows) {
-	args := make([]any, 0, 25)
+	args := make([]any, 0, 27)
 	for range 23 {
 		args = append(args, pgxmock.AnyArg())
 	}
 	// $24 is the request this test is about; $25 is the bound it is judged
-	// against, matched loosely because it is a constant and not what is asserted.
-	args = append(args, required, pgxmock.AnyArg())
+	// against and $26-$27 are issue #825's flag and interval, all matched
+	// loosely because none of them is what is asserted here.
+	args = append(args, required, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg())
 	mock.ExpectQuery(createMsgSQL).WithArgs(args...).WillReturnRows(rows)
 }
 
@@ -244,8 +246,8 @@ func ptrTo(s string) *string { return &s }
 // the tests that are about the SQL's shape rather than about what it is bound
 // with.
 func anyCreateArgs() []any {
-	args := make([]any, 0, 25)
-	for range 25 {
+	args := make([]any, 0, 27)
+	for range 27 {
 		args = append(args, pgxmock.AnyArg())
 	}
 	return args

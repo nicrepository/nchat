@@ -79,6 +79,10 @@ const NOTIFICATION_TITLES = new Map([
   ["channel_message", "Nova mensagem em um canal do NChat"],
   ["reaction", "Nova reação na sua mensagem"],
   ["call", "Chamada no NChat"],
+  // Issue #825. A reminder is the same urgent message asking again, so the copy
+  // says that rather than announcing something new: the recipient has already
+  // been told once and is being told that it is still waiting for them.
+  ["urgent_reminder", "Mensagem urgente ainda aguarda você no NChat"],
 ]);
 
 /** An event type this build does not know about is still a real notification. */

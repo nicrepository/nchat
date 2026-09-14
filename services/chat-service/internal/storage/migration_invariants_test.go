@@ -1194,3 +1194,99 @@ func TestChatMigration_AcknowledgementDownReversesTheUp(t *testing.T) {
 		t.Error("000049 down must drop the referencing table before the column it was added beside")
 	}
 }
+
+// Issue #825. The persistent reminder schema's load-bearing properties: an
+// intent flag that cannot be set on a message that is not urgent, a schedule
+// column whose resting value is NULL so the index it feeds is the size of the
+// live reminders, and the removal of the legacy unique constraint that would
+// otherwise cap every message at exactly one reminder.
+func TestChatMigration_PersistentNotificationsHoldTheirOwnInvariants(t *testing.T) {
+	up := readChatMigration(t, "000050_persistent_urgent_notifications.up.sql")
+	for _, expected := range []string{
+		// The backfill is the column default: every message written before this
+		// migration asked for no reminders, and the schema says so.
+		"ADD COLUMN persistent_notifications BOOLEAN NOT NULL DEFAULT false",
+		// #820: reminders exist only for an urgent message, and the database is
+		// the last line rather than the only one.
+		"CHECK (NOT persistent_notifications OR priority = 'urgent')",
+		// The schedule and the bound on it. Nullable on purpose — NULL is the
+		// resting state and is what keeps the row out of the index below.
+		"ADD COLUMN next_reminder_at TIMESTAMPTZ",
+		"reminder_count   SMALLINT NOT NULL DEFAULT 0",
+		// The due-reminder queue, partial over exactly the scheduler's predicate.
+		"CREATE INDEX idx_message_acknowledgements_due",
+		"WHERE state = 'pending' AND next_reminder_at IS NOT NULL",
+		// A reminder is a notification, so the outbox has to accept its type.
+		"'urgent_reminder'",
+		// The expand window 000042 opened closes here: the legacy unique over
+		// (message_id, recipient_user_id, kind) would cap a message at one
+		// reminder, absorbing every later one as a duplicate of the first.
+		"DROP CONSTRAINT notification_outbox_message_recipient_unique",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000050 missing %q", expected)
+		}
+	}
+	// No backfill and no rewrite of either table: both additions are boolean or
+	// defaulted columns, which PostgreSQL records in the catalogue.
+	if strings.Contains(up, "UPDATE chat.messages") {
+		t.Error("000050 must not rewrite chat.messages; the column default covers existing rows")
+	}
+	// Every constraint arrives NOT VALID, so the scan happens under 000051's
+	// weaker lock rather than under ACCESS EXCLUSIVE here.
+	if strings.Count(up, "NOT VALID;") != 3 {
+		t.Errorf("000050 must add exactly three NOT VALID constraints, got %d",
+			strings.Count(up, "NOT VALID;"))
+	}
+}
+
+// The down reverses exactly what the up added, in the order that works: the
+// reminder rows the legacy constraint would refuse are removed before it is
+// restored, or the revert would fail halfway.
+func TestChatMigration_PersistentNotificationsDownReversesTheUp(t *testing.T) {
+	down := readChatMigration(t, "000050_persistent_urgent_notifications.down.sql")
+	purge := strings.Index(down, "DELETE FROM chat.notification_outbox WHERE kind = 'urgent_reminder'")
+	restore := strings.Index(down, "ADD CONSTRAINT notification_outbox_message_recipient_unique")
+	if purge < 0 || restore < 0 {
+		t.Fatalf("000050 down must purge reminders and restore the legacy unique, got:\n%s", down)
+	}
+	if purge > restore {
+		t.Error("000050 down must remove the rows before restoring the constraint that refuses them")
+	}
+	for _, expected := range []string{
+		"DROP INDEX IF EXISTS chat.idx_message_acknowledgements_due",
+		"DROP COLUMN IF EXISTS next_reminder_at",
+		"DROP COLUMN IF EXISTS persistent_notifications",
+		// The narrowed vocabulary is validated again, because that is the state
+		// 000043 left it in: a down restores what it found, not something weaker.
+		"VALIDATE CONSTRAINT notification_outbox_kind_check",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("000050 down missing %q", expected)
+		}
+	}
+}
+
+// The constraints 000050 leaves NOT VALID are validated by 000051, and 000051's
+// down returns them to NOT VALID rather than dropping them outright — the same
+// two-step 000047/000048 uses, so a rollback never leaves a column unconstrained.
+func TestChatMigration_PersistentNotificationValidationIsItsOwnStep(t *testing.T) {
+	up := readChatMigration(t, "000051_validate_persistent_urgent_notifications.up.sql")
+	for _, expected := range []string{
+		"VALIDATE CONSTRAINT messages_persistent_notifications_priority_check",
+		"VALIDATE CONSTRAINT message_acknowledgements_reminder_count_check",
+		"VALIDATE CONSTRAINT notification_outbox_kind_check",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000051 missing %q", expected)
+		}
+	}
+	down := readChatMigration(t, "000051_validate_persistent_urgent_notifications.down.sql")
+	if strings.Count(down, "NOT VALID;") != 3 {
+		t.Errorf("000051 down must re-add all three constraints NOT VALID, got %d",
+			strings.Count(down, "NOT VALID;"))
+	}
+	if !strings.Contains(down, "BEGIN;") || !strings.Contains(down, "COMMIT;") {
+		t.Error("000051 down must drop and re-add inside one transaction")
+	}
+}

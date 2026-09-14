@@ -34,6 +34,19 @@ type fakeOutbox struct {
 	// claims counts calls to ClaimDue, which is how "the idle worker does not
 	// poll aggressively" is measured.
 	claims int
+
+	// The scripted halves of the reminder lifecycle (issue #825) and the counters
+	// that prove the worker called them. See the section at the end of this file
+	// for why these are scripted rather than simulated.
+	reminderResult    storage.ReminderScheduleResult
+	superseded        int
+	reminderPasses    int
+	supersedePasses   int
+	reminderBatchSize int
+	// reminderInstant is the reference the worker handed the scheduler, so a
+	// test can assert the worker supplies one rather than letting the store
+	// invent it (issue #825).
+	reminderInstant time.Time
 }
 
 type fakeRow struct {
@@ -310,3 +323,54 @@ func (f *fakeOutbox) Backlog(_ context.Context) (int, error) {
 
 // errStoreUnavailable stands in for a database that is refusing.
 var errStoreUnavailable = errors.New("store unavailable")
+
+// ── Persistent reminders (issue #825) ────────────────────────────────────────
+//
+// Scripted rather than simulated, unlike the claim protocol above, and the
+// distinction is deliberate. What the worker owes this feature is narrow: call
+// the two statements once per pass, count what they report, say so once rather
+// than once per recipient, and keep draining when either fails. Every rule that
+// actually decides a reminder — the five-minute window, only-pending
+// eligibility, the unique index that makes a repeat a no-op, the ceiling that
+// produces EXPIRED — is a property of the statements themselves and is proved
+// against a real PostgreSQL in the storage package. Reimplementing them here
+// would be a second implementation for the tests to agree with, which is how a
+// fake ends up testing itself.
+
+// reminderResult is what ScheduleDueReminders reports, set by a test.
+func (f *fakeOutbox) scheduleReminderResult(result storage.ReminderScheduleResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reminderResult = result
+}
+
+// supersededReminders is what SuppressResolvedReminders reports, set by a test.
+func (f *fakeOutbox) supersededReminders(count int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.superseded = count
+}
+
+func (f *fakeOutbox) ScheduleDueReminders(
+	_ context.Context, now time.Time, batchSize int,
+) (storage.ReminderScheduleResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reminderPasses++
+	f.reminderBatchSize = batchSize
+	f.reminderInstant = now
+	if err := f.failure("schedule_reminders"); err != nil {
+		return storage.ReminderScheduleResult{}, err
+	}
+	return f.reminderResult, nil
+}
+
+func (f *fakeOutbox) SuppressResolvedReminders(_ context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.supersedePasses++
+	if err := f.failure("suppress_resolved_reminders"); err != nil {
+		return 0, err
+	}
+	return f.superseded, nil
+}

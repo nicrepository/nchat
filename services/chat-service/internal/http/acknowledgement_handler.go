@@ -18,6 +18,13 @@ type acknowledgementProvider interface {
 	ReadBatch(
 		ctx context.Context, in service.ReadAcknowledgementBatchInput,
 	) (map[string]domain.AcknowledgementSummary, error)
+	// CancelPersistentNotifications is issue #825's sender-only command. It
+	// hangs off this same provider because it acts on the same per-recipient
+	// rows, so a deployment without a database answers 503 for it through the
+	// one nil check that already guards the other three.
+	CancelPersistentNotifications(
+		ctx context.Context, in service.AcknowledgementActionInput,
+	) (service.CancelPersistentNotificationsOutcome, error)
 }
 
 // acknowledgementBroadcaster tells a conversation's subscribers that one of its
@@ -297,4 +304,63 @@ func optionalTime(at time.Time) *time.Time {
 		return nil
 	}
 	return &at
+}
+
+// ── Persistent notifications (issue #825) ─────────────────────────────────────
+
+// persistentNotificationsJSON is what a cancellation reports.
+//
+// One number: how many recipients stopped being reminded by this call. A repeat
+// answers zero, which is what tells a client its first call had already
+// arrived without it having to compare two reads.
+//
+// Deliberately not a recipient list and not a state breakdown. Who had not
+// answered is the #824 read's question, decided there against that endpoint's
+// own rules about who may see a list; repeating it here would be a second place
+// that decision is made.
+type persistentNotificationsJSON struct {
+	MessageID string `json:"message_id"`
+	Stopped   int    `json:"stopped"`
+}
+
+// CancelPersistentNotifications handles
+// DELETE /api/chat/messages/{messageID}/persistent-notifications.
+//
+// The sender stops their own urgent message from reminding anybody. There is no
+// request body at all — who is asking is the session, which message is the path
+// — so there is nothing for a client to assert and nothing to mass-assign: the
+// recipients, their states, the schedule and the instant are all decided by the
+// statement that applies the change.
+//
+// Authorization is the store's, not this handler's, and it is a predicate in
+// the same UPDATE rather than a check before it: only the message's own sender
+// matches. A caller who is not the sender, a message in another workspace and a
+// message that never asked for reminders all answer 404, so the endpoint cannot
+// be used to discover which of the three it was.
+//
+// Idempotent, and answered with what actually happened rather than with 204:
+// two clicks, a retry and two concurrent requests leave the same rows in the
+// same states, and the count is what lets a client that lost the first response
+// stop guessing.
+//
+// Nothing is broadcast. Cancelling reminders changes no state any other reader
+// is entitled to observe — a message that also asked for confirmation keeps
+// asking for it, and the #824 endpoints never reported the reminder schedule —
+// so there is no invalidation for the conversation to hear about.
+func (h *MessageHandler) CancelPersistentNotifications(w http.ResponseWriter, r *http.Request) {
+	if !h.checkAcknowledgementDeps(w) {
+		return
+	}
+	in, ok := h.acknowledgementRequestContext(w, r)
+	if !ok {
+		return
+	}
+	outcome, err := h.acknowledgements.CancelPersistentNotifications(r.Context(), in)
+	if err != nil {
+		mapServiceError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, persistentNotificationsJSON{
+		MessageID: in.MessageID, Stopped: outcome.Stopped,
+	})
 }

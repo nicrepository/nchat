@@ -30,6 +30,10 @@ type fakeAcknowledgementProvider struct {
 	batchCalls       int
 	lastInput        service.AcknowledgementActionInput
 	lastBatch        service.ReadAcknowledgementBatchInput
+
+	// Issue #825.
+	stopped     int
+	cancelCalls int
 }
 
 func (f *fakeAcknowledgementProvider) Acknowledge(
@@ -41,6 +45,17 @@ func (f *fakeAcknowledgementProvider) Acknowledge(
 		return service.AcknowledgeOutcome{}, f.err
 	}
 	return service.AcknowledgeOutcome{Summary: f.summary, Route: f.route, Changed: f.changed}, nil
+}
+
+func (f *fakeAcknowledgementProvider) CancelPersistentNotifications(
+	_ context.Context, in service.AcknowledgementActionInput,
+) (service.CancelPersistentNotificationsOutcome, error) {
+	f.cancelCalls++
+	f.lastInput = in
+	if f.err != nil {
+		return service.CancelPersistentNotificationsOutcome{}, f.err
+	}
+	return service.CancelPersistentNotificationsOutcome{Stopped: f.stopped}, nil
 }
 
 // acknowledgementBroadcast records one published invalidation, so a test can

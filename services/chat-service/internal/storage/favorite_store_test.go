@@ -255,6 +255,8 @@ func TestPGXFavoriteStore_ListFavorites_WithEditedAt_ScansTimestamps(t *testing.
 		"", []byte(nil),
 		"standard",
 		false,
+		// persistent_notifications (issue #825).
+		false,
 		"Test User", "test@example.com", "", true,
 		now.Add(-time.Hour),
 	}

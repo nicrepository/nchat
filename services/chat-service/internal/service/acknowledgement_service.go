@@ -159,3 +159,42 @@ func validateAcknowledgementAction(input AcknowledgementActionInput) (Acknowledg
 	}
 	return input, nil
 }
+
+// CancelPersistentNotificationsOutcome is what a cancellation did.
+type CancelPersistentNotificationsOutcome = storage.CancelPersistentNotificationsResult
+
+// CancelPersistentNotifications stops one message's reminders on its sender's
+// authority (issue #825).
+//
+// Thin for the same reason Acknowledge is: who may do this, which rows it
+// reaches and what happens when it races an acknowledgement are all decided by
+// a single conditional UPDATE in the store. A sender check written here, above a
+// database that would accept the alternative, would be a check that holds only
+// while nothing races it — and the actor would still have to be re-read from the
+// session, which is what AcknowledgementActionInput.ActorUserID already is.
+//
+// Returns ErrNotFound for a message that does not exist, belongs to another
+// workspace, was sent by somebody else, or never asked for reminders — one
+// answer for all four.
+func (s *AcknowledgementService) CancelPersistentNotifications(
+	ctx context.Context, input AcknowledgementActionInput,
+) (CancelPersistentNotificationsOutcome, error) {
+	input, err := validateAcknowledgementAction(input)
+	if err != nil {
+		return CancelPersistentNotificationsOutcome{}, err
+	}
+	// Identifiers and a count only. Never the body, never the recipients, never
+	// who was still pending: this line is written every time somebody withdraws
+	// an urgent notice, and an audit trail is not a place to accumulate the
+	// contents of private conversations.
+	slog.InfoContext(ctx, "chat cancel persistent notifications",
+		"actor_user_id", input.ActorUserID,
+		"message_id", input.MessageID,
+	)
+	return s.acknowledgements.CancelPersistentNotifications(
+		ctx, storage.CancelPersistentNotificationsInput{
+			WorkspaceID: input.WorkspaceID,
+			MessageID:   input.MessageID,
+			SenderID:    input.ActorUserID,
+		})
+}

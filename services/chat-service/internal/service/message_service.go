@@ -239,6 +239,10 @@ type CreateChannelMessageInput struct {
 	// explicitly (issue #824). Independent of Priority in the domain even though
 	// the first release's composer only offers it on an urgent message.
 	AcknowledgementRequired bool
+	// PersistentNotifications asks this message to keep reminding the recipients
+	// who have neither confirmed nor answered it (issue #825). Refused unless
+	// Priority is urgent; the schedule itself is not caller-settable.
+	PersistentNotifications bool
 }
 
 // CreateDMMessageInput is the caller-provided input for posting to a DM conversation.
@@ -265,6 +269,9 @@ type CreateDMMessageInput struct {
 	// AcknowledgementRequired asks for explicit confirmation, on the same terms
 	// as the channel path's (issue #824).
 	AcknowledgementRequired bool
+	// PersistentNotifications asks for persistent reminders, on the same terms
+	// as the channel path's (issue #825).
+	PersistentNotifications bool
 }
 
 type ForwardChannelMessageInput struct {
@@ -466,6 +473,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
 		Priority: input.Priority, AcknowledgementRequired: input.AcknowledgementRequired,
+		PersistentNotifications: input.PersistentNotifications,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -493,7 +501,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 	replayInput := channelReplayInput(workspaceID, request, input)
 	existing, replayed, err := s.resolveCreateReplayOrAdmit(ctx, replayInput, acknowledgementFanout{
 		WorkspaceID: workspaceID, ChannelID: channelID, SenderID: senderID,
-		Required: request.AcknowledgementRequired,
+		Required: request.asksPerRecipient(),
 	})
 	if err != nil || replayed {
 		return existing, err
@@ -539,6 +547,7 @@ func (s *MessageService) CreateChannelMessage(ctx context.Context, input CreateC
 		MaxAttachmentBytes:      s.maxMessageAttachmentBytes,
 		Priority:                request.Priority,
 		AcknowledgementRequired: request.AcknowledgementRequired,
+		PersistentNotifications: request.PersistentNotifications,
 	}, links, body, replayInput, "create channel message")
 	if err != nil {
 		return domain.Message{}, err
@@ -572,6 +581,10 @@ type createRequestInput struct {
 	// (issue #824), exactly as the request stated it. Nothing normalises it:
 	// absence and false are the same request.
 	AcknowledgementRequired bool
+	// PersistentNotifications is the author asking for reminders (issue #825),
+	// exactly as the request stated it. Validated against the priority rather
+	// than normalised — see normalizeCreateRequest.
+	PersistentNotifications bool
 }
 
 // createRequest is the same send after normalisation: trimmed, bounded, and with
@@ -587,6 +600,22 @@ type createRequest struct {
 	// check and the replay fingerprint read it from one shape rather than from
 	// two differently-typed input structs.
 	AcknowledgementRequired bool
+	// PersistentNotifications travels with it for the same reason, and matters
+	// to the same two readers: reminders write the same per-recipient rows the
+	// bound counts, and a send that asks for them is a different operation from
+	// one that does not.
+	PersistentNotifications bool
+}
+
+// asksPerRecipient reports whether this send writes a per-recipient row for
+// everyone it reaches — because it asked for confirmation, because it asked for
+// reminders, or both (issues #824, #825).
+//
+// One question, because there is one set of rows and therefore one fan-out to
+// bound. Asking the two flags separately at each call site is how one of them
+// ends up bounded and the other does not.
+func (r createRequest) asksPerRecipient() bool {
+	return r.AcknowledgementRequired || r.PersistentNotifications
 }
 
 // normalizeCreateRequest applies the rules that hold for any send, before
@@ -624,8 +653,16 @@ func normalizeCreateRequest(input createRequestInput, maxAttachments int) (creat
 	if err != nil {
 		return createRequest{}, err
 	}
+	// The one rule binding reminders to the priority axis (issue #825), applied
+	// here so both create paths are held to it and neither can forget: the
+	// composer only offers the toggle on an urgent message, and a request that
+	// ignores that is refused rather than quietly sent without reminders.
+	if err := domain.ValidatePersistentNotifications(priority, input.PersistentNotifications); err != nil {
+		return createRequest{}, err
+	}
 	request.AttachmentIDs, request.BodyFormat, request.Priority = attachmentIDs, bodyFormat, priority
 	request.AcknowledgementRequired = input.AcknowledgementRequired
+	request.PersistentNotifications = input.PersistentNotifications
 	return request, nil
 }
 
@@ -638,8 +675,12 @@ type acknowledgementFanout struct {
 	ChannelID      string
 	ConversationID string
 	SenderID       string
-	// Required is the send's own flag. When it is false there is no bound to
-	// check and no query to spend, which is almost every message.
+	// Required is the send's own flag — either of them. A message that asks for
+	// confirmation and a message that asks for reminders write the same
+	// per-recipient rows, so they are bounded by the same ceiling and a send
+	// that asks for reminders alone must not slip past it (issue #825). When
+	// neither was asked for there is no bound to check and no query to spend,
+	// which is almost every message.
 	Required bool
 }
 
@@ -948,6 +989,11 @@ type createIdentity struct {
 	// for confirmation are two different sends, and a key reused across them
 	// must conflict rather than replay the one that asked for nothing.
 	AcknowledgementRequired bool
+	// PersistentNotifications is part of the identity for the same reason again
+	// (issue #825): the same urgent text sent once quietly and once with
+	// reminders are two different sends, and a key reused across them must
+	// conflict rather than replay the silent one.
+	PersistentNotifications bool
 }
 
 // createIdentityVersion tags the fingerprint's construction, so adding a field
@@ -975,6 +1021,15 @@ const priorityIdentityVersion = "create.v3"
 // provably means "asked for no acknowledgement", because anything else is v4.
 const acknowledgementIdentityVersion = "create.v4"
 
+// persistentNotificationsIdentityVersion tags a send that asks for persistent
+// reminders (issue #825).
+//
+// Only such a send uses it, on exactly the terms v3 and v4 established: a send
+// that asks for no reminders hashes as it did before this field existed, so keys
+// already in flight when this ships still replay. Anything below v5 now provably
+// means "asked for no reminders".
+const persistentNotificationsIdentityVersion = "create.v5"
+
 // fingerprint serialises the identity deterministically.
 //
 // Length-prefixed rather than delimited, so no combination of fields can be
@@ -996,6 +1051,9 @@ func (i createIdentity) fingerprint() string {
 	}
 	if i.AcknowledgementRequired {
 		fields = append(fields, "acknowledgement")
+	}
+	if i.PersistentNotifications {
+		fields = append(fields, "persistent_notifications")
 	}
 	fields = append(fields, i.AttachmentIDs...)
 
@@ -1019,6 +1077,8 @@ func (i createIdentity) statesPriority() bool {
 // distinct serialisation.
 func (i createIdentity) version() string {
 	switch {
+	case i.PersistentNotifications:
+		return persistentNotificationsIdentityVersion
 	case i.AcknowledgementRequired:
 		return acknowledgementIdentityVersion
 	case i.statesPriority():
@@ -1082,6 +1142,7 @@ func channelReplayInput(
 			AttachmentIDs:           request.AttachmentIDs,
 			Priority:                request.Priority,
 			AcknowledgementRequired: request.AcknowledgementRequired,
+			PersistentNotifications: request.PersistentNotifications,
 		}.fingerprint(),
 	}
 }
@@ -1104,6 +1165,7 @@ func dmReplayInput(
 			AttachmentIDs:           request.AttachmentIDs,
 			Priority:                request.Priority,
 			AcknowledgementRequired: request.AcknowledgementRequired,
+			PersistentNotifications: request.PersistentNotifications,
 		}.fingerprint(),
 	}
 }
@@ -1293,6 +1355,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		SenderID: input.SenderID, BodyText: input.BodyText,
 		BodyFormat: input.BodyFormat, AttachmentIDs: input.AttachmentIDs,
 		Priority: input.Priority, AcknowledgementRequired: input.AcknowledgementRequired,
+		PersistentNotifications: input.PersistentNotifications,
 	}, s.maxMessageAttachments)
 	if err != nil {
 		return domain.Message{}, err
@@ -1315,7 +1378,7 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 	replayInput := dmReplayInput(workspaceID, request, input)
 	existing, replayed, err := s.resolveCreateReplayOrAdmit(ctx, replayInput, acknowledgementFanout{
 		WorkspaceID: workspaceID, ConversationID: conversationID, SenderID: senderID,
-		Required: request.AcknowledgementRequired,
+		Required: request.asksPerRecipient(),
 	})
 	if err != nil || replayed {
 		return existing, err
@@ -1326,48 +1389,15 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		return domain.Message{}, err
 	}
 
-	isGroupDM := conversation.Type == domain.DMConversationTypeGroup
-	mentions, err := s.resolveOutgoingMentions(ctx, workspaceID, "", conversationID, isGroupDM, senderID, body, bodyFormat)
+	mentions, err := s.resolveDMMentions(ctx, dmMentionInput{
+		WorkspaceID: workspaceID, ConversationID: conversationID, SenderID: senderID,
+		Body: body, BodyFormat: bodyFormat,
+		IsGroup: conversation.Type == domain.DMConversationTypeGroup,
+	})
 	if err != nil {
 		return domain.Message{}, err
 	}
-	// Direct DMs keep their existing codec and cannot gain mention semantics by
-	// manually posting a v3 token. Group membership is the only DM authority.
-	if !isGroupDM && len(mentions.UserIDs)+len(mentions.ChannelIDs) > 0 {
-		return domain.Message{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
-	}
 	body = mentions.Body
-
-	// SR-002: refuse an over-bound @all before spending any more work on this
-	// send — reference validation, and the write itself. This is a friendly,
-	// specific pre-flight; it is not the authority. CreateMessage re-applies
-	// the identical, equally early-stopped rule atomically inside the same
-	// statement as the INSERT (invalid_all_mention_fanout), which is what
-	// actually decides whether the message is written — a group that grows past
-	// the bound in the gap between this check and that statement is caught
-	// there, not here.
-	//
-	// The count is asked for with a ceiling of one past the bound (SEC-776-01):
-	// "50 or fewer, and how many" and "more than 50" are the only two answers a
-	// bound decision can act on, so the database stops looking at 51 and an
-	// enormous group costs no more to judge than a barely-oversized one. The
-	// value that comes back saturates there and is never the group's real size.
-	//
-	// senderID is passed because the count must exclude them: #741's
-	// notification_recipients notifies nobody of their own message, so counting
-	// the author here would refuse a group of the author plus exactly the bound
-	// in others — a send whose @all reaches exactly the bound.
-	if mentions.AllMention {
-		eligible, err := s.messages.CountEligibleAllMentionRecipientsUpTo(
-			ctx, workspaceID, conversationID, senderID, domain.MaxGroupAllMentionRecipients+1,
-		)
-		if err != nil {
-			return domain.Message{}, fmt.Errorf("count eligible all-mention recipients: %w", err)
-		}
-		if eligible > domain.MaxGroupAllMentionRecipients {
-			return domain.Message{}, domain.ErrGroupAllMentionRecipientsExceeded
-		}
-	}
 
 	refs, err := s.validateCreateReferences(ctx, createReferenceInput{
 		WorkspaceID: workspaceID, DMConversationID: conversationID, SenderID: senderID,
@@ -1397,11 +1427,91 @@ func (s *MessageService) CreateDMMessage(ctx context.Context, input CreateDMMess
 		MaxAttachmentBytes:      s.maxMessageAttachmentBytes,
 		Priority:                request.Priority,
 		AcknowledgementRequired: request.AcknowledgementRequired,
+		PersistentNotifications: request.PersistentNotifications,
 	}, links, body, replayInput, "create dm message")
 	if err != nil {
 		return domain.Message{}, err
 	}
 	return s.announceCreatedMessage(ctx, workspaceID, senderID, "dm", conversationID, msg, links), nil
+}
+
+// dmMentionInput is one DM send's mention question: what the body says, and
+// which conversation is being asked to honour it.
+type dmMentionInput struct {
+	WorkspaceID    string
+	ConversationID string
+	SenderID       string
+	Body           string
+	BodyFormat     domain.MessageBodyFormat
+	// IsGroup decides what a mention may mean here at all. A 1:1 conversation
+	// has no membership to name, so it has no mention semantics either.
+	IsGroup bool
+}
+
+// resolveDMMentions resolves what a DM body mentions and refuses what this
+// conversation may not say.
+//
+// One responsibility, extracted from CreateDMMessage because it is one: the
+// channel path asks resolveOutgoingMentions and is done, while a DM has two
+// further rules that belong to the mention and to nothing else around it — a
+// 1:1 conversation cannot gain mention semantics by hand-posting a v3 token,
+// and a group @all is bounded. Inlining them put both, and the nesting of the
+// second, into the middle of a function whose subject is persisting a message.
+//
+// Neither rule is the authority. CreateMessage re-applies the identical,
+// equally early-stopped @all bound atomically inside the same statement as the
+// INSERT (invalid_all_mention_fanout), which is what actually decides whether
+// the message is written; a group that grows past the bound between here and
+// there is caught there, not here. This is the friendly, specific pre-flight.
+func (s *MessageService) resolveDMMentions(
+	ctx context.Context, input dmMentionInput,
+) (outgoingMentions, error) {
+	mentions, err := s.resolveOutgoingMentions(ctx, input.WorkspaceID, "", input.ConversationID,
+		input.IsGroup, input.SenderID, input.Body, input.BodyFormat)
+	if err != nil {
+		return outgoingMentions{}, err
+	}
+	// Direct DMs keep their existing codec and cannot gain mention semantics by
+	// manually posting a v3 token. Group membership is the only DM authority.
+	if !input.IsGroup && len(mentions.UserIDs)+len(mentions.ChannelIDs) > 0 {
+		return outgoingMentions{}, fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+	}
+	if err := s.assertAllMentionWithinBound(ctx, input, mentions.AllMention); err != nil {
+		return outgoingMentions{}, err
+	}
+	return mentions, nil
+}
+
+// assertAllMentionWithinBound refuses an over-bound @all before any more work is
+// spent on the send — reference validation, and the write itself (SR-002).
+//
+// The count is asked for with a ceiling of one past the bound (SEC-776-01):
+// "50 or fewer, and how many" and "more than 50" are the only two answers a
+// bound decision can act on, so the database stops looking at 51 and an enormous
+// group costs no more to judge than a barely-oversized one. The value that comes
+// back saturates there and is never the group's real size.
+//
+// senderID is passed because the count must exclude them: #741's
+// notification_recipients notifies nobody of their own message, so counting the
+// author here would refuse a group of the author plus exactly the bound in
+// others — a send whose @all reaches exactly the bound.
+func (s *MessageService) assertAllMentionWithinBound(
+	ctx context.Context, input dmMentionInput, allMention bool,
+) error {
+	if !allMention {
+		return nil
+	}
+	eligible, err := s.messages.CountEligibleAllMentionRecipientsUpTo(
+		ctx, input.WorkspaceID, input.ConversationID, input.SenderID,
+		domain.MaxGroupAllMentionRecipients+1,
+	)
+	if err != nil {
+		return fmt.Errorf("count eligible all-mention recipients: %w", err)
+	}
+	if eligible > domain.MaxGroupAllMentionRecipients {
+		return domain.ErrGroupAllMentionRecipientsExceeded
+	}
+	return nil
 }
 
 func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {

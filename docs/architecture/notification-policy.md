@@ -273,6 +273,13 @@ Ordem declarada das regras:
 | 9   | estado do coordenador | evento ja entregue                      | `duplicate`                          |
 | 10  | estado do coordenador | cooldown de burst                       | `burst_cooldown`                     |
 
+Um `urgent_reminder` (#825) atravessa exatamente essa tabela, em cada ocorrencia.
+Persistir nao e bypass: mute, origem, expediente e disponibilidade de canal
+decidem o decimo lembrete como decidiram o primeiro, e o mute e relido por linha
+pela projecao do outbox em vez de ser fixado quando a mensagem foi enviada. A
+unica coisa que a urgencia decide e _se_ ha mais uma ocorrencia — ver
+[notification-outbox.md](notification-outbox.md#lembretes-persistentes-de-mensagens-urgentes-825).
+
 A ordem **nao muda o resultado** — toda regra subtrai, entao o conjunto final
 independe da ordem. Ela decide qual reason e registrado quando duas regras
 tirariam o mesmo canal, e a leitura util para o operador e essa: um evento fora

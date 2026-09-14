@@ -78,6 +78,9 @@ func messageCols() []string {
 		// Whether the author asked for explicit confirmation (issue #824).
 		// NOT NULL DEFAULT false, on the same terms.
 		"acknowledgement_required",
+		// Whether the author asked for persistent reminders (issue #825).
+		// NOT NULL DEFAULT false, on the same terms again.
+		"persistent_notifications",
 	}
 }
 
@@ -98,6 +101,8 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		// The priority almost every message carries.
 		"standard",
 		// Almost no message asks for confirmation.
+		false,
+		// Fewer still ask to keep reminding.
 		false,
 	}
 }
@@ -181,6 +186,8 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(rows)
 }
@@ -252,6 +259,8 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), // priority (issue #821)
 					pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 					pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(), // persistent_notifications (issue #825)
+					pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 				).
 				WillReturnError(dbErr)
 
@@ -603,7 +612,9 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(),  // max_group_all_mention_recipients (issue #776 SR-002)
 					pgxmock.AnyArg(),  // priority (issue #821)
 					pgxmock.AnyArg(),  // acknowledgement_required (issue #824)
-					pgxmock.AnyArg()). // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(),  // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(),  // persistent_notifications (issue #825)
+					pgxmock.AnyArg()). // urgent reminder interval seconds (issue #825)
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -632,6 +643,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -681,6 +694,8 @@ func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound
 			pgxmock.AnyArg(),                    // priority (issue #821)
 			pgxmock.AnyArg(),                    // acknowledgement_required (issue #824)
 			domain.MaxAcknowledgementRecipients, // the bound, never a literal in SQL
+			pgxmock.AnyArg(),                    // persistent_notifications (issue #825)
+			pgxmock.AnyArg(),                    // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-bounded", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -712,6 +727,8 @@ func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOu
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -743,6 +760,8 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -947,6 +966,8 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
 		"standard",
+		false,
+		// persistent_notifications (issue #825).
 		false,
 		"Test User", "test@example.com", "", false,
 	}
@@ -1568,6 +1589,8 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
 		"standard",
+		false,
+		// persistent_notifications (issue #825).
 		false,
 		"Test User", "test@example.com", "", false,
 	}

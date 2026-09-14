@@ -132,6 +132,9 @@ describe("service worker: push", () => {
     ["channel_message", "Nova mensagem em um canal do NChat"],
     ["reaction", "Nova reação na sua mensagem"],
     ["call", "Chamada no NChat"],
+    // Issue #825: a reminder says the urgent message is still waiting rather
+    // than announcing a new one, because the recipient has already been told.
+    ["urgent_reminder", "Mensagem urgente ainda aguarda você no NChat"],
   ])("titles a '%s' event as %s", async (type, title) => {
     const harness = await loadServiceWorker();
 

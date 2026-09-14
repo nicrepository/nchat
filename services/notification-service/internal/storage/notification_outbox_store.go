@@ -93,6 +93,15 @@ type NotificationOutboxStore interface {
 	MarkFailed(ctx context.Context, id string, attempt int, category string) error
 	FailExhausted(ctx context.Context, maxAttempts int) (int, error)
 	Backlog(ctx context.Context) (int, error)
+
+	// The persistent reminder lifecycle (issue #825). See reminder_store.go for
+	// why it is the same queue rather than a second one.
+	//
+	// `now` is the instant the scheduling rule reasons about — which reminders
+	// are due, and when the next one falls. It is the caller's so the five-minute
+	// boundary can be asserted exactly rather than with a tolerance.
+	ScheduleDueReminders(ctx context.Context, now time.Time, batchSize int) (ReminderScheduleResult, error)
+	SuppressResolvedReminders(ctx context.Context) (int, error)
 }
 
 // PGXNotificationOutboxStore implements NotificationOutboxStore over a pgx pool.
@@ -322,6 +331,19 @@ const claimDueQuery = `
 		WHERE o.status IN ('eligible', 'retrying', 'processing')
 		  AND o.attempts < $3
 		  AND o.next_attempt_at <= now()
+		  -- Issue #825: a reminder is claimable only while its recipient is still
+		  -- pending, and this is where that becomes a guarantee rather than a
+		  -- hope. The sublink takes a row lock on the recipient's state, so the
+		  -- claim and a PENDING -> terminal transition are serialized on the same
+		  -- persisted row; see ReminderRecipientPendingForClaim for the race this
+		  -- closes, the lock order it establishes, and why an unlocked read here
+		  -- was a check-then-act.
+		  --
+		  -- The kind test short-circuits, so an ordinary notification never
+		  -- performs the lookup, takes no second lock, and follows exactly the
+		  -- path it followed before this feature existed.
+		  AND (o.kind <> '` + string(notificationevent.EventTypeUrgentReminder) + `'
+		       OR ` + ReminderRecipientPendingForClaim + `)
 		ORDER BY o.next_attempt_at, o.occurred_at, o.id
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
