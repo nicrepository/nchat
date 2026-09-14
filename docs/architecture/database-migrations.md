@@ -82,7 +82,20 @@ after interrupted apply or rollback attempts until manual repair is performed.
 | `auth`          | `auth`            | auth-service data model only; service integration planned |
 | `chat`          | `chat`            | chat-service (planned)                                    |
 | `files`         | `files`           | media-service (planned)                                   |
-| `notifications` | `notifications`   | notif-service (planned)                                   |
+| `notifications` | `notifications`   | reserved; not yet provisioned (see below)                 |
+
+The `notifications` domain directory is still a placeholder. Its schema is not
+part of the runtime contract yet: `scripts/db/grant-runtime.sql` grants
+`nchat_app` on `auth`, `chat` and `files` only, and the production bootstrap
+reconciles ownership for those same three schemas. A table created in a fourth
+schema would therefore be unreadable by every service until both of those, and
+both k3s overlays, are changed.
+
+notification-service's tables consequently live in `chat`, alongside the ones it
+already owns — `chat.notification_outbox` (`000006`/`000042`/`000044`),
+`chat.conversation_notification_prefs` (`000037`) and `chat.push_subscriptions`
+(`000045`). `scripts/ci/migrations-check.sh` enforces this: a down migration may
+only drop tables in the schema named by its own domain directory.
 
 ## Tooling
 

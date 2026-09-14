@@ -222,6 +222,8 @@ func (s *PGXPinStore) ListPins(ctx context.Context, workspaceID, targetType, tar
 			&msg.CreatedAt, &msg.UpdatedAt,
 			(*string)(&msg.LinkSafety),
 			&msg.EventType, &eventPayload,
+			(*string)(&msg.Priority),
+			&msg.AcknowledgementRequired,
 			&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 			&msg.IsFavorited,
 			&pin.PinnedAt, &pin.PinnedByUserID,

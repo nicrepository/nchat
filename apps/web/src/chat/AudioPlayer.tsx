@@ -24,6 +24,11 @@
  *    playback does not re-render even its own row 60 times a second.
  *  - Playback rate persists across the whole app via localStorage: a
  *    per-viewer convenience, never anything the server needs to know.
+ *  - A download control (issue #740) is drawn only when the caller offers one,
+ *    between the time and the rate. It is an errand run beside playback and
+ *    never through it: it neither arms `src` nor touches the element, so it
+ *    works before the first Play and during one, and its own failure is a note
+ *    beside the controls rather than anything the player has to recover from.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -67,6 +72,25 @@ function isValidDuration(value: number | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+/**
+ * An optional download control, drawn between the time label and the rate
+ * button (issue #740).
+ *
+ * The player owns where it sits, how it looks and its own in-flight state; the
+ * caller owns what "download" means and how the bytes are obtained. Absent —
+ * the recorder's local preview, an ordinary audio file whose row already
+ * carries a Baixar action — the control is not rendered at all, so nothing is
+ * offered twice.
+ */
+export interface AudioDownloadAction {
+  /** Accessible name, e.g. "Baixar mensagem de voz". */
+  label: string;
+  /** Pointer tooltip, e.g. "Baixar áudio". */
+  title: string;
+  /** Starts the download. Rejecting shows a note beside the player. */
+  start: () => Promise<void>;
+}
+
 export interface AudioPlayerProps {
   /** aria-label stem, e.g. "Áudio: reunião.mp3" or "Mensagem de voz". */
   label: string;
@@ -80,7 +104,74 @@ export interface AudioPlayerProps {
   onRequestLoad: () => void;
   /** Server- or client-declared length, seconds, shown before metadata loads. */
   durationHint?: number;
+  /** Offers a download beside the controls. Omitted, none is drawn. */
+  download?: AudioDownloadAction;
   testIdPrefix: string;
+}
+
+/**
+ * The download button and the one thing it can say.
+ *
+ * Its own component so the in-flight state belongs to the control that owns it
+ * rather than to the player: nothing here can reach playback, which is exactly
+ * the guarantee this feature needs. The failure note is a sibling rather than a
+ * child of the button so it can take a row of its own (see the `--download`
+ * rule), which is why this returns a fragment instead of an element.
+ */
+function AudioDownloadControl({
+  action,
+  testIdPrefix,
+}: {
+  action: AudioDownloadAction;
+  testIdPrefix: string;
+}) {
+  const [state, setState] = useState<"idle" | "running" | "failed">("idle");
+
+  // Touches nothing about playback: no pause, no play, no currentTime, no
+  // rate. Downloading a message you are listening to is a normal thing to do,
+  // so the two run side by side.
+  //
+  // The button stays enabled while the download resolves — disabling a focused
+  // control would take the keyboard user's place in the page away from them —
+  // so the guard against a double-start is here, and it is scoped to this one
+  // control. A failed attempt can be retried straight away.
+  const start = useCallback(() => {
+    if (state === "running") return;
+    setState("running");
+    action.start().then(
+      () => setState("idle"),
+      () => setState("failed"),
+    );
+  }, [action, state]);
+
+  return (
+    <>
+      <button
+        type="button"
+        className="chat-msg-area__audio-download"
+        aria-label={action.label}
+        title={action.title}
+        aria-busy={state === "running"}
+        data-testid={`${testIdPrefix}-download`}
+        onClick={start}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          download
+        </span>
+      </button>
+      {/* A failed download says so and changes nothing else — the player keeps
+          playing, keeps its position and keeps its rate. */}
+      {state === "failed" && (
+        <span
+          className="chat-msg-area__audio-note chat-msg-area__audio-note--download"
+          role="alert"
+          data-testid={`${testIdPrefix}-download-error`}
+        >
+          Não foi possível baixar o áudio.
+        </span>
+      )}
+    </>
+  );
 }
 
 export default function AudioPlayer({
@@ -90,6 +181,7 @@ export default function AudioPlayer({
   failed,
   onRequestLoad,
   durationHint,
+  download,
   testIdPrefix,
 }: AudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -235,6 +327,7 @@ export default function AudioPlayer({
       <span className="chat-msg-area__audio-time" data-testid={`${testIdPrefix}-time`}>
         {formatTime(currentTime)} / {formatTime(duration)}
       </span>
+      {download && <AudioDownloadControl action={download} testIdPrefix={testIdPrefix} />}
       <button
         type="button"
         className="chat-msg-area__audio-rate"

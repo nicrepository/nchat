@@ -180,6 +180,110 @@ func TestDMService_LeaveGroup_PropagatesTheStoreRefusal(t *testing.T) {
 	}
 }
 
+// ── Group admin removal (issue #685) ─────────────────────────────────────────
+
+const adminTargetUser = "00000000-0000-4000-8000-0000000000a2"
+
+func TestDMService_RemoveGroupParticipant_ForwardsCanonicalActorAndTarget(t *testing.T) {
+	dms := &fakeDMStore{}
+
+	result, err := service.NewDMService(dms, &fakeMemberStore{}).RemoveGroupParticipant(
+		context.Background(), service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup,
+			CallerID: strings.ToUpper(adminCaller), TargetUserID: strings.ToUpper(adminTargetUser),
+		})
+	if err != nil {
+		t.Fatalf("RemoveGroupParticipant: %v", err)
+	}
+	if dms.lastRemoveParticipant != [4]string{adminWSID, adminGroup, adminCaller, adminTargetUser} {
+		t.Fatalf("forwarded %v, want workspace/conversation/canonical caller/canonical target", dms.lastRemoveParticipant)
+	}
+	if result.Event.Kind != domain.MessageKindSystem {
+		t.Fatalf("event = %+v, want the removal's system message", result.Event)
+	}
+}
+
+// Removing yourself is LeaveGroup's job: the service refuses the request
+// before the store is ever reached, rather than letting a same-actor removal
+// masquerade as an admin action.
+func TestDMService_RemoveGroupParticipant_RefusesSelfRemoval(t *testing.T) {
+	dms := &fakeDMStore{}
+
+	_, err := service.NewDMService(dms, &fakeMemberStore{}).RemoveGroupParticipant(
+		context.Background(), service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup,
+			CallerID: adminCaller, TargetUserID: adminCaller,
+		})
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("error = %v, want ErrInvalidInput", err)
+	}
+	if dms.removeParticipantCalls != 0 {
+		t.Fatalf("the store was reached %d time(s) for a self-removal", dms.removeParticipantCalls)
+	}
+}
+
+func TestDMService_RemoveGroupParticipant_RejectsMalformedRequestsBeforeTheStore(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input service.RemoveGroupParticipantInput
+	}{
+		{name: "no workspace", input: service.RemoveGroupParticipantInput{
+			ConversationID: adminGroup, CallerID: adminCaller, TargetUserID: adminTargetUser,
+		}},
+		{name: "no conversation", input: service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, CallerID: adminCaller, TargetUserID: adminTargetUser,
+		}},
+		{name: "no actor", input: service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup, TargetUserID: adminTargetUser,
+		}},
+		{name: "no target", input: service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup, CallerID: adminCaller,
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dms := &fakeDMStore{}
+			if _, err := service.NewDMService(dms, &fakeMemberStore{}).RemoveGroupParticipant(
+				context.Background(), test.input); err == nil {
+				t.Fatal("expected the request to be refused")
+			}
+			if dms.removeParticipantCalls != 0 {
+				t.Fatalf("the store was reached %d time(s)", dms.removeParticipantCalls)
+			}
+		})
+	}
+}
+
+func TestDMService_RemoveGroupParticipant_PropagatesTheStoreRefusal(t *testing.T) {
+	dms := &fakeDMStore{removeParticipantErr: domain.ErrForbidden}
+
+	_, err := service.NewDMService(dms, &fakeMemberStore{}).RemoveGroupParticipant(
+		context.Background(), service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup,
+			CallerID: adminCaller, TargetUserID: adminTargetUser,
+		})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want the store's ErrForbidden", err)
+	}
+}
+
+// A target who was not a participant is a no-op the store reports as a zero
+// event; the service passes that through rather than inventing one.
+func TestDMService_RemoveGroupParticipant_PropagatesANoOpResult(t *testing.T) {
+	dms := &fakeDMStore{removeParticipantNoOp: true}
+
+	result, err := service.NewDMService(dms, &fakeMemberStore{}).RemoveGroupParticipant(
+		context.Background(), service.RemoveGroupParticipantInput{
+			WorkspaceID: adminWSID, ConversationID: adminGroup,
+			CallerID: adminCaller, TargetUserID: adminTargetUser,
+		})
+	if err != nil {
+		t.Fatalf("RemoveGroupParticipant: %v", err)
+	}
+	if result.Event.ID != "" {
+		t.Fatalf("event = %+v, want zero value for a no-op removal", result.Event)
+	}
+}
+
 // ── Channel self-leave ──────────────────────────────────────────────────────
 //
 // Two structural refusals, and both are re-derived in SQL rather than trusted

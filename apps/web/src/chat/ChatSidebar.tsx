@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 
 import "./ChatSidebar.css";
@@ -21,7 +21,9 @@ import PresenceDot from "./PresenceDot";
 import { presenceLabel, presenceTargetKey, usePresence, type PresenceState } from "./presence";
 import SidebarUserMenu from "./SidebarUserMenu";
 import { sortByActivity } from "./sidebarOrder";
+import { useSidebarSectionPreferences } from "./sidebarSectionPreferences";
 import type { SidebarState } from "./useChatSidebar";
+import type { DraftSummary } from "./useConversationDrafts";
 
 /**
  * The pinned indicator (issue #527).
@@ -255,31 +257,107 @@ function ErrorState({ onRetry }: ErrorStateProps) {
 
 // ── Section shell ─────────────────────────────────────────────────────────────
 
+/** Plural-aware Portuguese count phrase, screen-reader text for the header count (issue #779). */
+function unreadConversationCountLabel(count: number): string {
+  return `${count} conversa${count === 1 ? "" : "s"} não lida${count === 1 ? "" : "s"}`;
+}
+
 interface SectionProps {
-  /** Stable id; the heading owns it and each list is labelled by it. */
+  /** Stable id; the collapse button owns it and each list is labelled by it. */
   labelId: string;
   title: string;
   /** Only the first section sits flush against the CTA above it. */
   spaced?: boolean;
+  /** Independent per-section state (issue #779): expanded/collapsed and "show unread only" preference. */
+  collapsed: boolean;
+  onToggleCollapse: () => void;
+  showUnreadOnly: boolean;
+  onToggleShowUnreadOnly: () => void;
+  /** Conversations with unread in this section, never a sum of message counts. */
+  badgeCount: number;
   children: React.ReactNode;
 }
 
 /**
- * One sidebar category: a real heading plus its list.
+ * One sidebar category: a real heading plus its list (issue #396), now with
+ * two independent controls per section (issue #779) — collapse/expand and
+ * "show unread conversations when collapsed".
+ *
+ * The two controls are siblings, never nested buttons. The collapse button is
+ * the only element inside the `<h2>`, so the heading's accessible name stays
+ * exactly the section title; the count and the switch sit beside it and do
+ * not change that name.
+ *
+ * Issue #787 refines the two of them without touching the state behind either.
+ * The count is rendered only when there is something to count — a literal "0"
+ * beside every quiet section was noise, and an element that is absent also
+ * stops reserving width in the header. The switch keeps its role, its
+ * aria-checked and its handler and changes only how it is drawn: a rail with a
+ * thumb that physically moves, so on/off is legible without relying on colour.
+ * Its hover hint is a plain `title`: the browser already draws that, outside
+ * the sidebar's scrollport, so it cannot be clipped by the nav or widen it.
+ * `aria-label` stays the accessible name — it is the part that says *which*
+ * section this switch belongs to, which a generic hint must never replace.
  *
  * The listbox lives inside each list component rather than here so that an
  * empty section renders its message *instead of* an options container — an
  * empty `role="listbox"` with a paragraph inside is not a valid one.
  */
-function Section({ labelId, title, spaced, children }: SectionProps) {
+function Section({
+  labelId,
+  title,
+  spaced,
+  collapsed,
+  onToggleCollapse,
+  showUnreadOnly,
+  onToggleShowUnreadOnly,
+  badgeCount,
+  children,
+}: SectionProps) {
   return (
     <section className="chat-sidebar__section" aria-labelledby={labelId}>
-      <h2
-        id={labelId}
+      <div
         className={`chat-sidebar__section-label${spaced ? " chat-sidebar__section-label--mt" : ""}`}
       >
-        {title}
-      </h2>
+        <h2 id={labelId} className="chat-sidebar__section-heading">
+          <button
+            type="button"
+            className="chat-sidebar__section-collapse"
+            aria-expanded={!collapsed}
+            onClick={onToggleCollapse}
+          >
+            <span
+              className={`chat-sidebar__section-chevron${collapsed ? " chat-sidebar__section-chevron--collapsed" : ""}`}
+            >
+              <IconChevronDown />
+            </span>
+            {title}
+          </button>
+        </h2>
+        <span className="chat-sidebar__section-controls">
+          {badgeCount > 0 ? (
+            <span
+              className="chat-sidebar__section-unread-count"
+              aria-label={unreadConversationCountLabel(badgeCount)}
+            >
+              {badgeCount}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showUnreadOnly}
+            aria-label={`Mostrar mensagens não lidas quando ${title} estiver recolhida`}
+            title="Exibir não lidas quando a seção estiver recolhida"
+            className={`chat-sidebar__section-unread-toggle${showUnreadOnly ? " chat-sidebar__section-unread-toggle--on" : ""}`}
+            onClick={onToggleShowUnreadOnly}
+          >
+            <span className="chat-sidebar__section-unread-track" aria-hidden="true">
+              <span className="chat-sidebar__section-unread-thumb" />
+            </span>
+          </button>
+        </span>
+      </div>
       {children}
     </section>
   );
@@ -292,6 +370,58 @@ function Section({ labelId, title, spaced, children }: SectionProps) {
  */
 function unreadBadgeLabel(count: number, hasMentionUnread?: boolean): string {
   return hasMentionUnread ? `${count} não lidas, incluindo menção` : `${count} não lidas`;
+}
+
+// ── Draft indicator (issue #769) ────────────────────────────────────────────
+
+/**
+ * Context rather than a prop threaded through ChannelList/ChannelsByCategory/
+ * DMList/DMRow: those already pass RowActionsProps down unchanged to every
+ * row, and a keystroke-driven value has no business widening that surface.
+ * Provided once at ChatSidebar's root; read only by the two row components
+ * that actually draw the indicator.
+ */
+const DraftSummariesContext = createContext<ReadonlyMap<string, DraftSummary>>(new Map());
+
+/**
+ * The draft-key convention ChatMessageArea/ChatComposer already use —
+ * "channel"/"dm" only, never "group": a group DM is still kind "dm" to the
+ * route and the composer, unlike ConversationTarget's three-way kind used
+ * for row actions above.
+ */
+function draftKeyFor(kind: "channel" | "dm", id: string): string {
+  return `${kind}:${id}`;
+}
+
+const maxDraftPreviewLength = 40;
+
+/**
+ * "Rascunho: …" (issue #769) — never the full text (privacy: "PRIVACIDADE DA
+ * SIDEBAR"), and never anything that reveals draft != unread semantics on its
+ * own; this is purely an additional, independent label.
+ */
+function draftLabel(summary: DraftSummary): string {
+  if (summary.kind === "voice") return "Rascunho: mensagem de voz";
+  if (summary.kind === "attachments") {
+    return summary.attachmentCount === 1
+      ? "Rascunho: 1 arquivo"
+      : `Rascunho: ${summary.attachmentCount} arquivos`;
+  }
+  if (summary.kind === "mixed" || !summary.text) return "Rascunho";
+  const truncated =
+    summary.text.length > maxDraftPreviewLength
+      ? `${summary.text.slice(0, maxDraftPreviewLength).trimEnd()}…`
+      : summary.text;
+  return `Rascunho: ${truncated}`;
+}
+
+function DraftIndicator({ summary }: { summary: DraftSummary | undefined }) {
+  if (!summary) return null;
+  return (
+    <span className="chat-sidebar__draft-badge" data-testid="chat-sidebar-draft-badge">
+      {draftLabel(summary)}
+    </span>
+  );
 }
 
 // ── Row actions ───────────────────────────────────────────────────────────────
@@ -374,6 +504,7 @@ interface ChannelListProps {
 }
 
 function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: ChannelListProps) {
+  const draftSummaries = useContext(DraftSummariesContext);
   if (channels.length === 0) {
     return (
       <p className="chat-sidebar__empty" role="status">
@@ -410,25 +541,33 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
               onClick={() => onSelect(ch.id)}
             >
               {ch.type === "private" ? <IconLock /> : <IconHash />}
-              <span className="chat-sidebar__nav-item-name">{ch.name}</span>
-              {ch.type === "private" && (
-                <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
-                  privado
-                </span>
-              )}
-              {ch.unreadCount != null && ch.unreadCount > 0 && (
-                <span
-                  className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
-                  aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
-                >
-                  {ch.hasMentionUnread && (
-                    <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
-                      @
+              <span className="chat-sidebar__row-lines">
+                <span className="chat-sidebar__row-line">
+                  <span className="chat-sidebar__nav-item-name">{ch.name}</span>
+                  {ch.type === "private" && (
+                    <span className="chat-sidebar__badge chat-sidebar__badge--private sr-only">
+                      privado
                     </span>
                   )}
-                  {ch.unreadCount}
+                  {ch.unreadCount != null && ch.unreadCount > 0 && (
+                    <span
+                      className={`chat-sidebar__unread-badge${ch.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+                      aria-label={unreadBadgeLabel(ch.unreadCount, ch.hasMentionUnread)}
+                    >
+                      {ch.hasMentionUnread && (
+                        <span
+                          aria-hidden="true"
+                          className="chat-sidebar__unread-badge-mention-mark"
+                        >
+                          @
+                        </span>
+                      )}
+                      {ch.unreadCount}
+                    </span>
+                  )}
                 </span>
-              )}
+                <DraftIndicator summary={draftSummaries.get(draftKeyFor("channel", ch.id))} />
+              </span>
             </button>
             <RowActions target={target} {...actions} />
           </div>
@@ -471,6 +610,7 @@ function DMRow({
   actions: RowActionsProps;
 }) {
   const isGroup = dm.type === "group";
+  const draftSummaries = useContext(DraftSummariesContext);
   const counterpart = dm.counterpart;
   // Scoped to this conversation: the counterpart is one of its two participants,
   // so the server's roster for it is exactly the list that would have named them.
@@ -520,23 +660,28 @@ function DMRow({
             size="sm"
           />
         )}
-        <span className="chat-sidebar__dm-name">{dm.name}</span>
-        {isGroup && (
-          <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
-        )}
-        {dm.unreadCount != null && dm.unreadCount > 0 && (
-          <span
-            className={`chat-sidebar__unread-badge${dm.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
-            aria-label={unreadBadgeLabel(dm.unreadCount, dm.hasMentionUnread)}
-          >
-            {dm.hasMentionUnread && (
-              <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
-                @
+        <span className="chat-sidebar__row-lines">
+          <span className="chat-sidebar__row-line">
+            <span className="chat-sidebar__dm-name">{dm.name}</span>
+            {isGroup && (
+              <span className="chat-sidebar__badge chat-sidebar__badge--group sr-only">grupo</span>
+            )}
+            {dm.unreadCount != null && dm.unreadCount > 0 && (
+              <span
+                className={`chat-sidebar__unread-badge${dm.hasMentionUnread ? " chat-sidebar__unread-badge--mention" : ""}`}
+                aria-label={unreadBadgeLabel(dm.unreadCount, dm.hasMentionUnread)}
+              >
+                {dm.hasMentionUnread && (
+                  <span aria-hidden="true" className="chat-sidebar__unread-badge-mention-mark">
+                    @
+                  </span>
+                )}
+                {dm.unreadCount}
               </span>
             )}
-            {dm.unreadCount}
           </span>
-        )}
+          <DraftIndicator summary={draftSummaries.get(draftKeyFor("dm", dm.id))} />
+        </span>
       </button>
       <RowActions target={target} {...actions} />
     </div>
@@ -725,6 +870,15 @@ interface ChannelsByCategoryProps {
   actions: RowActionsProps;
   collapsed: Record<string, boolean>;
   onToggleCategory: (key: string) => void;
+  /**
+   * The section-level unread filter (issue #779) already dropped every read
+   * channel from `grouped`; a category that lost every channel that way is
+   * skipped instead of rendering a header over an empty, misleading list —
+   * distinct from a category that is genuinely empty, which keeps its usual
+   * "Nenhum canal disponível" message. The channel category collapse state
+   * itself (RF-17 / issue #688) is untouched either way.
+   */
+  hideEmptyGroups?: boolean;
 }
 
 /**
@@ -743,11 +897,14 @@ function ChannelsByCategory({
   actions,
   collapsed,
   onToggleCategory,
+  hideEmptyGroups,
 }: ChannelsByCategoryProps) {
   if (grouped.length <= 1 && grouped[0]?.category.kind === "uncategorized") {
+    const channels = grouped[0]?.channels ?? [];
+    if (hideEmptyGroups && channels.length === 0) return null;
     return (
       <ChannelList
-        channels={grouped[0]?.channels ?? []}
+        channels={channels}
         activeChannelId={activeChannelId}
         onSelect={onSelect}
         labelId={CHANNELS_LABEL_ID}
@@ -755,9 +912,12 @@ function ChannelsByCategory({
       />
     );
   }
+  const visibleGroups = hideEmptyGroups
+    ? grouped.filter(({ channels: categoryChannels }) => categoryChannels.length > 0)
+    : grouped;
   return (
     <div className="chat-sidebar__categories-list">
-      {grouped.map(({ category, channels: categoryChannels }) => {
+      {visibleGroups.map(({ category, channels: categoryChannels }) => {
         const categoryKey = category.id ?? "uncategorized";
         const headerId = `chat-sidebar-category-${categoryKey}`;
         const isCollapsed = Boolean(collapsed[categoryKey]);
@@ -897,6 +1057,16 @@ interface ChatSidebarProps {
     targetId: string,
     trigger: HTMLButtonElement | null,
   ) => void;
+  /**
+   * Which conversations have a draft, and a coarse summary of what kind
+   * (issue #769) — keyed the same way as everywhere else in the chat
+   * shell: "channel:<id>" / "dm:<id>". Deliberately its own coarse piece of
+   * state (see useConversationDrafts' module doc): it changes on an
+   * empty<->non-empty or attachment-count/kind boundary, never on a single
+   * keystroke, which is what keeps typing in the composer from
+   * re-rendering this whole sidebar.
+   */
+  draftSummaries?: ReadonlyMap<string, DraftSummary>;
 }
 
 /**
@@ -913,6 +1083,7 @@ export const chatNavigationId = "chat-navigation";
 const CHANNELS_LABEL_ID = "chat-sidebar-section-channels";
 const DIRECTS_LABEL_ID = "chat-sidebar-section-directs";
 const GROUPS_LABEL_ID = "chat-sidebar-section-groups";
+const EMPTY_DRAFT_SUMMARIES: ReadonlyMap<string, DraftSummary> = new Map();
 
 export default function ChatSidebar({
   state,
@@ -924,6 +1095,7 @@ export default function ChatSidebar({
   setMuted,
   leaveConversation,
   onOpenDetails,
+  draftSummaries = EMPTY_DRAFT_SUMMARIES,
 }: ChatSidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
@@ -938,6 +1110,21 @@ export default function ChatSidebar({
       [key]: !prev[key],
     }));
   };
+
+  // Independent collapse/"show unread" state for the three sections (issue
+  // #779), scoped to (user, workspace) — presentation only, so it lives here
+  // rather than in useChatSidebar or a shared context. See
+  // useSidebarSectionPreferences for how it stays correct on the first ready
+  // render and drops any stale value when the user or workspace changes,
+  // without ever calling setState during this render.
+  const {
+    prefs: sectionPrefs,
+    toggleCollapsed: toggleSectionCollapsed,
+    toggleShowUnreadOnly: toggleSectionShowUnreadOnly,
+  } = useSidebarSectionPreferences(
+    state.status === "ready" ? state.currentUserId : undefined,
+    state.status === "ready" ? state.workspaceId : undefined,
+  );
 
   const newConversationButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef(false);
@@ -1019,6 +1206,52 @@ export default function ChatSidebar({
     const { directs, groups } = partitionDMs(dms ?? []);
     return { orderedDirects: sortByActivity(directs), orderedGroups: sortByActivity(groups) };
   }, [dms]);
+
+  // Issue #779 — each section's "recolhida + mostrar não lidas" view: the
+  // already-sorted list, filtered to conversations with unread. Filtering
+  // after sorting rather than introducing a second order, and derived from
+  // the same canonical arrays as the header count and the badges, so there is
+  // never a second source of truth for what counts as unread.
+  const groupedChannelsByCategoryUnreadOnly = useMemo(
+    () =>
+      groupedChannelsByCategory.map(({ category, channels: categoryChannels }) => ({
+        category,
+        channels: categoryChannels.filter((ch) => hasUnread(ch.unreadCount)),
+      })),
+    [groupedChannelsByCategory],
+  );
+  const unreadChannelsCount = (channels ?? []).filter((ch) => hasUnread(ch.unreadCount)).length;
+  const unreadDirects = orderedDirects.filter((dm) => hasUnread(dm.unreadCount));
+  const unreadGroups = orderedGroups.filter((dm) => hasUnread(dm.unreadCount));
+
+  // Issue #779, code review — the section's visual state, computed once so
+  // each list renders exactly once instead of twice with complementary
+  // conditions. `showUnreadOnly` is purely the configuration (collapsed AND
+  // the preference is on); it deliberately never looks at `unreadCount`, so
+  // it cannot be confused with whether there happens to be anything to show.
+  // `sectionVisible` is the one place configuration and data mix: expanded is
+  // always visible, and a collapsed section in unread-only mode is visible
+  // only once there is at least one unread conversation — which is what keeps
+  // a genuinely-zero collapsed section from rendering an incorrect "Nenhum…"
+  // empty state instead of just its header.
+  const channelsShowUnreadOnly =
+    sectionPrefs.channels.collapsed && sectionPrefs.channels.showUnreadOnly;
+  const channelsSectionVisible =
+    !sectionPrefs.channels.collapsed || (channelsShowUnreadOnly && unreadChannelsCount > 0);
+  const visibleChannelGroups = channelsShowUnreadOnly
+    ? groupedChannelsByCategoryUnreadOnly
+    : groupedChannelsByCategory;
+
+  const directsShowUnreadOnly =
+    sectionPrefs.directs.collapsed && sectionPrefs.directs.showUnreadOnly;
+  const directsSectionVisible =
+    !sectionPrefs.directs.collapsed || (directsShowUnreadOnly && unreadDirects.length > 0);
+  const visibleDirects = directsShowUnreadOnly ? unreadDirects : orderedDirects;
+
+  const groupsShowUnreadOnly = sectionPrefs.groups.collapsed && sectionPrefs.groups.showUnreadOnly;
+  const groupsSectionVisible =
+    !sectionPrefs.groups.collapsed || (groupsShowUnreadOnly && unreadGroups.length > 0);
+  const visibleGroups = groupsShowUnreadOnly ? unreadGroups : orderedGroups;
 
   function handleChannelSelect(id: string) {
     navigate(`/chat/channel/${encodeURIComponent(id)}`);
@@ -1115,141 +1348,176 @@ export default function ChatSidebar({
   }
 
   return (
-    <aside
-      id={chatNavigationId}
-      className="chat-sidebar"
-      aria-label="Navegação do workspace Nchat"
-      data-testid="chat-sidebar"
-    >
-      {/* ── Brand ── */}
-      <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
-        <img
-          src="/assets/icononly_transparent.png"
-          alt=""
-          width={30}
-          height={34}
-          className="chat-sidebar__brand-img"
-        />
-        <div className="chat-sidebar__brand-copy">
-          <p className="chat-sidebar__brand-title">Nchat</p>
-          <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
-        </div>
-      </Link>
+    <DraftSummariesContext.Provider value={draftSummaries}>
+      <aside
+        id={chatNavigationId}
+        className="chat-sidebar"
+        aria-label="Navegação do workspace Nchat"
+        data-testid="chat-sidebar"
+      >
+        {/* ── Brand ── */}
+        <Link to="/chat" className="chat-sidebar__brand" aria-label="Nchat — Workspace Nic-Labs">
+          <img
+            src="/assets/icononly_transparent.png"
+            alt=""
+            width={30}
+            height={34}
+            className="chat-sidebar__brand-img"
+          />
+          <div className="chat-sidebar__brand-copy">
+            <p className="chat-sidebar__brand-title">Nchat</p>
+            <p className="chat-sidebar__brand-sub">Workspace Nic-Labs</p>
+          </div>
+        </Link>
 
-      {/* ── New conversation CTA ──
+        {/* ── New conversation CTA ──
           The sidebar's single creation entry point: the dialog behind it is
           where Pessoa/Grupo/Canal is chosen. The accessible name is the visible
           text, so it does not depend on a tooltip. Unavailable until the sidebar
           is ready because the dialog needs the current user id to exclude the
           actor from the search — never because of a role, which the server alone
           evaluates and which channel creation does not consider at all. */}
-      <button
-        ref={newConversationButtonRef}
-        type="button"
-        className="chat-sidebar__cta"
-        aria-haspopup="dialog"
-        disabled={state.status !== "ready"}
-        onClick={() => setNewConversationOpen(true)}
-      >
-        <IconAdd />
-        Nova conversa
-      </button>
+        <button
+          ref={newConversationButtonRef}
+          type="button"
+          className="chat-sidebar__cta"
+          aria-haspopup="dialog"
+          disabled={state.status !== "ready"}
+          onClick={() => setNewConversationOpen(true)}
+        >
+          <IconAdd />
+          Nova conversa
+        </button>
 
-      {/* ── Nav ──
+        {/* ── Nav ──
           Three product categories, three sections. Channels come from their own
           canonical list; 1:1 conversations and ad-hoc groups are split from the
           single DM list by the server-derived discriminator, so a conversation
           cannot show up twice or land in the wrong section. Nothing is
           classified while loading or on error: the sections only exist once the
           canonical data does. */}
-      <div className="chat-sidebar__nav">
-        {state.status === "loading" && <LoadingSkeleton />}
+        <div className="chat-sidebar__nav">
+          {state.status === "loading" && <LoadingSkeleton />}
 
-        {state.status === "error" && <ErrorState onRetry={retry} />}
+          {state.status === "error" && <ErrorState onRetry={retry} />}
 
-        {state.status === "ready" && (
-          <>
-            <Section labelId={CHANNELS_LABEL_ID} title="Canais">
-              <ChannelsByCategory
-                grouped={groupedChannelsByCategory}
-                activeChannelId={activeChannelId}
-                onSelect={handleChannelSelect}
-                actions={rowActions}
-                collapsed={collapsedCategories}
-                onToggleCategory={toggleCategory}
-              />
-            </Section>
+          {state.status === "ready" && (
+            <>
+              <Section
+                labelId={CHANNELS_LABEL_ID}
+                title="Canais"
+                collapsed={sectionPrefs.channels.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("channels")}
+                showUnreadOnly={sectionPrefs.channels.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("channels")}
+                badgeCount={unreadChannelsCount}
+              >
+                {channelsSectionVisible && (
+                  <ChannelsByCategory
+                    grouped={visibleChannelGroups}
+                    activeChannelId={activeChannelId}
+                    onSelect={handleChannelSelect}
+                    actions={rowActions}
+                    collapsed={collapsedCategories}
+                    onToggleCategory={toggleCategory}
+                    hideEmptyGroups={channelsShowUnreadOnly}
+                  />
+                )}
+              </Section>
 
-            <Section labelId={DIRECTS_LABEL_ID} title="Mensagens diretas" spaced>
-              <DMList
-                dms={orderedDirects}
-                activeDMId={activeDMId}
-                onSelect={handleDMSelect}
+              <Section
                 labelId={DIRECTS_LABEL_ID}
-                emptyMessage="Nenhuma mensagem direta."
-                actions={rowActions}
-              />
-            </Section>
+                title="Mensagens diretas"
+                spaced
+                collapsed={sectionPrefs.directs.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("directs")}
+                showUnreadOnly={sectionPrefs.directs.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("directs")}
+                badgeCount={unreadDirects.length}
+              >
+                {directsSectionVisible && (
+                  <DMList
+                    dms={visibleDirects}
+                    activeDMId={activeDMId}
+                    onSelect={handleDMSelect}
+                    labelId={DIRECTS_LABEL_ID}
+                    emptyMessage="Nenhuma mensagem direta."
+                    actions={rowActions}
+                  />
+                )}
+              </Section>
 
-            <Section labelId={GROUPS_LABEL_ID} title="Grupos" spaced>
-              <DMList
-                dms={orderedGroups}
-                activeDMId={activeDMId}
-                onSelect={handleDMSelect}
+              <Section
                 labelId={GROUPS_LABEL_ID}
-                emptyMessage="Nenhum grupo."
-                actions={rowActions}
-              />
-            </Section>
-          </>
-        )}
-        {actionError && (
-          <p className="chat-sidebar__pin-error" role="alert">
-            {actionError}
-          </p>
-        )}
-      </div>
+                title="Grupos"
+                spaced
+                collapsed={sectionPrefs.groups.collapsed}
+                onToggleCollapse={() => toggleSectionCollapsed("groups")}
+                showUnreadOnly={sectionPrefs.groups.showUnreadOnly}
+                onToggleShowUnreadOnly={() => toggleSectionShowUnreadOnly("groups")}
+                badgeCount={unreadGroups.length}
+              >
+                {groupsSectionVisible && (
+                  <DMList
+                    dms={visibleGroups}
+                    activeDMId={activeDMId}
+                    onSelect={handleDMSelect}
+                    labelId={GROUPS_LABEL_ID}
+                    emptyMessage="Nenhum grupo."
+                    actions={rowActions}
+                  />
+                )}
+              </Section>
+            </>
+          )}
+          {actionError && (
+            <p className="chat-sidebar__pin-error" role="alert">
+              {actionError}
+            </p>
+          )}
+        </div>
 
-      {/* ── Footer ── */}
-      <div className="chat-sidebar__footer">
-        <Link to="/chat/search" className="chat-sidebar__footer-item" aria-label="Buscar">
-          <IconSearch />
-          <span>Buscar</span>
-        </Link>
-        <Link
-          to="/chat/favorites"
-          className="chat-sidebar__footer-item"
-          aria-label="Meus favoritos"
-        >
-          <IconStar />
-          <span>Favoritos</span>
-        </Link>
-        <SidebarUser />
-      </div>
-      <SidebarRenameDialog
-        channels={channels}
-        dms={dms}
-        targetId={renamingId}
-        onClose={() => setRenamingId(null)}
-        onRenameChannel={renameChannel}
-        onRenameGroup={renameGroup}
-      />
-      <SidebarLeaveDialog
-        channels={channels}
-        dms={dms}
-        targetId={leavingId}
-        onClose={() => setLeavingId(null)}
-        onLeave={leaveConversation}
-      />
-      {newConversationOpen && state.status === "ready" && (
-        <NewConversationDialog
-          currentUserId={state.currentUserId}
-          categories={categories || []}
-          onClose={closeNewConversation}
-          onOpened={handleDMOpened}
-          onChannelCreated={handleChannelCreated}
+        {/* ── Footer ── */}
+        <div className="chat-sidebar__footer">
+          <Link to="/chat/search" className="chat-sidebar__footer-item" aria-label="Buscar">
+            <IconSearch />
+            <span>Buscar</span>
+          </Link>
+          <Link
+            to="/chat/favorites"
+            className="chat-sidebar__footer-item"
+            aria-label="Meus favoritos"
+          >
+            <IconStar />
+            <span>Favoritos</span>
+          </Link>
+          <SidebarUser />
+        </div>
+        <SidebarRenameDialog
+          channels={channels}
+          dms={dms}
+          targetId={renamingId}
+          onClose={() => setRenamingId(null)}
+          onRenameChannel={renameChannel}
+          onRenameGroup={renameGroup}
         />
-      )}
-    </aside>
+        <SidebarLeaveDialog
+          channels={channels}
+          dms={dms}
+          targetId={leavingId}
+          onClose={() => setLeavingId(null)}
+          onLeave={leaveConversation}
+        />
+        {newConversationOpen && state.status === "ready" && (
+          <NewConversationDialog
+            currentUserId={state.currentUserId}
+            categories={categories || []}
+            onClose={closeNewConversation}
+            onOpened={handleDMOpened}
+            onChannelCreated={handleChannelCreated}
+          />
+        )}
+      </aside>
+    </DraftSummariesContext.Provider>
   );
 }

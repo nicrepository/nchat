@@ -276,6 +276,143 @@ func (s *PGXDMStore) LeaveGroupConversation(ctx context.Context, workspaceID, co
 	return LeaveConversationResult{Event: event}, nil
 }
 
+// RemoveGroupParticipantResult carries the conversation_member_removed event
+// the transaction wrote, zero-valued when targetUserID did not currently
+// participate — the same "no change, no event" convention
+// RemoveChannelMemberByAdmin uses.
+type RemoveGroupParticipantResult struct {
+	Event domain.Message
+}
+
+// lockGroupForCreator holds the same three rows lockGroupForActor does, in the
+// same order, plus the conversation's created_by — the one extra fact this
+// operation's authorization needs, since a group has no role column to check
+// instead. The conversation lock is FOR SHARE: unlike rename, this operation
+// never writes the conversation row itself.
+func lockGroupForCreator(ctx context.Context, tx pgx.Tx, conversationID, workspaceID, callerID string) (string, error) {
+	var lockedID, createdBy string
+	err := tx.QueryRow(ctx, `
+		SELECT dc.id::text, COALESCE(dc.created_by::text, '')
+		FROM chat.dm_conversations dc
+		JOIN chat.workspaces w ON w.id = dc.workspace_id AND w.status = 'active'
+		WHERE dc.id = $1::uuid
+		  AND dc.workspace_id = $2::uuid
+		  AND dc.status = 'active'
+		  AND dc.type = 'group'
+		FOR SHARE OF dc`,
+		conversationID, workspaceID,
+	).Scan(&lockedID, &createdBy)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrNotFound
+		}
+		return "", fmt.Errorf("lock group conversation: %w", err)
+	}
+
+	var actorParticipates bool
+	err = tx.QueryRow(ctx, requireGroupParticipantSQL+shareParticipation, conversationID, callerID).Scan(&actorParticipates)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrForbidden
+		}
+		return "", fmt.Errorf("lock actor dm membership: %w", err)
+	}
+
+	var authorized bool
+	err = tx.QueryRow(ctx, requireActorWorkspaceMembershipSQL, workspaceID, callerID).Scan(&authorized)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrForbidden
+		}
+		return "", fmt.Errorf("lock actor workspace membership: %w", err)
+	}
+
+	if createdBy != callerID {
+		return "", domain.ErrForbidden
+	}
+	return lockedID, nil
+}
+
+// RemoveGroupParticipant removes targetUserID from a group conversation on
+// callerID's behalf and records conversation_member_removed in the same
+// transaction (issue #685).
+//
+// Lock order matches every other group mutation: conversation, then the
+// actor's own participation and workspace membership (lockGroupForCreator),
+// then — the one addition this operation makes — the target's participation,
+// taken FOR UPDATE because it is the row this operation writes.
+func (s *PGXDMStore) RemoveGroupParticipant(
+	ctx context.Context, workspaceID, conversationID, callerID, targetUserID string,
+) (RemoveGroupParticipantResult, error) {
+	if callerID == "" || targetUserID == "" {
+		return RemoveGroupParticipantResult{}, domain.ErrForbidden
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return RemoveGroupParticipantResult{}, fmt.Errorf("begin remove group participant: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	conversationID, err = lockGroupForCreator(ctx, tx, conversationID, workspaceID, callerID)
+	if err != nil {
+		return RemoveGroupParticipantResult{}, err
+	}
+
+	var targetParticipates bool
+	err = tx.QueryRow(ctx, requireGroupParticipantSQL+updateParticipation, conversationID, targetUserID).Scan(&targetParticipates)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return RemoveGroupParticipantResult{}, fmt.Errorf("commit remove group participant: %w", commitErr)
+			}
+			committed = true
+			return RemoveGroupParticipantResult{}, nil
+		}
+		return RemoveGroupParticipantResult{}, fmt.Errorf("lock target dm membership: %w", err)
+	}
+
+	targets, err := resolveConversationEventTargetUsers(ctx, tx, []string{targetUserID})
+	if err != nil {
+		return RemoveGroupParticipantResult{}, fmt.Errorf("resolve removed participant: %w", err)
+	}
+	event, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		WorkspaceID:      workspaceID,
+		DMConversationID: conversationID,
+		ActorID:          callerID,
+		Event:            domain.ConversationEventMemberRemoved,
+		Payload:          domain.ConversationEventPayload{TargetUsers: targets},
+	})
+	if err != nil {
+		return RemoveGroupParticipantResult{}, fmt.Errorf("insert member removed event: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE chat.dm_members
+		SET status = 'left', left_at = now()
+		WHERE conversation_id = $1::uuid AND user_id = $2::uuid AND status = 'active'`,
+		conversationID, targetUserID,
+	)
+	if err != nil {
+		return RemoveGroupParticipantResult{}, fmt.Errorf("remove group participant: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Unreachable in practice: the participation check above holds this very
+		// row FOR UPDATE, so nothing can have changed it since.
+		return RemoveGroupParticipantResult{}, domain.ErrForbidden
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return RemoveGroupParticipantResult{}, fmt.Errorf("commit remove group participant: %w", err)
+	}
+	committed = true
+	return RemoveGroupParticipantResult{Event: event}, nil
+}
+
 // groupLockModes says how one operation holds the two rows whose mode depends on
 // what it is about to write. Both fields are one of the locking-clause constants
 // above; nothing else is ever concatenated into these statements.

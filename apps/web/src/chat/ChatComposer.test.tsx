@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockFetchMentionCandidates } = vi.hoisted(() => ({
   mockFetchMentionCandidates: vi.fn(),
@@ -47,6 +47,179 @@ function setup() {
   render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
   return onSend;
 }
+
+/**
+ * jsdom lays nothing out, and a picker is only placed against a button the
+ * reader can see (issue #839): the emoji button gets a box inside the window
+ * here, and nothing else changes.
+ */
+const emojiButtonBox = {
+  x: 300,
+  y: 500,
+  left: 300,
+  right: 330,
+  top: 500,
+  bottom: 530,
+  width: 30,
+  height: 30,
+  toJSON: () => ({}),
+} as DOMRect;
+const realGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+let anchorBoxSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  anchorBoxSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ) {
+    if (this.getAttribute("aria-label") === "Inserir emoji") return emojiButtonBox;
+    return realGetBoundingClientRect.call(this);
+  });
+});
+
+afterEach(() => {
+  anchorBoxSpy.mockRestore();
+});
+
+describe("ChatComposer focus", () => {
+  it("focuses once when a desktop composer becomes writable without scrolling", async () => {
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    const focus = vi.spyOn(input, "focus");
+    expect(input).not.toHaveFocus();
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(focus).toHaveBeenCalledOnce();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Nova" onSend={vi.fn()} />);
+    expect(other).toHaveFocus();
+    expect(focus).toHaveBeenCalledOnce();
+    other.remove();
+  });
+
+  it("does not autofocus read-only or mobile composers", async () => {
+    const originalMatchMedia = window.matchMedia;
+    let matches = true;
+    let onChange!: () => void;
+    window.matchMedia = vi.fn().mockReturnValue({
+      get matches() {
+        return matches;
+      },
+      addEventListener: vi.fn((_, listener) => (onChange = listener)),
+      removeEventListener: vi.fn(),
+    });
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+    const input = await screen.findByTestId("chat-composer-input");
+    expect(input).not.toHaveFocus();
+
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    await waitFor(() => expect(input).not.toHaveFocus());
+    matches = false;
+    act(() => onChange());
+    await waitFor(() => expect(input).not.toHaveFocus());
+    window.matchMedia = originalMatchMedia;
+  });
+
+  it("respects focus moved to another control while loading", async () => {
+    const { rerender } = render(
+      <ChatComposer bodyFormat="v2" placeholder="Mensagem..." disabled onSend={vi.fn()} />,
+    );
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+
+    rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    await waitFor(() => expect(other).toHaveFocus());
+    other.remove();
+  });
+
+  it("keeps focus after Enter and preserves it with the draft on failure", async () => {
+    let rejectSend!: (error: Error) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((_, reject) => (rejectSend = reject)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "tentar novamente");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+    await act(async () => rejectSend(new Error("offline")));
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+
+    expect(input).toHaveFocus();
+    expect(input).toHaveTextContent("tentar novamente");
+  });
+
+  it("keeps focus after a successful Enter send", async () => {
+    const onSend = setup();
+    const input = await paste("", "enviar");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    expect(input).toHaveFocus();
+    await waitFor(() => expect(input.textContent?.trim()).toBe(""));
+  });
+
+  it("blocks edits during a pending send, then clears and restores focus", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "sent");
+    input.focus();
+
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+    await userEvent.type(input, " later", { skipClick: true });
+    expect(input).toHaveTextContent("sent");
+
+    await act(async () => resolveSend({ status: "sent" }));
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+    expect(input.textContent?.trim()).toBe("");
+    expect(input).toHaveFocus();
+  });
+
+  it("does not restore focus over a control chosen during a pending send", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi.fn().mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={onSend} />);
+    const input = await paste("", "sent");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "true"));
+
+    const other = document.createElement("button");
+    document.body.append(other);
+    other.focus();
+    await act(async () => resolveSend({ status: "sent" }));
+
+    expect(other).toHaveFocus();
+    other.remove();
+  });
+
+  it("returns focus after clicking send and keeps Shift+Enter as a line break", async () => {
+    const onSend = setup();
+    const input = await paste("", "linha um");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter", shiftKey: true });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input.querySelector("br")).not.toBeNull();
+
+    await userEvent.click(screen.getByTestId("chat-send-btn"));
+    expect(input).toHaveFocus();
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+  });
+});
 
 async function send(onSend: ReturnType<typeof setup>): Promise<string> {
   await userEvent.click(await screen.findByTestId("chat-send-btn"));
@@ -152,7 +325,7 @@ describe("ChatComposer mentions", () => {
     });
     render(
       <ChatComposer
-        channelId="22222222-2222-2222-2222-222222222222"
+        mentionTarget={{ kind: "channel", id: "22222222-2222-2222-2222-222222222222" }}
         bodyFormat="v3"
         placeholder="Mensagem..."
         onSend={onSend}
@@ -165,7 +338,7 @@ describe("ChatComposer mentions", () => {
     fireEvent.mouseDown(await screen.findByRole("option", { name: /Ana/ }));
 
     expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
-      "22222222-2222-2222-2222-222222222222",
+      { kind: "channel", id: "22222222-2222-2222-2222-222222222222" },
       "an",
       expect.any(AbortSignal),
     );
@@ -182,7 +355,7 @@ describe("ChatComposer mentions", () => {
     ]);
     render(
       <ChatComposer
-        channelId="22222222-2222-2222-2222-222222222222"
+        mentionTarget={{ kind: "channel", id: "22222222-2222-2222-2222-222222222222" }}
         bodyFormat="v3"
         placeholder="Mensagem..."
         onSend={vi.fn().mockResolvedValue({ status: "sent" })}
@@ -196,6 +369,163 @@ describe("ChatComposer mentions", () => {
     fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
 
     await waitFor(() => expect(screen.queryByRole("option", { name: /anuncios/ })).toBeNull());
+  });
+
+  it("opens on a bare @ and fetches the initial channel page", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "user-1", label: "Caio" },
+    ]);
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "channel", id: "channel-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    expect(await screen.findByRole("option", { name: /Caio/ })).toBeInTheDocument();
+    expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
+      { kind: "channel", id: "channel-1" },
+      "",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("enables the same v3 mention round-trip for a group", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      {
+        mentionType: "user",
+        id: "33333333-3333-3333-3333-333333333333",
+        label: "Juliane Lino",
+      },
+    ]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@ju", { skipClick: true });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /Juliane Lino/ }));
+
+    const stored = await send(onSend);
+    expect(stored).toContain("@[Juliane Lino](mention:user:33333333-3333-3333-3333-333333333333)");
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v3" />);
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@Juliane Lino");
+  });
+
+  it("offers @all for a group and selects it by mouse (issue #776)", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "33333333-3333-3333-3333-333333333333", label: "Juliane Lino" },
+    ]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@all", { skipClick: true });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: "all" }));
+
+    expect(input.querySelector(".chat-mention")).toHaveTextContent("@all");
+    const stored = await send(onSend);
+    expect(stored).toBe(`@[all](mention:all:${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)})`);
+
+    const { container } = render(<RichTextRenderer text={stored} bodyFormat="v3" />);
+    expect(container.querySelector(".rtr-mention")).toHaveTextContent("@all");
+  });
+
+  it("selects @all by Enter and does not crash on unmount (regression #773)", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([]);
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    const { unmount } = render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={onSend}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@all", { skipClick: true });
+    await screen.findByRole("option", { name: "all" });
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(input.querySelector(".chat-mention")).toHaveTextContent("@all"));
+    expect(() => unmount()).not.toThrow();
+  });
+
+  it("does not offer channel references in a group's autocomplete", async () => {
+    mockFetchMentionCandidates.mockResolvedValue([
+      { mentionType: "user", id: "user-1", label: "Ana" },
+    ]);
+    render(
+      <ChatComposer
+        mentionTarget={{ kind: "dm", id: "group-1" }}
+        bodyFormat="v3"
+        placeholder="Mensagem..."
+        onSend={vi.fn()}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    await screen.findByRole("option", { name: /Ana/ });
+    expect(mockFetchMentionCandidates).toHaveBeenLastCalledWith(
+      { kind: "dm", id: "group-1" },
+      "",
+      expect.any(AbortSignal),
+    );
+    // The server-side "dm" mentions search never returns channel candidates
+    // (mention_service.go), and this list has none to filter — the assertion
+    // is that @all (client-synthesized) and the fetched user are the only
+    // options, with no "#" channel row.
+    expect(screen.queryByText("#")).toBeNull();
+  });
+
+  it("keeps direct DMs on v2 without mention autocomplete", async () => {
+    mockFetchMentionCandidates.mockClear();
+    render(
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={vi.fn().mockResolvedValue({ status: "sent" })}
+      />,
+    );
+
+    const input = await screen.findByTestId("chat-composer-input");
+    input.focus();
+    await userEvent.type(input, "@", { skipClick: true });
+
+    expect(screen.queryByRole("listbox", { name: "Sugestões de menção" })).toBeNull();
+    expect(mockFetchMentionCandidates).not.toHaveBeenCalled();
   });
 });
 

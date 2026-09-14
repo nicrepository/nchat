@@ -17,6 +17,10 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/deploy/nchat-prod/lib.sh
 source "$SCRIPT_DIR/lib.sh"
+# For verified_release_manifest_id: the promotion re-derives the release
+# identity from the sealed manifest instead of accepting one it was handed.
+# shellcheck source=scripts/deploy/nchat-prod/release-manifest.sh
+source "$SCRIPT_DIR/release-manifest.sh"
 
 verify_final_state() {
   local expected="$1" mapping actual
@@ -61,12 +65,58 @@ require_smoke_evidence() {
   return 1
 }
 
+# Re-derives the release identity from the sealed manifest and requires the
+# cluster to be carrying that exact release.
+#
+# The pipeline hands this command an identity in its evidence, but an output can
+# be edited and a stale one can be replayed, so nothing is taken on trust: the
+# seal is verified here, the id is recomputed from it, and the result is
+# compared against what the slot is running right now. A rebuild of the same
+# commit seals a different manifest, so this is what a source SHA cannot see.
+require_release_identity() {
+  local observed_id="$1" manifest_dir="${NCHAT_PROD_RELEASE_MANIFEST_DIR:-}" recomputed
+  if [[ -z "$manifest_dir" ]]; then
+    echo "NCHAT_PROD_RELEASE_MANIFEST_DIR must name the directory holding the" >&2
+    echo "sealed release-manifest.json and release-manifest.sha256 being promoted." >&2
+    echo "A commit SHA does not identify a build: two builds of one commit carry" >&2
+    echo "different image digests, so the manifest is what says which bytes these are." >&2
+    return 1
+  fi
+  if ! recomputed="$(verified_release_manifest_id "$manifest_dir")"; then
+    echo "the release manifest in '$manifest_dir' is missing, unsealed or does not" >&2
+    echo "satisfy the release contract; it cannot identify what is being promoted." >&2
+    return 1
+  fi
+  if [[ "$recomputed" != "$observed_id" ]]; then
+    echo "the slot is running release $observed_id, but the sealed manifest being" >&2
+    echo "promoted is $recomputed. The candidate was rebuilt or redeployed after it" >&2
+    echo "was validated, so the approval does not cover what is on the cluster." >&2
+    return 1
+  fi
+  echo "release id verified against the sealed manifest: $recomputed"
+}
+
 main() {
   local target mapping release
   target="$(require_target_slot "$@")"
   require_context
   require_namespace
   mapping="$(collect_service_slots)"
+  # The reading that decides the mutation is the reading that gets classified,
+  # and it is classified here rather than only by whoever called this.
+  #
+  # A caller that validated its own earlier reading has proved something about a
+  # different moment: between that check and this one a Service can be deleted,
+  # have its selector cleared, or be patched to a value that is neither slot,
+  # and every one of those states used to reach switch_services_to_slot -- the
+  # `all_services_on_slot` test below simply returns false for them, which is
+  # the same answer it gives for an ordinary pending promotion. So the gate has
+  # to sit on this mapping, before anything is patched.
+  #
+  # A blue/green split still passes: that is the shape a cutover to this same
+  # target that stopped part-way leaves behind, and converging it is what a
+  # retry with the same --target exists for.
+  require_promotable_selectors "$mapping" "$target"
   print_context_banner "$mapping"
   echo "target slot: $target"
   # Two gates, and readiness alone is not the interesting one. A slot can be
@@ -76,13 +126,18 @@ main() {
   slot_ready "$target" || prod_fail "slot $target is not fully Ready; cutover blocked"
   release="$(require_consistent_release "$target")" || return 1
   echo "target release: $release"
+  # "<sha>:<id>" -- the commit and the sealed build, checked as one identity.
+  require_release_identity "${release#*:}" || return 1
   if all_services_on_slot "$mapping" "$target"; then
     report_no_op "$target"
     return 0
   fi
   require_smoke_evidence "$target" "$target:$release"
   confirm "Move production traffic to slot $target"
-  if ! switch_services_to_slot "$target"; then
+  # Backends take the new slot before the browser is served the new bundle:
+  # a client is compatible with its own release or newer, never with an
+  # older backend. See service_switch_order.
+  if ! switch_services_to_slot "$target" backends-first; then
     echo "Cutover stopped part-way. Production is in a mixed state." >&2
     echo "Re-run 'cutover.sh --target $target' to finish converging, or" >&2
     echo "'rollback.sh --target <previous> <reason>' to go back. Do not leave it mixed." >&2

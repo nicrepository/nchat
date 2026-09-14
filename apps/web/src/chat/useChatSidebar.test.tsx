@@ -7,9 +7,12 @@ import type {
   ShowBrowserMessageNotificationInput,
   ShowBrowserMessageNotificationResult,
 } from "./browserNotification";
+import { clearTokens } from "../lib/authSession";
+import { REALTIME_LEDGER_CAPACITY, retainedRealtimeIdCount } from "./realtimeMessageLedger";
+import { SOUND_COOLDOWN_MS } from "./notificationBurst";
 import { parseInstant } from "./sidebarOrder";
 import { savePersistedUnread } from "./sidebarUnreadPersistence";
-import type { WSMessageCreatedEvent } from "./useChatWebSocket";
+import type { WSMessageCreatedEvent, WSNotificationPolicy } from "./useChatWebSocket";
 import { useChatSidebar, type SidebarState } from "./useChatSidebar";
 
 const {
@@ -86,6 +89,38 @@ vi.mock("./useChatWebSocket", () => ({
     },
   ),
 }));
+
+/**
+ * These tests are about what an arriving message does to unread and to the
+ * alert surfaces — never about which tab gets to announce it.
+ *
+ * jsdom implements no Web Locks, and the presentation layer fails closed
+ * without them (see notificationPresentation.ts), so without this every one of
+ * these would find nothing presented. This grants the claim, which is the path
+ * a browser with Web Locks takes. Contention between tabs, and the fail-closed
+ * behaviour itself, are covered by that module's own suite.
+ */
+beforeEach(() => {
+  // The realtime ledger and the presentation memory are module-scoped on
+  // purpose (issue #750): they must survive a remount, so they also survive a
+  // test. Both are scoped to the session, so ending one is what starts each
+  // test from a client that has ingested nothing and announced nothing — the
+  // same mechanism a logout uses, not a test-only reset hook.
+  clearTokens();
+  Object.defineProperty(navigator, "locks", {
+    value: {
+      request: (_name: string, _options: unknown, callback: (lock: unknown) => unknown) => {
+        callback({ name: _name });
+        return Promise.resolve();
+      },
+    },
+    configurable: true,
+  });
+});
+
+afterEach(() => {
+  Reflect.deleteProperty(navigator, "locks");
+});
 
 const channelA = "11111111-1111-4111-8111-111111111111";
 const channelB = "22222222-2222-4222-8222-222222222222";
@@ -183,11 +218,102 @@ function messageCreated(
       body_text: bodyText,
       status: "active",
       is_removed: false,
+      notification_policy: serverDecision(targetType, bodyText, kind),
       created_at: messageCreatedAt,
       updated_at: messageCreatedAt,
     },
   };
 }
+
+/**
+ * The same event with the author's priority set, as a chat-service that carries
+ * the axis publishes it (#840). A raw wire value on purpose: what the client
+ * does with one it does not recognise is part of what these tests own.
+ */
+function withPriority(event: WSMessageCreatedEvent, priority: unknown): WSMessageCreatedEvent {
+  return { ...event, payload: { ...event.payload, priority } } as WSMessageCreatedEvent;
+}
+
+/**
+ * Stands in for the decision chat-service publishes with the event (issue
+ * #744): the central policy's answer plus the authoritative classification.
+ *
+ * The derivation itself is the server's, and it is tested there
+ * (services/chat-service/internal/app/notification_policy_test.go). What these
+ * tests own is the other half — that the client consumes the decision instead
+ * of working one out.
+ */
+function serverDecision(
+  targetType: "channel" | "dm",
+  bodyText: string,
+  kind: string,
+): WSNotificationPolicy {
+  const soundClass = targetType === "dm" ? "direct" : "general";
+  // A system message is not a notifiable event. The server still says so
+  // explicitly — an omitted object would mean "a server older than the
+  // contract", which is a different thing entirely.
+  if (kind !== "user") {
+    return {
+      policy_version: 1,
+      in_app: "deny",
+      sound: "deny",
+      web_push: "deny",
+      sound_class: soundClass,
+    };
+  }
+  const named = [...bodyText.matchAll(/\(mention:user:([^)]+)\)/g)].map(([, id]) => id);
+  return {
+    policy_version: 1,
+    // Allowed on this path: the realtime evaluation runs on the foreground
+    // surface, which is the one the toast lives on.
+    in_app: "allow",
+    sound: "allow",
+    // Denied on this path, and faithfully so: the realtime evaluation runs on
+    // the foreground surface and declares no push capability, so the central
+    // decision never allows the OS surface here. A fixture that allowed it
+    // would be testing a server that does not exist.
+    web_push: "deny",
+    sound_class: soundClass,
+    named_user_ids: named.length > 0 ? named : undefined,
+    names_everyone: bodyText.includes(`(mention:all:${ALL_MENTION_ID})`) || undefined,
+  };
+}
+
+/**
+ * A message.created carrying a deliberately chosen delivery plan (issue #744).
+ *
+ * The channels are set at odds with each other on purpose: a consumer that read
+ * a neighbouring channel's answer passes a uniform fixture and fails here.
+ */
+function messageWithPolicy(
+  messageId: string,
+  targetId: string,
+  policy: WSNotificationPolicy | undefined,
+  targetType: "channel" | "dm" = "channel",
+): WSMessageCreatedEvent {
+  const event = messageCreated(messageId, targetId, "other-1", targetType);
+  return {
+    ...event,
+    payload: event.payload ? { ...event.payload, notification_policy: policy } : undefined,
+  };
+}
+
+function plan(
+  inApp: "allow" | "deny",
+  sound: "allow" | "deny",
+  webPush: "allow" | "deny",
+): WSNotificationPolicy {
+  return {
+    policy_version: 1,
+    in_app: inApp,
+    sound,
+    web_push: webPush,
+    sound_class: "general",
+  };
+}
+
+/** The reserved id the server accepts as "everyone"; anything else is forged. */
+const ALL_MENTION_ID = "00000000-0000-0000-0000-000000000000";
 
 /** The same official mention token format RichTextRenderer parses (see richTextMarkers.ts). */
 function mentionToken(userId: string, label = "Você") {
@@ -404,7 +530,12 @@ describe("useChatSidebar realtime unread", () => {
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 1 });
   });
 
-  it("clears a conversation's badge on opening it and leaves other badges untouched", async () => {
+  // #492: opening a conversation's route is navigation, not a read receipt —
+  // the badge (and its mention flag) survive until something explicitly
+  // marks it read. The route still suppresses *further* increments for the
+  // conversation currently open, which is a separate, still-active rule
+  // (countsAsUnread's activeTarget check, independent of target_opened).
+  it("does not clear a conversation's badge on opening it, but still suppresses new unread while it stays open", async () => {
     const { Wrapper, navigateRef } = navigableWrapper("/chat");
     const { result } = renderHook(() => useChatSidebar(), { wrapper: Wrapper });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
@@ -430,13 +561,15 @@ describe("useChatSidebar realtime unread", () => {
     }
 
     act(() => navigateRef.current(`/chat/channel/${channelA}`));
-    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
-
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
     if (result.current.state.status === "ready") {
-      const opened = result.current.state.channels.find((c) => c.id === channelA);
-      expect(opened?.unreadCount).toBe(0);
-      expect(opened?.hasMentionUnread).toBeFalsy();
+      expect(result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread).toBe(
+        true,
+      );
     }
+
+    act(() => websocket.onMessageCreated?.(messageCreated("while-open", channelA)));
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
     expect(unreadCounts(result.current.state).channelB).toBe(1);
   });
 });
@@ -686,6 +819,21 @@ describe("useChatSidebar notification sound", () => {
   });
 });
 
+/**
+ * The same event with the OS-notification channel allowed.
+ *
+ * The cases below are about how a native notification is rendered, dismissed
+ * and clicked — not about whether the policy permits one, which
+ * soundRules.test.ts owns. Since the realtime decision denies `web_push`
+ * today, saying so here is what keeps these exercising the surface at all,
+ * and it says out loud which channel authorises it.
+ */
+function nativeAllowed(event: WSMessageCreatedEvent): WSMessageCreatedEvent {
+  const policy = event.payload?.notification_policy;
+  if (policy) policy.web_push = "allow";
+  return event;
+}
+
 describe("useChatSidebar native browser notification", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
@@ -715,7 +863,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-1", channelA)));
+    act(() => websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-1", channelA))));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledWith(
@@ -729,6 +877,64 @@ describe("useChatSidebar native browser notification", () => {
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
   });
 
+  // Issue #744, round 4: the chime and the OS notification are different
+  // interruptions, decided on different channels. Before this, one `sound:
+  // allow` opened both — a permitted chime silently bought a permission the
+  // policy had refused.
+  it("does not raise a native notification when only the chime was allowed", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // No nativeAllowed(): this is the decision the server actually publishes
+    // today — sound allowed, the OS surface denied — with the tab backgrounded,
+    // which is exactly where the two used to be confused.
+    act(() => websocket.onMessageCreated?.(messageCreated("native-sound-only", channelA)));
+
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("raises a native notification without a chime when only that channel was allowed", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const event = nativeAllowed(messageCreated("native-push-only", channelA));
+    const policy = event.payload?.notification_policy;
+    if (policy) policy.sound = "deny";
+    act(() => websocket.onMessageCreated?.(event));
+
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("stays silent on both surfaces when the policy allows neither", async () => {
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const event = messageCreated("native-neither", channelA);
+    const policy = event.payload?.notification_policy;
+    if (policy) policy.sound = "deny";
+    act(() => websocket.onMessageCreated?.(event));
+
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
   it("falls back to the chime when the native notification is not shown", async () => {
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
     const visibility = vi.spyOn(document, "visibilityState", "get");
@@ -738,7 +944,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-2", channelA)));
+    act(() => websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-2", channelA))));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
@@ -754,7 +960,9 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-unfocused", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-unfocused", channelA))),
+    );
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
@@ -769,12 +977,18 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-visible", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-visible", channelA))),
+    );
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
   });
 
+  // Mute is resolved server-side per recipient (issue #744, review round 6), so
+  // the decision that arrives for a muted conversation is already a denial — the
+  // browser does not re-apply the preference, and this fixture is the server
+  // saying so rather than the sidebar row saying it locally.
   it("keeps a muted conversation unread without a native notification or chime", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("hidden");
@@ -791,11 +1005,46 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-muted", channelA)));
+    const muted = messageWithPolicy("native-muted", channelA, {
+      policy_version: 1,
+      in_app: "deny",
+      sound: "deny",
+      web_push: "deny",
+      reasons: ["muted"],
+      sound_class: "general",
+    });
+    act(() => websocket.onMessageCreated?.(muted));
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    // Silencing an alert never hides the message: the badge still counts it.
     expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  // The other half of the same move: with a decision in hand the browser must
+  // not re-apply its own copy of the mute list. A server that allowed the event
+  // for this recipient has already accounted for their preferences.
+  it("does not re-apply its own mute list to a decision that allowed the event", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, muted: true },
+        { id: channelB, name: "B", type: "private", canWrite: true, muted: false },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], muted: false }],
+    });
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-allowed", channelA))),
+    );
+
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
   });
 
   it("attempts a native notification at most once for a duplicate delivery", async () => {
@@ -806,7 +1055,7 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    const event = messageCreated("native-dup", channelA);
+    const event = nativeAllowed(messageCreated("native-dup", channelA));
     act(() => {
       websocket.onMessageCreated?.(event);
       websocket.onMessageCreated?.(event);
@@ -823,7 +1072,11 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-own", channelA, currentUserId)));
+    act(() =>
+      websocket.onMessageCreated?.(
+        nativeAllowed(messageCreated("native-own", channelA, currentUserId)),
+      ),
+    );
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
@@ -837,7 +1090,9 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() =>
-      websocket.onMessageCreated?.(messageCreated("native-active-dm", dmC, "other-1", "dm")),
+      websocket.onMessageCreated?.(
+        nativeAllowed(messageCreated("native-active-dm", dmC, "other-1", "dm")),
+      ),
     );
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
@@ -855,7 +1110,9 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     expect(() =>
-      act(() => websocket.onMessageCreated?.(messageCreated("native-throws", channelA))),
+      act(() =>
+        websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-throws", channelA))),
+      ),
     ).not.toThrow();
 
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
@@ -876,19 +1133,22 @@ describe("useChatSidebar native browser notification", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
     const fetchesBeforeClick = mockFetchSidebarData.mock.calls.length;
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-late-click", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-late-click", channelA))),
+    );
     expect(unreadCounts(result.current.state).channelA).toBe(1);
 
     const { onNavigate } = mockShowBrowserMessageNotification.mock.calls[0][0];
     act(() => onNavigate(`/chat/channel/${channelA}`));
 
-    // Real navigation happened: the route change clears the badge exactly as
-    // it does for an in-app open (see "clears a conversation's badge on
-    // opening it" above).
-    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
-    // refreshSidebar() fired: a fresh fetch beyond the one triggered by the
-    // message event's own state update.
-    expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBeforeClick);
+    // Real navigation happened, but that alone is not a read receipt (#492) —
+    // the badge survives. What this proves is that refreshSidebar() fired: a
+    // fresh fetch beyond the one triggered by the message event's own state
+    // update.
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBeforeClick),
+    );
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
 
     // vi.restoreAllMocks() (afterEach, below) does not clear a plain
     // mockReturnValue on a vi.fn(), so leaving `shown: true` here would leak
@@ -908,7 +1168,9 @@ describe("useChatSidebar native browser notification", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    act(() => websocket.onMessageCreated?.(messageCreated("native-burst", channelA)));
+    act(() =>
+      websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-burst", channelA))),
+    );
     const { onNavigate } = mockShowBrowserMessageNotification.mock.calls[0][0];
     const fetchesBeforeClicks = mockFetchSidebarData.mock.calls.length;
 
@@ -1115,6 +1377,50 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("standard-unfocused", channelA)));
 
     expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  // The wire carries the author's priority (#821/#840) and the notification
+  // class is resolved from it (#826). What this owns is the edge: the field
+  // actually reaches the classification instead of being dropped on the way.
+  // The observable consequence is the sound budget, which urgent does not
+  // share with the room's ordinary traffic.
+  it("carries the author's priority from the wire into the notification class", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    // Another channel, so nothing here is suppressed for being on screen.
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-2", channelB)));
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+
+    act(() =>
+      websocket.onMessageCreated?.(withPriority(messageCreated("urgent-1", channelB), "urgent")),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+  });
+
+  // A priority this build does not know must never be the one that escalates.
+  it("treats an unrecognised wire priority as an ordinary message", async () => {
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("visible");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelA}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
+    act(() =>
+      websocket.onMessageCreated?.(withPriority(messageCreated("unknown-1", channelB), "critical")),
+    );
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
   });
 
   // Combines the two rules directly above into one session: badge
@@ -1343,7 +1649,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() =>
       websocket.onMessageCreated?.(
-        messageCreated("all-1", channelA, "other-1", "channel", undefined, "heads up @all"),
+        messageCreated(
+          "all-1",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `heads up @[all](mention:all:${ALL_MENTION_ID})`,
+        ),
       ),
     );
 
@@ -1358,7 +1671,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() =>
       websocket.onMessageCreated?.(
-        messageCreated("all-2", channelA, "other-1", "channel", undefined, "heads up @all"),
+        messageCreated(
+          "all-2",
+          channelA,
+          "other-1",
+          "channel",
+          undefined,
+          `heads up @[all](mention:all:${ALL_MENTION_ID})`,
+        ),
       ),
     );
 
@@ -1437,8 +1757,385 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
   });
 });
 
-describe("useChatSidebar sound mode changes at runtime", () => {
+/**
+ * The boundary between "this just happened" and "this is state I recovered",
+ * proven at the seam that actually decides it (issue #750).
+ *
+ * These do not hand an origin to the presentation layer and check it obeys —
+ * that would test a value, not the architecture. They drive the hook's real
+ * inputs: the live socket handler, the hydrating fetch, and the coalescing
+ * refetch that a reconnect and a membership change both run. Only one of the
+ * three may ever announce anything, and the other two must not, whatever they
+ * carry.
+ */
+describe("useChatSidebar — only the live path announces (issue #750)", () => {
   beforeEach(() => {
+    websocket.onMessageCreated = null;
+    websocket.onConversationAvailable = null;
+    websocket.onConversationEvent = null;
+    mockFetchSidebarData.mockClear();
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  });
+
+  /** The sidebar as the server hands it back, unread already counted server-side. */
+  function sidebarResponse(unreadCount: number) {
+    return {
+      currentUserId,
+      workspaceId: "workspace-1",
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true, unreadCount },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [], unreadCount }],
+      categories: [],
+    };
+  }
+
+  function presentationCount() {
+    return (
+      mockPlayMessageSound.mock.calls.length + mockShowBrowserMessageNotification.mock.calls.length
+    );
+  }
+
+  async function readySidebar(path = "/chat") {
+    const view = renderHook(() => useChatSidebar(), { wrapper: wrapper(path) });
+    await waitFor(() => expect(view.result.current.state.status).toBe("ready"));
+    return view;
+  }
+
+  // Hydration: the first load carries a hundred unread messages per
+  // conversation and announces none of them. It is not on the live path at all.
+  it("announces nothing for the hydrating load, however much unread it carries", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+
+    const { result } = await readySidebar();
+
+    expect(unreadCounts(result.current.state).channelA).toBe(100);
+    expect(presentationCount()).toBe(0);
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  /**
+   * Reconnect recovery. `conversation.available` is what the sidebar receives
+   * when the connection comes back with something it did not know about, and
+   * the response it triggers is the same coalescing refetch a resync runs.
+   * A hundred recovered unread messages, and not one alert.
+   */
+  it("announces nothing for the refetch a reconnect triggers", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(100));
+
+    expect(presentationCount()).toBe(0);
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  // The other recovery signal, a system message landing in a conversation:
+  // same refetch, same silence.
+  it("announces nothing for the refetch a conversation event triggers", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(40));
+    act(() => websocket.onConversationEvent?.());
+    await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(40));
+
+    expect(presentationCount()).toBe(0);
+  });
+
+  /**
+   * A route-only live frame — one with no payload — is a recovery signal too:
+   * it says something happened without saying what, so the sidebar asks the
+   * server rather than guessing, and announces nothing on the way.
+   */
+  it("announces nothing for a live frame that carries no message", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    await readySidebar();
+
+    const routeOnly = messageCreated("route-only", channelA);
+    act(() => websocket.onMessageCreated?.({ ...routeOnly, payload: undefined }));
+
+    expect(presentationCount()).toBe(0);
+  });
+
+  /**
+   * Import and migration (#506) reach this client already decided: the policy
+   * engine denies every channel for an origin that is not live. The client
+   * consumes that rather than re-deriving it, so the real contract is what is
+   * exercised here — no client-side flag is involved.
+   */
+  it("announces nothing for a message the policy denied on every channel", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageWithPolicy("imported-1", channelA, plan("deny", "deny", "deny")),
+      ),
+    );
+
+    expect(presentationCount()).toBe(0);
+    // Suppressing the alert never suppresses the message: the badge still moves.
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  // The live path, for contrast: the same hook, the same session, one frame.
+  it("announces exactly once for a live message", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(0));
+    const { result } = await readySidebar();
+
+    act(() => websocket.onMessageCreated?.(messageCreated("live-1", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(result.current.inAppAlert?.messageId).toBe("live-1");
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+  });
+
+  /**
+   * The composition, end to end: hydrate with unread, recover more over a
+   * reconnect, then receive one genuinely new live message. Everything
+   * recovered stays silent and the live one still announces — going quiet after
+   * a recovery is the failure that would make the whole gate unacceptable.
+   */
+  it("still announces the first live message after hydration and recovery", async () => {
+    mockFetchSidebarData.mockResolvedValue(sidebarResponse(100));
+    const { result } = await readySidebar();
+    act(() => websocket.onConversationAvailable?.());
+    await waitFor(() => expect(mockFetchSidebarData).toHaveBeenCalledTimes(2));
+    expect(presentationCount()).toBe(0);
+
+    act(() => websocket.onMessageCreated?.(messageCreated("live-after-recovery", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(result.current.inAppAlert?.messageId).toBe("live-after-recovery");
+  });
+});
+
+/**
+ * State ingestion happens once per message id, and unread derives from it
+ * (issue #750). These are the cases that would pass with an unbounded Set and
+ * must keep passing without one.
+ */
+describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [],
+    });
+  });
+
+  async function readySidebar() {
+    const view = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(view.result.current.state.status).toBe("ready"));
+    return view;
+  }
+
+  it("counts one message once, however many times it is delivered", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      for (let index = 0; index < 5; index += 1) {
+        websocket.onMessageCreated?.(messageCreated("delivered-again", channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(1);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A remount is what used to reopen this: the dedup set lived in a ref and
+   * died with the hook, so the same id could be counted a second time. The
+   * ledger is module-scoped and outlives the hook.
+   *
+   * The remount refetches, and the server's own unreadCount is the authority
+   * for the state that comes back — so the second sidebar starts at the 1 the
+   * server counted, and the redelivery must add nothing to it. A genuinely new
+   * message still does, which is what separates this from simply going deaf.
+   */
+  it("does not count a message again after a remount", async () => {
+    const first = await readySidebar();
+    act(() => websocket.onMessageCreated?.(messageCreated("across-remount", channelA)));
+    expect(unreadCounts(first.result.current.state).channelA).toBe(1);
+    first.unmount();
+
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, unreadCount: 1 }],
+      dms: [],
+    });
+    const second = await readySidebar();
+    act(() => websocket.onMessageCreated?.(messageCreated("across-remount", channelA)));
+
+    expect(unreadCounts(second.result.current.state).channelA).toBe(1);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+
+    act(() => websocket.onMessageCreated?.(messageCreated("after-remount", channelA)));
+    expect(unreadCounts(second.result.current.state).channelA).toBe(2);
+  });
+
+  it("keeps counting genuinely new messages", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      websocket.onMessageCreated?.(messageCreated("new-1", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-1", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-2", channelA));
+      websocket.onMessageCreated?.(messageCreated("new-3", channelA));
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(3);
+  });
+
+  /**
+   * High cardinality: a session that receives far more messages than any dedupe
+   * structure could hold must not leave one growing behind it. The ledger's
+   * bound is asserted directly — unread still counts every one of them.
+   */
+  it("keeps its dedupe state bounded through a very long session", async () => {
+    const { result } = await readySidebar();
+
+    act(() => {
+      for (let index = 0; index < 3_000; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`long-session-${index}`, channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(3_000);
+    expect(retainedRealtimeIdCount()).toBeLessThanOrEqual(REALTIME_LEDGER_CAPACITY);
+  });
+});
+
+describe("useChatSidebar burst suppression (issue #750)", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [],
+    });
+  });
+
+  /**
+   * The property the whole issue rests on: suppression is about what the reader
+   * *hears*, never about what they are owed. A rajada chimes once and still
+   * counts every message — the badge is decided by the reducer, from the same
+   * event, and it never consults the presentation layer's outcome.
+   */
+  it("counts every message of a rajada while chiming once", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+    });
+
+    expect(unreadCounts(result.current.state).channelA).toBe(25);
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The in-app surface stays bounded by its own design (issue #744): one alert,
+   * the newest. A rajada replaces it rather than stacking, so nothing
+   * accumulates and the reader is always offered the latest activity to open.
+   */
+  it("keeps exactly one in-app alert through a rajada, the newest", async () => {
+    // The toast is drawn in this window, and jsdom reports an unfocused
+    // document by default — so this case has to say someone is looking.
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+    });
+
+    expect(result.current.inAppAlert?.messageId).toBe("rajada-24");
+  });
+
+  /**
+   * Why the memory lives in the module and not in this hook: a remount — a
+   * route change, StrictMode's second mount, a new socket generation — builds a
+   * fresh hook with a fresh dedup set, and none of that means the reader
+   * stopped hearing what this tab already announced.
+   */
+  it("does not announce again after a remount an event it already announced", async () => {
+    const first = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(first.result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    first.unmount();
+
+    const second = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper(`/chat/channel/${channelB}`),
+    });
+    await waitFor(() => expect(second.result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a rajada in one conversation from silencing another", async () => {
+    const { result } = renderHook(() => useChatSidebar(), {
+      wrapper: wrapper("/chat"),
+    });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      for (let index = 0; index < 25; index += 1) {
+        websocket.onMessageCreated?.(messageCreated(`rajada-${index}`, channelA));
+      }
+      websocket.onMessageCreated?.(messageCreated("elsewhere", channelB));
+    });
+
+    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useChatSidebar sound mode changes at runtime", () => {
+  /**
+   * Moves past the burst window (issue #750) so the next assertion is about the
+   * preference that just changed and not about the cooldown: these events are
+   * milliseconds apart in the same conversation, which is a rajada, and a
+   * rajada is exactly what the sound gate collapses.
+   *
+   * Only Date is faked — scheduling stays real, so waitFor still works.
+   */
+  function leaveTheSoundBurstWindow() {
+    vi.setSystemTime(new Date(Date.now() + SOUND_COOLDOWN_MS));
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     websocket.onMessageCreated = null;
     mockPlayMessageSound.mockReset();
     mockGetSoundNotificationMode.mockReset();
@@ -1451,6 +2148,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -1475,6 +2173,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
     // Switched back to 'all' mid-session: the very next eligible event plays
     // immediately, and the badge keeps counting correctly across the flip.
     mockGetSoundNotificationMode.mockReturnValue("all");
+    leaveTheSoundBurstWindow();
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-2b", channelA)));
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
     expect(unreadCounts(result.current.state).channelA).toBe(3);
@@ -1485,6 +2184,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-3", channelA)));
     expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
 
+    leaveTheSoundBurstWindow();
     act(() =>
       websocket.onMessageCreated?.(
         messageCreated(
@@ -2063,8 +2763,11 @@ describe("useChatSidebar — badge persistence", () => {
     await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(1));
   });
 
-  it("marks the opened conversation read without blocking the local badge clear", async () => {
-    mockMarkConversationRead.mockRejectedValueOnce(new Error("offline"));
+  // #492: opening a conversation's route is a navigation event, not a read
+  // receipt. Marking read now happens only once ChatMessageArea has evidence
+  // the user reached the real bottom, via the same markRead() below — never
+  // automatically from the route alone.
+  it("does not mark a conversation read just because its route opened", async () => {
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
       workspaceId,
@@ -2076,8 +2779,9 @@ describe("useChatSidebar — badge persistence", () => {
       wrapper: wrapper(`/chat/channel/${channelA}`),
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
-    await waitFor(() => expect(mockMarkConversationRead).toHaveBeenCalledWith("channel", channelA));
-    expect(unreadCounts(result.current.state).channelA).toBe(0);
+
+    expect(mockMarkConversationRead).not.toHaveBeenCalled();
+    expect(unreadCounts(result.current.state).channelA).toBe(3);
   });
 
   afterEach(() => {
@@ -2145,7 +2849,10 @@ describe("useChatSidebar — badge persistence", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("to-be-read", channelA)));
     expect(unreadCounts(result.current.state).channelA).toBe(1);
 
+    // #492: opening the route no longer marks it read — mark it explicitly,
+    // the same way ChatMessageArea will once it confirms the real bottom.
     act(() => navigateRef.current(`/chat/channel/${channelA}`));
+    act(() => result.current.markRead({ kind: "channel", targetId: channelA }));
     await waitFor(() => expect(unreadCounts(result.current.state).channelA).toBe(0));
     unmount();
 
@@ -2544,10 +3251,13 @@ describe("useChatSidebar conversation preferences", () => {
   };
 
   it("mutes a direct conversation optimistically and keeps the other rows alone", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
     const result = await readyHook();
 
-    await act(async () => {
-      await result.current.setMuted({ kind: "dm", targetId: dmC }, true);
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "dm", targetId: dmC }, true);
     });
 
     expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", dmC, true);
@@ -2557,6 +3267,22 @@ describe("useChatSidebar conversation preferences", () => {
     if (result.current.state.status === "ready") {
       expect(result.current.state.channels[0]?.muted).toBeFalsy();
     }
+
+    // The server now holds it, so the refetch that follows a confirmed write
+    // keeps it — the optimistic guess and the canonical answer agree.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true }],
+      dms: [
+        { id: dmC, name: "Juliane", type: "1:1", muted: true },
+        { id: groupD, name: "Squad", type: "group", isGroup: true },
+      ],
+    });
+    persisted.resolve();
+    await act(async () => operation);
+
+    await waitFor(() => expect(dmRow(result, dmC)?.muted).toBe(true));
+    expect(dmRow(result, groupD)?.muted).toBeFalsy();
   });
 
   it("rolls a mute back to what it was when the server refuses", async () => {
@@ -2584,12 +3310,151 @@ describe("useChatSidebar conversation preferences", () => {
     const result = await readyHook();
     expect(dmRow(result, groupD)?.muted).toBe(true);
 
+    // What the server will hold once the DELETE is accepted.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [],
+      dms: [{ id: groupD, name: "Squad", type: "group", isGroup: true, muted: false }],
+    });
     await act(async () => {
       await result.current.setMuted({ kind: "dm", targetId: groupD }, false);
     });
 
     expect(mockSetConversationMuted).toHaveBeenCalledWith("dm", groupD, false);
-    expect(dmRow(result, groupD)?.muted).toBe(false);
+    await waitFor(() => expect(dmRow(result, groupD)?.muted).toBe(false));
+  });
+
+  // ── Mute: reconciliation and one-write-per-conversation (issue #729) ────────
+
+  it("refetches the canonical list once a mute is confirmed", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    let operation!: Promise<void>;
+    act(() => {
+      operation = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    // Optimistic while in flight, and no refetch yet: nothing is confirmed.
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+    expect(mockFetchSidebarData.mock.calls.length).toBe(fetchesBefore);
+
+    persisted.resolve();
+    await act(async () => operation);
+
+    await waitFor(() =>
+      expect(mockFetchSidebarData.mock.calls.length).toBeGreaterThan(fetchesBefore),
+    );
+  });
+
+  it("does not refetch when the mute is refused", async () => {
+    mockSetConversationMuted.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+    const fetchesBefore = mockFetchSidebarData.mock.calls.length;
+
+    await act(async () => {
+      await expect(result.current.setMuted({ kind: "dm", targetId: dmC }, true)).rejects.toThrow(
+        "offline",
+      );
+    });
+
+    expect(mockFetchSidebarData.mock.calls.length).toBe(fetchesBefore);
+    expect(dmRow(result, dmC)?.muted).toBeFalsy();
+  });
+
+  // Two surfaces call this — the sidebar row menu and the notifications settings
+  // page, both mounted together on /profile — so the guard has to live here, not
+  // in either of them. A POST and a DELETE racing on the same mute endpoint have
+  // no ordering guarantee in flight.
+  it("drops a second mute for the same conversation while the first is in flight", async () => {
+    const persisted = deferredValue<void>();
+    mockSetConversationMuted.mockReturnValueOnce(persisted.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, false);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(1);
+    // The dropped call changed nothing either — the row still shows the write
+    // that is actually on its way to the server.
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+
+    persisted.resolve();
+    await act(async () => first);
+
+    // Once it is finished the conversation is writable again.
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, false);
+    });
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a different conversation be muted while another write is in flight", async () => {
+    const channelWrite = deferredValue<void>();
+    const groupWrite = deferredValue<void>();
+    mockSetConversationMuted
+      .mockReturnValueOnce(channelWrite.promise)
+      .mockReturnValueOnce(groupWrite.promise);
+    const result = await readyHook();
+
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+    act(() => {
+      second = result.current.setMuted({ kind: "dm", targetId: groupD }, true);
+    });
+
+    // The second conversation was never made to wait on the first.
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+    expect(mockSetConversationMuted).toHaveBeenLastCalledWith("dm", groupD, true);
+    expect(dmRow(result, groupD)?.muted).toBe(true);
+    if (result.current.state.status !== "ready") throw new Error("not ready");
+    expect(result.current.state.channels[0]?.muted).toBe(true);
+
+    channelWrite.resolve();
+    groupWrite.resolve();
+    await act(async () => {
+      await Promise.all([first, second]);
+    });
+  });
+
+  it("releases the conversation after a refusal so a retry is possible", async () => {
+    mockSetConversationMuted.mockRejectedValueOnce(new Error("offline"));
+    const result = await readyHook();
+
+    await act(async () => {
+      await expect(
+        result.current.setMuted({ kind: "channel", targetId: channelA }, true),
+      ).rejects.toThrow("offline");
+    });
+
+    // What the server holds once the retry is accepted.
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [{ id: channelA, name: "A", type: "public", canWrite: true, muted: true }],
+      dms: [],
+    });
+    await act(async () => {
+      await result.current.setMuted({ kind: "channel", targetId: channelA }, true);
+    });
+
+    expect(mockSetConversationMuted).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      if (result.current.state.status !== "ready") throw new Error("not ready");
+      expect(result.current.state.channels[0]?.muted).toBe(true);
+    });
   });
 
   it("pins a direct conversation optimistically, then reconciles with the server", async () => {
@@ -2657,5 +3522,182 @@ describe("useChatSidebar conversation preferences", () => {
     expect(result.current.state.dms.map((dm) => dm.id)).toEqual([dmC, groupD]);
     expect(result.current.state.channels.every((channel) => !channel.muted)).toBe(true);
     expect(result.current.state.dms.every((dm) => !dm.muted && !dm.pinnedAt)).toBe(true);
+  });
+});
+
+/**
+ * Issue #744, review round 6: the in-app channel has a consumer, and these
+ * assert the consumer rather than the helper that gates it.
+ *
+ * `result.current.inAppAlert` is what AppShell renders InAppMessageAlert from,
+ * so a case that expects a toast expects that value to be set and a case that
+ * forbids one expects it to stay null. The chime and the OS notification are
+ * asserted through the same mocks the rest of this file uses, so every case
+ * states what all three surfaces did.
+ */
+describe("the in-app surface consumes its own channel", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    // The chime preference is a local execution preference and a previous
+    // describe may have left it at "off"; these cases are about the channels.
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [] }],
+    });
+  });
+
+  // The in-app surface is drawn in this window, so every case has to say
+  // whether anyone is looking at it. jsdom reports an unfocused document by
+  // default, which is itself one of the cases below.
+  function setWindowFocused(focused: boolean) {
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue(focused ? "visible" : "hidden");
+  }
+
+  async function deliver(event: WSMessageCreatedEvent, path = "/chat", focused = true) {
+    setWindowFocused(focused);
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper(path) });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => websocket.onMessageCreated?.(event));
+    return result;
+  }
+
+  it("raises the toast and nothing else when only in_app is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-a", channelA, plan("allow", "deny", "deny")));
+    expect(result.current.inAppAlert?.messageId).toBe("m-a");
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not raise the toast when in_app is denied and sound is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-b", channelA, plan("deny", "allow", "deny")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("does not raise the toast when only web_push is allowed", async () => {
+    const result = await deliver(messageWithPolicy("m-c", channelA, plan("deny", "deny", "allow")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+  });
+
+  it("raises nothing when every channel is denied", async () => {
+    const result = await deliver(messageWithPolicy("m-d", channelA, plan("deny", "deny", "deny")));
+    expect(result.current.inAppAlert).toBeNull();
+    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("keeps the accepted legacy behaviour for a payload with no decision", async () => {
+    const result = await deliver(messageWithPolicy("m-e", channelA, undefined));
+    // Absence is "nobody told us", so the local gates alone decide — and they do
+    // not silence. This is the compatibility path agreed in an earlier round.
+    expect(result.current.inAppAlert?.messageId).toBe("m-e");
+    // Focused, so the OS surface is the one that makes no sense here and the
+    // chime is what runs. Neither is a policy decision.
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayMessageSound).toHaveBeenCalled();
+  });
+
+  it("suppresses the toast for the conversation this tab is showing", async () => {
+    // in_app is allowed centrally; the local gate is the only thing that removes
+    // it, and it can only remove.
+    const result = await deliver(
+      messageWithPolicy("m-f", channelA, plan("allow", "allow", "deny")),
+      `/chat/channel/${channelA}`,
+    );
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  it("dismisses the alert on request", async () => {
+    const result = await deliver(messageWithPolicy("m-g", channelA, plan("allow", "deny", "deny")));
+    expect(result.current.inAppAlert).not.toBeNull();
+    act(() => result.current.dismissInAppAlert());
+    expect(result.current.inAppAlert).toBeNull();
+  });
+
+  // A central denial is final. No local state may put the surface back.
+  it("never turns a central in-app denial into a toast", async () => {
+    for (const path of ["/chat", `/chat/channel/${channelB}`]) {
+      mockPlayMessageSound.mockClear();
+      const result = await deliver(
+        messageWithPolicy("m-h", channelA, plan("deny", "allow", "allow")),
+        path,
+      );
+      expect(result.current.inAppAlert).toBeNull();
+    }
+  });
+});
+
+/**
+ * Issue #744, review round 7: focus gates the in-app surface in the flow the UI
+ * actually reads.
+ *
+ * `result.current.inAppAlert` is what AppShell renders InAppMessageAlert from,
+ * so "no alert is created" is asserted as that value staying null — and staying
+ * null, rather than being held for later.
+ */
+describe("the in-app surface is not created for an unfocused window", () => {
+  beforeEach(() => {
+    websocket.onMessageCreated = null;
+    mockPlayMessageSound.mockReset();
+    mockShowBrowserMessageNotification.mockReset();
+    mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
+    mockGetSoundNotificationMode.mockReset();
+    mockGetSoundNotificationMode.mockReturnValue("all");
+    mockFetchSidebarData.mockResolvedValue({
+      currentUserId,
+      channels: [
+        { id: channelA, name: "A", type: "public", canWrite: true },
+        { id: channelB, name: "B", type: "private", canWrite: true },
+      ],
+      dms: [{ id: dmC, type: "1:1", name: "C", participants: [] }],
+    });
+  });
+
+  async function deliverWithFocus(focused: boolean) {
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue(focused ? "visible" : "hidden");
+    const { result } = renderHook(() => useChatSidebar(), { wrapper: wrapper("/chat") });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() =>
+      websocket.onMessageCreated?.(
+        messageWithPolicy("focus-1", channelA, plan("allow", "allow", "allow")),
+      ),
+    );
+    return result;
+  }
+
+  it("creates no alert while the window is hidden, even though in_app is allowed", async () => {
+    const result = await deliverWithFocus(false);
+    expect(result.current.inAppAlert).toBeNull();
+    // ...and the OS surface is exactly the one that does make sense here.
+    expect(mockShowBrowserMessageNotification).toHaveBeenCalled();
+  });
+
+  it("creates the alert once the window is the one in front", async () => {
+    const result = await deliverWithFocus(true);
+    expect(result.current.inAppAlert?.messageId).toBe("focus-1");
+  });
+
+  // The alert must not be queued: a hidden window produces nothing to show
+  // later, so returning to the tab does not surface a stale message.
+  it("does not hold a hidden window's alert for later", async () => {
+    const result = await deliverWithFocus(false);
+    expect(result.current.inAppAlert).toBeNull();
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    expect(result.current.inAppAlert).toBeNull();
   });
 });

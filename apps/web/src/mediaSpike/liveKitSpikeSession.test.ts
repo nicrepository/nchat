@@ -20,6 +20,8 @@ const liveKitMock = vi.hoisted(() => {
     TrackUnmuted: "trackUnmuted",
     ActiveSpeakersChanged: "activeSpeakersChanged",
     LocalTrackUnpublished: "localTrackUnpublished",
+    MediaDevicesChanged: "mediaDevicesChanged",
+    ActiveDeviceChanged: "activeDeviceChanged",
   } as const;
   const kinds = { Audio: "audio", Video: "video" } as const;
   const sources = {
@@ -28,7 +30,9 @@ const liveKitMock = vi.hoisted(() => {
     ScreenShare: "screen_share",
   } as const;
   const permissionDenied = "permission-denied";
+  const notFound = "not-found";
   const rooms: MockRoom[] = [];
+  const supportsAudioOutputSelection = vi.fn(() => true);
 
   interface MockPublication {
     source: string;
@@ -62,6 +66,9 @@ const liveKitMock = vi.hoisted(() => {
     readonly startAudio = vi.fn(async () => undefined);
     readonly disconnect = vi.fn(async () => undefined);
     readonly removeAllListeners = vi.fn();
+    readonly getActiveDevice = vi.fn((): string | undefined => undefined);
+    readonly switchActiveDevice = vi.fn(async (): Promise<unknown> => true);
+    static getLocalDevices = vi.fn(async (): Promise<unknown[]> => []);
 
     constructor(options: unknown) {
       this.options = options;
@@ -113,24 +120,29 @@ const liveKitMock = vi.hoisted(() => {
     kinds,
     sources,
     permissionDenied,
+    notFound,
     rooms,
     MockRoom,
-    getFailure: vi.fn((error: unknown) =>
-      (error as { deviceFailure?: string }).deviceFailure === permissionDenied
-        ? permissionDenied
-        : "other",
-    ),
+    supportsAudioOutputSelection,
+    getFailure: vi.fn((error: unknown) => {
+      const failure = (error as { deviceFailure?: string }).deviceFailure;
+      if (failure === permissionDenied) return permissionDenied;
+      if (failure === notFound) return notFound;
+      return "other";
+    }),
   };
 });
 
 vi.mock("livekit-client", () => ({
   MediaDeviceFailure: {
     PermissionDenied: liveKitMock.permissionDenied,
+    NotFound: liveKitMock.notFound,
     getFailure: liveKitMock.getFailure,
   },
   Room: liveKitMock.MockRoom,
   RoomEvent: liveKitMock.events,
   Track: { Kind: liveKitMock.kinds, Source: liveKitMock.sources },
+  supportsAudioOutputSelection: liveKitMock.supportsAudioOutputSelection,
 }));
 
 function callbacks(): LiveKitSpikeSessionCallbacks {
@@ -151,6 +163,8 @@ function callbacks(): LiveKitSpikeSessionCallbacks {
     onScreenShareChanged: vi.fn(),
     onLocalScreenShareChanged: vi.fn(),
     onRemoteScreenShareChanged: vi.fn(),
+    onDeviceListChanged: vi.fn(),
+    onActiveDeviceChanged: vi.fn(),
   };
 }
 
@@ -1426,6 +1440,134 @@ describe("createLiveKitSpikeSession", () => {
       expect(b.handlers.onElementRemoved).not.toHaveBeenCalled();
       expect(b.handlers.onMicrophoneStateChanged).not.toHaveBeenCalled();
       expect(remoteTrackOnB.detach).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("device selection (issue #755)", () => {
+    it("enumerates devices per kind without requesting permission", async () => {
+      const { room, session } = setup();
+      liveKitMock.MockRoom.getLocalDevices.mockResolvedValueOnce([
+        { deviceId: "mic-1", label: "Headset USB" },
+        { deviceId: "mic-2", label: "" },
+      ]);
+
+      const devices = await session.listMediaDevices("audioinput");
+
+      expect(liveKitMock.MockRoom.getLocalDevices).toHaveBeenCalledWith("audioinput", false);
+      expect(devices).toEqual([
+        { deviceId: "mic-1", kind: "audioinput", label: "Headset USB" },
+        { deviceId: "mic-2", kind: "audioinput", label: "" },
+      ]);
+      void room;
+    });
+
+    it("reads the SDK-confirmed active device", () => {
+      const { room, session } = setup();
+      room.getActiveDevice.mockReturnValue("mic-1");
+
+      expect(session.getActiveDevice("audioinput")).toBe("mic-1");
+      expect(room.getActiveDevice).toHaveBeenCalledWith("audioinput");
+    });
+
+    it("switches audioinput without throwing on success", async () => {
+      const { room, session } = setup();
+
+      await session.switchActiveDevice("audioinput", "mic-2");
+
+      expect(room.switchActiveDevice).toHaveBeenCalledWith("audioinput", "mic-2");
+    });
+
+    it("switches videoinput without throwing on success", async () => {
+      const { room, session } = setup();
+
+      await session.switchActiveDevice("videoinput", "cam-2");
+
+      expect(room.switchActiveDevice).toHaveBeenCalledWith("videoinput", "cam-2");
+    });
+
+    it("reports audiooutput support via the SDK feature check", () => {
+      const { session } = setup();
+      liveKitMock.supportsAudioOutputSelection.mockReturnValueOnce(false);
+
+      expect(session.isAudioOutputSupported()).toBe(false);
+      expect(liveKitMock.supportsAudioOutputSelection).toHaveBeenCalled();
+    });
+
+    it("maps a permission-denied switch failure to a recoverable device error", async () => {
+      const { room, session } = setup();
+      room.switchActiveDevice.mockRejectedValueOnce({
+        deviceFailure: liveKitMock.permissionDenied,
+      });
+
+      await expect(session.switchActiveDevice("audioinput", "mic-2")).rejects.toMatchObject({
+        name: "SpikeDeviceError",
+        deviceKind: "audioinput",
+        kind: "denied",
+      });
+    });
+
+    it("maps a not-found switch failure (device removed between listing and selecting)", async () => {
+      const { room, session } = setup();
+      room.switchActiveDevice.mockRejectedValueOnce({ deviceFailure: liveKitMock.notFound });
+
+      await expect(session.switchActiveDevice("videoinput", "cam-gone")).rejects.toMatchObject({
+        name: "SpikeDeviceError",
+        deviceKind: "videoinput",
+        kind: "not_found",
+      });
+    });
+
+    it("maps an unsupported audiooutput switch to a generic recoverable device error", async () => {
+      const { room, session } = setup();
+      room.switchActiveDevice.mockRejectedValueOnce(
+        new Error("cannot switch audio output, the current browser does not support it"),
+      );
+
+      await expect(session.switchActiveDevice("audiooutput", "speaker-1")).rejects.toMatchObject({
+        name: "SpikeDeviceError",
+        deviceKind: "audiooutput",
+        kind: "unavailable",
+      });
+    });
+
+    it("maps a listMediaDevices enumeration failure to a recoverable device error", async () => {
+      const { session } = setup();
+      liveKitMock.MockRoom.getLocalDevices.mockRejectedValueOnce(
+        Object.assign(new Error("enumerate failed"), {
+          deviceFailure: liveKitMock.permissionDenied,
+        }),
+      );
+
+      await expect(session.listMediaDevices("audioinput")).rejects.toMatchObject({
+        name: "SpikeDeviceError",
+        deviceKind: "audioinput",
+        kind: "denied",
+      });
+    });
+
+    it("notifies device-list and active-device changes only while not disposed", async () => {
+      const { handlers, room, session } = setup();
+
+      room.emit(liveKitMock.events.MediaDevicesChanged);
+      room.emit(liveKitMock.events.ActiveDeviceChanged, "audioinput", "mic-2");
+      expect(handlers.onDeviceListChanged).toHaveBeenCalledOnce();
+      expect(handlers.onActiveDeviceChanged).toHaveBeenCalledExactlyOnceWith("audioinput", "mic-2");
+
+      await session.disconnect();
+      room.emit(liveKitMock.events.MediaDevicesChanged);
+      room.emit(liveKitMock.events.ActiveDeviceChanged, "videoinput", "cam-2");
+      expect(handlers.onDeviceListChanged).toHaveBeenCalledOnce();
+      expect(handlers.onActiveDeviceChanged).toHaveBeenCalledOnce();
+    });
+
+    it("ignores calls after teardown instead of touching a torn-down Room", async () => {
+      const { room, session } = setup();
+      await session.disconnect();
+
+      expect(await session.listMediaDevices("audioinput")).toEqual([]);
+      expect(session.getActiveDevice("audioinput")).toBeUndefined();
+      await session.switchActiveDevice("audioinput", "mic-2");
+      expect(room.switchActiveDevice).not.toHaveBeenCalled();
     });
   });
 });

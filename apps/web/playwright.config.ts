@@ -28,7 +28,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npx pnpm dev --host 127.0.0.1 --port 5173",
+    command: "pnpm dev --host 127.0.0.1 --port 5173",
     url: baseURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

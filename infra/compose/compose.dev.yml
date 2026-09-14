@@ -17,7 +17,10 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=64m,mode=1777
-      - /work:size=128m,mode=0700,uid=65532,gid=65532
+      # Also holds the ffmpeg audio route's request scratch files (input +
+      # output, each bounded by converter.MaxAudio{Input,Output}Bytes = 50Mi)
+      # alongside LibreOffice's — see infra/k8s's matching bump.
+      - /work:size=256m,mode=0700,uid=65532,gid=65532
     networks:
       - nchat-dev
 

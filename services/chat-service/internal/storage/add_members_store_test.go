@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	pgxmock "github.com/pashagolub/pgxmock/v2"
@@ -25,6 +26,32 @@ const (
 	msTargetA      = "target-a"
 	msTargetB      = "target-b"
 )
+
+// expectMemberAddedEvent sets up the two statements a non-empty batch add now
+// writes in the same transaction, before the total-count read (issue #685):
+// resolving display names for the newly-added ids, then the
+// conversation_member_added system message itself.
+func expectMemberAddedEvent(mock pgxmock.PgxPoolIface, channelID, dmConversationID string, addedIDs []string) {
+	rows := pgxmock.NewRows([]string{"user_id", "display_name"})
+	for _, id := range addedIDs {
+		rows.AddRow(id, "Member "+id)
+	}
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs(addedIDs).
+		WillReturnRows(rows)
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{
+				"id", "workspace_id", "channel_id", "dm_conversation_id",
+				"sender_id", "kind", "event_type", "created_at",
+			}).AddRow("event-member-added", msWorkspace, channelID, dmConversationID, msActor, "system",
+				"conversation_member_added", time.Now()),
+		)
+}
 
 // ── AddChannelMembers ───────────────────────────────────────────────────────
 
@@ -49,6 +76,7 @@ func TestPGXMemberStore_AddChannelMembers_RevalidatesActorBeforeWriting(t *testi
 		WithArgs(msWorkspace, msChannel, []string{msTargetA, msTargetB}, "member").
 		WillReturnRows(pgxmock.NewRows([]string{"eligible", "inserted", "added_ids"}).
 			AddRow(2, 2, []string{msTargetA, msTargetB}))
+	expectMemberAddedEvent(mock, msChannel, "", []string{msTargetA, msTargetB})
 	mock.ExpectQuery(`(?s)SELECT count\(\*\).*FROM chat\.channel_members cm`).
 		WithArgs(msWorkspace, msChannel).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(7))
@@ -152,6 +180,7 @@ func TestPGXMemberStore_AddChannelMembers_ReportsExistingMembers(t *testing.T) {
 		WithArgs(msWorkspace, msChannel, []string{msTargetA, msTargetB}, "member").
 		WillReturnRows(pgxmock.NewRows([]string{"eligible", "inserted", "added_ids"}).
 			AddRow(2, 1, []string{msTargetA}))
+	expectMemberAddedEvent(mock, msChannel, "", []string{msTargetA})
 	mock.ExpectQuery(`(?s)SELECT count\(\*\)`).
 		WithArgs(msWorkspace, msChannel).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(4))
@@ -166,6 +195,49 @@ func TestPGXMemberStore_AddChannelMembers_ReportsExistingMembers(t *testing.T) {
 	}
 	if result.Added != 1 || result.AlreadyMembers != 1 {
 		t.Fatalf("Added/Already = %d/%d, want 1/1", result.Added, result.AlreadyMembers)
+	}
+}
+
+// The membership rows and the conversation_member_added event are one
+// transaction: a failure writing the event must roll back the membership
+// insert too, so a batch never leaves people added with no event describing
+// it, or half-added at all (issue #685).
+func TestPGXMemberStore_AddChannelMembers_RollsBackWhenEventInsertFails(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`FROM chat.channels WHERE id = \$1::uuid FOR UPDATE`).WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`(?s)FOR SHARE OF wm`).
+		WithArgs(msWorkspace, msChannel, msActor).
+		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
+	mock.ExpectQuery(`(?s)WITH eligible AS`).
+		WithArgs(msWorkspace, msChannel, []string{msTargetA}, "member").
+		WillReturnRows(pgxmock.NewRows([]string{"eligible", "inserted", "added_ids"}).
+			AddRow(1, 1, []string{msTargetA}))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{msTargetA}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow(msTargetA, "Target A"))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXMemberStore(mock)
+	if _, err := store.AddChannelMembers(
+		context.Background(), msWorkspace, msChannel, msActor, []string{msTargetA},
+	); err == nil {
+		t.Fatal("expected the event insert failure to surface")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
@@ -239,6 +311,7 @@ func TestPGXDMStore_AddGroupParticipants_LocksConversationThenActor(t *testing.T
 	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_members AS dm.*dm\.status <> 'active'.*RETURNING user_id`).
 		WithArgs(msConversation, msWorkspace, []string{msTargetA}).
 		WillReturnRows(dmMemberUpsertRows(1, msTargetA))
+	expectMemberAddedEvent(mock, "", msConversation, []string{msTargetA})
 	mock.ExpectQuery(`(?s)SELECT count\(\*\).*FROM chat\.dm_members.*status = 'active'`).
 		WithArgs(msConversation).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(3))
@@ -323,6 +396,7 @@ func TestPGXDMStore_AddGroupParticipants_AddedMatchesTheReturnedIDs(t *testing.T
 	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_members AS dm`).
 		WithArgs(msConversation, msWorkspace, []string{msTargetA, msTargetB}).
 		WillReturnRows(dmMemberUpsertRows(2, msTargetB))
+	expectMemberAddedEvent(mock, "", msConversation, []string{msTargetB})
 	mock.ExpectQuery(`(?s)SELECT count\(\*\).*status = 'active'`).
 		WithArgs(msConversation).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(4))
@@ -341,6 +415,48 @@ func TestPGXDMStore_AddGroupParticipants_AddedMatchesTheReturnedIDs(t *testing.T
 	}
 	if result.AlreadyMembers != 1 {
 		t.Fatalf("AlreadyMembers = %d, want 1", result.AlreadyMembers)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// Same atomicity guarantee as the channel side: a failure writing the
+// conversation_member_added event rolls back the dm_members upsert too, so a
+// batch never leaves someone added to a group with no event describing it
+// (issue #685).
+func TestPGXDMStore_AddGroupParticipants_RollsBackWhenEventInsertFails(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*FOR SHARE OF dc`).
+		WithArgs(msConversation, msWorkspace).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(msConversation))
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*FOR SHARE OF dm`).
+		WithArgs(msConversation, msWorkspace, msActor).
+		WillReturnRows(pgxmock.NewRows([]string{"ok"}).AddRow(true))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_members AS dm`).
+		WithArgs(msConversation, msWorkspace, []string{msTargetA}).
+		WillReturnRows(dmMemberUpsertRows(1, msTargetA))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{msTargetA}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow(msTargetA, "Target A"))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	_, err = storage.NewPGXDMStore(mock).
+		AddGroupParticipants(context.Background(), groupAddInput([]string{msTargetA}))
+	if err == nil {
+		t.Fatal("expected the event insert failure to surface")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -420,6 +536,7 @@ func TestPGXDMStore_AddGroupParticipants_AcceptsNewcomersRegardlessOfSize(t *tes
 	mock.ExpectQuery(`(?s)INSERT INTO chat\.dm_members AS dm`).
 		WithArgs(msConversation, msWorkspace, []string{msTargetA}).
 		WillReturnRows(dmMemberUpsertRows(1, msTargetA))
+	expectMemberAddedEvent(mock, "", msConversation, []string{msTargetA})
 	// Well past the 50 that used to be a ceiling, and nothing consults it.
 	mock.ExpectQuery(`(?s)SELECT count\(\*\).*FROM chat\.dm_members.*status = 'active'`).
 		WithArgs(msConversation).

@@ -193,6 +193,36 @@ export type MessageKind = "user" | "system";
 export type MessageStatus = "active" | "deleted" | "pending_link_scan";
 
 /**
+ * How urgently a message asks to be attended to (issue #821), as the author
+ * stated it and the server persisted it.
+ *
+ * It is the author's claim and nothing else: `urgent` grants no authority, and
+ * no rule here may read it as one. The client renders and classifies this
+ * value; it never infers it and never raises it.
+ */
+export type MessagePriority = "standard" | "important" | "urgent";
+
+/** The three values the server persists; anything else is not one of them. */
+const persistedMessagePriorities = ["standard", "important", "urgent"] as const;
+
+/**
+ * Narrows an unknown server value to a MessagePriority.
+ *
+ * Absent means a chat-service that predates the axis, which is `standard` —
+ * the behaviour every message had before it existed.
+ *
+ * An unrecognised value becomes `standard` too, and that is the fail-closed
+ * direction here rather than a separate `unknown` state: the only thing this
+ * axis can do is escalate an alert, so a value this build does not understand
+ * must never be the one that escalates it. A future server that adds a fourth
+ * priority is then heard as an ordinary message by this build, never as an
+ * alarm nobody here has reasoned about.
+ */
+export function normalizeMessagePriority(raw?: unknown): MessagePriority {
+  return persistedMessagePriorities.find((priority) => priority === raw) ?? "standard";
+}
+
+/**
  * RF-21 link-safety axis, independent of MessageStatus (issue #135).
  *
  * `status` answers "does this message exist for readers". This answers "what is
@@ -288,27 +318,58 @@ export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
 
 export interface MentionCandidate {
   /** "all" is synthesized client-side (see mentionExtension.tsx) — never fetched from the server. */
-  mentionType: "user" | "all";
+  mentionType: "user" | "channel" | "all";
   id: string;
   label: string;
 }
 
+export interface MentionTarget {
+  kind: "channel" | "dm";
+  id: string;
+}
+
 /**
  * The server-generated conversation events a system message can describe
- * (issue #527). A closed set: an event this build does not know is rendered as
- * nothing rather than guessed at.
+ * (issue #527, extended by issue #685). A closed set: an event this build
+ * does not know is rendered as nothing rather than guessed at.
  */
-export type ConversationEventType = "conversation_renamed" | "conversation_member_left";
+export type ConversationEventType =
+  | "conversation_renamed"
+  | "conversation_member_left"
+  | "conversation_created"
+  | "conversation_archived"
+  | "conversation_member_added"
+  | "conversation_member_removed"
+  | "call_started"
+  | "call_ended";
+
+/**
+ * The minimal portrait of a member.added/member.removed target: an id (the
+ * authority — "is this me?") and a display name resolved once, server-side,
+ * at write time. Unlike the actor (always the message's own sender), a
+ * target has no other field to be resolved from, and this client never
+ * fetches a profile by id on its own — so the name travels here, purely
+ * informational, never used to decide anything.
+ */
+export interface ConversationEventTargetUser {
+  userId: string;
+  displayName?: string;
+}
 
 /**
  * The structured facts a system message carries. Deliberately no actor name —
  * the actor is the message's own sender, resolved through the same authorized
  * projection every other message's sender goes through, so nothing a client
- * sends can put a name here.
+ * sends can put a name here. Every field is present only for the event type
+ * it belongs to.
  */
 export interface ConversationEventPayload {
   oldName?: string;
   newName?: string;
+  targetUsers?: ConversationEventTargetUser[];
+  callId?: string;
+  callType?: "audio" | "video";
+  callDurationSeconds?: number;
 }
 
 export interface Message {
@@ -357,6 +418,20 @@ export interface Message {
   isFavorited: boolean;
   /** Server-derived RF-08 snapshot marker; source provenance is intentionally hidden. */
   isForwarded: boolean;
+  /**
+   * The author asked this message's recipients to confirm receipt (issue #824).
+   *
+   * Only the flag. Who was asked, who answered and what this reader's own state
+   * is are a separate authorised read — see MessageAcknowledgement — so a
+   * timeline of a hundred messages does not carry a hundred recipient sets it
+   * will never draw.
+   *
+   * Optional, and absent means exactly what `false` means — this message asked
+   * nobody. Same reasoning as linkSafetyState above: the decoder always fills
+   * it, and absence is safe in the only direction that matters, since a missing
+   * flag can never invent a confirmation request that was never made.
+   */
+  acknowledgementRequired?: boolean;
   /** Immediate parent preview for RF-07 quote-reply. One level only. */
   quoted?: QuotedMessage;
   /** RF-09 cross-target reference, resolved for the current reader. */
@@ -370,6 +445,89 @@ export interface Message {
    * work here unchanged and the scan gates are not written a second time.
    */
   attachments?: ChannelAttachment[];
+}
+
+/**
+ * One recipient's answer to a message that asked for explicit confirmation
+ * (issue #824, policy from #820).
+ *
+ * `pending` is the only unresolved state; the other four are terminal and none
+ * of them returns to it. The server owns every transition — this client renders
+ * the state it is given and never infers one.
+ *
+ * It is deliberately a different axis from reading and from delivery. #820
+ * states the separation as DELIVERED != READ != ACKNOWLEDGED, so nothing that
+ * marks a conversation read, scrolls it into view or receives it over the socket
+ * may produce one of these.
+ */
+export type MessageAcknowledgementState =
+  | "pending"
+  | "acknowledged"
+  | "responded"
+  | "expired"
+  | "cancelled";
+
+/** The states the server persists, used to narrow an unknown response value. */
+const persistedAcknowledgementStates = [
+  "pending",
+  "acknowledged",
+  "responded",
+  "expired",
+  "cancelled",
+] as const;
+
+/**
+ * Narrows a server value to a MessageAcknowledgementState, or to `undefined`
+ * for "this message never asked this reader anything" — which is what the
+ * server sends as an empty string, and what the sender of a message always gets.
+ *
+ * An unrecognised value also becomes `undefined`: a state this build does not
+ * understand must not be rendered as pending, which is the one state that offers
+ * an action.
+ */
+export function normalizeAcknowledgementState(
+  value: unknown,
+): MessageAcknowledgementState | undefined {
+  return persistedAcknowledgementStates.find((state) => state === value);
+}
+
+/**
+ * How one message's acknowledgement stands, as the reader asking is allowed to
+ * see it.
+ *
+ * Every terminal state is counted separately because they do not mean the same
+ * thing to the person who asked: a reply, a withdrawal and a deadline that
+ * passed all stop a request being pending. The counts are the server's; this
+ * client never recomputes them from a partial recipient list.
+ */
+export interface MessageAcknowledgement {
+  messageId: string;
+  /** The message's own flag. False means nobody was asked and every count is 0. */
+  required: boolean;
+  total: number;
+  pending: number;
+  acknowledged: number;
+  responded: number;
+  expired: number;
+  cancelled: number;
+  /**
+   * The reader's own state, absent when this message never asked them — its
+   * sender, or somebody who joined after it was sent. Absent is not a state.
+   */
+  viewerState?: MessageAcknowledgementState;
+  /**
+   * Per-recipient detail, present only when the server chose to send it. The
+   * server decides that; this client never infers the authorisation, and never
+   * hides an unauthorised answer with CSS.
+   */
+  recipients?: MessageAcknowledgementRecipient[];
+}
+
+export interface MessageAcknowledgementRecipient {
+  recipientId: string;
+  state: MessageAcknowledgementState;
+  /** When this recipient stopped being pending; absent while they still are. */
+  resolvedAt?: string;
 }
 
 export interface MessageEditHistoryEntry {

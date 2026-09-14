@@ -1,10 +1,21 @@
 package config
 
-import platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+import (
+	"strings"
+
+	platformconfig "github.com/nicrepository/nchat/libs/go/platform/config"
+)
 
 const (
 	serviceName = "notification-service"
 	defaultPort = 8084
+
+	// The access-token contract auth-service issues, shared verbatim with every
+	// other service that validates one. Defaults here and nowhere else, so a
+	// notification-service that authenticates a token chat-service would refuse
+	// is not something a missing environment variable can produce.
+	defaultJWTIssuer   = "nchat-auth"
+	defaultJWTAudience = "nchat-api"
 )
 
 type Config struct {
@@ -16,6 +27,13 @@ type Config struct {
 	DBConnectTimeoutSeconds  int
 	AuthEmailOutboxEncKey    string
 	AuthPublicWebBaseURL     string
+
+	// The access token this service validates on its authenticated routes
+	// (issue #745). An empty secret leaves those routes mounted but refusing
+	// every request, which is the state an operator can see.
+	AuthJWTHMACSecret string
+	AuthJWTIssuer     string
+	AuthJWTAudience   string
 
 	SMTPHost              string
 	SMTPPort              int
@@ -29,6 +47,18 @@ type Config struct {
 	SMTPBackoffSeconds    int
 	SMTPWorkerEnabled     bool
 	SMTPWorkerPollSeconds int
+
+	// NotificationWorker is the outbox worker's own block (issue #742). Nested
+	// rather than flattened: it is a second worker with a second lifetime, and
+	// nine more SMTP-prefixed-looking fields would say nothing about which
+	// belongs to which.
+	NotificationWorker NotificationWorkerConfig
+
+	// WebPush is the delivery channel that worker sends through (issue #746).
+	// Separate from NotificationWorker because the two fail independently: a
+	// worker with no keys is a misconfigured channel, not a misconfigured
+	// worker, and the readiness reason has to be able to say which.
+	WebPush WebPushConfig
 }
 
 func Load() Config {
@@ -41,6 +71,9 @@ func Load() Config {
 		DBConnectTimeoutSeconds:  platformconfig.GetInt("DB_CONNECT_TIMEOUT_SECONDS", 5),
 		AuthEmailOutboxEncKey:    platformconfig.GetString("AUTH_EMAIL_OUTBOX_ENCRYPTION_KEY", ""),
 		AuthPublicWebBaseURL:     platformconfig.GetString("AUTH_PUBLIC_WEB_BASE_URL", ""),
+		AuthJWTHMACSecret:        platformconfig.GetString("AUTH_JWT_HMAC_SECRET", ""),
+		AuthJWTIssuer:            strings.TrimSpace(platformconfig.GetString("AUTH_JWT_ISSUER", defaultJWTIssuer)),
+		AuthJWTAudience:          strings.TrimSpace(platformconfig.GetString("AUTH_JWT_AUDIENCE", defaultJWTAudience)),
 
 		SMTPHost:              platformconfig.GetString("SMTP_HOST", ""),
 		SMTPPort:              platformconfig.GetInt("SMTP_PORT", 587),
@@ -54,6 +87,9 @@ func Load() Config {
 		SMTPBackoffSeconds:    platformconfig.GetInt("SMTP_BACKOFF_SECONDS", 60),
 		SMTPWorkerEnabled:     platformconfig.GetBool("SMTP_WORKER_ENABLED", false),
 		SMTPWorkerPollSeconds: platformconfig.GetInt("SMTP_WORKER_POLL_SECONDS", 10),
+
+		NotificationWorker: loadNotificationWorker(),
+		WebPush:            loadWebPush(),
 	}
 }
 

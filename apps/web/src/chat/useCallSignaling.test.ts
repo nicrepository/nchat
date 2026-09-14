@@ -3191,6 +3191,10 @@ describe("useCallSignaling ownership handoff (RF-23 × RF-24)", () => {
       readonly setMicrophoneEnabled = vi.fn(async (): Promise<void> => undefined);
       readonly startAudio = vi.fn(async (): Promise<void> => undefined);
       readonly disconnect = vi.fn(async (): Promise<void> => undefined);
+      readonly listMediaDevices = vi.fn(async (): Promise<never[]> => []);
+      readonly getActiveDevice = vi.fn((): string | undefined => undefined);
+      readonly switchActiveDevice = vi.fn(async (): Promise<void> => undefined);
+      readonly isAudioOutputSupported = vi.fn((): boolean => true);
 
       constructor(label: string, callbacks: FakeCallbacks) {
         this.label = label;

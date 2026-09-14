@@ -1,8 +1,14 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
-import type { LinkSafetyRecheck, Message } from "./chatTypes";
+import type {
+  LinkSafetyRecheck,
+  MentionTarget,
+  Message,
+  MessageAcknowledgement,
+} from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
+import MessageAcknowledgementStrip from "./MessageAcknowledgement";
 import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
 import MessageToolbar from "./MessageToolbar";
@@ -43,7 +49,7 @@ export interface MessageBubbleProps {
   onEditForbidden: (messageId: string) => void;
   onDeleteMessage: (messageId: string) => Promise<void>;
   editDisabled?: boolean;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   /** The conversation on screen; presence is resolved within it (RF-58). */
   presenceTarget?: string;
   /** RF-05: pin/unpin action for readable channels and DMs. */
@@ -77,6 +83,20 @@ export interface MessageBubbleProps {
    * warning is the important half — the action is a convenience.
    */
   onReconcileLinkSafety?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
+  /**
+   * Issue #824. The server's own summary for this message, absent while it is
+   * still being read and for every message that asked nobody — which is almost
+   * all of them, so the strip below draws nothing at all in the common case.
+   */
+  acknowledgement?: MessageAcknowledgement;
+  /** True while this message's confirmation is in flight. */
+  acknowledging?: boolean;
+  /**
+   * Confirms receipt. Optional: without it the strip still reports the state,
+   * which is the half that matters — an action nobody wired is better absent
+   * than broken.
+   */
+  onAcknowledge?: (messageId: string) => void;
 }
 
 function MessageMeta({
@@ -267,7 +287,7 @@ function MessageBubbleBody({
       <div ref={bubbleRef} className={messageBodyClassName(message)}>
         <MessageContent
           message={message}
-          channelId={props.channelId}
+          mentionTarget={props.mentionTarget}
           editing={editing.editing}
           onSaveEdit={editing.saveEdit}
           onCancelEdit={editing.cancelEdit}
@@ -278,6 +298,16 @@ function MessageBubbleBody({
           onReferenceJump={props.onReferenceJump}
           onReconcileLinkSafety={props.onReconcileLinkSafety}
         />
+        {props.onAcknowledge ? (
+          <MessageAcknowledgementStrip
+            messageId={message.id}
+            acknowledgement={props.acknowledgement}
+            senderId={message.senderId}
+            currentUserId={props.currentUserId}
+            submitting={props.acknowledging ?? false}
+            onAcknowledge={props.onAcknowledge}
+          />
+        ) : null}
       </div>
       <MessageToolbar
         message={message}

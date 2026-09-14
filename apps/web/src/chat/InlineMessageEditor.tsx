@@ -2,7 +2,7 @@ import { EditorContent } from "@tiptap/react";
 import { useCallback, useState } from "react";
 
 import { MessageEditError } from "./chatApi";
-import type { Message } from "./chatTypes";
+import type { MentionTarget, Message } from "./chatTypes";
 import ComposerToolbar from "./ComposerToolbar";
 import { richTextToTiptapDoc, type CodecFormat } from "./tiptapSerializer";
 import { useChatEditor } from "./useChatEditor";
@@ -10,7 +10,7 @@ import type { SendResult } from "./useMessages";
 
 interface InlineMessageEditorProps {
   message: Message;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   onSave: (body: string, format: CodecFormat) => Promise<Message>;
   onCancel: () => void;
   onForbidden: () => void;
@@ -18,7 +18,7 @@ interface InlineMessageEditorProps {
 
 export default function InlineMessageEditor({
   message,
-  channelId,
+  mentionTarget,
   onSave,
   onCancel,
   onForbidden,
@@ -52,7 +52,7 @@ export default function InlineMessageEditor({
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder: "Editar mensagem",
     disabled: false,
-    channelId,
+    mentionTarget,
     bodyFormat: format,
     initialContent,
     clearOnSend: false,

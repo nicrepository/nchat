@@ -1231,12 +1231,31 @@ func TestMessageHandler_SearchMentions_ReturnsAuthorizedCandidates(t *testing.T)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if mentions.lastInput.WorkspaceID != testWorkspaceID || mentions.lastInput.ChannelID != testChannelID || mentions.lastInput.CallerID != msgTestUserID || mentions.lastInput.Query != "al" {
+	if mentions.lastInput.WorkspaceID != testWorkspaceID || mentions.lastInput.TargetType != "channel" || mentions.lastInput.TargetID != testChannelID || mentions.lastInput.CallerID != msgTestUserID || mentions.lastInput.Query != "al" {
 		t.Fatalf("unexpected service input: %+v", mentions.lastInput)
 	}
 	body := decodeBody(t, rec)["data"].(map[string]any)
 	if len(body["users"].([]any)) != 1 || len(body["channels"].([]any)) != 1 {
 		t.Fatalf("unexpected candidates: %v", body)
+	}
+}
+
+func TestMessageHandler_SearchDMMentions_UsesGroupTarget(t *testing.T) {
+	mentions := &fakeMentionProvider{out: service.SearchMentionsOutput{
+		Users: []domain.MentionCandidate{{Type: domain.MentionTypeUser, ID: msgTestUserID, Label: "Alice"}},
+	}}
+	h := httpapi.NewMessageHandler(&fakeWorkspaceResolver{workspace: activeWorkspace()}, &fakeMessageProvider{}, mentions)
+	rec := httptest.NewRecorder()
+	r := requestWithUser(http.MethodGet, "/api/chat/dm/33333333-3333-3333-3333-333333333333/mentions", nil)
+	r.SetPathValue("conversationID", "33333333-3333-3333-3333-333333333333")
+
+	h.SearchDMMentions(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if mentions.lastInput.TargetType != "dm" || mentions.lastInput.TargetID != "33333333-3333-3333-3333-333333333333" {
+		t.Fatalf("unexpected service input: %+v", mentions.lastInput)
 	}
 }
 
@@ -2487,5 +2506,82 @@ func TestMessageHandler_LinkSafetyStatus_RefusesWhenTheWorkspaceIsUnresolved(t *
 	}
 	if messages.lastLinkSafetyInput.SenderID != "" {
 		t.Fatal("an unresolved workspace still reached the service")
+	}
+}
+
+// A system message's structured event must reach the wire (issue #527/#685):
+// the storage layer has always computed EventType/EventPayload, but nothing
+// ever copied them into the JSON response until now. Without this, no
+// conversation event — old or new — is ever visible to a client, no matter
+// how correctly it was persisted and published.
+func TestMessageHandler_GetChannelMessage_IncludesEventTypeAndPayloadForSystemMessage(t *testing.T) {
+	messages := &fakeMessageProvider{channelMsg: domain.Message{
+		ID:        testMessageID,
+		SenderID:  msgTestUserID,
+		Kind:      domain.MessageKindSystem,
+		EventType: string(domain.ConversationEventRenamed),
+		EventPayload: domain.ConversationEventPayload{
+			OldName: "infra", NewName: "infraestrutura",
+		},
+	}}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	request := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages/"+testMessageID, nil)
+	request.SetPathValue("channelID", testChannelID)
+	request.SetPathValue("messageID", testMessageID)
+	recorder := httptest.NewRecorder()
+
+	handler.GetChannelMessage(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	payload := envelope.Data
+	if payload["event_type"] != string(domain.ConversationEventRenamed) {
+		t.Fatalf("event_type = %v, want %q", payload["event_type"], domain.ConversationEventRenamed)
+	}
+	eventPayload, ok := payload["event_payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("event_payload missing or not an object: %v", payload["event_payload"])
+	}
+	if eventPayload["old_name"] != "infra" || eventPayload["new_name"] != "infraestrutura" {
+		t.Fatalf("event_payload = %v, want old_name/new_name preserved", eventPayload)
+	}
+}
+
+// The other half of the same guarantee: an ordinary user message must never
+// carry event_type/event_payload keys at all — not even empty ones — so a
+// client can keep treating their mere presence as "this is a system message".
+func TestMessageHandler_GetChannelMessage_OmitsEventFieldsForUserMessage(t *testing.T) {
+	messages := &fakeMessageProvider{channelMsg: domain.Message{
+		ID: testMessageID, SenderID: msgTestUserID, Kind: domain.MessageKindUser, BodyText: "oi",
+	}}
+	handler := makeHandlerWithUser(&fakeWorkspaceResolver{workspace: activeWorkspace()}, messages)
+	request := requestWithUser(http.MethodGet, "/api/chat/channels/"+testChannelID+"/messages/"+testMessageID, nil)
+	request.SetPathValue("channelID", testChannelID)
+	request.SetPathValue("messageID", testMessageID)
+	recorder := httptest.NewRecorder()
+
+	handler.GetChannelMessage(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var envelope struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, present := envelope.Data["event_type"]; present {
+		t.Fatalf("event_type present on a user message: %v", envelope.Data["event_type"])
+	}
+	if _, present := envelope.Data["event_payload"]; present {
+		t.Fatalf("event_payload present on a user message: %v", envelope.Data["event_payload"])
 	}
 }

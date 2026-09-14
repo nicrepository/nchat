@@ -1,0 +1,6 @@
+BEGIN;
+
+-- The indexes belong to the table and go with it.
+DROP TABLE IF EXISTS chat.push_subscriptions;
+
+COMMIT;

@@ -5,10 +5,11 @@
  * rule. AttachmentAudio.test.tsx covers the fetch-on-demand wiring around it.
  */
 
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import AudioPlayer from "./AudioPlayer";
+import AudioPlayer, { type AudioDownloadAction } from "./AudioPlayer";
 
 beforeEach(() => {
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
@@ -239,6 +240,247 @@ describe("AudioPlayer", () => {
 
       expect(screen.getByTestId("p-voice6-seek")).toHaveValue("2");
       expect(screen.getByTestId("p-voice6-time")).toHaveTextContent("0:02 / 0:04");
+    });
+  });
+
+  // Issue #740: a voice message can be saved to disk from the player itself.
+  // The requirement that shapes every test here is "and nothing else changes":
+  // the download is an errand the player runs beside playback, never instead
+  // of it.
+  describe("issue #740: download control", () => {
+    function downloadable(action: Partial<AudioDownloadAction> = {}, prefix = "p-dl") {
+      const start = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={42}
+          download={{
+            label: "Baixar mensagem de voz",
+            title: "Baixar áudio",
+            start,
+            ...action,
+          }}
+          testIdPrefix={prefix}
+        />,
+      );
+      return { start, button: screen.getByTestId(`${prefix}-download`) };
+    }
+
+    it("draws no download control when the caller offers none", () => {
+      render(
+        <AudioPlayer
+          label="Áudio: nota.ogg"
+          src="blob:one"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          testIdPrefix="p-plain"
+        />,
+      );
+      expect(screen.queryByTestId("p-plain-download")).not.toBeInTheDocument();
+    });
+
+    it("places the download between the elapsed time and the speed", () => {
+      downloadable();
+      const controls = within(screen.getByTestId("p-dl-player")).getAllByTestId(/p-dl-/);
+      expect(controls.map((node) => node.dataset.testid)).toEqual([
+        "p-dl-audio-el",
+        "p-dl-playpause",
+        "p-dl-seek",
+        "p-dl-time",
+        "p-dl-download",
+        "p-dl-rate",
+      ]);
+    });
+
+    it("names the action for assistive technology and for a pointer", () => {
+      const { button } = downloadable();
+      expect(button).toHaveAccessibleName("Baixar mensagem de voz");
+      expect(button).toHaveAttribute("title", "Baixar áudio");
+      expect(button.tagName).toBe("BUTTON");
+    });
+
+    it("starts the download on Enter and on Space, and keeps focus on the button", async () => {
+      const user = userEvent.setup();
+      const { start, button } = downloadable();
+
+      button.focus();
+      await user.keyboard("{Enter}");
+      await waitFor(() => expect(start).toHaveBeenCalledTimes(1));
+      expect(button).toHaveFocus();
+
+      await user.keyboard(" ");
+      await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+      expect(button).toHaveFocus();
+    });
+
+    it("downloads before the first Play without loading or playing anything", () => {
+      const onRequestLoad = vi.fn();
+      const start = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src={null}
+          loading={false}
+          failed={false}
+          onRequestLoad={onRequestLoad}
+          durationHint={42}
+          download={{ label: "Baixar mensagem de voz", title: "Baixar áudio", start }}
+          testIdPrefix="p-pre"
+        />,
+      );
+
+      fireEvent.click(screen.getByTestId("p-pre-download"));
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(onRequestLoad).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("p-pre-audio-el")).not.toBeInTheDocument();
+    });
+
+    it("leaves playback, position and speed untouched while playing", () => {
+      const { start, button } = downloadable({}, "p-live");
+      const audioEl = screen.getByTestId("p-live-audio-el") as HTMLAudioElement;
+      const pause = vi.spyOn(audioEl, "pause");
+      const play = vi.spyOn(audioEl, "play");
+
+      fireEvent.click(screen.getByTestId("p-live-rate"));
+      Object.defineProperty(audioEl, "duration", { value: 42, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+      Object.defineProperty(audioEl, "currentTime", { value: 12, configurable: true });
+      fireEvent.timeUpdate(audioEl);
+      fireEvent.play(audioEl);
+
+      fireEvent.click(button);
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(pause).not.toHaveBeenCalled();
+      expect(play).not.toHaveBeenCalled();
+      expect(audioEl.currentTime).toBe(12);
+      expect(audioEl.playbackRate).toBe(1.5);
+      expect(screen.getByTestId("p-live-time")).toHaveTextContent("0:12 / 0:42");
+      // Still playing: the button offers to pause, not to resume.
+      expect(screen.getByTestId("p-live-playpause")).toHaveAccessibleName("Pausar Mensagem de voz");
+    });
+
+    it("still downloads once playback has ended, without rewinding it", () => {
+      const { start, button } = downloadable({}, "p-ended");
+      const audioEl = screen.getByTestId("p-ended-audio-el") as HTMLAudioElement;
+      Object.defineProperty(audioEl, "duration", { value: 42, configurable: true });
+      fireEvent.loadedMetadata(audioEl);
+      fireEvent.ended(audioEl);
+
+      fireEvent.click(button);
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId("p-ended-time")).toHaveTextContent("0:42 / 0:42");
+      expect(screen.getByTestId("p-ended-playpause")).toHaveAccessibleName(
+        "Reproduzir Mensagem de voz",
+      );
+    });
+
+    it("still cycles the speed 1x -> 1.5x -> 2x -> 1x after a download", async () => {
+      const { start, button } = downloadable({}, "p-rate");
+      fireEvent.click(button);
+      await waitFor(() => expect(start).toHaveBeenCalled());
+
+      const rate = screen.getByTestId("p-rate-rate");
+      expect(rate).toHaveTextContent("1x");
+      fireEvent.click(rate);
+      expect(rate).toHaveTextContent("1.5x");
+      fireEvent.click(rate);
+      expect(rate).toHaveTextContent("2x");
+      fireEvent.click(rate);
+      expect(rate).toHaveTextContent("1x");
+    });
+
+    it("marks only that button busy while it resolves, and refuses a second start", () => {
+      let settle = () => {};
+      const start = vi
+        .fn<() => Promise<void>>()
+        .mockImplementation(() => new Promise<void>((resolve) => (settle = resolve)));
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          download={{ label: "Baixar mensagem de voz", title: "Baixar áudio", start }}
+          testIdPrefix="p-busy"
+        />,
+      );
+
+      const button = screen.getByTestId("p-busy-download");
+      fireEvent.click(button);
+      fireEvent.click(button);
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-busy", "true");
+      // Never disabled: disabling a focused control takes the keyboard user's
+      // place in the page away from them.
+      expect(button).toBeEnabled();
+      // Playback controls stay usable throughout.
+      expect(screen.getByTestId("p-busy-playpause")).toBeEnabled();
+      expect(screen.getByTestId("p-busy-seek")).toBeEnabled();
+      expect(screen.getByTestId("p-busy-rate")).toBeEnabled();
+
+      settle();
+    });
+
+    it("reports a failure beside the player and allows a retry", async () => {
+      const start = vi
+        .fn<() => Promise<void>>()
+        .mockRejectedValueOnce(new Error("nope"))
+        .mockResolvedValueOnce(undefined);
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed={false}
+          onRequestLoad={() => undefined}
+          durationHint={42}
+          download={{ label: "Baixar mensagem de voz", title: "Baixar áudio", start }}
+          testIdPrefix="p-fail"
+        />,
+      );
+
+      fireEvent.click(screen.getByTestId("p-fail-download"));
+      const note = await screen.findByTestId("p-fail-download-error");
+      expect(note).toHaveTextContent("Não foi possível baixar o áudio.");
+      // The player is still a player: nothing was unmounted or reset.
+      expect(screen.getByTestId("p-fail-audio-el")).toBeInTheDocument();
+      expect(screen.getByTestId("p-fail-time")).toHaveTextContent("0:00 / 0:42");
+      expect(screen.getByTestId("p-fail-rate")).toHaveTextContent("1x");
+
+      fireEvent.click(screen.getByTestId("p-fail-download"));
+      await waitFor(() => {
+        expect(screen.queryByTestId("p-fail-download-error")).not.toBeInTheDocument();
+      });
+      expect(start).toHaveBeenCalledTimes(2);
+    });
+
+    it("stays available for audio the browser cannot decode", () => {
+      const start = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+      render(
+        <AudioPlayer
+          label="Mensagem de voz"
+          src="blob:voice"
+          loading={false}
+          failed
+          onRequestLoad={() => undefined}
+          download={{ label: "Baixar mensagem de voz", title: "Baixar áudio", start }}
+          testIdPrefix="p-broken"
+        />,
+      );
+
+      expect(screen.getByTestId("p-broken-playpause")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("p-broken-download"));
+      expect(start).toHaveBeenCalledTimes(1);
     });
   });
 });

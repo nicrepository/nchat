@@ -31,11 +31,12 @@ import { createMentionExtension } from "./mentionExtension";
 import { tiptapDocToMarkdown } from "./tiptapSerializer";
 import type { CodecFormat, TTNode } from "./tiptapSerializer";
 import type { SendResult } from "./useMessages";
+import type { MentionTarget } from "./chatTypes";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
-    mentionChannelContext: {
-      setMentionChannel: (channelId?: string) => ReturnType;
+    mentionTargetContext: {
+      setMentionTarget: (target?: MentionTarget) => ReturnType;
     };
   }
 }
@@ -44,13 +45,13 @@ const ChatListItem = ListItem.extend({
   content: "paragraph (paragraph|bulletList|orderedList)*",
 });
 
-const MentionChannelContext = Extension.create({
-  name: "mentionChannelContext",
-  addStorage: () => ({ channelId: undefined as string | undefined }),
+const MentionTargetContext = Extension.create({
+  name: "mentionTargetContext",
+  addStorage: () => ({ target: undefined as MentionTarget | undefined }),
   addCommands() {
     return {
-      setMentionChannel: (channelId) => () => {
-        this.storage.channelId = channelId;
+      setMentionTarget: (target) => () => {
+        this.storage.target = target;
         return true;
       },
     };
@@ -62,7 +63,7 @@ const MentionChannelContext = Extension.create({
 export interface UseChatEditorOptions {
   placeholder: string;
   disabled?: boolean;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   bodyFormat: CodecFormat;
   initialContent?: TTNode;
   clearOnSend?: boolean;
@@ -87,6 +88,22 @@ export interface UseChatEditorOptions {
    * "started typing".
    */
   onActivity?: (hasContent: boolean) => void;
+  /**
+   * Issue #769: mirrors every content-changing edit into the conversation's
+   * draft, synchronously and on the same TipTap onUpdate as onActivity — so
+   * the draft is never behind the last keystroke by the time a conversation
+   * switch reads it.
+   */
+  onTextChange?: (doc: TTNode) => void;
+  /**
+   * Issue #769, "ACK ATRASADO": evaluated once the send this handleSend call
+   * started has resolved with `{status: "sent"}`, right before clearing the
+   * editor. If it returns false, the editor content is left exactly as it
+   * is — the reader has already written something new since pressing Enter,
+   * and clearing now would erase that, not the message that was actually
+   * sent. Absent, the pre-existing unconditional-clear behavior is kept.
+   */
+  shouldClearOnSent?: () => boolean;
 }
 
 // ── Shared extension factory ──────────────────────────────────────────────────
@@ -113,7 +130,7 @@ export function createChatEditorExtensions(enableMentions = true) {
     HardBreak,
   ];
   return enableMentions
-    ? [...extensions, MentionChannelContext, createMentionExtension()]
+    ? [...extensions, MentionTargetContext, createMentionExtension()]
     : extensions;
 }
 
@@ -122,7 +139,7 @@ export function createChatEditorExtensions(enableMentions = true) {
 export function useChatEditor({
   placeholder,
   disabled,
-  channelId,
+  mentionTarget,
   bodyFormat,
   initialContent,
   clearOnSend = true,
@@ -130,9 +147,12 @@ export function useChatEditor({
   canSendEmpty = false,
   onSend,
   onActivity,
+  onTextChange,
+  shouldClearOnSent,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
+  const restoreFocusAfterSendRef = useRef(false);
 
   // Ref, like handleSendRef below: onUpdate is captured once per extensions
   // instance, so a new onActivity identity each render must not require
@@ -140,6 +160,14 @@ export function useChatEditor({
   const onActivityRef = useRef(onActivity);
   useEffect(() => {
     onActivityRef.current = onActivity;
+  });
+
+  // Same reasoning as onActivityRef — onUpdate is captured once per editor
+  // instance (issue #769: draft text must keep flowing to the store across
+  // renders that change the identity of onTextChange).
+  const onTextChangeRef = useRef(onTextChange);
+  useEffect(() => {
+    onTextChangeRef.current = onTextChange;
   });
 
   // Ref keeps the latest handleSend accessible to the submitOnEnter extension
@@ -184,6 +212,10 @@ export function useChatEditor({
         const hasContentNow = !e.isEmpty;
         setHasContent(hasContentNow);
         onActivityRef.current?.(hasContentNow);
+        // Issue #769: written synchronously, on the very same update that
+        // changes `hasContent` — never debounced — so a conversation switch
+        // immediately after the last keystroke can never race ahead of it.
+        onTextChangeRef.current?.(e.getJSON());
       },
       content: initialContent,
       onCreate: ({ editor: e }) => setHasContent(!e.isEmpty),
@@ -191,15 +223,21 @@ export function useChatEditor({
     [bodyFormat],
   );
 
-  // Mentions (and therefore setMentionChannel) exist only on the v3 editor.
+  // Mentions (and therefore setMentionTarget) exist only on the v3 editor.
   // The capability is read from the editor instance, never inferred from the
   // bodyFormat prop: useEditor swaps instances from an effect, so on a
   // v2 → v3 switch (DM → channel, same mounted composer) this effect runs once
   // while `editor` is still the v2 instance. Calling the command there threw and
   // tore down the whole React root, blanking the app until a reload.
+  const mentionTargetKind = mentionTarget?.kind;
+  const mentionTargetId = mentionTarget?.id;
   useEffect(() => {
-    editor?.commands.setMentionChannel?.(channelId);
-  }, [editor, channelId]);
+    editor?.commands.setMentionTarget?.(
+      mentionTargetKind && mentionTargetId
+        ? { kind: mentionTargetKind, id: mentionTargetId }
+        : undefined,
+    );
+  }, [editor, mentionTargetKind, mentionTargetId]);
 
   // Sync editable state and aria attributes when props change.
   useEffect(() => {
@@ -209,7 +247,23 @@ export function useChatEditor({
     const dom = editor.view.dom;
     dom.setAttribute("aria-disabled", String(!isEditable));
     dom.setAttribute("aria-label", placeholder);
+    if (isEditable && restoreFocusAfterSendRef.current) {
+      dom.focus({ preventScroll: true });
+    }
+    if (!sending) restoreFocusAfterSendRef.current = false;
   }, [editor, disabled, sending, placeholder]);
+
+  useEffect(() => {
+    if (!editor || !sending || !restoreFocusAfterSendRef.current) return;
+    const dom = editor.view.dom;
+    const cancelRestore = (event: FocusEvent) => {
+      if (event.target !== dom && !dom.contains(event.target as Node)) {
+        restoreFocusAfterSendRef.current = false;
+      }
+    };
+    document.addEventListener("focusin", cancelRestore);
+    return () => document.removeEventListener("focusin", cancelRestore);
+  }, [editor, sending]);
 
   const canSend = (hasContent || canSendEmpty) && !sending && !disabled;
 
@@ -217,10 +271,13 @@ export function useChatEditor({
     if (!canSend || !editor) return;
     const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
     if (!body && !canSendEmpty) return;
+    restoreFocusAfterSendRef.current = editor.isFocused;
     setSending(true);
     try {
       const result = await onSend(body);
-      if (result.status === "sent" && clearOnSend) {
+      if (result.status === "sent" && clearOnSend && (shouldClearOnSent?.() ?? true)) {
+        // emitUpdate=true fires the onUpdate above, which is what mirrors
+        // the now-empty document back into the draft (issue #769).
         editor.commands.clearContent(true);
       }
       // result.status === "stale": target changed — editor content preserved

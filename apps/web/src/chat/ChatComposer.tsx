@@ -34,11 +34,14 @@ import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import { useChatEditor } from "./useChatEditor";
+import { noopConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import type { CodecFormat } from "./tiptapSerializer";
-import type { Message, MessageBodyFormat } from "./chatTypes";
+import type { MentionTarget, Message, MessageBodyFormat } from "./chatTypes";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { senderLabel } from "./messageDisplay";
 import RichTextRenderer from "./RichTextRenderer";
+import { NAV_DRAWER_QUERY } from "./useNavDrawer";
+import { useMediaQuery } from "./useMediaQuery";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -74,7 +77,7 @@ function uploadPercent({ loaded, total }: UploadProgress): number {
 
 export interface ChatComposerProps {
   placeholder: string;
-  channelId?: string;
+  mentionTarget?: MentionTarget;
   bodyFormat: CodecFormat;
   disabled?: boolean;
   replyPreview?: ComposerReplyPreview | null;
@@ -88,7 +91,11 @@ export interface ChatComposerProps {
    * pressing Enviar links them to the new message rather than sending them
    * again.
    */
-  onSend: (body: string, attachmentIds?: string[]) => Promise<SendResult>;
+  onSend: (
+    body: string,
+    attachmentIds?: string[],
+    acknowledgementRequired?: boolean,
+  ) => Promise<SendResult>;
   /**
    * Destination for attachments (RF-32, issue #458). One prop serves channels
    * and DMs — the composer is already the single place both render — so the
@@ -114,6 +121,14 @@ export interface ChatComposerProps {
    * Absent, the picker still opens — it simply offers no "Recentes".
    */
   emoji?: ComposerEmojiOptions;
+  /**
+   * Issue #769: the store this composer's text, attachments and voice
+   * recording are lifted into, so they survive this component's own
+   * remount on a conversation switch. Absent (or no uploadTarget, which is
+   * what the draft is keyed by) falls back to a no-op store — every
+   * pre-#769 caller and test keeps behaving exactly as before.
+   */
+  drafts?: ConversationDraftsApi;
 }
 
 export interface ComposerReplyPreview {
@@ -619,12 +634,17 @@ function ComposerBar({
   voice,
   canSend,
   onSend,
+  acknowledgementRequired,
+  onAcknowledgementRequiredChange,
 }: {
   editor: Editor | null;
   disabled: boolean;
   emoji?: ComposerEmojiOptions;
   pickerOpen: boolean;
   onPickerOpenChange: (open: boolean) => void;
+  /** Issue #824: whether the next send asks for confirmation, and its toggle. */
+  acknowledgementRequired: boolean;
+  onAcknowledgementRequiredChange: (required: boolean) => void;
   /** Absent when this composer has nowhere to put a file. */
   attach: ComposerAttachOptions | null;
   /** Absent when this composer has no destination, or the browser cannot record. */
@@ -640,6 +660,8 @@ function ComposerBar({
         emoji={emoji}
         pickerOpen={pickerOpen}
         onPickerOpenChange={onPickerOpenChange}
+        acknowledgementRequired={acknowledgementRequired}
+        onAcknowledgementRequiredChange={onAcknowledgementRequiredChange}
       />
       {attach && <ComposerAttachButton {...attach} />}
       {voice && (
@@ -662,7 +684,10 @@ function ComposerBar({
         className="chat-msg-area__send-btn"
         disabled={!canSend}
         aria-label="Enviar mensagem"
-        onClick={() => void onSend()}
+        onClick={() => {
+          editor?.view.dom.focus({ preventScroll: true });
+          void onSend();
+        }}
         data-testid="chat-send-btn"
       >
         <IconSend />
@@ -721,7 +746,7 @@ function voiceOptions(
 
 export default function ChatComposer({
   placeholder,
-  channelId,
+  mentionTarget,
   bodyFormat,
   disabled,
   replyPreview,
@@ -735,14 +760,36 @@ export default function ChatComposer({
   onAttachmentUploaded,
   onActivity,
   emoji,
+  drafts: draftsProp,
 }: ChatComposerProps) {
   const hadContextRef = useRef(false);
+  const initialFocusOwnerRef = useRef(document.activeElement);
+  const initialFocusHandledRef = useRef(false);
+  const suppressInitialFocus = useMediaQuery(`${NAV_DRAWER_QUERY}, (pointer: coarse)`);
   // A picker left hanging over a sent message is noise. Closing on a confirmed
   // send is the only case the toolbar cannot see for itself; a change of
   // conversation needs no code at all, because ChatMessageArea keys this
   // composer by target and the whole subtree — picker included — is remounted.
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
-  const upload = useAttachmentUpload(uploadTarget, attachmentLimits, onAttachmentUploaded);
+  // The defaulted store, safe for this component's own reads/writes below
+  // (getDraft always reporting "nothing" is a correct no-op here). NOT what
+  // is handed to useAttachmentUpload/useVoiceRecorder — those two tell "a
+  // real store is wired" apart from "it is not" by this prop's presence,
+  // and a noop store answers every ownership question the same inert way a
+  // real, empty one does, which would make an in-flight upload's result
+  // look "no longer wanted" the moment it resolves (issue #769 review).
+  const drafts = draftsProp ?? noopConversationDrafts;
+  // Issue #769: the same identity useAttachmentUpload/useVoiceRecorder
+  // already derive their own targetKey from — one draft per destination,
+  // never per mounted component instance.
+  const draftKey = uploadTarget ? `${uploadTarget.kind}:${uploadTarget.id}` : null;
+  const upload = useAttachmentUpload(
+    uploadTarget,
+    attachmentLimits,
+    onAttachmentUploaded,
+    draftsProp,
+    draftKey,
+  );
   const attachEnabled = Boolean(uploadTarget) && !disabled;
   const uploading = upload.busy;
   // Whether any attachment — queued, uploading, ready or even failed-but-not-
@@ -765,8 +812,17 @@ export default function ChatComposer({
       const result = await onSend("", [attachmentId]);
       return result.status === "sent";
     },
+    drafts: draftsProp,
+    draftKey,
   });
   const recording = recorder.phase !== "idle";
+  /**
+   * Whether the next send asks its recipients to confirm receipt (issue #824).
+   *
+   * Composer state, not conversation state: it describes the draft, so it
+   * resets with the draft and never outlives the message it was set for.
+   */
+  const [acknowledgementRequired, setAcknowledgementRequired] = useState(false);
   const pendingAttachments = upload.items
     .map((item) => item.attachment)
     .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
@@ -784,15 +840,38 @@ export default function ChatComposer({
    *    result or a thrown error leaves it exactly where it was, so the same
    *    already-uploaded file can be sent again without re-uploading it.
    */
+  // Issue #769, "ACK ATRASADO": whether the text editor should actually
+  // clear once this send resolves. Decided the instant the send resolves —
+  // by comparing the draft's revision then against its revision when this
+  // send *started* — and deliberately before upload.resetAfterPublish()
+  // runs below, which bumps the revision itself (attachments consumed by
+  // this very send, not a new edit) and would otherwise read as "the reader
+  // moved on" every single time.
+  const shouldClearTextRef = useRef(true);
+  // -1 (never a real revision, which starts at 1 on a draft's first
+  // mutation) rather than null/undefined: with the no-op store every
+  // caller that does not opt into #769 gets — including most of this
+  // file's own tests — getDraft always reports undefined, and comparing
+  // two undefineds by strict equality is exactly as valid a "unchanged"
+  // signal as comparing two real revisions.
+  const noRevision = -1;
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
+    const revisionAtSubmit = drafts.getDraft(draftKey ?? "")?.revision ?? noRevision;
     const result = await onSend(
       body,
       pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
+      acknowledgementRequired,
     );
     if (result.status === "sent") {
+      shouldClearTextRef.current =
+        (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
       upload.resetAfterPublish();
       setEmojiPickerOpen(false);
+      // The request belongs to the message that carried it, not to the
+      // composer: leaving it on would silently ask for confirmation of
+      // everything typed afterwards (issue #824).
+      setAcknowledgementRequired(false);
     }
     return result;
   };
@@ -800,13 +879,20 @@ export default function ChatComposer({
   const { editor, canSend, sending, handleSend } = useChatEditor({
     placeholder,
     disabled,
-    channelId,
+    mentionTarget,
     bodyFormat,
     // An attachment is content, so a composer holding one may send an empty
     // document — but not while its own upload is still running.
     canSendEmpty: hasSendableAttachment(upload),
+    // Issue #769: seeds this fresh editor instance with whatever was typed
+    // for this conversation before — read once, at creation, exactly like
+    // every other TipTap-instance-scoped option here (useEditor only
+    // re-reads its `content` option when it recreates the instance).
+    initialContent: draftKey ? (drafts.getDraft(draftKey)?.text ?? undefined) : undefined,
     onSend: handleComposerSend,
     onActivity,
+    onTextChange: draftKey ? (doc) => drafts.setText(draftKey, doc) : undefined,
+    shouldClearOnSent: () => shouldClearTextRef.current,
   });
 
   // Whether a new attachment may be taken at all right now. A voice
@@ -822,6 +908,24 @@ export default function ChatComposer({
   const canAcceptAttachments = attachEnabled && !recording;
   const drop = useComposerDropZone(attachEnabled, canAcceptAttachments, upload.selectFiles);
   const activeEditor = editor ?? null;
+
+  useEffect(() => {
+    if (initialFocusHandledRef.current || disabled || !editor) return;
+    if (suppressInitialFocus) {
+      initialFocusHandledRef.current = true;
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      if (!editor.isEditable) return;
+      if (document.activeElement !== initialFocusOwnerRef.current) {
+        initialFocusHandledRef.current = true;
+        return;
+      }
+      initialFocusHandledRef.current = true;
+      editor.view.dom.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [disabled, editor, suppressInitialFocus]);
 
   const startRecording = () => {
     // A picker left open over a recording panel is the same noise a picker
@@ -889,6 +993,8 @@ export default function ChatComposer({
               // sending now would post a message without it.
               canSend={canSend && !uploading}
               onSend={handleSend}
+              acknowledgementRequired={acknowledgementRequired}
+              onAcknowledgementRequiredChange={setAcknowledgementRequired}
             />
           </>
         )}

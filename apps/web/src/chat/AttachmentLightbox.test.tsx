@@ -25,6 +25,20 @@ const createObjectURL = vi.fn();
 const revokeObjectURL = vi.fn();
 const onClose = vi.fn();
 
+/**
+ * The bytes the card hands over (issue #675): the viewer mints its own object
+ * URL from them rather than borrowing one the card is about to revoke, so these
+ * stand in for what each test used to pass as an `inlineUrl` string. The
+ * createObjectURL stub below maps each back to that same address, which keeps
+ * every assertion about what is on screen unchanged.
+ */
+const inlineBlobs = {
+  "blob:preview-1": new Blob(["preview-1"]),
+  "blob:static-preview": new Blob(["static-preview"]),
+  "blob:webp-original": new Blob(["webp-original"]),
+  "blob:already-animated": new Blob(["already-animated"]),
+};
+
 function attachment(overrides: Partial<ChannelAttachment> = {}): ChannelAttachment {
   return {
     id: "img-1",
@@ -54,7 +68,12 @@ beforeEach(() => {
   createObjectURL.mockReset();
   revokeObjectURL.mockReset();
   let created = 0;
-  createObjectURL.mockImplementation(() => `blob:orig-${++created}`);
+  createObjectURL.mockImplementation((value: Blob) => {
+    for (const [url, blob] of Object.entries(inlineBlobs)) {
+      if (blob === value) return url;
+    }
+    return `blob:orig-${++created}`;
+  });
   vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
   stubMatchMedia(false);
 });
@@ -70,7 +89,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -86,7 +105,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -99,7 +118,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -113,7 +132,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -128,7 +147,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -146,7 +165,7 @@ describe("shell", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -163,7 +182,7 @@ describe("resolution", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -180,7 +199,7 @@ describe("resolution", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -195,7 +214,7 @@ describe("resolution", () => {
     render(
       <AttachmentLightbox
         attachment={attachment({ contentType: "image/webp" })}
-        inlineUrl="blob:webp-original"
+        inlineBlob={inlineBlobs["blob:webp-original"]}
         inlineIsOriginal
         onClose={onClose}
       />,
@@ -213,7 +232,7 @@ describe("resolution", () => {
     render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -226,11 +245,11 @@ describe("resolution", () => {
     );
   });
 
-  it("revokes the original URL it created when it unmounts", async () => {
+  it("revokes every URL it created — the original and its own copy of the inline bytes — when it unmounts", async () => {
     const { unmount } = render(
       <AttachmentLightbox
         attachment={attachment()}
-        inlineUrl="blob:preview-1"
+        inlineBlob={inlineBlobs["blob:preview-1"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -242,8 +261,10 @@ describe("resolution", () => {
     unmount();
 
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:orig-1");
-    // The URL the card owns is never this component's to revoke.
-    expect(revokeObjectURL).not.toHaveBeenCalledWith("blob:preview-1");
+    // Issue #675: the inline address is this component's own, minted from the
+    // blob the card handed over, so it revokes that one too. The card's URL is
+    // never touched here — it was never received.
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:preview-1");
   });
 });
 
@@ -258,7 +279,7 @@ describe("GIF + reduced motion", () => {
     render(
       <AttachmentLightbox
         attachment={gifAttachment()}
-        inlineUrl="blob:static-preview"
+        inlineBlob={inlineBlobs["blob:static-preview"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -277,7 +298,7 @@ describe("GIF + reduced motion", () => {
     render(
       <AttachmentLightbox
         attachment={gifAttachment()}
-        inlineUrl="blob:static-preview"
+        inlineBlob={inlineBlobs["blob:static-preview"]}
         inlineIsOriginal={false}
         onClose={onClose}
       />,
@@ -295,7 +316,7 @@ describe("GIF + reduced motion", () => {
     render(
       <AttachmentLightbox
         attachment={gifAttachment()}
-        inlineUrl="blob:already-animated"
+        inlineBlob={inlineBlobs["blob:already-animated"]}
         inlineIsOriginal
         onClose={onClose}
       />,

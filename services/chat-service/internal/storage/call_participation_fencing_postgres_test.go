@@ -19,7 +19,7 @@ func TestPGXCallStoreParticipationFenceP1P2P3PostgreSQL(t *testing.T) {
 	ctx := t.Context()
 	expiresAt := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, p1, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, p1, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-000000003001",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,
@@ -144,7 +144,7 @@ func TestPGXCallStoreConcurrentAdmissionSerializesAgainstStaleLeavePostgreSQL(t 
 	store := storage.NewPGXCallStore(pool)
 	ctx := t.Context()
 	expiresAt := time.Now().UTC().Add(30 * time.Second)
-	call, _, p1, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, p1, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace, RequestID: "c6220000-0000-4000-8000-000000003101",
 		CallerID: leavePGUserA, TargetType: domain.CallTargetChannel, TargetID: leavePGChannel,
 		Type: domain.CallTypeAudio, ExpiresAt: expiresAt,

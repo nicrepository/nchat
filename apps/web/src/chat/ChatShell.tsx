@@ -10,6 +10,7 @@ import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SidebarState } from "./useChatSidebar";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
 
 /**
  * The sidebar's data, or empty stand-ins while it is still loading.
@@ -105,6 +106,15 @@ export interface ChatOutletContext {
   channels: Channel[];
   dms: DMConversation[];
   attachmentLimits?: WorkspaceAttachmentLimits;
+  /**
+   * The same markRead useChatSidebar already hands the sidebar's own "Marcar
+   * como lida" menu action (#527) — not a second read-state mechanism.
+   * ChatMessageArea calls it once it has evidence the user reached the real
+   * bottom (#492); opening the route alone is no longer sufficient. Optional
+   * like every other callback here, so a partial outlet context (tests,
+   * emptyOutletContext) never has to fabricate one.
+   */
+  markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
   refreshConversations?: () => void;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
@@ -133,10 +143,19 @@ export interface ChatOutletContext {
   resourceCallSession?: ActiveResourceCallSession;
   /** Present only while a direct 1:1 call is active, media-connected, and locally owned (issue #673) — never merely ringing. */
   directCallSession?: ActiveDirectCallSession;
+  /**
+   * The per-conversation composer state (issue #769) — see
+   * AppShellOutletContext. Optional only so the many existing
+   * ChatOutletContext test fixtures that predate this field keep
+   * typechecking; ChatMessageArea falls back to noopConversationDrafts
+   * (never reached in production, where AppShell always provides the real
+   * store).
+   */
+  drafts?: ConversationDraftsApi;
 }
 
 export default function ChatShell() {
-  const { state, retry } = useOutletContext<AppShellOutletContext>();
+  const { state, retry, markRead, drafts } = useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
     calls,
@@ -240,6 +259,8 @@ export default function ChatShell() {
     channels: ready.channels,
     dms: ready.dms,
     attachmentLimits: ready.attachmentLimits,
+    markRead,
+    drafts,
     refreshConversations: retry,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,

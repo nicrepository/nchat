@@ -37,6 +37,31 @@ func TestPGXMemberStore_SearchChannelMembers_ScopesWorkspaceChannelAndActiveMemb
 	}
 }
 
+func TestPGXMemberStore_SearchDMConversationMembers_ScopesActiveGroupAndMemberships(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations.*w\.status = 'active'.*caller\.status = 'active'.*caller_wm\.status = 'active'.*candidate\.status = 'active'.*candidate_wm\.status = 'active'.*u\.status = 'active'.*u\.deleted_at IS NULL.*dc\.type = 'group'.*ORDER BY lower\(u\.display_name\), u\.id`).
+		WithArgs("ws-1", "group-1", "caller-1", "ju", 20).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "display_name"}).
+			AddRow("user-2", "Juliane Lino"))
+
+	got, err := storage.NewPGXMemberStore(mock).SearchDMConversationMembers(
+		context.Background(), "ws-1", "group-1", "caller-1", "ju", 20,
+	)
+	if err != nil {
+		t.Fatalf("SearchDMConversationMembers: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "user-2" || got[0].Label != "Juliane Lino" {
+		t.Fatalf("unexpected candidates: %#v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
 func TestPGXMemberStore_ListChannelMemberProfilesByIDs_ScopesToChannelMembership(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -1189,6 +1214,145 @@ func TestPGXMemberStore_RemoveChannelMember_GeneralChannel_Denied(t *testing.T) 
 	err = store.RemoveChannelMember(context.Background(), "ws-1", "ch-geral", "user-1")
 	if !errors.Is(err, domain.ErrCannotLeaveGeneralChannel) {
 		t.Fatalf("general channel remove should return ErrCannotLeaveGeneralChannel, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// ── RemoveChannelMemberByAdmin (issue #685) ─────────────────────────────────
+
+// A successful removal resolves the target's name and writes
+// conversation_member_removed in the same transaction as the delete, before
+// the commit that makes both visible together.
+func TestPGXMemberStore_RemoveChannelMemberByAdmin_WritesEvent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
+	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
+		WithArgs("ch-1", "user-1").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{"user-1"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow("user-1", "User One"))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{
+				"id", "workspace_id", "channel_id", "dm_conversation_id",
+				"sender_id", "kind", "event_type", "created_at",
+			}).AddRow("event-member-removed", "ws-1", "ch-1", "", "admin-1", "system",
+				"conversation_member_removed", time.Now()),
+		)
+	mock.ExpectCommit()
+
+	store := storage.NewPGXMemberStore(mock)
+	event, err := store.RemoveChannelMemberByAdmin(context.Background(), "ws-1", "ch-1", "admin-1", "user-1")
+	if err != nil {
+		t.Fatalf("RemoveChannelMemberByAdmin: %v", err)
+	}
+	if event.ID != "event-member-removed" {
+		t.Fatalf("event.ID = %q, want the inserted event's id", event.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// Removing someone who is not a member deletes nothing, so no event is
+// written — an admin retrying a stale removal must not announce a departure
+// that never happened.
+func TestPGXMemberStore_RemoveChannelMemberByAdmin_NotMember_NoEvent(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
+	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
+		WithArgs("ch-1", "user-99").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectCommit()
+
+	store := storage.NewPGXMemberStore(mock)
+	event, err := store.RemoveChannelMemberByAdmin(context.Background(), "ws-1", "ch-1", "admin-1", "user-99")
+	if err != nil {
+		t.Fatalf("non-member remove should be idempotent, got: %v", err)
+	}
+	if event.ID != "" {
+		t.Fatalf("event = %+v, want zero value for a no-op removal", event)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+func TestPGXMemberStore_RemoveChannelMemberByAdmin_GeneralChannel_Denied(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-geral", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(true))
+
+	store := storage.NewPGXMemberStore(mock)
+	_, err = store.RemoveChannelMemberByAdmin(context.Background(), "ws-1", "ch-geral", "admin-1", "user-1")
+	if !errors.Is(err, domain.ErrCannotLeaveGeneralChannel) {
+		t.Fatalf("general channel remove should return ErrCannotLeaveGeneralChannel, got: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A failure inserting the event rolls back the delete, so a removed
+// membership never exists without the event describing it.
+func TestPGXMemberStore_RemoveChannelMemberByAdmin_RollsBackWhenEventInsertFails(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock: %v", err)
+	}
+	defer mock.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT is_general FROM chat\.channels`).
+		WithArgs("ch-1", "ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"is_general"}).AddRow(false))
+	mock.ExpectExec(`DELETE FROM chat\.channel_members`).
+		WithArgs("ch-1", "user-1").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{"user-1"}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow("user-1", "User One"))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	store := storage.NewPGXMemberStore(mock)
+	if _, err := store.RemoveChannelMemberByAdmin(context.Background(), "ws-1", "ch-1", "admin-1", "user-1"); err == nil {
+		t.Fatal("expected the event insert failure to surface")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)

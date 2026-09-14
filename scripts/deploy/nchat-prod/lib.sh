@@ -17,6 +17,12 @@ NCHAT_PROD_NAMESPACE="${NCHAT_PROD_NAMESPACE:-nchat-prod}"
 # an outage. Overridable for a rehearsal cluster, never silently.
 NCHAT_PROD_CONTEXT="${NCHAT_PROD_CONTEXT:-nchat-prod-deployer}"
 NCHAT_PROD_SLOT_LABEL='nchat.io/release-slot'
+# The two annotations that together identify what a slot is running: the commit
+# it was built from, and the sealed release whose digests it actually pins.
+NCHAT_PROD_RELEASE_SHA_ANNOTATION='nchat.io/release-sha'
+NCHAT_PROD_RELEASE_ID_ANNOTATION='nchat.io/release-id'
+# Written beside the digests by release-digests.sh, read by the deploy.
+NCHAT_PROD_RELEASE_ID_FILE=release-id.txt
 NCHAT_PROD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 NCHAT_PROD_SLOTS=(blue green)
 # The slot the first production release is established in. Blue is the baseline
@@ -180,6 +186,34 @@ all_services_on_slot() {
   [[ "$slots" == "$target" ]]
 }
 
+# The preflight of a promotion to an explicit, already-authorised target.
+#
+# `resolve_active_slot` is the wrong question here and answering it is a bug: it
+# refuses every mixed reading, and a mixed reading of blue and green is the
+# normal shape of a cutover to this same target that stopped part-way. Refusing
+# it would make the documented retry -- `--target <the same slot>` -- impossible
+# through the one path that is supposed to converge it, while a namespace
+# holding `purple`, an unset selector or a Service that is not there would be
+# just as "mixed" and needs to fail.
+#
+# So the mapping is classified against the target instead of being resolved into
+# an active slot. Every stable Service must select the target or its opposite;
+# anything else is a state this cannot describe, and it fails before any
+# mutation. The target itself is never derived from what is found -- it is the
+# caller's, it stays the caller's, and a retry converges rather than reversing.
+require_promotable_selectors() {
+  local mapping="$1" target="$2" other service slot
+  is_valid_slot "$target" ||
+    prod_fail "the promotion target must be one of ${NCHAT_PROD_SLOTS[*]}, got '$target'"
+  other="$(opposite_slot "$target")"
+  while read -r service slot; do
+    if [[ "$slot" != "$target" && "$slot" != "$other" ]]; then
+      printf '%s\n' "$mapping" >&2
+      prod_fail "service/$service selects '$slot', which is neither $target nor $other; cutover blocked"
+    fi
+  done <<<"$mapping"
+}
+
 # Everything Kubernetes reports about a rollout, as one pipe-separated record:
 #   generation|observedGeneration|replicas|updated|ready|available|unavailable
 deployment_rollout_state() {
@@ -279,7 +313,11 @@ deployment_observed_releases() {
   component="$(deployment_component "$deployment")" || return 1
   [[ -n "$component" ]] || return 1
   template='{range .items[?(@.status.conditions[?(@.type=="Ready")].status=="True")]}'
-  template+="{.metadata.annotations['nchat\\.io/release-sha']}{'\n'}{end}"
+  # Both halves of the identity, joined, so every gate downstream compares the
+  # code AND the bytes. A pod missing either annotation yields a value that
+  # matches no valid release and is refused rather than defaulted.
+  template+="{.metadata.annotations['nchat\\.io/release-sha']}{':'}"
+  template+="{.metadata.annotations['nchat\\.io/release-id']}{'\n'}{end}"
   kubectl get pods -n "$NCHAT_PROD_NAMESPACE" \
     -l "app.kubernetes.io/component=$component,$NCHAT_PROD_SLOT_LABEL=$slot" \
     -o "jsonpath=$template" 2>/dev/null
@@ -287,9 +325,10 @@ deployment_observed_releases() {
 
 # The single release every Ready pod of a workload carries, or a state token.
 #
-#   <sha>          every Ready pod runs this release
+#   <sha>:<id>     every Ready pod runs this release
 #   none           the workload has no Ready pod
 #   mixed          Ready pods disagree — a rollout caught in the middle
+#   unset          the pods carry no complete release identity
 observed_release_of() {
   local deployment="$1" slot="$2" releases distinct count
   releases="$(deployment_observed_releases "$deployment" "$slot")" || { printf 'none'; return 0; }
@@ -297,6 +336,11 @@ observed_release_of() {
   count="$(printf '%s\n' "$distinct" | grep -c .)"
   [[ "$count" -ne 0 ]] || { printf 'none'; return 0; }
   [[ "$count" -eq 1 ]] || { printf 'mixed'; return 0; }
+  # An identity is the commit and the sealed release together. A pod carrying
+  # only one of the two annotations produces a half-formed value here, and
+  # naming it explicitly is what stops it being compared as though it were a
+  # release: `unset` is refused by every caller, a truncated pair might not be.
+  [[ "$distinct" =~ ^[a-f0-9]{40}:[a-f0-9]{64}$ ]] || { printf 'unset'; return 0; }
   printf '%s' "$distinct"
 }
 
@@ -405,6 +449,38 @@ require_consistent_release() {
   prod_fail "slot $slot is $state; deploy the release again before promoting it"
 }
 
+# Binds what a slot is actually running to the release the caller asked for.
+#
+# slot_release_state answers what the slot carries. That is a statement about
+# the slot alone: a concurrent redeploy of the same slot produces a state that
+# is equally CONSISTENT and equally Ready, and nothing in "consistent" tells the
+# two releases apart. Comparing the observed identity to a named one is what
+# turns "this slot agrees with itself" into "this slot is running the release
+# this run built".
+#
+# The identity is the commit and the sealed build together, so a rebuild of the
+# same commit fails here as surely as a different commit does.
+#
+# Every state that is not exactly the expected release stops the caller, the
+# non-CONSISTENT ones included: NOT_DEPLOYED, ROLLING_OUT and MIXED are answers
+# about a slot that cannot be reported as carrying any release at all, and a
+# cluster that cannot be read produces one of them rather than a match.
+#
+# Named for the slot it reads. cutover.sh carries its own, older
+# require_release_identity, which answers a different question -- does the
+# sealed manifest being promoted match the id the slot reports -- and takes one
+# argument rather than two. That script sources this file and then defines its
+# own, so a shared name would leave which of the two ran depending on the order
+# of a `source` line, with two incompatible signatures under one global symbol.
+require_slot_release_identity() {
+  local slot="$1" expected="$2" state
+  state="$(slot_release_state "$slot")" ||
+    prod_fail "cannot read the release identity of slot $slot"
+  [[ "$state" == "CONSISTENT $expected" ]] ||
+    prod_fail "slot $slot carries '$state', expected 'CONSISTENT $expected'"
+  printf '%s' "$expected"
+}
+
 # The evidence a smoke run produces and a cutover checks: the slot AND the exact
 # release that was validated on it.
 #
@@ -413,9 +489,21 @@ require_consistent_release() {
 # -- promoting a release nobody smoked. Binding the two means a candidate that
 # changed after validation no longer matches.
 smoke_evidence_for() {
-  local slot="$1" sha
-  sha="$(slot_release "$slot")" || return 1
-  printf '%s:%s' "$slot" "$sha"
+  local slot="$1" release
+  release="$(slot_release "$slot")" || return 1
+  printf '%s:%s' "$slot" "$release"
+}
+
+# The release identity recorded beside the digests, refused unless it is one.
+read_release_id() {
+  local artifacts_dir="$1" release_id
+  local file="$artifacts_dir/$NCHAT_PROD_RELEASE_ID_FILE"
+  # Checked before it is read: `$(<missing)` under `set -e` ends the caller with
+  # a shell diagnostic instead of the refusal the caller wants to report.
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  release_id="$(<"$file")"
+  [[ "$release_id" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s' "$release_id"
 }
 
 confirm() {
@@ -496,12 +584,74 @@ patch_service_slot() {
 # milliseconds of two slots serving at once, which the release contract already
 # requires to be safe — Blue and Green run against one database, one Valkey and
 # one object store, and both must speak the same event and API shapes.
-switch_services_to_slot() {
-  local slot="$1" service moved=0
-  is_valid_slot "$slot" || return 1
+# The Services that serve the browser its own code. Everything else in the
+# stable list is something that code talks to.
+#
+# The distinction exists because a slot change is not instantaneous: the
+# Services are patched one at a time, and between two patches production is
+# genuinely split. Which half is ahead in that window decides whether the split
+# is harmless or not — a browser is only ever compatible with a backend of its
+# own release or newer, never with an older one. chat-service is the case that
+# made this concrete: since issue #744 the realtime event carries the delivery
+# decision the client consumes, and a new bundle talking to a chat-service that
+# predates it would have to guess.
+NCHAT_PROD_FRONTEND_SERVICES=(
+  nchat-web
+  nchat-admin-web
+)
+
+is_frontend_service() {
+  local candidate="$1" service
+  for service in "${NCHAT_PROD_FRONTEND_SERVICES[@]}"; do
+    [[ "$candidate" == "$service" ]] && return 0
+  done
+  return 1
+}
+
+# Prints the stable Services of one half, in declaration order.
+print_services_of_kind() {
+  local want="$1" service kind
   for service in "${NCHAT_PROD_STABLE_SERVICES[@]}"; do
+    if is_frontend_service "$service"; then kind=frontend; else kind=backend; fi
+    if [[ "$kind" == "$want" ]]; then printf '%s\n' "$service"; fi
+  done
+  return 0
+}
+
+# The order a slot change moves the Services in.
+#
+#   backends-first   promoting a newer release: every backend takes the new slot
+#                    before the browser is served the new bundle, so a new client
+#                    can never reach an older backend
+#   frontends-first  going back to an older release: the browser is served the
+#                    older bundle first, for the same reason read the other way
+#
+# Neither is a default anyone should have to infer, so both call sites name the
+# one they need.
+service_switch_order() {
+  case "$1" in
+    backends-first)
+      print_services_of_kind backend
+      print_services_of_kind frontend
+      ;;
+    frontends-first)
+      print_services_of_kind frontend
+      print_services_of_kind backend
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+switch_services_to_slot() {
+  local slot="$1" direction="$2" service moved=0 total="${#NCHAT_PROD_STABLE_SERVICES[@]}" order
+  is_valid_slot "$slot" || return 1
+  order="$(service_switch_order "$direction")" || {
+    echo "unknown switch order: $direction" >&2
+    return 1
+  }
+  while read -r service; do
     if ! patch_service_slot "$service" "$slot"; then
-      echo "failed to patch service/$service after $moved of ${#NCHAT_PROD_STABLE_SERVICES[@]}" >&2
+      echo "failed to patch service/$service after $moved of $total" >&2
       return 1
     fi
     if [[ "$(service_slot "$service")" != "$slot" ]]; then
@@ -510,7 +660,13 @@ switch_services_to_slot() {
     fi
     moved=$((moved + 1))
     echo "  service/$service -> $slot"
-  done
+  done <<<"$order"
+  # A Service missing from the order would leave production split with nothing
+  # reporting it, so the count is checked rather than assumed.
+  if [[ "$moved" -ne "$total" ]]; then
+    echo "switch order covered $moved of $total stable services" >&2
+    return 1
+  fi
 }
 
 # --- capacity preflight -------------------------------------------------

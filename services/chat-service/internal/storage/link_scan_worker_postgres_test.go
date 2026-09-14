@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
@@ -78,6 +80,11 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		{`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
 		  VALUES ($2, $1, 'rf21-worker', 'RF21 worker', 'public', 'active')
 		  ON CONFLICT (id) DO NOTHING`, []any{workspace, channel}},
+		// A mention is only valid for somebody who is in the channel, so the
+		// membership is part of the fixture rather than an assumption.
+		{`INSERT INTO chat.channel_members (channel_id, user_id)
+		  VALUES ($1, $2), ($1, $3) ON CONFLICT DO NOTHING`,
+			[]any{channel, author, mentioned}},
 	} {
 		if _, err := pool.Exec(ctx, seed.sql, seed.args...); err != nil {
 			t.Fatalf("seed workspace: %v", err)
@@ -886,6 +893,114 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		}
 	})
 
+	// Regression: a recipient who could reach the target when the message was
+	// sent, but cannot by the time the scan decides it, must NOT have their
+	// parked notification promoted. The hardened SQL revalidates access at
+	// promotion time, and this test is the evidence that it works.
+	//
+	// The channel is private, and that is the point. chat.channel_visible_to_user
+	// is the project's one authority on who may see a channel, and under it an
+	// explicit membership is the only thing that grants a private channel — so
+	// deleting that row is genuinely losing access. Deleting it from a public
+	// channel would not be: an active workspace member still sees a public
+	// channel, still reads the message, and a test that called that "lost access"
+	// would only be asserting a predicate the domain does not have.
+	t.Run("a notification is not promoted when the recipient loses channel access", func(t *testing.T) {
+		const (
+			lostMember     = "e3000000-0000-4000-8000-00000000000c"
+			lostMemberMsg  = "e3000000-0000-4000-8000-00000000000d"
+			privateChannel = "e3000000-0000-4000-8000-00000000000e"
+		)
+		resetQueue(t)
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, lostMemberMsg); err != nil {
+			t.Fatalf("clean message: %v", err)
+		}
+
+		// The user is a workspace member and an explicit member of a private
+		// channel — the only grant that channel has.
+		seedPrivateChannelScenario(t, pool, workspace, privateChannel, lostMember, author)
+
+		// A withheld message that mentions the soon-to-leave member.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.link_scans (canonical_url, status, decided_at)
+			VALUES ($1, 'safe', now())
+			ON CONFLICT (canonical_url)
+			DO UPDATE SET status = 'safe', decided_at = now(), scan_uuid = NULL`,
+			goodURL); err != nil {
+			t.Fatalf("seed verdict: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.messages
+				(id, workspace_id, channel_id, sender_id, kind, body_text, body_format,
+				 status, link_safety_fingerprint)
+			VALUES ($1, $2, $3, $4, 'user', 'mentioning lost member', 'v2',
+			        'pending_link_scan', $5)`,
+			lostMemberMsg, workspace, privateChannel, author, fingerprint); err != nil {
+			t.Fatalf("seed message: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+			VALUES ($1, $2, $3)`, lostMemberMsg, goodURL, fingerprint); err != nil {
+			t.Fatalf("seed association: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO chat.message_pending_mentions (message_id, user_id)
+			VALUES ($1, $2)`, lostMemberMsg, lostMember); err != nil {
+			t.Fatalf("seed pending mention: %v", err)
+		}
+
+		// The member leaves the private channel before the scan decides the
+		// message. Their workspace membership is untouched, so what they lose is
+		// exactly the channel — which is what the promotion has to notice.
+		if _, err := pool.Exec(ctx, `
+			DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`,
+			privateChannel, lostMember); err != nil {
+			t.Fatalf("remove channel membership: %v", err)
+		}
+
+		// Promotion resolves the message — published — but the mention must NOT
+		// reach the notification outbox.
+		summary, err := store.ResolveDecidedMessages(ctx)
+		if err != nil {
+			t.Fatalf("ResolveDecidedMessages: %v", err)
+		}
+		if summary.Published != 1 {
+			t.Fatalf("summary = %+v, want the message published", summary)
+		}
+
+		var msgStatus string
+		if err := pool.QueryRow(ctx,
+			`SELECT status FROM chat.messages WHERE id = $1`, lostMemberMsg,
+		).Scan(&msgStatus); err != nil {
+			t.Fatalf("read message status: %v", err)
+		}
+		if msgStatus != "active" {
+			t.Fatalf("message status = %q, want active", msgStatus)
+		}
+
+		// The outbox event exists — the message was promoted — but no mention
+		// notification was emitted for the ex-member.
+		var notificationCount int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM chat.notification_outbox
+			WHERE message_id = $1 AND recipient_user_id = $2 AND kind = 'mention'`,
+			lostMemberMsg, lostMember,
+		).Scan(&notificationCount); err != nil {
+			t.Fatalf("count notifications: %v", err)
+		}
+		if notificationCount != 0 {
+			t.Fatalf("notification_outbox has %d rows for the ex-member, want 0", notificationCount)
+		}
+
+		// Clean up.
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.messages WHERE id = $1`, lostMemberMsg); err != nil {
+			t.Fatalf("clean message: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM chat.channels WHERE id = $1`, privateChannel); err != nil {
+			t.Fatalf("clean private channel: %v", err)
+		}
+	})
+
 	// The dispatcher half: claim, deliver, retire. Depends on the events the
 	// previous subtest wrote.
 	t.Run("the dispatcher claims, delivers and retires events", func(t *testing.T) {
@@ -1057,4 +1172,35 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 			t.Fatalf("%d expired window(s) survived the prune", remaining)
 		}
 	})
+}
+
+// seedPrivateChannelScenario creates the recipient, a private channel, and the
+// explicit memberships that are the only way into it. Extracted from the
+// subtest that uses it so the seeding does not add its four error checks to a
+// test function that is already far past what any of them should be.
+func seedPrivateChannelScenario(t *testing.T, pool *pgxpool.Pool, workspace, channelID, recipient, author string) {
+	t.Helper()
+	ctx := t.Context()
+	statements := []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO auth.users (id, email, display_name)
+		  VALUES ($1, 'rf21-lost@e.test', 'Lost') ON CONFLICT (id) DO NOTHING`,
+			[]any{recipient}},
+		{`INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+		  VALUES ($1, $2, 'active') ON CONFLICT DO NOTHING`,
+			[]any{workspace, recipient}},
+		{`INSERT INTO chat.channels (id, workspace_id, slug, display_name, type, status)
+		  VALUES ($2, $1, 'rf21-private', 'RF21 private', 'private', 'active')
+		  ON CONFLICT (id) DO NOTHING`, []any{workspace, channelID}},
+		{`INSERT INTO chat.channel_members (channel_id, user_id)
+		  VALUES ($1, $2), ($1, $3) ON CONFLICT DO NOTHING`,
+			[]any{channelID, recipient, author}},
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatalf("seed private channel scenario: %v", err)
+		}
+	}
 }

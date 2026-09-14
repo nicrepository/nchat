@@ -308,6 +308,33 @@ const messagePage = (messages: Message[]): MessagePage => ({ messages, nextCurso
 
 // Channel-details payload keyed by channel, so a test that switches channels can
 // assert the panel followed the switch rather than kept the first channel's data.
+/**
+ * jsdom performs no layout, so a test has to define the scroll container's
+ * geometry by hand — and doing that in the same step as the scroll event makes
+ * a simulated reader indistinguishable from an async reflow.
+ *
+ * #788: ChatMessageArea reads a reader's intent only from a scroll event whose
+ * scrollHeight is unchanged since the previous one, because an event that also
+ * grew the timeline describes a layout that shifted underneath a stationary
+ * viewport, not a person. So a simulated scroll settles the geometry first,
+ * the way a browser settles it at layout time before anyone can scroll.
+ */
+function settleListLayout(list: HTMLElement, scrollHeight: number, clientHeight: number) {
+  Object.defineProperty(list, "scrollHeight", { configurable: true, value: scrollHeight });
+  Object.defineProperty(list, "clientHeight", { configurable: true, value: clientHeight });
+  fireEvent.scroll(list);
+}
+
+/** The reader's own scroll: only scrollTop moves, exactly as in a browser. */
+function userScrollTo(list: HTMLElement, scrollTop: number) {
+  Object.defineProperty(list, "scrollTop", {
+    configurable: true,
+    writable: true,
+    value: scrollTop,
+  });
+  fireEvent.scroll(list);
+}
+
 function groupDetailsFor(conversationId: string) {
   return {
     id: conversationId,
@@ -482,6 +509,28 @@ function domRect(rect: Partial<DOMRect>): DOMRect {
   } as DOMRect;
 }
 
+/**
+ * The layout jsdom never gives the timeline. The hover toolbar is placed inside
+ * the band the list occupies, against a bubble the reader can see (issue
+ * #839); with no boxes there is no band, no visible bubble, and no toolbar
+ * would ever open. So the list fills the window here, every bubble sits inside
+ * it, and either picker's button sits inside the window — and a test that mocks
+ * rects of its own falls back to this rather than to a zero box.
+ */
+function layoutRect(this: Element): DOMRect {
+  if (this.classList.contains("chat-msg-area__list")) {
+    return domRect({ right: 1024, bottom: 768, width: 1024, height: 768 });
+  }
+  if (this.classList.contains("chat-msg-area__msg-bubble")) {
+    return domRect({ top: 300, bottom: 340, left: 100, right: 400, width: 300, height: 40 });
+  }
+  const label = this.getAttribute("aria-label");
+  if (label === "Mais reações" || label === "Inserir emoji") {
+    return domRect({ top: 260, bottom: 290, left: 300, right: 330, width: 30, height: 30 });
+  }
+  return domRect({});
+}
+
 async function openFullReactionPicker(messageIndex = 0) {
   const bubbles = await screen.findAllByTestId("chat-msg-bubble");
   fireEvent.mouseEnter(bubbles[messageIndex]);
@@ -490,9 +539,12 @@ async function openFullReactionPicker(messageIndex = 0) {
 
 // ── Setup / teardown ──────────────────────────────────────────────────────────
 
+let layoutSpy: ReturnType<typeof vi.spyOn>;
+
 beforeEach(() => {
   setTokens("test-at");
   localStorage.clear();
+  layoutSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(layoutRect);
   wsMockState.capturedWSMessageCreated = null;
   wsMockState.capturedWSMessageUpdated = null;
   wsMockState.capturedReactionUpdated = null;
@@ -565,6 +617,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  layoutSpy.mockRestore();
   clearTokens();
 });
 
@@ -2922,17 +2975,7 @@ describe("ChatMessageArea — message list", () => {
               toJSON: () => ({}),
             };
           }
-          return {
-            x: 0,
-            y: 0,
-            left: 0,
-            right: 0,
-            top: 0,
-            bottom: 0,
-            width: 0,
-            height: 0,
-            toJSON: () => ({}),
-          };
+          return layoutRect.call(this);
         });
       renderChannelArea();
 
@@ -2944,6 +2987,31 @@ describe("ChatMessageArea — message list", () => {
       rectSpy.mockRestore();
     },
   );
+
+  // A button with no room for the picker above it or below it (issue #839
+  // follow-up): the picker is not squeezed across its own button, it closes.
+  it("closes the picker when it fits on neither side of its button", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.getAttribute("aria-label") === "Mais reações") {
+          return domRect({ left: 450, right: 480, top: 100, bottom: 700, width: 30, height: 600 });
+        }
+        if (this.classList.contains("chat-emoji-surface")) {
+          return domRect({ right: 188, bottom: 150, width: 188, height: 150 });
+        }
+        return layoutRect.call(this);
+      });
+    renderChannelArea();
+
+    await openFullReactionPicker();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument(),
+    );
+    rectSpy.mockRestore();
+  });
 
   // The picker opens at the size of its Suspense fallback and grows when the
   // lazily-imported catalog lands. Without a second placement it would keep the
@@ -2960,7 +3028,7 @@ describe("ChatMessageArea — message list", () => {
         if (this.classList.contains("chat-emoji-surface")) {
           return domRect({ right: 188, bottom: pickerHeight, width: 188, height: pickerHeight });
         }
-        return domRect({});
+        return layoutRect.call(this);
       });
     renderChannelArea();
 
@@ -3022,14 +3090,19 @@ describe("ChatMessageArea — message list", () => {
   it("stops observing the picker once it is closed", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
     renderChannelArea();
+    await screen.findAllByTestId("chat-msg-bubble");
+    // Baseline includes MessageList's own #788 tail-lock observer (the
+    // timeline content wrapper), which mounts with the message list itself
+    // and is unrelated to the picker.
+    const baseline = observedElements().length;
 
     await openFullReactionPicker();
-    expect(observedElements()).toHaveLength(1);
+    expect(observedElements()).toHaveLength(baseline + 1);
 
     fireEvent.keyDown(document, { key: "Escape" });
 
     expect(screen.queryByRole("dialog", { name: "Escolher reação" })).not.toBeInTheDocument();
-    expect(observedElements()).toHaveLength(0);
+    expect(observedElements()).toHaveLength(baseline);
   });
 
   it("closes the reaction picker when its anchor leaves the viewport", async () => {
@@ -3050,17 +3123,7 @@ describe("ChatMessageArea — message list", () => {
             toJSON: () => ({}),
           };
         }
-        return {
-          x: 0,
-          y: 0,
-          left: 0,
-          right: 0,
-          top: 0,
-          bottom: 0,
-          width: 0,
-          height: 0,
-          toJSON: () => ({}),
-        };
+        return layoutRect.call(this);
       });
     renderChannelArea();
 
@@ -3074,12 +3137,27 @@ describe("ChatMessageArea — message list", () => {
 
   it("keeps the portaled reaction picker anchored when the message list scrolls", async () => {
     mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage()]));
+    // The toolbar holding the picker closes when its bubble leaves the list's
+    // band on scroll (issue #839), and jsdom lays nothing out — so the bubble
+    // is given a box inside the list, as it would have in a browser.
+    const rectSpy = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: Element) {
+        if (this.classList.contains("chat-msg-area__list")) {
+          return domRect({ right: 800, bottom: 600, width: 800, height: 600 });
+        }
+        if (this.classList.contains("chat-msg-area__msg-bubble")) {
+          return domRect({ top: 200, bottom: 240, left: 100, right: 300, width: 200, height: 40 });
+        }
+        return layoutRect.call(this);
+      });
     renderChannelArea();
 
     await openFullReactionPicker();
     fireEvent.scroll(screen.getByRole("log", { name: "Mensagens" }));
 
     expect(screen.getByRole("dialog", { name: "Escolher reação" })).toBeInTheDocument();
+    rectSpy.mockRestore();
   });
 
   it("keeps only one message reaction picker open", async () => {
@@ -4158,6 +4236,9 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         referencedMessageId: undefined,
         attachmentIds: undefined,
         idempotencyKey: expect.any(String),
+        // Issue #824: carried on every send and omitted from the wire when
+        // false, which chatApiAcknowledgement.test.ts asserts separately.
+        acknowledgementRequired: false,
       },
     ]);
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
@@ -4486,6 +4567,9 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
         referencedMessageId: rf09SourceMessageID,
         attachmentIds: undefined,
         idempotencyKey: expect.any(String),
+        // Issue #824: carried on every send and omitted from the wire when
+        // false, which chatApiAcknowledgement.test.ts asserts separately.
+        acknowledgementRequired: false,
       },
     ]);
     await waitFor(() =>
@@ -4521,6 +4605,100 @@ describe("ChatMessageArea — RF-09 cross-channel references", () => {
 // ── Stale response guard ──────────────────────────────────────────────────────
 
 describe("ChatMessageArea — stale response guard", () => {
+  it("focuses the new composer only after the switched conversation finishes loading", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)));
+
+    function TwoChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <TwoChannelTest />
+      </MemoryRouter>,
+    );
+
+    const channel1Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel1Input).toHaveFocus());
+
+    const switchButton = screen.getByRole("button", { name: "Ir para canal 2" });
+    await user.click(switchButton);
+
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    expect(channel2Input).not.toBe(channel1Input);
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    expect(switchButton).toHaveFocus();
+
+    const focus = vi.spyOn(channel2Input, "focus");
+    await act(async () => resolveChannel2(emptyPage));
+
+    await waitFor(() => expect(channel2Input).toHaveFocus());
+    expect(focus).toHaveBeenCalledOnce();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it("allows only the final composer to autofocus during a rapid conversation switch", async () => {
+    const user = userEvent.setup();
+    let resolveChannel2!: (page: MessagePage) => void;
+    let resolveChannel3!: (page: MessagePage) => void;
+    mockFetchChannelMessages
+      .mockResolvedValueOnce(emptyPage)
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel2 = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (resolveChannel3 = resolve)));
+
+    function ThreeChannelTest() {
+      const navigate = useNavigate();
+      return (
+        <div>
+          <button onClick={() => navigate("/chat/channel/canal-2")}>Ir para canal 2</button>
+          <button onClick={() => navigate("/chat/channel/canal-3")}>Ir para canal 3</button>
+          <Routes>
+            <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Routes>
+        </div>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/canal-1"]}>
+        <ThreeChannelTest />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("chat-composer-input")).toHaveFocus());
+    await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const channel2Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel2Input).toHaveAttribute("aria-disabled", "true"));
+    const channel2Focus = vi.spyOn(channel2Input, "focus");
+
+    const channel3Button = screen.getByRole("button", { name: "Ir para canal 3" });
+    await user.click(channel3Button);
+    const channel3Input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(channel3Input).toHaveAttribute("aria-disabled", "true"));
+    const channel3Focus = vi.spyOn(channel3Input, "focus");
+
+    await act(async () => resolveChannel2(emptyPage));
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Button).toHaveFocus();
+
+    await act(async () => resolveChannel3(emptyPage));
+    await waitFor(() => expect(channel3Input).toHaveFocus());
+    expect(channel2Focus).not.toHaveBeenCalled();
+    expect(channel3Focus).toHaveBeenCalledOnce();
+  });
+
   it("response for old target does not render when target changes", async () => {
     const user = userEvent.setup();
 
@@ -4554,6 +4732,9 @@ describe("ChatMessageArea — stale response guard", () => {
 
     // Switch to canal-2 while canal-1 is still loading.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
 
     // Now let canal-1's stale request resolve.
     resolveChannel1!(messagePage([makeMessage({ bodyText: "Mensagem do canal 1" })]));
@@ -4695,11 +4876,15 @@ describe("ChatMessageArea — stale response guard", () => {
     // Navigate to canal-2 while the POST for canal-1 is still in-flight. The
     // composer is keyed by target, so canal-1's draft is destroyed with it.
     await user.click(screen.getByRole("button", { name: "Ir para canal 2" }));
+    const currentInput = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(currentInput).toHaveFocus());
 
     // Resolve the stale POST for canal-1 — should return { status: "stale" }.
     await act(async () => {
       resolveSendA!(makeMessage({ bodyText: "rascunho canal 1" }));
     });
+
+    expect(currentInput).toHaveFocus();
 
     // Canal-1's draft must never surface in canal-2 — neither in the composer
     // nor in the timeline — and the stale completion must not touch either.
@@ -5016,10 +5201,15 @@ describe("ChatMessageArea — infinite scroll", () => {
     // Wait for both fetches to complete (initial + one loadMore triggered by auto-fire).
     await waitFor(() => expect(screen.getByText("Antiga")).toBeInTheDocument());
 
-    // The observer was created once (when hasMore became true) and observe() fired once.
-    // After prepend, hasMore=false → effect re-runs with !hasMore → returns early, no new observer.
-    expect(observeCallCount).toBe(1);
-    // Exactly two fetches: initial load + one loadMore.
+    // The top (loadMore) sentinel's observer was created once (when hasMore
+    // became true) and observe() fired once; after prepend, hasMore=false →
+    // effect re-runs with !hasMore → returns early, no new observer. The
+    // bottom (#492) sentinel mounts exactly once regardless of hasMore and
+    // contributes its own single observe() call — it does not loop either,
+    // since its effect has no hasMore/messages dependency to re-run on.
+    expect(observeCallCount).toBe(2);
+    // Exactly two fetches: initial load + one loadMore. The bottom sentinel's
+    // auto-fire never triggers a fetch of its own.
     expect(mockFetchChannelMessages).toHaveBeenCalledTimes(2);
   });
 
@@ -5910,10 +6100,8 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
 
     // Simulate user scrolled far up: scrollHeight=1000, clientHeight=400, scrollTop=0
     // → distance from bottom = 1000 - 0 - 400 = 600 > 150 → not near bottom.
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
 
     // Clear any scrollIntoView calls from the initial load.
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
@@ -5952,10 +6140,8 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
     const list = screen.getByRole("log");
     // Simulate near-bottom scroll: scrollHeight=500, clientHeight=400, scrollTop=99
     // → distance from bottom = 500 - 99 - 400 = 1 ≤ 150 → near bottom.
-    Object.defineProperty(list, "scrollHeight", { configurable: true, value: 500 });
-    Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
-    Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 99 });
-    fireEvent.scroll(list);
+    settleListLayout(list, 500, 400);
+    userScrollTo(list, 99);
 
     const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
     scrollMock.mockClear();
@@ -5978,6 +6164,665 @@ describe("ChatMessageArea — WS message scroll behavior", () => {
 
     // scrollIntoView SHOULD be called — user is near the bottom.
     await waitFor(() => expect(scrollMock).toHaveBeenCalledTimes(1));
+  });
+});
+
+// ── #492: scroll navigation & read-state separation ──────────────────────────
+//
+// bottomSentinelCallback() locates the IntersectionObserver instance observing
+// the bottom sentinel (data-testid="chat-bottom-sentinel") specifically, so
+// these tests never depend on construction order relative to the top
+// (loadMore) sentinel, which infinite-scroll's own MockIO already owns.
+
+describe("ChatMessageArea — #492 scroll navigation & read-state", () => {
+  interface IOInstance {
+    element: Element;
+    callback: IntersectionObserverCallback;
+  }
+  let ioInstances: IOInstance[] = [];
+  let capturedOnMessageCreatedForBadge: ((evt: WSMessageCreatedEvent) => void) | null = null;
+
+  beforeEach(() => {
+    ioInstances = [];
+    capturedOnMessageCreatedForBadge = null;
+    class MultiMockIO {
+      #callback: IntersectionObserverCallback;
+      constructor(cb: IntersectionObserverCallback) {
+        this.#callback = cb;
+      }
+      observe = vi.fn((el: Element) => {
+        ioInstances.push({ element: el, callback: this.#callback });
+      });
+      disconnect = vi.fn();
+      unobserve = vi.fn();
+    }
+    vi.stubGlobal("IntersectionObserver", MultiMockIO);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function bottomSentinelCallback(): IntersectionObserverCallback {
+    const sentinel = screen.getByTestId("chat-bottom-sentinel");
+    const instance = ioInstances.find((i) => i.element === sentinel);
+    if (!instance) throw new Error("bottom sentinel IntersectionObserver not registered yet");
+    return instance.callback;
+  }
+
+  function fireBottomSentinel(isIntersecting: boolean) {
+    act(() => {
+      bottomSentinelCallback()([{ isIntersecting } as IntersectionObserverEntry], {
+        disconnect: vi.fn(),
+      } as unknown as IntersectionObserver);
+    });
+  }
+
+  function scrollAwayFromBottom(list: HTMLElement) {
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 0);
+  }
+
+  function scrollBackToBottom(list: HTMLElement) {
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 900);
+  }
+
+  function renderWithContext(
+    channelId: string,
+    ctx: Partial<ChatOutletContext> & { currentUserId: string },
+  ) {
+    return render(
+      <MemoryRouter initialEntries={[`/chat/channel/${channelId}`]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ channels: [], dms: [], ...ctx }} />}
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("opens directly at the bottom, without smooth scroll, when there is no unread", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+    );
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+    });
+
+    await waitFor(() => expect(screen.getByText("Última mensagem")).toBeInTheDocument());
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("opens directly at the first unread message with a 'Novas mensagens' separator when unreadCount > 0", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m3", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+    });
+
+    await waitFor(() => expect(screen.getByText("Não lida 1")).toBeInTheDocument());
+
+    const separator = screen.getByRole("separator", { name: "Novas mensagens" });
+    expect(separator).toBeInTheDocument();
+    // The separator sits immediately before the first unread message ("Não
+    // lida 1", the earliest of the last 2 eligible messages) — not before the
+    // already-read one.
+    const listContent = screen.getByRole("log").querySelector(".chat-msg-area__list-content")!;
+    const listItems = Array.from(listContent.children);
+    const separatorIndex = listItems.indexOf(separator);
+    const firstUnreadIndex = listItems.findIndex((el) => el.textContent?.includes("Não lida 1"));
+    expect(separatorIndex).toBeGreaterThan(-1);
+    expect(separatorIndex).toBeLessThan(firstUnreadIndex);
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("does not call mark-read just from opening a conversation with unread", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderId: "other-1", bodyText: "Não lida 1" }),
+        makeMessage({ id: "m2", senderId: "other-1", bodyText: "Não lida 2" }),
+      ]),
+    );
+    const markRead = vi.fn();
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 2 }],
+      markRead,
+    });
+
+    await screen.findByText("Não lida 1");
+    expect(markRead).not.toHaveBeenCalled();
+  });
+
+  it("calls markRead once the bottom sentinel confirms the real tail was reached", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", senderId: "other-1", bodyText: "Última" })]),
+    );
+    const markRead = vi.fn();
+
+    renderWithContext("geral", {
+      currentUserId: "me-123",
+      channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 1 }],
+      markRead,
+    });
+
+    await screen.findByText("Última");
+    expect(markRead).not.toHaveBeenCalled();
+
+    fireBottomSentinel(true);
+
+    expect(markRead).toHaveBeenCalledWith({ kind: "channel", targetId: "geral" });
+  });
+
+  it("shows the go-to-bottom button once the user scrolls away from the bottom threshold", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    await screen.findByText("Msg");
+
+    expect(
+      screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+    ).not.toBeInTheDocument();
+
+    scrollAwayFromBottom(screen.getByRole("log"));
+
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the go-to-bottom button once the user manually scrolls back within the threshold", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    scrollBackToBottom(list);
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the go-to-bottom button visible after restoring a history position left on a previous visit", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", bodyText: "Antiga" }),
+        makeMessage({ id: "m2", bodyText: "Mais antiga ainda" }),
+      ]),
+    );
+
+    const { unmount } = renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Antiga");
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    unmount();
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    await screen.findByText("Antiga");
+
+    // Returning to a conversation left mid-history must not silently default
+    // to the bottom — the button stays visible because the restored phase is
+    // not AT_BOTTOM.
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not end SCROLLING_TO_BOTTOM (hide the button) until the bottom sentinel actually confirms arrival", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+    await userEvent.click(button);
+
+    // A layout shift (e.g. an image finishing its load) can bounce the
+    // sentinel through a non-intersecting state before the real arrival —
+    // the button must survive that instead of disappearing early.
+    fireBottomSentinel(false);
+    expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+
+    fireBottomSentinel(true);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("uses instant positioning, never smooth, when prefers-reduced-motion is set", async () => {
+    const matchMediaMock = vi.fn().mockReturnValue({
+      matches: true,
+      media: "(prefers-reduced-motion: reduce)",
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    });
+    vi.stubGlobal("matchMedia", matchMediaMock);
+
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+    );
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+
+    scrollAwayFromBottom(list);
+    const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    const scrollMock = window.Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>;
+    scrollMock.mockClear();
+    await userEvent.click(button);
+
+    expect(scrollMock).toHaveBeenCalledWith({ behavior: "auto" });
+    expect(scrollMock).not.toHaveBeenCalledWith(expect.objectContaining({ behavior: "smooth" }));
+  });
+
+  it("names the button with the pending count once new messages arrive while reading history", async () => {
+    const initialMsg = makeMessage({ id: "m1", bodyText: "Msg" });
+    const wsMsg = makeMessage({ id: "m2", senderId: "other-1", bodyText: "Nova enquanto lia" });
+    mockFetchChannelMessages.mockResolvedValue(messagePage([initialMsg]));
+    vi.mocked(chatApi.fetchChannelMessage).mockResolvedValue(wsMsg);
+    vi.mocked(useChatWebSocket).mockImplementation(
+      ({ onMessageCreated }: { onMessageCreated: (evt: WSMessageCreatedEvent) => void }) => {
+        capturedOnMessageCreatedForBadge = onMessageCreated;
+        return {
+          toggleReaction: wsMockState.toggleReaction,
+          sendTyping: wsMockState.sendTyping,
+          connectionStatus: "connected",
+        };
+      },
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+    const list = await screen.findByRole("log");
+    await screen.findByText("Msg");
+    scrollAwayFromBottom(list);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    await act(async () => {
+      capturedOnMessageCreatedForBadge?.({
+        type: "message.created",
+        event_id: "evt-1",
+        created_at: new Date().toISOString(),
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "geral",
+        message_id: "m2",
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText("Nova enquanto lia")).toBeInTheDocument());
+    expect(
+      await screen.findByRole("button", { name: "Ir para o final da conversa, 1 novas mensagens" }),
+    ).toBeInTheDocument();
+  });
+
+  it("falls back safely when the saved anchor message no longer exists", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Única mensagem" })]),
+    );
+
+    // Simulate a stale sessionStorage anchor pointing at a message that is no
+    // longer part of the loaded window (deleted, or from before retention).
+    sessionStorage.setItem(
+      "nchat.chat.viewport.v1:me-123:channel:geral",
+      JSON.stringify({
+        atBottom: false,
+        anchorMessageId: "long-gone",
+        anchorOffsetPx: 40,
+        savedAt: Date.now(),
+      }),
+    );
+
+    renderWithContext("geral", { currentUserId: "me-123" });
+
+    // Must not hang or crash — falls back to a defined state (bottom, since
+    // there is no unread either) instead of an infinite search.
+    await screen.findByText("Única mensagem");
+    expect(screen.getByTestId("chat-message-area")).toBeInTheDocument();
+  });
+
+  it("ignores a stale resolution from a conversation left mid-search after a rapid switch", async () => {
+    mockFetchChannelMessages.mockImplementation((channelId: string) => {
+      if (channelId === "slow") {
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve(messagePage([makeMessage({ id: "slow-1", bodyText: "Lenta" })])),
+            50,
+          ),
+        );
+      }
+      return Promise.resolve(messagePage([makeMessage({ id: "fast-1", bodyText: "Rápida" })]));
+    });
+
+    function SwitchButton() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate("/chat/channel/fast")}>
+          trocar
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/slow"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={<ParentWithContext ctx={{ currentUserId: "me-123", channels: [], dms: [] }} />}
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <div>
+                  <SwitchButton />
+                  <ChatMessageArea kind="channel" />
+                </div>
+              }
+            />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    // Switch away before the slow fetch resolves — must not crash when it
+    // eventually does, and must never render the stale conversation's data.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await userEvent.click(screen.getByRole("button", { name: "trocar" }));
+    await screen.findByText("Rápida");
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+
+    expect(screen.queryByText("Lenta")).not.toBeInTheDocument();
+  });
+
+  // #788: an async reflow (an attachment/document/media preview finishing its
+  // layout well after the initial positioning) must not strand the viewport
+  // away from the real bottom, nor invent a false reading-history position —
+  // but it also must never override a genuine reading-history position. The
+  // regression is reproduced generically via the content wrapper's own
+  // ResizeObserver (flushResizeObservers, from setupTests) — never coupled to
+  // any specific attachment component.
+  describe("tail-lock across async reflow (#788)", () => {
+    const anchorKey = "nchat.chat.viewport.v1:me-123:channel:geral";
+
+    it("re-pins to the real bottom when content grows asynchronously after opening at the bottom", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+      );
+      renderWithContext("geral", {
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Última mensagem");
+
+      // Content grew (scrollHeight increased) but scrollTop is stale — the
+      // geometry an attachment finishing its layout leaves behind.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 400 });
+
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(600);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("does not pull the viewport back when the user scrolled up but stayed inside the near-bottom threshold", async () => {
+      // The phase alone cannot gate the tail-lock: #492's scroll handler
+      // assigns AT_BOTTOM anywhere within BOTTOM_THRESHOLD_PX (150) of the
+      // end, so a deliberate small scroll up leaves the phase AT_BOTTOM while
+      // the viewport is no longer at the real tail. A reflow must respect
+      // that intent instead of yanking the reader down.
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Real tail is scrollTop 600; the user scrolls up 100px — still within
+      // the 150px near-bottom threshold, so the phase stays AT_BOTTOM.
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 500);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+
+      // Historical content grows underneath them.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(500);
+    });
+
+    it("keeps following the tail when a scroll event carries a scrollHeight an async reflow already moved", async () => {
+      // #788 root cause, in miniature. The tail-lock corrects a reflow with a
+      // direct scrollTop write; the scroll event that write produces is
+      // delivered a frame later, and a second reflow can land in between. The
+      // handler then sees a distance-from-the-tail that belongs to the new
+      // layout, not to anything the reader did. Treating it as intent is what
+      // disarmed the tail-lock permanently — after that, every later reflow
+      // went uncorrected (measured in DEV: 2051px from the tail).
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Settled, and genuinely at the real tail.
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 600);
+
+      // The timeline grew before this scroll event was delivered.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      fireEvent.scroll(list);
+
+      // A layout shift alone never becomes READING_HISTORY...
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+      // ...and the tail-lock is still armed for the reflow that follows.
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1200);
+    });
+
+    it("stops following the tail on the reader's first real scroll once the layout has stabilised", async () => {
+      // #788: the scrollHeight gate must not be a one-way street. It exists to
+      // stop a reflow from being mistaken for intent — but the moment the
+      // layout settles, an ordinary scroll has to count again, or the reader
+      // would be pinned to the tail forever after any attachment loads.
+      //
+      // The whole sequence in one test, because it is the composition that
+      // matters: ignoring the contaminated event (covered above) and honouring
+      // a later real one (covered elsewhere) are each true in isolation while
+      // the gate could still be stuck between them.
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      // Following the tail, settled at the real bottom.
+      settleListLayout(list, 1000, 400);
+      userScrollTo(list, 600);
+
+      // A reflow, and a scroll event delivered against the grown scrollHeight:
+      // ignored as intent, so the tail-lock re-pins to the new tail.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      fireEvent.scroll(list);
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1200);
+
+      // The pin's own scroll event, now with a stable scrollHeight: still the
+      // real tail, so the intent is simply re-affirmed.
+      fireEvent.scroll(list);
+
+      // The layout has stabilised and the reader scrolls up ~100px — an
+      // ordinary event, stable scrollHeight. It stays inside the 150px
+      // courtesy threshold, so the phase remains AT_BOTTOM and no button
+      // appears: the phase alone could never express what just happened.
+      userScrollTo(list, 1100);
+      expect(
+        screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+      ).not.toBeInTheDocument();
+
+      // Another reflow must respect that: no pull back to the tail.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 2200 });
+      act(() => flushResizeObservers());
+      expect(list.scrollTop).toBe(1100);
+    });
+
+    it("does not pull the viewport back to the bottom when the user is reading history and content resizes", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      scrollAwayFromBottom(list);
+      await screen.findByRole("button", { name: "Ir para o final da conversa" });
+      const scrollTopBefore = list.scrollTop;
+
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1400 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(scrollTopBefore);
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    });
+
+    it("does not pull a restored reading-history position back to the bottom when content resizes", async () => {
+      sessionStorage.setItem(
+        anchorKey,
+        JSON.stringify({
+          atBottom: false,
+          anchorMessageId: "m1",
+          anchorOffsetPx: 0,
+          savedAt: Date.now(),
+        }),
+      );
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([
+          makeMessage({ id: "m1", bodyText: "Antiga" }),
+          makeMessage({ id: "m2", bodyText: "Mais recente" }),
+        ]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Antiga");
+
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1000 });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: 400 });
+      Object.defineProperty(list, "scrollTop", { configurable: true, writable: true, value: 0 });
+
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(0);
+      expect(
+        await screen.findByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+    });
+
+    it("re-pins to the real bottom during an in-flight 'Ir para o final' animation if content grows mid-flight", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Msg" })]),
+      );
+      renderWithContext("geral", { currentUserId: "me-123" });
+      const list = await screen.findByRole("log");
+      await screen.findByText("Msg");
+
+      scrollAwayFromBottom(list); // scrollHeight=1000, clientHeight=400, scrollTop=0
+      const button = await screen.findByRole("button", { name: "Ir para o final da conversa" });
+      await userEvent.click(button); // phase -> SCROLLING_TO_BOTTOM
+
+      // Content grows mid-animation — a direct scrollTop write, not a second
+      // scrollIntoView, so it can't race the click's own in-flight animation.
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: 1600 });
+      act(() => flushResizeObservers());
+
+      expect(list.scrollTop).toBe(1200);
+      // Still visible until the bottom sentinel actually confirms arrival —
+      // unchanged #492 semantics (scrollTop alone is never "arrival").
+      expect(
+        screen.getByRole("button", { name: "Ir para o final da conversa" }),
+      ).toBeInTheDocument();
+
+      fireBottomSentinel(true);
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "Ir para o final da conversa" }),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    it("never persists a false reading-history anchor after a reflow while at the bottom", async () => {
+      sessionStorage.removeItem(anchorKey);
+      mockFetchChannelMessages.mockResolvedValue(
+        messagePage([makeMessage({ id: "m1", bodyText: "Última mensagem" })]),
+      );
+      const { unmount } = renderWithContext("geral", {
+        currentUserId: "me-123",
+        channels: [{ id: "geral", name: "Geral", type: "public", canWrite: true, unreadCount: 0 }],
+      });
+      await screen.findByText("Última mensagem");
+
+      act(() => flushResizeObservers());
+      unmount();
+
+      const raw = sessionStorage.getItem(anchorKey);
+      expect(raw).not.toBeNull();
+      expect(JSON.parse(raw!)).toMatchObject({ atBottom: true, anchorMessageId: null });
+    });
   });
 });
 

@@ -23,24 +23,34 @@
  * Images and GIFs (issue #491) are the one exception to "a row per
  * attachment": AttachmentImagePreview draws a large preview above the same
  * name/size/status/Baixar footer every other type shows in its row, and a
- * click on it opens AttachmentLightbox. This component owns the one lightbox
- * that can be open at a time and the focus-return-on-close that goes with it,
- * the same way ConversationDetailsPanel owns focus return for AddMembersDialog
- * — the dialog itself only ever calls onClose.
+ * click on it asks AttachmentViewerHost to open AttachmentLightbox. The viewer
+ * is hosted above the timeline rather than here (issue #675) so it survives the
+ * virtualization unmounting this message underneath it; this component only
+ * ever asks, and the host owns the one viewer that can be open at a time and
+ * the focus return that goes with it.
+ *
+ * Each attachment is also its own lazy-hydration unit (issue #675): far from
+ * the viewport it is a shell with no request behind it, and the gate it
+ * provides is what every renderer below reads before fetching anything.
  */
 
-import { useState } from "react";
+import { useState, type Ref } from "react";
 
 import AttachmentAudio from "./AttachmentAudio";
 import AttachmentDocumentPreview from "./AttachmentDocumentPreview";
 import AttachmentImagePreview, { type AttachmentImageOpenPayload } from "./AttachmentImagePreview";
-import AttachmentLightbox from "./AttachmentLightbox";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
-import DocumentPreviewViewer from "./DocumentPreviewViewer";
+import AttachmentViewerHost from "./AttachmentViewerHost";
+import { useAttachmentViewer } from "./attachmentViewer";
+import { AttachmentHydrationContext, useLazyAttachment } from "./lazyAttachment";
 import { isImageAttachment } from "./attachmentImageRules";
 import { isVoiceMessage } from "./attachmentAudioRules";
-import { fetchAttachmentContent } from "./filesApi";
+import {
+  attachmentDownloadFilename,
+  saveAttachmentToDisk,
+  voiceMessageFilename,
+} from "./attachmentDownload";
 import { formatFileSize } from "./conversationDetailsDisplay";
 import { isPreviewAvailable, type ChannelAttachment } from "./chatTypes";
 
@@ -103,15 +113,7 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
     if (state === "loading") return;
     setState("loading");
     try {
-      const blob = await fetchAttachmentContent(attachment.id);
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      // The filename is an attribute value React never renders as markup and
-      // the browser never resolves as a path.
-      anchor.download = attachment.filename || "arquivo";
-      anchor.click();
-      URL.revokeObjectURL(url);
+      await saveAttachmentToDisk(attachment.id, attachmentDownloadFilename(attachment));
       setState("idle");
     } catch {
       // No server text is surfaced: it may carry detail that does not belong
@@ -146,8 +148,15 @@ function AttachmentDownloadButton({ attachment }: { attachment: ChannelAttachmen
 
 interface MessageAttachmentProps {
   attachment: ChannelAttachment;
+  /** The owning message's ISO timestamp — see VoiceMessageAttachment. */
+  sentAt: string;
   onOpenImage: (attachment: ChannelAttachment, payload: AttachmentImageOpenPayload) => void;
   onOpenDocument: (attachment: ChannelAttachment, trigger: HTMLButtonElement) => void;
+}
+
+interface AttachmentBodyProps extends MessageAttachmentProps {
+  /** The lazy-hydration observer's target — see MessageAttachment below. */
+  rowRef: Ref<HTMLLIElement>;
 }
 
 /**
@@ -158,10 +167,40 @@ interface MessageAttachmentProps {
  * and a note for one still being scanned, so the status line below only adds
  * the words those two silent states are missing; a clean, playable one needs
  * no second confirmation once the player itself is on screen.
+ *
+ * The one action it offers is the download (issue #740), drawn inside the
+ * player between the time and the speed. It goes through the same
+ * authenticated content route every other attachment's Baixar uses — a voice
+ * message is an ordinary attachment as far as file-service is concerned, so
+ * the conversation check and the malware-scan gate that decide it are the
+ * existing ones, unchanged and re-evaluated on the request the click makes.
  */
-function VoiceMessageAttachment({ attachment }: { attachment: ChannelAttachment }) {
+function VoiceMessageAttachment({
+  attachment,
+  sentAt,
+  rowRef,
+}: {
+  attachment: ChannelAttachment;
+  rowRef: Ref<HTMLLIElement>;
+  /**
+   * When the message was sent. It is what dates the saved file: an attachment
+   * of a message has no createdAt of its own — chat-service dates it by the
+   * message — so the name would otherwise be the same for every recording.
+   */
+  sentAt: string;
+}) {
+  // Built from ids and metadata the message already carries, so constructing
+  // it costs no request: a timeline of recordings still fetches nothing until
+  // someone presses a button.
+  const download = {
+    label: "Baixar mensagem de voz",
+    title: "Baixar áudio",
+    start: () => saveAttachmentToDisk(attachment.id, voiceMessageFilename(sentAt)),
+  };
+
   return (
     <li
+      ref={rowRef}
       className="chat-msg-area__attachment chat-msg-area__attachment--voice"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
@@ -169,7 +208,7 @@ function VoiceMessageAttachment({ attachment }: { attachment: ChannelAttachment 
         <span className="material-symbols-outlined">mic</span>
       </span>
       <div className="chat-msg-area__voice-body">
-        <AttachmentAudio attachment={attachment} />
+        <AttachmentAudio attachment={attachment} download={download} />
         {attachment.status !== "clean" && (
           <span
             className={`chat-msg-area__attachment-status chat-msg-area__attachment-status--${attachment.status}`}
@@ -184,9 +223,33 @@ function VoiceMessageAttachment({ attachment }: { attachment: ChannelAttachment 
   );
 }
 
-function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageAttachmentProps) {
+/**
+ * One attachment, and the lazy-hydration gate that decides when it may fetch
+ * anything (issue #675).
+ *
+ * The gate is provided here rather than passed down: every renderer below —
+ * image preview, document card, thumbnail, video poster — reads it from context
+ * through its own hook, so a new attachment type inherits the policy without
+ * threading a prop through it.
+ */
+function MessageAttachment(props: MessageAttachmentProps) {
+  const { ref, gate } = useLazyAttachment();
+  return (
+    <AttachmentHydrationContext.Provider value={gate}>
+      <AttachmentBody {...props} rowRef={ref} />
+    </AttachmentHydrationContext.Provider>
+  );
+}
+
+function AttachmentBody({
+  attachment,
+  sentAt,
+  onOpenImage,
+  onOpenDocument,
+  rowRef,
+}: AttachmentBodyProps) {
   if (isVoiceMessage(attachment)) {
-    return <VoiceMessageAttachment attachment={attachment} />;
+    return <VoiceMessageAttachment attachment={attachment} sentAt={sentAt} rowRef={rowRef} />;
   }
   const icon = (
     <span className="chat-msg-area__attachment-icon" aria-hidden="true">
@@ -221,6 +284,7 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
   if (isImageAttachment(attachment)) {
     return (
       <li
+        ref={rowRef}
         className="chat-msg-area__attachment"
         data-testid={`chat-message-attachment-${attachment.id}`}
       >
@@ -246,6 +310,7 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
   if (isDocumentAttachment(attachment)) {
     return (
       <li
+        ref={rowRef}
         className="chat-msg-area__attachment"
         data-testid={`chat-message-attachment-${attachment.id}`}
       >
@@ -283,6 +348,7 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
 
   return (
     <li
+      ref={rowRef}
       className="chat-msg-area__attachment"
       data-testid={`chat-message-attachment-${attachment.id}`}
     >
@@ -301,34 +367,32 @@ function MessageAttachment({ attachment, onOpenImage, onOpenDocument }: MessageA
   );
 }
 
-interface OpenLightbox {
-  attachment: ChannelAttachment;
-  trigger: HTMLButtonElement;
-  url: string;
-  isOriginal: boolean;
+export default function MessageAttachments(props: {
+  attachments: ChannelAttachment[] | undefined;
+  /** The owning message's ISO timestamp. See VoiceMessageAttachment. */
+  sentAt: string;
+}) {
+  // The host steps aside when the timeline already provides one above the list,
+  // which is what keeps an open viewer alive after virtualization unmounts this
+  // message (issue #675). Rendered on its own, this is still self-sufficient.
+  return (
+    <AttachmentViewerHost>
+      <MessageAttachmentList {...props} />
+    </AttachmentViewerHost>
+  );
 }
 
-export default function MessageAttachments({
+function MessageAttachmentList({
   attachments,
+  sentAt,
 }: {
   attachments: ChannelAttachment[] | undefined;
+  sentAt: string;
 }) {
-  const [lightbox, setLightbox] = useState<OpenLightbox | null>(null);
-  const [documentViewer, setDocumentViewer] = useState<{
-    attachment: ChannelAttachment;
-    trigger: HTMLButtonElement;
-  } | null>(null);
+  const viewer = useAttachmentViewer();
   const [expandedRuns, setExpandedRuns] = useState<Set<number>>(() => new Set());
 
   if (!attachments || attachments.length === 0) return null;
-
-  function closeLightbox() {
-    // The control that opened it gets focus back on close — this component
-    // owns that button, the same way ConversationDetailsPanel owns it for
-    // AddMembersDialog, so AttachmentLightbox itself never needs to know it.
-    lightbox?.trigger.focus();
-    setLightbox(null);
-  }
 
   const segments: Array<
     | { kind: "images"; attachments: ChannelAttachment[] }
@@ -345,12 +409,9 @@ export default function MessageAttachments({
   }
 
   const openImage = (openedAttachment: ChannelAttachment, payload: AttachmentImageOpenPayload) =>
-    setLightbox({
-      attachment: openedAttachment,
-      trigger: payload.trigger,
-      url: payload.url,
-      isOriginal: payload.isOriginal,
-    });
+    viewer.openImage(openedAttachment, payload);
+  const openDocument = (openedAttachment: ChannelAttachment, trigger: HTMLButtonElement) =>
+    viewer.openDocument(openedAttachment, trigger);
 
   return (
     <>
@@ -361,8 +422,9 @@ export default function MessageAttachments({
               <MessageAttachment
                 key={segment.attachment.id}
                 attachment={segment.attachment}
+                sentAt={sentAt}
                 onOpenImage={openImage}
-                onOpenDocument={(attachment, trigger) => setDocumentViewer({ attachment, trigger })}
+                onOpenDocument={openDocument}
               />
             );
           }
@@ -381,10 +443,9 @@ export default function MessageAttachments({
                   <MessageAttachment
                     key={attachment.id}
                     attachment={attachment}
+                    sentAt={sentAt}
                     onOpenImage={openImage}
-                    onOpenDocument={(attachment, trigger) =>
-                      setDocumentViewer({ attachment, trigger })
-                    }
+                    onOpenDocument={openDocument}
                   />
                 ))}
               </ul>
@@ -408,23 +469,6 @@ export default function MessageAttachments({
           );
         })}
       </ul>
-      {lightbox && (
-        <AttachmentLightbox
-          attachment={lightbox.attachment}
-          inlineUrl={lightbox.url}
-          inlineIsOriginal={lightbox.isOriginal}
-          onClose={closeLightbox}
-        />
-      )}
-      {documentViewer && (
-        <DocumentPreviewViewer
-          attachment={documentViewer.attachment}
-          onClose={() => {
-            documentViewer.trigger.focus();
-            setDocumentViewer(null);
-          }}
-        />
-      )}
     </>
   );
 }

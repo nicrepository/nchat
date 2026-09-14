@@ -19,7 +19,7 @@
  * the card; the animation must not autoplay just because the view got bigger.
  */
 
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import "./AttachmentLightbox.css";
@@ -31,22 +31,35 @@ import type { ChannelAttachment } from "./chatTypes";
 
 interface AttachmentLightboxProps {
   attachment: ChannelAttachment;
-  /** The URL the card was already showing — reused so opening never blanks. */
-  inlineUrl: string;
-  /** True when `inlineUrl` is already the original (animated GIF, or WebP). */
+  /**
+   * The bytes the card was already showing — reused so opening never blanks.
+   *
+   * The blob, not the card's object URL (issue #675): the timeline virtualizes,
+   * so the card that opened this can be unmounted while the viewer is still
+   * open, and its URL is revoked on the way out. This component mints its own
+   * address from the same bytes and revokes it when it closes, which is what
+   * makes the viewer independent of the item's lifecycle.
+   */
+  inlineBlob: Blob;
+  /** True when `inlineBlob` is already the original (animated GIF, or WebP). */
   inlineIsOriginal: boolean;
   onClose: () => void;
 }
 
 export default function AttachmentLightbox({
   attachment,
-  inlineUrl,
+  inlineBlob,
   inlineIsOriginal,
   onClose,
 }: AttachmentLightboxProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const [userPlayedGif, setUserPlayedGif] = useState(false);
+
+  // This viewer's own address for the handed-over bytes, revoked when it closes
+  // or when different bytes replace them.
+  const inlineUrl = useMemo(() => URL.createObjectURL(inlineBlob), [inlineBlob]);
+  useEffect(() => () => URL.revokeObjectURL(inlineUrl), [inlineUrl]);
 
   // Focus opens on Fechar: there is no primary input here, and it is the one
   // control guaranteed to exist regardless of GIF/reduced-motion state.

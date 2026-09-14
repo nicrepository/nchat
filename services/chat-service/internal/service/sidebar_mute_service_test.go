@@ -44,6 +44,14 @@ func (f *fakeNotificationPrefStore) Unmute(_ context.Context, userID, targetType
 	return f.unmutErr
 }
 
+// FilterMutedUsers is the realtime fan-out's read (issue #744) and no sidebar
+// path calls it; the fake satisfies the interface without pretending to model it.
+func (f *fakeNotificationPrefStore) FilterMutedUsers(
+	_ context.Context, _, _, _ string, _ []string,
+) ([]string, error) {
+	return nil, nil
+}
+
 func (f *fakeNotificationPrefStore) ListMuted(_ context.Context, _, _ string) ([]storage.MutedConversation, error) {
 	return f.listed, f.listErr
 }

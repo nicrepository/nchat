@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 )
@@ -83,6 +84,27 @@ type CreateMessageInput struct {
 	ReferencedMessageID    string
 	MentionedUserIDs       []string
 	MentionedChannelIDs    []string
+	// MentionAllGroupMembers is issue #776's @all in a group DM. It is never
+	// set for a channel — channel @all is unchanged, still purely textual —
+	// and the service sets it only after re-deriving that the DM target really
+	// is an active group and the body really carries an "all" token.
+	//
+	// It is deliberately not a recipient list: trusting an id list the service
+	// computed ahead of the write is exactly the TOCTOU a membership change
+	// between fetch and send would exploit. Instead this is a flag CreateMessage
+	// resolves itself, in the same statement as the insert, by reading
+	// chat.dm_members directly under that statement's own read-committed
+	// snapshot — so a member removed (or added) by a change that *committed*
+	// before this statement began is correctly reflected either way. That is
+	// not the same claim as serializing against a change strictly concurrent
+	// with this statement's own execution: this CTE takes no row lock on
+	// dm_members/workspace_members, so a removal committing mid-statement is
+	// ordinary read-committed visibility, not a guarantee this design makes or
+	// needs — #776's requirement is "the source of truth at the authoritative
+	// moment wins" against a membership change that already happened, which a
+	// pre-computed list would miss entirely; it is not a request for
+	// serializable isolation against a write racing the send itself.
+	MentionAllGroupMembers bool
 	// AttachmentIDs are candidate files.attachments ids, already parsed as
 	// canonical UUIDs, deduplicated and bounded by the service. They are
 	// candidates only: CreateMessage re-validates every one of them against the
@@ -101,6 +123,20 @@ type CreateMessageInput struct {
 	// path already excludes, so it is withheld from everyone until the worker
 	// promotes it. The service decides this; a client cannot ask for a status.
 	Status domain.MessageStatus
+	// Priority is the author's stated message priority (issue #821), already
+	// normalized and validated by the service. Empty means standard — see
+	// normalizeCreateMessageInput — so an internal caller that never saw a
+	// request still writes a value the CHECK constraint accepts.
+	Priority domain.MessagePriority
+	// AcknowledgementRequired asks every eligible recipient of this message to
+	// confirm receipt explicitly (issue #824).
+	//
+	// The flag is the whole of the caller's say in the matter. Who the
+	// recipients are is derived by the statement below, from membership, in the
+	// same commit as the message — a caller cannot name them, add one or leave
+	// one out.
+	AcknowledgementRequired bool
+
 	// LinkSafetyState is derived by the service from the same verdict snapshot as
 	// Status. Empty is correct for linkless and withheld messages; a cached-safe
 	// active message must carry safe immediately.
@@ -476,10 +512,46 @@ type MessageStore interface {
 	// or "channel:<uuid>", scoped to workspaceID.
 	ResolveMentionLabels(ctx context.Context, workspaceID string, userIDs, channelIDs []string) (map[string]string, error)
 
-	// ResolveAuthorizedMentionLabels returns labels only for references that are
-	// valid in sourceChannelID for requesterID. CreateMessage repeats this check
-	// atomically as the final authorization backstop.
-	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
+	// ResolveAuthorizedMentionLabels returns labels only for references valid in
+	// the source channel or group conversation for requesterID. CreateMessage
+	// repeats this check atomically as the final authorization backstop.
+	ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, sourceDMConversationID, requesterID string, userIDs, channelIDs []string) (map[string]string, error)
+
+	// CountEligibleAllMentionRecipientsUpTo reports how many members a group
+	// DM's @all currently resolves to (issue #776, SR-002) — active dm_members,
+	// with active workspace membership, on an active and non-deleted account,
+	// exactly the predicate CreateMessage's own eligible_all_mention_recipients
+	// CTE applies.
+	//
+	// senderID is excluded from the count, because notification_recipients
+	// excludes it from the notifications (issue #741): the bound counts the
+	// people an @all actually reaches, not the roster it was written in.
+	//
+	// The count saturates at limit and stops reading membership there, so
+	// deciding a bound never costs more than limit rows however large the group
+	// is (SEC-776-01). It exists so a caller can refuse an over-bound @all with
+	// a specific error before ever attempting the write; it is advisory, and
+	// CreateMessage re-decides the same rule inside its own statement. That
+	// re-decision is what catches a membership change committed between this
+	// call and the write; a change committing strictly concurrently with the
+	// write itself is ordinary read-committed visibility, not something either
+	// side serializes against.
+	CountEligibleAllMentionRecipientsUpTo(ctx context.Context, workspaceID, dmConversationID, senderID string, limit int) (int, error)
+
+	// CountAcknowledgementRecipientsUpTo reports how many people a message that
+	// asks for confirmation would be asking (issue #824) — the channel's members
+	// or the conversation's, with active workspace membership and a live
+	// account, never the sender — saturating at limit.
+	//
+	// Its purpose is a specific refusal before the write: a send whose
+	// acknowledgement would exceed domain.MaxAcknowledgementRecipients is told
+	// so, rather than being written and then discovered to have created a
+	// fan-out nobody bounded. It is advisory. A membership change committing
+	// between this call and the write is ordinary read-committed visibility, and
+	// the consequence of losing that race is a handful of rows past a product
+	// bound — not a duplicate, not a missing recipient, and nothing the primary
+	// key does not already hold.
+	CountAcknowledgementRecipientsUpTo(ctx context.Context, workspaceID, channelID, dmConversationID, senderID string, limit int) (int, error)
 
 	// ListChannelMessages returns a paginated set of messages for a channel.
 	// Visibility is enforced in SQL: active workspace, active workspace membership,
@@ -555,7 +627,9 @@ func messageColumns(alias string) string {
 	` + p + `created_at, ` + p + `updated_at,
 	` + p + `link_safety_state,
 	COALESCE(` + p + `event_type, ''),
-	COALESCE(` + p + `event_payload, '{}'::jsonb)`
+	COALESCE(` + p + `event_payload, '{}'::jsonb),
+	` + p + `priority,
+	` + p + `acknowledgement_required`
 }
 
 // listMessageColumns returns messageColumns plus sender display info from
@@ -624,6 +698,8 @@ func scanMessageWithSenderAndQuoteExtra(row pgx.Row, extra ...any) (domain.Messa
 		&msg.CreatedAt, &msg.UpdatedAt,
 		(*string)(&msg.LinkSafety),
 		&msg.EventType, &eventPayload,
+		(*string)(&msg.Priority),
+		&msg.AcknowledgementRequired,
 		&msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL,
 		&msg.IsFavorited,
 		&quote.ID, &quote.AuthorID, &quote.BodyText, (*string)(&quote.BodyFormat), (*string)(&quote.Status),
@@ -666,45 +742,110 @@ func nullableUUID(s string) *string {
 	return &s
 }
 
-func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error) {
-	kind := input.Kind
-	if kind == "" {
-		kind = domain.MessageKindUser
-	}
-	bodyFormat := input.BodyFormat
-	if bodyFormat == "" {
-		bodyFormat = domain.MessageBodyFormatV1
-	}
-	maxAttachmentBytes := input.MaxAttachmentBytes
-	if maxAttachmentBytes <= 0 {
-		maxAttachmentBytes = domain.DefaultMaxMessageAttachmentBytes
-	}
-	// Authorization and reference integrity are enforced atomically in one INSERT.
-	//
-	// The auth subquery (UNION ALL of channel branch + DM branch) yields exactly one
-	// row only when the sender is authorized at insert time:
-	//   channel branch ($2 IS NOT NULL):
-	//     - workspace active, sender is active workspace_member
-	//     - channel belongs to workspace, channel is active
-	//     - public channel: active workspace member is sufficient
-	//     - private channel: sender must also be an active channel_member
-	//   DM branch ($3 IS NOT NULL):
-	//     - workspace active, sender is active workspace_member
-	//     - DM conversation belongs to workspace, DM conversation is active
-	//     - sender must be an active dm_member
-	//
-	// Stale channel_members / dm_members cannot bypass an inactive/suspended/left
-	// workspace_member because the workspace_members JOIN filters wm.status = 'active'
-	// independently.
-	//
-	// The invalid_refs CTE keeps parent/forwarded references in the same target and
-	// permits RF-09 referenced messages in another target only when the sender can
-	// currently read the active origin. Any failure maps to the same zero-row result.
-	//
-	// The INSERT is wrapped in a CTE so the outer SELECT can JOIN auth.users and
-	// return sender display info (sender_display_name, sender_email) in the same
-	// round-trip. This avoids a separate GET after insert for the broadcast payload.
-	row := s.pool.QueryRow(ctx, `
+// createMessageQuery is the whole of creating a message: authorization,
+// reference integrity, attachment binding, link-scan association and the
+// notifications it produces, in one statement that either commits all of it or
+// none of it.
+//
+// It is a package-level value rather than a literal inside CreateMessage for
+// the same reason resolvePendingMessagesQuery is: a four-hundred-line string in
+// the middle of a function hides the handful of Go decisions the function
+// actually makes. Assembled once at init from the shared fragments below.
+//
+// Authorization and reference integrity are enforced atomically in one INSERT.
+//
+// The auth subquery (UNION ALL of channel branch + DM branch) yields exactly one
+// row only when the sender is authorized at insert time:
+//
+//	channel branch ($2 IS NOT NULL):
+//	  - workspace active, sender is active workspace_member
+//	  - channel belongs to workspace, channel is active
+//	  - public channel: active workspace member is sufficient
+//	  - private channel: sender must also be an active channel_member
+//	DM branch ($3 IS NOT NULL):
+//	  - workspace active, sender is active workspace_member
+//	  - DM conversation belongs to workspace, DM conversation is active
+//	  - sender must be an active dm_member
+//
+// Stale channel_members / dm_members cannot bypass an inactive/suspended/left
+// workspace_member because the workspace_members JOIN filters wm.status = 'active'
+// independently.
+//
+// The invalid_refs CTE keeps parent/forwarded references in the same target and
+// permits RF-09 referenced messages in another target only when the sender can
+// currently read the active origin. Any failure maps to the same zero-row result.
+//
+// The INSERT is wrapped in a CTE so the outer SELECT can JOIN auth.users and
+// return sender display info (sender_display_name, sender_email) in the same
+// round-trip. This avoids a separate GET after insert for the broadcast payload.
+// acknowledgementRecipientsSQL is who a message that asks for confirmation is
+// asking (issue #824), written once and read from two places: the CTE inside
+// the creating statement that materialises the rows, and the bound check that
+// decides whether the send is allowed at all. A second copy is a second
+// definition of "eligible recipient", and the two would answer differently the
+// first time either is touched.
+//
+// The set is deliberately the same shape as issue #741's notification
+// recipients and is derived here, from membership, never from the request:
+//
+//   - a channel message asks chat.channel_members. Not everyone
+//     chat.channel_visible_to_user admits — a public channel is visible to every
+//     non-guest member of the workspace, and "everybody who could have read it"
+//     is not a set anybody agreed to be answerable for. Joining is the act that
+//     makes somebody a participant, so joining is what makes them a recipient.
+//   - a DM or group asks its active members.
+//   - neither asks the sender. Nobody confirms receipt of their own message,
+//     which is also what keeps the bound counting the set that is actually
+//     asked.
+//
+// Workspace membership and account state are re-checked rather than assumed:
+// a deactivated account or a former member must not appear in a denominator
+// the sender is shown as "0 of 7 confirmed" forever.
+// guardArg is a boolean expression both branches are gated on. It exists so the
+// creating statement can pass its own "did this send ask for anything" flag
+// *inside* the scan rather than above it: a message that asks for nothing is
+// almost every message, and a filter applied after the fact would still walk
+// the channel's member list on every ordinary send. The bound check, which is
+// only ever reached for a send that did ask, passes a literal true.
+func acknowledgementRecipientsSQL(guardArg, workspaceArg, channelArg, dmArg, senderArg string) string {
+	return `
+		SELECT cm.user_id AS recipient_id
+		FROM chat.channel_members cm
+		JOIN chat.channels c
+		  ON c.id = cm.channel_id
+		 AND c.workspace_id = ` + workspaceArg + `::uuid
+		 AND c.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = c.workspace_id
+		 AND wm.user_id = cm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE ` + guardArg + `
+		  AND ` + channelArg + `::uuid IS NOT NULL
+		  AND cm.channel_id = ` + channelArg + `::uuid
+		  AND cm.user_id <> ` + senderArg + `::uuid
+		UNION ALL
+		SELECT dm.user_id
+		FROM chat.dm_members dm
+		JOIN chat.dm_conversations dc
+		  ON dc.id = dm.conversation_id
+		 AND dc.workspace_id = ` + workspaceArg + `::uuid
+		 AND dc.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = dc.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE ` + guardArg + `
+		  AND ` + dmArg + `::uuid IS NOT NULL
+		  AND dm.conversation_id = ` + dmArg + `::uuid
+		  AND dm.status = 'active'
+		  AND dm.user_id <> ` + senderArg + `::uuid`
+}
+
+var createMessageQuery = `
 		WITH user_mentions AS (
 			SELECT DISTINCT id::uuid AS user_id
 			FROM unnest($11::text[]) AS ids(id)
@@ -782,7 +923,7 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 					  AND dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 				))
 				OR ($10::uuid IS NOT NULL AND NOT EXISTS (
-					SELECT 1 FROM chat.messages m`+messageAccessJoins("$4")+`
+					SELECT 1 FROM chat.messages m` + messageAccessJoins("$4") + `
 					WHERE m.id = $10::uuid
 					  AND m.workspace_id = $1::uuid
 					  AND m.status = 'active'
@@ -791,13 +932,13 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 						m.channel_id IS NOT DISTINCT FROM $2::uuid
 						AND m.dm_conversation_id IS NOT DISTINCT FROM $3::uuid
 					  )
-					  AND `+messageAccessPredicate("$4")+`
+					  AND ` + messageAccessPredicate("$4") + `
 				))
 		),
 		invalid_mentions AS (
 			SELECT 1
 			FROM user_mentions um
-			WHERE $2::uuid IS NULL OR NOT EXISTS (
+			WHERE NOT EXISTS (
 				SELECT 1
 				FROM chat.channels source_channel
 				JOIN chat.channel_members cm
@@ -810,14 +951,35 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				  ON mentioned_user.id = um.user_id
 				 AND mentioned_user.status = 'active'
 				 AND mentioned_user.deleted_at IS NULL
-				WHERE source_channel.id = $2::uuid
+				WHERE $2::uuid IS NOT NULL
+				  AND source_channel.id = $2::uuid
 				  AND source_channel.workspace_id = $1::uuid
 				  AND source_channel.status = 'active'
+				UNION ALL
+				SELECT 1
+				FROM chat.dm_conversations source_dm
+				JOIN chat.dm_members mentioned_dm
+				  ON mentioned_dm.conversation_id = source_dm.id
+				 AND mentioned_dm.user_id = um.user_id
+				 AND mentioned_dm.status = 'active'
+				JOIN chat.workspace_members mentioned_member
+				  ON mentioned_member.workspace_id = source_dm.workspace_id
+				 AND mentioned_member.user_id = um.user_id
+				 AND mentioned_member.status = 'active'
+				JOIN auth.users mentioned_user
+				  ON mentioned_user.id = um.user_id
+				 AND mentioned_user.status = 'active'
+				 AND mentioned_user.deleted_at IS NULL
+				WHERE $3::uuid IS NOT NULL
+				  AND source_dm.id = $3::uuid
+				  AND source_dm.workspace_id = $1::uuid
+				  AND source_dm.type = 'group'
+				  AND source_dm.status = 'active'
 			)
 			UNION ALL
 			SELECT 1
 			FROM channel_mentions mentioned
-			WHERE NOT EXISTS (
+			WHERE $2::uuid IS NULL OR NOT EXISTS (
 				SELECT 1
 				FROM chat.channels c
 				JOIN chat.workspaces w
@@ -832,6 +994,160 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				  AND chat.channel_visible_to_user(c.id, $4::uuid)
 			)
 		),
+		-- issue #776: @all in a group DM. Recipients are never taken from the
+		-- service layer's own list — that would trust a set computed before this
+		-- statement ran, so a change that already committed by the time the send
+		-- reaches the database (a member removed, or added, before this request
+		-- was even issued) would be missed entirely. Instead this CTE reads
+		-- chat.dm_members itself, inside the same statement as the INSERT, under
+		-- that statement's own read-committed snapshot — which is what makes a
+		-- membership change that committed *before* this statement began always
+		-- visible here, regardless of what the client's autocomplete or composer
+		-- last saw.
+		--
+		-- This is not a claim of serializable isolation against a write racing
+		-- this exact statement's own execution: dm_members/workspace_members are
+		-- read here with no row lock (no FOR UPDATE/FOR SHARE), so a removal that
+		-- commits strictly concurrently with this INSERT is ordinary Postgres
+		-- read-committed visibility, not something this design serializes
+		-- against. #776's requirement is "the source of truth beats a value the
+		-- client is holding," not "this send blocks on every in-flight
+		-- membership write" — locking dm_members here would be a real behavior
+		-- and performance change with no stated requirement driving it, so none
+		-- was added speculatively.
+		--
+		-- $21 is the one bit the service contributes: whether the body carries an
+		-- "all" token in a target the service already confirmed is a group. The
+		-- dc.type = 'group' condition re-asserts that authoritatively rather than
+		-- trusting the flag alone — a DM cannot actually change type, but the
+		-- guard costs nothing and keeps this CTE correct on its own terms. This
+		-- reads $1/$3 (the request's own target parameters) rather than
+		-- inserted.workspace_id/inserted.dm_conversation_id deliberately: it must
+		-- be computable *before* the INSERT below runs, so the INSERT's own WHERE
+		-- clause can refuse to write a message at all when the fan-out is over
+		-- the SR-002 bound (see invalid_all_mention_fanout).
+		-- When $21 is false the WHERE eliminates every row, so a channel send (or
+		-- any DM send without @all) reaches this CTE and produces nothing —
+		-- byte-for-byte the same mention_outbox/pending_mentions rows as before
+		-- this feature existed.
+		--
+		-- SEC-776-01: the LIMIT is the whole point of this CTE's shape. Reading
+		-- one row past the bound is everything either decision needs — at most
+		-- $22 rows means "send it, and these are exactly the recipients", one
+		-- more means "refuse", and neither answer improves by walking the rest of
+		-- a 50,000-member roster. So the database stops at $22 + 1 rows, and an
+		-- oversized group costs the same as a group of 51.
+		--
+		-- No DISTINCT: chat.dm_members is keyed (conversation_id, user_id) and
+		-- both joins below are on primary keys, so an eligible member already
+		-- yields exactly one row. Dropping it is what lets the LIMIT stop early
+		-- rather than forcing a dedupe across the whole roster first.
+		eligible_all_mention_recipients AS (
+			SELECT dm.user_id
+			FROM chat.dm_conversations dc
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id
+			 AND dm.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = dc.workspace_id
+			 AND wm.user_id = dm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u
+			  ON u.id = dm.user_id
+			 AND u.status = 'active'
+			 AND u.deleted_at IS NULL
+			WHERE $21::boolean
+			  AND $3::uuid IS NOT NULL
+			  AND dc.id = $3::uuid
+			  AND dc.workspace_id = $1::uuid
+			  AND dc.type = 'group'
+			  AND dc.status = 'active'
+			  -- The sender is not a recipient of their own message (#741's rule,
+			  -- applied in notification_recipients below). Excluding them here too
+			  -- is what keeps the bound counting the same set that is actually
+			  -- notified: without it a group of the author plus exactly $22 others
+			  -- would count $22 + 1 and be refused, while the notifications it
+			  -- would have produced number exactly $22.
+			  AND dm.user_id <> $4::uuid
+			LIMIT $22::int + 1
+		),
+		-- issue #776 SR-002: a broadcast is either sent to everyone it resolves to
+		-- or sent to no one — never truncated to an arbitrary first-N subset,
+		-- which would silently misinform an author about who actually saw an
+		-- @all they wrote for a larger audience. Gating the INSERT's own WHERE
+		-- clause on this is what makes "too large" a whole-message refusal (zero
+		-- rows: no message, no outbox, no partial fan-out) rather than a value
+		-- decided after the row already exists.
+		--
+		-- It asks the one question that decides the bound — "is there a row past
+		-- the limit?" — as an existence test over the already-capped CTE above,
+		-- not as a count over the roster. OFFSET $22 skips the rows a legal @all
+		-- may have; anything still standing is the $22+1'th eligible recipient
+		-- and refuses the message. Which row that is does not matter and is not
+		-- ordered: only whether one exists.
+		--
+		-- $22 is domain.MaxGroupAllMentionRecipients, passed as a parameter
+		-- rather than inlined so the Go constant stays the only place the limit
+		-- is spelled out — the "+ 1" above derives from it rather than repeating
+		-- a second literal.
+		invalid_all_mention_fanout AS (
+			SELECT 1
+			FROM eligible_all_mention_recipients
+			OFFSET $22::int
+			LIMIT 1
+		),
+		-- The recipients an accepted @all actually notifies. Reading from the
+		-- capped CTE (never a second pass over membership) and refusing to yield
+		-- anything at all once the bound is broken, so the "all or nobody" rule
+		-- holds here on its own terms rather than only as a consequence of the
+		-- INSERT below writing no row.
+		all_mention_recipients AS (
+			SELECT user_id
+			FROM eligible_all_mention_recipients
+			WHERE NOT EXISTS (SELECT 1 FROM invalid_all_mention_fanout)
+		),
+		-- The recipients this send would ask, taken once (issue #824).
+		--
+		-- This CTE is the whole of the bound's atomicity. Everything downstream
+		-- reads it — the refusal below and the rows that materialise the request —
+		-- so the set that is counted and the set that is written are the same set,
+		-- evaluated once under this statement's own snapshot. The earlier shape
+		-- counted in one statement and materialised in another, which left a window
+		-- in which somebody could join between the two and turn a send judged at the
+		-- bound into one row past it.
+		--
+		-- Capped at one row past the bound, exactly as #776's @all CTE is: "at most
+		-- the bound, and these are the recipients" and "more than the bound" are the
+		-- only two answers either decision needs, so an enormous channel costs the
+		-- same to judge as a barely-oversized one.
+		--
+		-- A send that asks for nothing produces no rows here at all: the guard is
+		-- inside the scan, so an ordinary message never walks a member list.
+		eligible_acknowledgement_recipients AS (
+			SELECT recipient_id
+			FROM (` + acknowledgementRecipientsSQL("$24::boolean", "$1", "$2", "$3", "$4") + `
+			) candidate
+			LIMIT $25::int + 1
+		),
+		-- Is there a row past the bound? An existence test over the already-capped
+		-- CTE rather than a count over the roster. OFFSET skips the rows a legal
+		-- request may have; anything still standing is the $25+1'th recipient and
+		-- refuses the message.
+		invalid_acknowledgement_fanout AS (
+			SELECT 1
+			FROM eligible_acknowledgement_recipients
+			OFFSET $25::int
+			LIMIT 1
+		),
+		-- The recipients an accepted request actually asks. Reading from the capped
+		-- CTE and yielding nothing once the bound is broken, so "all or nobody"
+		-- holds here on its own terms rather than only as a consequence of the
+		-- INSERT below writing no row.
+		acknowledgement_recipients AS (
+			SELECT recipient_id
+			FROM eligible_acknowledgement_recipients
+			WHERE NOT EXISTS (SELECT 1 FROM invalid_acknowledgement_fanout)
+		),
 		inserted AS (
 			INSERT INTO chat.messages
 				(workspace_id, channel_id, dm_conversation_id, sender_id,
@@ -839,10 +1155,10 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 				 parent_message_id, forwarded_from_message_id, referenced_message_id,
 				 create_idempotency_key, create_request_fingerprint, link_safety_state,
 				 link_safety_fingerprint,
-				 link_safety_projection_version)
+				 link_safety_projection_version, priority, acknowledgement_required)
 			SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $14::text,
 			       $8::uuid, $9::uuid, $10::uuid, NULLIF($16, ''), NULLIF($18, ''), $19::text,
-			       NULLIF($17, ''), 1
+			       NULLIF($17, ''), 1, $23::text, $24::boolean
 			FROM (
 				-- Channel message authorization branch.
 				SELECT 1
@@ -870,6 +1186,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			WHERE NOT EXISTS (SELECT 1 FROM invalid_refs)
 			  AND NOT EXISTS (SELECT 1 FROM invalid_mentions)
 			  AND NOT EXISTS (SELECT 1 FROM invalid_attachments)
+			  AND NOT EXISTS (SELECT 1 FROM invalid_all_mention_fanout)
+			  AND NOT EXISTS (SELECT 1 FROM invalid_acknowledgement_fanout)
 			RETURNING id, workspace_id, channel_id, dm_conversation_id, sender_id,
 				          kind, body_text, body_format, status,
 			          parent_message_id, forwarded_from_message_id, referenced_message_id,
@@ -879,30 +1197,209 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			          -- system message is written by its own event path. The columns
 			          -- are still projected because the outer SELECT reads this CTE
 			          -- through messageColumns, which names them (issue #527).
-			          event_type, event_payload
+			          event_type, event_payload,
+			          priority, acknowledgement_required
 		),
-		-- A published message notifies its mentions immediately, exactly as it
+		-- The recipients this message asks to confirm receipt (issue #824).
+		--
+		-- Written in the statement that writes the message, so "the message
+		-- exists" and "these people were asked" are one commit: there is no
+		-- window in which a message displays a confirmation request that nobody
+		-- was recorded as having received, and a send that is refused for any
+		-- reason at all leaves nothing behind, because this reads the inserted
+		-- CTE and that CTE produced no row.
+		--
+		-- Set-based, like the outbox above and for the same reason: a statement
+		-- per recipient inside an interactive send is what turns a channel into
+		-- a latency problem.
+		--
+		-- The rows are written for a withheld message too, unlike
+		-- notification_outbox_rows. Nothing about them is a side effect aimed at
+		-- a recipient — no notification, no sound, nothing they can observe
+		-- until the message is published, because every read of this table is
+		-- gated by read access to the message itself. What they are is the
+		-- snapshot of who was asked, and the instant that snapshot is true is
+		-- the instant of the send, not the instant a link scan happens to
+		-- finish.
+		--
+		-- ON CONFLICT DO NOTHING is belt and braces: the primary key already
+		-- makes a second row for the same recipient impossible, and the source
+		-- set cannot contain a duplicate — chat.channel_members and
+		-- chat.dm_members are keyed by (container, user) and the two branches are
+		-- mutually exclusive, since a message has either a channel or a
+		-- conversation and never both.
+		acknowledgement_rows AS (
+			INSERT INTO chat.message_acknowledgements (message_id, recipient_id)
+			SELECT inserted.id, r.recipient_id
+			FROM inserted
+			CROSS JOIN acknowledgement_recipients r
+			ON CONFLICT DO NOTHING
+			RETURNING recipient_id
+		),
+		-- A reply resolves the replier's own pending request (issue #824,
+		-- policy from #820): somebody who wrote back has answered, and
+		-- continuing to ask them is the reminder loop #825 exists to stop.
+		--
+		-- state = 'pending' is the whole guard. It is a compare-and-set against
+		-- the row this statement locks, so a reply racing an acknowledgement or
+		-- a cancellation loses to whichever committed first rather than
+		-- overwriting a terminal state, and a retried send that replays into a
+		-- second reply finds nothing left to resolve.
+		--
+		-- Restricted to a published reply. A withheld one is invisible to the
+		-- person who asked, so marking them answered would show a sender
+		-- "responded" against a reply they cannot see and may never see, if the
+		-- scan condemns it. Leaving the request pending is the safe direction of
+		-- that error: being asked once more costs a click, being wrongly
+		-- recorded as having answered costs the sender the truth.
+		answered_acknowledgement AS (
+			UPDATE chat.message_acknowledgements a
+			SET state = 'responded', resolved_at = now()
+			FROM inserted
+			WHERE inserted.status = 'active'
+			  AND a.message_id = $8::uuid
+			  AND a.recipient_id = inserted.sender_id
+			  AND a.state = 'pending'
+			RETURNING a.message_id
+		),
+		-- Who this message notifies (issue #741).
+		--
+		-- Every recipient is derived here, from the database, in the same statement
+		-- that inserts the message. Nothing in this CTE comes from the request: a
+		-- client names mentions, and invalid_mentions above has already refused any
+		-- it may not make, but it never names a recipient, a workspace or an event
+		-- type. A forged recipient is not a request a client can make.
+		--
+		-- One row per recipient, not one per rule. A single message can reach the
+		-- same person as a mention, as a reply to something they wrote and as a DM
+		-- they belong to; DISTINCT ON keeps the strongest classification and drops
+		-- the rest, so a worker cannot turn one message into three notifications.
+		-- Rank is that strength: being named personally outranks being answered,
+		-- which outranks being in the conversation.
+		--
+		-- Set-based, and it has to be: an INSERT per recipient would put a query per
+		-- conversation member inside an interactive send.
+		--
+		-- channel_message is deliberately not produced. Fanning a channel message
+		-- out to every member synchronously is the amplification risk #741 asks to
+		-- be assessed before it is built, and who wants a channel notification is a
+		-- policy question rather than a persistence one. The event type exists in
+		-- the contract; its producer arrives with the policy that bounds it.
+		notification_recipients AS (
+			SELECT DISTINCT ON (recipient_id) recipient_id, kind, priority
+			FROM (
+				SELECT um.user_id AS recipient_id,
+				       'mention'::text AS kind, 'high'::text AS priority, 1 AS rank
+				FROM user_mentions um
+				UNION ALL
+				-- @all in a group DM (issue #776), which is a mention and is
+				-- classified as one: the author named this conversation's members
+				-- deliberately, and being named collectively is still being named.
+				-- It shares rank 1 with the individual mentions above because it
+				-- carries the same weight — a member reached by @all and by an
+				-- individual mention is one recipient with one classification, which
+				-- the DISTINCT ON below settles either way since both rows agree.
+				--
+				-- The recipient set is already bounded and already filtered:
+				-- all_mention_recipients yields nothing at all once the fan-out
+				-- exceeds the #776 bound, and the INSERT above refuses the message
+				-- in that case, so this branch cannot become an unbounded fan-out
+				-- and cannot be the route by which a member the @all policy
+				-- excludes is notified as a mention.
+				SELECT amr.user_id, 'mention', 'high', 1
+				FROM all_mention_recipients amr
+				UNION ALL
+				-- The author of the message being answered, but only while they can
+				-- still reach the place it was answered in. A notification names a
+				-- target and says something happened there, so sending one to somebody
+				-- who has left the channel, the conversation or the workspace tells
+				-- them about activity they are no longer entitled to observe. The
+				-- reply rule is the only one that could do that: a mention is already
+				-- refused by invalid_mentions, and the DM rule reads current
+				-- membership directly.
+				--
+				-- Re-reading the parent's workspace is defence in depth: invalid_refs
+				-- already refuses a parent from another workspace, and a notification
+				-- is exactly the side effect that would cross the tenant boundary if
+				-- that check ever weakened.
+				SELECT parent.sender_id, 'reply', 'high', 2
+				FROM chat.messages parent
+				JOIN chat.workspace_members author
+				  ON author.workspace_id = parent.workspace_id
+				 AND author.user_id = parent.sender_id
+				 AND author.status = 'active'
+				WHERE parent.id = $8::uuid
+				  AND parent.workspace_id = $1::uuid
+				  AND parent.status = 'active'
+				  AND (
+					($2::uuid IS NOT NULL AND chat.channel_visible_to_user($2::uuid, parent.sender_id))
+					OR ($3::uuid IS NOT NULL AND EXISTS (
+						SELECT 1 FROM chat.dm_members still_in
+						WHERE still_in.conversation_id = $3::uuid
+						  AND still_in.user_id = parent.sender_id
+						  AND still_in.status = 'active'
+					))
+				  )
+				UNION ALL
+				-- Everyone else still in the conversation. Bounded by design: this is
+				-- a conversation's membership, not a channel's.
+				SELECT dm.user_id, 'direct_message', 'normal', 3
+				FROM chat.dm_members dm
+				WHERE dm.conversation_id = $3::uuid
+				  AND dm.status = 'active'
+			) candidate
+			-- Nobody is notified of their own message.
+			WHERE candidate.recipient_id <> $4::uuid
+			ORDER BY recipient_id, rank
+		),
+		-- A published message notifies its recipients immediately, exactly as it
 		-- always has. A withheld one must not: a notification is a side effect
 		-- aimed at somebody who is not allowed to know the message exists yet,
 		-- and RF-21's rule is that a pending message produces none of those.
-		mention_outbox AS (
+		--
+		-- occurred_at is the message's own created_at, not now(): the two are the
+		-- same instant here, and taking it from the row is what keeps them the same
+		-- instant for a producer that is replaying something older. origin is the
+		-- literal 'live' because this path is a user pressing send; an importer
+		-- writes its own, which is the whole reason the column is not a timestamp
+		-- heuristic.
+		--
+		-- dedupe_key is the format libs/go/platform/notificationevent defines, and
+		-- the unique index over (workspace_id, recipient_user_id, dedupe_key) is
+		-- what makes a retry of this send produce one logical notification instead
+		-- of a second one.
+		--
+		-- ON CONFLICT names no arbiter on purpose. Two unique indexes express the
+		-- same grain during the expand window migration 000042 opens — the new
+		-- dedupe index and the legacy UNIQUE the previous release still names in its
+		-- own ON CONFLICT — and picking one of them would turn a conflict on the
+		-- other into an error instead of the replay it is. Without an arbiter both
+		-- are handled and nothing else is: DO NOTHING absorbs unique violations
+		-- only, so a foreign key or check failure still aborts the statement, and
+		-- with it the message.
+		notification_outbox_rows AS (
 			INSERT INTO chat.notification_outbox
-				(workspace_id, message_id, recipient_user_id, kind, status)
-			SELECT inserted.workspace_id, inserted.id, user_mentions.user_id, 'mention', 'pending'
+				(workspace_id, message_id, recipient_user_id, kind, status,
+				 source_type, occurred_at, priority, origin, dedupe_key)
+			SELECT inserted.workspace_id, inserted.id, r.recipient_id, r.kind, 'pending',
+			       'message', inserted.created_at, r.priority, 'live',
+			       ` + notificationevent.MessageDedupeKeySQL("inserted.id", "r.kind") + `
 			FROM inserted
-			CROSS JOIN user_mentions
+			CROSS JOIN notification_recipients r
 			WHERE inserted.status = 'active'
-			ON CONFLICT (message_id, recipient_user_id, kind) DO NOTHING
+			ON CONFLICT DO NOTHING
 			RETURNING id
 		),
-		-- Dropping the mentions instead would lose them for good once the scan
+		-- Dropping the notifications instead would lose them for good once the scan
 		-- cleared, so they are parked and released by the promotion, in the same
-		-- transaction that makes the message publishable.
+		-- transaction that makes the message publishable. The parked row carries its
+		-- classification: a promoted message must not announce every recipient as a
+		-- mention.
 		pending_mentions AS (
-			INSERT INTO chat.message_pending_mentions (message_id, user_id)
-			SELECT inserted.id, user_mentions.user_id
+			INSERT INTO chat.message_pending_mentions (message_id, user_id, kind, priority)
+			SELECT inserted.id, r.recipient_id, r.kind, r.priority
 			FROM inserted
-			CROSS JOIN user_mentions
+			CROSS JOIN notification_recipients r
 			WHERE inserted.status = 'pending_link_scan'
 			ON CONFLICT DO NOTHING
 			RETURNING message_id
@@ -941,70 +1438,139 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 			ON CONFLICT DO NOTHING
 			RETURNING canonical_url
 		)
-		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
+		SELECT ` + listMessageWithQuoteColumns("m", "$4", "q") + `
 		FROM inserted m
-		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
+		LEFT JOIN auth.users u ON u.id = m.sender_id` + quotedMessageJoin("m", "q")
+
+func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessageInput) (domain.Message, error) {
+	input = normalizeCreateMessageInput(input)
+	row := s.pool.QueryRow(ctx, createMessageQuery, createMessageArgs(input)...)
+	msg, err := scanMessageWithSenderAndQuote(row)
+	if err != nil {
+		return domain.Message{}, mapCreateMessageError(err)
+	}
+	return s.hydrateAttachments(ctx, msg, input.AttachmentIDs)
+}
+
+// normalizeCreateMessageInput applies the server-owned defaults, so every value
+// the statement binds is decided in one place instead of at the call site.
+//
+// None of these are settable by a client that omitted them: the kind of a
+// created message is always a user message, the body format is the oldest one
+// still accepted, and the attachment ceiling is the deployment's, not the
+// request's. A zero or negative ceiling is a caller that did not state one, and
+// is replaced rather than honoured — binding it would let an omission disable
+// the limit.
+func normalizeCreateMessageInput(input CreateMessageInput) CreateMessageInput {
+	if input.Kind == "" {
+		input.Kind = domain.MessageKindUser
+	}
+	if input.BodyFormat == "" {
+		input.BodyFormat = domain.MessageBodyFormatV1
+	}
+	if input.MaxAttachmentBytes <= 0 {
+		input.MaxAttachmentBytes = domain.DefaultMaxMessageAttachmentBytes
+	}
+	input.Status = messageStatusOrActive(input.Status)
+	input.Priority = input.Priority.OrStandard()
+	return input
+}
+
+// createMessageArgs is the bind order of createMessageQuery, fixed and stated
+// once. The query numbers its parameters up to $23 and reads several of them
+// from more than one CTE, so the order is a contract between two things that sit
+// hundreds of lines apart; keeping it beside neither of them, in a function that
+// does nothing else, is what makes it checkable at a glance.
+//
+// $21 and $22 are issue #776's: whether this body carries an @all the service
+// already authorized for a group DM, and the bound that @all's fan-out may not
+// exceed. The query reads them only from the eligible_all_mention_recipients and
+// invalid_all_mention_fanout CTEs.
+//
+// $23 is issue #821's message priority, read only by the INSERT. $24 is issue
+// #824's acknowledgement flag, read by the INSERT and by the CTE that decides
+// whether to materialise any recipient rows at all, and $25 is the bound that
+// CTE may not exceed — passed as a parameter rather than inlined so the Go
+// constant stays the only place the limit is spelled out, exactly as $22 is for
+// #776. New parameters are appended rather than inserted in a place that reads
+// better: renumbering would silently re-point every other parameter in a
+// four-hundred-line query.
+func createMessageArgs(input CreateMessageInput) []any {
+	return []any{
 		input.WorkspaceID,
 		nullableUUID(input.ChannelID),
 		nullableUUID(input.DMConversationID),
 		input.SenderID,
-		string(kind),
+		string(input.Kind),
 		input.BodyText,
-		string(bodyFormat),
+		string(input.BodyFormat),
 		nullableUUID(input.ParentMessageID),
 		nullableUUID(input.ForwardedFromMessageID),
 		nullableUUID(input.ReferencedMessageID),
 		input.MentionedUserIDs,
 		input.MentionedChannelIDs,
 		input.AttachmentIDs,
-		string(messageStatusOrActive(input.Status)),
+		string(input.Status),
 		input.LinkScanURLs,
 		input.IdempotencyKey,
 		input.LinkSafetyFingerprint,
 		input.RequestFingerprint,
 		string(input.LinkSafetyState),
-		maxAttachmentBytes,
-	)
-	msg, err := scanMessageWithSenderAndQuote(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Non-enumerating TOCTOU backstop: auth failure, reference failure and
-			// attachment failure all produce 0 rows. The service layer returns typed
-			// errors from pre-validation; this backstop returns ErrNotFound to avoid
-			// leaking target existence — or which attachment ids exist.
-			return domain.Message{}, domain.ErrNotFound
-		}
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			switch pgErr.Code {
-			case "23505", "23503": // unique_violation, foreign_key_violation
-				// A collision on the idempotency index is not a failure: it is a
-				// concurrent retry of this very send, and the caller resolves it
-				// by reading back what the winner created. Every other unique
-				// violation keeps the non-enumerating answer — the attachment may
-				// have been linked between invalid_attachments and
-				// attachment_links, and that race must stay indistinguishable.
-				if pgErr.ConstraintName == createIdempotencyConstraint {
-					return domain.Message{}, ErrCreateReplay
-				}
-				return domain.Message{}, domain.ErrNotFound
-			case "23514", "23502": // check_violation, not_null_violation
-				return domain.Message{}, domain.ErrInvalidInput
-			}
-		}
-		return domain.Message{}, fmt.Errorf("create message: %w", err)
+		input.MaxAttachmentBytes,
+		input.MentionAllGroupMembers,
+		domain.MaxGroupAllMentionRecipients,
+		string(input.Priority),
+		input.AcknowledgementRequired,
+		domain.MaxAcknowledgementRecipients,
 	}
-	// The links were written by a CTE of the statement above, which cannot see its
-	// own effects, so the metadata is read back here — one query, never one per
-	// attachment.
-	if len(input.AttachmentIDs) > 0 {
-		messages := []domain.Message{msg}
-		if err := s.loadAttachmentBatch(ctx, messages); err != nil {
-			return domain.Message{}, err
-		}
-		msg = messages[0]
+}
+
+// mapCreateMessageError turns what PostgreSQL reports into what the service
+// layer is allowed to learn.
+//
+// The non-enumerating rule is the whole point and it is why this is not a
+// pass-through: an authorization failure, an invalid reference and an attachment
+// that does not exist all produce zero rows, and all three answer ErrNotFound,
+// so a caller cannot use the difference to discover which ids are real. The one
+// unique violation that is not a refusal is the idempotency key — that is a
+// concurrent retry of this very send, and the caller resolves it by reading back
+// what the winner created. Every other constraint failure keeps the same
+// non-enumerating answer.
+func mapCreateMessageError(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
 	}
-	return msg, nil
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return fmt.Errorf("create message: %w", err)
+	}
+	switch pgErr.Code {
+	case "23505", "23503": // unique_violation, foreign_key_violation
+		if pgErr.ConstraintName == createIdempotencyConstraint {
+			return ErrCreateReplay
+		}
+		return domain.ErrNotFound
+	case "23514", "23502": // check_violation, not_null_violation
+		return domain.ErrInvalidInput
+	}
+	return fmt.Errorf("create message: %w", err)
+}
+
+// hydrateAttachments reads back the attachment metadata the creating statement
+// wrote. A CTE cannot see its own effects, so the links exist but their
+// projection does not — one query for the whole message, never one per
+// attachment, and none at all for a message that carries none.
+func (s *PGXMessageStore) hydrateAttachments(
+	ctx context.Context, msg domain.Message, attachmentIDs []string,
+) (domain.Message, error) {
+	if len(attachmentIDs) == 0 {
+		return msg, nil
+	}
+	messages := []domain.Message{msg}
+	if err := s.loadAttachmentBatch(ctx, messages); err != nil {
+		return domain.Message{}, err
+	}
+	return messages[0], nil
 }
 
 // SnapshotForwardableMessage reads what a forward would copy.
@@ -1152,6 +1718,18 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 			          -- are still projected because the outer SELECT reads this CTE
 			          -- through messageColumns, which names them (issue #527).
 			          event_type, event_payload,
+			          -- Never copied from the source: a forward is a new message
+			          -- sent by a different author, so it takes the column default
+			          -- ('standard') rather than inheriting somebody else's claim.
+			          -- Carrying 'urgent' across would make forwarding a way to
+			          -- re-escalate a message its own author never escalated.
+			          priority,
+			          -- Never copied either, for the stronger version of the same
+			          -- reason: inheriting it would ask a second set of people to
+			          -- confirm a message on behalf of an author who never asked
+			          -- anyone, and would create their rows from a forward the
+			          -- original sender cannot see.
+			          acknowledgement_required,
 			          (xmax <> 0) AS replayed
 		),
 		-- RF-21, same atomicity argument as CreateMessage's: the withheld
@@ -1423,17 +2001,8 @@ func (s *PGXMessageStore) DeleteMessage(ctx context.Context, input DeleteMessage
 
 	changed := current.Status != domain.MessageStatusDeleted || deletedAt == nil
 	if changed {
-		tag, err := tx.Exec(ctx, `
-			UPDATE chat.messages
-			SET status = 'deleted', deleted_at = COALESCE(deleted_at, $4), updated_at = $4
-			WHERE id = $1 AND workspace_id = $2 AND sender_id = $3`,
-			input.MessageID, input.WorkspaceID, input.RequesterID, databaseNow,
-		)
-		if err != nil {
-			return domain.Message{}, false, fmt.Errorf("soft delete message: %w", err)
-		}
-		if tag.RowsAffected() != 1 {
-			return domain.Message{}, false, domain.ErrNotFound
+		if err := applyMessageDeletion(ctx, tx, input, databaseNow); err != nil {
+			return domain.Message{}, false, err
 		}
 	}
 
@@ -1452,6 +2021,46 @@ func (s *PGXMessageStore) DeleteMessage(ctx context.Context, input DeleteMessage
 		return domain.Message{}, false, fmt.Errorf("commit message delete: %w", err)
 	}
 	return deleted, changed, nil
+}
+
+// applyMessageDeletion performs the two writes a deletion is: the message is
+// marked removed, and every request it still had outstanding is withdrawn.
+//
+// One function because they are one fact. Both run inside the caller's
+// transaction, so there is no commit in which a removed message still has
+// somebody pending on it, and a failure in either takes the other with it.
+func applyMessageDeletion(
+	ctx context.Context, tx pgx.Tx, input DeleteMessageInput, databaseNow time.Time,
+) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE chat.messages
+		SET status = 'deleted', deleted_at = COALESCE(deleted_at, $4), updated_at = $4
+		WHERE id = $1 AND workspace_id = $2 AND sender_id = $3`,
+		input.MessageID, input.WorkspaceID, input.RequesterID, databaseNow,
+	)
+	if err != nil {
+		return fmt.Errorf("soft delete message: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrNotFound
+	}
+	// Withdrawing the message withdraws the question (issue #824).
+	// state = 'pending' keeps this a compare-and-set: an acknowledgement or a
+	// reply that committed first stands, and is not rewritten into a
+	// cancellation that would tell the sender nobody answered.
+	//
+	// The rows are not deleted. They are the record of who was asked and what
+	// they said, and a sender who removes a message does not thereby erase that
+	// four people had already confirmed it.
+	if _, err := tx.Exec(ctx, `
+		UPDATE chat.message_acknowledgements
+		SET state = 'cancelled', resolved_at = $2
+		WHERE message_id = $1 AND state = 'pending'`,
+		input.MessageID, databaseNow,
+	); err != nil {
+		return fmt.Errorf("cancel pending acknowledgements: %w", err)
+	}
+	return nil
 }
 
 func (s *PGXMessageStore) ListMessageEditHistory(ctx context.Context, input ListMessageEditHistoryInput) ([]domain.MessageEditHistory, error) {
@@ -1559,14 +2168,14 @@ func (s *PGXMessageStore) ResolveMentionLabels(ctx context.Context, workspaceID 
 	return scanMentionLabels(rows, labels)
 }
 
-func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, requesterID string, userIDs, channelIDs []string) (map[string]string, error) {
+func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, workspaceID, sourceChannelID, sourceDMConversationID, requesterID string, userIDs, channelIDs []string) (map[string]string, error) {
 	labels := make(map[string]string, len(userIDs)+len(channelIDs))
 	if len(userIDs)+len(channelIDs) == 0 {
 		return labels, nil
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT 'user', u.id::text, u.display_name
-		FROM unnest($4::text[]) AS ids(id)
+		FROM unnest($5::text[]) AS ids(id)
 		JOIN chat.channels source_channel
 		  ON source_channel.id = $2::uuid
 		 AND source_channel.workspace_id = $1::uuid
@@ -1580,8 +2189,24 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		JOIN auth.users u
 		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
 		UNION ALL
-		SELECT 'channel', c.id::text, c.display_name
+		SELECT 'user', u.id::text, u.display_name
 		FROM unnest($5::text[]) AS ids(id)
+		JOIN chat.dm_conversations source_dm
+		  ON source_dm.id = $3::uuid
+		 AND source_dm.workspace_id = $1::uuid
+		 AND source_dm.type = 'group'
+		 AND source_dm.status = 'active'
+		JOIN chat.dm_members dm
+		  ON dm.conversation_id = source_dm.id AND dm.user_id = ids.id::uuid AND dm.status = 'active'
+		JOIN chat.workspace_members wm
+		  ON wm.workspace_id = source_dm.workspace_id
+		 AND wm.user_id = dm.user_id
+		 AND wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		UNION ALL
+		SELECT 'channel', c.id::text, c.display_name
+		FROM unnest($6::text[]) AS ids(id)
 		JOIN chat.channels c
 		  ON c.id = ids.id::uuid
 		 AND c.workspace_id = $1::uuid
@@ -1590,16 +2215,114 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		  ON w.id = c.workspace_id AND w.status = 'active'
 		JOIN chat.workspace_members requester
 		  ON requester.workspace_id = c.workspace_id
-		 AND requester.user_id = $3::uuid
+		 AND requester.user_id = $4::uuid
 		 AND requester.status = 'active'
-		WHERE chat.channel_visible_to_user(c.id, $3::uuid)`,
-		workspaceID, sourceChannelID, requesterID, userIDs, channelIDs,
+		WHERE $2::uuid IS NOT NULL
+		  AND chat.channel_visible_to_user(c.id, $4::uuid)`,
+		workspaceID, nullableUUID(sourceChannelID), nullableUUID(sourceDMConversationID), requesterID, userIDs, channelIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve authorized mention labels: %w", err)
 	}
 	defer rows.Close()
 	return scanMentionLabels(rows, labels)
+}
+
+// CountEligibleAllMentionRecipientsUpTo mirrors CreateMessage's own
+// eligible_all_mention_recipients predicate exactly, as a single set-based
+// count — no row is ever fetched to Go, and no member profile is read.
+//
+// The result SATURATES at limit: the LIMIT sits inside the subquery that reads
+// membership, below the aggregate, so the database stops after limit matching
+// rows and never walks the rest of an arbitrarily large roster. A caller
+// asking with limit = MaxGroupAllMentionRecipients+1 therefore learns
+// "0..50 exactly" or "at least 51", which is all a bound decision needs, and
+// the answer costs the same for a 51-member group and a 50,000-member one.
+//
+// Because it saturates it is never the group's real size and must not be
+// rendered as one; it exists only to be compared against the bound.
+//
+// senderID is excluded, matching notification_recipients' rule that nobody is
+// notified of their own message (issue #741). It is a parameter rather than an
+// omission because the bound must count the recipients that are actually
+// notified: counting the author would refuse a group of the author plus exactly
+// MaxGroupAllMentionRecipients others, whose @all notifies exactly that many.
+//
+// dmConversationID must name an active group DM or the count is 0, which the
+// caller reads as "no recipients," not as an error: a 1:1 or missing target
+// has no business calling this at all, and CreateMessage's own authorization
+// is what actually decides accessibility.
+func (s *PGXMessageStore) CountEligibleAllMentionRecipientsUpTo(ctx context.Context, workspaceID, dmConversationID, senderID string, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("count eligible all-mention recipients: %w: limit must be positive", domain.ErrInvalidInput)
+	}
+	var count int
+	// No DISTINCT: chat.dm_members is keyed (conversation_id, user_id) and both
+	// joins below are on primary keys, so one eligible member yields exactly one
+	// row already. Dropping it is what lets LIMIT stop early instead of forcing
+	// a dedupe over the whole roster first.
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM (
+			SELECT 1
+			FROM chat.dm_conversations dc
+			JOIN chat.dm_members dm
+			  ON dm.conversation_id = dc.id
+			 AND dm.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = dc.workspace_id
+			 AND wm.user_id = dm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u
+			  ON u.id = dm.user_id
+			 AND u.status = 'active'
+			 AND u.deleted_at IS NULL
+			WHERE dc.id = $2::uuid
+			  AND dc.workspace_id = $1::uuid
+			  AND dc.type = 'group'
+			  AND dc.status = 'active'
+			  AND dm.user_id <> $3::uuid
+			LIMIT $4::int
+		) eligible_limited`,
+		workspaceID, dmConversationID, senderID, limit,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count eligible all-mention recipients: %w", err)
+	}
+	return count, nil
+}
+
+// CountAcknowledgementRecipientsUpTo answers how many people a send would ask to
+// confirm receipt, stopping once it has counted limit of them (issue #824).
+//
+// Asked with a ceiling of one past the bound, for the same reason #776's
+// equivalent is: "at most the bound, and how many" and "more than the bound"
+// are the only two answers a bound decision can act on, so the database stops
+// looking rather than walking a roster whose size is not otherwise interesting.
+// The value that comes back saturates there and is never the channel's real
+// size — which is also why it is safe to derive a refusal from: the caller
+// learns "too many", not "how many".
+//
+// It reads the same definition of an eligible recipient the creating statement
+// materialises, so the set it judges is the set that would be written.
+func (s *PGXMessageStore) CountAcknowledgementRecipientsUpTo(
+	ctx context.Context, workspaceID, channelID, dmConversationID, senderID string, limit int,
+) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("count acknowledgement recipients: %w: limit must be positive", domain.ErrInvalidInput)
+	}
+	var count int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM (`+acknowledgementRecipientsSQL("true", "$1", "$2", "$3", "$4")+`
+			LIMIT $5::int
+		) eligible_limited`,
+		workspaceID, nullableUUID(channelID), nullableUUID(dmConversationID), senderID, limit,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count acknowledgement recipients: %w", err)
+	}
+	return count, nil
 }
 
 func scanMentionLabels(rows pgx.Rows, labels map[string]string) (map[string]string, error) {
@@ -2201,6 +2924,8 @@ func collectMessagesWithSenderAndQuote(rows messageRows, withSender bool) ([]dom
 			&msg.CreatedAt, &msg.UpdatedAt,
 			(*string)(&msg.LinkSafety),
 			&msg.EventType, &eventPayload,
+			(*string)(&msg.Priority),
+			&msg.AcknowledgementRequired,
 		}
 		if withSender {
 			dest = append(dest, &msg.SenderDisplayName, &msg.SenderEmail, &msg.SenderAvatarURL, &msg.IsFavorited)

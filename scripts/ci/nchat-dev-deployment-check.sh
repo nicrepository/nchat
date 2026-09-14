@@ -763,6 +763,47 @@ validate_hostname_unicode_locale_and_boundaries() {
   fi
 }
 
+# The caller of the single builder (CICD-05) has to stay a caller: it delegates
+# every build to build-nchat-images.yml and grows no matrix of its own, so the
+# eleven images cannot drift between development and production. The rest of the
+# two-workflow contract -- the protected dispatch, the immutable SHA, the
+# reachable-from-main gate and the registry permission boundary -- is owned by
+# scripts/ci/check_build_images_workflow.py, which pnpm ci runs against both
+# files; restating it here would only give it a second, weaker definition.
+check_single_builder_caller() {
+  local caller="$1"
+  # An active `uses:` key, not the path wherever it happens to appear: a comment
+  # or a quoted value mentioning the builder proves nothing about the wiring.
+  grep -Eq '^[[:space:]]*uses:[[:space:]]+\./\.github/workflows/build-nchat-images\.yml[[:space:]]*$' "$caller" || return 1
+  ! grep -Eq '^[[:space:]]*matrix:' "$caller" || return 1
+}
+
+# A caller whose delegation moved to another workflow with the builder path left
+# behind as a comment. Every string a substring matcher looks for is still in
+# the file; nothing delegates to the single builder any more.
+comment_out_single_builder() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *'uses: ./.github/workflows/build-nchat-images.yml')
+        printf '%s\n' "${line%%uses:*}uses: ./.github/workflows/other.yml" "#$line" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
+}
+
+validate_single_builder_contract() {
+  local caller="$ROOT_DIR/.github/workflows/images.yml" mutant="$TEMP_DIR/images-caller.yml"
+  check_single_builder_caller "$caller" || fail "image workflow no longer delegates to the single builder"
+  grep -Fv 'uses: ./.github/workflows/build-nchat-images.yml' "$caller" >"$mutant"
+  ! check_single_builder_caller "$mutant" || fail "a caller that dropped the single builder was accepted"
+  { cat "$caller"; printf '      matrix:\n'; } >"$mutant"
+  ! check_single_builder_caller "$mutant" || fail "a caller with a build matrix of its own was accepted"
+  comment_out_single_builder <"$caller" >"$mutant"
+  [[ "$(grep -Ec '^[[:space:]]*#[[:space:]]*uses:[[:space:]]+\./\.github/workflows/build-nchat-images\.yml$' "$mutant")" -eq 1 ]] || fail "the commented-builder fixture did not apply"
+  ! check_single_builder_caller "$mutant" || fail "a caller that only mentions the single builder in a comment was accepted"
+}
+
 validate_image_inventory() {
   local service image deployment invalid_inventory="$TEMP_DIR/invalid-images.txt"
   local -a discovered=()
@@ -772,8 +813,7 @@ validate_image_inventory() {
   done
   [[ "$(printf '%s\n' "${discovered[@]}" | LC_ALL=C sort)" == \
       "$(printf '%s\n' "${NCHAT_DEV_GO_SERVICES[@]}" | LC_ALL=C sort)" ]] || fail "Go service inventory drift"
-  grep -Fq 'fromJSON(needs.inventory.outputs.images)' "$ROOT_DIR/.github/workflows/images.yml" || fail "image workflow does not derive its matrix"
-  ! grep -q 'workflow_dispatch:' "$ROOT_DIR/.github/workflows/images.yml" || fail "unprotected manual image publishing is enabled"
+  validate_single_builder_contract
   ! grep -Eq 'for image in (web|auth-service)' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy duplicates the image inventory"
   ! grep -Eq 'kubectl[[:space:]]+apply[[:space:]]+-k' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy uses kubectl embedded Kustomize"
   grep -Fq 'actual_kustomize="$(kustomize version)"' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "deploy does not validate standalone Kustomize"

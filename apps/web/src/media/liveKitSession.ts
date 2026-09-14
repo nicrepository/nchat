@@ -1,4 +1,6 @@
 import type {
+  CallDeviceKind,
+  CallMediaDevice,
   LiveKitSpikeSession,
   LiveKitSpikeSessionCallbacks,
   LiveKitSpikeSessionFactory,
@@ -8,6 +10,7 @@ export type LiveKitSession = LiveKitSpikeSession;
 export type LiveKitSessionCallbacks = LiveKitSpikeSessionCallbacks;
 export type LiveKitSessionFactory = LiveKitSpikeSessionFactory;
 export type LiveKitSessionLoader = () => Promise<LiveKitSessionFactory>;
+export type { CallDeviceKind, CallMediaDevice };
 
 interface LiveKitSessionModule {
   createLiveKitSpikeSession: LiveKitSessionFactory;

@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
-import { showBrowserMessageNotification } from "./browserNotification";
 import {
   fetchSidebarData,
   leaveConversation as leaveConversationRequest,
@@ -13,16 +12,27 @@ import {
 } from "./chatApi";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
-import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
-import { playMessageSound } from "./messageSound";
+import {
+  normalizeMessagePriority,
+  type Channel,
+  type ChannelCategory,
+  type ConversationActivity,
+  type DMConversation,
+} from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
 import {
   loadPersistedUnread,
   savePersistedUnread,
   type PersistedUnreadEntry,
 } from "./sidebarUnreadPersistence";
-import { getSoundNotificationMode } from "./soundPreference";
-import { classifySoundEvent, shouldPlayMessageSound } from "./soundRules";
+import type { InAppAlert } from "./InAppMessageAlert";
+import {
+  presentLiveMessageNotification,
+  type MessageNotificationEvent,
+  type MessagePresentationSinks,
+} from "./notificationPresentation";
+import { admitRealtimeMessage } from "./realtimeMessageLedger";
+import { isNamedRecipient } from "./soundRules";
 import {
   useChatWebSocket,
   type WSMessageCreatedEvent,
@@ -322,96 +332,102 @@ function targetFromPath(pathname: string): WSSubscriptionTarget | undefined {
 }
 
 /**
- * Announces one freshly received message to the reader and reports whether it
- * mentions them.
+ * What the sidebar already knows about the conversation an event arrived in.
  *
- * Two things at once because they answer the same question from the same
- * classification: "is this relevant to the reader" decides the chime, and its
- * mention half decides the unread badge's dot. It is computed here rather than
- * threaded out of the reducer because a reducer performs state transitions, not
- * side effects like audio playback — and running the classification twice for
- * one event is how the two answers eventually disagree.
+ * One lookup rather than one per field: the mute preference and the
+ * conversation's name are two facts about the same row, and reading it twice is
+ * how they eventually come from different rows. The absent row is normalised
+ * here as well, so the caller reads two plain values instead of re-deciding what
+ * a missing conversation means at each use.
  */
-function announceMessage(
+function conversationRowFor(
   event: WSMessageCreatedEvent,
-  currentUserId: string,
-  activeTarget: WSSubscriptionTarget | undefined,
-  isMuted: boolean,
-  onNavigate: (path: string) => void,
-): boolean {
-  const payload = event.payload;
-  if (!payload) return false;
-  const classified = classifySoundEvent(payload, event.target_type, currentUserId);
-  if (isMuted) return classified.isMentioned;
-  const isWindowFocused =
-    document.visibilityState === "visible" &&
-    typeof document.hasFocus === "function" &&
-    document.hasFocus();
-  const play = shouldPlayMessageSound({
-    mode: getSoundNotificationMode(),
-    // Already past the seenRealtimeMessageIds check at the call site — this
-    // event is guaranteed fresh by the time it reaches this decision.
-    isDuplicate: false,
-    isOwnMessage: (payload.sender_id ?? "") === currentUserId,
-    category: classified.category,
-    isMentioned: classified.isMentioned,
-    isActiveConversation:
-      activeTarget?.kind === event.target_type && activeTarget.targetId === event.target_id,
-    isWindowFocused,
-  });
-  if (play) notifyOrChime(event, payload, isWindowFocused, onNavigate);
-  return classified.isMentioned;
+  state: SidebarState,
+): { muted: boolean; name: string } {
+  const items =
+    state.status !== "ready" ? [] : event.target_type === "channel" ? state.channels : state.dms;
+  const row = items.find(({ id }) => id === event.target_id);
+  return { muted: Boolean(row?.muted), name: row?.name ?? "" };
+}
+
+/** The wire payload projected onto what the presentation layer reads. */
+function notificationEventFrom(
+  event: WSMessageCreatedEvent,
+  payload: NonNullable<WSMessageCreatedEvent["payload"]>,
+  conversationName: string,
+): MessageNotificationEvent {
+  return {
+    eventId: payload.id,
+    targetKind: event.target_type,
+    targetId: event.target_id,
+    senderId: payload.sender_id ?? "",
+    senderDisplayName: payload.sender_display_name ?? "",
+    // Typed unknown on the wire on purpose: it is a URL from another user's
+    // profile and the payload does not vouch for it. A non-string is simply
+    // no avatar, which the alert already renders as initials.
+    senderAvatarUrl:
+      typeof payload.sender_avatar_url === "string" ? payload.sender_avatar_url : undefined,
+    bodyText: payload.body_text ?? "",
+    conversationName,
+    // Narrowed here, at the wire's edge, so the presentation layer receives one
+    // of three values and never a server string it has to interpret (#826).
+    priority: normalizeMessagePriority(payload.priority),
+    policy: payload.notification_policy,
+  };
 }
 
 /**
- * The native notification and the chime are alternate channels for the same
- * eligible event, never both: a native one shown successfully replaces the
- * chime; anything else (denied/default/unsupported permission, a background API
- * failure, or the tab being in the foreground — native notifications never fire
- * there) falls through to the sound path.
+ * Hands one freshly received message to the presentation layer (issue #749).
+ *
+ * The sidebar's own part is over by the time this runs: the event has been
+ * deduplicated and unread is about to be updated. Whether anything is heard or
+ * shown, on which surface, and on which tab, is decided entirely over there —
+ * this supplies the event plus the two facts no server can observe (the reader
+ * has this conversation open here; they muted it).
+ *
+ * Nothing comes back. A chime that is blocked, an event another tab claimed, or
+ * a browser that cannot coordinate at all changes nothing about the badge:
+ * presentation and message state are separate on purpose.
  */
-function notifyOrChime(
+function presentIncomingMessage(
   event: WSMessageCreatedEvent,
-  payload: NonNullable<WSMessageCreatedEvent["payload"]>,
-  isWindowFocused: boolean,
-  onNavigate: (path: string) => void,
+  state: SidebarState,
+  activeTarget: WSSubscriptionTarget | undefined,
+  row: { muted: boolean; name: string },
+  sinks: MessagePresentationSinks,
 ): void {
-  let shown = false;
-  if (!isWindowFocused) {
-    try {
-      shown = showBrowserMessageNotification({
-        targetKind: event.target_type,
-        targetId: event.target_id,
-        senderDisplayName: payload.sender_display_name,
-        bodyText: payload.body_text,
-        onNavigate,
-      }).shown;
-    } catch {
-      // The module already guards itself; this is defense in depth — the WS
-      // callback must never break because of it.
-    }
-  }
-  if (shown) return;
-  // playMessageSound() already never throws, but the unread badge must update
-  // even if that guarantee is ever violated — a failed chime is never allowed to
-  // break message receipt.
-  try {
-    playMessageSound();
-  } catch {
-    // Swallowed on purpose: see above.
-  }
+  const payload = event.payload;
+  if (state.status !== "ready" || !payload) return;
+  // Deliberately not awaited, and safe to drop: the presentation layer never
+  // rejects, and its outcome changes nothing here. Whether this tab won the
+  // event's claim, lost it, or found no way to coordinate at all, the unread
+  // badge and the message itself are decided by the lines that follow.
+  void presentLiveMessageNotification(
+    notificationEventFrom(event, payload, row.name),
+    {
+      currentUserId: state.currentUserId,
+      isMutedConversation: row.muted,
+      isActiveConversation:
+        activeTarget?.kind === event.target_type && activeTarget.targetId === event.target_id,
+    },
+    sinks,
+  );
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useChatSidebar() {
   const [state, dispatch] = useReducer(reducer, { status: "loading" });
+  // The in-app surface of the delivery plan (issue #744). One alert, the newest,
+  // and nothing kept: it is a notification, not a history. Held here because
+  // this hook is where an arriving message is already turned into effects.
+  const [inAppAlert, setInAppAlert] = useState<InAppAlert | null>(null);
+  const dismissInAppAlert = useCallback(() => setInAppAlert(null), []);
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const openedTarget = targetFromPath(pathname);
   const openedTargetKind = openedTarget?.kind;
   const openedTargetId = openedTarget?.targetId;
-  const seenRealtimeMessageIds = useRef(new Set<string>());
   const mountedRef = useRef(true);
   const loadPromiseRef = useRef<Promise<void> | null>(null);
 
@@ -602,8 +618,14 @@ export function useChatSidebar() {
     // same refetch settles it — and it is coalesced, so a burst costs one.
     onConversationEvent: refreshSidebar,
     onMessageCreated: (event: WSMessageCreatedEvent) => {
-      if (seenRealtimeMessageIds.current.has(event.message_id)) return;
-      seenRealtimeMessageIds.current.add(event.message_id);
+      // State ingestion, once per message and before anything derives from it
+      // (issue #750). `false` is a redelivery: this client already took the
+      // message in, so it must neither count again nor be offered for
+      // presentation. The ledger is bounded and session-scoped — it replaced an
+      // unbounded Set held here, which grew for the life of the tab. See
+      // realtimeMessageLedger for why bounding it is safe against the server's
+      // own delivery contract.
+      if (!admitRealtimeMessage(event.message_id)) return;
       // The message's own created_at, assigned when the row was written — not
       // the envelope's created_at (when the event was published), not the moment
       // it arrived here, and never a browser clock. It is absent on route-only
@@ -616,22 +638,21 @@ export function useChatSidebar() {
         refreshSidebar();
         return;
       }
+      const row = conversationRowFor(event, state);
+      // The mention half of the classification the presentation layer also
+      // reads, and the only part of it the sidebar needs: it decides the unread
+      // badge's dot. Authoritative — the server's own mention codec decided
+      // this, not a reading of the body here.
       const isMentioned =
         state.status === "ready" &&
-        announceMessage(
-          event,
-          state.currentUserId,
-          openedTarget,
-          Boolean(
-            (event.target_type === "channel" ? state.channels : state.dms).find(
-              ({ id }) => id === event.target_id,
-            )?.muted,
-          ),
-          (path) => {
-            navigate(path);
-            refreshSidebar();
-          },
-        );
+        isNamedRecipient(event.payload?.notification_policy, state.currentUserId);
+      presentIncomingMessage(event, state, openedTarget, row, {
+        showInApp: setInAppAlert,
+        navigate: (path) => {
+          navigate(path);
+          refreshSidebar();
+        },
+      });
       dispatch({
         type: "message_created",
         target: { kind: event.target_type, targetId: event.target_id },
@@ -642,19 +663,6 @@ export function useChatSidebar() {
       });
     },
   });
-
-  useEffect(() => {
-    if (state.status === "ready" && openedTargetKind && openedTargetId) {
-      dispatch({
-        type: "target_opened",
-        target: { kind: openedTargetKind, targetId: openedTargetId },
-      });
-      void Promise.resolve(markConversationRead(openedTargetKind, openedTargetId)).catch(() => {
-        // Local UI remains responsive while a later refresh reconciles with
-        // the server. A failed read receipt must never break chat navigation.
-      });
-    }
-  }, [openedTargetKind, openedTargetId, state.status]);
 
   const setPinned = useCallback(
     async (target: WSSubscriptionTarget, pinned: boolean) => {
@@ -713,27 +721,54 @@ export function useChatSidebar() {
   );
 
   /**
+   * Conversations with a mute write in flight, keyed `kind:targetId`.
+   *
+   * A ref rather than state: nothing renders from it, and it has to be read and
+   * written synchronously inside one call — a state update would land a render
+   * later, which is exactly the window two clicks slip through.
+   */
+  const muteInFlight = useRef<Set<string>>(new Set());
+
+  /**
    * Silences or restores one conversation for this user only (issue #527).
    *
    * Optimistic like the pin, and for the same reason: it is a private
    * preference the server either accepts or refuses outright, so showing the
    * new state immediately and rolling back on failure is honest. The refetch
-   * after a confirmed write reconciles with what was actually persisted.
+   * after a confirmed write reconciles with what was actually persisted —
+   * without it the optimistic guess would be the last word, which is what the
+   * comment above this function already claimed and the code did not do.
+   *
+   * One write per conversation at a time (issue #729). Two surfaces reach this
+   * same function — the sidebar row menu and the notifications settings page,
+   * both mounted together on /profile — so a per-target guard here is what
+   * makes the property hold wherever the click came from, rather than each
+   * surface policing only itself. A second call for a conversation already
+   * being written is dropped, not queued: POST and DELETE to the same mute
+   * endpoint have no ordering guarantee in flight, and the refetch that follows
+   * the first one converges the row with the server anyway. Different
+   * conversations are independent and never wait on each other.
    */
   const setMuted = useCallback(
     async (target: WSSubscriptionTarget, muted: boolean) => {
       if (state.status !== "ready") return;
+      const key = `${target.kind}:${target.targetId}`;
+      if (muteInFlight.current.has(key)) return;
       const items = target.kind === "channel" ? state.channels : state.dms;
       const previous = Boolean(items.find((item) => item.id === target.targetId)?.muted);
+      muteInFlight.current.add(key);
       dispatch({ type: "mute_changed", target, muted });
       try {
         await setConversationMuted(target.kind, target.targetId, muted);
+        refreshSidebar();
       } catch (error) {
         dispatch({ type: "mute_changed", target, muted: previous });
         throw error;
+      } finally {
+        muteInFlight.current.delete(key);
       }
     },
-    [state],
+    [refreshSidebar, state],
   );
 
   /**
@@ -789,5 +824,7 @@ export function useChatSidebar() {
     renameGroup,
     setMuted,
     leaveConversation,
+    inAppAlert,
+    dismissInAppAlert,
   };
 }

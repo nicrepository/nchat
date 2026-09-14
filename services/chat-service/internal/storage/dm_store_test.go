@@ -30,6 +30,12 @@ func dmMemberUpsertRows(eligible int, addedUserIDs ...string) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{"eligible", "added_user_ids"}).AddRow(eligible, addedUserIDs)
 }
 
+// Also the regression guard for issue #685's conversation_created event: a
+// 1:1 direct conversation has no roster to narrate, and createDirectConversation
+// (unlike createGroupConversation, below) never calls InsertConversationEvent.
+// Strict, ordered pgxmock expectations mean an accidental call here would fail
+// this test with "unexpected call to Query INSERT INTO chat.messages" rather
+// than silently passing.
 func TestPGXDMStore_CreateDirectConversation_CreatesCanonicalPair(t *testing.T) {
 	mock, err := pgxmock.NewPool()
 	if err != nil {
@@ -176,6 +182,7 @@ func TestPGXDMStore_CreateGroupConversation_CommitsConversationAndMembers(t *tes
 		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-group", "ws-1", "group", "Project", "active", "user-1", now, now))
+	expectConversationCreatedEvent(mock, "", "dm-group")
 	mock.ExpectQuery(`(?s)unnest\(\$3::uuid\[\]\).*auth\.users u.*u\.status = 'active' AND u\.deleted_at IS NULL.*INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
 		WillReturnRows(dmMemberUpsertRows(3))
@@ -212,6 +219,7 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenMemberInsertFails(t *te
 		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now))
+	expectConversationCreatedEvent(mock, "", "dm-group")
 	mock.ExpectQuery(`INSERT INTO chat\.dm_members`).
 		WithArgs("dm-group", "ws-1", []string{"user-1", "user-2", "user-3"}).
 		WillReturnError(errors.New("member insert failed"))
@@ -244,6 +252,7 @@ func TestPGXDMStore_CreateGroupConversation_RollsBackWhenAParticipantIsNotEligib
 		WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 		WillReturnRows(pgxmock.NewRows(dmConversationCols()).
 			AddRow("dm-group", "ws-1", "group", "", "active", "user-1", now, now))
+	expectConversationCreatedEvent(mock, "", "dm-group")
 	// Two of the three requested participants were eligible at write time: the
 	// count mismatch alone must abort the whole group, without the store having to
 	// know which one dropped out.
@@ -284,6 +293,7 @@ func TestPGXDMStore_CreateGroupConversation_PropagatesTransactionFailures(t *tes
 			mock.ExpectBegin()
 			mock.ExpectQuery(`INSERT INTO chat\.dm_conversations`).WithArgs("ws-1", pgxmock.AnyArg(), "user-1").
 				WillReturnRows(pgxmock.NewRows(dmConversationCols()).AddRow("dm-1", "ws-1", "group", "", "active", "user-1", now, now))
+			expectConversationCreatedEvent(mock, "", "dm-1")
 			mock.ExpectQuery(`INSERT INTO chat\.dm_members`).WithArgs("dm-1", "ws-1", []string{"user-1"}).WillReturnRows(dmMemberUpsertRows(1))
 			mock.ExpectCommit().WillReturnError(errors.New("commit failed"))
 			mock.ExpectRollback()

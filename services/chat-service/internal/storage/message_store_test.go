@@ -72,6 +72,12 @@ func messageCols() []string {
 		// The structured conversation event (issue #527). Non-null only on
 		// kind='system' rows, which the database enforces.
 		"event_type", "event_payload",
+		// The author's stated priority (issue #821). NOT NULL DEFAULT 'standard',
+		// so every row has one including every row written before the column did.
+		"priority",
+		// Whether the author asked for explicit confirmation (issue #824).
+		// NOT NULL DEFAULT false, on the same terms.
+		"acknowledgement_required",
 	}
 }
 
@@ -89,6 +95,10 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		"",
 		// A user message carries no conversation event.
 		"", []byte(nil),
+		// The priority almost every message carries.
+		"standard",
+		// Almost no message asks for confirmation.
+		false,
 	}
 }
 
@@ -166,6 +176,11 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // create request fingerprint
 			pgxmock.AnyArg(), // initial link safety state
 			pgxmock.AnyArg(), // aggregate attachment byte limit
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
+			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
+			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
 		).
 		WillReturnRows(rows)
 }
@@ -232,6 +247,11 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
 					pgxmock.AnyArg(),
+					pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+					pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+					pgxmock.AnyArg(), // priority (issue #821)
+					pgxmock.AnyArg(), // acknowledgement_required (issue #824)
+					pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
 				).
 				WillReturnError(dbErr)
 
@@ -578,7 +598,12 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
-					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+					pgxmock.AnyArg(),  // mention_all_group_members (issue #776)
+					pgxmock.AnyArg(),  // max_group_all_mention_recipients (issue #776 SR-002)
+					pgxmock.AnyArg(),  // priority (issue #821)
+					pgxmock.AnyArg(),  // acknowledgement_required (issue #824)
+					pgxmock.AnyArg()). // max_acknowledgement_recipients (issue #824)
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -602,6 +627,11 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			[]string{"22222222-2222-2222-2222-222222222222"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
+			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
+			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -622,6 +652,82 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 	checkExpectations(t, mock)
 }
 
+// SEC-776-01, pinned against the statement that actually runs rather than a
+// hand-copied mirror of it: the eligible-recipient CTE carries a LIMIT of one
+// past the bound, and the bound decision itself is an OFFSET/LIMIT existence
+// test over that already-capped set — never an aggregate over the roster.
+//
+// A regex over the real SQL is the right instrument here because the property
+// is a property of the query text: a CTE with LIMIT n cannot yield more than n
+// rows whatever the planner decides, so this holds independently of statistics,
+// version or configuration. The EXPLAIN in
+// message_all_mention_group_postgres_test.go covers the complementary
+// pre-flight path on a live planner.
+func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)eligible_all_mention_recipients AS \(.*`+
+		`LIMIT \$22::int \+ 1.*`+
+		`invalid_all_mention_fanout AS \(\s*SELECT 1\s*FROM eligible_all_mention_recipients\s*OFFSET \$22::int\s*LIMIT 1.*`+
+		`all_mention_recipients AS \(.*FROM eligible_all_mention_recipients`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			true,                                // mention_all_group_members
+			domain.MaxGroupAllMentionRecipients, // the bound, never a literal in SQL
+			pgxmock.AnyArg(),                    // priority (issue #821)
+			pgxmock.AnyArg(),                    // acknowledgement_required (issue #824)
+			domain.MaxAcknowledgementRecipients, // the bound, never a literal in SQL
+		).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-bounded", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
+
+	if _, err := storage.NewPGXMessageStore(mock).CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", DMConversationID: "33333333-3333-3333-3333-333333333333",
+		SenderID: "user-1", BodyText: "@all", BodyFormat: domain.MessageBodyFormatV3,
+		MentionAllGroupMembers: true,
+	}); err != nil {
+		t.Fatalf("CreateMessage: %v", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOutbox(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.dm_conversations source_dm.*source_dm\.type = 'group'.*chat\.notification_outbox.*ON CONFLICT`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(),
+			[]string{"11111111-1111-1111-1111-111111111111"},
+			[]string{},
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			false,            // mention_all_group_members: not set by this input (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
+			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
+			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+		).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
+
+	msg, err := storage.NewPGXMessageStore(mock).CreateMessage(context.Background(), storage.CreateMessageInput{
+		WorkspaceID: "ws-1", DMConversationID: "33333333-3333-3333-3333-333333333333",
+		SenderID: "user-1", BodyText: "mention", BodyFormat: domain.MessageBodyFormatV3,
+		MentionedUserIDs:    []string{"11111111-1111-1111-1111-111111111111"},
+		MentionedChannelIDs: []string{},
+	})
+	if err != nil || msg.ID != "msg-group-mention" {
+		t.Fatalf("message=%+v err=%v", msg, err)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.channel_members.*NOT EXISTS \(SELECT 1 FROM invalid_mentions\)`).
@@ -632,6 +738,11 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			[]string{"99999999-9999-9999-9999-999999999999"},
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), // mention_all_group_members (issue #776)
+			pgxmock.AnyArg(), // max_group_all_mention_recipients (issue #776 SR-002)
+			pgxmock.AnyArg(), // priority (issue #821)
+			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
+			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -718,7 +829,7 @@ func TestPGXMessageStore_ResolveMentionLabels(t *testing.T) {
 func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 	t.Run("empty IDs skip database", func(t *testing.T) {
 		labels, err := storage.NewPGXMessageStore(newMock(t)).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", nil, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", nil, nil,
 		)
 		if err != nil || len(labels) != 0 {
 			t.Fatalf("labels=%v err=%v", labels, err)
@@ -728,16 +839,33 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 	t.Run("returns only channel members and visible channels", func(t *testing.T) {
 		mock := newMock(t)
 		mock.ExpectQuery(`(?s)chat\.channel_members.*chat\.workspace_members.*auth\.users.*UNION ALL.*chat\.workspaces.*channel_visible_to_user`).
-			WithArgs("ws-1", "ch-1", "requester-1", []string{"user-1"}, []string{"ch-2"}).
+			WithArgs("ws-1", pgxmock.AnyArg(), pgxmock.AnyArg(), "requester-1", []string{"user-1"}, []string{"ch-2"}).
 			WillReturnRows(pgxmock.NewRows([]string{"kind", "id", "label"}).
 				AddRow("user", "user-1", "Ana").
 				AddRow("channel", "ch-2", "produto"))
 
 		labels, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1",
+			context.Background(), "ws-1", "ch-1", "", "requester-1",
 			[]string{"user-1"}, []string{"ch-2"},
 		)
 		if err != nil || labels["user:user-1"] != "Ana" || labels["channel:ch-2"] != "produto" {
+			t.Fatalf("labels=%v err=%v", labels, err)
+		}
+		checkExpectations(t, mock)
+	})
+
+	t.Run("returns only active group members", func(t *testing.T) {
+		mock := newMock(t)
+		mock.ExpectQuery(`(?s)chat\.dm_conversations.*source_dm\.type = 'group'.*chat\.dm_members`).
+			WithArgs("ws-1", pgxmock.AnyArg(), pgxmock.AnyArg(), "requester-1", []string{"user-1"}, []string{}).
+			WillReturnRows(pgxmock.NewRows([]string{"kind", "id", "label"}).
+				AddRow("user", "user-1", "Juliane Lino"))
+
+		labels, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
+			context.Background(), "ws-1", "", "group-1", "requester-1",
+			[]string{"user-1"}, []string{},
+		)
+		if err != nil || labels["user:user-1"] != "Juliane Lino" {
 			t.Fatalf("labels=%v err=%v", labels, err)
 		}
 		checkExpectations(t, mock)
@@ -747,7 +875,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 		mock := newMock(t)
 		mock.ExpectQuery(`SELECT 'user'`).WillReturnError(errors.New("db unavailable"))
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected query error")
@@ -760,7 +888,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 			pgxmock.NewRows([]string{"kind", "id", "label"}).AddRow("user", "user-1", nil),
 		)
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected scan error")
@@ -775,7 +903,7 @@ func TestPGXMessageStore_ResolveAuthorizedMentionLabels(t *testing.T) {
 				RowError(0, errors.New("stream failed")),
 		)
 		_, err := storage.NewPGXMessageStore(mock).ResolveAuthorizedMentionLabels(
-			context.Background(), "ws-1", "ch-1", "requester-1", []string{"user-1"}, nil,
+			context.Background(), "ws-1", "ch-1", "", "requester-1", []string{"user-1"}, nil,
 		)
 		if err == nil {
 			t.Fatal("expected iteration error")
@@ -818,6 +946,8 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
+		"standard",
+		false,
 		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)
@@ -1115,6 +1245,11 @@ func TestPGXMessageStore_DeleteMessage_SoftDeletesAndPreservesRow(t *testing.T) 
 	mock.ExpectExec(`(?s)UPDATE chat\.messages.*status = 'deleted'.*sender_id = \$3`).
 		WithArgs("msg-1", "ws-1", "user-1", now).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// Issue #824: withdrawing the message withdraws the question, in the same
+	// transaction and bearing the same instant as the delete.
+	mock.ExpectExec(`(?s)UPDATE chat\.message_acknowledgements.*state = 'cancelled'.*state = 'pending'`).
+		WithArgs("msg-1", now).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
 	row := listMessageWithQuoteRow("msg-1", "ws-1", "ch-1", "", createdAt)
 	row[8], row[14], row[16] = "deleted", &now, now
 	mock.ExpectQuery(`(?s)SELECT .*FROM chat\.messages m.*WHERE m\.id = \$1 AND m\.workspace_id = \$2`).
@@ -1432,6 +1567,8 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		"",
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
+		"standard",
+		false,
 		"Test User", "test@example.com", "", false,
 	}
 	row = append(row, emptyQuoteRow()...)

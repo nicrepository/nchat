@@ -32,7 +32,7 @@ RUN cd services/document-converter && GOWORK=off CGO_ENABLED=0 GOOS=linux go bui
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y libreoffice-calc libreoffice-impress libreoffice-writer fonts-dejavu-core \
+    && apt-get install --no-install-recommends -y libreoffice-calc libreoffice-impress libreoffice-writer fonts-dejavu-core ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin converter
 COPY --from=build /out/document-converter /usr/local/bin/document-converter

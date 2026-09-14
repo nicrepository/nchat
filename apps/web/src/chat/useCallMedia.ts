@@ -2,14 +2,19 @@ import { useCallback, useEffect, useRef, useState, type RefCallback } from "reac
 
 import {
   loadLiveKitSessionFactory,
+  type CallDeviceKind,
+  type CallMediaDevice,
   type LiveKitSession,
   type LiveKitSessionCallbacks,
   type LiveKitSessionFactory,
   type LiveKitSessionLoader,
 } from "../media/liveKitSession";
 import { nextStableSpeaker, type StableSpeakerState } from "../calls/activeSpeaker";
+import { readDevicePreference, writeDevicePreference } from "../calls/callDevicePreference";
 import type { MediaIntent } from "../calls/callOwnership";
 import type { CallType } from "./callState";
+
+const DEVICE_KINDS: CallDeviceKind[] = ["audioinput", "videoinput", "audiooutput"];
 
 export type CallMediaStatus =
   | "idle"
@@ -75,6 +80,18 @@ export interface CallMediaController {
   toggleCamera: () => Promise<boolean | undefined>;
   toggleScreenShare: () => Promise<void>;
   activateAudio: () => Promise<void>;
+  // Device selection (issue #755). Populated once the session is connected;
+  // empty/false before then. Independent of pendingControl (mic/camera/
+  // screen-share) — a device switch never blocks, and is never blocked by,
+  // those toggles.
+  mediaDevices: Record<CallDeviceKind, CallMediaDevice[]>;
+  activeDeviceId: Partial<Record<CallDeviceKind, string>>;
+  devicePendingKinds: CallDeviceKind[];
+  deviceError: string | null;
+  audioOutputSupported: boolean;
+  // Never enables a device that is currently off — see liveKitSpikeSession's
+  // switchActiveDevice doc. Returns whether the switch actually applied.
+  switchDevice: (kind: CallDeviceKind, deviceId: string) => Promise<boolean>;
 }
 
 export interface CallMediaSessionController extends CallMediaController {
@@ -105,6 +122,11 @@ interface MediaState {
   screenShareEnabled: boolean;
   remoteScreenShare: RemoteScreenShare | null;
   participants: ParticipantMedia[];
+  mediaDevices: Record<CallDeviceKind, CallMediaDevice[]>;
+  activeDeviceId: Partial<Record<CallDeviceKind, string>>;
+  devicePendingKinds: CallDeviceKind[];
+  deviceError: string | null;
+  audioOutputSupported: boolean;
 }
 
 const initialState: MediaState = {
@@ -123,6 +145,11 @@ const initialState: MediaState = {
   screenShareEnabled: false,
   remoteScreenShare: null,
   participants: [],
+  mediaDevices: { audioinput: [], videoinput: [], audiooutput: [] },
+  activeDeviceId: {},
+  devicePendingKinds: [],
+  deviceError: null,
+  audioOutputSupported: false,
 };
 
 interface ParticipantMediaEntry {
@@ -138,6 +165,16 @@ interface ParticipantMediaEntry {
 // or generation can never be mistaken for the currently pending one.
 interface PendingMediaOperation {
   readonly control: "microphone" | "camera" | "screen-share";
+  readonly session: LiveKitSession;
+  readonly generation: number;
+}
+
+// Same reference-identity guard as PendingMediaOperation above, keyed per
+// CallDeviceKind (a Map, not a single slot) so switching the microphone and
+// the camera concurrently are independent operations — never blocking each
+// other, and each still immune to a stale resolution overwriting a newer
+// switch for that same kind.
+interface PendingDeviceOperation {
   readonly session: LiveKitSession;
   readonly generation: number;
 }
@@ -180,6 +217,13 @@ export function useCallMedia(
   // avoid acting on a stale closure.
   const microphoneEnabledRef = useRef(false);
   const screenShareEnabledRef = useRef(false);
+  // Device selection (issue #755) bookkeeping, independent of
+  // pendingControlRef above (mic/camera/screen-share on/off).
+  const devicePendingRef = useRef(new Map<CallDeviceKind, PendingDeviceOperation>());
+  // Mirrors state.activeDeviceId so onActiveDeviceChanged (an SDK callback
+  // that only ever names ONE kind at a time) can merge into it without
+  // reading stale React state from a closure.
+  const activeDeviceIdRef = useRef<Partial<Record<CallDeviceKind, string>>>({});
   const speakerStateRef = useRef<StableSpeakerState | null>(null);
   const speakerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localContainerRef = useRef<HTMLDivElement | null>(null);
@@ -372,6 +416,8 @@ export function useCallMedia(
       audioActivationRequiredRef.current = false;
       microphoneEnabledRef.current = false;
       screenShareEnabledRef.current = false;
+      devicePendingRef.current.clear();
+      activeDeviceIdRef.current = {};
       generationRef.current += 1;
       clearElements();
       if (session && !disconnectPromiseRef.current) {
@@ -385,6 +431,48 @@ export function useCallMedia(
     remoteAudioContainerRef.current = element;
     if (element) element.replaceChildren(...remoteAudioElementsRef.current);
   }, []);
+
+  // Re-enumerates every device kind and re-reads the SDK's own active
+  // device, then publishes both together — never devices without a matching
+  // active id, which would leave the UI unable to show a selected value it
+  // just received the option for. Called after a successful connect and
+  // whenever the SDK reports the device list changed (hot-plug). Guards
+  // against a stale resolution racing a stop()/reconnect the same way every
+  // other async operation in this hook does (session/generation check on
+  // the far side of the await, never before it).
+  const refreshMediaDevices = useCallback(
+    async (
+      session: LiveKitSession,
+      generation: number,
+    ): Promise<Record<CallDeviceKind, CallMediaDevice[]> | null> => {
+      const lists = await Promise.all(
+        DEVICE_KINDS.map((kind) => session.listMediaDevices(kind).catch(() => [])),
+      );
+      if (
+        !mountedRef.current ||
+        generationRef.current !== generation ||
+        sessionRef.current !== session
+      ) {
+        return null;
+      }
+      const mediaDevices = Object.fromEntries(
+        DEVICE_KINDS.map((kind, index) => [kind, lists[index]]),
+      ) as Record<CallDeviceKind, CallMediaDevice[]>;
+      const activeDeviceId: Partial<Record<CallDeviceKind, string>> = {};
+      for (const kind of DEVICE_KINDS) {
+        const id = session.getActiveDevice(kind);
+        if (id) activeDeviceId[kind] = id;
+      }
+      activeDeviceIdRef.current = activeDeviceId;
+      update({
+        mediaDevices,
+        activeDeviceId,
+        audioOutputSupported: session.isAudioOutputSupported(),
+      });
+      return mediaDevices;
+    },
+    [update],
+  );
 
   const callbacksFor = useCallback(
     (generation: number): LiveKitSessionCallbacks => {
@@ -609,11 +697,22 @@ export function useCallMedia(
           remoteScreenSharesRef.current.set(trackSid, { identity, element });
           syncPresentedRemoteScreenShare();
         },
+        onDeviceListChanged() {
+          if (!current()) return;
+          const session = sessionRef.current;
+          if (session) void refreshMediaDevices(session, generation);
+        },
+        onActiveDeviceChanged(kind, deviceId) {
+          if (!current()) return;
+          activeDeviceIdRef.current = { ...activeDeviceIdRef.current, [kind]: deviceId };
+          update({ activeDeviceId: activeDeviceIdRef.current });
+        },
       };
     },
     [
       ensureParticipant,
       invalidateDeadSession,
+      refreshMediaDevices,
       removeParticipant,
       syncParticipants,
       syncPresentedRemoteScreenShare,
@@ -751,6 +850,8 @@ export function useCallMedia(
     audioActivationRequiredRef.current = false;
     microphoneEnabledRef.current = false;
     screenShareEnabledRef.current = false;
+    devicePendingRef.current.clear();
+    activeDeviceIdRef.current = {};
     generationRef.current += 1;
     clearElements();
     update(initialState);
@@ -851,6 +952,32 @@ export function useCallMedia(
           if (sessionRef.current !== session || generationRef.current !== generation) {
             return undefined;
           }
+          // Device selection (issue #755): re-enumerate, then reapply the
+          // user's last device preference for this browser — never gated on
+          // initialIntent/call type, since a device choice is independent of
+          // MediaIntent's mic/camera on/off. switchActiveDevice never
+          // captures a device that is not currently published, so this can
+          // never turn mic/camera on. Best-effort: a device that vanished or
+          // an unsupported output kind is silently skipped, never a connect
+          // failure.
+          const deviceLists = await refreshMediaDevices(session, generation);
+          if (sessionRef.current !== session || generationRef.current !== generation) {
+            return undefined;
+          }
+          if (deviceLists) {
+            const preference = readDevicePreference();
+            for (const kind of DEVICE_KINDS) {
+              const deviceId = preference[kind];
+              if (!deviceId) continue;
+              if (kind === "audiooutput" && !session.isAudioOutputSupported()) continue;
+              if (!deviceLists[kind].some((device) => device.deviceId === deviceId)) continue;
+              if (session.getActiveDevice(kind) === deviceId) continue;
+              await session.switchActiveDevice(kind, deviceId).catch(() => undefined);
+              if (sessionRef.current !== session || generationRef.current !== generation) {
+                return undefined;
+              }
+            }
+          }
           if (initialIntent) {
             // Recovery (issue #610): apply the restored snapshot EXACTLY —
             // never enable-then-disable, never getUserMedia for a device
@@ -927,7 +1054,7 @@ export function useCallMedia(
       void connecting.then(clearPendingConnection, clearPendingConnection);
       return connecting;
     },
-    [clearElements, ensureSession, trackedDisconnect, update],
+    [clearElements, ensureSession, refreshMediaDevices, trackedDisconnect, update],
   );
 
   const toggleMicrophone = useCallback(async (): Promise<boolean | undefined> => {
@@ -1016,6 +1143,40 @@ export function useCallMedia(
     }
   }, [update]);
 
+  // Selecting a device is never gated behind pendingControlRef (mic/camera/
+  // screen-share) — the two are deliberately independent kinds of pending
+  // state. Double-submit for the SAME kind is rejected outright; a stale
+  // resolution (superseded by a newer switch of the same kind, or by
+  // stop()/invalidateDeadSession clearing devicePendingRef entirely) is
+  // detected by the same reference-identity check every other operation in
+  // this hook uses, and never writes deviceError or the preference.
+  const switchDevice = useCallback(
+    async (kind: CallDeviceKind, deviceId: string): Promise<boolean> => {
+      const session = sessionRef.current;
+      if (!session || devicePendingRef.current.has(kind)) return false;
+      const operation: PendingDeviceOperation = { session, generation: generationRef.current };
+      devicePendingRef.current.set(kind, operation);
+      update({ devicePendingKinds: [...devicePendingRef.current.keys()], deviceError: null });
+      try {
+        await session.switchActiveDevice(kind, deviceId);
+        if (devicePendingRef.current.get(kind) !== operation) return false;
+        writeDevicePreference(kind, deviceId);
+        return true;
+      } catch (error) {
+        if (devicePendingRef.current.get(kind) === operation) {
+          update({ deviceError: deviceErrorMessage(error) });
+        }
+        return false;
+      } finally {
+        if (devicePendingRef.current.get(kind) === operation) {
+          devicePendingRef.current.delete(kind);
+          update({ devicePendingKinds: [...devicePendingRef.current.keys()] });
+        }
+      }
+    },
+    [update],
+  );
+
   const bindLocalMedia = useCallback<RefCallback<HTMLDivElement>>((element) => {
     localContainerRef.current = element;
     if (element && localElementRef.current) element.replaceChildren(localElementRef.current);
@@ -1036,11 +1197,23 @@ export function useCallMedia(
     toggleCamera,
     toggleScreenShare,
     activateAudio: startAudio,
+    switchDevice,
     prepare,
     startAudio,
     connect,
     stop,
   };
+}
+
+function deviceErrorMessage(error: unknown): string {
+  switch (mediaErrorKind(error)) {
+    case "denied":
+      return "Permissão negada para o dispositivo.";
+    case "not_found":
+      return "O dispositivo selecionado não está mais disponível.";
+    default:
+      return "Não foi possível trocar o dispositivo.";
+  }
 }
 
 function mediaErrorKind(error: unknown): string | undefined {

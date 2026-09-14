@@ -1,6 +1,7 @@
 package service
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -41,7 +42,7 @@ func mentionTokens(body string) []mentionToken {
 		contentEnd := contentStart + close
 		end := contentEnd + 1
 		parts := strings.Split(body[contentStart:contentEnd], ":")
-		if len(parts) != 3 || parts[0] != "mention" || (parts[1] != "user" && parts[1] != "channel") {
+		if len(parts) != 3 || parts[0] != "mention" || (parts[1] != "user" && parts[1] != "channel" && parts[1] != "all") {
 			continue
 		}
 		id, err := uuid.Parse(parts[2])
@@ -52,6 +53,49 @@ func mentionTokens(body string) []mentionToken {
 		start = end - 1
 	}
 	return tokens
+}
+
+func hasMentionKind(body, kind string) bool {
+	for _, token := range mentionTokens(body) {
+		if token.kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// allMentionTokenIDs returns the id carried by every "all"-kind token in body,
+// in order, duplicates included. The codec only ever produces a single
+// canonical id for "all" (the reserved nil UUID — see ALL_MENTION_ID
+// client-side); this is what lets a caller tell that canonical form apart
+// from a structurally valid but forged token naming an arbitrary id
+// (issue #776, SR-001).
+func allMentionTokenIDs(body string) []string {
+	var ids []string
+	for _, token := range mentionTokens(body) {
+		if token.kind == "all" {
+			ids = append(ids, token.id)
+		}
+	}
+	return ids
+}
+
+// NamedRecipients reports who a message body names: the ids of the users named
+// by a mention token, and whether it names everyone.
+//
+// It is exported because the realtime payload has to carry the *authoritative*
+// answer to "was I named" (issue #744). The browser used to work it out for
+// itself, with its own copy of the mention grammar, and a client grammar that
+// drifts from this one is a client that disagrees with the server about what a
+// mention is. Everything here is the same codec the rest of the service uses;
+// nothing is restated.
+//
+// Only the canonical "all" token counts as naming everyone — the reserved nil
+// UUID — for the reason allMentionTokenIDs gives: a structurally valid token
+// naming an arbitrary id is forged, and must not buy an alert (SR-001).
+func NamedRecipients(body string) (userIDs []string, everyone bool) {
+	users, _ := extractMentionIDs(body)
+	return users, slices.Contains(allMentionTokenIDs(body), uuid.Nil.String())
 }
 
 func escapedAt(body string, index int) bool {

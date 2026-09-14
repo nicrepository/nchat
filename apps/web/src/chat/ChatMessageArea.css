@@ -253,16 +253,132 @@
 
 /* ── Message list ────────────────────────────────────────────────────────────── */
 
+/*
+  #492: positioning wrapper for the scroll container, so the floating
+  "Ir para o final" button can be pinned near the bottom of the visible
+  viewport (position: absolute) without scrolling away with the list.
+*/
+.chat-msg-area__list-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 .chat-msg-area__list {
   flex: 1;
   overflow-y: auto;
   padding: 20px clamp(12px, 2vw, 24px);
+  min-height: 0;
+  /*
+    #492: no blanket smooth scroll — every scroll-behavior::"smooth" | "auto"
+    is now explicit in JS at the call site (ChatMessageArea.tsx), because a
+    blanket rule here would make ordinary scrollTop assignments (prepend
+    compensation, instant positioning) animate too, which is exactly the
+    "auto-scroll on open" bug this issue fixes.
+  */
+}
+
+/*
+  #788: the timeline content itself, not the scroll container — its box
+  height is what tracks listRef.scrollHeight, so this is what the tail-lock
+  ResizeObserver watches to notice an async attachment/media reflow.
+*/
+.chat-msg-area__list-content {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-height: 0;
-  /* Smooth scroll when new messages arrive */
-  scroll-behavior: smooth;
+}
+
+/* ── Virtualized timeline (#675) ───────────────────────────────────────────────
+   The canvas is as tall as the whole loaded history so the scrollbar tells the
+   truth, while only the rows near the viewport exist inside it. Each row is
+   positioned by transform rather than `top`: the browser can move a composited
+   layer without reflowing, which is what keeps a fast scroll smooth. */
+
+.chat-msg-area__virtual-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.chat-msg-area__virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  /* The gap the flex column above gives every other row, reproduced here: an
+     absolutely positioned row is outside that flow. */
+  padding-bottom: 4px;
+}
+
+/* ── New-messages separator (#492) ───────────────────────────────────────────── */
+
+.chat-msg-area__new-messages-divider {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--color-primary, #6d28d9);
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 10px 0;
+}
+
+.chat-msg-area__new-messages-divider::before,
+.chat-msg-area__new-messages-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--color-primary-tint-strong, #e6d7f7);
+}
+
+/* ── Go-to-bottom button (#492) ──────────────────────────────────────────────── */
+
+.chat-msg-area__scroll-bottom-btn {
+  position: absolute;
+  right: 20px;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 9999px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface, #fff);
+  color: var(--color-primary, #6d28d9);
+  box-shadow: var(--shadow-md, 0 4px 16px rgba(22, 18, 31, 0.12));
+  cursor: pointer;
+}
+
+.chat-msg-area__scroll-bottom-btn:hover {
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+.chat-msg-area__scroll-bottom-btn:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-msg-area__scroll-bottom-badge {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The scroll itself is already forced instant in JS (prefersReducedMotion()
+     in ChatMessageArea.tsx) — this only removes the button's own hover/focus
+     transition, matching every other reduced-motion block in this file. */
+  .chat-msg-area__scroll-bottom-btn {
+    transition: none;
+  }
 }
 
 /* ── Day divider ─────────────────────────────────────────────────────────────── */
@@ -299,18 +415,20 @@
 }
 
 .chat-msg-area__msg-avatar {
-  width: 30px;
-  height: 30px;
+  width: 39px;
+  height: 39px;
   border-radius: 50%;
   background: linear-gradient(135deg, #7b43e8, #b485f4);
   color: #fff;
-  font-size: 10.5px;
+  font-size: 13.5px;
   font-weight: 700;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  align-self: flex-end;
+  /* Anchors to the top of the name+content block (issue #495), not the
+     bottom — flex-end left it trailing below multi-line messages. */
+  align-self: flex-start;
   /* Anchors the presence dot (RF-58); the avatar's own box is unchanged. */
   position: relative;
 }
@@ -345,12 +463,6 @@
   flex-direction: row-reverse;
 }
 
-.chat-msg-area__msg-sender {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: var(--color-ink, #16121f);
-}
-
 .chat-msg-area__msg-sender-action {
   padding: 0;
   border: 0;
@@ -358,6 +470,16 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+/* Declared after -action so its font-size/font-weight win the cascade over
+   -action's `font: inherit` reset (same specificity, both classes coexist on
+   the group/channel sender button) — keeping it visually equal to the plain
+   DM sender span (issue #495 follow-up). */
+.chat-msg-area__msg-sender {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
 }
 
 .chat-msg-area__msg-sender-action:hover,
@@ -1098,8 +1220,21 @@
   opacity: 0.55;
 }
 
+/* The toolbar is a manual popover (issue #839). Shown, it is painted in the top
+   layer, whose containing block is the viewport no matter what sits above it in
+   the DOM — and what sits above it is a virtualized row positioned by
+   `transform`, which would otherwise capture `position: fixed` and offset every
+   viewport coordinate the placement computes by the row's own translation. It
+   also keeps the toolbar out of the row's box and the list's scrollable
+   overflow, so hovering can neither remeasure a row nor move the scrollbar.
+   The declarations after `position` undo the UA popover stylesheet, which
+   centres a popover and draws it in system colours. */
 .chat-msg-area__reaction-menu {
   position: fixed;
+  inset: auto;
+  margin: 0;
+  overflow: visible;
+  color: inherit;
   z-index: var(--z-overlay-emoji);
   display: flex;
   gap: 2px;
@@ -2238,7 +2373,9 @@
 
 .mention-list,
 .mention-list__empty {
-  min-width: 220px;
+  box-sizing: border-box;
+  width: min(360px, calc(100vw - 16px));
+  min-width: min(220px, calc(100vw - 16px));
   max-height: 240px;
   overflow-y: auto;
   padding: 6px;
@@ -2251,6 +2388,15 @@
 .mention-list__empty {
   color: var(--color-muted, #7c7390);
   font-size: 13px;
+}
+
+.mention-list__heading {
+  padding: 6px 10px 3px;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .mention-list__item {
@@ -2271,9 +2417,26 @@
   background: var(--color-surface-2, #faf8fd);
 }
 
+.mention-list__item:focus-visible {
+  outline: 2px solid var(--color-primary-strong, #4c1d95);
+  outline-offset: -2px;
+}
+
 .mention-list__sigil {
   color: var(--color-primary, #0e7490);
   font-weight: 700;
+}
+
+.mention-list__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-list__selected {
+  margin-left: auto;
+  font-size: 16px;
 }
 
 /* ── ComposerToolbar ─────────────────────────────────────────────────────────── */
@@ -2803,6 +2966,29 @@
   }
 }
 
+/* Video poster (issue #675): the card a clean video shows before anyone presses
+   Play. It reserves the same box the player will occupy, so arming playback
+   never shifts the timeline. */
+.chat-msg-area__attachment-video-poster {
+  all: unset;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: #fff;
+}
+
+.chat-msg-area__attachment-video-poster .material-symbols-outlined {
+  font-size: 56px;
+}
+
+.chat-msg-area__attachment-video-poster:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: -2px;
+}
+
 .chat-msg-area__attachment-gif-toggle {
   position: absolute;
   right: 8px;
@@ -2842,6 +3028,7 @@
 }
 
 .chat-msg-area__audio-playbtn,
+.chat-msg-area__audio-download,
 .chat-msg-area__audio-rate {
   display: inline-flex;
   align-items: center;
@@ -2858,10 +3045,38 @@
   cursor: pointer;
 }
 
+.chat-msg-area__audio-download,
 .chat-msg-area__audio-rate {
   background: var(--color-surface, #fff);
   color: var(--color-primary, #6d28d9);
   border: 1px solid var(--color-border, #e8e3f0);
+}
+
+/* Wide enough for "1.5x" so the row does not resize as the rate cycles. */
+.chat-msg-area__audio-rate {
+  min-width: 44px;
+}
+
+/* Download (issue #740). Icon-only to keep the player's height and density —
+   the label lives in aria-label and in the pointer tooltip — and never allowed
+   to shrink: the progress bar is the one control that gives up width first. */
+.chat-msg-area__audio-download {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0 6px;
+}
+
+/* Comfortable touch target without changing the player's height: the box the
+   finger hits extends into the surrounding gap only, never over the seek bar
+   or the rate button, so a drag on the timeline is unaffected. */
+.chat-msg-area__audio-download::after {
+  content: "";
+  position: absolute;
+  inset: -6px -4px;
+}
+
+.chat-msg-area__audio-download .material-symbols-outlined {
+  font-size: 18px;
 }
 
 .chat-msg-area__audio-playbtn:disabled,
@@ -2870,15 +3085,20 @@
   opacity: 0.6;
 }
 
+.chat-msg-area__audio-download[aria-busy="true"] {
+  opacity: 0.6;
+}
+
 .chat-msg-area__audio-playbtn:focus-visible,
+.chat-msg-area__audio-download:focus-visible,
 .chat-msg-area__audio-rate:focus-visible {
   outline: 2px solid var(--color-primary-strong, #4c1d95);
   outline-offset: 2px;
 }
 
 .chat-msg-area__audio-seek {
-  flex: 1 1 120px;
-  min-width: 80px;
+  flex: 1 1 80px;
+  min-width: 64px;
   accent-color: var(--color-primary, #6d28d9);
 }
 
@@ -2897,6 +3117,12 @@
 
 .chat-msg-area__audio-note[role="alert"] {
   color: var(--color-danger-strong, #b91c1c);
+}
+
+/* The download's own note sits beside its button in the DOM — where assistive
+   technology reads it — but always takes the last row of the control strip. */
+.chat-msg-area__audio-note--download {
+  order: 1;
 }
 
 /* ── Voice message compact presentation (issue #670) ──────────────────────────
@@ -3029,4 +3255,67 @@
   .chat-msg-area__composer {
     padding-top: 8px;
   }
+}
+
+/* ── Acknowledgement (issue #824) ───────────────────────────────────────────
+   One row under the message body, never a card: #820's rendering rules keep
+   the request attached to the message rather than wrapping it, and a panel per
+   urgent message would make a busy channel unreadable. Every value is an
+   existing token, so this inherits both themes without declaring a palette. */
+.chat-msg-ack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+  font-size: 12px;
+}
+
+.chat-msg-ack__action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 999px;
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-msg-ack__action:hover:not(:disabled) {
+  background: var(--color-surface-2, #f8fbfc);
+}
+
+.chat-msg-ack__action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* The resolved states carry their own words (see MessageAcknowledgement), so
+   the colour here is reinforcement and never the only signal. */
+.chat-msg-ack__state {
+  margin: 0;
+  color: var(--color-muted, #5c7380);
+}
+
+.chat-msg-ack__state[data-state="acknowledged"],
+.chat-msg-ack__state[data-state="responded"] {
+  color: var(--color-success, #1f7a4d);
+}
+
+.chat-msg-ack__summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  color: var(--color-muted, #5c7380);
+}
+
+.chat-msg-ack__count {
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
 }

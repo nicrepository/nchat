@@ -997,3 +997,200 @@ func TestChatMigration_KeepsWorkspaceScopedConversationIndexes(t *testing.T) {
 		}
 	}
 }
+
+// Issue #741. The notification outbox stops being mention-only, and the
+// properties that make it a durable event log rather than a queue of hints are
+// asserted on the migration text: they are what every later reader depends on.
+func TestChatMigration_NotificationOutboxEventContract(t *testing.T) {
+	up := readChatMigration(t, "000042_notification_outbox_event_contract.up.sql")
+	for _, expected := range []string{
+		// The event vocabulary the domain package declares.
+		"'direct_message', 'mention', 'reply', 'channel_message', 'reaction', 'call'",
+		// suppressed must be representable, and separately from failed.
+		"'pending', 'eligible', 'suppressed', 'processing', 'sent', 'retrying', 'failed'",
+		// A suppression and its reason arrive together or not at all, and the
+		// reason is bounded so the column cannot be used to carry content.
+		"(status = 'suppressed') = (suppressed_reason IS NOT NULL)",
+		"char_length(suppressed_reason) BETWEEN 1 AND 200",
+		// Terminal states are terminal because the database says so, not because
+		// the Go constant is named that way.
+		"CREATE FUNCTION chat.enforce_notification_outbox_transition()",
+		"BEFORE UPDATE OF status ON chat.notification_outbox",
+		// The historical/import/replay marker.
+		"CHECK (origin IN ('live', 'import', 'replay', 'resync'))",
+		// Idempotency is the database's decision, qualified by tenant.
+		"CREATE UNIQUE INDEX notification_outbox_dedupe_uq",
+		"ON chat.notification_outbox (workspace_id, recipient_user_id, dedupe_key)",
+		// The parked notifications of a withheld message keep their kind.
+		"ALTER TABLE chat.message_pending_mentions",
+		// Widening a CHECK is a declared operation under Blue/Green.
+		"nchat:blue-green contract-phase",
+		// Retention is documented rather than implemented.
+		"Retention (documented, not implemented)",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("notification outbox migration missing %q", expected)
+		}
+	}
+	// One index over the non-terminal states, not one per state.
+	if !strings.Contains(up, "WHERE status IN ('pending', 'eligible', 'retrying')") {
+		t.Error("the worker index must cover every non-terminal state")
+	}
+	if strings.Count(up, "CREATE INDEX") != 1 {
+		t.Errorf("expected exactly one non-unique index, got %d", strings.Count(up, "CREATE INDEX"))
+	}
+	// The legacy UNIQUE constraint is retained: the previous release names it in
+	// its own ON CONFLICT, so dropping it here would break that slot.
+	if strings.Contains(up, "DROP CONSTRAINT notification_outbox_message_recipient_unique") {
+		t.Error("the legacy unique constraint must survive the expand release")
+	}
+
+	down := readChatMigration(t, "000042_notification_outbox_event_contract.down.sql")
+	for _, expected := range []string{
+		"DROP COLUMN IF EXISTS dedupe_key",
+		"DROP COLUMN IF EXISTS suppressed_reason",
+		"CHECK (kind IN ('mention'))",
+		"DROP TRIGGER IF EXISTS notification_outbox_enforce_transition",
+		"DROP FUNCTION IF EXISTS chat.enforce_notification_outbox_transition()",
+		"CHECK (status IN ('pending', 'processing', 'sent', 'failed'))",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("notification outbox down migration missing %q", expected)
+		}
+	}
+}
+
+// Every constraint 000042 leaves NOT VALID is validated by 000043. A constraint
+// that stayed NOT VALID would enforce new rows but let the planner ignore it,
+// and nothing would ever say so.
+func TestChatMigration_NotificationOutboxConstraintsAreValidated(t *testing.T) {
+	up := readChatMigration(t, "000042_notification_outbox_event_contract.up.sql")
+	validate := readChatMigration(t, "000043_validate_notification_outbox_event_contract.up.sql")
+	for _, constraint := range []string{
+		"notification_outbox_kind_check",
+		"notification_outbox_status_check",
+		"notification_outbox_source_type_check",
+		"notification_outbox_priority_check",
+		"notification_outbox_origin_check",
+		"notification_outbox_suppressed_reason_check",
+		"notification_outbox_dedupe_key_check",
+	} {
+		if !strings.Contains(up, constraint) {
+			t.Errorf("000042 does not define %s", constraint)
+		}
+		if !strings.Contains(validate, "VALIDATE CONSTRAINT "+constraint) {
+			t.Errorf("000043 does not validate %s", constraint)
+		}
+	}
+	if !strings.Contains(readChatMigration(t, "000043_validate_notification_outbox_event_contract.down.sql"), "NOT VALID") {
+		t.Error("the validate migration must be reversible to NOT VALID")
+	}
+}
+
+// Issue #821. The priority column is the message's own axis, and this pins the
+// three properties that make it safe to add to a table that grows forever: a
+// default that makes every pre-existing row meaningful, a bound the database
+// enforces itself, and no scan during the deploy.
+func TestChatMigration_MessagePriorityDefaultsAndBounds(t *testing.T) {
+	up := readChatMigration(t, "000047_message_priority.up.sql")
+	for _, expected := range []string{
+		// NOT NULL DEFAULT is what turns every message written before this
+		// column into a standard one without a backfill.
+		"ADD COLUMN priority TEXT NOT NULL DEFAULT 'standard'",
+		// Exactly the three the domain declares — no more, no fewer.
+		"CHECK (priority IN ('standard', 'important', 'urgent'))",
+		// The deploy must not scan chat.messages under ACCESS EXCLUSIVE.
+		"NOT VALID",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000047 missing %q", expected)
+		}
+	}
+	// No backfill: the column default is the backfill. An UPDATE over
+	// chat.messages is exactly the long-running write this design avoids.
+	if strings.Contains(up, "UPDATE chat.messages") {
+		t.Error("000047 must not rewrite chat.messages; the column default covers existing rows")
+	}
+
+	down := readChatMigration(t, "000047_message_priority.down.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT IF EXISTS messages_priority_check",
+		"DROP COLUMN IF EXISTS priority",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("000047 down missing %q", expected)
+		}
+	}
+}
+
+// The constraint 000047 leaves NOT VALID is validated by 000048, and 000048's
+// down puts it back. A constraint that stayed NOT VALID would enforce new rows
+// but let the planner ignore it, and nothing would ever say so.
+func TestChatMigration_MessagePriorityCheckIsValidated(t *testing.T) {
+	validate := readChatMigration(t, "000048_validate_message_priority_check.up.sql")
+	if !strings.Contains(validate, "VALIDATE CONSTRAINT messages_priority_check") {
+		t.Error("000048 does not validate messages_priority_check")
+	}
+	down := readChatMigration(t, "000048_validate_message_priority_check.down.sql")
+	for _, expected := range []string{
+		"DROP CONSTRAINT messages_priority_check",
+		"CHECK (priority IN ('standard', 'important', 'urgent'))",
+		"NOT VALID",
+	} {
+		if !strings.Contains(down, expected) {
+			t.Errorf("000048 down missing %q", expected)
+		}
+	}
+}
+
+// Issue #824. The acknowledgement schema's three load-bearing properties: a
+// flag that makes every pre-existing message mean "asked nobody", a primary key
+// that is the uniqueness guarantee rather than a second index next to one, and
+// a coherence check that refuses half a resolution.
+func TestChatMigration_AcknowledgementSchemaHoldsItsOwnInvariants(t *testing.T) {
+	up := readChatMigration(t, "000049_message_acknowledgement.up.sql")
+	for _, expected := range []string{
+		// The backfill is the column default; every message written before this
+		// migration asked for nothing, and the schema says so.
+		"ADD COLUMN acknowledgement_required BOOLEAN NOT NULL DEFAULT false",
+		// Identity, not a separate unique index: a recipient is their row, so a
+		// second acknowledgement cannot become a second row.
+		"PRIMARY KEY (message_id, recipient_id)",
+		// The five states of #820's machine, and no others.
+		"CHECK (state IN ('pending', 'acknowledged', 'responded', 'expired', 'cancelled'))",
+		// Resolution and its instant are one fact; the schema refuses half of it.
+		"CHECK ((state = 'pending') = (resolved_at IS NULL))",
+		// The rows belong to the message and disappear with it.
+		"REFERENCES chat.messages (id) ON DELETE CASCADE",
+	} {
+		if !strings.Contains(up, expected) {
+			t.Errorf("000049 missing %q", expected)
+		}
+	}
+	// No backfill and no rewrite of the message table: a boolean column with a
+	// default is a catalogue change, and an UPDATE over chat.messages is exactly
+	// the long-running write this avoids.
+	if strings.Contains(up, "UPDATE chat.messages") {
+		t.Error("000049 must not rewrite chat.messages; the column default covers existing rows")
+	}
+	// No index beyond the primary key. Every query this feature has reads the
+	// full key or its message_id prefix, and an index nothing uses is write cost
+	// on the hot send path.
+	if strings.Contains(up, "CREATE INDEX") {
+		t.Error("000049 creates an index no query in this feature would use")
+	}
+}
+
+// The down reverses exactly what the up added, in the order that works: the
+// table first, because it references chat.messages.
+func TestChatMigration_AcknowledgementDownReversesTheUp(t *testing.T) {
+	down := readChatMigration(t, "000049_message_acknowledgement.down.sql")
+	table := strings.Index(down, "DROP TABLE IF EXISTS chat.message_acknowledgements")
+	column := strings.Index(down, "DROP COLUMN IF EXISTS acknowledgement_required")
+	if table < 0 || column < 0 {
+		t.Fatalf("000049 down must drop both the table and the column, got:\n%s", down)
+	}
+	if table > column {
+		t.Error("000049 down must drop the referencing table before the column it was added beside")
+	}
+}

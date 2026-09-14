@@ -117,7 +117,10 @@ type ChannelStore interface {
 	// A change of display name also writes a conversation_renamed system message
 	// in the same transaction, returned alongside the channel (issue #527).
 	UpdateChannel(ctx context.Context, input UpdateChannelInput) (UpdateChannelResult, error)
-	ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error)
+	// ArchiveChannel also writes a conversation_archived system message in the
+	// same transaction (issue #685). actorID is the caller whose management
+	// permission the service already re-derived.
+	ArchiveChannel(ctx context.Context, workspaceID, channelID, actorID string) (domain.Channel, error)
 	// LeaveChannelSelf removes the actor's own membership and records the
 	// departure in the same transaction. Self-leave only, and refused for the
 	// general channel in SQL (issue #527).
@@ -148,7 +151,39 @@ func (s *PGXChannelStore) CreateCategory(ctx context.Context, input CreateCatego
 }
 
 func (s *PGXChannelStore) CreateChannel(ctx context.Context, input CreateChannelInput) (domain.Channel, error) {
-	return createChannel(ctx, s.pool, input)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("begin create channel: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	ch, err := createChannel(ctx, tx, input)
+	if err != nil {
+		return domain.Channel{}, err
+	}
+	// issue #685: as in CreateChannelForActiveMember, but this path (used only
+	// for a workspace's bootstrap #geral channel — see WorkspaceService) has no
+	// authorization CTE to guarantee an actor, so the event is skipped rather
+	// than attributed to nothing when CreatedBy is unset.
+	if ch.CreatedBy != "" {
+		if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+			WorkspaceID: ch.WorkspaceID, ChannelID: ch.ID,
+			ActorID: ch.CreatedBy, Event: domain.ConversationEventCreated,
+		}); err != nil {
+			return domain.Channel{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Channel{}, fmt.Errorf("commit create channel: %w", err)
+	}
+	committed = true
+	return ch, nil
 }
 
 // CreateChannelForActiveMember is the authorization-bearing creation path used
@@ -247,6 +282,17 @@ func (s *PGXChannelStore) CreateChannelForActiveMember(ctx context.Context, inpu
 		return domain.Channel{}, fmt.Errorf("create channel for active member: %w", err)
 	}
 
+	// issue #685: creation is a conversation event like a rename or a
+	// departure, in the same transaction as the row it describes. ch.CreatedBy
+	// is always set here — the authorized_context CTE above supplies it, never
+	// the caller — so there is always an actor to attribute it to.
+	if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		WorkspaceID: ch.WorkspaceID, ChannelID: ch.ID,
+		ActorID: ch.CreatedBy, Event: domain.ConversationEventCreated,
+	}); err != nil {
+		return domain.Channel{}, err
+	}
+
 	if input.EnsureCreatorMemberRole != "" {
 		if err := addChannelMember(ctx, tx, ch.ID, ch.CreatedBy, input.EnsureCreatorMemberRole); err != nil {
 			return domain.Channel{}, err
@@ -296,6 +342,7 @@ func createChannel(ctx context.Context, q channelQuerier, input CreateChannelInp
 
 type channelQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
@@ -816,9 +863,24 @@ func updateChannel(ctx context.Context, q channelQuerier, input UpdateChannelInp
 	return ch, nil
 }
 
-func (s *PGXChannelStore) ArchiveChannel(ctx context.Context, workspaceID, channelID string) (domain.Channel, error) {
+// ArchiveChannel marks a non-general channel archived and records a
+// conversation_archived system event in the same transaction (issue #685),
+// the same pattern updateChannelAuthorized already follows for a rename:
+// the write and the event either both commit or neither does.
+func (s *PGXChannelStore) ArchiveChannel(ctx context.Context, workspaceID, channelID, actorID string) (domain.Channel, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Channel{}, fmt.Errorf("begin archive channel: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
 	var ch domain.Channel
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE chat.channels
 		SET status = 'archived',
 		    updated_at = now()
@@ -844,6 +906,18 @@ func (s *PGXChannelStore) ArchiveChannel(ctx context.Context, workspaceID, chann
 		}
 		return domain.Channel{}, fmt.Errorf("archive channel: %w", err)
 	}
+
+	if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		WorkspaceID: workspaceID, ChannelID: channelID,
+		ActorID: actorID, Event: domain.ConversationEventArchived,
+	}); err != nil {
+		return domain.Channel{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Channel{}, fmt.Errorf("commit archive channel: %w", err)
+	}
+	committed = true
 	return ch, nil
 }
 

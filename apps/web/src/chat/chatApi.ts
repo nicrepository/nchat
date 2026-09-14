@@ -14,6 +14,7 @@ import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
+  normalizeAcknowledgementState,
   normalizeBodyFormat,
   normalizeLinkSafety,
   parseDMConversationType,
@@ -32,15 +33,19 @@ import {
   type MessageBodyFormat,
   type LinkSafetyRecheck,
   type MentionCandidate,
+  type MentionTarget,
   type DMConversation,
   type FavoriteItem,
   type FavoritesPage,
   type Message,
+  type MessageAcknowledgement,
+  type MessageAcknowledgementRecipient,
   type MessageEditHistoryEntry,
   type MessagePage,
   type MessageSecuritySnapshot,
   type PinnedItem,
   type ConversationEventPayload,
+  type ConversationEventTargetUser,
   type ConversationEventType,
 } from "./chatTypes";
 
@@ -872,6 +877,8 @@ interface MessageResponse {
   reference?: ReferenceResponse;
   /** RF-32. Absent on a text-only message and on any pre-RF-32 server. */
   attachments?: unknown;
+  /** Issue #824. Absent on a pre-#824 server, which asked nobody to confirm. */
+  acknowledgement_required?: unknown;
 }
 
 interface QuoteResponse {
@@ -1034,17 +1041,50 @@ function mapConversationEvent(r: MessageResponse): {
   eventType?: ConversationEventType;
   eventPayload?: ConversationEventPayload;
 } {
-  const known: ConversationEventType[] = ["conversation_renamed", "conversation_member_left"];
+  const known: ConversationEventType[] = [
+    "conversation_renamed",
+    "conversation_member_left",
+    "conversation_created",
+    "conversation_archived",
+    "conversation_member_added",
+    "conversation_member_removed",
+    "call_started",
+    "call_ended",
+  ];
   const eventType = known.find((candidate) => candidate === r.event_type);
   if (r.kind !== "system" || !eventType) return {};
   const payload =
     typeof r.event_payload === "object" && r.event_payload
       ? (r.event_payload as Record<string, unknown>)
       : {};
-  const read = (value: unknown) => (typeof value === "string" ? value : undefined);
+  const readString = (value: unknown) => (typeof value === "string" ? value : undefined);
+  const readNumber = (value: unknown) => (typeof value === "number" ? value : undefined);
+  const readCallType = (value: unknown): "audio" | "video" | undefined =>
+    value === "audio" || value === "video" ? value : undefined;
+  const readTargetUsers = (value: unknown): ConversationEventTargetUser[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    const users: ConversationEventTargetUser[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "object" || !entry) continue;
+      const userId = readString((entry as Record<string, unknown>)["user_id"]);
+      if (!userId) continue;
+      users.push({
+        userId,
+        displayName: readString((entry as Record<string, unknown>)["display_name"]),
+      });
+    }
+    return users.length > 0 ? users : undefined;
+  };
   return {
     eventType,
-    eventPayload: { oldName: read(payload["old_name"]), newName: read(payload["new_name"]) },
+    eventPayload: {
+      oldName: readString(payload["old_name"]),
+      newName: readString(payload["new_name"]),
+      targetUsers: readTargetUsers(payload["target_users"]),
+      callId: readString(payload["call_id"]),
+      callType: readCallType(payload["call_type"]),
+      callDurationSeconds: readNumber(payload["call_duration_seconds"]),
+    },
   };
 }
 
@@ -1135,6 +1175,10 @@ function mapMessage(r: MessageResponse): Message {
     reactions: mapReactions(r.reactions),
     isFavorited: r.is_favorited ?? false,
     isForwarded: r.is_forwarded === true,
+    // Strict equality, so a server that does not send the field at all — and a
+    // value this build does not understand — both read as "asked nobody". The
+    // safe direction: an absent flag never invents a confirmation request.
+    acknowledgementRequired: r.acknowledgement_required === true,
   };
 }
 
@@ -1254,6 +1298,16 @@ export interface PostMessageOptions {
    */
   attachmentIds?: string[];
   idempotencyKey?: string;
+  /** DMs default to v2; group composers opt into the existing v3 codec. */
+  bodyFormat?: "v2" | "v3";
+  /**
+   * Ask this message's recipients to confirm receipt explicitly (issue #824).
+   *
+   * Omitted from the request entirely when false, so a send that asks for
+   * nothing is byte-for-byte the payload it has always been and a pre-#824
+   * server is unaffected.
+   */
+  acknowledgementRequired?: boolean;
   signal?: AbortSignal;
 }
 
@@ -1266,6 +1320,7 @@ function postMessageBody(bodyText: string, bodyFormat: string, options: PostMess
     // Omitted entirely when there is none, so a text-only request is the exact
     // payload it has always been.
     ...(options.attachmentIds?.length ? { attachment_ids: options.attachmentIds } : {}),
+    ...(options.acknowledgementRequired ? { acknowledgement_required: true } : {}),
   });
 }
 
@@ -1428,24 +1483,32 @@ async function resolveMessageReferences(
 }
 
 export async function fetchMentionCandidates(
-  channelId: string,
+  target: MentionTarget,
   query: string,
   signal?: AbortSignal,
 ): Promise<MentionCandidate[]> {
-  const url = `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/mentions?q=${encodeURIComponent(query)}`;
+  const segment = target.kind === "channel" ? "channels" : "dm";
+  const url = `${CHAT_BASE}/${segment}/${encodeURIComponent(target.id)}/mentions?q=${encodeURIComponent(query)}`;
   const res = await authenticatedFetch<MentionEnvelope>(url, { method: "GET", signal });
   if (!isMentionEnvelope(res)) return [];
-  // Channel-reference mentions (backend still returns them; the composer no
-  // longer offers them) are intentionally dropped here — @-mentions are for
-  // people only. The .type === "user" filter also guards against a malformed
-  // backend response placing a "channel" entry in the users array.
-  return res.data.users
-    .filter((candidate) => candidate.type === "user")
+  const users = res.data.users
+    .filter(({ type }) => type === "user")
     .map((candidate) => ({
       mentionType: "user" as const,
       id: candidate.id,
       label: candidate.label,
     }));
+  if (target.kind === "dm") return users;
+  return [
+    ...users,
+    ...res.data.channels
+      .filter(({ type }) => type === "channel")
+      .map((candidate) => ({
+        mentionType: "channel" as const,
+        id: candidate.id,
+        label: candidate.label,
+      })),
+  ];
 }
 
 export async function postDMMessage(
@@ -1459,7 +1522,7 @@ export async function postDMMessage(
       "Content-Type": "application/json",
       ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
     },
-    body: postMessageBody(bodyText, "v2", options),
+    body: postMessageBody(bodyText, options.bodyFormat ?? "v2", options),
     signal: options.signal,
   });
   return mapMessage(res.data);
@@ -1640,6 +1703,148 @@ export async function getMessageHistory(
   } catch (error) {
     return mapMessageEditError(error);
   }
+}
+
+// ── Acknowledgement API (issue #824) ─────────────────────────────────────────
+
+interface AcknowledgementResponse {
+  message_id?: unknown;
+  required?: unknown;
+  total?: unknown;
+  pending?: unknown;
+  acknowledged?: unknown;
+  responded?: unknown;
+  expired?: unknown;
+  cancelled?: unknown;
+  viewer_state?: unknown;
+  recipients?: unknown;
+}
+
+function acknowledgementPath(messageId: string): string {
+  return `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}/acknowledgement`;
+}
+
+/** A non-negative integer, or 0 for anything else a server might send. */
+function acknowledgementCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+
+/**
+ * The per-recipient list, present only when the server chose to send it.
+ *
+ * A row whose state this build does not recognise is dropped rather than
+ * guessed at: the list is rendered, and a state nobody understands has no
+ * rendering.
+ */
+function mapAcknowledgementRecipients(
+  value: unknown,
+): MessageAcknowledgementRecipient[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const recipients = value.flatMap((entry): MessageAcknowledgementRecipient[] => {
+    const row = entry as { recipient_id?: unknown; state?: unknown; resolved_at?: unknown };
+    const state = normalizeAcknowledgementState(row.state);
+    if (typeof row.recipient_id !== "string" || !state) return [];
+    return [
+      {
+        recipientId: row.recipient_id,
+        state,
+        resolvedAt: typeof row.resolved_at === "string" ? row.resolved_at : undefined,
+      },
+    ];
+  });
+  return recipients;
+}
+
+function mapAcknowledgement(messageId: string, r: AcknowledgementResponse): MessageAcknowledgement {
+  return {
+    messageId: typeof r.message_id === "string" ? r.message_id : messageId,
+    required: r.required === true,
+    total: acknowledgementCount(r.total),
+    pending: acknowledgementCount(r.pending),
+    acknowledged: acknowledgementCount(r.acknowledged),
+    responded: acknowledgementCount(r.responded),
+    expired: acknowledgementCount(r.expired),
+    cancelled: acknowledgementCount(r.cancelled),
+    viewerState: normalizeAcknowledgementState(r.viewer_state),
+    recipients: mapAcknowledgementRecipients(r.recipients),
+  };
+}
+
+/**
+ * Reads how one message's acknowledgement stands (issue #824).
+ *
+ * A read, and only a read: opening or fetching a message is not confirming it.
+ * What comes back is scoped by the server to what this reader may see — the
+ * counts and their own state for everybody, the per-recipient list for the
+ * sender — so nothing here decides authorisation.
+ */
+export async function fetchMessageAcknowledgement(
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<MessageAcknowledgement> {
+  const res = await authenticatedFetch<{ data: AcknowledgementResponse }>(
+    acknowledgementPath(messageId),
+    { method: "GET", signal },
+  );
+  return mapAcknowledgement(messageId, res.data);
+}
+
+/**
+ * Reads how a page of messages' acknowledgements stand, in one request (issue
+ * #824).
+ *
+ * One call for the screen rather than one per message that asked for
+ * confirmation: opening a conversation holding twenty urgent notices used to
+ * cost twenty round trips and twenty aggregations, and every reconnect cost
+ * them again.
+ *
+ * POST despite being a read, for the same reason fetchLinkSafetyStatuses is: the
+ * request carries a list of ids, and a list does not belong in a query string.
+ *
+ * The answer holds an entry only for a message the server let this reader see,
+ * so a missing key is the same non-enumerating answer the single read gives. It
+ * carries summaries only — the per-recipient list stays on the message-scoped
+ * read, where the server decides who may have it.
+ */
+export async function fetchMessageAcknowledgements(
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, MessageAcknowledgement>> {
+  if (messageIds.length === 0) return {};
+  const res = await authenticatedFetch<{
+    data: { acknowledgements?: Record<string, AcknowledgementResponse> };
+  }>(`${CHAT_BASE}/messages/acknowledgements`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message_ids: messageIds }),
+    signal,
+  });
+  const entries = res.data.acknowledgements ?? {};
+  const summaries: Record<string, MessageAcknowledgement> = {};
+  for (const [messageId, entry] of Object.entries(entries)) {
+    summaries[messageId] = mapAcknowledgement(messageId, entry);
+  }
+  return summaries;
+}
+
+/**
+ * Confirms receipt of a message that asked this reader to (issue #824).
+ *
+ * No request body at all: who is confirming is the session and which message is
+ * the path, so there is nothing for this client to assert and no recipient id it
+ * could get wrong. Idempotent — the server answers a repeat with the state that
+ * actually holds — and the resulting summary is returned so the caller renders
+ * the authoritative answer without a second request.
+ */
+export async function acknowledgeMessage(
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<MessageAcknowledgement> {
+  const res = await authenticatedFetch<{ data: AcknowledgementResponse }>(
+    acknowledgementPath(messageId),
+    { method: "POST", signal },
+  );
+  return mapAcknowledgement(messageId, res.data);
 }
 
 // ── Favorites API (RF-06) ─────────────────────────────────────────────────────

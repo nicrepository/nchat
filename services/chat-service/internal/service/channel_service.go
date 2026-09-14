@@ -412,7 +412,7 @@ func (s *ChannelService) ArchiveChannel(ctx context.Context, workspaceID, channe
 	if current.IsGeneral {
 		return domain.Channel{}, fmt.Errorf("%w: geral is immutable", domain.ErrInvalidInput)
 	}
-	archived, err := s.channels.ArchiveChannel(ctx, workspaceID, channelID)
+	archived, err := s.channels.ArchiveChannel(ctx, workspaceID, channelID, callerID)
 	if err != nil {
 		return domain.Channel{}, err
 	}

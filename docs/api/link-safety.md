@@ -272,9 +272,15 @@ em `deleted` por um link inconclusive continuam deletadas. Nao ha backfill de
 proposito: republica-las faria mensagens historicas aparecerem, sem aviso e fora
 de ordem, para destinatarios que nunca as viram.
 
-**Mencoes de mensagem retida sao adiadas, nao perdidas.** Elas ficam em
+**Notificacoes de mensagem retida sao adiadas, nao perdidas.** Elas ficam em
 `chat.message_pending_mentions` e sao movidas para `chat.notification_outbox` na
 mesma transacao da promocao. Mensagem bloqueada nunca gera notificacao.
+
+Desde a issue #741 a tabela guarda tambem a classificacao (`kind`, `priority`) de
+cada destinatario, porque uma mensagem retida pode ter produzido mention, reply e
+direct_message. O nome `message_pending_mentions` foi mantido: renomea-lo
+quebraria o slot que ainda roda a release anterior. Ver
+[notification-outbox.md](../architecture/notification-outbox.md).
 
 A edicao e a unica excecao ao pending: reter uma _edicao_ significaria mostrar a
 todos um corpo nao verificado, ou manter o antigo enquanto se diz ao autor que

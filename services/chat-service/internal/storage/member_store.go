@@ -35,6 +35,7 @@ type MemberStore interface {
 	AddChannelMembers(ctx context.Context, workspaceID, channelID, callerID string, userIDs []string) (AddMembersResult, error)
 	GetChannelMember(ctx context.Context, channelID, userID string) (domain.ChannelMember, error)
 	SearchChannelMembers(ctx context.Context, workspaceID, channelID, prefix string, limit int) ([]domain.MentionCandidate, error)
+	SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error)
 	// ListOnlineChannelMemberProfiles returns the channel's member totals plus up
 	// to limit of the members in onlineUserIDs, in one round trip. The presence
 	// filter is applied before the limit, so an online member never loses a slot
@@ -62,6 +63,16 @@ type MemberStore interface {
 	// workspaceID. Returns ErrCannotLeaveGeneralChannel if the channel has is_general=true.
 	// Returns nil when the membership does not exist (idempotent).
 	RemoveChannelMember(ctx context.Context, workspaceID, channelID, userID string) error
+	// RemoveChannelMemberByAdmin deletes targetUserID's channel membership on
+	// actorID's behalf and, unlike RemoveChannelMember, records a
+	// conversation_member_removed event in the same transaction (issue #685),
+	// returned so the caller can publish it — its zero value means "removed
+	// nothing, no event", the same convention UpdateChannelResult.Event uses.
+	// It is a separate function rather than an actorID parameter bolted onto
+	// RemoveChannelMember so the self-leave path — already covered and relied
+	// upon elsewhere — stays untouched. Returns ErrCannotLeaveGeneralChannel for
+	// #geral.
+	RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error)
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
 }
@@ -445,6 +456,13 @@ type AddMembersResult struct {
 	// signal out to the input would tell people about conversations they were
 	// already in, or were never added to. len(AddedUserIDs) == Added.
 	AddedUserIDs []string
+	// EventMessageID is the conversation_member_added system message this
+	// transaction wrote (issue #835 realtime follow-up), empty when nothing
+	// was actually added. The caller broadcasts it via
+	// PublishConversationEvent so the timeline updates live — mirroring
+	// call_started/call_ended and every other conversation event — instead
+	// of only being visible on the next reload.
+	EventMessageID string
 }
 
 // AddChannelMembers adds every user in userIDs to channelID, or none.
@@ -593,6 +611,27 @@ func (s *PGXMemberStore) AddChannelMembers(
 		return AddMembersResult{}, domain.ErrForbidden
 	}
 
+	// issue #685: one conversation_member_added event per batch, never one per
+	// member — inserted is the RETURNING of the statement above, so a batch
+	// that was entirely "already a member" (inserted == 0) writes no event at
+	// all, matching AddedUserIDs' own doc comment about what actually changed.
+	var eventMessageID string
+	if len(addedUserIDs) > 0 {
+		targets, err := resolveConversationEventTargetUsers(ctx, tx, addedUserIDs)
+		if err != nil {
+			return AddMembersResult{}, err
+		}
+		event, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+			WorkspaceID: workspaceID, ChannelID: channelID, ActorID: callerID,
+			Event:   domain.ConversationEventMemberAdded,
+			Payload: domain.ConversationEventPayload{TargetUsers: targets},
+		})
+		if err != nil {
+			return AddMembersResult{}, err
+		}
+		eventMessageID = event.ID
+	}
+
 	var total int
 	if err := tx.QueryRow(ctx, `
 		SELECT count(*)
@@ -618,6 +657,7 @@ func (s *PGXMemberStore) AddChannelMembers(
 		AlreadyMembers: eligible - inserted,
 		TotalCount:     total,
 		AddedUserIDs:   addedUserIDs,
+		EventMessageID: eventMessageID,
 	}, nil
 }
 
@@ -670,6 +710,47 @@ func (s *PGXMemberStore) SearchChannelMembers(ctx context.Context, workspaceID, 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate channel member mentions: %w", err)
+	}
+	return results, nil
+}
+
+func (s *PGXMemberStore) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id::text, u.display_name
+		FROM chat.dm_conversations dc
+		JOIN chat.workspaces w
+		  ON w.id = dc.workspace_id AND w.status = 'active'
+		JOIN chat.dm_members caller
+		  ON caller.conversation_id = dc.id AND caller.user_id = $3::uuid AND caller.status = 'active'
+		JOIN chat.workspace_members caller_wm
+		  ON caller_wm.workspace_id = dc.workspace_id AND caller_wm.user_id = caller.user_id AND caller_wm.status = 'active'
+		JOIN chat.dm_members candidate
+		  ON candidate.conversation_id = dc.id AND candidate.status = 'active'
+		JOIN chat.workspace_members candidate_wm
+		  ON candidate_wm.workspace_id = dc.workspace_id AND candidate_wm.user_id = candidate.user_id AND candidate_wm.status = 'active'
+		JOIN auth.users u
+		  ON u.id = candidate.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE dc.id = $2::uuid
+		  AND dc.workspace_id = $1::uuid
+		  AND dc.type = 'group'
+		  AND dc.status = 'active'
+		  AND left(lower(u.display_name), length($4)) = lower($4)
+		ORDER BY lower(u.display_name), u.id
+		LIMIT $5`, workspaceID, conversationID, callerID, prefix, limit)
+	if err != nil {
+		return nil, fmt.Errorf("search dm conversation members: %w", err)
+	}
+	defer rows.Close()
+	results := make([]domain.MentionCandidate, 0, limit)
+	for rows.Next() {
+		candidate := domain.MentionCandidate{Type: domain.MentionTypeUser}
+		if err := rows.Scan(&candidate.ID, &candidate.Label); err != nil {
+			return nil, fmt.Errorf("scan dm conversation member mention: %w", err)
+		}
+		results = append(results, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dm conversation member mentions: %w", err)
 	}
 	return results, nil
 }
@@ -1039,4 +1120,70 @@ func (s *PGXMemberStore) RemoveChannelMember(ctx context.Context, workspaceID, c
 	}
 	committed = true
 	return nil
+}
+
+// RemoveChannelMemberByAdmin deletes a channel membership on actorID's behalf
+// and records the conversation_member_removed event in the same transaction
+// (issue #685). See the interface doc for why this does not share
+// RemoveChannelMember's body.
+func (s *PGXMemberStore) RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("begin remove channel member by admin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var isGeneral bool
+	err = tx.QueryRow(ctx, `
+		SELECT is_general FROM chat.channels
+		WHERE id = $1 AND workspace_id = $2
+		FOR UPDATE`,
+		channelID, workspaceID,
+	).Scan(&isGeneral)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Message{}, nil
+		}
+		return domain.Message{}, fmt.Errorf("check channel for remove by admin: %w", err)
+	}
+	if isGeneral {
+		return domain.Message{}, domain.ErrCannotLeaveGeneralChannel
+	}
+
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM chat.channel_members
+		WHERE channel_id = $1 AND user_id = $2`,
+		channelID, targetUserID,
+	)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("remove channel member by admin: %w", err)
+	}
+	var event domain.Message
+	if tag.RowsAffected() > 0 {
+		targets, err := resolveConversationEventTargetUsers(ctx, tx, []string{targetUserID})
+		if err != nil {
+			return domain.Message{}, fmt.Errorf("resolve removed member: %w", err)
+		}
+		event, err = InsertConversationEvent(ctx, tx, ConversationEventInput{
+			WorkspaceID: workspaceID,
+			ChannelID:   channelID,
+			ActorID:     actorID,
+			Event:       domain.ConversationEventMemberRemoved,
+			Payload:     domain.ConversationEventPayload{TargetUsers: targets},
+		})
+		if err != nil {
+			return domain.Message{}, fmt.Errorf("insert member removed event: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Message{}, fmt.Errorf("commit remove channel member by admin: %w", err)
+	}
+	committed = true
+	return event, nil
 }

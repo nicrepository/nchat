@@ -1774,6 +1774,14 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
           emitCallTechnicalEvent("end");
           void endResourceParticipation().catch(() => undefined);
         },
+    devices: {
+      mediaDevices: media.mediaDevices,
+      activeDeviceId: media.activeDeviceId,
+      devicePendingKinds: media.devicePendingKinds,
+      deviceError: media.deviceError,
+      audioOutputSupported: media.audioOutputSupported,
+      onSwitch: media.switchDevice,
+    },
   };
   const floatingStatus =
     media.status === "reconnecting"

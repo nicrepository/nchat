@@ -4,6 +4,9 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { avatarColorFor, initialsFrom } from "../chat/messageDisplay";
+import type { CallDeviceKind, CallMediaDevice } from "../media/liveKitSession";
+import CallControls from "./CallControls";
+import type { DeviceSettingsProps } from "./DeviceSettingsMenu";
 import DedicatedCallStage from "./DedicatedCallStage";
 import FloatingCallWindow from "./FloatingCallWindow";
 import GlobalCallIndicator from "./GlobalCallIndicator";
@@ -34,6 +37,26 @@ const videoPresent = {
   localName: "Você",
   localInitials: "V",
 };
+
+function device(kind: CallDeviceKind, deviceId: string, label: string): CallMediaDevice {
+  return { deviceId, kind, label };
+}
+
+function devicesFixture(overrides: Partial<DeviceSettingsProps> = {}): DeviceSettingsProps {
+  return {
+    mediaDevices: {
+      audioinput: [device("audioinput", "mic-1", "Microfone integrado")],
+      videoinput: [device("videoinput", "cam-1", "Webcam integrada")],
+      audiooutput: [device("audiooutput", "speaker-1", "Alto-falantes")],
+    },
+    activeDeviceId: { audioinput: "mic-1", videoinput: "cam-1", audiooutput: "speaker-1" },
+    devicePendingKinds: [],
+    deviceError: null,
+    audioOutputSupported: true,
+    onSwitch: vi.fn(),
+    ...overrides,
+  };
+}
 
 describe("IncomingCallPopup", () => {
   it("shows a non-modal video call without stealing focus", () => {
@@ -933,5 +956,215 @@ describe("active speaker CSS", () => {
     expect(presentationCSS).toMatch(
       /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.call-speaker-surface::after[\s\S]*transition: none/,
     );
+  });
+});
+
+describe("DeviceSettingsMenu (issue #755)", () => {
+  function openMenu() {
+    fireEvent.click(screen.getByRole("button", { name: "Configurações de áudio e vídeo" }));
+    return screen.getByRole("dialog", { name: "Configurações de áudio e vídeo" });
+  }
+
+  it("is not rendered when CallControls receives no devices prop", () => {
+    render(<CallControls {...controls} />);
+    expect(
+      screen.queryByRole("button", { name: "Configurações de áudio e vídeo" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("exposes a disclosure trigger with the required accessible name and ARIA state", () => {
+    render(<CallControls {...controls} devices={devicesFixture()} />);
+    const trigger = screen.getByRole("button", { name: "Configurações de áudio e vídeo" });
+
+    expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("dialog", { name: "Configurações de áudio e vídeo" })).toBeVisible();
+  });
+
+  it("lists the three device groups with explicit labels and the active device selected", () => {
+    render(<CallControls {...controls} devices={devicesFixture()} />);
+    openMenu();
+
+    const mic = screen.getByRole("combobox", { name: "Microfone" });
+    const camera = screen.getByRole("combobox", { name: "Câmera" });
+    const output = screen.getByRole("combobox", { name: "Saída de áudio" });
+    expect(mic).toHaveValue("mic-1");
+    expect(camera).toHaveValue("cam-1");
+    expect(output).toHaveValue("speaker-1");
+    expect(screen.getByRole("option", { name: "Microfone integrado" })).toBeInTheDocument();
+  });
+
+  it("falls back to a readable ordinal label when the browser reports an empty device label", () => {
+    render(
+      <CallControls
+        {...controls}
+        devices={devicesFixture({
+          mediaDevices: {
+            audioinput: [device("audioinput", "mic-1", "")],
+            videoinput: [],
+            audiooutput: [],
+          },
+          activeDeviceId: {},
+        })}
+      />,
+    );
+    openMenu();
+
+    expect(screen.getByRole("option", { name: "Microfone 1" })).toBeInTheDocument();
+    expect(screen.queryByText("mic-1")).not.toBeInTheDocument();
+  });
+
+  it("calls onSwitch with the selected kind and device id", () => {
+    const onSwitch = vi.fn();
+    render(<CallControls {...controls} devices={devicesFixture({ onSwitch })} />);
+    openMenu();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Câmera" }), {
+      target: { value: "cam-1" },
+    });
+
+    expect(onSwitch).toHaveBeenCalledWith("videoinput", "cam-1");
+  });
+
+  it("disables only the field that is currently pending", () => {
+    render(
+      <CallControls
+        {...controls}
+        devices={devicesFixture({ devicePendingKinds: ["audioinput"] })}
+      />,
+    );
+    openMenu();
+
+    expect(screen.getByRole("combobox", { name: "Microfone" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Câmera" })).not.toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Alterando dispositivo…");
+  });
+
+  it("shows an empty device list as loading rather than a false 'not found'", () => {
+    render(
+      <CallControls
+        {...controls}
+        devices={devicesFixture({
+          mediaDevices: { audioinput: [], videoinput: [], audiooutput: [] },
+          activeDeviceId: {},
+        })}
+      />,
+    );
+    openMenu();
+
+    expect(screen.getAllByText("Carregando dispositivos…")).toHaveLength(3);
+    expect(screen.getByRole("combobox", { name: "Microfone" })).toBeDisabled();
+  });
+
+  it("surfaces a recoverable device error without hiding the working fields", () => {
+    render(
+      <CallControls
+        {...controls}
+        devices={devicesFixture({ deviceError: "Não foi possível trocar o dispositivo." })}
+      />,
+    );
+    openMenu();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível trocar o dispositivo.");
+    expect(screen.getByRole("combobox", { name: "Microfone" })).not.toBeDisabled();
+  });
+
+  it("hides the audiooutput selector with a short message when the browser has no output-switching support", () => {
+    render(
+      <CallControls {...controls} devices={devicesFixture({ audioOutputSupported: false })} />,
+    );
+    openMenu();
+
+    expect(screen.queryByRole("combobox", { name: "Saída de áudio" })).not.toBeInTheDocument();
+    expect(screen.getByText("O navegador controla a saída de áudio")).toBeInTheDocument();
+    // Mic/camera stay fully usable — only output is affected.
+    expect(screen.getByRole("combobox", { name: "Microfone" })).not.toBeDisabled();
+  });
+
+  it("closes on Escape and returns focus to the trigger", () => {
+    render(<CallControls {...controls} devices={devicesFixture()} />);
+    const trigger = screen.getByRole("button", { name: "Configurações de áudio e vídeo" });
+    const dialog = openMenu();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Configurações de áudio e vídeo" }),
+    ).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("closes when a click lands outside the panel and the trigger", () => {
+    render(<CallControls {...controls} devices={devicesFixture()} />);
+    openMenu();
+
+    fireEvent.mouseDown(document.body);
+
+    expect(
+      screen.queryByRole("dialog", { name: "Configurações de áudio e vídeo" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("never lets a click inside the panel reach a control underneath it (overlay isolation)", () => {
+    const onMicrophone = vi.fn();
+    const onEnd = vi.fn();
+    render(
+      <CallControls
+        {...controls}
+        onMicrophone={onMicrophone}
+        onEnd={onEnd}
+        devices={devicesFixture()}
+      />,
+    );
+    const dialog = openMenu();
+
+    fireEvent.mouseDown(dialog);
+    fireEvent.click(dialog);
+
+    expect(onMicrophone).not.toHaveBeenCalled();
+    expect(onEnd).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Configurações de áudio e vídeo" })).toBeVisible();
+  });
+
+  it("is reused identically inside FloatingCallWindow", () => {
+    render(
+      <FloatingCallWindow
+        title="Ana"
+        status="connected"
+        participantCount={2}
+        controls={{ ...controls, devices: devicesFixture() }}
+        onExpand={vi.fn()}
+        {...videoPresent}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Configurações de áudio e vídeo" }),
+    ).toBeInTheDocument();
+  });
+
+  it("is reused identically inside DedicatedCallStage without disturbing the participant grid", () => {
+    render(
+      <DedicatedCallStage
+        title="Equipe"
+        status="connected"
+        participantCount={1}
+        participants={[]}
+        controls={{ ...controls, devices: devicesFixture() }}
+        onMinimize={vi.fn()}
+        hasLocalVideo={false}
+        localSeed="local-user"
+        localDisplayName="Você"
+        localInitials="V"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Configurações de áudio e vídeo" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Participantes" })).toBeInTheDocument();
   });
 });

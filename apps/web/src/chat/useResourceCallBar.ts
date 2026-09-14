@@ -14,7 +14,7 @@ import { useMemo } from "react";
 
 import type { ActiveResourceCallBarProps } from "../calls/ActiveResourceCallBar";
 import type { ChatOutletContext } from "./ChatShell";
-import type { ResourceCallHeaderState } from "./ChatMessageArea";
+import type { ResourceCallHeaderState } from "../calls/resourceCallTypes";
 
 export interface ResourceCallBarInput {
   kind: "channel" | "dm";

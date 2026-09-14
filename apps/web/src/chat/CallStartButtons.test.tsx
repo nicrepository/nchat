@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
 
-import { HeaderChannel, HeaderDM } from "./ChatMessageArea";
+import { HeaderChannel, HeaderDM } from "./message-area/ConversationHeader";
 
 it("starts audio or video only for the server-resolved DM counterpart", () => {
   const start = vi.fn(() => true);

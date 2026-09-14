@@ -29,6 +29,10 @@ func (s *MemberService) SearchChannelMembers(ctx context.Context, workspaceID, c
 	return s.members.SearchChannelMembers(ctx, workspaceID, channelID, prefix, limit)
 }
 
+func (s *MemberService) SearchDMConversationMembers(ctx context.Context, workspaceID, conversationID, callerID, prefix string, limit int) ([]domain.MentionCandidate, error) {
+	return s.members.SearchDMConversationMembers(ctx, workspaceID, conversationID, callerID, prefix, limit)
+}
+
 // JoinWorkspace adds userID to workspaceID with the given role. If the user is
 // already a member, the existing membership record is returned without error.
 func (s *MemberService) JoinWorkspace(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {
@@ -336,39 +340,45 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 // Adding and removing the same row are the same authority, so RF-74 widening
 // the add to the workspace moderator widens the removal with it.
 // Returns ErrForbidden when removing from #geral or when caller lacks permission.
-func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) error {
+//
+// The returned domain.Message is the conversation_member_removed event the
+// same transaction wrote, zero-valued when targetUserID was not a member —
+// the same "publish only when there is one" convention UpdateChannel's Event
+// uses, so a caller that asks to remove a non-member broadcasts nothing.
+func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) (domain.Message, error) {
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
 	if err != nil {
-		return fmt.Errorf("get channel: %w", err)
+		return domain.Message{}, fmt.Errorf("get channel: %w", err)
 	}
 	if channel.IsGeneral {
-		return domain.ErrForbidden
+		return domain.Message{}, domain.ErrForbidden
 	}
 
 	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			return domain.ErrForbidden
+			return domain.Message{}, domain.ErrForbidden
 		}
-		return fmt.Errorf("get workspace: %w", err)
+		return domain.Message{}, fmt.Errorf("get workspace: %w", err)
 	}
 	if workspace.Status != domain.WorkspaceStatusActive {
-		return domain.ErrForbidden
+		return domain.Message{}, domain.ErrForbidden
 	}
 
 	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
 	if errors.Is(err, domain.ErrNotFound) {
-		return domain.ErrForbidden
+		return domain.Message{}, domain.ErrForbidden
 	}
 	if err != nil {
-		return fmt.Errorf("get caller workspace member: %w", err)
+		return domain.Message{}, fmt.Errorf("get caller workspace member: %w", err)
 	}
 	if !domain.CanManageChannelMembers(&caller) {
-		return domain.ErrForbidden
+		return domain.Message{}, domain.ErrForbidden
 	}
 
-	if err := s.members.RemoveChannelMember(ctx, workspaceID, channelID, targetUserID); err != nil {
-		return fmt.Errorf("remove channel member: %w", err)
+	event, err := s.members.RemoveChannelMemberByAdmin(ctx, workspaceID, channelID, callerID, targetUserID)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("remove channel member: %w", err)
 	}
-	return nil
+	return event, nil
 }

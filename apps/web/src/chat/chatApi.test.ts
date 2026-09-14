@@ -2229,13 +2229,16 @@ describe("fetchMentionCandidates", () => {
       },
     });
 
-    const candidates = await fetchMentionCandidates("channel-1", "an");
+    const candidates = await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an");
 
     expect(mockAuthFetch).toHaveBeenCalledWith(
       expect.stringContaining("/channels/channel-1/mentions?q=an"),
       expect.objectContaining({ method: "GET" }),
     );
-    expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
+    expect(candidates).toEqual([
+      { mentionType: "user", id: "user-1", label: "Ana" },
+      { mentionType: "channel", id: "channel-2", label: "anuncios" },
+    ]);
   });
 
   it("drops channel candidates even when the backend still returns them — mentions are for people only", async () => {
@@ -2246,8 +2249,12 @@ describe("fetchMentionCandidates", () => {
       },
     });
 
-    const candidates = await fetchMentionCandidates("channel-1", "an");
+    const candidates = await fetchMentionCandidates({ kind: "dm", id: "group-1" }, "an");
 
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      expect.stringContaining("/dm/group-1/mentions?q=an"),
+      expect.objectContaining({ method: "GET" }),
+    );
     // MentionCandidate no longer has a "channel" variant at all — this
     // exhaustively proves nothing from res.data.channels leaked through.
     expect(candidates).toEqual([{ mentionType: "user", id: "user-1", label: "Ana" }]);
@@ -2256,7 +2263,7 @@ describe("fetchMentionCandidates", () => {
   it("fails safe to an empty list when the response shape is malformed", async () => {
     mockAuthFetch.mockResolvedValue({ data: { users: [{ id: "user-1" }], channels: null } });
 
-    const candidates = await fetchMentionCandidates("channel-1", "an");
+    const candidates = await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an");
 
     expect(candidates).toEqual([]);
   });
@@ -2266,7 +2273,7 @@ describe("fetchMentionCandidates", () => {
       data: { users: [{ type: "admin", id: "user-1", label: "Ana" }], channels: [] },
     });
 
-    const candidates = await fetchMentionCandidates("channel-1", "an");
+    const candidates = await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an");
 
     expect(candidates).toEqual([]);
   });
@@ -2274,19 +2281,19 @@ describe("fetchMentionCandidates", () => {
   it("fails safe to an empty list when a candidate is not an object", async () => {
     mockAuthFetch.mockResolvedValue({ data: { users: ["ana", null], channels: [] } });
 
-    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
+    expect(await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an")).toEqual([]);
   });
 
   it("fails safe to an empty list when the envelope itself is not an object", async () => {
     mockAuthFetch.mockResolvedValue(null);
 
-    expect(await fetchMentionCandidates("channel-1", "an")).toEqual([]);
+    expect(await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an")).toEqual([]);
   });
 
   it("fails safe to an empty list when data is missing entirely", async () => {
     mockAuthFetch.mockResolvedValue({});
 
-    const candidates = await fetchMentionCandidates("channel-1", "an");
+    const candidates = await fetchMentionCandidates({ kind: "channel", id: "channel-1" }, "an");
 
     expect(candidates).toEqual([]);
   });
@@ -2295,6 +2302,13 @@ describe("fetchMentionCandidates", () => {
 // ── postDMMessage ─────────────────────────────────────────────────────────────
 
 describe("postDMMessage", () => {
+  it("sends v3 for a group when the caller selects that codec", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("group-1", "@[Ana](mention:user:user-1)", { bodyFormat: "v3" });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toMatchObject({ body_format: "v3" });
+  });
+
   it("calls the correct URL for a DM conversation", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     await postDMMessage("dm-juliane", "Oi!");

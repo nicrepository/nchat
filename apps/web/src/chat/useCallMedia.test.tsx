@@ -2,7 +2,12 @@ import { act, render, renderHook, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { MediaIntent } from "../calls/callOwnership";
-import type { LiveKitSessionFactory, LiveKitSessionLoader } from "../media/liveKitSession";
+import type {
+  CallDeviceKind,
+  CallMediaDevice,
+  LiveKitSessionFactory,
+  LiveKitSessionLoader,
+} from "../media/liveKitSession";
 import { useCallMedia } from "./useCallMedia";
 
 const liveKitAdapterLoaded = vi.hoisted(() => vi.fn());
@@ -34,7 +39,15 @@ interface SessionCallbacks {
     element: HTMLMediaElement,
     active: boolean,
   ): void;
+  onDeviceListChanged(): void;
+  onActiveDeviceChanged(kind: CallDeviceKind, deviceId: string): void;
 }
+
+// Device-selection test fixtures (issue #755) — what a freshly-created
+// FakeSession reports before any test overrides its own instance's mocks.
+// Reset in beforeEach so one test's device list never leaks into the next.
+let deviceListFixture: CallMediaDevice[] = [];
+let audioOutputSupportedFixture = true;
 
 function remoteVideoFor(identity: string): HTMLVideoElement {
   const element = document.createElement("video");
@@ -67,6 +80,15 @@ class FakeSession {
     this.callbacks.onScreenShareChanged(enabled);
   });
   readonly disconnect = vi.fn(async (): Promise<void> => undefined);
+  // Fixture-backed so a test can pre-configure what a session-to-be-created
+  // will report, without racing connect()'s own internal enumeration.
+  readonly listMediaDevices = vi.fn(async (): Promise<CallMediaDevice[]> => deviceListFixture);
+  readonly getActiveDevice = vi.fn((): string | undefined => undefined);
+  readonly switchActiveDevice = vi.fn(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    async (_kind: CallDeviceKind, _deviceId: string): Promise<void> => undefined,
+  );
+  readonly isAudioOutputSupported = vi.fn((): boolean => audioOutputSupportedFixture);
 
   constructor(callbacks: SessionCallbacks) {
     this.callbacks = callbacks;
@@ -123,6 +145,9 @@ const liveKitServerUrl = "wss://livekit-dev.nic-labs.com";
 beforeEach(() => {
   vi.clearAllMocks();
   window.history.replaceState({}, "", "/chat/dm/example");
+  deviceListFixture = [];
+  audioOutputSupportedFixture = true;
+  localStorage.clear();
 });
 
 describe("useCallMedia", () => {
@@ -2247,5 +2272,255 @@ describe("useCallMedia connect() failure cleanup (Security Review pós-Code Qual
     expect(view.result.current.error).toBe("Não foi possível conectar a mídia da chamada.");
     expect(view.result.current.error).not.toContain("participant-token");
     expect(view.result.current.error).not.toContain(liveKitServerUrl);
+  });
+
+  describe("device selection (issue #755)", () => {
+    async function connected(
+      view: ReturnType<typeof setup>,
+      call: { call_id: string; call_type: "audio" | "video" } = videoCall,
+    ) {
+      await act(() => view.result.current.connect(call, "participant-token", liveKitServerUrl));
+      return view.getSession();
+    }
+
+    it("enumerates the initial device list and active device after connecting", async () => {
+      deviceListFixture = [{ deviceId: "mic-1", kind: "audioinput", label: "Built-in" }];
+      const view = setup();
+      const session = await connected(view);
+      session.getActiveDevice.mockReturnValue("mic-1");
+
+      // getActiveDevice above is only observed by the NEXT enumeration —
+      // trigger the SDK's own hot-plug signal to pick it up, mirroring how
+      // a real device list only ever refreshes on RoomEvent.MediaDevicesChanged.
+      await act(async () => {
+        session.callbacks.onDeviceListChanged();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(view.result.current.mediaDevices.audioinput).toEqual([
+        { deviceId: "mic-1", kind: "audioinput", label: "Built-in" },
+      ]);
+      expect(view.result.current.activeDeviceId.audioinput).toBe("mic-1");
+      expect(view.result.current.audioOutputSupported).toBe(true);
+    });
+
+    it("marks only the switching kind pending and clears it on success", async () => {
+      const view = setup();
+      const session = await connected(view);
+      const switching = deferred<void>();
+      session.switchActiveDevice.mockReturnValueOnce(switching.promise);
+
+      let result!: Promise<boolean>;
+      act(() => {
+        result = view.result.current.switchDevice("audioinput", "mic-2");
+      });
+      expect(view.result.current.devicePendingKinds).toEqual(["audioinput"]);
+
+      await act(async () => {
+        switching.resolve();
+        await result;
+      });
+
+      expect(view.result.current.devicePendingKinds).toEqual([]);
+      expect(session.switchActiveDevice).toHaveBeenCalledWith("audioinput", "mic-2");
+      expect(await result).toBe(true);
+    });
+
+    it("reports a recoverable device error without ending the call", async () => {
+      const view = setup();
+      const session = await connected(view);
+      session.switchActiveDevice.mockRejectedValueOnce({ kind: "denied" });
+
+      const result = await act(() => view.result.current.switchDevice("videoinput", "cam-2"));
+
+      expect(result).toBe(false);
+      expect(view.result.current.deviceError).toBe("Permissão negada para o dispositivo.");
+      expect(view.result.current.status).toBe("connected");
+      expect(view.result.current.devicePendingKinds).toEqual([]);
+    });
+
+    it("rejects a double-submit for the same kind while a switch is already pending", async () => {
+      const view = setup();
+      const session = await connected(view);
+      const switching = deferred<void>();
+      session.switchActiveDevice.mockReturnValueOnce(switching.promise);
+
+      let first!: Promise<boolean>;
+      act(() => {
+        first = view.result.current.switchDevice("audioinput", "mic-2");
+      });
+      const second = await act(() => view.result.current.switchDevice("audioinput", "mic-3"));
+
+      expect(second).toBe(false);
+      expect(session.switchActiveDevice).toHaveBeenCalledOnce();
+
+      await act(async () => {
+        switching.resolve();
+        await first;
+      });
+    });
+
+    it("switches two different kinds concurrently without blocking each other", async () => {
+      const view = setup();
+      const session = await connected(view);
+      const mic = deferred<void>();
+      const camera = deferred<void>();
+      session.switchActiveDevice.mockImplementation((kind: CallDeviceKind) =>
+        kind === "audioinput" ? mic.promise : camera.promise,
+      );
+
+      let micSwitch!: Promise<boolean>;
+      let cameraSwitch!: Promise<boolean>;
+      act(() => {
+        micSwitch = view.result.current.switchDevice("audioinput", "mic-2");
+        cameraSwitch = view.result.current.switchDevice("videoinput", "cam-2");
+      });
+
+      expect(view.result.current.devicePendingKinds.sort()).toEqual(["audioinput", "videoinput"]);
+
+      await act(async () => {
+        mic.resolve();
+        camera.resolve();
+        await Promise.all([micSwitch, cameraSwitch]);
+      });
+
+      expect(view.result.current.devicePendingKinds).toEqual([]);
+    });
+
+    it("ignores a stale switch resolution superseded by stop() before it settles", async () => {
+      const view = setup();
+      const session = await connected(view);
+      const switching = deferred<void>();
+      session.switchActiveDevice.mockReturnValueOnce(switching.promise);
+
+      let pending!: Promise<boolean>;
+      act(() => {
+        pending = view.result.current.switchDevice("audioinput", "mic-2");
+      });
+
+      await act(() => view.result.current.stop());
+      await act(async () => {
+        switching.resolve();
+        await pending;
+      });
+
+      expect(view.result.current.deviceError).toBeNull();
+      expect(view.result.current.devicePendingKinds).toEqual([]);
+    });
+
+    it("reflects the SDK's own active-device fallback without touching mic/camera enabled state", async () => {
+      const view = setup();
+      const session = await connected(view, { ...videoCall, call_type: "audio" });
+      expect(view.result.current.microphoneEnabled).toBe(true);
+      expect(view.result.current.cameraEnabled).toBe(false);
+
+      act(() => session.callbacks.onActiveDeviceChanged("audioinput", "fallback-mic"));
+
+      expect(view.result.current.activeDeviceId.audioinput).toBe("fallback-mic");
+      expect(view.result.current.microphoneEnabled).toBe(true);
+      expect(view.result.current.cameraEnabled).toBe(false);
+      expect(session.enableMicrophone).toHaveBeenCalledOnce();
+      expect(session.setMicrophoneEnabled).not.toHaveBeenCalled();
+    });
+
+    it("never enables the microphone by switching it while it is off", async () => {
+      const view = setup();
+      // Recovery connect with microphone off, matching #610's OFF/OFF snapshot.
+      await act(() =>
+        view.result.current.connect(videoCall, "participant-token", liveKitServerUrl, {
+          microphone: false,
+          camera: false,
+        }),
+      );
+      const session = view.getSession();
+      expect(view.result.current.microphoneEnabled).toBe(false);
+
+      await act(() => view.result.current.switchDevice("audioinput", "mic-2"));
+
+      expect(view.result.current.microphoneEnabled).toBe(false);
+      expect(session.setMicrophoneEnabled).toHaveBeenCalledExactlyOnceWith(false);
+      expect(session.enableMicrophone).not.toHaveBeenCalled();
+    });
+
+    it("never enables the camera by switching it while it is off", async () => {
+      const view = setup();
+      await act(() =>
+        view.result.current.connect(
+          { ...videoCall, call_id: "00000000-0000-4000-8000-000000000804" },
+          "participant-token",
+          liveKitServerUrl,
+          { microphone: false, camera: false },
+        ),
+      );
+      const session = view.getSession();
+      expect(view.result.current.cameraEnabled).toBe(false);
+
+      await act(() => view.result.current.switchDevice("videoinput", "cam-2"));
+
+      expect(view.result.current.cameraEnabled).toBe(false);
+      expect(session.setCameraEnabled).toHaveBeenCalledExactlyOnceWith(false);
+      expect(session.enableCamera).not.toHaveBeenCalled();
+    });
+
+    it("persists a successful switch as a browser device preference", async () => {
+      const view = setup();
+      const session = await connected(view);
+
+      await act(() => view.result.current.switchDevice("audiooutput", "speaker-2"));
+
+      expect(session.switchActiveDevice).toHaveBeenCalledWith("audiooutput", "speaker-2");
+      const stored = JSON.parse(localStorage.getItem("nchat.call.device-preference.v1") ?? "{}");
+      expect(stored.audiooutput).toBe("speaker-2");
+    });
+
+    it("does not persist a preference when the switch failed", async () => {
+      const view = setup();
+      const session = await connected(view);
+      session.switchActiveDevice.mockRejectedValueOnce({ kind: "denied" });
+
+      await act(() => view.result.current.switchDevice("audiooutput", "speaker-2"));
+
+      expect(localStorage.getItem("nchat.call.device-preference.v1")).toBeNull();
+    });
+
+    it("reapplies a stored device preference to a newly connected session (handoff)", async () => {
+      localStorage.setItem(
+        "nchat.call.device-preference.v1",
+        JSON.stringify({ audioinput: "headset-1" }),
+      );
+      deviceListFixture = [{ deviceId: "headset-1", kind: "audioinput", label: "Headset" }];
+      const view = setup();
+
+      const session = await connected(view);
+
+      expect(session.switchActiveDevice).toHaveBeenCalledWith("audioinput", "headset-1");
+    });
+
+    it("never reapplies a stored preference for a device that no longer exists", async () => {
+      localStorage.setItem(
+        "nchat.call.device-preference.v1",
+        JSON.stringify({ audioinput: "unplugged-headset" }),
+      );
+      deviceListFixture = [];
+      const view = setup();
+
+      const session = await connected(view);
+
+      expect(session.switchActiveDevice).not.toHaveBeenCalled();
+    });
+
+    it("never attempts an audiooutput preference when the browser does not support it", async () => {
+      localStorage.setItem(
+        "nchat.call.device-preference.v1",
+        JSON.stringify({ audiooutput: "speaker-2" }),
+      );
+      deviceListFixture = [{ deviceId: "speaker-2", kind: "audiooutput", label: "Speaker" }];
+      audioOutputSupportedFixture = false;
+      const view = setup();
+
+      const session = await connected(view);
+
+      expect(session.switchActiveDevice).not.toHaveBeenCalledWith("audiooutput", "speaker-2");
+    });
   });
 });
