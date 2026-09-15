@@ -64,5 +64,68 @@ describe("SessionRow", () => {
   it("omits the IP line entirely when ipAddress is empty", () => {
     render(<SessionRow session={{ ...base, ipAddress: "" }} onRevoke={vi.fn()} />);
     expect(screen.queryByText(/aproximado/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^IP/)).not.toBeInTheDocument();
+  });
+
+  it("puts browser and platform on one identity line, with the badge beside it", () => {
+    render(<SessionRow session={{ ...base, current: true }} onRevoke={vi.fn()} />);
+    const identity = screen.getByText("Firefox 142").parentElement;
+    expect(identity).toHaveTextContent(/^Firefox 142 · Windows 10\/11Sessão atual$/);
+    expect(identity).toContainElement(screen.getByText("Windows 10/11"));
+  });
+
+  it("shows the masked IP as approximate metadata next to the activity", () => {
+    render(<SessionRow session={{ ...base, ipAddress: "203.0.*.*" }} onRevoke={vi.fn()} />);
+    const ip = screen.getByText("203.0.*.*");
+    expect(ip.parentElement).toHaveTextContent("IP 203.0.*.* (aproximado)");
+    expect(ip.closest(".session-row__meta")).toHaveTextContent(/Último acesso em/);
+  });
+
+  it("says 'Ativa agora' for the current session and the last access for a remote one", () => {
+    const { unmount } = render(
+      <SessionRow session={{ ...base, current: true }} onRevoke={vi.fn()} />,
+    );
+    expect(screen.getByText("Ativa agora")).toBeInTheDocument();
+    expect(screen.queryByText(/Último acesso/)).not.toBeInTheDocument();
+    unmount();
+
+    render(<SessionRow session={base} onRevoke={vi.fn()} />);
+    expect(screen.queryByText("Ativa agora")).not.toBeInTheDocument();
+    expect(screen.getByText(/Último acesso em/).querySelector("time")).toHaveAttribute(
+      "datetime",
+      base.lastSeenAt,
+    );
+  });
+
+  it("never invents a location line", () => {
+    render(<SessionRow session={base} onRevoke={vi.fn()} />);
+    expect(screen.getByTestId("session-row")).not.toHaveTextContent(/, [A-Z]{2}\b/);
+  });
+
+  it("picks a decorative device icon from the platform", () => {
+    const android =
+      "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36";
+    const { container, unmount } = render(
+      <SessionRow session={{ ...base, userAgent: android }} onRevoke={vi.fn()} />,
+    );
+    const icon = container.querySelector(".session-row__icon");
+    expect(icon).toHaveAttribute("aria-hidden", "true");
+    expect(icon).toHaveTextContent("smartphone");
+    unmount();
+
+    const desktop = render(<SessionRow session={base} onRevoke={vi.fn()} />);
+    expect(desktop.container.querySelector(".session-row__icon")).toHaveTextContent("computer");
+  });
+
+  it("uses a neutral icon, not a desktop, when the platform is unknown", () => {
+    for (const userAgent of ["", "curl/8.5.0"]) {
+      const { container, unmount } = render(
+        <SessionRow session={{ ...base, userAgent }} onRevoke={vi.fn()} />,
+      );
+      const icon = container.querySelector(".session-row__icon");
+      expect(icon).toHaveAttribute("aria-hidden", "true");
+      expect(icon).toHaveTextContent(/^devices$/);
+      unmount();
+    }
   });
 });

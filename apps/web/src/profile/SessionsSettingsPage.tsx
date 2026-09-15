@@ -124,31 +124,44 @@ export default function SessionsSettingsPage() {
     <div className="sessions-settings">
       <header className="sessions-settings__header">
         <h2 className="sessions-settings__title">Sessões</h2>
-        {hasOtherSessions && (
-          <button
-            type="button"
-            className="sessions-settings__revoke-all"
-            onClick={() => setConfirm({ target: "others", generation: getSessionGeneration() })}
-          >
-            Revogar todas as outras
-          </button>
-        )}
+        <p className="sessions-settings__scope">
+          Estas são sessões do NChat. Revogá-las encerra o acesso ao NChat, mas não encerra a sessão
+          no provedor de identidade.
+        </p>
       </header>
-      <p className="sessions-settings__scope">
-        Estas são sessões do NChat. Revogá-las encerra o acesso ao NChat, mas não encerra a sessão
-        no provedor de identidade.
-      </p>
-      <ul className="sessions-settings__list">
-        {sessions.map((session) => (
-          <SessionRow
-            key={session.id}
-            session={session}
-            onRevoke={(id) =>
-              setConfirm({ target: "single", sessionId: id, generation: getSessionGeneration() })
-            }
-          />
-        ))}
-      </ul>
+      <section className="sessions-settings__card" aria-labelledby="sessions-devices-title">
+        <div className="sessions-settings__card-head">
+          <div>
+            <h3 id="sessions-devices-title" className="sessions-settings__card-title">
+              Dispositivos conectados
+            </h3>
+            <p className="sessions-settings__card-sub">
+              Revogue qualquer sessão que você não reconhece. O IP é exibido parcialmente e é
+              aproximado.
+            </p>
+          </div>
+          {hasOtherSessions && (
+            <button
+              type="button"
+              className="sessions-settings__revoke-all"
+              onClick={() => setConfirm({ target: "others", generation: getSessionGeneration() })}
+            >
+              Revogar todas as outras
+            </button>
+          )}
+        </div>
+        <ul className="sessions-settings__list">
+          {sessions.map((session) => (
+            <SessionRow
+              key={session.id}
+              session={session}
+              onRevoke={(id) =>
+                setConfirm({ target: "single", sessionId: id, generation: getSessionGeneration() })
+              }
+            />
+          ))}
+        </ul>
+      </section>
       {visibleConfirm && (
         <RevokeSessionDialog
           target={visibleConfirm.target}

@@ -320,7 +320,8 @@ function makeSession(overrides: Partial<MockSession> & { id: string }): MockSess
     idle_expires_at: "2026-08-28T10:00:00Z",
     absolute_expires_at: null,
     revoked_at: null,
-    ip_address: "203.0.113.10",
+    // What the real endpoint serves: the mask, never the address (issue #859).
+    ip_address: "203.0.*.*",
     user_agent: "Mozilla/5.0 (E2E)",
     current: false,
     ...overrides,
@@ -909,6 +910,14 @@ test.describe("Profile & account settings (#672)", () => {
     await page.goto("/profile/sessions");
     await expect(page.getByTestId("session-row")).toHaveCount(3);
     await expect(page.getByText("Sessão atual")).toHaveCount(1);
+    const devices = page.getByRole("region", { name: "Dispositivos conectados" });
+    await expect(devices.getByTestId("session-row")).toHaveCount(3);
+    await expect(sessionRow(page, "Firefox 142")).toContainText("Firefox 142 · LinuxSessão atual");
+    await expect(sessionRow(page, "Firefox 142")).toContainText("Ativa agora");
+    await expect(sessionRow(page, "Firefox 142").getByRole("button")).toHaveCount(0);
+    await expect(sessionRow(page, "Chrome 152")).toContainText("Chrome 152 · Windows 10/11");
+    await expect(sessionRow(page, "Chrome 152")).toContainText("Último acesso em");
+    await expect(sessionRow(page, "Chrome 152")).toContainText("IP 203.0.*.* (aproximado)");
 
     await sessionRow(page, "Chrome 152").getByRole("button", { name: "Revogar sessão" }).click();
     const revokeOneDialog = page.getByRole("dialog", { name: "Revogar sessão?" });
@@ -1007,6 +1016,33 @@ test.describe("Profile & account settings (#672)", () => {
     await expect(dialog).toBeHidden();
     await expect(sessionRow(page, "Microsoft Edge 153")).toHaveCount(0);
     await expect(page.getByTestId("session-row")).toHaveCount(1);
+  });
+
+  test("sessions responsive: rows and actions stay inside the viewport down to 390px", async ({
+    page,
+  }) => {
+    await mockSessionsApi(page, [
+      makeSession({ id: "current", current: true, user_agent: UA.firefoxLinux }),
+      makeSession({ id: "s2", user_agent: UA.edgeWindows }),
+    ]);
+    for (const viewport of [
+      { width: 1366, height: 768 },
+      { width: 768, height: 1024 },
+      { width: 390, height: 844 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await page.goto("/profile/sessions");
+      const revoke = sessionRow(page, "Microsoft Edge 153").getByRole("button", {
+        name: "Revogar sessão",
+      });
+      await expect(revoke).toBeVisible();
+      const hasOverflow = await page.evaluate(
+        () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      );
+      expect(hasOverflow, `${viewport.width}x${viewport.height}`).toBe(false);
+      const box = await revoke.boundingBox();
+      expect(box !== null && box.x + box.width <= viewport.width, `${viewport.width}px`).toBe(true);
+    }
   });
 
   test("responsive: no horizontal overflow at 1920x1080, 1366x768, 768x1024, 390x844", async ({

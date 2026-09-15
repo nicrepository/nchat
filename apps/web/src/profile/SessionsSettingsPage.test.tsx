@@ -49,6 +49,23 @@ describe("SessionsSettingsPage", () => {
     expect(screen.getByText("Sessão atual")).toBeInTheDocument();
   });
 
+  it("groups the rows and the revoke-all action in a 'Dispositivos conectados' card", async () => {
+    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions);
+    render(<SessionsSettingsPage />);
+    const card = await screen.findByRole("region", { name: "Dispositivos conectados" });
+    expect(within(card).getAllByTestId("session-row")).toHaveLength(2);
+    expect(within(card).getByRole("button", { name: "Revogar todas as outras" })).toBeVisible();
+    expect(within(card).getAllByRole("button", { name: "Revogar sessão" })).toHaveLength(1);
+    expect(within(card).getByText(/IP é exibido parcialmente e é aproximado/)).toBeInTheDocument();
+  });
+
+  it("offers no revoke-all when the current session is the only one", async () => {
+    vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce([sessions[0]]);
+    render(<SessionsSettingsPage />);
+    await screen.findByText("Sessão atual");
+    expect(screen.queryByRole("button", { name: /revogar/i })).not.toBeInTheDocument();
+  });
+
   it("states that revocation affects NChat sessions, not the identity provider", async () => {
     vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(sessions);
     render(<SessionsSettingsPage />);
