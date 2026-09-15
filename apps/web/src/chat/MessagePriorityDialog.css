@@ -39,9 +39,28 @@
   /* The sheet clears a phone's home indicator, and resolves to the plain
      padding everywhere the inset is 0. */
   padding-bottom: calc(14px + env(safe-area-inset-bottom));
-  /* A short viewport scrolls the panel rather than pushing its buttons off
-     screen; nothing ever scrolls sideways. */
+  /* A short viewport scrolls the options rather than pushing the buttons off
+     screen. The cap is the sheet's; the popover's is written inline from the
+     room beside its trigger, because a viewport fraction knows nothing about
+     where the anchor is — 85vh still overflows a button sitting at 85vh.
+
+     The panel itself never scrolls: it is the frame, and it clips to its own
+     radius so the body cannot show through the corners. */
+  display: flex;
+  flex-direction: column;
   max-height: 85vh;
+  overflow: hidden;
+}
+
+/*
+ * The options, and the only part that scrolls.
+ *
+ * `min-height: 0` is what makes that true: a flex item's floor is its content,
+ * so without it the body refuses to shrink, the panel grows past its cap and
+ * the actions are pushed out again — the very thing the cap exists to prevent.
+ */
+.msg-priority__scroll {
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -97,7 +116,13 @@
   color: var(--color-muted, #7c7390);
 }
 
+/*
+ * Below the scrollport rather than inside it, so Aplicar keeps its place
+ * whatever the options do. `flex-shrink: 0` is the whole of that guarantee —
+ * the row gives up no height when the panel is capped.
+ */
 .msg-priority__actions {
+  flex: 0 0 auto;
   display: flex;
   justify-content: flex-end;
   gap: 8px;

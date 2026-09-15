@@ -23,11 +23,19 @@
  * urgent anyway" unreachable rather than merely untested.
  */
 
-import { useLayoutEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type RefObject,
+} from "react";
 import { createPortal } from "react-dom";
 
 import "./MessagePriorityDialog.css";
-import { placeAgainstAnchor } from "./emoji/useAnchoredPicker";
+import { placeAgainstAnchor, viewportPadding } from "./emoji/useAnchoredPicker";
 import { useMediaQuery } from "./useMediaQuery";
 import type { MessagePriority } from "./chatTypes";
 import {
@@ -50,15 +58,76 @@ const sheetQuery = "(max-width: 1023.98px)";
 /** Distance kept between the popover and the button it belongs to. */
 const anchorGap = 7;
 
+/**
+ * The shortest popover worth drawing against the button.
+ *
+ * Roughly the panel's own floor — the title, two of the three choices and the
+ * actions row — below which a clamped popover would be a scrollport with barely
+ * a line of content in it. The sheet is the honest layout at that point: it
+ * needs no room beside anything and already scrolls.
+ */
+const minAnchoredHeight = 180;
+
+/**
+ * The taller of the two gaps around the anchor, which is the room the popover
+ * actually has to work with.
+ *
+ * `placeAgainstAnchor` prefers above and flips below, and clamping to this
+ * makes those two agree without teaching it a second rule: a panel no taller
+ * than the bigger gap fits that side by construction, so the side with the room
+ * is the side it chooses.
+ *
+ * `window.innerHeight` rather than `visualViewport`, which this app does not
+ * use anywhere — the same measure `placeAgainstAnchor` itself is written
+ * against, so the two cannot disagree about where the bottom of the screen is.
+ * The cost is a phone keyboard, and the popover is not the phone layout.
+ */
+function availableHeight(anchor: DOMRect, gap: number): number {
+  const above = anchor.top - gap - viewportPadding;
+  const below = window.innerHeight - anchor.bottom - gap - viewportPadding;
+  return Math.max(above, below);
+}
+
+/**
+ * Caps the panel, and only when the cap actually changes.
+ *
+ * The write is what the ResizeObserver below is watching for, so writing an
+ * identical value would be a measure/write/measure loop that never settles.
+ */
+function applyMaxHeight(panel: HTMLElement, available: number): void {
+  const next = `${Math.round(available)}px`;
+  if (panel.style.maxHeight !== next) panel.style.maxHeight = next;
+}
+
 const orderedPriorities: MessagePriority[] = ["standard", "important", "urgent"];
 
 /**
- * Places the panel beside its trigger, and reports whether it managed to.
+ * Places the panel beside its trigger, keeps it whole while its own content
+ * changes size, and reports whether it managed to.
  *
  * A failure is not hidden: placeAgainstAnchor leaves an unplaceable surface
  * invisible, which is right for a picker that can simply close and wrong for a
  * dialog the reader just opened. So the inline placement is dropped and the
  * panel falls back to the sheet layout, which needs no room beside anything.
+ *
+ * # Why the panel is capped before it is measured
+ *
+ * This panel is not a fixed size. Choosing Urgente reveals two checkboxes and a
+ * paragraph of hint, and the panel grows by about a third — after it has
+ * already been placed. Placed above the button, `top` is what was written and
+ * the growth all happens downwards, so the tall panel keeps the short one's top
+ * edge and its bottom runs off the screen, taking Aplicar with it (issue #823).
+ *
+ * Capping first is what makes the placement true of the panel that will exist
+ * rather than of the one being measured: a panel no taller than the room beside
+ * the button fits there whatever it is showing, and anything it cannot show
+ * scrolls inside its own body with the actions still pinned below.
+ *
+ * # Why it cannot oscillate
+ *
+ * The anchored/sheet decision is taken from the anchor's geometry alone, never
+ * from how tall the panel currently is. A decision that read the panel's own
+ * height would flip the layout, resize the panel, and flip it back forever.
  */
 function useAnchoredPlacement(
   compact: boolean,
@@ -67,7 +136,7 @@ function useAnchoredPlacement(
 ): boolean {
   const [anchored, setAnchored] = useState(!compact);
 
-  useLayoutEffect(() => {
+  const place = useCallback(() => {
     const panel = panelRef.current;
     const anchor = anchorRef.current;
     if (compact || !panel || !anchor) {
@@ -75,6 +144,13 @@ function useAnchoredPlacement(
       return;
     }
     const box = anchor.getBoundingClientRect();
+    const available = availableHeight(box, anchorGap);
+    if (available < minAnchoredHeight) {
+      panel.removeAttribute("style");
+      setAnchored(false);
+      return;
+    }
+    applyMaxHeight(panel, available);
     const placed = placeAgainstAnchor(
       panel,
       box,
@@ -86,6 +162,25 @@ function useAnchoredPlacement(
     if (!placed) panel.removeAttribute("style");
     setAnchored(placed);
   }, [anchorRef, compact, panelRef]);
+
+  useLayoutEffect(place, [place]);
+
+  // The panel is the thing that changes size, so the panel is what is watched —
+  // the same mechanism the emoji picker uses for its lazily-loaded catalog, and
+  // for the same reason: the second placement happens at the moment the size
+  // actually changes, with no timer and no guessed delay. `resize` covers the
+  // window changing underneath an open dialog.
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (compact || !panel) return;
+    const observer = new ResizeObserver(place);
+    observer.observe(panel);
+    window.addEventListener("resize", place);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", place);
+    };
+  }, [compact, panelRef, place]);
 
   return anchored;
 }
@@ -203,32 +298,39 @@ export default function MessagePriorityDialog({
         onKeyDown={handleKeyDown}
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <fieldset className="msg-priority__group">
-          <legend id={titleId} className="msg-priority__title">
-            Prioridade da mensagem
-          </legend>
-          {orderedPriorities.map((priority) => (
-            <label key={priority} className="msg-priority__choice">
-              <input
-                type="radio"
-                name="composer-priority"
-                value={priority}
-                checked={draft.priority === priority}
-                // Autofocus on the applied choice: the reader arrives on the
-                // value they are changing, and the arrow keys a native radio
-                // group already answers move from there.
-                autoFocus={draft.priority === priority}
-                data-testid={`priority-option-${priority}`}
-                onChange={() => patchDraft({ priority })}
-              />
-              <span>{priorityLabels[priority]}</span>
-            </label>
-          ))}
-        </fieldset>
+        {/* The one part that scrolls when the panel is capped. The actions are
+            its sibling rather than its last child, so a short viewport takes
+            room from the options and never from Aplicar. The legend stays
+            inside the fieldset it names — a legend is only a group's label
+            where it is the fieldset's first child. */}
+        <div className="msg-priority__scroll">
+          <fieldset className="msg-priority__group">
+            <legend id={titleId} className="msg-priority__title">
+              Prioridade da mensagem
+            </legend>
+            {orderedPriorities.map((priority) => (
+              <label key={priority} className="msg-priority__choice">
+                <input
+                  type="radio"
+                  name="composer-priority"
+                  value={priority}
+                  checked={draft.priority === priority}
+                  // Autofocus on the applied choice: the reader arrives on the
+                  // value they are changing, and the arrow keys a native radio
+                  // group already answers move from there.
+                  autoFocus={draft.priority === priority}
+                  data-testid={`priority-option-${priority}`}
+                  onChange={() => patchDraft({ priority })}
+                />
+                <span>{priorityLabels[priority]}</span>
+              </label>
+            ))}
+          </fieldset>
 
-        {allowsAttentionOptions(draft.priority) && (
-          <UrgentOptions draft={draft} onChange={patchDraft} />
-        )}
+          {allowsAttentionOptions(draft.priority) && (
+            <UrgentOptions draft={draft} onChange={patchDraft} />
+          )}
+        </div>
 
         <div className="msg-priority__actions">
           <button
