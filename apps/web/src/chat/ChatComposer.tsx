@@ -795,6 +795,23 @@ function voiceOptions(
   };
 }
 
+/**
+ * Whether focus currently sits inside a surface that owns it — a menu or a
+ * dialog — and would be dismissed by having it taken away.
+ *
+ * The composer's opening focus is a convenience: it saves a click when a
+ * conversation is opened and nothing else wants focus. It is never worth
+ * dismissing something the reader deliberately opened, and a menu is exactly
+ * that — it closes when focus leaves it, so taking focus from one destroys it.
+ *
+ * Asked of the roles rather than of any particular component, so every popup
+ * that already announces itself correctly is covered by the same rule and no
+ * new coupling to the sidebar is introduced here.
+ */
+function focusIsOwnedByOverlay(active: Element | null): boolean {
+  return Boolean(active?.closest("[role='menu'], [role='dialog']"));
+}
+
 export default function ChatComposer({
   placeholder,
   mentionTarget,
@@ -995,7 +1012,22 @@ export default function ChatComposer({
     }
     const frame = requestAnimationFrame(() => {
       if (!editor.isEditable) return;
-      if (document.activeElement !== initialFocusOwnerRef.current) {
+      // Somebody moved focus while the editor was still being built: it is
+      // theirs, not ours.
+      //
+      // The second test is not the same statement as the first. The baseline
+      // above is whatever was focused when *this composer mounted*, and the
+      // composer does not mount when the conversation opens — it mounts when
+      // the editor is ready, which on a slow first paint can be a second or
+      // more later. Anything already holding focus by then is adopted as the
+      // baseline, and "focus has not moved since I arrived" silently becomes
+      // "nothing owns focus" — which is false. An open row menu was already
+      // focused, so the composer took focus off it and the menu, which closes
+      // when focus leaves it, closed under the reader's cursor.
+      if (
+        document.activeElement !== initialFocusOwnerRef.current ||
+        focusIsOwnedByOverlay(document.activeElement)
+      ) {
         initialFocusHandledRef.current = true;
         return;
       }
