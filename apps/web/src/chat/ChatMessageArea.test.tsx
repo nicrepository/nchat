@@ -5882,6 +5882,37 @@ describe("ChatMessageArea — sender display", () => {
     expect(screen.getByRole("button", { name: "Abrir conversa com Fernanda" })).toBeEnabled();
   });
 
+  it("shows a distinct message when the recipient is no longer available (issue #795 §9)", async () => {
+    // getOrCreateDirectDM answers a forbidden/unknown/ineligible target — a
+    // suspended or removed account included — with 404 "user not available"
+    // (dm_handler.go's writeDMConversationError), deliberately undifferentiated
+    // server-side. Only this specific status gets its own copy; any other
+    // failure (see the 403 test above) keeps the generic retry line.
+    mockGetOrCreateDirectDM.mockRejectedValue(
+      new ApiRequestError(404, "not_found", "user not available"),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "other-456",
+          senderDisplayName: "Fernanda",
+          bodyText: "mensagem atual",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Esta pessoa não está mais disponível para conversa direta.",
+    );
+    expect(screen.getByText("mensagem atual")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Abrir conversa com Fernanda" })).toBeEnabled();
+  });
+
   it("renders another sender name as a DM action in group DMs", async () => {
     mockFetchDMMessages.mockResolvedValue(
       messagePage([makeMessage({ senderId: "other-456", senderDisplayName: "Fernanda" })]),
@@ -5973,6 +6004,166 @@ describe("ChatMessageArea — sender display", () => {
 
     await screen.findByTestId("chat-msg-bubble");
     expect(screen.queryByTestId("chat-msg-sender")).not.toBeInTheDocument();
+  });
+});
+
+// ── #795 mention click opens a DM ──────────────────────────────────────────────
+
+describe("ChatMessageArea — #795 mention click opens DM", () => {
+  const anaId = "11111111-1111-1111-1111-111111111111";
+  const anaMention = `Oi @[Ana](mention:user:${anaId})`;
+
+  it("opens the mentioned user's DM, refreshes the sidebar, and navigates", async () => {
+    const refreshConversations = vi.fn();
+    mockGetOrCreateDirectDM.mockResolvedValue({ conversationId: "dm-ana", created: false });
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ bodyText: anaMention, bodyFormat: "v3" })]),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [], refreshConversations }}
+              />
+            }
+          >
+            <Route
+              path="channel/:id"
+              element={
+                <>
+                  <ChatMessageArea kind="channel" />
+                  <CurrentPath />
+                </>
+              }
+            />
+            <Route path="dm/:id" element={<CurrentPath />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Ana" }));
+
+    await waitFor(() => expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith(anaId, expect.any(AbortSignal));
+    await waitFor(() => expect(refreshConversations).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("current-path")).toHaveTextContent("/chat/dm/dm-ana");
+  });
+
+  it("keyboard activation opens a DM", async () => {
+    const user = userEvent.setup();
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ bodyText: anaMention, bodyFormat: "v3" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    const mention = await screen.findByRole("button", { name: "Abrir conversa com Ana" });
+    mention.focus();
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(mockGetOrCreateDirectDM).toHaveBeenCalledWith(anaId, expect.any(AbortSignal)),
+    );
+  });
+
+  it("does not offer a DM action for a mention of the reader themself", async () => {
+    // The sender is the reader too, so MessageMeta's own sender-name DM
+    // action does not render — this isolates the assertion to the mention.
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "me-123",
+          bodyText: `Oi @[Você](mention:user:me-123)`,
+          bodyFormat: "v3",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByRole("button", { name: /Abrir conversa/ })).not.toBeInTheDocument();
+    expect(mockGetOrCreateDirectDM).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a DM action for an @all mention", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: "me-123",
+          bodyText: "Oi @[all](mention:all:00000000-0000-0000-0000-000000000000)",
+          bodyFormat: "v3",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await screen.findByTestId("chat-msg-bubble");
+    expect(screen.queryByRole("button", { name: /Abrir conversa/ })).not.toBeInTheDocument();
+    expect(mockGetOrCreateDirectDM).not.toHaveBeenCalled();
+  });
+
+  it("shares pending/error state with the author-DM action for the same recipient", async () => {
+    let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({
+          senderId: anaId,
+          senderDisplayName: "Ana",
+          bodyText: anaMention,
+          bodyFormat: "v3",
+        }),
+      ]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    // The sender-name action (MessageMeta) and the clicked mention (message
+    // body) both carry the accessible name "Abrir conversa com Ana" — they
+    // are two different affordances for the same recipient id.
+    await screen.findByTestId("chat-msg-sender");
+    const [senderButton, mention] = screen.getAllByRole("button", {
+      name: "Abrir conversa com Ana",
+    });
+    fireEvent.click(mention);
+
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+    expect(mention).toHaveAttribute("aria-busy", "true");
+    // Same recipient id, so the sender-name action is disabled too — one
+    // in-flight request per recipient, not per click origin
+    // (useAuthorDM.resolveRecipientDM is shared by both callers).
+    expect(senderButton).toBeDisabled();
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-ana", created: true });
+    });
+  });
+
+  it("shows the unavailable-recipient message when the mentioned user can no longer be DMed (issue #795 §9)", async () => {
+    mockGetOrCreateDirectDM.mockRejectedValue(
+      new ApiRequestError(404, "not_found", "user not available"),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ bodyText: anaMention, bodyFormat: "v3" })]),
+    );
+    renderChannelAreaForUser("me-123");
+
+    await userEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Ana" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Esta pessoa não está mais disponível para conversa direta.",
+    );
+    // The timeline the mention lives in stays intact and the mention stays
+    // clickable — a removed recipient never breaks the conversation on screen.
+    expect(screen.getByText("@Ana")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Abrir conversa com Ana" })).toBeEnabled();
   });
 });
 

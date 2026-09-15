@@ -13,6 +13,7 @@ import type { RefObject } from "react";
 
 import ConversationSystemMessage from "../../ConversationSystemMessage.tsx";
 import MessageBubble, { type MessageBubbleProps } from "../../MessageBubble";
+import type { MentionType } from "../../richTextMarkers";
 import type { MentionTarget, Message, MessageAcknowledgement } from "../../chatTypes";
 import type { SystemMessageScope } from "../../conversationSystemMessage";
 import type { EmojiUsage } from "../../emoji/emojiUsage";
@@ -29,6 +30,8 @@ export interface TimelineMessageActions {
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onQuoteJump: (messageId: string) => void;
   onOpenAuthorDM?: MessageBubbleProps["onOpenAuthorDM"];
+  /** Opens a DM when a `@user` mention in a message body is clicked (issue #795). */
+  onMentionClick?: (mentionType: MentionType, id: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /** RF-21 "Verificar novamente" (issue #135); see MessageBubbleProps. */
   onReconcileLinkSafety?: MessageBubbleProps["onReconcileLinkSafety"];
@@ -199,6 +202,15 @@ function TimelineMessageRow({
       onReferenceJump={actions.onReferenceJump}
       onOpenAuthorDM={actions.onOpenAuthorDM}
       openingAuthorDM={context.openingAuthorDMIds?.has(message.senderId) ?? false}
+      mentionInteraction={
+        actions.onMentionClick
+          ? {
+              currentUserId: context.currentUserId,
+              onMentionClick: actions.onMentionClick,
+              openingIds: context.openingAuthorDMIds,
+            }
+          : undefined
+      }
       isHighlighted={highlightedMessageId === message.id}
       setMessageRef={setMessageRef}
     />

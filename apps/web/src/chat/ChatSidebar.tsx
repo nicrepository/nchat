@@ -393,33 +393,24 @@ function draftKeyFor(kind: "channel" | "dm", id: string): string {
   return `${kind}:${id}`;
 }
 
-const maxDraftPreviewLength = 40;
-
 /**
- * "Rascunho: …" (issue #769) — never the full text (privacy: "PRIVACIDADE DA
- * SIDEBAR"), and never anything that reveals draft != unread semantics on its
- * own; this is purely an additional, independent label.
+ * "Rascunho" (issue #769; simplified by issue #845) — never text, a file
+ * count or a voice description (privacy: "PRIVACIDADE DA SIDEBAR"), and
+ * never shown on the conversation that is currently open: the existence of
+ * a draft and the visibility of this badge are different things (issue
+ * #845, "CONVERSA ATIVA") — the composer already shows the draft there.
  */
-function draftLabel(summary: DraftSummary): string {
-  if (summary.kind === "voice") return "Rascunho: mensagem de voz";
-  if (summary.kind === "attachments") {
-    return summary.attachmentCount === 1
-      ? "Rascunho: 1 arquivo"
-      : `Rascunho: ${summary.attachmentCount} arquivos`;
-  }
-  if (summary.kind === "mixed" || !summary.text) return "Rascunho";
-  const truncated =
-    summary.text.length > maxDraftPreviewLength
-      ? `${summary.text.slice(0, maxDraftPreviewLength).trimEnd()}…`
-      : summary.text;
-  return `Rascunho: ${truncated}`;
-}
-
-function DraftIndicator({ summary }: { summary: DraftSummary | undefined }) {
-  if (!summary) return null;
+function DraftIndicator({
+  summary,
+  isActive,
+}: {
+  summary: DraftSummary | undefined;
+  isActive: boolean;
+}) {
+  if (!summary || isActive) return null;
   return (
     <span className="chat-sidebar__draft-badge" data-testid="chat-sidebar-draft-badge">
-      {draftLabel(summary)}
+      Rascunho
     </span>
   );
 }
@@ -566,7 +557,10 @@ function ChannelList({ channels, activeChannelId, onSelect, labelId, actions }: 
                     </span>
                   )}
                 </span>
-                <DraftIndicator summary={draftSummaries.get(draftKeyFor("channel", ch.id))} />
+                <DraftIndicator
+                  summary={draftSummaries.get(draftKeyFor("channel", ch.id))}
+                  isActive={isActive}
+                />
               </span>
             </button>
             <RowActions target={target} {...actions} />
@@ -680,7 +674,10 @@ function DMRow({
               </span>
             )}
           </span>
-          <DraftIndicator summary={draftSummaries.get(draftKeyFor("dm", dm.id))} />
+          <DraftIndicator
+            summary={draftSummaries.get(draftKeyFor("dm", dm.id))}
+            isActive={isActive}
+          />
         </span>
       </button>
       <RowActions target={target} {...actions} />

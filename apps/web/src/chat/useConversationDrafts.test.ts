@@ -161,11 +161,27 @@ describe("useConversationDrafts", () => {
     // that call is what opening the conversation would do, and the whole
     // point of the sidebar tag is to be visible before that happens.
     const { result: fresh } = renderHook(() => useConversationDrafts("u1"));
-    expect(fresh.current.summaries.get("dm:caio")).toEqual({
-      kind: "text",
-      text: "vou verificar",
-      attachmentCount: 0,
-    });
+    expect(fresh.current.summaries.get("dm:caio")).toEqual({ hasDraft: true });
+  });
+
+  it("does not let a debounced persist scheduled before a send resurrect the sent text (issue #845, race)", () => {
+    const { result } = renderHook(() => useConversationDrafts("u1"));
+    // A keystroke schedules a 400ms debounced sessionStorage write for
+    // "teste" — deliberately not advanced yet, so the timer is still
+    // pending when the draft is emptied below.
+    act(() => result.current.setText("dm:caio", textDoc("teste")));
+    // Mirrors what a confirmed send does: the editor clears and its
+    // onUpdate mirrors the now-empty doc back via setText, which is the
+    // only path that empties the draft on send (see useChatEditor.ts).
+    act(() => result.current.setText("dm:caio", emptyDoc));
+    expect(result.current.getDraft("dm:caio")).toBeUndefined();
+    expect(loadDraftPersistence("u1", "dm:caio")).toBeNull();
+
+    // The stale timer for "teste" fires here. It must not have survived
+    // the transition to EMPTY above.
+    act(() => vi.advanceTimersByTime(500));
+    expect(loadDraftPersistence("u1", "dm:caio")).toBeNull();
+    expect(result.current.getDraft("dm:caio")).toBeUndefined();
   });
 
   it("never mirrors attachments or voice messages to sessionStorage", () => {
@@ -192,37 +208,31 @@ describe("useConversationDrafts", () => {
     expect(u2.current.getDraft("dm:caio")).toBeUndefined();
   });
 
-  it("summaries only changes on a coarse boundary crossing, not on every keystroke", () => {
+  it("summaries only changes at the EMPTY<->HAS_DRAFT boundary, never on a keystroke that keeps text present (issue #845)", () => {
     const { result } = renderHook(() => useConversationDrafts("u1"));
-    act(() => result.current.setText("dm:caio", textDoc("a")));
+    act(() => result.current.setText("dm:caio", textDoc("t")));
     const summariesAfterFirstChar = result.current.summaries;
-    act(() => result.current.setText("dm:caio", textDoc("ab")));
-    // Text content changed (so the preview text differs) — this IS expected
-    // to update the summary map identity, but exactly once per meaningful
-    // preview change, not as a structural no-op.
+    // "t" -> "te" -> "tes" -> "teste": still has meaningful text the whole
+    // time, so the summary map identity must not move at all.
+    act(() => result.current.setText("dm:caio", textDoc("te")));
+    act(() => result.current.setText("dm:caio", textDoc("tes")));
+    act(() => result.current.setText("dm:caio", textDoc("teste")));
+    expect(result.current.summaries).toBe(summariesAfterFirstChar);
+
+    // Only the EMPTY -> HAS_DRAFT / HAS_DRAFT -> EMPTY crossing changes it.
+    act(() => result.current.setText("dm:caio", emptyDoc));
     expect(result.current.summaries).not.toBe(summariesAfterFirstChar);
-    const afterSecondChar = result.current.summaries;
-    act(() => result.current.setText("dm:caio", textDoc("ab")));
-    // Setting the exact same text again must not produce a new Map identity.
-    expect(result.current.summaries).toBe(afterSecondChar);
+    expect(result.current.summaries.has("dm:caio")).toBe(false);
   });
 
-  it("summaries reports attachmentCount and a text preview for the sidebar", () => {
+  it("summaries reports draft presence only — never text, kind or attachment count (issue #845, privacy/performance)", () => {
     const { result } = renderHook(() => useConversationDrafts("u1"));
     act(() => result.current.setText("dm:caio", textDoc("vou verificar")));
-    expect(result.current.summaries.get("dm:caio")).toEqual({
-      kind: "text",
-      text: "vou verificar",
-      attachmentCount: 0,
-    });
+    expect(result.current.summaries.get("dm:caio")).toEqual({ hasDraft: true });
     act(() =>
       result.current.setAttachments("dm:caio", [fakeAttachment("a1"), fakeAttachment("a2")]),
     );
-    expect(result.current.summaries.get("dm:caio")).toEqual({
-      kind: "mixed",
-      text: "vou verificar",
-      attachmentCount: 2,
-    });
+    expect(result.current.summaries.get("dm:caio")).toEqual({ hasDraft: true });
   });
 
   it("treats a @mention as meaningful text, even with no plain text alongside it", () => {
@@ -238,11 +248,7 @@ describe("useConversationDrafts", () => {
     const { result } = renderHook(() => useConversationDrafts("u1"));
     act(() => result.current.setText("dm:caio", mentionDoc));
     expect(result.current.getDraft("dm:caio")).toBeDefined();
-    expect(result.current.summaries.get("dm:caio")).toEqual({
-      kind: "text",
-      text: "@juliane",
-      attachmentCount: 0,
-    });
+    expect(result.current.summaries.get("dm:caio")).toEqual({ hasDraft: true });
   });
 
   it("updateAttachment on a localId no longer in the draft never resurrects it", () => {

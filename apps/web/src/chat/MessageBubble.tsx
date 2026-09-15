@@ -16,6 +16,7 @@ import { formatTime, senderLabel } from "./messageDisplay";
 import { PersonAvatarImage } from "./PersonAvatarImage";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import PresenceDot from "./PresenceDot";
+import type { MentionInteraction } from "./RichTextRenderer";
 import { useMessageEditing } from "./useMessageEditing";
 
 function senderInitials(msg: Message): string {
@@ -64,6 +65,8 @@ export interface MessageBubbleProps {
   currentUserId: string;
   onOpenAuthorDM?: (message: Message) => void;
   openingAuthorDM?: boolean;
+  /** Opens a DM when a `@user` mention in the message body is clicked (issue #795). */
+  mentionInteraction?: MentionInteraction;
   reactionMenuVisible: boolean;
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
@@ -297,6 +300,7 @@ function MessageBubbleBody({
           onQuoteJump={props.onQuoteJump}
           onReferenceJump={props.onReferenceJump}
           onReconcileLinkSafety={props.onReconcileLinkSafety}
+          mentionInteraction={props.mentionInteraction}
         />
         {props.onAcknowledge ? (
           <MessageAcknowledgementStrip

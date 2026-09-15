@@ -2432,6 +2432,22 @@
   font-weight: 600;
 }
 
+/* Issue #795: opening a DM from a mention gets only an interaction
+   affordance — no font, size, color, background, padding or line-height
+   change versus the shared .rtr-mention rule above. */
+.rtr-mention[data-mention-clickable="true"] {
+  cursor: pointer;
+}
+
+.rtr-mention[data-mention-clickable="true"]:hover {
+  text-decoration: underline;
+}
+
+.rtr-mention[data-mention-clickable="true"]:focus-visible {
+  outline: 2px solid var(--color-focus-ring, currentColor);
+  outline-offset: 1px;
+}
+
 .mention-popup {
   position: fixed;
   z-index: var(--z-overlay-mention, 300);

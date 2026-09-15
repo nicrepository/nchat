@@ -13,6 +13,10 @@ vi.mock("./chatApi", () => ({
 import ChatComposer from "./ChatComposer";
 import RichTextRenderer from "./RichTextRenderer";
 import type { SendResult } from "./useMessages";
+import { useConversationDrafts } from "./useConversationDrafts";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
+import { loadDraftPersistence } from "./chatDraftPersistence";
+import type { AttachmentUploadItem } from "./useAttachmentUpload";
 
 function clipboardData(html: string, plain: string): DataTransfer {
   return {
@@ -625,5 +629,100 @@ describe("ChatComposer emoji picker", () => {
     await send(onSend);
 
     await waitFor(() => expect(screen.queryByTestId("toolbar-emoji-picker")).toBeNull());
+  });
+});
+
+// Issue #845: ChatComposer wired to a real (non-noop) ConversationDraftsApi,
+// the same way AppShell/ChatMessageArea wire it in production — as opposed
+// to every test above, which relies on the default noop store and therefore
+// never exercises the draft-consumption/ACK-race guard at all.
+describe("ChatComposer with a real draft store (issue #845)", () => {
+  const draftKey = "dm:caio";
+
+  function DraftedComposer({
+    onSend,
+    onDrafts,
+  }: {
+    onSend: (body: string) => Promise<SendResult>;
+    onDrafts: (drafts: ConversationDraftsApi) => void;
+  }) {
+    const drafts = useConversationDrafts("u1");
+    onDrafts(drafts);
+    return (
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={onSend}
+        uploadTarget={{ kind: "dm", id: "caio" }}
+        drafts={drafts}
+      />
+    );
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("send + navigate + return: a confirmed send consumes the draft, and a debounce in flight cannot resurrect it", async () => {
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    let drafts!: ConversationDraftsApi;
+    render(<DraftedComposer onSend={onSend} onDrafts={(d) => (drafts = d)} />);
+
+    const input = await paste("", "mensagem enviada");
+    input.focus();
+    // A debounced sessionStorage write for "mensagem enviada" is now
+    // pending (400ms) — deliberately not awaited before sending.
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    await waitFor(() => expect(drafts.getDraft(draftKey)).toBeUndefined());
+    expect(loadDraftPersistence("u1", draftKey)).toBeNull();
+
+    // Simulates the reader navigating away and back (an unmount/remount
+    // does not touch sessionStorage) while the stale pre-send debounce
+    // timer, if it survived, would still be in flight.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(loadDraftPersistence("u1", draftKey)).toBeNull();
+    expect(drafts.getDraft(draftKey)).toBeUndefined();
+  });
+
+  it("ACK atrasado: a draft mutation that lands while a send is still in flight leaves the editor untouched once that send confirms", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi
+      .fn<(body: string) => Promise<SendResult>>()
+      .mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    let drafts!: ConversationDraftsApi;
+    render(<DraftedComposer onSend={onSend} onDrafts={(d) => (drafts = d)} />);
+
+    const input = await paste("", "A");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+
+    // While A's send is still pending, something else touches this
+    // conversation's draft — e.g. an attachment upload that started before
+    // the send resolves (issue #845, "vale também para novo attachment,
+    // novo reply, nova voice message adicionados após o submit").
+    const fakeAttachment: AttachmentUploadItem = {
+      localId: "a1",
+      file: new File(["x"], "a1.txt"),
+      status: "queued",
+      progress: null,
+      error: null,
+      attachment: null,
+    };
+    act(() => drafts.setAttachments(draftKey, [fakeAttachment]));
+
+    // A's send now confirms.
+    await act(async () => resolveSend({ status: "sent" }));
+
+    // The guard must see that the draft moved on since A was submitted and
+    // must NOT clear the editor — clearing here would silently drop
+    // whatever the reader has added since pressing Enter (issue #845, "ACK
+    // ATRASADO").
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+    expect(input.textContent?.trim()).toBe("A");
   });
 });

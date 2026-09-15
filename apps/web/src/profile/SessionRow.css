@@ -23,6 +23,13 @@
   overflow-wrap: anywhere;
 }
 
+.session-row__platform {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: #6b7280;
+  overflow-wrap: anywhere;
+}
+
 .session-row__meta {
   margin: 0;
   display: flex;
@@ -62,6 +69,7 @@
   .session-row {
     border-bottom-color: rgba(255, 255, 255, 0.12);
   }
+  .session-row__platform,
   .session-row__meta {
     color: #d1d5db;
   }

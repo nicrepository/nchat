@@ -32,6 +32,7 @@ const { api } = vi.hoisted(() => ({
     postChannelMessage: vi.fn(),
     postDMMessage: vi.fn(),
     fetchMentionCandidates: vi.fn(),
+    getOrCreateDirectDM: vi.fn(),
   },
 }));
 
@@ -45,6 +46,7 @@ vi.mock("./chatApi", async (importOriginal) => ({
   postChannelMessage: api.postChannelMessage,
   postDMMessage: api.postDMMessage,
   fetchMentionCandidates: api.fetchMentionCandidates,
+  getOrCreateDirectDM: api.getOrCreateDirectDM,
 }));
 
 // ── WebSocket fake ────────────────────────────────────────────────────────────
@@ -233,6 +235,7 @@ beforeEach(() => {
   api.postChannelMessage.mockResolvedValue(message("m-new", "enviada"));
   api.postDMMessage.mockResolvedValue(message("m-new", "enviada"));
   api.fetchMentionCandidates.mockResolvedValue([]);
+  api.getOrCreateDirectDM.mockResolvedValue({ conversationId: dmId, created: false });
 });
 
 afterEach(() => {
@@ -694,6 +697,39 @@ describe("composer drafts never cross conversation targets", () => {
       "segunda",
       expect.anything(),
     );
+  });
+
+  // Issue #795: clicking an individual @mention opens a DM the same way any
+  // other in-app navigation does — through the router, without remounting
+  // AppShell. This is the regression guard #769's draft store is exposed to:
+  // a mention click must not clear or leak a draft any more than the
+  // sidebar-click navigation the tests above already cover.
+  it("preserves the origin conversation's draft after opening a DM from a mention", async () => {
+    api.fetchChannelMessages.mockResolvedValueOnce(
+      page([
+        {
+          ...message("m-mention", "Oi @[Julia](mention:user:55555555-5555-4555-8555-555555555555)"),
+          bodyFormat: "v3",
+        },
+      ]),
+    );
+
+    renderAt(`/chat/channel/${secretChannelId}`);
+    await typeDraft(secretDraft);
+
+    await user.click(await screen.findByRole("button", { name: "Abrir conversa com Julia" }));
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/dm/${dmId}`));
+    expect(api.getOrCreateDirectDM).toHaveBeenCalledWith(
+      "55555555-5555-4555-8555-555555555555",
+      expect.any(AbortSignal),
+    );
+
+    await clickSecretChannel();
+    await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${secretChannelId}`));
+
+    const input = await screen.findByTestId("chat-composer-input");
+    await waitFor(() => expect(input).toHaveTextContent(secretDraft));
+    expect(screen.getByTestId("chat-send-btn")).toBeEnabled();
   });
 
   it("destroys the previous editor instance and leaves no stray mention popup", async () => {

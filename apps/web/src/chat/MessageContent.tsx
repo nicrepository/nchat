@@ -15,6 +15,7 @@ import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import InlineMessageEditor from "./InlineMessageEditor";
 import MessageAttachments from "./MessageAttachments";
 import RichTextRenderer from "./RichTextRenderer";
+import type { MentionInteraction } from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
 /**
@@ -379,9 +380,16 @@ function MessageBodyContent({
   onSaveEdit,
   onCancelEdit,
   onEditForbidden,
+  mentionInteraction,
 }: Pick<
   MessageContentProps,
-  "message" | "mentionTarget" | "editing" | "onSaveEdit" | "onCancelEdit" | "onEditForbidden"
+  | "message"
+  | "mentionTarget"
+  | "editing"
+  | "onSaveEdit"
+  | "onCancelEdit"
+  | "onEditForbidden"
+  | "mentionInteraction"
 >) {
   if (message.isRemoved) return "Mensagem removida.";
   if (message.linkSafetyState === "malicious") {
@@ -413,6 +421,7 @@ function MessageBodyContent({
       text={message.bodyText}
       bodyFormat={message.bodyFormat}
       linksClickable={linksClickable}
+      mention={mentionInteraction}
     />
   );
 }
@@ -429,6 +438,8 @@ export interface MessageContentProps {
   onQuoteJump?: (messageId: string) => void;
   onReferenceJump?: (reference: NonNullable<Message["reference"]>) => void;
   onReconcileLinkSafety?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
+  /** Opens a DM when a `@user` mention in the message body is clicked (issue #795). */
+  mentionInteraction?: MentionInteraction;
 }
 
 export default function MessageContent(props: MessageContentProps) {

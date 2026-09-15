@@ -19,6 +19,7 @@ import type {
   DMConversation,
   ChannelCategory,
 } from "./chatTypes";
+import type { DraftSummary } from "./useConversationDrafts";
 
 // ── Mock chatApi ──────────────────────────────────────────────────────────────
 
@@ -3132,6 +3133,7 @@ describe("ChatSidebar — row action menu", () => {
     ) => Promise<void>;
     leaveConversation?: (target: { kind: "channel" | "dm"; targetId: string }) => Promise<void>;
     onOpenDetails?: (kind: "channel" | "dm", targetId: string) => void;
+    draftSummaries?: ReadonlyMap<string, DraftSummary>;
   }
 
   const renderSidebar = ({
@@ -3145,6 +3147,7 @@ describe("ChatSidebar — row action menu", () => {
     setMuted = vi.fn().mockResolvedValue(undefined),
     leaveConversation = vi.fn().mockResolvedValue(undefined),
     onOpenDetails = vi.fn(),
+    draftSummaries,
   }: RenderOptions = {}) =>
     render(
       <MemoryRouter initialEntries={[path]}>
@@ -3158,6 +3161,7 @@ describe("ChatSidebar — row action menu", () => {
           setMuted={setMuted}
           leaveConversation={leaveConversation}
           onOpenDetails={onOpenDetails}
+          draftSummaries={draftSummaries}
         />
       </MemoryRouter>,
     );
@@ -3166,6 +3170,33 @@ describe("ChatSidebar — row action menu", () => {
     screen.getByRole("button", { name: `Mais opções para ${name}` });
 
   // ── The pin is state, not an action ────────────────────────────────────────
+
+  // ── Draft indicator (issue #845) ──────────────────────────────────────────
+
+  it("shows a bare Rascunho badge on an inactive conversation with a draft, and nothing on the active one", () => {
+    const draftSummaries = new Map<string, DraftSummary>([["channel:geral", { hasDraft: true }]]);
+    renderSidebar({
+      channels: [channel("geral"), channel("infra")],
+      // "infra" is the active conversation — "geral" is not.
+      path: "/chat/channel/infra",
+      draftSummaries,
+    });
+
+    const badges = screen.getAllByTestId("chat-sidebar-draft-badge");
+    expect(badges).toHaveLength(1);
+    expect(badges[0]).toHaveTextContent("Rascunho");
+  });
+
+  it("hides the Rascunho badge once the conversation with the draft becomes active", () => {
+    const draftSummaries = new Map<string, DraftSummary>([["channel:geral", { hasDraft: true }]]);
+    renderSidebar({
+      channels: [channel("geral")],
+      path: "/chat/channel/geral",
+      draftSummaries,
+    });
+
+    expect(screen.queryByTestId("chat-sidebar-draft-badge")).not.toBeInTheDocument();
+  });
 
   it("draws no pin at all on an unpinned row", () => {
     renderSidebar({ channels: [channel("geral")], dms: [dm("Juliane", "1:1")] });

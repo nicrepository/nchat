@@ -14,13 +14,20 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+const FIREFOX_WINDOWS =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0";
+const CHROME_WINDOWS =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+const EDGE_WINDOWS =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0";
+
 const sessions: sessionsApi.Session[] = [
   {
     id: "current",
     createdAt: "",
     lastSeenAt: "",
     ipAddress: "1.2.x.x",
-    userAgent: "Firefox",
+    userAgent: FIREFOX_WINDOWS,
     current: true,
   },
   {
@@ -28,7 +35,7 @@ const sessions: sessionsApi.Session[] = [
     createdAt: "",
     lastSeenAt: "",
     ipAddress: "3.4.x.x",
-    userAgent: "Chrome",
+    userAgent: CHROME_WINDOWS,
     current: false,
   },
 ];
@@ -79,7 +86,7 @@ describe("SessionsSettingsPage", () => {
     await act(async () => resolveOlder(sessions));
 
     expect(screen.getAllByTestId("session-row")).toHaveLength(1);
-    expect(screen.queryByText("Chrome")).not.toBeInTheDocument();
+    expect(screen.queryByText("Chrome 152")).not.toBeInTheDocument();
   });
 
   it("keeps session B data when session A resolves after the auth generation changes", async () => {
@@ -114,7 +121,7 @@ describe("SessionsSettingsPage", () => {
 
     await act(async () => resolveA(sessions));
     expect(screen.getAllByTestId("session-row")).toHaveLength(1);
-    expect(screen.queryByText("Chrome")).not.toBeInTheDocument();
+    expect(screen.queryByText("Chrome 152")).not.toBeInTheDocument();
   });
 
   it("revokes a single session through the confirm dialog and relists", async () => {
@@ -155,7 +162,7 @@ describe("SessionsSettingsPage", () => {
     setTokens("session-a");
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
-    await screen.findByText("Chrome");
+    await screen.findByText("Chrome 152");
     await user.click(screen.getByRole("button", { name: "Revogar sessão" }));
     await user.click(
       within(screen.getByRole("dialog")).getByRole("button", { name: "Revogar sessão" }),
@@ -164,12 +171,12 @@ describe("SessionsSettingsPage", () => {
 
     await act(async () => setTokens("session-b"));
     await waitFor(() => expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2));
-    await act(async () => resolveB([{ ...sessions[0], userAgent: "Edge" }]));
-    await screen.findByText("Edge");
+    await act(async () => resolveB([{ ...sessions[0], userAgent: EDGE_WINDOWS }]));
+    await screen.findByText("Microsoft Edge 153");
 
     await act(async () => resolveRevoke());
     expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("Edge")).toBeInTheDocument();
+    expect(screen.getByText("Microsoft Edge 153")).toBeInTheDocument();
   });
 
   it("does not submit a revoke-all confirmation opened by an older auth generation", async () => {
@@ -179,7 +186,7 @@ describe("SessionsSettingsPage", () => {
     setTokens("session-a");
     const user = userEvent.setup();
     render(<SessionsSettingsPage />);
-    await screen.findByText("Chrome");
+    await screen.findByText("Chrome 152");
     await user.click(screen.getByRole("button", { name: /revogar todas as outras/i }));
     const staleConfirm = within(screen.getByRole("dialog")).getByRole("button", {
       name: "Revogar sessões",
