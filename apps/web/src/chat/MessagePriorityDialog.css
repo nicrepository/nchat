@@ -1,0 +1,132 @@
+/*
+ * The composer's priority selector (issue #822).
+ *
+ * Two layouts, one component. `--anchored` is the desktop popover, placed by
+ * script against its trigger and therefore fixed-positioned; without it the
+ * panel is the bottom sheet, which is also what a desktop popover falls back to
+ * when there is no room beside the button.
+ *
+ * Every colour is a design token already in use by the composer. Priority is
+ * never carried by colour alone anywhere in this file: the radio, its text and
+ * the composer's own summary state it in words.
+ */
+
+.msg-priority__backdrop {
+  position: fixed;
+  inset: 0;
+  /* The app's modal layer, shared with the row-menu dialogs. */
+  z-index: 420;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: rgba(22, 18, 31, 0.45);
+}
+
+/* Anchored, the backdrop only catches the click outside; it dims nothing. */
+.msg-priority__backdrop--anchored {
+  background: transparent;
+}
+
+.msg-priority {
+  width: min(360px, 100%);
+  padding: 14px 16px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: 16px 16px 0 0;
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 18px 48px rgba(22, 18, 31, 0.22));
+  color: var(--color-ink, #16121f);
+  font-size: 13.5px;
+  /* The sheet clears a phone's home indicator, and resolves to the plain
+     padding everywhere the inset is 0. */
+  padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  /* A short viewport scrolls the panel rather than pushing its buttons off
+     screen; nothing ever scrolls sideways. */
+  max-height: 85vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.msg-priority--anchored {
+  position: fixed;
+  width: 288px;
+  border-radius: var(--radius-md, 10px);
+  padding-bottom: 14px;
+}
+
+.msg-priority__group {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.msg-priority__title {
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--color-muted, #7c7390);
+}
+
+.msg-priority__choice,
+.msg-priority__option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 6px;
+  border-radius: var(--radius-sm, 6px);
+  cursor: pointer;
+}
+
+.msg-priority__choice:hover,
+.msg-priority__option:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.msg-priority__options {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border, #e8e3f0);
+}
+
+.msg-priority__hint {
+  margin: 2px 6px 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--color-muted, #7c7390);
+}
+
+.msg-priority__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.msg-priority__cancel,
+.msg-priority__apply {
+  min-height: 36px;
+  padding: 0 14px;
+  font: inherit;
+  font-weight: 600;
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+}
+
+.msg-priority__cancel {
+  border: 1px solid var(--color-border, #e8e3f0);
+  background: var(--color-surface, #fff);
+  color: var(--color-ink, #16121f);
+}
+
+.msg-priority__apply {
+  border: 0;
+  background: var(--color-primary, #6d28d9);
+  color: #fff;
+}
+
+.msg-priority :focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}

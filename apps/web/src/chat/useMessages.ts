@@ -30,6 +30,7 @@
 import { useCallback, useEffect, useMemo, useReducer } from "react";
 
 import type { LinkSafetyRecheck, Message, MessageAcknowledgement } from "./chatTypes";
+import type { MessagePriorityIntent } from "./messagePriority";
 import { messagesGateway } from "./messages/messagesGateway";
 import { reducer } from "./messages/reducer";
 import { initialState } from "./messages/types";
@@ -109,8 +110,8 @@ export interface UseMessagesResult {
     body: string,
     referencedMessageId?: string,
     attachmentIds?: string[],
-    /** Issue #824: ask this message's recipients to confirm receipt. */
-    acknowledgementRequired?: boolean,
+    /** Issue #822: the priority, confirmation request and reminder policy. */
+    priority?: MessagePriorityIntent,
   ) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;

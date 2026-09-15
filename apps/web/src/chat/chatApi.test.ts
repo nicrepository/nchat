@@ -2009,6 +2009,75 @@ describe("fetchDMMessage", () => {
 
 // ── postChannelMessage ────────────────────────────────────────────────────────
 
+// ── Message priority (issues #821, #822, #824, #825) ─────────────────────────
+
+describe("message priority wire contract", () => {
+  // The exact payload chat-service defines: `priority` is a string of its own
+  // enum, and the two flags are plain booleans beside it. Nothing here renames
+  // or wraps them.
+  it("sends the stated priority and the flags that travel with it", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "reiniciar o cluster", {
+      priority: "urgent",
+      acknowledgementRequired: true,
+      persistentNotifications: true,
+    });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "reiniciar o cluster",
+      body_format: "v3",
+      priority: "urgent",
+      acknowledgement_required: true,
+      persistent_notifications: true,
+    });
+  });
+
+  it("sends important without any urgent-only flag", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "olhem isto", {
+      priority: "important",
+      acknowledgementRequired: false,
+      persistentNotifications: false,
+    });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "olhem isto",
+      body_format: "v3",
+      priority: "important",
+    });
+  });
+
+  // Absent is what chat-service already reads as standard. Sending the word —
+  // or worse, an empty string, which the service answers 400 — would change a
+  // payload that has worked since before the axis existed.
+  it("omits the field entirely for a standard message", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postChannelMessage("geral", "olá", { priority: "standard" });
+    const [, stated] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(stated.body as string)).toEqual({ body_text: "olá", body_format: "v3" });
+
+    mockAuthFetch.mockClear();
+    await postChannelMessage("geral", "olá");
+    const [, silent] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(silent.body as string)).toEqual({ body_text: "olá", body_format: "v3" });
+  });
+
+  it("carries the same contract from a DM", async () => {
+    mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
+    await postDMMessage("dm-1", "agora", {
+      priority: "urgent",
+      persistentNotifications: true,
+    });
+    const [, options] = mockAuthFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      body_text: "agora",
+      body_format: "v2",
+      priority: "urgent",
+      persistent_notifications: true,
+    });
+  });
+});
+
 // ── RF-32 attachments ─────────────────────────────────────────────────────────
 
 describe("message attachments", () => {

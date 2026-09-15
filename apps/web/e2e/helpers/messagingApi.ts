@@ -181,12 +181,20 @@ export interface MessagingScenario {
       parent_message_id?: string;
       referenced_message_id?: string;
       attachment_ids?: string[];
+      /** The attention axis a send may state (issues #821, #824, #825). */
+      priority?: string;
+      acknowledgement_required?: boolean;
+      persistent_notifications?: boolean;
     }>;
     dmPosts: Array<{
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
       attachment_ids?: string[];
+      /** The attention axis a send may state (issues #821, #824, #825). */
+      priority?: string;
+      acknowledgement_required?: boolean;
+      persistent_notifications?: boolean;
     }>;
     forwards: Array<{
       destinationChannelId: string;

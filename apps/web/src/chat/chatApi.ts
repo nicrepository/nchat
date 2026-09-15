@@ -44,6 +44,7 @@ import {
   type MessageAcknowledgementRecipient,
   type MessageEditHistoryEntry,
   type MessagePage,
+  type MessagePriority,
   type MessageSecuritySnapshot,
   type PinnedItem,
   type ConversationEventPayload,
@@ -1368,6 +1369,16 @@ export interface PostMessageOptions {
   /** DMs default to v2; group composers opt into the existing v3 codec. */
   bodyFormat?: "v2" | "v3";
   /**
+   * The author's stated priority (issue #821).
+   *
+   * Omitted from the request when it is `standard`, which is what an absent
+   * priority already means to chat-service. Deliberately not sent as the empty
+   * string: the service treats `""` as a stated-but-invalid priority and
+   * answers 400, because a client that filled the field in wrongly must not be
+   * silently demoted to standard.
+   */
+  priority?: MessagePriority;
+  /**
    * Ask this message's recipients to confirm receipt explicitly (issue #824).
    *
    * Omitted from the request entirely when false, so a send that asks for
@@ -1375,6 +1386,15 @@ export interface PostMessageOptions {
    * server is unaffected.
    */
   acknowledgementRequired?: boolean;
+  /**
+   * Keep reminding the recipients who neither confirmed nor answered (#825).
+   *
+   * Omitted when false, on the same terms. The service refuses it on a message
+   * that is not urgent rather than ignoring it, so this is only ever sent
+   * alongside `priority: "urgent"` — see normalizePriorityIntent, which is what
+   * guarantees the pair rather than a check at this layer.
+   */
+  persistentNotifications?: boolean;
   signal?: AbortSignal;
 }
 
@@ -1387,7 +1407,9 @@ function postMessageBody(bodyText: string, bodyFormat: string, options: PostMess
     // Omitted entirely when there is none, so a text-only request is the exact
     // payload it has always been.
     ...(options.attachmentIds?.length ? { attachment_ids: options.attachmentIds } : {}),
+    ...(options.priority && options.priority !== "standard" ? { priority: options.priority } : {}),
     ...(options.acknowledgementRequired ? { acknowledgement_required: true } : {}),
+    ...(options.persistentNotifications ? { persistent_notifications: true } : {}),
   });
 }
 

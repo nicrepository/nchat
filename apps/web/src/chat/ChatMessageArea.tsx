@@ -35,6 +35,7 @@ import { useLocation, useNavigate } from "react-router";
 
 import "./ChatMessageArea.css";
 import type { Message } from "./chatTypes";
+import type { MessagePriorityIntent } from "./messagePriority";
 import { fetchAllowedReactionEmojis } from "./chatApi";
 import { usePendingReference } from "./usePendingReference";
 import { useConversationTarget } from "./useConversationTarget";
@@ -309,13 +310,13 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     async (
       body: string,
       attachmentIds?: string[],
-      acknowledgementRequired?: boolean,
+      priority?: MessagePriorityIntent,
     ): Promise<SendResult> => {
       const result = await sendMessage(
         body,
         pendingReference.messageId || undefined,
         attachmentIds,
-        acknowledgementRequired,
+        priority,
       );
       if (result.status === "sent") {
         // Sending is itself the clearest possible "stopped typing" signal — do

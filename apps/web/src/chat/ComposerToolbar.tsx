@@ -19,6 +19,13 @@ import type { Editor } from "@tiptap/core";
 
 import { useAnchoredPicker } from "./emoji/useAnchoredPicker";
 import { emptyEmojiUsage, type EmojiUsage } from "./emoji/emojiUsage";
+import MessagePriorityDialog from "./MessagePriorityDialog";
+import {
+  isDefaultPriorityIntent,
+  priorityTriggerLabel,
+  standardPriorityIntent,
+  type MessagePriorityIntent,
+} from "./messagePriority";
 
 /**
  * The picker and its catalog stay in the chunk the reactions already load, so
@@ -116,23 +123,21 @@ export interface ComposerToolbarProps {
   pickerOpen?: boolean;
   onPickerOpenChange?: (open: boolean) => void;
   /**
-   * Ask this message's recipients to confirm receipt (issue #824).
+   * What this message states about its own priority, and how to restate it
+   * (issue #822).
    *
-   * A toggle rather than a checkbox inside a priority popover, because the
-   * popover does not exist yet: #822 owns the composer's priority control and
-   * #820 places "Solicitar confirmação" inside it. Until that lands this is the
-   * only way to reach a backend capability that is otherwise unusable, and when
-   * it lands this button is what that popover absorbs.
-   *
-   * #820 keeps acknowledgement independent of priority in the domain — it says
-   * the first UI *may* offer it only for Urgent, not that it must — so offering
-   * it on its own is within the stated policy rather than ahead of it.
+   * One value rather than a control per flag: priority, the confirmation
+   * request (#824) and the persistent reminders (#825) are decided together in
+   * the popover this button opens, and a toolbar that could set one of them
+   * behind the others' backs is how a stale flag reaches the server. This
+   * absorbs the standalone acknowledgement toggle #824 left here for exactly
+   * this issue to take over.
    *
    * Omitted entirely by callers that do not support it (the inline editor), so
    * the button simply is not drawn.
    */
-  acknowledgementRequired?: boolean;
-  onAcknowledgementRequiredChange?: (required: boolean) => void;
+  priority?: MessagePriorityIntent;
+  onPriorityChange?: (intent: MessagePriorityIntent) => void;
 }
 
 const noEmojiUse = () => undefined;
@@ -154,6 +159,73 @@ function useComposerEmoji(props: ComposerToolbarProps) {
     onToneChange: emoji?.onToneChange ?? noEmojiUse,
     onUsed: emoji?.onUsed ?? noEmojiUse,
   };
+}
+
+/**
+ * The priority button and the popover it owns (issue #822).
+ *
+ * Its own component, and its own open state, because the toolbar has no reason
+ * to know when a popover is open: the value is what the composer above cares
+ * about, and it arrives only through onChange. That also keeps the applied
+ * intent and the popover's draft in different components, so there is no way
+ * for an unapplied edit to leak upwards.
+ *
+ * Closing — Cancelar, Escape, a click outside or Aplicar — always hands focus
+ * back to this button, which is where the reader was before it opened.
+ */
+function ComposerPriorityControl({
+  intent,
+  disabled,
+  onChange,
+}: {
+  intent: MessagePriorityIntent;
+  disabled: boolean;
+  onChange: (intent: MessagePriorityIntent) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const stated = !isDefaultPriorityIntent(intent);
+
+  function close() {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`composer-toolbar__btn${
+          stated ? ` composer-toolbar__btn--priority-${intent.priority}` : ""
+        }`}
+        // The whole applied state, in words: a screen reader hears the priority
+        // and the options that came with it, never the tint that also marks them.
+        aria-label={priorityTriggerLabel(intent)}
+        title={priorityTriggerLabel(intent)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        disabled={disabled}
+        data-testid="toolbar-priority-btn"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+          error
+        </span>
+      </button>
+      {open && (
+        <MessagePriorityDialog
+          intent={intent}
+          anchorRef={triggerRef}
+          onCancel={close}
+          onApply={(applied) => {
+            onChange(applied);
+            close();
+          }}
+        />
+      )}
+    </>
+  );
 }
 
 export default function ComposerToolbar(props: ComposerToolbarProps) {
@@ -225,27 +297,19 @@ export default function ComposerToolbar(props: ComposerToolbarProps) {
       })}
 
       {/*
-        Issue #824. A toggle button, not a checkbox: it sits among the other
-        toolbar controls and carries its state in aria-pressed, so a screen
-        reader hears "Solicitar confirmação de recebimento, pressed" rather than
-        depending on the tint that marks it.
+        Issue #822. One button for the whole attention axis — priority, the
+        confirmation request and the persistent reminders — because they are
+        decided together and the server reads them together. It replaces the
+        standalone acknowledgement toggle #824 parked here until this popover
+        existed; the capability is unchanged, it simply lives inside the dialog
+        now instead of beside it.
       */}
-      {props.onAcknowledgementRequiredChange ? (
-        <button
-          type="button"
-          className={`composer-toolbar__btn${
-            props.acknowledgementRequired ? " composer-toolbar__btn--active" : ""
-          }`}
-          aria-label="Solicitar confirmação de recebimento"
-          aria-pressed={props.acknowledgementRequired ?? false}
+      {props.onPriorityChange ? (
+        <ComposerPriorityControl
+          intent={props.priority ?? standardPriorityIntent}
           disabled={disabled}
-          data-testid="toolbar-acknowledgement-btn"
-          onClick={() => props.onAcknowledgementRequiredChange?.(!props.acknowledgementRequired)}
-        >
-          <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
-            how_to_reg
-          </span>
-        </button>
+          onChange={props.onPriorityChange}
+        />
       ) : null}
 
       {/* ── Emoji button + picker ── */}

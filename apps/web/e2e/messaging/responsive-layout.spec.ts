@@ -315,6 +315,48 @@ test.describe("layout responsivo", () => {
     await expectNoHorizontalScroll(page);
   });
 
+  /**
+   * ISSUE #822 — the priority selector is a popover on desktop and a sheet on a
+   * phone, and this is the half a jsdom test cannot answer: that the sheet is
+   * actually on screen, reachable and does not widen the page.
+   *
+   * It also closes the loop the unit tests stop short of: what the browser
+   * finally posts is asserted against the real request body.
+   */
+  test("celular: prioridade abre como sheet utilizável e envia o contrato aplicado", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize(PHONE);
+    const { scenario } = await openChannel(page, testInfo);
+
+    await fillComposer(page, "reiniciar o cluster antes das 14h");
+    await page.getByTestId("toolbar-priority-btn").click();
+
+    const sheet = page.getByTestId("composer-priority-dialog");
+    await expect(sheet).toBeVisible();
+    await expect(page.getByTestId("priority-cancel")).toBeVisible();
+    await expect(page.getByTestId("priority-apply")).toBeVisible();
+    await expectNoHorizontalScroll(page);
+
+    await page.getByTestId("priority-option-urgent").check();
+    await page.getByTestId("priority-persistent").check();
+    await expect(sheet).toContainText("lembretes a cada 5 minutos até confirmação ou resposta");
+    await expectNoHorizontalScroll(page);
+
+    await page.getByTestId("priority-apply").click();
+    await expect(sheet).toBeHidden();
+    await expect(page.getByTestId("composer-priority-summary")).toContainText("Urgente");
+    await expectNoHorizontalScroll(page);
+
+    await page.getByTestId("chat-send-btn").click();
+    await expect
+      .poll(() => scenario.requests.channelPosts.length, { timeout: 5_000 })
+      .toBeGreaterThan(0);
+    const posted = scenario.requests.channelPosts.at(-1);
+    expect(posted?.priority).toBe("urgent");
+    expect(posted?.persistent_notifications).toBe(true);
+  });
+
   test("celular: Escape fecha a navegação e devolve o foco ao acionador", async ({
     page,
   }, testInfo) => {
