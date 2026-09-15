@@ -4,8 +4,9 @@
  * Everything that interrupts the reader for an incoming message goes through
  * `presentLiveMessageNotification`: the in-app toast, the chime, the OS-level
  * notification. No component plays audio, opens a channel, or decides on its
- * own whether an event deserves a surface — this module is the only importer of
- * messageSound.ts, and the only place the three surfaces are executed.
+ * own whether an event deserves a surface — this module is the only caller of
+ * the notification sound player from the message path, and the only place the
+ * three surfaces are executed.
  *
  * What it deliberately does **not** own, because each already has an owner:
  *
@@ -122,7 +123,7 @@ import { showBrowserMessageNotification } from "./browserNotification";
 import type { MessagePriority } from "./chatTypes";
 import type { InAppAlert } from "./InAppMessageAlert";
 import { buildMessagePreview } from "./messagePreview";
-import { playMessageSound } from "./messageSound";
+import { playNotificationSound } from "../notifications/notificationSound";
 import { sessionScoped } from "../lib/sessionScoped";
 import { createBurstGate } from "./notificationBurst";
 import {
@@ -293,13 +294,20 @@ function raiseNative(event: MessageNotificationEvent, sinks: MessagePresentation
 /**
  * Executes whichever surfaces were authorised.
  *
- * The chime is last and is swallowed whole: playMessageSound() already never
- * throws and already absorbs the autoplay rejection, and this is the guarantee
- * that a failed sound stays a failed sound — it cannot alter unread, cannot
- * stop the event being processed, and is never retried.
+ * The chime is last and is swallowed whole: playNotificationSound() already
+ * never throws and already absorbs the autoplay rejection, and this is the
+ * guarantee that a failed sound stays a failed sound — it cannot alter unread,
+ * cannot stop the event being processed, and is never retried.
+ *
+ * Which of the Lumen sounds plays is the resolved class and nothing else
+ * (#826/#827): `NotificationClass` is assignable to `NotificationSound`, so the
+ * class this event was already given *is* the key, checked by the compiler.
+ * There is no second classification here, and no file name either — this module
+ * has never known where a sound lives and still does not.
  */
 function executeSurfaces(
   event: MessageNotificationEvent,
+  notificationClass: NotificationClass,
   surfaces: AuthorisedSurfaces,
   sinks: MessagePresentationSinks,
 ): void {
@@ -307,7 +315,7 @@ function executeSurfaces(
   const nativeShown = surfaces.native && raiseNative(event, sinks);
   if (nativeShown || !surfaces.sound) return;
   try {
-    playMessageSound();
+    playNotificationSound(notificationClass);
   } catch {
     // Swallowed on purpose: see above.
   }
@@ -410,7 +418,7 @@ function presentOnce(
   const memory = presentationMemory();
   memory.markPresented(event.eventId);
   const sound = surfaces.sound && memory.allowSound(soundCooldownKey(event, notificationClass));
-  executeSurfaces(event, { ...surfaces, sound }, sinks);
+  executeSurfaces(event, notificationClass, { ...surfaces, sound }, sinks);
 }
 
 /**

@@ -23,7 +23,7 @@ const {
   mockSetConversationMuted,
   mockSetConversationNotificationMode,
   mockLeaveConversation,
-  mockPlayMessageSound,
+  mockPlayNotificationSound,
   mockGetSoundNotificationMode,
   mockShowBrowserMessageNotification,
   websocket,
@@ -35,7 +35,7 @@ const {
   mockSetConversationMuted: vi.fn(),
   mockSetConversationNotificationMode: vi.fn(),
   mockLeaveConversation: vi.fn(),
-  mockPlayMessageSound: vi.fn(),
+  mockPlayNotificationSound: vi.fn(),
   mockGetSoundNotificationMode: vi.fn(
     () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
   ),
@@ -62,8 +62,8 @@ vi.mock("./chatApi", () => ({
   setConversationNotificationMode: mockSetConversationNotificationMode,
   leaveConversation: mockLeaveConversation,
 }));
-vi.mock("./messageSound", () => ({
-  playMessageSound: mockPlayMessageSound,
+vi.mock("../notifications/notificationSound", () => ({
+  playNotificationSound: mockPlayNotificationSound,
 }));
 vi.mock("./soundPreference", () => ({
   getSoundNotificationMode: mockGetSoundNotificationMode,
@@ -580,7 +580,7 @@ describe("useChatSidebar realtime unread", () => {
 describe("useChatSidebar notification sound", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
       channels: [
@@ -602,7 +602,7 @@ describe("useChatSidebar notification sound", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-1", channelA)));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not play a sound for the current user's own message", async () => {
@@ -613,7 +613,7 @@ describe("useChatSidebar notification sound", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-own", channelA, currentUserId)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("does not play a sound for a message in the currently active conversation", async () => {
@@ -624,7 +624,7 @@ describe("useChatSidebar notification sound", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-active", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("plays a sound only once for a duplicate delivery of the same message id", async () => {
@@ -639,7 +639,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(event);
     });
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not play a sound for a route-only event with no message payload", async () => {
@@ -652,11 +652,11 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(routeOnlyMessageCreated("message-route-only", channelA)),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
-  it("still updates the unread badge when playMessageSound throws", async () => {
-    mockPlayMessageSound.mockImplementation(() => {
+  it("still updates the unread badge when playNotificationSound throws", async () => {
+    mockPlayNotificationSound.mockImplementation(() => {
       throw new Error("audio backend unavailable");
     });
     const { result } = renderHook(() => useChatSidebar(), {
@@ -686,7 +686,7 @@ describe("useChatSidebar notification sound", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("dm-message-1", dmC, "other-1", "dm")));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not play a sound for a DM message in the currently active DM", async () => {
@@ -700,7 +700,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(messageCreated("dm-message-active", dmC, "other-1", "dm")),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("does not play a sound for the current user's own DM message", async () => {
@@ -713,7 +713,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(messageCreated("dm-message-own", dmC, currentUserId, "dm")),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("plays a sound only once for a duplicate delivery of the same DM message id", async () => {
@@ -728,7 +728,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(event);
     });
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("counts a duplicate @mention delivery only once for sound, badge and hasMentionUnread", async () => {
@@ -750,7 +750,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(event);
     });
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     if (result.current.state.status === "ready") {
       const channel = result.current.state.channels.find((c) => c.id === channelA);
       expect(channel?.unreadCount).toBe(1);
@@ -777,7 +777,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(event);
     });
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     if (result.current.state.status === "ready") {
       const dm = result.current.state.dms.find((d) => d.id === dmC);
       expect(dm?.unreadCount).toBe(1);
@@ -796,12 +796,12 @@ describe("useChatSidebar notification sound", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     act(() => websocket.onMessageCreated?.(messageCreated("chan-message", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 0 });
 
-    mockPlayMessageSound.mockClear();
+    mockPlayNotificationSound.mockClear();
     act(() => websocket.onMessageCreated?.(messageCreated("dm-message", dmC, "other-1", "dm")));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(unreadCounts(result.current.state)).toEqual({ channelA: 1, channelB: 0, dmC: 1 });
   });
 
@@ -815,7 +815,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(messageCreated("group-message-1", groupD, "other-1", "dm")),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     if (result.current.state.status === "ready") {
       expect(result.current.state.dms.find((d) => d.id === groupD)?.unreadCount).toBe(1);
     }
@@ -840,7 +840,7 @@ function nativeAllowed(event: WSMessageCreatedEvent): WSMessageCreatedEvent {
 describe("useChatSidebar native browser notification", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
     mockFetchSidebarData.mockResolvedValue({
@@ -877,7 +877,7 @@ describe("useChatSidebar native browser notification", () => {
         bodyText: "Nova mensagem",
       }),
     );
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   // Issue #744, round 4: the chime and the OS notification are different
@@ -899,7 +899,7 @@ describe("useChatSidebar native browser notification", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("native-sound-only", channelA)));
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("raises a native notification without a chime when only that channel was allowed", async () => {
@@ -917,7 +917,7 @@ describe("useChatSidebar native browser notification", () => {
     act(() => websocket.onMessageCreated?.(event));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("stays silent on both surfaces when the policy allows neither", async () => {
@@ -935,7 +935,7 @@ describe("useChatSidebar native browser notification", () => {
     act(() => websocket.onMessageCreated?.(event));
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("falls back to the chime when the native notification is not shown", async () => {
@@ -950,7 +950,7 @@ describe("useChatSidebar native browser notification", () => {
     act(() => websocket.onMessageCreated?.(nativeAllowed(messageCreated("native-2", channelA))));
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("uses a native notification when the page is visible but another application has focus", async () => {
@@ -968,7 +968,7 @@ describe("useChatSidebar native browser notification", () => {
     );
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("never attempts a native notification while the page and window are focused", async () => {
@@ -985,7 +985,7 @@ describe("useChatSidebar native browser notification", () => {
     );
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // Mute is resolved server-side per recipient (issue #744, review round 6), so
@@ -1019,7 +1019,7 @@ describe("useChatSidebar native browser notification", () => {
     act(() => websocket.onMessageCreated?.(muted));
 
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     // Silencing an alert never hides the message: the badge still counts it.
     expect(unreadCounts(result.current.state).channelA).toBe(1);
   });
@@ -1118,7 +1118,7 @@ describe("useChatSidebar native browser notification", () => {
       ),
     ).not.toThrow();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(unreadCounts(result.current.state).channelA).toBe(1);
   });
 
@@ -1195,7 +1195,7 @@ describe("useChatSidebar native browser notification", () => {
 describe("useChatSidebar sound preference and DM/mention rules", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockGetSoundNotificationMode.mockReset();
     mockGetSoundNotificationMode.mockReturnValue("all");
     mockFetchSidebarData.mockResolvedValue({
@@ -1224,7 +1224,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("message-1", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("still updates the unread badge when the sound mode is 'off'", async () => {
@@ -1258,7 +1258,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not give mention priority to a mention of a different user", async () => {
@@ -1285,7 +1285,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("does not play a sound for a mention inside the current user's own message", async () => {
@@ -1317,7 +1317,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
     expect(unreadCounts(result.current.state).channelA).toBe(0);
     if (result.current.state.status === "ready") {
@@ -1347,7 +1347,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("plays a sound for a DM in the active conversation once the window loses focus", async () => {
@@ -1361,12 +1361,12 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     // Focused + active: no sound (unchanged from the existing DM-active test).
     act(() => websocket.onMessageCreated?.(messageCreated("dm-focused", dmC, "other-1", "dm")));
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
 
     // Same active DM, window now in the background: DM priority still plays.
     visibility.mockReturnValue("hidden");
     act(() => websocket.onMessageCreated?.(messageCreated("dm-unfocused", dmC, "other-1", "dm")));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not play a standard channel message in the active conversation even when the window is unfocused", async () => {
@@ -1379,7 +1379,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("standard-unfocused", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   // The wire carries the author's priority (#821/#840) and the notification
@@ -1399,13 +1399,13 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     // Another channel, so nothing here is suppressed for being on screen.
     act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
     act(() => websocket.onMessageCreated?.(messageCreated("standard-2", channelB)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     act(() =>
       websocket.onMessageCreated?.(withPriority(messageCreated("urgent-1", channelB), "urgent")),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 
   // A priority this build does not know must never be the one that escalates.
@@ -1423,7 +1423,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       websocket.onMessageCreated?.(withPriority(messageCreated("unknown-1", channelB), "critical")),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // Combines the two rules directly above into one session: badge
@@ -1443,7 +1443,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     act(() =>
       websocket.onMessageCreated?.(messageCreated("active-seq-standard", channelA, "other-1")),
     );
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(unreadCounts(result.current.state).channelA).toBe(0);
 
     act(() =>
@@ -1458,7 +1458,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
         ),
       ),
     );
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     // Badge stays 0 even on the message that DID play.
     expect(unreadCounts(result.current.state).channelA).toBe(0);
     if (result.current.state.status === "ready") {
@@ -1484,7 +1484,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
         websocket.onMessageCreated?.(messageCreated("dm-no-visibility", dmC, "other-1", "dm")),
       ),
     ).not.toThrow();
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("plays only once for a DM message that also contains a mention of the current user", async () => {
@@ -1506,7 +1506,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // ── 'mentions' mode ──────────────────────────────────────────────────────
@@ -1520,7 +1520,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("in 'mentions' mode, still updates the unread badge for a plain message even without sound", async () => {
@@ -1532,7 +1532,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("standard-badge-mentions", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     if (result.current.state.status === "ready") {
       expect(result.current.state.channels.find((c) => c.id === channelA)?.unreadCount).toBe(1);
     }
@@ -1547,7 +1547,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("dm-plain", dmC, "other-1", "dm")));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("in 'mentions_and_dms' mode, plays for a background DM without a mention", async () => {
@@ -1559,7 +1559,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("dm-mode4", dmC, "other-1", "dm")));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("in 'mentions_and_dms' mode, does not play for a plain channel message", async () => {
@@ -1571,7 +1571,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("standard-mode4", channelA)));
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("in 'mentions_and_dms' mode, plays for a real @mention in a channel", async () => {
@@ -1594,7 +1594,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("in 'mentions' mode, plays once for a DM that also contains a mention of the current user", async () => {
@@ -1617,7 +1617,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("in 'mentions' mode, plays for a real @mention of the current user in a background channel", async () => {
@@ -1640,7 +1640,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("in 'mentions' mode, plays for an @all broadcast in a background channel", async () => {
@@ -1663,7 +1663,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("in 'all' mode, an @all broadcast also plays (background channel)", async () => {
@@ -1685,7 +1685,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // ── Mention badge (visual indicator, independent of sound mode) ─────────
@@ -1751,7 +1751,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
       ),
     );
 
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     if (result.current.state.status === "ready") {
       expect(result.current.state.channels.find((c) => c.id === channelA)?.hasMentionUnread).toBe(
         true,
@@ -1777,7 +1777,7 @@ describe("useChatSidebar — only the live path announces (issue #750)", () => {
     websocket.onConversationAvailable = null;
     websocket.onConversationEvent = null;
     mockFetchSidebarData.mockClear();
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
     mockGetSoundNotificationMode.mockReset();
@@ -1802,7 +1802,8 @@ describe("useChatSidebar — only the live path announces (issue #750)", () => {
 
   function presentationCount() {
     return (
-      mockPlayMessageSound.mock.calls.length + mockShowBrowserMessageNotification.mock.calls.length
+      mockPlayNotificationSound.mock.calls.length +
+      mockShowBrowserMessageNotification.mock.calls.length
     );
   }
 
@@ -1898,7 +1899,7 @@ describe("useChatSidebar — only the live path announces (issue #750)", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("live-1", channelA)));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(result.current.inAppAlert?.messageId).toBe("live-1");
     expect(unreadCounts(result.current.state).channelA).toBe(1);
   });
@@ -1918,7 +1919,7 @@ describe("useChatSidebar — only the live path announces (issue #750)", () => {
 
     act(() => websocket.onMessageCreated?.(messageCreated("live-after-recovery", channelA)));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(result.current.inAppAlert?.messageId).toBe("live-after-recovery");
   });
 });
@@ -1931,7 +1932,7 @@ describe("useChatSidebar — only the live path announces (issue #750)", () => {
 describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockGetSoundNotificationMode.mockReturnValue("all");
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
@@ -1956,7 +1957,7 @@ describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () 
     });
 
     expect(unreadCounts(result.current.state).channelA).toBe(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -1984,7 +1985,7 @@ describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () 
     act(() => websocket.onMessageCreated?.(messageCreated("across-remount", channelA)));
 
     expect(unreadCounts(second.result.current.state).channelA).toBe(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     act(() => websocket.onMessageCreated?.(messageCreated("after-remount", channelA)));
     expect(unreadCounts(second.result.current.state).channelA).toBe(2);
@@ -2025,7 +2026,7 @@ describe("useChatSidebar — realtime ingestion is idempotent (issue #750)", () 
 describe("useChatSidebar burst suppression (issue #750)", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockGetSoundNotificationMode.mockReturnValue("all");
     mockFetchSidebarData.mockResolvedValue({
       currentUserId,
@@ -2056,7 +2057,7 @@ describe("useChatSidebar burst suppression (issue #750)", () => {
     });
 
     expect(unreadCounts(result.current.state).channelA).toBe(25);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -2095,7 +2096,7 @@ describe("useChatSidebar burst suppression (issue #750)", () => {
     });
     await waitFor(() => expect(first.result.current.state.status).toBe("ready"));
     act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     first.unmount();
 
     const second = renderHook(() => useChatSidebar(), {
@@ -2104,7 +2105,7 @@ describe("useChatSidebar burst suppression (issue #750)", () => {
     await waitFor(() => expect(second.result.current.state.status).toBe("ready"));
     act(() => websocket.onMessageCreated?.(messageCreated("survives-remount", channelA)));
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a rajada in one conversation from silencing another", async () => {
@@ -2120,7 +2121,7 @@ describe("useChatSidebar burst suppression (issue #750)", () => {
       websocket.onMessageCreated?.(messageCreated("elsewhere", channelB));
     });
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -2140,7 +2141,7 @@ describe("useChatSidebar sound mode changes at runtime", () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["Date"] });
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockGetSoundNotificationMode.mockReset();
     mockGetSoundNotificationMode.mockReturnValue("all");
     mockFetchSidebarData.mockResolvedValue({
@@ -2163,14 +2164,14 @@ describe("useChatSidebar sound mode changes at runtime", () => {
 
     // Starts in 'all': a plain background message plays.
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-1", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     // Switched to 'off' mid-session: the very next event must not play, with no
     // remount and no reset of the hook's dedup set in between — but the badge
     // keeps counting regardless of mute (muting is a sound-only concern).
     mockGetSoundNotificationMode.mockReturnValue("off");
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-2", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
     expect(unreadCounts(result.current.state).channelA).toBe(2);
 
     // Switched back to 'all' mid-session: the very next eligible event plays
@@ -2178,14 +2179,14 @@ describe("useChatSidebar sound mode changes at runtime", () => {
     mockGetSoundNotificationMode.mockReturnValue("all");
     leaveTheSoundBurstWindow();
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-2b", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
     expect(unreadCounts(result.current.state).channelA).toBe(3);
 
     // Switched to 'mentions': a plain message still doesn't play, but a real
     // @mention does — both take effect immediately, same hook instance.
     mockGetSoundNotificationMode.mockReturnValue("mentions");
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-3", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
 
     leaveTheSoundBurstWindow();
     act(() =>
@@ -2200,13 +2201,13 @@ describe("useChatSidebar sound mode changes at runtime", () => {
         ),
       ),
     );
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(3);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(3);
 
     // Replaying the very first (already-seen) message id after the mode
     // changes must stay deduplicated — a later preference change does not
     // reopen dedup for an event already processed.
     act(() => websocket.onMessageCreated?.(messageCreated("runtime-1", channelA)));
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(3);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -2720,7 +2721,7 @@ describe("useChatSidebar — badge persistence", () => {
     websocket.onConversationAvailable = null;
     mockFetchSidebarData.mockReset();
     mockMarkConversationRead.mockReset();
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
   });
@@ -2939,7 +2940,7 @@ describe("useChatSidebar — badge persistence", () => {
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
     expect(unreadCounts(result.current.state).channelA).toBe(5);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
@@ -3104,7 +3105,7 @@ describe("useChatSidebar — ações do menu de conversa", () => {
 describe("useChatSidebar — system messages", () => {
   beforeEach(() => {
     mockFetchSidebarData.mockReset();
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: false });
     websocket.onConversationEvent = null;
@@ -3140,7 +3141,7 @@ describe("useChatSidebar — system messages", () => {
     // The mention flag is untouched: only message.created can set it, and a
     // system event is not one.
     expect(channel?.hasMentionUnread).toBe(false);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
   // ── Leaving the conversation on screen (issue #527, code review) ───────────
@@ -3882,7 +3883,7 @@ describe("useChatSidebar conversation preferences", () => {
 describe("the in-app surface consumes its own channel", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
     // The chime preference is a local execution preference and a previous
@@ -3918,27 +3919,27 @@ describe("the in-app surface consumes its own channel", () => {
   it("raises the toast and nothing else when only in_app is allowed", async () => {
     const result = await deliver(messageWithPolicy("m-a", channelA, plan("allow", "deny", "deny")));
     expect(result.current.inAppAlert?.messageId).toBe("m-a");
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
   it("does not raise the toast when in_app is denied and sound is allowed", async () => {
     const result = await deliver(messageWithPolicy("m-b", channelA, plan("deny", "allow", "deny")));
     expect(result.current.inAppAlert).toBeNull();
-    expect(mockPlayMessageSound).toHaveBeenCalled();
+    expect(mockPlayNotificationSound).toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
   it("does not raise the toast when only web_push is allowed", async () => {
     const result = await deliver(messageWithPolicy("m-c", channelA, plan("deny", "deny", "allow")));
     expect(result.current.inAppAlert).toBeNull();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("raises nothing when every channel is denied", async () => {
     const result = await deliver(messageWithPolicy("m-d", channelA, plan("deny", "deny", "deny")));
     expect(result.current.inAppAlert).toBeNull();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
@@ -3950,7 +3951,7 @@ describe("the in-app surface consumes its own channel", () => {
     // Focused, so the OS surface is the one that makes no sense here and the
     // chime is what runs. Neither is a policy decision.
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).toHaveBeenCalled();
+    expect(mockPlayNotificationSound).toHaveBeenCalled();
   });
 
   it("suppresses the toast for the conversation this tab is showing", async () => {
@@ -3973,7 +3974,7 @@ describe("the in-app surface consumes its own channel", () => {
   // A central denial is final. No local state may put the surface back.
   it("never turns a central in-app denial into a toast", async () => {
     for (const path of ["/chat", `/chat/channel/${channelB}`]) {
-      mockPlayMessageSound.mockClear();
+      mockPlayNotificationSound.mockClear();
       const result = await deliver(
         messageWithPolicy("m-h", channelA, plan("deny", "allow", "allow")),
         path,
@@ -3994,7 +3995,7 @@ describe("the in-app surface consumes its own channel", () => {
 describe("the in-app surface is not created for an unfocused window", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
-    mockPlayMessageSound.mockReset();
+    mockPlayNotificationSound.mockReset();
     mockShowBrowserMessageNotification.mockReset();
     mockShowBrowserMessageNotification.mockReturnValue({ shown: true });
     mockGetSoundNotificationMode.mockReset();
