@@ -948,6 +948,8 @@ interface MessageResponse {
   attachments?: unknown;
   /** Issue #824. Absent on a pre-#824 server, which asked nobody to confirm. */
   acknowledgement_required?: unknown;
+  /** Issue #825. Absent on a pre-#825 server, which never reminded anybody. */
+  persistent_notifications?: unknown;
   /**
    * Issue #821. Typed unknown because it is classified rather than trusted:
    * normalizeMessagePriority narrows it, and a pre-#821 server sends nothing —
@@ -1254,6 +1256,7 @@ function mapMessage(r: MessageResponse): Message {
     // value this build does not understand — both read as "asked nobody". The
     // safe direction: an absent flag never invents a confirmation request.
     acknowledgementRequired: r.acknowledgement_required === true,
+    persistentNotifications: r.persistent_notifications === true,
     // Issue #823. Narrowed rather than trusted: an unrecognised value reads as
     // `standard` and draws nothing, so a priority this build has not reasoned
     // about can never be the one that raises a reader's attention.

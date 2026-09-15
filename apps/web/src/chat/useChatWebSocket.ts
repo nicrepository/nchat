@@ -115,6 +115,16 @@ export interface WSMessagePayload {
    * server, which asked nobody.
    */
   acknowledgement_required?: unknown;
+  /**
+   * The message asked to keep reminding its recipients until they confirm,
+   * answer, or the reminders run out (issue #825), shown as the
+   * "Persistente" notice (issue #846).
+   *
+   * Carried here for the same reason acknowledgement_required is: a message
+   * inserted from this event and the same message after a reload must render
+   * identically. Absent on a pre-#846 server.
+   */
+  persistent_notifications?: unknown;
   /** The central delivery decision. See WSNotificationPolicy. */
   notification_policy?: WSNotificationPolicy;
   is_removed: boolean;

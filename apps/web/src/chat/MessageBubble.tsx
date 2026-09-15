@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
+import type { CallParticipantProfile } from "./chatApi";
 import type {
   LinkSafetyRecheck,
   MentionTarget,
@@ -100,6 +101,17 @@ export interface MessageBubbleProps {
    * than broken.
    */
   onAcknowledge?: (messageId: string) => void;
+  /**
+   * Issue #846. Reads this message's full per-recipient detail, for the
+   * details popover the sender's summary opens. Optional, like onAcknowledge:
+   * without it the summary counts still render, just without the popover.
+   */
+  onOpenAcknowledgementDetails?: (messageId: string) => void;
+  /** Issue #846. See TimelineRowContext.resolveRecipientIdentities. */
+  resolveRecipientIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
 }
 
 function MessageMeta({
@@ -310,6 +322,8 @@ function MessageBubbleBody({
             currentUserId={props.currentUserId}
             submitting={props.acknowledging ?? false}
             onAcknowledge={props.onAcknowledge}
+            onOpenDetails={props.onOpenAcknowledgementDetails}
+            resolveIdentities={props.resolveRecipientIdentities}
           />
         ) : null}
       </div>

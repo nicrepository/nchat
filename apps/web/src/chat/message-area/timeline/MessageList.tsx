@@ -12,6 +12,7 @@
 import { useMemo } from "react";
 
 import AttachmentViewerHost from "../../AttachmentViewerHost";
+import type { CallParticipantProfile } from "../../chatApi";
 import type { MentionTarget, Message, MessageAcknowledgement } from "../../chatTypes";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import type { SystemMessageScope } from "../../conversationSystemMessage";
@@ -50,6 +51,11 @@ export interface MessageListProps {
   acknowledgements?: Record<string, MessageAcknowledgement>;
   /** Issue #824: the message whose confirmation is in flight, if any. */
   acknowledgingId?: string | null;
+  /** Issue #846: see TimelineRowContext.resolveRecipientIdentities. */
+  resolveRecipientIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
   recentReactionEmojis: string[];
   emojiUsage: EmojiUsage;
   onEmojiToneChange: (tone: number) => void;
@@ -131,6 +137,7 @@ export default function MessageList(props: MessageListProps) {
     openingAuthorDMIds: props.openingAuthorDMIds,
     acknowledgements: props.acknowledgements,
     acknowledgingId: props.acknowledgingId,
+    resolveRecipientIdentities: props.resolveRecipientIdentities,
     messagesById,
   };
 

@@ -75,6 +75,7 @@ export function messageFromCreatedPayload(payload: WSMessagePayload): Message {
     // both are claims about the message that authorise nothing.
     priority: normalizeMessagePriority(payload.priority),
     acknowledgementRequired: payload.acknowledgement_required === true,
+    persistentNotifications: payload.persistent_notifications === true,
     quoted: !removed && quoted ? quotedFromPayload(quoted) : undefined,
     // Same parser as the HTTP path, so an event and a refetch describe the
     // same attachment. Withheld for a removed message, like the body.

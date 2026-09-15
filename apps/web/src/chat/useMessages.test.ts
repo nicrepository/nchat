@@ -5871,18 +5871,26 @@ describe("useMessages acknowledgement realtime", () => {
       fireWsEventWithPayload(
         "channel",
         "ch-1",
-        makePayload({ id: "urgente", priority: "urgent", acknowledgement_required: true }),
+        makePayload({
+          id: "urgente",
+          priority: "urgent",
+          acknowledgement_required: true,
+          persistent_notifications: true,
+        }),
       ),
     );
 
     await waitFor(() => expect(result.current.acknowledgements.urgente).toBeDefined());
 
-    // The message is in the timeline, still carrying both claims.
+    // The message is in the timeline, still carrying all three claims (issue
+    // #846: persistentNotifications must arrive on the same event as the other
+    // two, not only on a later reload).
     expect(result.current.state.messages).toHaveLength(1);
     expect(result.current.state.messages[0]).toMatchObject({
       id: "urgente",
       priority: "urgent",
       acknowledgementRequired: true,
+      persistentNotifications: true,
     });
     // The existing batch read was used, once, and asked about exactly this
     // message — not about the whole conversation, which is the read

@@ -968,6 +968,11 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		// Carried on a removed message too, like Priority above: what a message
 		// asked for is not content, and the removal path blanks content.
 		AcknowledgementRequired: msg.AcknowledgementRequired,
+		// PersistentNotifications mirrors the HTTP message contract's field of
+		// the same name (issue #825), for the same reason AcknowledgementRequired
+		// does: a message inserted from this event and the same message after a
+		// reload must render identically.
+		PersistentNotifications: msg.PersistentNotifications,
 		LinkSafetyState:         string(msg.LinkSafety),
 		IsRemoved:               removed,
 		CreatedAt:               msg.CreatedAt,

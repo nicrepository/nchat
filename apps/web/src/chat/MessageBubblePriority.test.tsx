@@ -162,6 +162,27 @@ describe("an urgent message", () => {
     expect(urgentIcon).not.toBe(importantIcon);
   });
 
+  // Issue #846: "Requer confirmação" and "Persistente" ride the same compact
+  // row as the priority label, each independently — neither is inferred from
+  // urgent, and a flag that is false draws nothing at all.
+  it("shows the complementary claims only when their own flag is set", () => {
+    renderBubble({
+      message: messageWith({
+        priority: "urgent",
+        acknowledgementRequired: true,
+        persistentNotifications: true,
+      }),
+    });
+    expect(priorityBadge()).toHaveTextContent("Requer confirmação");
+    expect(priorityBadge()).toHaveTextContent("Persistente");
+  });
+
+  it("shows neither complementary claim when neither flag is set", () => {
+    renderBubble({ message: messageWith({ priority: "urgent" }) });
+    expect(priorityBadge()).not.toHaveTextContent("Requer confirmação");
+    expect(priorityBadge()).not.toHaveTextContent("Persistente");
+  });
+
   /**
    * The rule the issue states twice: a marker on the message, never a red
    * panel. The bubble that holds the body must carry no priority class of its

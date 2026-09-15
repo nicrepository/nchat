@@ -52,6 +52,16 @@ export interface Acknowledgements {
    * `reconcile` above catches whatever a closed one missed.
    */
   reconcileOne(messageId: string): void;
+  /**
+   * Reads one message's full detail — including the per-recipient list, for a
+   * sender authorised to see it (issue #846's details popover).
+   *
+   * Forced, unlike reconcileOne: the batch read that fills `summaries` for a
+   * page never carries `recipients` (that is a page-sized response deliberately
+   * kept small), so a sender opening the popover for the first time has no
+   * detail cached yet and must ask again for the same message.
+   */
+  loadAcknowledgementDetail(messageId: string): void;
 }
 
 interface Options {
@@ -257,6 +267,14 @@ export function useAcknowledgements({ scope, messages, requests }: Options): Ack
     [load, messages],
   );
 
+  const loadAcknowledgementDetail = useCallback(
+    (messageId: string) => {
+      if (!messages.some((message) => message.id === messageId)) return;
+      load(messageId, true);
+    },
+    [load, messages],
+  );
+
   const acknowledge = useCallback(
     (messageId: string) => {
       // One confirmation in flight at a time, and never a second for a message
@@ -280,5 +298,13 @@ export function useAcknowledgements({ scope, messages, requests }: Options): Ack
     [pendingId, scope, store],
   );
 
-  return { summaries, pendingId, error, acknowledge, reconcile, reconcileOne };
+  return {
+    summaries,
+    pendingId,
+    error,
+    acknowledge,
+    reconcile,
+    reconcileOne,
+    loadAcknowledgementDetail,
+  };
 }
