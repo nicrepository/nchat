@@ -3339,6 +3339,62 @@
   }
 }
 
+/* ── Stated priority on the message (issue #823) ────────────────────────────
+   The composer's own priority row, transplanted onto the delivered message, so
+   the axis looks the same at both ends: the same geometry, the same thin left
+   rule, the same two semantic colours and nothing invented here. See
+   .chat-msg-area__composer-priority above.
+
+   Every value is an existing token, so this follows the product's theme rather
+   than declaring a palette of its own. Colour is the last of three signals —
+   the label is visible text and the icon sits beside it — so the whole thing
+   still reads with colour removed.
+
+   The bubble's own surface is untouched: an urgent message is a message with a
+   marker on it, never a red panel, and its body keeps the same contrast every
+   other message's body has. */
+.chat-msg-area__priority {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 2px 8px 2px 7px;
+  border-left: 3px solid var(--color-muted, #5c7380);
+  border-radius: var(--radius-sm, 4px);
+  font-size: 11px;
+  font-weight: 700;
+  /* Wraps rather than stretching the bubble on a narrow viewport. */
+  max-width: 100%;
+}
+
+.chat-msg-area__priority .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* The uppercasing is scoped to the visible word rather than applied to the row.
+   The row also carries the visually-hidden "Prioridade da mensagem:" prefix,
+   and some screen readers announce a text-transform:uppercase string letter by
+   letter — which would turn the one piece of text written for them into
+   spelling. */
+.chat-msg-area__priority-label {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Moderate emphasis: the design system's own accent, never an alarm. */
+.chat-msg-area__priority--important {
+  border-left-color: var(--color-primary, #0e7490);
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary-strong, #155e75);
+}
+
+/* Semantic danger, reserved for urgent. A tinted marker, not a red surface. */
+.chat-msg-area__priority--urgent {
+  border-left-color: var(--color-danger, #dc2626);
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+}
+
 /* ── Acknowledgement (issue #824) ───────────────────────────────────────────
    One row under the message body, never a card: #820's rendering rules keep
    the request attached to the message rather than wrapping it, and a panel per

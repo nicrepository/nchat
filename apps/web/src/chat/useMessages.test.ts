@@ -1362,6 +1362,33 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0].isForwarded).toBe(true);
   });
 
+  // Fail-safe in the only direction that matters: the axis can raise a reader's
+  // attention and nothing else, so a value this build has not reasoned about
+  // must be the ordinary message, never the alarm. Same for the flag — an
+  // absent or malformed one can never invent a confirmation request.
+  it("reads an absent or unrecognised realtime priority as standard", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", makePayload({ id: "sem-campo" })));
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "desconhecida", priority: "catastrophic", acknowledgement_required: 1 }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
+    for (const message of result.current.state.messages) {
+      expect(message.priority).toBe("standard");
+      expect(message.acknowledgementRequired).toBe(false);
+    }
+  });
+
   it("normalizes false, missing, and unexpected realtime forwarding markers to false", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>
@@ -2630,6 +2657,153 @@ describe("useMessages — toggleFavorite", () => {
 });
 
 describe("useMessages — message editing", () => {
+  /**
+   * Issue #823. What the server already knows about one urgent message that
+   * asked its recipients to confirm receipt. Distinctive counts, so the
+   * assertions below cannot pass against a default or a leftover.
+   */
+  const urgentSummary = {
+    messageId: "msg-edit",
+    required: true,
+    total: 7,
+    pending: 3,
+    acknowledged: 4,
+    responded: 0,
+    expired: 0,
+    cancelled: 0,
+    viewerState: "pending" as const,
+  };
+
+  /**
+   * The starting point both edit transitions below have to preserve: an urgent
+   * message that asked for confirmation, already in the timeline, with its
+   * summary already read.
+   *
+   * Returned only once the summary has landed, so a test that follows can tell
+   * "the edit kept it" apart from "it was never there".
+   */
+  async function renderUrgentAskingMessage() {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-edit",
+          bodyText: "reiniciar o cluster",
+          priority: "urgent",
+          acknowledgementRequired: true,
+        }),
+      ],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockResolvedValue({ "msg-edit": urgentSummary });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["msg-edit"]).toBeDefined());
+    return result;
+  }
+
+  /**
+   * #820 states it as a rule: editing the text must not remove the priority,
+   * reset the acknowledgement, or recreate the message as standard. This runs
+   * the edit rather than rendering a fixture that was already marked edited —
+   * a fixture proves what a message looks like, never what a transition does
+   * to one.
+   *
+   * The PATCH response deliberately says nothing about either claim, which is
+   * exactly the shape an incomplete reconstruction of the message would have.
+   * The confirmed edit is applied *onto* the message the state already holds,
+   * so both survive; a confirmEditOnMessage that replaced instead of merging
+   * fails here.
+   */
+  it("keeps the priority and the confirmation request across a confirmed edit", async () => {
+    const result = await renderUrgentAskingMessage();
+    mockEditMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-edit",
+        bodyText: "reiniciar o cluster às 14h",
+        bodyFormat: "v3",
+        isEdited: true,
+        editCount: 1,
+        editedAt: "2026-09-15T14:00:00Z",
+      }),
+    );
+
+    await act(() =>
+      result.current.editMessageLocal("msg-edit", "reiniciar o cluster às 14h", "v3"),
+    );
+
+    expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "reiniciar o cluster às 14h", 3);
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-edit",
+      bodyText: "reiniciar o cluster às 14h",
+      isEdited: true,
+      editCount: 1,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+    // The summary is held beside the message rather than on it, so an edit must
+    // leave it alone too — losing the counts would be the same defect wearing a
+    // different hat.
+    expect(result.current.acknowledgements["msg-edit"]).toMatchObject({
+      total: 7,
+      acknowledged: 4,
+      viewerState: "pending",
+    });
+  });
+
+  /**
+   * The same rule on the path that rebuilds the message from a snapshot rather
+   * than merging into it: a refused edit reverts to the message captured before
+   * the optimistic write, and that snapshot has to be the whole message.
+   *
+   * The optimistic stage is asserted before the rejection lands, because a
+   * rollback that looked right only because nothing had changed would be no
+   * evidence at all.
+   */
+  it("restores the priority and the confirmation request when the edit is refused", async () => {
+    const result = await renderUrgentAskingMessage();
+    let rejectEdit!: (error: Error) => void;
+    mockEditMessage.mockImplementation(
+      () => new Promise<Message>((_resolve, reject) => (rejectEdit = reject)),
+    );
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-edit", "rascunho otimista", "v3");
+    });
+
+    // In flight: the body really changed, and neither claim was dropped on the
+    // way in.
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "rascunho otimista",
+      isEdited: true,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+
+    const settled = request.catch((error: unknown) => error);
+    act(() => rejectEdit(new Error("PATCH recusado")));
+    // The rejection is the public contract — the caller keeps the draft from
+    // it — so it is asserted rather than swallowed.
+    expect(await settled).toEqual(new Error("PATCH recusado"));
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0].bodyText).toBe("reiniciar o cluster"),
+    );
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-edit",
+      isEdited: false,
+      editCount: 0,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+    expect(result.current.acknowledgements["msg-edit"]).toMatchObject({
+      total: 7,
+      acknowledged: 4,
+      viewerState: "pending",
+    });
+  });
+
   it("confirms server edit fields without clearing reactions or favorite state", async () => {
     const initial = makeMessage({
       id: "msg-edit",
@@ -5652,6 +5826,80 @@ describe("useMessages acknowledgement realtime", () => {
       viewerState,
     };
   }
+
+  /**
+   * Issue #823. The whole path a message takes when it arrives over realtime
+   * rather than over HTTP: the event lands, the message enters the timeline
+   * carrying both of its author's claims, the acknowledgement hook notices the
+   * confirmation request, reads the summary in the batch it already uses, and
+   * the answer lands keyed to that message.
+   *
+   * This is asserted end to end rather than at the mapper because the defect it
+   * guards against is a broken *link*, not a broken field: before #823 the
+   * realtime payload dropped `acknowledgement_required` entirely, so a message
+   * that asked for confirmation looked ordinary until the page was reloaded —
+   * a state in which every individual mapping is correct and the flow still
+   * produces nothing. A test that only read the message back off the state
+   * would have passed against exactly that bug.
+   */
+  it("reads the summary for an urgent message that arrived over realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    // Counts nothing else in this suite produces, so an assertion that passes
+    // here cannot be passing against a default or a leftover.
+    const summary = {
+      messageId: "urgente",
+      required: true,
+      total: 7,
+      pending: 3,
+      acknowledged: 4,
+      responded: 0,
+      expired: 0,
+      cancelled: 0,
+      viewerState: "pending" as const,
+    };
+    mockFetchMessageAcknowledgements.mockResolvedValue({ urgente: summary });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    // The conversation loaded empty, so every read below is attributable to the
+    // event and to nothing else.
+    expect(mockFetchMessageAcknowledgements).not.toHaveBeenCalled();
+
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "urgente", priority: "urgent", acknowledgement_required: true }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.acknowledgements.urgente).toBeDefined());
+
+    // The message is in the timeline, still carrying both claims.
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "urgente",
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+    // The existing batch read was used, once, and asked about exactly this
+    // message — not about the whole conversation, which is the read
+    // amplification this feature has to keep avoiding.
+    expect(mockFetchMessageAcknowledgements).toHaveBeenCalledTimes(1);
+    expect(mockFetchMessageAcknowledgements.mock.calls[0][0]).toEqual(["urgente"]);
+    // And the answer is keyed to that message, with the server's own counts and
+    // this reader's own state — which is everything the strip renders from.
+    expect(result.current.acknowledgements.urgente).toMatchObject({
+      messageId: "urgente",
+      required: true,
+      total: 7,
+      acknowledged: 4,
+      pending: 3,
+      viewerState: "pending",
+    });
+  });
 
   it("re-reads only the message an acknowledgement event names", async () => {
     mockFetchChannelMessages.mockResolvedValue({

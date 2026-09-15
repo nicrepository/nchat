@@ -146,6 +146,42 @@ describe("ChatComposer focus", () => {
     other.remove();
   });
 
+  /**
+   * The composer's opening focus is a convenience, and it must never be worth
+   * dismissing something the reader deliberately opened.
+   *
+   * The menu is focused *before* the composer mounts, which is the case the
+   * "focus moved while loading" guard above cannot see: the composer adopts
+   * whatever holds focus when it arrives as its baseline, so "focus has not
+   * moved since I mounted" reads as "nobody wants it" — and it is wrong,
+   * because a menu closes when focus leaves it. On a slow first paint the
+   * editor is not ready for a second or more, which is long enough for a
+   * reader to open a sidebar row's menu and have it shut under their cursor.
+   */
+  it("never takes the opening focus from a menu that already owns it", async () => {
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    const item = document.createElement("button");
+    item.setAttribute("role", "menuitem");
+    menu.append(item);
+    document.body.append(menu);
+    item.focus();
+
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    const input = await screen.findByTestId("chat-composer-input");
+    // The opening focus is scheduled on a frame. Queueing one behind it is what
+    // makes this an assertion about the decision rather than about the clock:
+    // callbacks run in order, so by the time this one resolves the composer's
+    // has already either taken focus or declined to.
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+
+    expect(item).toHaveFocus();
+    expect(input).not.toHaveFocus();
+    menu.remove();
+  });
+
   it("keeps focus after Enter and preserves it with the draft on failure", async () => {
     let rejectSend!: (error: Error) => void;
     const onSend = vi.fn().mockReturnValue(new Promise((_, reject) => (rejectSend = reject)));

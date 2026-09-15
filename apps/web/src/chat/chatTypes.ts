@@ -481,6 +481,21 @@ export interface Message {
    * flag can never invent a confirmation request that was never made.
    */
   acknowledgementRequired?: boolean;
+  /**
+   * The author's stated priority (issue #821), as this message is rendered
+   * (issue #823).
+   *
+   * Optional, and absent means exactly what `"standard"` means — the behaviour
+   * every message had before the axis existed. Both decoders fill it through
+   * normalizeMessagePriority, so a value this build does not recognise arrives
+   * here as `standard` and draws no badge at all: the only thing this axis can
+   * do is raise a reader's attention, so an unknown value must never be the one
+   * that raises it.
+   *
+   * It is the author's claim and grants nothing. Nothing may be authorised,
+   * shown or hidden on the strength of it.
+   */
+  priority?: MessagePriority;
   /** Immediate parent preview for RF-07 quote-reply. One level only. */
   quoted?: QuotedMessage;
   /** RF-09 cross-target reference, resolved for the current reader. */

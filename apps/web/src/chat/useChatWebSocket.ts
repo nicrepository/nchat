@@ -104,6 +104,17 @@ export interface WSMessagePayload {
    * server.
    */
   priority?: unknown;
+  /**
+   * The message asked its recipients to confirm receipt (issue #824). Only the
+   * flag — who was asked and who answered is a separate authorised read, and
+   * broadcasting a recipient list to a conversation's subscribers is exactly
+   * the exposure #824 refuses.
+   *
+   * Carried here so a message inserted from this event and the same message
+   * after a reload render identically (issue #823); absent on a pre-#824
+   * server, which asked nobody.
+   */
+  acknowledgement_required?: unknown;
   /** The central delivery decision. See WSNotificationPolicy. */
   notification_policy?: WSNotificationPolicy;
   is_removed: boolean;

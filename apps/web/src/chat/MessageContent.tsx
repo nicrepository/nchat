@@ -13,6 +13,7 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { linkSafetyAllowsAnchors } from "./chatTypes";
 import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import InlineMessageEditor from "./InlineMessageEditor";
+import { messagePriorityBadges } from "./messagePriority";
 import MessageAttachments from "./MessageAttachments";
 import RichTextRenderer from "./RichTextRenderer";
 import type { MentionInteraction } from "./RichTextRenderer";
@@ -262,6 +263,56 @@ function LinkSafetyNotice({
 }
 
 /**
+ * The author's stated priority, drawn on the message itself (issue #823).
+ *
+ * # Why it lives here and not in the meta row
+ *
+ * Priority is a property of what was said, not of who said it. Drawing it
+ * beside the name, the timestamp or the presence dot would read as an attribute
+ * of the sender — #823 rules that out explicitly — so it sits inside the bubble,
+ * with the other things that qualify the content, and a grouped message keeps
+ * its own badge because the message is what carries the claim.
+ *
+ * # What it is not
+ *
+ * It is not a security signal and it authorises nothing. `urgent` is the
+ * author's claim about their own message; no reader gains an action, a
+ * permission or a view because of it, and nothing here decides what may be seen.
+ *
+ * The badge is text and an icon first. The stylesheet tints it — a moderate
+ * accent for `important`, the semantic danger colour for `urgent`, and a thin
+ * left rule borrowed from the composer's own statement of the same axis — but
+ * removing every colour from this page would leave both states fully legible,
+ * which is the requirement. The bubble's own surface is never repainted: an
+ * urgent message stays as readable as any other.
+ */
+function MessagePriorityBadge({ message }: { message: Message }) {
+  // A removed message is replaced by its placeholder, and the claim its author
+  // made about it goes with everything else the placeholder replaces.
+  if (message.isRemoved) return null;
+  // Absent for `standard`, which is the one that must draw nothing at all.
+  const badge = messagePriorityBadges[message.priority ?? "standard"];
+  if (!badge) return null;
+  return (
+    <div
+      className={`chat-msg-area__priority chat-msg-area__priority--${message.priority}`}
+      data-testid="chat-message-priority"
+      data-priority={message.priority}
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        {badge.icon}
+      </span>
+      {/* The visible word alone is "Urgente", which is unambiguous next to the
+          message it labels but not when a screen reader reaches it out of that
+          context. This names the axis; the label below is the value, and the
+          icon says nothing, so the state is announced exactly once. */}
+      <span className="sr-only">Prioridade da mensagem:</span>
+      <span className="chat-msg-area__priority-label">{badge.label}</span>
+    </div>
+  );
+}
+
+/**
  * RF-21 (issue #135). Above the content, so a reader sees the caveat before the
  * link it is about. The two link-safety states are deliberately different in
  * tone and in consequence:
@@ -288,6 +339,10 @@ function MessageNotices({
 }) {
   return (
     <>
+      {/* First, because it qualifies the whole message: a reader scanning a busy
+          channel should see what the author claimed before reading what they
+          wrote. */}
+      <MessagePriorityBadge message={message} />
       {message.status === "pending_link_scan" && (
         <div className="chat-msg-area__pending-scan" data-testid="chat-message-pending-scan">
           <span className="material-symbols-outlined" aria-hidden="true">

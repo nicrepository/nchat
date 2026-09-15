@@ -2062,6 +2062,43 @@ describe("message priority wire contract", () => {
     expect(JSON.parse(silent.body as string)).toEqual({ body_text: "olá", body_format: "v3" });
   });
 
+  // ── The inbound half (issue #823) ──────────────────────────────────────────
+  //
+  // chat-service always sends `priority`; what matters here is that the client
+  // reads it back on every path a message arrives by, and that it narrows the
+  // value rather than trusting it.
+  it("reads the stated priority off a listed message", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({ id: "m-urgent", priority: "urgent" }),
+        msgRaw({ id: "m-important", priority: "important" }),
+        msgRaw({ id: "m-standard", priority: "standard" }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    expect(page.messages.map((message) => message.priority)).toEqual([
+      "urgent",
+      "important",
+      "standard",
+    ]);
+  });
+
+  // The fail-safe direction. An absent field is a pre-#821 server, and an
+  // unrecognised one is a server ahead of this build; both are read as the
+  // ordinary message, because escalating a reader's attention is the only thing
+  // this axis can do and an unknown value must never be what escalates it.
+  it("reads an absent or unrecognised priority as standard", async () => {
+    mockAuthFetch.mockResolvedValue(
+      msgListEnvelope([
+        msgRaw({ id: "m-absent" }),
+        msgRaw({ id: "m-unknown", priority: "catastrophic" }),
+        msgRaw({ id: "m-null", priority: null }),
+      ]),
+    );
+    const page = await fetchChannelMessages("geral");
+    for (const message of page.messages) expect(message.priority).toBe("standard");
+  });
+
   it("carries the same contract from a DM", async () => {
     mockAuthFetch.mockResolvedValue(msgEnvelope(msgRaw()));
     await postDMMessage("dm-1", "agora", {
