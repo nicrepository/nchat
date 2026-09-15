@@ -36,6 +36,14 @@ const LONG_WORD = "Supercalifragilisticoexpialidosoemumapalavrasemespacosnenhump
 const WIDE = { width: 1440, height: 900 };
 const TABLET = { width: 768, height: 1024 };
 const PHONE = { width: 390, height: 844 };
+/**
+ * A laptop short enough to be the popover's hard case (issue #823): room above
+ * the composer for the panel's small state and not for its tall one.
+ */
+const PRIORITY_POPOVER_SIZES = [
+  { width: 1366, height: 768 },
+  { width: 1366, height: 620 },
+];
 
 /** Every size the issue's minimum visual matrix names. */
 const VIEWPORT_MATRIX = [
@@ -148,6 +156,24 @@ async function expectNoHorizontalScroll(page: Page) {
     );
   });
   expect(overflow).toBeLessThanOrEqual(1);
+}
+
+/**
+ * A floating surface is whole inside the viewport, top and bottom included.
+ *
+ * Asserted on the box rather than on `toBeInViewport`, which passes on any
+ * intersection at all: a dialog whose lower half is off screen is partly in the
+ * viewport and entirely useless.
+ */
+async function expectWithinViewport(page: Page, locator: Locator) {
+  const box = await locator.boundingBox();
+  expect(box).not.toBeNull();
+  const size = page.viewportSize();
+  expect(size).not.toBeNull();
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(size!.height);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(size!.width);
 }
 
 /**
@@ -356,6 +382,51 @@ test.describe("layout responsivo", () => {
     expect(posted?.priority).toBe("urgent");
     expect(posted?.persistent_notifications).toBe(true);
   });
+
+  /**
+   * ISSUE #823 — the desktop popover on a short viewport.
+   *
+   * The reported defect: the panel is placed above the toolbar button while it
+   * is still showing three radios, and Urgente then adds two checkboxes and a
+   * hint underneath. Placed from a `top` computed for the smaller box, the
+   * grown panel keeps that `top` and runs off the bottom of the screen, taking
+   * Aplicar with it — the one action the dialog exists for.
+   *
+   * So the geometry is asserted *after* the growth, not only on open. The short
+   * laptop is what makes the defect reachable — room above the button for the
+   * small panel and not for the tall one — and the ordinary one is here so the
+   * cap that fixes it cannot quietly start clipping a viewport that was always
+   * fine.
+   */
+  for (const size of PRIORITY_POPOVER_SIZES) {
+    test(`desktop ${size.height}px: o popover de prioridade continua na viewport ao crescer`, async ({
+      page,
+    }, testInfo) => {
+      await page.setViewportSize(size);
+      await openChannel(page, testInfo);
+
+      await fillComposer(page, "reiniciar o cluster antes das 14h");
+      await page.getByTestId("toolbar-priority-btn").click();
+      const dialog = page.getByTestId("composer-priority-dialog");
+      await expect(dialog).toBeVisible();
+      await expectWithinViewport(page, dialog);
+
+      // The growth the bug needs: two checkboxes and a paragraph of hint.
+      await page.getByTestId("priority-option-urgent").check();
+      await expect(page.getByTestId("priority-persistent")).toBeVisible();
+      await page.getByTestId("priority-persistent").check();
+      await expect(dialog).toContainText("lembretes a cada 5 minutos até confirmação ou resposta");
+
+      // Still whole, and the action still reachable and still doing its job.
+      await expectWithinViewport(page, dialog);
+      await expect(page.getByTestId("priority-apply")).toBeInViewport();
+      await expectNoHorizontalScroll(page);
+
+      await page.getByTestId("priority-apply").click();
+      await expect(dialog).toBeHidden();
+      await expect(page.getByTestId("composer-priority-summary")).toContainText("Urgente");
+    });
+  }
 
   test("celular: Escape fecha a navegação e devolve o foco ao acionador", async ({
     page,

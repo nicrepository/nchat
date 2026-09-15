@@ -11,10 +11,11 @@
  * urgent-only flags behind, and the send carrying exactly what was applied.
  */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { flushResizeObservers } from "../setupTests";
 import ChatComposer from "./ChatComposer";
 import type { MessagePriorityIntent } from "./messagePriority";
 import type { SendResult } from "./messages/types";
@@ -370,6 +371,142 @@ describe("composer priority — desktop", () => {
 
     expect(dialog()).not.toHaveClass("msg-priority--anchored");
     expect(dialog()).toBeVisible();
+  });
+});
+
+/**
+ * ISSUE #823 — the popover has to stay whole while its own content changes.
+ *
+ * Choosing Urgente reveals two checkboxes and a hint, and the panel grows by
+ * about a third *after* it has been placed. Placed above the button, the growth
+ * is all downwards, so the tall panel keeps the short one's top edge and its
+ * bottom — with Aplicar on it — leaves the screen.
+ *
+ * jsdom lays nothing out, so both boxes are stubbed: the trigger's, and the
+ * panel's, whose height answers according to what it is currently showing.
+ * That is what lets these assert a real re-placement rather than the same
+ * arithmetic twice.
+ */
+describe("composer priority — staying inside the viewport", () => {
+  const anchorTop = 500;
+  const shortPanel = 200;
+  const tallPanel = 320;
+
+  /** The panel is tall exactly when the urgent options are on screen. */
+  function stubBoxes(viewportHeight: number, top = anchorTop) {
+    vi.stubGlobal("innerHeight", viewportHeight);
+    const real = Element.prototype.getBoundingClientRect;
+    const rect = (top: number, height: number, left: number, width: number) =>
+      ({
+        x: left,
+        y: top,
+        left,
+        right: left + width,
+        top,
+        bottom: top + height,
+        width,
+        height,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      const id = this.getAttribute("data-testid");
+      if (id === "toolbar-priority-btn") return rect(top, 30, 300, 30);
+      if (id !== "composer-priority-dialog") return real.call(this);
+      const tall = Boolean(this.querySelector("[data-testid='priority-persistent']"));
+      return rect(0, tall ? tallPanel : shortPanel, 300, 288);
+    });
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const topOf = () => Number.parseFloat(dialog().style.top);
+  const maxHeightOf = () => dialog().style.maxHeight;
+
+  /**
+   * The cap is the room beside the anchor, which is the whole point: a viewport
+   * fraction knows nothing about where the button is, and 85vh overflows a
+   * button that sits at 85vh.
+   */
+  it("caps itself to the room beside its trigger, not to a slice of the viewport", () => {
+    stubBoxes(620);
+    setup();
+    open();
+
+    // Above the button: its top, less the gap and the edge padding.
+    expect(maxHeightOf()).toBe(`${anchorTop - 7 - 8}px`);
+    expect(dialog()).toHaveClass("msg-priority--anchored");
+  });
+
+  // The regression itself. Without a second placement the top stays where the
+  // short panel put it and the tall panel hangs off the bottom.
+  it("places itself again when choosing Urgente makes it taller", () => {
+    stubBoxes(620);
+    setup();
+    open();
+    expect(topOf()).toBe(anchorTop - shortPanel - 7);
+
+    fireEvent.click(screen.getByTestId("priority-option-urgent"));
+    act(() => flushResizeObservers());
+
+    expect(topOf()).toBe(anchorTop - tallPanel - 7);
+    // Whole, above the button, with nothing past either edge.
+    expect(topOf()).toBeGreaterThanOrEqual(8);
+    expect(topOf() + tallPanel).toBeLessThanOrEqual(anchorTop);
+  });
+
+  // The composer sits at the bottom, so a shorter window brings its button up
+  // with it and the room above shrinks. The cap has to follow, or the panel
+  // that fitted a moment ago no longer does.
+  it("places itself again when the window changes size underneath it", () => {
+    stubBoxes(620);
+    setup();
+    open();
+    expect(maxHeightOf()).toBe(`${anchorTop - 7 - 8}px`);
+
+    vi.restoreAllMocks();
+    stubBoxes(500, 380);
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    expect(maxHeightOf()).toBe(`${380 - 7 - 8}px`);
+    expect(topOf()).toBe(380 - shortPanel - 7);
+    expect(dialog()).toHaveClass("msg-priority--anchored");
+  });
+
+  /**
+   * Too little room on either side is the sheet's case. Capping down to a
+   * sliver would be a scrollport with nothing in it, so the layout changes
+   * instead — and the decision is taken from the anchor alone, which is what
+   * stops it flipping back the moment the new layout resizes the panel.
+   */
+  it("falls back to the sheet when neither side has usable room", () => {
+    vi.stubGlobal("innerHeight", 200);
+    const real = Element.prototype.getBoundingClientRect;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.getAttribute("data-testid") !== "toolbar-priority-btn") return real.call(this);
+      return {
+        x: 300,
+        y: 90,
+        left: 300,
+        right: 330,
+        top: 90,
+        bottom: 120,
+        width: 30,
+        height: 30,
+        toJSON: () => ({}),
+      } as DOMRect;
+    });
+    setup();
+    open();
+
+    expect(dialog()).not.toHaveClass("msg-priority--anchored");
+    expect(dialog()).not.toHaveAttribute("style");
+    expect(screen.getByTestId("priority-apply")).toBeVisible();
   });
 });
 
