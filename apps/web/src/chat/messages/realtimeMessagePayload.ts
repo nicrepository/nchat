@@ -12,6 +12,7 @@
 import {
   normalizeBodyFormat,
   normalizeLinkSafety,
+  normalizeMessagePriority,
   parseMessageAttachments,
   type Message,
 } from "../chatTypes";
@@ -66,6 +67,14 @@ export function messageFromCreatedPayload(payload: WSMessagePayload): Message {
     // just created cannot be favorited yet.
     isFavorited: false,
     isForwarded: payload.is_forwarded === true,
+    // Issues #821/#824, rendered by #823. Both travel on the event for the same
+    // reason: a message inserted from realtime and the same message after a
+    // reload must render identically, and a field carried by only one of the
+    // two paths is a badge — or a confirmation request — that appears after a
+    // refresh and not before. Both use the HTTP path's own normalisers, and
+    // both are claims about the message that authorise nothing.
+    priority: normalizeMessagePriority(payload.priority),
+    acknowledgementRequired: payload.acknowledgement_required === true,
     quoted: !removed && quoted ? quotedFromPayload(quoted) : undefined,
     // Same parser as the HTTP path, so an event and a refetch describe the
     // same attachment. Withheld for a removed message, like the body.

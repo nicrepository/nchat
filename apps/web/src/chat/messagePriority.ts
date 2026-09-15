@@ -45,6 +45,40 @@ export const priorityLabels: Record<MessagePriority, string> = {
 };
 
 /**
+ * What a stated priority draws on the message itself (issue #823).
+ *
+ * `label` is visible text and `icon` is a decorative Material Symbols ligature,
+ * so every state this map describes is perceivable without colour — #820 and
+ * #823 both require that, and the tint in the stylesheet is a third signal
+ * rather than the first one.
+ */
+export interface MessagePriorityBadge {
+  /** Material Symbols ligature. Rendered aria-hidden: it never carries meaning alone. */
+  icon: string;
+  label: string;
+}
+
+/**
+ * The priorities that draw a badge, and what each one draws.
+ *
+ * Deliberately partial: `standard` has no entry, so an ordinary message renders
+ * exactly what it rendered before this issue — no element, no class, no
+ * attribute. That is the whole of the "standard preserves the current
+ * rendering" rule, expressed as an absent key rather than as a test somewhere.
+ *
+ * It is also where the fail-safe lands. normalizeMessagePriority resolves
+ * anything this build does not recognise to `standard`, which lands here on a
+ * missing key and draws nothing — a future fourth priority is read as an
+ * ordinary message, never as an alarm nobody here has reasoned about.
+ */
+export const messagePriorityBadges: Partial<Record<MessagePriority, MessagePriorityBadge>> = {
+  important: { icon: "label_important", label: priorityLabels.important },
+  // The same ligature the composer's priority trigger uses, so the axis reads
+  // as one thing from the moment it is stated to the moment it is delivered.
+  urgent: { icon: "error", label: priorityLabels.urgent },
+};
+
+/**
  * Whether this priority may carry the confirmation and reminder options — the
  * whole of the first version's policy, in one place.
  *
