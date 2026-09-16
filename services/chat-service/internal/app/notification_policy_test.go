@@ -130,6 +130,37 @@ func (tc classificationCase) check(t *testing.T) {
 	}
 }
 
+// Issue #862: the OS notification of an event the notification outbox also
+// delivers belongs to Web Push alone. The realtime decision never authorises
+// it, for any recipient of any classification the outbox produces — so a page
+// open in a hidden tab raises no native notification of its own beside the
+// Service Worker's, and none is left for a client to suppress.
+func TestRealtimeDecisionNeverAuthorisesTheOSSurfaceForAnyRecipient(t *testing.T) {
+	reply := channelMessage(mentionOfBob)
+	reply.ReplyToSenderID = "user-3"
+	for _, test := range []struct {
+		name        string
+		message     domain.Message
+		recipientID string
+	}{
+		{name: "mention", message: reply, recipientID: bobUserID},
+		{name: "reply", message: reply, recipientID: "user-3"},
+		{name: "channel message", message: reply, recipientID: "user-4"},
+		{name: "direct message", message: directMessage("oi"), recipientID: "user-4"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := recipientPolicy{}.PolicyFor(
+				domainMessageToWSPayload(test.message), test.recipientID, ws.RecipientPreferenceNone)
+			if policy == nil || policy.InApp != ws.NotificationAllow {
+				t.Fatalf("policy = %+v, want an in-app allow so the web_push denial is not vacuous", policy)
+			}
+			if policy.WebPush != ws.NotificationDeny {
+				t.Fatalf("web_push = %q, want %q", policy.WebPush, ws.NotificationDeny)
+			}
+		})
+	}
+}
+
 // TestEventsThatAreNotNotifiableDenyExplicitly is the rollout contract from the
 // server's side: this build always says something, so a client can tell "not
 // notifiable" from "an older server that cannot answer". A nil here would make

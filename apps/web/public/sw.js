@@ -194,10 +194,47 @@ async function showPushNotification(payload) {
   }
 }
 
+/**
+ * Whether an NChat window can present this event itself right now (issue #862).
+ *
+ * That is a window that is visible *and* focused — the same test the page
+ * applies before it draws a toast (notificationPresentation's
+ * isWindowFocused). Such a page presents what it sees arrive: nothing for the
+ * conversation that is open, a toast for another one. An OS notification on top
+ * of that would be the redundant alert #678 forbids.
+ *
+ * A window that is visible but not focused cannot: the page draws no toast
+ * without focus, and the realtime decision never authorises an OS notification
+ * of its own. Suppressing here would leave that reader with at most a chime, so
+ * the push is shown. A hidden window is the same case. The worker cannot know
+ * which conversation the page shows — the outbox row carries no session — so a
+ * focused window is the whole test.
+ *
+ * A browser that enforces userVisibleOnly does not demand a notification while
+ * a tab of the origin is visible. Any failure to ask reads as "no such window":
+ * a missed suppression costs a duplicate, a wrong one costs the notification.
+ */
+async function hasFocusedAppWindow() {
+  try {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    return windows.some(
+      (client) =>
+        isAppWindow(client) && client.visibilityState === "visible" && client.focused === true,
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function presentPush(payload) {
+  if (await hasFocusedAppWindow()) return;
+  await showPushNotification(payload);
+}
+
 self.addEventListener("push", (event) => {
   const payload = readPushPayload(event);
   if (!payload) return;
-  event.waitUntil(showPushNotification(payload));
+  event.waitUntil(presentPush(payload));
 });
 
 self.addEventListener("notificationclick", (event) => {

@@ -210,6 +210,12 @@ func requirePrincipal(w http.ResponseWriter, r *http.Request) (domain.Principal,
 const (
 	errCodeEndpointConflict = "push_endpoint_conflict"
 	errCodeUnsupportedMedia = "unsupported_media_type"
+	// errCodePushDeliveryUnavailable is a deployment configured to deliver Web
+	// Push whose worker is not running right now (#862). A 503 and never a null
+	// key: "delivers no push" and "delivery is down at the moment" are different
+	// facts, and reading the second as the first would tell a person their
+	// environment has no notifications.
+	errCodePushDeliveryUnavailable = "push_delivery_unavailable"
 )
 
 // writePushError maps a domain error onto the response.

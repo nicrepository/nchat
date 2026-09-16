@@ -4,6 +4,7 @@ import { ApiRequestError } from "../lib/api";
 import { authenticatedFetch } from "../lib/authClient";
 import {
   deletePushSubscription,
+  fetchPushVapidPublicKey,
   isPushEndpointConflict,
   listPushSubscriptions,
   registerPushSubscription,
@@ -15,6 +16,34 @@ const URL = "/api/notifications/push/subscriptions";
 
 beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
+});
+
+describe("fetchPushVapidPublicKey", () => {
+  it("returns the key the notification-service signs with", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({ data: { vapid_public_key: "BKey" } });
+
+    await expect(fetchPushVapidPublicKey()).resolves.toBe("BKey");
+    expect(authenticatedFetch).toHaveBeenCalledWith("/api/notifications/push/config", {
+      method: "GET",
+      signal: undefined,
+    });
+  });
+
+  it.each([[null], [""], ["   "]])(
+    "reads %j as a deployment that delivers no push",
+    async (key) => {
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({ data: { vapid_public_key: key } });
+
+      await expect(fetchPushVapidPublicKey()).resolves.toBeNull();
+    },
+  );
+
+  it("propagates a failure instead of reporting the deployment as unconfigured", async () => {
+    vi.mocked(authenticatedFetch).mockRejectedValueOnce(
+      new ApiRequestError(503, "unavailable", "down"),
+    );
+    await expect(fetchPushVapidPublicKey()).rejects.toBeInstanceOf(ApiRequestError);
+  });
 });
 
 describe("listPushSubscriptions", () => {

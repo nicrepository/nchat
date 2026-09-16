@@ -13,6 +13,7 @@ import {
   getWebPushDeviceId,
   readWebPushCredentials,
   readWebPushPermission,
+  subscribedWithKey,
   webPushCapability,
 } from "./webPushBrowser";
 
@@ -45,7 +46,6 @@ function supportPushApis(): void {
 beforeEach(() => {
   vi.mocked(isBrowserNotificationSecureContext).mockReturnValue(true);
   vi.mocked(getBrowserNotificationPermission).mockReturnValue("granted");
-  vi.stubEnv("VITE_NOTIFICATION_VAPID_PUBLIC_KEY", VAPID_KEY);
   supportPushApis();
   localStorage.clear();
   _resetWebPushDeviceId();
@@ -53,13 +53,12 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   Reflect.deleteProperty(navigator, "serviceWorker");
 });
 
 describe("webPushCapability", () => {
-  it("reports supported when the origin, the APIs and the key are all there", () => {
+  it("reports supported when the origin and the APIs are there", () => {
     expect(webPushCapability()).toBe("supported");
   });
 
@@ -99,16 +98,6 @@ describe("webPushCapability", () => {
         value: realNavigator,
       });
     }
-  });
-
-  it("reports not_configured when the VAPID public key is blank", () => {
-    vi.stubEnv("VITE_NOTIFICATION_VAPID_PUBLIC_KEY", "   ");
-    expect(webPushCapability()).toBe("not_configured");
-  });
-
-  it("reports not_configured when the deployment never set a VAPID public key", () => {
-    vi.stubEnv("VITE_NOTIFICATION_VAPID_PUBLIC_KEY", undefined);
-    expect(webPushCapability()).toBe("not_configured");
   });
 });
 
@@ -180,11 +169,39 @@ describe("registration and subscription", () => {
   it("subscribes user-visible only, with the configured application server key", async () => {
     const subscribe = vi.fn().mockResolvedValue(subscriptionJson());
     const registration = { pushManager: { subscribe } } as unknown as ServiceWorkerRegistration;
-    await createLocalSubscription(registration);
+    await createLocalSubscription(registration, VAPID_KEY);
     expect(subscribe).toHaveBeenCalledWith({
       userVisibleOnly: true,
       applicationServerKey: VAPID_KEY,
     });
+  });
+});
+
+describe("subscribedWithKey", () => {
+  const key = Uint8Array.from([4, 250, 251, 252, 253, 254, 255]);
+  const keyBase64Url = "BPr7_P3-_w";
+
+  function subscribedWith(bytes: Uint8Array | null): PushSubscription {
+    return { options: { applicationServerKey: bytes?.buffer ?? null } } as PushSubscription;
+  }
+
+  it("matches the key the subscription was minted with, in the url-safe alphabet", () => {
+    expect(subscribedWithKey(subscribedWith(key), keyBase64Url)).toBe(true);
+  });
+
+  it("refuses a subscription minted for a different key", () => {
+    const other = Uint8Array.from([4, 0, 0, 0, 0, 0, 0]);
+    expect(subscribedWithKey(subscribedWith(key.slice(0, 6)), keyBase64Url)).toBe(false);
+    expect(subscribedWithKey(subscribedWith(other), keyBase64Url)).toBe(false);
+  });
+
+  it("refuses when the configured key is not base64url at all", () => {
+    expect(subscribedWithKey(subscribedWith(key), "***")).toBe(false);
+  });
+
+  it("gives a browser that does not expose the key the benefit of the doubt", () => {
+    expect(subscribedWithKey(subscribedWith(null), keyBase64Url)).toBe(true);
+    expect(subscribedWithKey({} as PushSubscription, keyBase64Url)).toBe(true);
   });
 });
 

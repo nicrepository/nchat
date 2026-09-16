@@ -5,8 +5,10 @@ Codigo em `services/notification-service/internal/worker/webpush_*.go`,
 `internal/storage/push_delivery_store.go` e `internal/config/webpush.go`.
 
 Digest pos-expediente e a UI de Perfil > Notificacoes **estao fora** desta
-camada e continuam nao existindo. Service Worker e `notificationclick` tambem
-estao fora dela, e passaram a existir na #747 — ver
+camada. O digest continua nao existindo; a UI passou a existir e, desde a #862,
+le a saude real do Web Push pelo reconcile do browser, nunca por esta camada.
+Service Worker e `notificationclick` tambem estao fora dela, e passaram a
+existir na #747 — ver
 [notification-service-worker.md](notification-service-worker.md), que consome
 o payload descrito abaixo. O reconcile do browser tambem esta fora, e passou a
 existir na #748 — ver
@@ -378,8 +380,43 @@ ser claimado.
 O motivo nomeia a variavel e nunca o valor — esta e a ultima camada onde uma
 chave VAPID poderia virar linha de log.
 
-As chaves seguem o padrao de secret ja adotado (Sealed Secrets); nenhum valor
-real esta neste repositorio, e os testes geram o par que usam.
+As chaves seguem o padrao de secret ja adotado (Sealed Secrets), no Secret
+proprio `nchat-webpush` montado so por este servico (#862); nenhum valor real
+esta neste repositorio, e os testes geram o par que usam. Procedimento:
+[sealed-secrets-rotation.md](../runbooks/sealed-secrets-rotation.md).
+
+### A chave publica no browser (#862)
+
+O browser nao recebe a chave pelo build. `GET /api/notifications/push/config`,
+autenticada e montada junto com as rotas de subscription, devolve
+`{"vapid_public_key": "<base64url sem padding>"}` — ou `null` quando o worker
+esta desligado ou `NotificationWorkerReady` reprova. Dois motivos:
+
+- **coerencia por construcao**: quem serve a chave publica e o processo que
+  assina com a privada, entao "frontend com a chave A, backend assinando com B"
+  nao e uma configuracao que se consiga escrever;
+- **uma imagem por SHA**: o `web` e construido uma vez e promovido por digest;
+  um `VITE_*` por ambiente exigiria uma imagem por ambiente.
+
+`null` e o `not_configured` do cliente. Um deployment com as chaves certas e o
+worker desligado tambem responde `null`: nenhuma subscription e criada para um
+canal que ninguem drena.
+
+Configurado nao e o mesmo que rodando. Um worker habilitado e com configuracao
+valida pode parar depois do boot (lease recusado, contexto encerrado), e para
+esse caso a rota responde **503 `push_delivery_unavailable`**, sem chave e sem
+detalhe. O que decide e `notificationWorkerAlive` — o mesmo probe
+(`App.NotificationWorkerRunning`) que o check `notification-worker-running` do
+`/readyz` le —, entao readiness e `/push/config` nao conseguem discordar sobre o
+mesmo worker. O cliente trata o 503 como `error` de backend e oferece tentar de
+novo; "este ambiente nao entrega push" continua reservado ao `null`.
+
+| Situacao                                 | Resposta                        |
+| ---------------------------------------- | ------------------------------- |
+| worker desligado                         | 200 `vapid_public_key: null`    |
+| worker habilitado, configuracao invalida | 200 `vapid_public_key: null`    |
+| worker habilitado, configurado e rodando | 200 com a chave                 |
+| worker habilitado, configurado e parado  | 503 `push_delivery_unavailable` |
 
 ## Observabilidade
 
@@ -420,6 +457,17 @@ sem fragment, ate 2048 bytes. Esta camada acrescenta defesa em profundidade:
   hostname da URL. Nada aqui enfraquece isso.
 
 Todo push service real e publicamente roteavel, entao nada legitimo se perde.
+
+No cluster, a camada de fora e a NetworkPolicy
+`nchat-allow-notification-webpush-egress` (#862, em
+`infra/k8s/components/least-privilege-network-policies`): so egress, so
+`component: notification`, so TCP/443, para a internet publica menos RFC 1918
+(que contem os CIDRs de pod e service do k3s), CGNAT, loopback, link-local
+(metadata de cloud), benchmarking, multicast e reservados — a mesma lista da
+policy do RF-21, numa policy propria. `scripts/ci/lib/k8s-public-egress.sh`
+nomeia as tres unicas policies autorizadas a citar `0.0.0.0/0` e reprova
+qualquer outra; `scripts/ci/test_k8s_public_egress.sh` prova que cada regra
+rejeita o que diz rejeitar.
 
 Nenhum endpoint HTTP novo foi criado. A #746 nao precisa de um, e um "endpoint de
 teste" seria superficie de relay que a issue manda evitar.

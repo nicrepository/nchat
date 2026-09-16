@@ -18,8 +18,14 @@ import { registerNotificationServiceWorker } from "./serviceWorkerRegistration";
  * `registerNotificationServiceWorker`, called through, never reimplemented.
  */
 
-/** Why this client cannot do Web Push at all, or that it can. */
-export type WebPushCapability = "supported" | "unsupported" | "insecure_context" | "not_configured";
+/**
+ * Whether this browser can do Web Push at all, and if not, why.
+ *
+ * Whether the *deployment* delivers push is not a browser fact: it is the
+ * notification-service's answer (`fetchPushVapidPublicKey`), because only the
+ * process holding the private key knows which public key it signs with.
+ */
+export type WebPushCapability = "supported" | "unsupported" | "insecure_context";
 
 /** `unsupported` here means the Notification API itself is absent or unreadable. */
 export type WebPushPermission = "default" | "granted" | "denied" | "unsupported";
@@ -33,30 +39,15 @@ const DEVICE_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 let memoryDeviceId: string | null = null;
 
 /**
- * The VAPID public key, base64url, as `pushManager.subscribe` accepts it
- * directly (`applicationServerKey` takes a DOMString as well as a BufferSource).
- *
- * It is public by construction — a push service reads it out of every request
- * this deployment signs — and it is build-time configuration rather than a
- * runtime fetch because the private half already comes from the environment on
- * the server. Read on each call, never at module load, so a test can stub it.
- */
-function applicationServerKey(): string {
-  return (import.meta.env.VITE_NOTIFICATION_VAPID_PUBLIC_KEY ?? "").trim();
-}
-
-/**
- * Whether push can work here at all, and if not, which of the three reasons.
+ * Whether push can work here at all, and if not, which of the two reasons.
  *
  * `registerNotificationServiceWorker` folds an insecure origin in with an
  * absent API, which is the right call for "should I register a worker"; a
- * person being told why their notifications are off needs the two apart, and
- * needs a deployment with no configured key to read as neither of them.
+ * person being told why their notifications are off needs the two apart.
  */
 export function webPushCapability(): WebPushCapability {
   if (!isBrowserNotificationSecureContext()) return "insecure_context";
   if (!hasPushApis()) return "unsupported";
-  if (applicationServerKey() === "") return "not_configured";
   return "supported";
 }
 
@@ -137,14 +128,49 @@ export function getLocalSubscription(
 /**
  * Creates one. `userVisibleOnly` is mandatory on Chrome and is also the honest
  * declaration: every push this application sends becomes a notification.
+ *
+ * `applicationServerKey` is the base64url VAPID public key, which
+ * `pushManager.subscribe` accepts directly as a string.
  */
 export function createLocalSubscription(
   registration: ServiceWorkerRegistration,
+  applicationServerKey: string,
 ): Promise<PushSubscription> {
-  return registration.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: applicationServerKey(),
-  });
+  return registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey });
+}
+
+/**
+ * Whether a subscription was created for this VAPID public key.
+ *
+ * A subscription is bound to the key it was minted with. After the deployment
+ * rotates its pair, a subscription minted for the old one still exists and
+ * still registers, and every push to it is refused by the push service — a
+ * browser that looks connected and is not. A browser that does not expose the
+ * key it subscribed with gets the benefit of the doubt: re-subscribing on every
+ * pass would be worse than the rotation it tries to detect.
+ */
+export function subscribedWithKey(
+  subscription: PushSubscription,
+  applicationServerKey: string,
+): boolean {
+  const current = subscription.options?.applicationServerKey;
+  if (!current) return true;
+  const expected = decodeBase64Url(applicationServerKey);
+  const actual = new Uint8Array(current);
+  return expected !== null && sameBytes(actual, expected);
+}
+
+function decodeBase64Url(value: string): Uint8Array | null {
+  try {
+    const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+    return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.length === right.length && left.every((byte, index) => byte === right[index]);
 }
 
 /** The endpoint and keys, exactly as #745 wants them. */

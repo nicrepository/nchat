@@ -574,6 +574,48 @@ spec:
         - protocol: TCP
           port: 443
 ---
+# Issue #862. Web Push leaves the cluster: notification-service POSTs each push
+# to the browser's push service (FCM, Mozilla autopush, WNS), whose addresses
+# are anycast and change, so the destination is stated the same way as
+# nchat-allow-link-safety-egress — the public internet minus every private,
+# cluster, loopback, link-local (169.254.169.254 is the cloud metadata endpoint)
+# and reserved block — and on 443 alone.
+#
+# Its own policy, never another component added to the link-safety one: the two
+# exist for different features, are enabled independently, and removing one must
+# not take the other's egress with it. Nothing uses it while
+# NOTIFICATION_WORKER_ENABLED is false; the sender also refuses a non-public
+# destination at dial time and follows no redirect, so this is the outer layer
+# (docs/architecture/notification-web-push.md, SSRF).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nchat-allow-notification-webpush-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: notification
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+---
 # Keycloak SSO resolves to the node HTTPS endpoint in nchat-dev, which the CNI
 # HostPort rules DNAT to Traefik's websecure port. Since the namespace uses
 # default-deny egress, auth-service needs an explicit path to that endpoint.
