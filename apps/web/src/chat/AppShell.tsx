@@ -1,12 +1,23 @@
-import { useCallback, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
-import { Outlet, useLocation } from "react-router";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
+import { Outlet, useLocation, useNavigate } from "react-router";
 
 import "./AppShell.css";
 import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
+import InAppMessageAlert, { type InAppAlert } from "./InAppMessageAlert";
 import { useNavDrawer } from "./useNavDrawer";
 import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
 import type { Channel, DMConversation } from "./chatTypes";
 import { useChatSidebar } from "./useChatSidebar";
+import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
+import { onAuthChange } from "../lib/authSession";
+import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
 
 /**
  * Resolves a row menu's target to the details panel's own vocabulary.
@@ -162,7 +173,15 @@ function useRootScrollLock() {
 /** Named once, because AppShell.css and ChatShell.test.tsx both spell it. */
 export const ROOT_LOCK_CLASS = "chat-root-locked";
 
-export type AppShellOutletContext = ReturnType<typeof useChatSidebar>;
+export type AppShellOutletContext = ReturnType<typeof useChatSidebar> & {
+  /**
+   * The per-conversation composer state (issue #769). Mounted here —
+   * AppShell is the one component that survives both a channel<->dm switch
+   * and a trip to /profile and back — and threaded down through
+   * ChatOutletContext the same way currentUserId/channels/dms already are.
+   */
+  drafts: ConversationDraftsApi;
+};
 
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_DMS: DMConversation[] = [];
@@ -177,6 +196,33 @@ function mainAriaLabel(pathname: string): string {
 export default function AppShell() {
   useRootScrollLock();
   const sidebar = useChatSidebar();
+  // Scoped by the authenticated user, not by workspace — the web client has
+  // no workspace switcher; the server resolves workspace from the session.
+  // An empty id while the sidebar is still loading means no draft can be
+  // read or written yet, which is the same "nothing to show" state a fresh
+  // login already produces.
+  const drafts = useConversationDrafts(
+    sidebar.state.status === "ready" ? sidebar.state.currentUserId : "",
+  );
+  // Issue #769, "FASE 14 — LOGOUT": draft text/attachments/voice are
+  // sensitive content. A logout, or a fresh login over a stale session,
+  // both fire this — clearing on either direction is what keeps a second
+  // user signing in on the same tab from ever seeing the first user's
+  // drafts, without this component needing to know which direction fired.
+  //
+  // The sound player is released on the same boundary (#827) and for the
+  // weaker of the two reasons: its elements hold no content, but a session
+  // that has ended has no business still owning decoded audio, and this is
+  // the identity boundary the app already has — no global handler is added
+  // for it.
+  useEffect(
+    () =>
+      onAuthChange(() => {
+        drafts.clearAllDrafts();
+        disposeNotificationSoundPlayer();
+      }),
+    [drafts],
+  );
   const {
     state,
     retry,
@@ -186,6 +232,8 @@ export default function AppShell() {
     renameGroup,
     setMuted,
     leaveConversation,
+    inAppAlert,
+    dismissInAppAlert,
   } = sidebar;
   // Details opened from a row menu, for that row's target (issue #527). Held
   // here rather than in ChatMessageArea because the target may be a
@@ -235,6 +283,16 @@ export default function AppShell() {
   // that is about to unmount — the menu restores its own trigger in an effect,
   // one commit later.
   const detailsOpenerRef = useRef<HTMLElement | null>(null);
+  // Opening the alert is the one action it offers, and it is plain navigation:
+  // the alert is a pointer at a conversation, not a place to read it.
+  const navigateFromAlert = useNavigate();
+  const openInAppAlert = useCallback(
+    (alert: InAppAlert) => {
+      dismissInAppAlert();
+      navigateFromAlert(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
+    },
+    [dismissInAppAlert, navigateFromAlert],
+  );
   const openSidebarDetails = useCallback(
     (kind: "channel" | "dm", targetId: string, opener: HTMLElement | null) => {
       const resolved = resolveDetailsTarget(kind, targetId, dms);
@@ -290,6 +348,7 @@ export default function AppShell() {
         setMuted={setMuted}
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}
+        draftSummaries={drafts.summaries}
       />
       {/* Pointer half of "the background is not interactive while the drawer is
           open"; `inert` below is the keyboard and assistive-technology half.
@@ -306,13 +365,26 @@ export default function AppShell() {
         />
       )}
       <main className="chat-app__main" aria-label={mainAriaLabel(pathname)} inert={navModal}>
-        <Outlet context={sidebar} />
+        <Outlet context={{ ...sidebar, drafts }} />
       </main>
       <SidebarDetailsPanel
         target={openDetailsTarget}
         currentUserId={state.status === "ready" ? state.currentUserId : ""}
         onClose={closeSidebarDetails}
       />
+      {/* The in-app channel of the delivery plan (issue #744). Whether it is
+          here at all was decided by chat-service for this recipient; this shell
+          only renders what the decision allowed. Keyed by the message so a newer
+          alert replaces the current one outright rather than inheriting its
+          dismissal timer. */}
+      {inAppAlert && (
+        <InAppMessageAlert
+          key={inAppAlert.messageId}
+          alert={inAppAlert}
+          onOpen={openInAppAlert}
+          onDismiss={dismissInAppAlert}
+        />
+      )}
     </div>
   );
 }

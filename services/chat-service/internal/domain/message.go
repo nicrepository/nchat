@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // MessageKind classifies the origin of a message.
 type MessageKind string
@@ -163,6 +166,115 @@ func (s MessageLinkSafety) RestrictsLinks() bool {
 	return s == MessageLinkSafetyMalicious
 }
 
+// MessagePriority is how urgently a message asks to be attended to (issue #821).
+//
+// It is a fact the author states about their own message, and nothing more. It
+// grants no authority: `urgent` does not widen what its sender may read, post
+// or reach, and every authorization check a message already passes is unchanged
+// by it. Downstream, a notification policy is free to read it and free to
+// suppress it — this type carries the fact to that decision, it does not take
+// it, and nothing here rings a bell, sends a push or picks a channel.
+//
+// The three values are closed, and validated in one place: see
+// NormalizeMessagePriority. Anything else is refused rather than folded into
+// the default, because "the client sent a word we do not know" and "the client
+// said nothing" are different requests and only the second one has an obvious
+// answer.
+type MessagePriority string
+
+const (
+	// MessagePriorityStandard is every message that does not ask for anything
+	// special, which is almost all of them. It is what an absent value means and
+	// what every message written before this axis existed carries.
+	MessagePriorityStandard MessagePriority = "standard"
+	// MessagePriorityImportant asks to stand out from ordinary traffic.
+	MessagePriorityImportant MessagePriority = "important"
+	// MessagePriorityUrgent is the strongest claim an author can make about
+	// their own message. It is still only a claim.
+	MessagePriorityUrgent MessagePriority = "urgent"
+)
+
+var messagePriorities = map[MessagePriority]struct{}{
+	MessagePriorityStandard:  {},
+	MessagePriorityImportant: {},
+	MessagePriorityUrgent:    {},
+}
+
+// Valid reports whether p is one of the declared priorities. The empty value is
+// not one of them — absence is resolved by NormalizeMessagePriority, which is a
+// different question from whether a stated value is a priority at all.
+func (p MessagePriority) Valid() bool {
+	_, ok := messagePriorities[p]
+	return ok
+}
+
+// OrStandard resolves a missing value for a reader.
+//
+// The database column is NOT NULL DEFAULT 'standard', so a message read through
+// storage always carries one of the three. This exists for the other direction:
+// a projection built from a partially-populated Message must not put an empty
+// string on the wire where clients expect a priority, and the safe filling is
+// the one that claims nothing.
+func (p MessagePriority) OrStandard() MessagePriority {
+	if p == "" {
+		return MessagePriorityStandard
+	}
+	return p
+}
+
+// NormalizeMessagePriority is the single place the three values are enforced.
+//
+// The three cases the wire can present, kept apart deliberately:
+//
+//	absent          -> standard, so a client that predates this axis keeps working
+//	                   without being made to spell out the default
+//	stated, known   -> itself
+//	stated, unknown -> ErrInvalidInput, never silently downgraded to standard —
+//	                   an author who asked for something we do not understand is
+//	                   owed an error, not a quiet demotion
+//
+// It lives in the domain rather than at the edge so an internal caller that
+// never sees an HTTP request is held to the same rule. The database repeats it
+// as a CHECK constraint; that is defence in depth, not the primary control.
+func NormalizeMessagePriority(priority MessagePriority) (MessagePriority, error) {
+	if priority == "" {
+		return MessagePriorityStandard, nil
+	}
+	if !priority.Valid() {
+		return "", fmt.Errorf("%w: unsupported priority", ErrInvalidInput)
+	}
+	return priority, nil
+}
+
+// ErrPersistentNotificationsRequireUrgent reports a send that asked for
+// persistent notifications on a message that is not urgent (issue #825).
+//
+// Wraps ErrInvalidInput so the generic 400 mapping applies with no new HTTP
+// case, exactly as ErrAcknowledgementRecipientsExceeded does. The message
+// states the rule and nothing about the message it refused.
+var ErrPersistentNotificationsRequireUrgent = fmt.Errorf(
+	"%w: persistent notifications require an urgent message", ErrInvalidInput)
+
+// ValidatePersistentNotifications enforces the one rule that binds the reminder
+// policy to the priority axis (issue #825, from #820: "disponível apenas para
+// mensagens Urgent").
+//
+// Refused rather than silently ignored. A sender who ticked the box on an
+// important message asked for something this version does not do, and quietly
+// sending without reminders would leave them believing the message keeps asking
+// when it does not — the one failure mode a persistent notification has.
+//
+// It lives in the domain so an internal caller that never sees an HTTP request
+// is held to the same rule, and chat.messages repeats it as
+// messages_persistent_notifications_priority_check; that is defence in depth,
+// not the primary control.
+func ValidatePersistentNotifications(priority MessagePriority, persistent bool) error {
+	if persistent && priority.OrStandard() != MessagePriorityUrgent {
+		return ErrPersistentNotificationsRequireUrgent
+	}
+	return nil
+}
+
 // MessageBodyFormat selects the grammar used to render BodyText.
 type MessageBodyFormat string
 
@@ -190,6 +302,41 @@ type Message struct {
 	BodyText         string
 	BodyFormat       MessageBodyFormat
 	Status           MessageStatus
+	// Priority is the author's own claim about how urgently this message asks
+	// to be attended to (issue #821). It is set once, when the message is
+	// created, and no edit path changes it.
+	//
+	// It is data on the message and nothing else: it authorises nothing, and
+	// this type performs no notification side effect because of it. A policy
+	// that later decides how to alert somebody reads this; it is not told what
+	// to do by it.
+	Priority MessagePriority
+	// AcknowledgementRequired is the author asking their recipients to confirm
+	// receipt explicitly (issue #824). Set once, when the message is created;
+	// no edit path changes it, and editing the body does not reset any answer
+	// already given.
+	//
+	// It is an axis of its own and not a consequence of Priority: #820 keeps
+	// the two independent in the domain even though the first release's UI only
+	// offers acknowledgement on an urgent message. Like Priority it authorises
+	// nothing — the per-recipient rows it causes to be written are derived in
+	// the database from membership, never from anything a client sends.
+	AcknowledgementRequired bool
+	// PersistentNotifications is the author asking an urgent message to keep
+	// asking until each recipient confirms it, answers it, or the reminders run
+	// out (issue #825). Set once, when the message is created; no edit path
+	// changes it.
+	//
+	// It is an intent and not a schedule. What it causes is a server-side
+	// reminder lifecycle whose interval, ceiling and per-recipient state are
+	// all decided by the server — see notificationevent.UrgentReminderInterval
+	// and MaxUrgentReminders — so there is nothing here a client names and
+	// nothing it can lengthen.
+	//
+	// Independent of AcknowledgementRequired, which #820 states outright: a
+	// message may keep asking without asking for a button to be pressed, and a
+	// message may ask for confirmation without ever reminding anybody.
+	PersistentNotifications bool
 	// LinkSafety is the link-safety axis, independent of Status. See
 	// MessageLinkSafety: it is what a client needs to decide whether to draw the
 	// "could not verify" notice, and what nothing in this service may read as
@@ -227,7 +374,28 @@ type Message struct {
 
 	// Quoted is the immediate parent message preview for quote-reply.
 	// It is intentionally one level only; nested parent quotes are not populated.
+	//
+	// It is a *presentation* DTO and must not be read as a semantic authority:
+	// it is blanked for a removed message, withheld for a condemned body, and
+	// absent from every projection that does not join the parent. Whether this
+	// message answers somebody is ReplyToSenderID, below.
 	Quoted *QuotedMessage
+
+	// ReplyToSenderID is the author of the message this one replies to, read
+	// from the persisted parent row (issue #136).
+	//
+	// It exists because a notification policy has to know "does this answer
+	// somebody" and Quoted cannot be asked: it is shaped by what a reader may
+	// see, so a deleted parent or a condemned body would silently turn a reply
+	// into an ordinary message. This field is the fact, and survives every rule
+	// that governs the preview.
+	//
+	// The same fact chat.notification_outbox's recipient CTE reads as
+	// parent.sender_id, so the realtime path and the push path classify one
+	// message identically. Empty when this message replies to nothing, or when
+	// the projection that produced it did not join the parent — never derived
+	// from anything a client sent.
+	ReplyToSenderID string
 
 	// Reference is the caller-authorized RF-09 preview. When the message has a
 	// reference but the caller cannot currently read its origin, Available is false

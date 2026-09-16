@@ -34,6 +34,19 @@ type fakeOutbox struct {
 	// claims counts calls to ClaimDue, which is how "the idle worker does not
 	// poll aggressively" is measured.
 	claims int
+
+	// The scripted halves of the reminder lifecycle (issue #825) and the counters
+	// that prove the worker called them. See the section at the end of this file
+	// for why these are scripted rather than simulated.
+	reminderResult    storage.ReminderScheduleResult
+	superseded        int
+	reminderPasses    int
+	supersedePasses   int
+	reminderBatchSize int
+	// reminderInstant is the reference the worker handed the scheduler, so a
+	// test can assert the worker supplies one rather than letting the store
+	// invent it (issue #825).
+	reminderInstant time.Time
 }
 
 type fakeRow struct {
@@ -55,6 +68,32 @@ func newFakeOutbox() *fakeOutbox {
 // seedPending adds an event in the state every producer writes.
 func (f *fakeOutbox) seedPending(id string) *fakeRow {
 	return f.seed(id, notificationevent.StatePending)
+}
+
+// seedPendingMuted adds a pending event whose recipient has muted the
+// conversation it happened in — the state the outbox projection resolves from
+// chat.conversation_notification_prefs (issue #744).
+func (f *fakeOutbox) seedPendingMuted(id string) *fakeRow {
+	row := f.seedPending(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row.event.Muted = true
+	return row
+}
+
+// seedPendingWithLevel adds an event whose recipient narrowed the conversation
+// to a level (issue #136), with the event kind the level is judged against.
+//
+// The kind is a parameter because that is the whole of what the level decides
+// on: the same preference allows a mention and suppresses an ordinary message,
+// and a fixture that fixed the kind could only ever prove one of the two.
+func (f *fakeOutbox) seedPendingWithLevel(id, level string, kind notificationevent.EventType) *fakeRow {
+	row := f.seedPending(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row.event.NotificationLevel = level
+	row.event.EventType = string(kind)
+	return row
 }
 
 // seedEligible adds an event a policy has already approved.
@@ -82,8 +121,12 @@ func (f *fakeOutbox) seed(id string, state notificationevent.State) *fakeRow {
 			Priority:    "high",
 			SourceType:  "message",
 			SourceID:    "msg-" + id,
-			DedupeKey:   "message:msg-" + id + ":mention",
-			OccurredAt:  f.now(),
+			// Every row the producers write carries an origin, and the column
+			// defaults to 'live'. A fixture without one would be a row the
+			// policy is right to refuse, which is not what these tests are for.
+			Origin:     "live",
+			DedupeKey:  "message:msg-" + id + ":mention",
+			OccurredAt: f.now(),
 		},
 		state: state,
 	}
@@ -295,3 +338,54 @@ func (f *fakeOutbox) Backlog(_ context.Context) (int, error) {
 
 // errStoreUnavailable stands in for a database that is refusing.
 var errStoreUnavailable = errors.New("store unavailable")
+
+// ── Persistent reminders (issue #825) ────────────────────────────────────────
+//
+// Scripted rather than simulated, unlike the claim protocol above, and the
+// distinction is deliberate. What the worker owes this feature is narrow: call
+// the two statements once per pass, count what they report, say so once rather
+// than once per recipient, and keep draining when either fails. Every rule that
+// actually decides a reminder — the five-minute window, only-pending
+// eligibility, the unique index that makes a repeat a no-op, the ceiling that
+// produces EXPIRED — is a property of the statements themselves and is proved
+// against a real PostgreSQL in the storage package. Reimplementing them here
+// would be a second implementation for the tests to agree with, which is how a
+// fake ends up testing itself.
+
+// reminderResult is what ScheduleDueReminders reports, set by a test.
+func (f *fakeOutbox) scheduleReminderResult(result storage.ReminderScheduleResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reminderResult = result
+}
+
+// supersededReminders is what SuppressResolvedReminders reports, set by a test.
+func (f *fakeOutbox) supersededReminders(count int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.superseded = count
+}
+
+func (f *fakeOutbox) ScheduleDueReminders(
+	_ context.Context, now time.Time, batchSize int,
+) (storage.ReminderScheduleResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reminderPasses++
+	f.reminderBatchSize = batchSize
+	f.reminderInstant = now
+	if err := f.failure("schedule_reminders"); err != nil {
+		return storage.ReminderScheduleResult{}, err
+	}
+	return f.reminderResult, nil
+}
+
+func (f *fakeOutbox) SuppressResolvedReminders(_ context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.supersedePasses++
+	if err := f.failure("suppress_resolved_reminders"); err != nil {
+		return 0, err
+	}
+	return f.superseded, nil
+}

@@ -724,6 +724,44 @@ func (s *DMService) LeaveGroup(ctx context.Context, input LeaveGroupInput) (stor
 	return s.dms.LeaveGroupConversation(ctx, input.WorkspaceID, input.ConversationID, callerID)
 }
 
+// RemoveGroupParticipantInput carries an actor and a target, and nothing else —
+// same shape as RenameGroupInput/LeaveGroupInput, for the same reason: a
+// group's authority is participation and creatorship, both re-derived inside
+// the store's transaction, so there is nothing here a client could assert.
+type RemoveGroupParticipantInput struct {
+	WorkspaceID    string
+	CallerID       string
+	ConversationID string
+	TargetUserID   string
+}
+
+// RemoveGroupParticipant removes targetUserID from a group conversation.
+//
+// Only the group's creator may remove another participant (issue #685) — a
+// group has no admin or moderator role to consult, unlike a channel, so
+// creatorship is the only authority narrower than "any participant" the
+// domain has. The check itself lives in the store, re-derived inside the
+// transaction like every other group mutation; this method only rejects the
+// one shape the store cannot distinguish from a real removal — a caller
+// naming themselves, which is LeaveGroup's job, not this one.
+func (s *DMService) RemoveGroupParticipant(ctx context.Context, input RemoveGroupParticipantInput) (storage.RemoveGroupParticipantResult, error) {
+	if strings.TrimSpace(input.WorkspaceID) == "" || strings.TrimSpace(input.ConversationID) == "" {
+		return storage.RemoveGroupParticipantResult{}, fmt.Errorf("%w: workspace_id and conversation_id are required", domain.ErrInvalidInput)
+	}
+	callerID, err := canonicalizeUserID(input.CallerID)
+	if err != nil {
+		return storage.RemoveGroupParticipantResult{}, err
+	}
+	targetUserID, err := canonicalizeUserID(input.TargetUserID)
+	if err != nil {
+		return storage.RemoveGroupParticipantResult{}, err
+	}
+	if targetUserID == callerID {
+		return storage.RemoveGroupParticipantResult{}, fmt.Errorf("%w: use leave to remove yourself", domain.ErrInvalidInput)
+	}
+	return s.dms.RemoveGroupParticipant(ctx, input.WorkspaceID, input.ConversationID, callerID, targetUserID)
+}
+
 // normalizeGroupRenameTitle trims and bounds a new group title.
 //
 // It shares maxDMTitleRunes with creation, deliberately, so a rename cannot be

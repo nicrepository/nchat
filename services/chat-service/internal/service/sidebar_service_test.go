@@ -75,6 +75,10 @@ func (f *sidebarFakeMemberStore) ListChannelMemberProfilesByIDs(_ context.Contex
 func (f *sidebarFakeMemberStore) SearchDMCandidates(_ context.Context, _, _, _ string, _ int) ([]domain.DMCandidate, error) {
 	return nil, nil
 }
+func (f *sidebarFakeMemberStore) RemoveChannelMemberByAdmin(_ context.Context, _, _, _, _ string) (domain.Message, error) {
+	return domain.Message{}, nil
+}
+
 func (f *sidebarFakeMemberStore) RemoveChannelMember(_ context.Context, _, _, _ string) error {
 	return nil
 }
@@ -183,6 +187,10 @@ func (f *sidebarFakeDMStore) RenameGroupConversation(context.Context, storage.Re
 
 func (f *sidebarFakeDMStore) LeaveGroupConversation(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
 	return storage.LeaveConversationResult{}, nil
+}
+
+func (f *sidebarFakeDMStore) RemoveGroupParticipant(context.Context, string, string, string, string) (storage.RemoveGroupParticipantResult, error) {
+	return storage.RemoveGroupParticipantResult{}, nil
 }
 
 func (f *sidebarFakeDMStore) CreateDirectConversation(_ context.Context, _ storage.CreateDirectConversationInput) (storage.CreateDirectConversationResult, error) {

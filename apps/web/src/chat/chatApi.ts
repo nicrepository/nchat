@@ -14,8 +14,10 @@ import { authenticatedFetch } from "../lib/authClient";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
+  normalizeAcknowledgementState,
   normalizeBodyFormat,
   normalizeLinkSafety,
+  normalizeMessagePriority,
   parseDMConversationType,
   parseMessageAttachments,
   parseReactionUsers,
@@ -24,6 +26,8 @@ import {
   type ChannelCategory,
   type ChannelDetails,
   type ChannelMemberProfile,
+  type ConversationNotificationLevel,
+  type ConversationNotificationMode,
   type GroupDetails,
   type GroupParticipantProfile,
   type DMCandidate,
@@ -37,11 +41,15 @@ import {
   type FavoriteItem,
   type FavoritesPage,
   type Message,
+  type MessageAcknowledgement,
+  type MessageAcknowledgementRecipient,
   type MessageEditHistoryEntry,
   type MessagePage,
+  type MessagePriority,
   type MessageSecuritySnapshot,
   type PinnedItem,
   type ConversationEventPayload,
+  type ConversationEventTargetUser,
   type ConversationEventType,
 } from "./chatTypes";
 
@@ -65,6 +73,8 @@ interface SidebarChannelResponse {
   can_rename?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -92,6 +102,8 @@ interface SidebarDMResponse {
   unread_count?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
 }
 
 interface SidebarResponse {
@@ -106,6 +118,11 @@ interface SidebarResponse {
   };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
+  /**
+   * The issue #136 rollout gate, as the server reports it. Absent on a server
+   * that predates the field, which is read as "off" — the compatible answer.
+   */
+  conversation_notification_levels_enabled?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -223,11 +240,25 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     // the capabilities above: anything that is not an explicit `true` is "no".
     isGeneral: ch.is_general === true,
     muted: ch.muted === true,
+    notificationLevel: parseNotificationLevel(ch.notification_level),
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
   };
+}
+
+/**
+ * Reads the conversation notification level off the wire (issue #136).
+ *
+ * Only the one non-default value is recognised; everything else — absent, null,
+ * a level a newer server added, a string a proxy rewrote — becomes "all". That
+ * is the same strictness `muted` and `can_write` are parsed with, and it fails
+ * in the direction that keeps a conversation audible: a level this build cannot
+ * interpret must not silence anything.
+ */
+function parseNotificationLevel(value: unknown): ConversationNotificationLevel {
+  return value === "mentions_replies" ? "mentions_replies" : "all";
 }
 
 function isUnreadCount(value: unknown): value is number {
@@ -339,6 +370,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     muted: dm.muted === true,
+    notificationLevel: parseNotificationLevel(dm.notification_level),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
@@ -429,6 +461,9 @@ export async function fetchSidebarData(): Promise<{
   maxUploadBytes?: number | null;
   maxFiles?: number;
   maxBytes?: number;
+  // Optional in the signature for the same reason the limits above are: a
+  // caller with a partial fixture reads it as absent, and absent is "off".
+  notificationLevelsEnabled?: boolean;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -486,6 +521,12 @@ export async function fetchSidebarData(): Promise<{
       typeof rawMaxBytes === "number" && Number.isSafeInteger(rawMaxBytes) && rawMaxBytes > 0
         ? rawMaxBytes
         : Number.MAX_SAFE_INTEGER,
+    // Strict equality, like every other capability on this payload: anything
+    // that is not an explicit `true` — absent, null, a truthy string from a
+    // proxy that rewrote the response — is "off". The server re-derives the
+    // same answer on every write, so a client that got this wrong would only
+    // change which error it receives (issue #136).
+    notificationLevelsEnabled: sidebar.conversation_notification_levels_enabled === true,
     channels,
     dms,
     categories,
@@ -753,6 +794,38 @@ export async function setConversationMuted(
 }
 
 /**
+ * Sets the whole notification preference of one conversation (issue #136).
+ *
+ * The canonical surface, where the two `/mute` calls above are the sidebar's
+ * shortcut for one dimension of it. A per-user preference, so the request
+ * carries no user: the actor is the session and the workspace is resolved
+ * server-side.
+ *
+ * PUT with the complete desired state, so sending the same mode twice is the
+ * same preference — what a settings select needs when somebody clicks around.
+ * The server owns the translation into storage: this client never sends a level
+ * and a mute separately, and never learns that a mute is a timestamp.
+ *
+ * The general channel refuses `muted` server-side, in SQL; this client never
+ * decides that.
+ */
+export async function setConversationNotificationMode(
+  targetType: "channel" | "dm",
+  targetId: string,
+  mode: ConversationNotificationMode,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/notification-preference`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/notification-preference`;
+  await authenticatedFetch(target, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+/**
  * Renames a group conversation (issue #527).
  *
  * Groups only. A 1:1 conversation reaches nothing on the server — the statement
@@ -873,6 +946,16 @@ interface MessageResponse {
   reference?: ReferenceResponse;
   /** RF-32. Absent on a text-only message and on any pre-RF-32 server. */
   attachments?: unknown;
+  /** Issue #824. Absent on a pre-#824 server, which asked nobody to confirm. */
+  acknowledgement_required?: unknown;
+  /** Issue #825. Absent on a pre-#825 server, which never reminded anybody. */
+  persistent_notifications?: unknown;
+  /**
+   * Issue #821. Typed unknown because it is classified rather than trusted:
+   * normalizeMessagePriority narrows it, and a pre-#821 server sends nothing —
+   * which is `standard`, the behaviour every message had before the axis.
+   */
+  priority?: unknown;
 }
 
 interface QuoteResponse {
@@ -1035,17 +1118,50 @@ function mapConversationEvent(r: MessageResponse): {
   eventType?: ConversationEventType;
   eventPayload?: ConversationEventPayload;
 } {
-  const known: ConversationEventType[] = ["conversation_renamed", "conversation_member_left"];
+  const known: ConversationEventType[] = [
+    "conversation_renamed",
+    "conversation_member_left",
+    "conversation_created",
+    "conversation_archived",
+    "conversation_member_added",
+    "conversation_member_removed",
+    "call_started",
+    "call_ended",
+  ];
   const eventType = known.find((candidate) => candidate === r.event_type);
   if (r.kind !== "system" || !eventType) return {};
   const payload =
     typeof r.event_payload === "object" && r.event_payload
       ? (r.event_payload as Record<string, unknown>)
       : {};
-  const read = (value: unknown) => (typeof value === "string" ? value : undefined);
+  const readString = (value: unknown) => (typeof value === "string" ? value : undefined);
+  const readNumber = (value: unknown) => (typeof value === "number" ? value : undefined);
+  const readCallType = (value: unknown): "audio" | "video" | undefined =>
+    value === "audio" || value === "video" ? value : undefined;
+  const readTargetUsers = (value: unknown): ConversationEventTargetUser[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+    const users: ConversationEventTargetUser[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "object" || !entry) continue;
+      const userId = readString((entry as Record<string, unknown>)["user_id"]);
+      if (!userId) continue;
+      users.push({
+        userId,
+        displayName: readString((entry as Record<string, unknown>)["display_name"]),
+      });
+    }
+    return users.length > 0 ? users : undefined;
+  };
   return {
     eventType,
-    eventPayload: { oldName: read(payload["old_name"]), newName: read(payload["new_name"]) },
+    eventPayload: {
+      oldName: readString(payload["old_name"]),
+      newName: readString(payload["new_name"]),
+      targetUsers: readTargetUsers(payload["target_users"]),
+      callId: readString(payload["call_id"]),
+      callType: readCallType(payload["call_type"]),
+      callDurationSeconds: readNumber(payload["call_duration_seconds"]),
+    },
   };
 }
 
@@ -1136,6 +1252,15 @@ function mapMessage(r: MessageResponse): Message {
     reactions: mapReactions(r.reactions),
     isFavorited: r.is_favorited ?? false,
     isForwarded: r.is_forwarded === true,
+    // Strict equality, so a server that does not send the field at all — and a
+    // value this build does not understand — both read as "asked nobody". The
+    // safe direction: an absent flag never invents a confirmation request.
+    acknowledgementRequired: r.acknowledgement_required === true,
+    persistentNotifications: r.persistent_notifications === true,
+    // Issue #823. Narrowed rather than trusted: an unrecognised value reads as
+    // `standard` and draws nothing, so a priority this build has not reasoned
+    // about can never be the one that raises a reader's attention.
+    priority: normalizeMessagePriority(r.priority),
   };
 }
 
@@ -1257,6 +1382,33 @@ export interface PostMessageOptions {
   idempotencyKey?: string;
   /** DMs default to v2; group composers opt into the existing v3 codec. */
   bodyFormat?: "v2" | "v3";
+  /**
+   * The author's stated priority (issue #821).
+   *
+   * Omitted from the request when it is `standard`, which is what an absent
+   * priority already means to chat-service. Deliberately not sent as the empty
+   * string: the service treats `""` as a stated-but-invalid priority and
+   * answers 400, because a client that filled the field in wrongly must not be
+   * silently demoted to standard.
+   */
+  priority?: MessagePriority;
+  /**
+   * Ask this message's recipients to confirm receipt explicitly (issue #824).
+   *
+   * Omitted from the request entirely when false, so a send that asks for
+   * nothing is byte-for-byte the payload it has always been and a pre-#824
+   * server is unaffected.
+   */
+  acknowledgementRequired?: boolean;
+  /**
+   * Keep reminding the recipients who neither confirmed nor answered (#825).
+   *
+   * Omitted when false, on the same terms. The service refuses it on a message
+   * that is not urgent rather than ignoring it, so this is only ever sent
+   * alongside `priority: "urgent"` — see normalizePriorityIntent, which is what
+   * guarantees the pair rather than a check at this layer.
+   */
+  persistentNotifications?: boolean;
   signal?: AbortSignal;
 }
 
@@ -1269,6 +1421,9 @@ function postMessageBody(bodyText: string, bodyFormat: string, options: PostMess
     // Omitted entirely when there is none, so a text-only request is the exact
     // payload it has always been.
     ...(options.attachmentIds?.length ? { attachment_ids: options.attachmentIds } : {}),
+    ...(options.priority && options.priority !== "standard" ? { priority: options.priority } : {}),
+    ...(options.acknowledgementRequired ? { acknowledgement_required: true } : {}),
+    ...(options.persistentNotifications ? { persistent_notifications: true } : {}),
   });
 }
 
@@ -1651,6 +1806,148 @@ export async function getMessageHistory(
   } catch (error) {
     return mapMessageEditError(error);
   }
+}
+
+// ── Acknowledgement API (issue #824) ─────────────────────────────────────────
+
+interface AcknowledgementResponse {
+  message_id?: unknown;
+  required?: unknown;
+  total?: unknown;
+  pending?: unknown;
+  acknowledged?: unknown;
+  responded?: unknown;
+  expired?: unknown;
+  cancelled?: unknown;
+  viewer_state?: unknown;
+  recipients?: unknown;
+}
+
+function acknowledgementPath(messageId: string): string {
+  return `${CHAT_BASE}/messages/${encodeURIComponent(messageId)}/acknowledgement`;
+}
+
+/** A non-negative integer, or 0 for anything else a server might send. */
+function acknowledgementCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+
+/**
+ * The per-recipient list, present only when the server chose to send it.
+ *
+ * A row whose state this build does not recognise is dropped rather than
+ * guessed at: the list is rendered, and a state nobody understands has no
+ * rendering.
+ */
+function mapAcknowledgementRecipients(
+  value: unknown,
+): MessageAcknowledgementRecipient[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const recipients = value.flatMap((entry): MessageAcknowledgementRecipient[] => {
+    const row = entry as { recipient_id?: unknown; state?: unknown; resolved_at?: unknown };
+    const state = normalizeAcknowledgementState(row.state);
+    if (typeof row.recipient_id !== "string" || !state) return [];
+    return [
+      {
+        recipientId: row.recipient_id,
+        state,
+        resolvedAt: typeof row.resolved_at === "string" ? row.resolved_at : undefined,
+      },
+    ];
+  });
+  return recipients;
+}
+
+function mapAcknowledgement(messageId: string, r: AcknowledgementResponse): MessageAcknowledgement {
+  return {
+    messageId: typeof r.message_id === "string" ? r.message_id : messageId,
+    required: r.required === true,
+    total: acknowledgementCount(r.total),
+    pending: acknowledgementCount(r.pending),
+    acknowledged: acknowledgementCount(r.acknowledged),
+    responded: acknowledgementCount(r.responded),
+    expired: acknowledgementCount(r.expired),
+    cancelled: acknowledgementCount(r.cancelled),
+    viewerState: normalizeAcknowledgementState(r.viewer_state),
+    recipients: mapAcknowledgementRecipients(r.recipients),
+  };
+}
+
+/**
+ * Reads how one message's acknowledgement stands (issue #824).
+ *
+ * A read, and only a read: opening or fetching a message is not confirming it.
+ * What comes back is scoped by the server to what this reader may see — the
+ * counts and their own state for everybody, the per-recipient list for the
+ * sender — so nothing here decides authorisation.
+ */
+export async function fetchMessageAcknowledgement(
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<MessageAcknowledgement> {
+  const res = await authenticatedFetch<{ data: AcknowledgementResponse }>(
+    acknowledgementPath(messageId),
+    { method: "GET", signal },
+  );
+  return mapAcknowledgement(messageId, res.data);
+}
+
+/**
+ * Reads how a page of messages' acknowledgements stand, in one request (issue
+ * #824).
+ *
+ * One call for the screen rather than one per message that asked for
+ * confirmation: opening a conversation holding twenty urgent notices used to
+ * cost twenty round trips and twenty aggregations, and every reconnect cost
+ * them again.
+ *
+ * POST despite being a read, for the same reason fetchLinkSafetyStatuses is: the
+ * request carries a list of ids, and a list does not belong in a query string.
+ *
+ * The answer holds an entry only for a message the server let this reader see,
+ * so a missing key is the same non-enumerating answer the single read gives. It
+ * carries summaries only — the per-recipient list stays on the message-scoped
+ * read, where the server decides who may have it.
+ */
+export async function fetchMessageAcknowledgements(
+  messageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, MessageAcknowledgement>> {
+  if (messageIds.length === 0) return {};
+  const res = await authenticatedFetch<{
+    data: { acknowledgements?: Record<string, AcknowledgementResponse> };
+  }>(`${CHAT_BASE}/messages/acknowledgements`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message_ids: messageIds }),
+    signal,
+  });
+  const entries = res.data.acknowledgements ?? {};
+  const summaries: Record<string, MessageAcknowledgement> = {};
+  for (const [messageId, entry] of Object.entries(entries)) {
+    summaries[messageId] = mapAcknowledgement(messageId, entry);
+  }
+  return summaries;
+}
+
+/**
+ * Confirms receipt of a message that asked this reader to (issue #824).
+ *
+ * No request body at all: who is confirming is the session and which message is
+ * the path, so there is nothing for this client to assert and no recipient id it
+ * could get wrong. Idempotent — the server answers a repeat with the state that
+ * actually holds — and the resulting summary is returned so the caller renders
+ * the authoritative answer without a second request.
+ */
+export async function acknowledgeMessage(
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<MessageAcknowledgement> {
+  const res = await authenticatedFetch<{ data: AcknowledgementResponse }>(
+    acknowledgementPath(messageId),
+    { method: "POST", signal },
+  );
+  return mapAcknowledgement(messageId, res.data);
 }
 
 // ── Favorites API (RF-06) ─────────────────────────────────────────────────────

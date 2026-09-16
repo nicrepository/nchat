@@ -36,6 +36,9 @@ type dmProvider interface {
 	RenameGroup(ctx context.Context, input service.RenameGroupInput) (storage.RenameGroupResult, error)
 	// LeaveGroup removes the caller's own participation (issue #527).
 	LeaveGroup(ctx context.Context, input service.LeaveGroupInput) (storage.LeaveConversationResult, error)
+	// RemoveGroupParticipant removes another participant on the group creator's
+	// behalf (issue #685) — the admin-initiated counterpart to LeaveGroup.
+	RemoveGroupParticipant(ctx context.Context, input service.RemoveGroupParticipantInput) (storage.RemoveGroupParticipantResult, error)
 }
 
 type dmRateLimiter interface {
@@ -653,6 +656,13 @@ func (h *DMHandler) AddParticipants(w http.ResponseWriter, r *http.Request) {
 		h.broadcast.PublishConversationAvailable(
 			r.Context(), workspaceID, "dm", conversationID, result.AddedUserIDs,
 		)
+		// members.added tells existing participants' panels to refetch, but
+		// carries no system message — without this, "Fulano entrou no grupo"
+		// only ever showed up on the next reload (issue #835 realtime
+		// follow-up), same gap RemoveParticipant below already closed.
+		if result.EventMessageID != "" {
+			h.broadcast.PublishConversationEvent(r.Context(), workspaceID, "dm", conversationID, result.EventMessageID)
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
 		Added:          result.Added,
@@ -892,6 +902,56 @@ func (h *DMHandler) LeaveGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.publishGroupChange(r.Context(), workspaceID, conversationID, result.Event.ID, false)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// RemoveParticipant handles DELETE /api/chat/dm/{conversationID}/participants/{userID}
+// (issue #685) — the admin-initiated counterpart to LeaveGroup. Only the
+// group's creator may remove another participant; that authorization is
+// re-derived inside the store's transaction, like everything else about a
+// group mutation, so this function decides nothing beyond decoding the path.
+//
+// The realtime signal is published only after the store commits and only when
+// it actually removed someone — naming a user who does not currently
+// participate is a no-op that announces nothing.
+func (h *DMHandler) RemoveParticipant(w http.ResponseWriter, r *http.Request) {
+	if !h.checkDeps(w) {
+		return
+	}
+	conversationID := r.PathValue("conversationID")
+	if !validateTargetID(w, conversationID, "conversation_id") {
+		return
+	}
+	targetUserID := r.PathValue("userID")
+	if !validateTargetID(w, targetUserID, "user_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	if !h.allowAction(w, r, callerID, groupAdminAction, groupAdminRateLimit) {
+		return
+	}
+	workspaceID, ok := h.resolveWorkspaceID(r.Context(), w)
+	if !ok {
+		return
+	}
+
+	result, err := h.dms.RemoveGroupParticipant(r.Context(), service.RemoveGroupParticipantInput{
+		WorkspaceID:    workspaceID,
+		CallerID:       callerID,
+		ConversationID: conversationID,
+		TargetUserID:   targetUserID,
+	})
+	if err != nil {
+		writeGroupAdminError(w, err)
+		return
+	}
+	if h.broadcast != nil && result.Event.ID != "" {
+		h.broadcast.PublishConversationEvent(r.Context(), workspaceID, "dm", conversationID, result.Event.ID)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -852,6 +852,12 @@ type fakeDMStore struct {
 	lastLeaveGroup  [3]string
 	leaveGroupErr   error
 
+	// Admin participant removal (issue #685).
+	lastRemoveParticipant  [4]string
+	removeParticipantErr   error
+	removeParticipantNoOp  bool
+	removeParticipantCalls int
+
 	// callParticipantProfiles models the conversation's active participants by
 	// user ID (issue #612); ListParticipantProfilesByIDs returns only the
 	// requested IDs present here, mirroring the real store's join silently
@@ -893,6 +899,22 @@ func (f *fakeDMStore) LeaveGroupConversation(_ context.Context, workspaceID, con
 		return storage.LeaveConversationResult{}, f.leaveGroupErr
 	}
 	return storage.LeaveConversationResult{
+		Event: domain.Message{ID: "event-" + conversationID, Kind: domain.MessageKindSystem},
+	}, nil
+}
+
+func (f *fakeDMStore) RemoveGroupParticipant(
+	_ context.Context, workspaceID, conversationID, callerID, targetUserID string,
+) (storage.RemoveGroupParticipantResult, error) {
+	f.removeParticipantCalls++
+	f.lastRemoveParticipant = [4]string{workspaceID, conversationID, callerID, targetUserID}
+	if f.removeParticipantErr != nil {
+		return storage.RemoveGroupParticipantResult{}, f.removeParticipantErr
+	}
+	if f.removeParticipantNoOp {
+		return storage.RemoveGroupParticipantResult{}, nil
+	}
+	return storage.RemoveGroupParticipantResult{
 		Event: domain.Message{ID: "event-" + conversationID, Kind: domain.MessageKindSystem},
 	}, nil
 }

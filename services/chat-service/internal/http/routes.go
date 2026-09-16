@@ -15,12 +15,29 @@ const (
 	// SQL, not by omitting the route.
 	RouteChannelMute = "/api/chat/channels/{channelID}/mute"
 	RouteDMMute      = "/api/chat/dm/{conversationID}/mute"
+	// Issue #136 notification preference: the canonical surface for the whole
+	// per-conversation preference, where /mute above is the sidebar's shortcut
+	// for one dimension of it.
+	//
+	// PUT and not POST, because the request states the complete desired state of
+	// one named sub-resource rather than appending anything: sending the same
+	// body twice is the same preference, which is what the settings page needs
+	// when a user clicks around a select. The same prefixes and the same absence
+	// of a workspace segment as every other chat route — the workspace and the
+	// actor come from the session.
+	RouteChannelNotificationPreference = "/api/chat/channels/{channelID}/notification-preference"
+	RouteDMNotificationPreference      = "/api/chat/dm/{conversationID}/notification-preference"
 	// Issue #527 self-leave. DELETE on the actor's own membership, and the path
 	// names no user precisely because it cannot affect anyone else's: the actor
 	// is the session. The administrative removal of *another* member keeps its
 	// own surface under /members.
 	RouteChannelMembership = "/api/chat/channels/{channelID}/membership"
 	RouteDMMembership      = "/api/chat/dm/{conversationID}/membership"
+	// Issue #685 admin removal, the group counterpart of RouteChannelMember:
+	// distinct from RouteDMMembership above because that one always acts on the
+	// caller, while this one names the target in the path and requires
+	// creatorship.
+	RouteDMParticipant = "/api/chat/dm/{conversationID}/participants/{userID}"
 	// Issue #527 group rename. Under the DM prefix because a group is a
 	// chat.dm_conversations row; served only for PATCH, and only for a group —
 	// a 1:1 conversation matches nothing in the statement behind it.
@@ -51,6 +68,10 @@ const (
 	// a group is a chat.dm_conversations row and not a channel. Neither carries a
 	// workspace segment, for the same reason none of the others does.
 	RouteChannelMembers = "/api/chat/channels/{channelID}/members"
+	// Issue #685 admin removal, distinct from the self-leave DELETE above: this
+	// one names the target in the path and requires management authority, while
+	// RouteChannelMembership always acts on the caller.
+	RouteChannelMember = "/api/chat/channels/{channelID}/members/{userID}"
 	// Issue #398 contextual candidate search. Scoped to the target conversation
 	// because "who can still be added" depends on who is already in it, and the
 	// panel's capped preview is not a membership list. Same prefix convention as
@@ -107,7 +128,36 @@ const (
 	// credentials to look up arbitrary URLs.
 	RouteMessageLinkSafetyReconcile = "/api/chat/messages/{messageID}/link-safety/reconcile"
 	RouteMessageEditHistory         = "/api/chat/messages/{messageID}/history"
-	RouteWorkspaceSettings          = "/api/v1/workspaces/{workspaceID}/settings"
+	// Issue #824 recipient acknowledgement. Message-scoped and target-free, for
+	// the same reason RouteMessageFavorite is: the message is the aggregate, and
+	// the conversation it lives in is something the server resolves from it
+	// rather than something a client restates and could restate wrongly.
+	//
+	// There is deliberately no user segment. POST always acts on the caller —
+	// naming a recipient in the path would invite the belief that some other
+	// value belongs there — and GET answers with what the caller is authorised
+	// to see rather than with whoever they ask about.
+	RouteMessageAcknowledgement = "/api/chat/messages/{messageID}/acknowledgement"
+	// Issue #824 page load. A literal segment under the same prefix as
+	// {messageID}, on the same terms as RouteMessageLinkSafetyStatus above: Go's
+	// mux prefers the literal, and the two are served for different methods
+	// anyway. POST because the request carries a batch of ids, though it is a
+	// read — and it answers with summaries only, never the per-recipient detail,
+	// which stays on the message-scoped route.
+	RouteMessageAcknowledgements = "/api/chat/messages/acknowledgements"
+	// Issue #825 persistent notifications. Message-scoped and target-free on the
+	// same terms as the acknowledgement route above, and with no user segment
+	// for a stronger version of the same reason: the only person who may act
+	// here is the message's own sender, and the server knows who that is — a
+	// path segment naming an actor would invite the belief that some other value
+	// belongs there.
+	//
+	// DELETE, because the request withdraws a policy and carries no body at all.
+	// There is no POST counterpart: reminders are started by sending the
+	// message, never by a second call, so there is no endpoint through which an
+	// already-sent message can be made to start paging people.
+	RouteMessagePersistentNotifications = "/api/chat/messages/{messageID}/persistent-notifications"
+	RouteWorkspaceSettings              = "/api/v1/workspaces/{workspaceID}/settings"
 	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
 	// is the only prefix the gateways forward to chat-service (Traefik local and
 	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never

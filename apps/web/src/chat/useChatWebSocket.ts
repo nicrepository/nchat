@@ -40,6 +40,37 @@ const SUBSCRIPTION_RETRY_BASE_DELAY_MS = 250;
 const SUBSCRIPTION_RETRY_MAX_DELAY_MS = 2_000;
 const MAX_SUBSCRIPTION_RECOVERY_ATTEMPTS = 3;
 
+/**
+ * The central delivery decision for one event (issue #744), produced by
+ * chat-service with `libs/go/platform/notificationpolicy` and consumed — never
+ * recomputed — by this client.
+ *
+ * Absent only on a legacy payload, from a chat-service that predates the
+ * contract, during rollout compatibility; an explicit `deny` is a different
+ * thing entirely. When present, each channel decision is authoritative on its
+ * own and none of them implies another.
+ */
+export interface WSNotificationPolicy {
+  policy_version: number;
+  /**
+   * Authorises the interruptive in-app surface — the toast — and nothing else.
+   * Not the sidebar, the badge or the unread count: suppressing an alert may
+   * never hide the message itself.
+   */
+  in_app: "allow" | "deny";
+  /** Authorises the local chime, and nothing else. */
+  sound: "allow" | "deny";
+  /** Authorises the OS-level notification surface, and nothing else. */
+  web_push: "allow" | "deny";
+  /** Present only on a suppression, in the policy's own closed vocabulary. */
+  reasons?: string[];
+  /** The class every recipient of this event shares. */
+  sound_class: "general" | "direct";
+  /** The recipients this message names, as the server's mention codec read it. */
+  named_user_ids?: string[];
+  names_everyone?: boolean;
+}
+
 export interface WSMessagePayload {
   id: string;
   workspace_id: string;
@@ -65,6 +96,37 @@ export interface WSMessagePayload {
    * the client that reads it.
    */
   link_safety_state?: unknown;
+  /**
+   * The author's stated priority (issue #821): standard, important or urgent.
+   * Typed unknown because it is a value this client classifies rather than
+   * trusts a shape of — normalizeMessagePriority narrows it, and anything it
+   * does not recognise is read as an ordinary message. Absent on a pre-#840
+   * server.
+   */
+  priority?: unknown;
+  /**
+   * The message asked its recipients to confirm receipt (issue #824). Only the
+   * flag — who was asked and who answered is a separate authorised read, and
+   * broadcasting a recipient list to a conversation's subscribers is exactly
+   * the exposure #824 refuses.
+   *
+   * Carried here so a message inserted from this event and the same message
+   * after a reload render identically (issue #823); absent on a pre-#824
+   * server, which asked nobody.
+   */
+  acknowledgement_required?: unknown;
+  /**
+   * The message asked to keep reminding its recipients until they confirm,
+   * answer, or the reminders run out (issue #825), shown as the
+   * "Persistente" notice (issue #846).
+   *
+   * Carried here for the same reason acknowledgement_required is: a message
+   * inserted from this event and the same message after a reload must render
+   * identically. Absent on a pre-#846 server.
+   */
+  persistent_notifications?: unknown;
+  /** The central delivery decision. See WSNotificationPolicy. */
+  notification_policy?: WSNotificationPolicy;
   is_removed: boolean;
   created_at: string;
   updated_at: string;
@@ -371,6 +433,23 @@ export interface WSConversationEventMessage {
 }
 
 /**
+ * One message's acknowledgement changed (issue #824).
+ *
+ * An invalidation hint and nothing else: it names the message and the
+ * conversation, and the handler re-reads the authorised summary for exactly
+ * that message. The server deliberately puts no state on the wire — who
+ * answered and how many are outstanding are a per-reader answer, and a
+ * broadcast has no way to make one — so there is nothing here to apply
+ * directly, and nothing here that a subscriber was not already allowed to know.
+ */
+export interface WSAcknowledgementUpdatedEvent {
+  type: "message.acknowledgement_updated";
+  target_type: "channel" | "dm";
+  target_id: string;
+  message_id: string;
+}
+
+/**
  * An attachment's antimalware verdict changed (RF-22).
  *
  * Produced by file-service and relayed over the same bus and the same
@@ -430,6 +509,8 @@ interface UseChatWebSocketOptions {
   onConversationAvailable?: (event: WSConversationAvailableEvent) => void;
   onConversationUpdated?: (event: WSConversationUpdatedEvent) => void;
   onConversationEvent?: (event: WSConversationEventMessage) => void;
+  /** Issue #824: one message's acknowledgement changed; re-read just that one. */
+  onAcknowledgementUpdated?: (event: WSAcknowledgementUpdatedEvent) => void;
   onReactionError?: (event: WSClientErrorEvent) => void;
   onSubscriptionError?: (event: WSClientErrorEvent) => void;
   onSubscribed?: (event: WSSubscribedEvent) => void;
@@ -478,6 +559,7 @@ export function useChatWebSocket({
   onConversationAvailable,
   onConversationUpdated,
   onConversationEvent,
+  onAcknowledgementUpdated,
   onReactionError,
   onSubscriptionError,
   onSubscribed,
@@ -511,6 +593,7 @@ export function useChatWebSocket({
   const onConversationAvailableRef = useRef(onConversationAvailable);
   const onConversationUpdatedRef = useRef(onConversationUpdated);
   const onConversationEventRef = useRef(onConversationEvent);
+  const onAcknowledgementUpdatedRef = useRef(onAcknowledgementUpdated);
   const onReactionErrorRef = useRef(onReactionError);
   const onSubscriptionErrorRef = useRef(onSubscriptionError);
   const onSubscribedRef = useRef(onSubscribed);
@@ -537,6 +620,7 @@ export function useChatWebSocket({
     onConversationAvailableRef.current = onConversationAvailable;
     onConversationUpdatedRef.current = onConversationUpdated;
     onConversationEventRef.current = onConversationEvent;
+    onAcknowledgementUpdatedRef.current = onAcknowledgementUpdated;
     onReactionErrorRef.current = onReactionError;
     onSubscriptionErrorRef.current = onSubscriptionError;
     onSubscribedRef.current = onSubscribed;
@@ -740,7 +824,36 @@ export function useChatWebSocket({
         onAttachmentStatusRef.current?.(incoming.data as unknown as WSAttachmentStatusEvent);
         return true;
       }
+      if (routeAcknowledgementUpdated(d, incoming)) return true;
       return routeConversationEvent(d, incoming);
+    }
+
+    /**
+     * Issue #824. One message's acknowledgement changed; re-read that one.
+     *
+     * Its own router rather than another branch inside routeConversationEvent:
+     * that function is already at the complexity the project allows, and a hint
+     * that is neither a conversation update nor a system message does not belong
+     * in the function named for those two anyway.
+     *
+     * Gated on the message id for the same reason its neighbours are — a frame
+     * naming nothing to re-read is a frame with nothing to do.
+     */
+    function routeAcknowledgementUpdated(
+      d: Record<string, unknown>,
+      incoming: IncomingTarget,
+    ): boolean {
+      if (
+        d["type"] !== "message.acknowledgement_updated" ||
+        !incoming.type ||
+        typeof d["message_id"] !== "string"
+      ) {
+        return false;
+      }
+      onAcknowledgementUpdatedRef.current?.(
+        incoming.data as unknown as WSAcknowledgementUpdatedEvent,
+      );
+      return true;
     }
 
     // An event with no recognised target type is not one this protocol produces

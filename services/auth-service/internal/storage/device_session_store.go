@@ -24,11 +24,13 @@ func NewPGXDeviceSessionStore(pool Pool) *PGXDeviceSessionStore {
 
 // ListSessions returns sessions for userID ordered newest first.
 // includeRevoked=false returns only active sessions; true returns all.
+// ip_address is inet: host() yields the bare address, whereas ::text appends
+// the CIDR suffix ("203.0.113.10/32") that net.ParseIP rejects (issue #859).
 func (s *PGXDeviceSessionStore) ListSessions(ctx context.Context, userID string, includeRevoked bool, limit int) ([]domain.SessionInfo, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, device_id, created_at, last_seen_at,
 		       idle_expires_at, absolute_expires_at, revoked_at,
-		       ip_address::text, user_agent
+		       host(ip_address), user_agent
 		FROM auth.user_sessions
 		WHERE user_id = $1
 		  AND ($2 OR revoked_at IS NULL)

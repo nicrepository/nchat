@@ -2,10 +2,17 @@
 # Coverage for the chat/file tests that need a real PostgreSQL.
 #
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
-# outbox suite and issue #742's worker claim suite: all three prove properties
-# only a database can hold — atomicity across one statement, a unique index
-# deciding what counts as the same event, and FOR UPDATE SKIP LOCKED handing two
-# concurrent workers disjoint rows.
+# outbox suite, issue #742's worker claim suite, issue #745's push subscription
+# suite, issue #746's Web Push delivery ledger, issue #821's message priority
+# column, issue #824's per-recipient acknowledgement and issue #825's persistent
+# reminder scheduler: all of them prove
+# properties only a database can hold —
+# atomicity across one statement, a unique index deciding what counts as the same
+# event or the same subscription, an ON CONFLICT that refuses to move ownership,
+# FOR UPDATE SKIP LOCKED handing two concurrent workers disjoint rows, and a
+# column default plus CHECK constraint deciding what a row written by an older
+# release means and which values may ever be stored, and a conditional UPDATE
+# deciding which of two concurrent state transitions wins.
 #
 # Usage: link-safety-postgres-coverage.sh <go-module> [output-profile]
 #
@@ -55,6 +62,14 @@ case "$MODULE" in
       TestTwoURLConcurrentEditsUseStableLockOrderPostgreSQL
       TestMessageSecuritySnapshotsAreOneAuthorizedProjectionPostgreSQL
       TestMaliciousBodyIsWithheldFromEveryProjectionPostgreSQL
+      TestMessagePriorityDefaultsToStandardPostgreSQL
+      TestMessagePriorityAbsentOnCreateIsStandardPostgreSQL
+      TestMessagePriorityConstraintAcceptsDeclaredValuesPostgreSQL
+      TestMessagePriorityConstraintRejectsUnsupportedValuesPostgreSQL
+      TestMessagePriorityConstraintRejectsInvalidUpdatePostgreSQL
+      TestMessagePriorityCreateRoundTripsPostgreSQL
+      TestMessagePriorityListingPreservesPriorityPostgreSQL
+      TestMessagePriorityEditPreservesPriorityPostgreSQL
       TestNotificationOutboxCommitsWithMessagePostgreSQL
       TestNotificationOutboxRowContractPostgreSQL
       TestNotificationOutboxStoresNoMessageBodyPostgreSQL
@@ -89,6 +104,90 @@ case "$MODULE" in
       TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
+      # Issue #136. The first three read the migrated schema and the fixture the
+      # outbox suite above already seeds; the fourth creates and drops a database
+      # of its own, exactly like the #741 round trip two lines up.
+      TestRealtimeAndOutboxClassifyTheSameMessageIdenticallyPostgreSQL
+      TestAReplyStaysAReplyWithoutAVisibleQuotePostgreSQL
+      TestAnOrdinaryGroupMessageClassifiesIdenticallyPostgreSQL
+      TestConversationNotificationLevelMigrationRoundTripPostgreSQL
+      # Mute and Unmute racing on one row, from two connections, plus the
+      # database's own refusal of the state the race used to produce. Only a
+      # real PostgreSQL can hold either property: one is an interleaving and the
+      # other is a CHECK constraint.
+      TestPGXNotificationPrefStoreMuteUnmuteRacePostgreSQL
+      TestPGXNotificationPrefStoreRacePreservesTheLevelPostgreSQL
+      TestConversationNotificationPrefsRefuseTheSparseDefaultPostgreSQL
+      TestConversationNotificationPrefsAllowAnUnsilencedLevelPostgreSQL
+      # Issue #824. Per-recipient acknowledgement: a recipient set derived in
+      # the same statement as the INSERT, a primary key that is the reason two
+      # clicks cannot become two rows, conditional UPDATEs that make an
+      # acknowledgement racing a reply or a deletion converge, and two CHECK
+      # constraints deciding which states may ever be stored and whether a
+      # resolution may exist without its instant.
+      TestAcknowledgementAsksChannelMembersNotEveryReaderPostgreSQL
+      TestAcknowledgementAsksConversationMembersPostgreSQL
+      TestAcknowledgementAsksNobodyWhenItWasNotRequestedPostgreSQL
+      TestAcknowledgementSnapshotDoesNotFollowMembershipPostgreSQL
+      TestAcknowledgementIsUniquePerRecipientPostgreSQL
+      TestAcknowledgeIsIdempotentPostgreSQL
+      TestAcknowledgeConcurrentCallsConvergePostgreSQL
+      TestReplyResolvesOnlyTheReplierPostgreSQL
+      TestAcknowledgeAfterAReplyKeepsTheReplyPostgreSQL
+      TestDeleteCancelsPendingAndKeepsAnswersPostgreSQL
+      TestAcknowledgeRacingDeleteHasOneWinnerPostgreSQL
+      TestEditDoesNotResetAcknowledgementPostgreSQL
+      TestReadingAMessageDoesNotAcknowledgeItPostgreSQL
+      TestAcknowledgementSummaryAndDetailPostgreSQL
+      TestAcknowledgeRefusesSomebodyWhoWasNeverAskedPostgreSQL
+      TestAcknowledgeRefusesAfterLosingAccessPostgreSQL
+      TestAcknowledgementIsIsolatedByWorkspacePostgreSQL
+      TestAcknowledgementStateConstraintRefusesUndeclaredValuesPostgreSQL
+      TestAcknowledgementRefusesHalfAResolutionPostgreSQL
+      TestAcknowledgementCascadesWithItsMessagePostgreSQL
+      TestCountAcknowledgementRecipientsMatchesTheSnapshotPostgreSQL
+      # Issue #824 round two. The fan-out bound decided inside the creating
+      # statement, over the same snapshot the recipient rows are written from,
+      # and an acknowledgement racing a reply for the same row.
+      TestAcknowledgementBoundAdmitsExactlyTheLimitPostgreSQL
+      TestAcknowledgementBoundRefusesTheWholeMessagePostgreSQL
+      TestAcknowledgementBoundHoldsWhileMembershipGrowsPostgreSQL
+      TestAcknowledgementReplayIsUnaffectedByTheBoundPostgreSQL
+      TestAcknowledgeRacingReplyConvergesPostgreSQL
+      TestAcknowledgeAfterLosingTheRaceChangesNothingPostgreSQL
+      # Issue #824 round three. The page batch: one statement answering for a
+      # whole page, with authorization still decided per message inside it.
+      TestAcknowledgementBatchAnswersAWholePagePostgreSQL
+      TestAcknowledgementBatchOmitsWhatTheCallerMayNotReadPostgreSQL
+      TestAcknowledgementBatchGivesALateJoinerNoStatePostgreSQL
+      # Issue #824 round four. One read, one statement, one snapshot: the
+      # counts and the recipients they count can no longer be observed
+      # half-applied while a concurrent transition commits between them.
+      TestReadAcknowledgementNeverMixesSnapshotsPostgreSQL
+      # Issue #825. The reminder schedule written by the same statement as the
+      # message, the CHECK that makes reminders on a non-urgent message
+      # unreachable, the conditional UPDATEs that decide which of two concurrent
+      # resolutions wins, and the sender-only cancellation whose authorization is
+      # a predicate of the statement rather than a read before it.
+      TestPersistentReminderMigrationRoundTripPostgreSQL
+      TestPersistentNotificationsAbsentLeavesNoScheduleWhatsoeverPostgreSQL
+      TestUrgentWithoutPersistentNotificationsSchedulesNothingPostgreSQL
+      TestPersistentNotificationsScheduleTheFirstReminderPostgreSQL
+      TestPersistentNotificationsRequireUrgentInTheSchemaPostgreSQL
+      TestReplyStopsOnlyTheRepliersRemindersPostgreSQL
+      TestAcknowledgementStopsTheAcknowledgersRemindersPostgreSQL
+      TestDeletingAMessageStopsItsRemindersPostgreSQL
+      TestRemindersDoNotAppearInTheAcknowledgementSummaryPostgreSQL
+      TestARemindedRecipientCannotAcknowledgePostgreSQL
+      TestOnlyTheSenderCanCancelRemindersPostgreSQL
+      TestARecipientCannotCancelSomebodyElsesRemindersPostgreSQL
+      TestCancellingRemindersIsScopedToTheWorkspacePostgreSQL
+      TestCancellingRemindersIsIdempotentPostgreSQL
+      TestCancellingRemindersPreservesAnswersAlreadyGivenPostgreSQL
+      TestCancellingRemindersOnAQuietMessageIsNotFoundPostgreSQL
+      TestAWithheldMessageSchedulesNoRemindersPostgreSQL
+      TestPublishingAWithheldMessageStartsItsRemindersPostgreSQL
+      TestPromotingTwiceDoesNotRestartTheReminderClockPostgreSQL
     )
     ;;
   services/notification-service)
@@ -121,6 +220,97 @@ case "$MODULE" in
       TestNotificationEvaluationStampsAvailabilityPostgreSQL
       TestNotificationSuppressionStampsNoAvailabilityPostgreSQL
       TestNotificationFutureRetryStaysUnclaimedPostgreSQL
+      TestMuteResolutionPostgreSQL
+      # Issue #745. The push subscription contract: two unique indexes deciding
+      # identity and endpoint ownership under concurrency, the generation that
+      # keeps a late delivery answer off the endpoint that replaced the one it
+      # describes, the lifecycle CHECK, and the authorisation query against the
+      # real auth and chat schemas.
+      TestPushSubscriptionRegistersPostgreSQL
+      TestPushSubscriptionRetryIsIdempotentPostgreSQL
+      TestPushSubscriptionReRegistersTheSameDevicePostgreSQL
+      TestPushSubscriptionKeepsSeveralDevicesPostgreSQL
+      TestPushSubscriptionEndpointCannotChangeOwnerPostgreSQL
+      TestPushSubscriptionEndpointIsIsolatedAcrossWorkspacesPostgreSQL
+      TestPushSubscriptionIsUnreachableByAnotherUserPostgreSQL
+      TestPushSubscriptionConcurrentRegistrationStaysSinglePostgreSQL
+      TestPushSubscriptionConcurrentEndpointClaimHasOneWinnerPostgreSQL
+      TestPushSubscriptionConcurrentDisableAndRegisterStaysCoherentPostgreSQL
+      TestPushSubscriptionSuccessResetsFailuresPostgreSQL
+      TestPushSubscriptionGoneStatusesInvalidatePostgreSQL
+      TestPushSubscriptionTransientFailuresDoNotInvalidatePostgreSQL
+      TestPushSubscriptionInvalidationIsPerSubscriptionPostgreSQL
+      TestPushSubscriptionLateResultsCannotReviveOrRewritePostgreSQL
+      TestPushSubscriptionDisableRetainsTheRowPostgreSQL
+      TestPushSubscriptionDisablePreservesAProviderVerdictPostgreSQL
+      TestPushSubscriptionReRegistrationRevivesARetiredRowPostgreSQL
+      TestPushSubscriptionHasNoDeviceCeilingPostgreSQL
+      TestPushSubscriptionStartsAtAValidGenerationPostgreSQL
+      TestPushSubscriptionIdenticalRetryKeepsTheGenerationPostgreSQL
+      TestPushSubscriptionRotationAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionReactivationAfterDisableAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionReactivationAfterRetirementAdvancesTheGenerationPostgreSQL
+      TestPushSubscriptionStaleResultCannotTouchANewGenerationPostgreSQL
+      TestPushSubscriptionCurrentGenerationStillAppliesPostgreSQL
+      TestPushSubscriptionRotationClearsSuccessHistoryPostgreSQL
+      TestPushSubscriptionIdenticalRetryKeepsSuccessHistoryPostgreSQL
+      TestPushSubscriptionSchemaRefusesIncoherentRowsPostgreSQL
+      TestPushSubscriptionSchemaCarriesItsIndexesPostgreSQL
+      TestPushSubscriptionMigrationRoundTripPostgreSQL
+      TestPushPrincipalResolvesFromTheSessionPostgreSQL
+      TestPushPrincipalRefusesAMismatchedSessionPostgreSQL
+      TestPushPrincipalRefusesARetiredSessionPostgreSQL
+      TestPushPrincipalRefusesALostMembershipPostgreSQL
+      # Issue #746. The Web Push delivery ledger: a primary key deduplicating
+      # under genuine concurrency with no read before any write, a fan-out whose
+      # exclusions are a join rather than a filter in Go, and two cascades that
+      # are the whole of this table's retention policy.
+      # Issue #825. The reminder scheduler: a due-reminder claim two schedulers
+      # cannot both take, a unique index deciding whether the nth reminder
+      # already exists, one statement writing both the outbox row and the
+      # schedule, a ceiling that produces the EXPIRED state 000049 declared, and
+      # a claim predicate that refuses a reminder whose recipient answered.
+      TestReminderWindowBoundaryIsExactPostgreSQL
+      TestDueReminderIsScheduledAndTheWindowAdvancesPostgreSQL
+      TestScheduledReminderEntersTheOrdinaryQueuePostgreSQL
+      TestSeveralReminderCyclesUseTheExactWindowPostgreSQL
+      # The claim's linearization point: two real transactions proving that a
+      # PENDING -> terminal transition and the claim are serialized on the
+      # recipient's own row, in both orders.
+      TestReminderClaimLosesToACommittedTerminalTransitionPostgreSQL
+      TestReminderClaimRefusesARecipientBeingResolvedConcurrentlyPostgreSQL
+      TestReminderClaimHoldsTheLinearizationPointAgainstATransitionPostgreSQL
+      TestOnlyAPendingRecipientProducesAReminderPostgreSQL
+      TestResolvingOneRecipientLeavesTheOthersRemindedPostgreSQL
+      TestADeletedMessageRemindsNobodyPostgreSQL
+      TestAMessageThatNoLongerAsksRemindsNobodyPostgreSQL
+      TestRepeatingAReminderPassCreatesNoSecondEventPostgreSQL
+      TestConcurrentSchedulersProduceOneReminderEachPostgreSQL
+      TestReminderSchedulingRespectsTheBatchSizePostgreSQL
+      TestRemindersStopAtTheCeilingPostgreSQL
+      TestTheCeilingDoesNotWithdrawAConfirmationRequestPostgreSQL
+      TestAResolvedRecipientsReminderIsNotClaimablePostgreSQL
+      TestAResolvedRecipientsReminderIsSuppressedPostgreSQL
+      TestSuppressingResolvedRemindersSparesTheLiveOnesPostgreSQL
+      TestOrdinaryNotificationsAreUnaffectedByTheReminderPredicatePostgreSQL
+      TestUrgentReminderDedupeKeyMatchesSQLPostgreSQL
+      TestPushDeliveryFanOutReturnsEveryActiveBrowserPostgreSQL
+      TestPushDeliveryFanOutIsScopedToTheRecipientPostgreSQL
+      TestPushDeliveryFanOutExcludesRetiredBrowsersPostgreSQL
+      TestPushDeliveryFanOutExcludesDisabledBrowsersPostgreSQL
+      TestPushDeliveryFanOutExcludesAlreadyDeliveredBrowsersPostgreSQL
+      TestPushDeliveryLedgerIsPerNotificationPostgreSQL
+      TestPushDeliveryConcurrentRecordsStaySinglePostgreSQL
+      TestPushDeliveryReplayKeepsTheFirstRecordPostgreSQL
+      TestPushDeliveryLedgerCascadesFromBothParentsPostgreSQL
+      TestPushDeliveryLedgerRefusesIncoherentRowsPostgreSQL
+      TestPushDeliveryLedgerMigrationRoundTripPostgreSQL
+      # Issue #746 again: why a compare-and-set matched nothing. A 410 about an
+      # endpoint the browser has already replaced must not retire the live
+      # generation that replaced it, and only the database can decide that.
+      TestPushDeliveryStale410DoesNotRetireARotatedSubscriptionPostgreSQL
+      TestPushDeliveryClassifiesEveryCompareAndSetOutcomePostgreSQL
+      TestPushDeliveryEveryOutcomeIsClassifiedPostgreSQL
     )
     ;;
   services/file-service)

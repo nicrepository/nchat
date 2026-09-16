@@ -1,6 +1,7 @@
 package service
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -77,6 +78,24 @@ func allMentionTokenIDs(body string) []string {
 		}
 	}
 	return ids
+}
+
+// NamedRecipients reports who a message body names: the ids of the users named
+// by a mention token, and whether it names everyone.
+//
+// It is exported because the realtime payload has to carry the *authoritative*
+// answer to "was I named" (issue #744). The browser used to work it out for
+// itself, with its own copy of the mention grammar, and a client grammar that
+// drifts from this one is a client that disagrees with the server about what a
+// mention is. Everything here is the same codec the rest of the service uses;
+// nothing is restated.
+//
+// Only the canonical "all" token counts as naming everyone — the reserved nil
+// UUID — for the reason allMentionTokenIDs gives: a structurally valid token
+// naming an arbitrary id is forged, and must not buy an alert (SR-001).
+func NamedRecipients(body string) (userIDs []string, everyone bool) {
+	users, _ := extractMentionIDs(body)
+	return users, slices.Contains(allMentionTokenIDs(body), uuid.Nil.String())
 }
 
 func escapedAt(body string, index int) bool {

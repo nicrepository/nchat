@@ -32,6 +32,11 @@ const maxBodyBytes = 1 << 16 // 64 KiB
 const (
 	errCodeMaliciousURL         = "malicious_url"
 	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// Its own code, so a client can tell "this deployment has not enabled
+	// granular notification levels yet" from "the sidebar service is missing"
+	// (issue #136). Both are 503; only one of them changes when an operator
+	// opens the rollout gate.
+	errCodeNotificationLevelsUnavailable = "notification_levels_unavailable"
 	// errCodeLinkCheckPending says the links are being scanned right now and
 	// the operation should be retried shortly. It is only ever returned by
 	// editing: creating and forwarding accept the message and withhold it
@@ -114,9 +119,17 @@ type MessageHandler struct {
 	favorites      favoriteProvider
 	pins           pinProvider
 	pinBroadcaster pinBroadcaster
-	settings       storage.WorkspaceSettingsStore
-	settingsAuth   workspaceSettingsAuthorizer
-	editLimiter    editRateLimiter
+	// acknowledgements serves the issue #824 endpoints. Nil until WithAcknowledgements
+	// is called, which is what makes those two routes answer 503 rather than
+	// panic in a deployment without a database.
+	acknowledgements acknowledgementProvider
+	// acknowledgementBroadcaster announces a committed acknowledgement to the
+	// conversation's subscribers (issue #824). Nil is a working deployment: the
+	// endpoint still records the change, and clients reconcile on reconnect.
+	acknowledgementBroadcaster acknowledgementBroadcaster
+	settings                   storage.WorkspaceSettingsStore
+	settingsAuth               workspaceSettingsAuthorizer
+	editLimiter                editRateLimiter
 	// linkReconcile answers "Verificar novamente" (issue #135). Nil is a working
 	// deployment: the route then answers 503 rather than pretending it looked.
 	linkReconcile linkReconcileProvider
@@ -173,6 +186,16 @@ func (h *MessageHandler) WithPins(pins pinProvider, broadcaster pinBroadcaster) 
 	return h
 }
 
+// WithAcknowledgements enables the issue #824 acknowledgement endpoints.
+// Returns the handler for chaining; when never called, those routes answer 503.
+func (h *MessageHandler) WithAcknowledgements(
+	acknowledgements acknowledgementProvider, broadcaster acknowledgementBroadcaster,
+) *MessageHandler {
+	h.acknowledgements = acknowledgements
+	h.acknowledgementBroadcaster = broadcaster
+	return h
+}
+
 // NewMessageHandler returns a MessageHandler. Missing dependencies produce 503
 // only on the endpoints that use them.
 func NewMessageHandler(workspaces workspaceResolver, messages messageProvider, mentions mentionProvider) *MessageHandler {
@@ -207,6 +230,32 @@ type messageJSON struct {
 	BodyFormat      string `json:"body_format"`
 	IsRemoved       bool   `json:"is_removed,omitempty"`
 	Status          string `json:"status"`
+	// Priority is the author's stated message priority (issue #821): one of
+	// standard, important, urgent. Always present — every message has one, and a
+	// client that has to distinguish "absent" from "standard" would be doing the
+	// defaulting the server already did. It is descriptive: nothing a client may
+	// do is widened by it.
+	Priority string `json:"priority"`
+	// AcknowledgementRequired says this message asked its recipients to confirm
+	// receipt (issue #824). Always present, for the same reason Priority is:
+	// every message has an answer to this and it is not the client's job to
+	// default it.
+	//
+	// It says only that the request exists. Who was asked, who answered and what
+	// this caller's own state is are not here — they are a separate read, so the
+	// message list stays one query and a timeline of a hundred messages does not
+	// aggregate a hundred recipient sets it will not draw.
+	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications says this urgent message keeps reminding the
+	// recipients who have neither confirmed nor answered it (issue #825). Always
+	// present, on the same terms as the two fields above.
+	//
+	// It says only that the policy was asked for. Whether any reminder is still
+	// outstanding, for whom, and how many have been sent are deliberately absent:
+	// they are per-recipient state, they change without the message changing, and
+	// a timeline of a hundred messages must not aggregate a hundred reminder
+	// schedules it will not draw.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// LinkSafetyState is the link-safety axis and is independent of Status
 	// (issue #135): a published message whose links could not all be verified is
 	// `active` and carries "inconclusive" here. It is what the client draws the
@@ -228,6 +277,12 @@ type messageJSON struct {
 	// Attachments is omitted entirely for a message that carries none, so every
 	// existing text-only response is byte-for-byte what it was.
 	Attachments []messageAttachmentJSON `json:"attachments,omitempty"`
+	// EventType and EventPayload carry a server-generated conversation event
+	// (issue #527/#685). Both are set only for Kind == "system" — EventPayload
+	// as a pointer so a user message's response has neither field at all,
+	// rather than an empty object claiming to be one.
+	EventType    string                           `json:"event_type,omitempty"`
+	EventPayload *domain.ConversationEventPayload `json:"event_payload,omitempty"`
 }
 
 // messageAttachmentJSON is the only shape of an attachment a message viewer
@@ -389,6 +444,60 @@ type createMessageRequest struct {
 	BodyFormat          string `json:"body_format"`
 	ParentMessageID     string `json:"parent_message_id"`
 	ReferencedMessageID string `json:"referenced_message_id"`
+	// Priority is the optional message priority (issue #821), decoded as
+	// RawMessage for the same reason updateEditWindowRequest decodes its own
+	// field that way: a plain string cannot tell "the client said nothing" from
+	// "the client said something", and those are different requests here.
+	//
+	//	absent   -> standard. A client that predates this field sends exactly
+	//	            what it always sent and keeps working.
+	//	null     -> 400. Saying "no priority" is saying something, and it is not
+	//	            one of the three.
+	//	""       -> 400, for the same reason. Silence defaults; an empty string
+	//	            is not silence.
+	//	123, [], -> 400. RawMessage defers the decode, so a wrong JSON type is a
+	//	{}, true    validation failure here instead of a silent zero value.
+	//
+	// See parseCreateMessagePriority, which is where that distinction is drawn
+	// once for both the channel and the DM path.
+	//
+	// Accepted on create only. editMessageRequest deliberately has no
+	// counterpart, and decodeStrictJSON rejects unknown fields, so a PATCH
+	// carrying "priority" is a 400 — there is no payload that re-prioritises a
+	// message after it was sent.
+	Priority json.RawMessage `json:"priority"`
+	// AcknowledgementRequired asks this message's recipients to confirm receipt
+	// (issue #824).
+	//
+	// A plain bool, unlike Priority above, because here absence and false are
+	// the same request: a client that says nothing is asking for nothing, and
+	// there is no third value for the two to be confused with. A wrong JSON type
+	// is refused by decodeStrictJSON before this field is read.
+	//
+	// Accepted on create only. editMessageRequest has no counterpart and
+	// decodeStrictJSON rejects unknown fields, so a PATCH carrying it is a 400:
+	// editing a message neither adds a confirmation request nor withdraws one,
+	// and — the rule #824 states — never resets an answer already given.
+	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications asks this message to keep reminding every recipient
+	// who has neither confirmed nor answered it (issue #825).
+	//
+	// A plain bool, like AcknowledgementRequired and for the same reason: absence
+	// and false are the same request. It is refused on a message that is not
+	// urgent — see domain.ValidatePersistentNotifications — rather than ignored,
+	// because a sender who asked for reminders and silently got none would
+	// believe their message was still asking when it had stopped.
+	//
+	// There is deliberately no interval, deadline or attempt-count field beside
+	// it. #820 puts a configurable interval out of scope for this version, and
+	// the whole schedule is a server-side constant, so there is nothing here a
+	// client can lengthen, shorten or restart.
+	//
+	// Accepted on create only. editMessageRequest has no counterpart and
+	// decodeStrictJSON rejects unknown fields, so a PATCH carrying it is a 400:
+	// editing a message neither starts reminders nor stops them, and #820 states
+	// outright that editing must not restart a timer.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// AttachmentIDs binds already-uploaded files to this message (RF-32).
 	//
 	// A list, even though the product rule is one attachment per message, so
@@ -533,23 +642,26 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		editedAt = &m.EditedAt
 	}
 	j := messageJSON{
-		ID:                m.ID,
-		SenderID:          m.SenderID,
-		SenderDisplayName: m.SenderDisplayName,
-		SenderEmail:       m.SenderEmail,
-		SenderAvatarURL:   m.SenderAvatarURL,
-		Kind:              string(m.Kind),
-		BodyFormat:        string(m.BodyFormat),
-		Status:            string(m.Status),
-		LinkSafetyState:   string(m.LinkSafety),
-		CreatedAt:         m.CreatedAt,
-		UpdatedAt:         m.UpdatedAt,
-		EditedAt:          editedAt,
-		EditCount:         m.EditCount,
-		IsEdited:          m.EditCount > 0,
-		Reactions:         make([]reactionJSON, len(m.Reactions)),
-		IsFavorited:       m.IsFavorited,
-		IsForwarded:       m.ForwardedFromMessageID != "",
+		ID:                      m.ID,
+		SenderID:                m.SenderID,
+		SenderDisplayName:       m.SenderDisplayName,
+		SenderEmail:             m.SenderEmail,
+		SenderAvatarURL:         m.SenderAvatarURL,
+		Kind:                    string(m.Kind),
+		BodyFormat:              string(m.BodyFormat),
+		Status:                  string(m.Status),
+		Priority:                string(m.Priority.OrStandard()),
+		AcknowledgementRequired: m.AcknowledgementRequired,
+		PersistentNotifications: m.PersistentNotifications,
+		LinkSafetyState:         string(m.LinkSafety),
+		CreatedAt:               m.CreatedAt,
+		UpdatedAt:               m.UpdatedAt,
+		EditedAt:                editedAt,
+		EditCount:               m.EditCount,
+		IsEdited:                m.EditCount > 0,
+		Reactions:               make([]reactionJSON, len(m.Reactions)),
+		IsFavorited:             m.IsFavorited,
+		IsForwarded:             m.ForwardedFromMessageID != "",
 	}
 	for i, reaction := range m.Reactions {
 		j.Reactions[i] = reactionJSON{
@@ -571,6 +683,11 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		// Withheld for a removed message, like the body: the placeholder is the
 		// whole of what a deleted message says.
 		j.Attachments = mapAttachmentsJSON(m.Attachments)
+	}
+	if m.Kind == domain.MessageKindSystem {
+		j.EventType = m.EventType
+		payload := m.EventPayload
+		j.EventPayload = &payload
 	}
 	return j
 }
@@ -679,6 +796,45 @@ func (h *MessageHandler) ListAllowedReactionEmojis(w http.ResponseWriter, r *htt
 func decodeCreateRequest(w http.ResponseWriter, r *http.Request) (createMessageRequest, bool) {
 	var req createMessageRequest
 	return req, decodeStrictJSON(w, r, &req)
+}
+
+// parseCreateMessagePriority resolves a create request's priority field, and is
+// the one place the difference between an omitted priority and a stated one is
+// decided (issue #821).
+//
+// Shared by both create handlers rather than written twice: a second parser is a
+// second set of rules to drift, and "what does an empty priority mean" must not
+// have one answer for a channel and another for a DM.
+//
+// The empty check is deliberately here and not delegated to the domain. The
+// domain's NormalizeMessagePriority answers "" with standard on purpose — that
+// is its rule for an *internal* caller that states nothing, and it protects the
+// paths that never see a request. At this boundary "" is not silence: the client
+// put the field in the body and filled it with a value that is not a priority,
+// and answering that with a silent demotion tells them their message was sent
+// the way they asked when it was not. Presence is a fact only this layer still
+// has, so this layer is where it is spent.
+//
+// Returns (priority, true) when the request may proceed; writes the service's
+// own 400 shape and returns false otherwise.
+func parseCreateMessagePriority(w http.ResponseWriter, raw json.RawMessage) (domain.MessagePriority, bool) {
+	if raw == nil {
+		return domain.MessagePriorityStandard, true
+	}
+	// One Unmarshal covers every wrong shape: a number, a boolean, an array and
+	// an object all fail it, and `null` succeeds into the zero string, which the
+	// emptiness check below then refuses alongside a literal "".
+	var stated string
+	if err := json.Unmarshal(raw, &stated); err != nil || stated == "" {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid priority")
+		return "", false
+	}
+	priority, err := domain.NormalizeMessagePriority(domain.MessagePriority(stated))
+	if err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, httputil.ErrCodeBadRequest, "invalid priority")
+		return "", false
+	}
+	return priority, true
 }
 
 func decodeStrictJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -1209,16 +1365,24 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	priority, ok := parseCreateMessagePriority(w, req.Priority)
+	if !ok {
+		return
+	}
+
 	msg, err := h.messages.CreateChannelMessage(r.Context(), service.CreateChannelMessageInput{
-		WorkspaceID:         wsID,
-		ChannelID:           channelID,
-		SenderID:            userID, // always from auth context — never from body
-		BodyText:            req.BodyText,
-		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
-		IdempotencyKey:      idempotencyKey,
-		ParentMessageID:     req.ParentMessageID,
-		ReferencedMessageID: req.ReferencedMessageID,
-		AttachmentIDs:       req.AttachmentIDs,
+		WorkspaceID:             wsID,
+		ChannelID:               channelID,
+		SenderID:                userID, // always from auth context — never from body
+		BodyText:                req.BodyText,
+		BodyFormat:              domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:          idempotencyKey,
+		ParentMessageID:         req.ParentMessageID,
+		ReferencedMessageID:     req.ReferencedMessageID,
+		AttachmentIDs:           req.AttachmentIDs,
+		Priority:                priority,
+		AcknowledgementRequired: req.AcknowledgementRequired,
+		PersistentNotifications: req.PersistentNotifications,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1364,16 +1528,24 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	priority, ok := parseCreateMessagePriority(w, req.Priority)
+	if !ok {
+		return
+	}
+
 	msg, err := h.messages.CreateDMMessage(r.Context(), service.CreateDMMessageInput{
-		WorkspaceID:         wsID,
-		ConversationID:      convID,
-		SenderID:            userID,
-		BodyText:            req.BodyText,
-		BodyFormat:          domain.MessageBodyFormat(req.BodyFormat),
-		IdempotencyKey:      idempotencyKey,
-		ParentMessageID:     req.ParentMessageID,
-		ReferencedMessageID: req.ReferencedMessageID,
-		AttachmentIDs:       req.AttachmentIDs,
+		WorkspaceID:             wsID,
+		ConversationID:          convID,
+		SenderID:                userID,
+		BodyText:                req.BodyText,
+		BodyFormat:              domain.MessageBodyFormat(req.BodyFormat),
+		IdempotencyKey:          idempotencyKey,
+		ParentMessageID:         req.ParentMessageID,
+		ReferencedMessageID:     req.ReferencedMessageID,
+		AttachmentIDs:           req.AttachmentIDs,
+		Priority:                priority,
+		AcknowledgementRequired: req.AcknowledgementRequired,
+		PersistentNotifications: req.PersistentNotifications,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1800,6 +1972,12 @@ func mapServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrURLCheckUnavailable):
 		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
 			"the link could not be checked for safety, try again")
+	case errors.Is(err, domain.ErrConversationNotificationLevelsDisabled):
+		// 503 and not 400: the mode is valid and the caller did nothing wrong —
+		// this deployment has not opened the rollout gate yet. The body names
+		// neither the flag nor the environment variable behind it.
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeNotificationLevelsUnavailable,
+			"granular notification levels are not available in this deployment")
 	case errors.Is(err, domain.ErrURLCheckPending):
 		// 409 and not 503: nothing is broken, the scan this request queued is
 		// simply not finished. The already-published version of the message is

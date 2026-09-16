@@ -150,6 +150,86 @@ func TestGetMySessions_HidesSensitiveFields(t *testing.T) {
 	}
 }
 
+// The handler only ever emits the mask: IPv6 keeps its first group, an absent
+// address omits the field, and anything net.ParseIP rejects — including the
+// CIDR form inet::text produced before issue #859 — fails closed to omitted
+// rather than being echoed.
+func TestGetMySessions_MasksEveryIPShape(t *testing.T) {
+	tokens := makeTestTokenManager(t)
+	accessToken, _, err := tokens.GenerateAccessToken("user-1", "sid-v4")
+	if err != nil {
+		t.Fatalf("generate token: %v", err)
+	}
+
+	now := time.Now().UTC()
+	session := func(id, ip string) domain.SessionInfo {
+		return domain.SessionInfo{ID: id, IPAddress: ip, CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now.Add(time.Hour)}
+	}
+	svc := &mockSessionManager{sessions: []domain.SessionInfo{
+		session("sid-v4", "203.0.113.10"),
+		session("sid-v6", "2001:db8:85a3::8a2e:370:7334"),
+		session("sid-none", ""),
+		session("sid-cidr", "198.51.100.7/32"),
+	}}
+
+	handler := httpapi.BearerAuth(tokens)(httpapi.GetMySessions(svc))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/auth/me/sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Data []struct {
+				ID        string  `json:"id"`
+				IPAddress *string `json:"ip_address"`
+			} `json:"data"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Ordered like the service's rows, so a missing, extra or reordered session
+	// fails here instead of letting the IP checks below pass over nothing.
+	want := []struct {
+		id string
+		ip *string
+	}{
+		{"sid-v4", ptr("203.0.*.*")},
+		{"sid-v6", ptr("2001:*")},
+		{"sid-none", nil},
+		{"sid-cidr", nil},
+	}
+	got := envelope.Data.Data
+	if len(got) != len(want) {
+		t.Fatalf("expected %d sessions, got %d: %s", len(want), len(got), rec.Body.String())
+	}
+	for i, w := range want {
+		if got[i].ID != w.id {
+			t.Fatalf("session %d: expected id %q, got %q", i, w.id, got[i].ID)
+		}
+		if (w.ip == nil) != (got[i].IPAddress == nil) || (w.ip != nil && *w.ip != *got[i].IPAddress) {
+			t.Fatalf("%s: expected ip_address %v, got %v", w.id, deref(w.ip), deref(got[i].IPAddress))
+		}
+	}
+	body := rec.Body.String()
+	if containsAny(body, "203.0.113.10", "113.10", "db8", "198.51.100", "/32") {
+		t.Fatalf("response must not contain any raw address: %s", body)
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+func deref(s *string) string {
+	if s == nil {
+		return "<omitted>"
+	}
+	return *s
+}
+
 func TestGetMySessions_IncludeRevokedQueryParam(t *testing.T) {
 	tokens := makeTestTokenManager(t)
 	accessToken, _, err := tokens.GenerateAccessToken("user-1", "sid-1")

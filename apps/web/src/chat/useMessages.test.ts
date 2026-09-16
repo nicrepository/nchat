@@ -21,6 +21,7 @@ import { ApiRequestError } from "../lib/api";
 import { clearTokens, setTokens } from "../lib/authSession";
 import type {
   WSClientErrorEvent,
+  WSConversationEventMessage,
   WSMessageBlockedEvent,
   WSMessageCreatedEvent,
   WSMessageUpdatedEvent,
@@ -50,7 +51,24 @@ let capturedOnReactionError: ((evt: WSClientErrorEvent) => void) | null = null;
 let capturedOnSubscriptionError: ((evt: WSClientErrorEvent) => void) | null = null;
 let capturedOnSubscribed: ((evt: WSSubscribedEvent) => void) | null = null;
 let capturedOnPinUpdated: ((evt: WSPinUpdatedEvent) => void) | null = null;
+let capturedOnAcknowledgementUpdated: ((evt: { message_id: string }) => void) | null = null;
+let capturedOnConversationEvent: ((evt: WSConversationEventMessage) => void) | null = null;
 const mockToggleReaction = vi.fn(() => true);
+
+/**
+ * The presentation entry point, spied rather than stubbed out (issue #750).
+ *
+ * Nothing under useMessages imports it — eslint.config.js forbids that — and
+ * these tests are what keeps the claim honest: if any load, page or resync path
+ * ever reached it, the spy would record the call.
+ */
+const { mockPresentLiveMessageNotification } = vi.hoisted(() => ({
+  mockPresentLiveMessageNotification: vi.fn(),
+}));
+
+vi.mock("./notificationPresentation", () => ({
+  presentLiveMessageNotification: mockPresentLiveMessageNotification,
+}));
 
 vi.mock("./useChatWebSocket", () => ({
   useChatWebSocket: ({
@@ -60,6 +78,8 @@ vi.mock("./useChatWebSocket", () => ({
     onMessageUpdated,
     onReactionUpdated,
     onPinUpdated,
+    onConversationEvent,
+    onAcknowledgementUpdated,
     onReactionError,
     onSubscriptionError,
     onSubscribed,
@@ -72,6 +92,8 @@ vi.mock("./useChatWebSocket", () => ({
     onMessageUpdated?: (evt: WSMessageUpdatedEvent) => void;
     onReactionUpdated?: (evt: WSReactionUpdatedEvent) => void;
     onPinUpdated?: (evt: WSPinUpdatedEvent) => void;
+    onConversationEvent?: (evt: WSConversationEventMessage) => void;
+    onAcknowledgementUpdated?: (evt: { message_id: string }) => void;
     onReactionError?: (evt: WSClientErrorEvent) => void;
     onSubscriptionError?: (evt: WSClientErrorEvent) => void;
     onSubscribed?: (evt: WSSubscribedEvent) => void;
@@ -82,6 +104,8 @@ vi.mock("./useChatWebSocket", () => ({
     capturedOnMessageUpdated = onMessageUpdated ?? null;
     capturedOnReactionUpdated = onReactionUpdated ?? null;
     capturedOnPinUpdated = onPinUpdated ?? null;
+    capturedOnConversationEvent = onConversationEvent ?? null;
+    capturedOnAcknowledgementUpdated = onAcknowledgementUpdated ?? null;
     capturedOnReactionError = onReactionError ?? null;
     capturedOnSubscriptionError = onSubscriptionError ?? null;
     capturedOnSubscribed = onSubscribed ?? null;
@@ -108,6 +132,9 @@ const {
   mockPostDMMessage,
   mockEditMessage,
   mockDeleteMessage,
+  mockFetchMessageAcknowledgement,
+  mockFetchMessageAcknowledgements,
+  mockAcknowledgeMessage,
 } = vi.hoisted(() => ({
   mockFavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
   mockUnfavoriteMessage: vi.fn<(id: string) => Promise<void>>(),
@@ -117,6 +144,27 @@ const {
     vi.fn<(id: string, body: string, options?: { bodyFormat?: "v2" | "v3" }) => Promise<Message>>(),
   mockEditMessage: vi.fn<(id: string, body: string, bodyFormat: number) => Promise<Message>>(),
   mockDeleteMessage: vi.fn<(id: string) => Promise<Message>>(),
+  mockFetchMessageAcknowledgements:
+    vi.fn<
+      (
+        messageIds: string[],
+        signal?: AbortSignal,
+      ) => Promise<Record<string, import("./chatTypes").MessageAcknowledgement>>
+    >(),
+  mockFetchMessageAcknowledgement:
+    vi.fn<
+      (
+        messageId: string,
+        signal?: AbortSignal,
+      ) => Promise<import("./chatTypes").MessageAcknowledgement>
+    >(),
+  mockAcknowledgeMessage:
+    vi.fn<
+      (
+        messageId: string,
+        signal?: AbortSignal,
+      ) => Promise<import("./chatTypes").MessageAcknowledgement>
+    >(),
   mockReconcileMessageLinkSafety: vi.fn<
     (
       messageId: string,
@@ -196,6 +244,15 @@ vi.mock("./chatApi", async (importOriginal) => ({
     mockFetchLinkSafetyStatuses(messageIds, signal),
   reconcileMessageLinkSafety: (messageId: string, signal?: AbortSignal) =>
     mockReconcileMessageLinkSafety(messageId, signal),
+  // Issue #824. Present so the acknowledgement hook has something to call; the
+  // fixtures here carry no message that asks for confirmation, so neither is
+  // reached unless a test says otherwise.
+  fetchMessageAcknowledgement: (messageId: string, signal?: AbortSignal) =>
+    mockFetchMessageAcknowledgement(messageId, signal),
+  fetchMessageAcknowledgements: (messageIds: string[], signal?: AbortSignal) =>
+    mockFetchMessageAcknowledgements(messageIds, signal),
+  acknowledgeMessage: (messageId: string, signal?: AbortSignal) =>
+    mockAcknowledgeMessage(messageId, signal),
 }));
 
 // ── filesApi mock (preview reconciliation) ────────────────────────────────────
@@ -316,6 +373,20 @@ function fireWsEventNoPayload(
     event_id: "evt-1",
     created_at: new Date().toISOString(),
     workspace_id: "ws-1",
+    target_type: targetType,
+    target_id: targetId,
+    message_id: messageId,
+  });
+}
+
+/** Fire a conversation.event event (issue #685) — always carries only an id. */
+function fireWsConversationEvent(
+  targetType: "channel" | "dm",
+  targetId: string,
+  messageId: string,
+): void {
+  capturedOnConversationEvent?.({
+    type: "conversation.event",
     target_type: targetType,
     target_id: targetId,
     message_id: messageId,
@@ -1291,6 +1362,33 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0].isForwarded).toBe(true);
   });
 
+  // Fail-safe in the only direction that matters: the axis can raise a reader's
+  // attention and nothing else, so a value this build has not reasoned about
+  // must be the ordinary message, never the alarm. Same for the flag — an
+  // absent or malformed one can never invent a confirmation request.
+  it("reads an absent or unrecognised realtime priority as standard", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => fireWsEventWithPayload("channel", "ch-1", makePayload({ id: "sem-campo" })));
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({ id: "desconhecida", priority: "catastrophic", acknowledgement_required: 1 }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(2));
+    for (const message of result.current.state.messages) {
+      expect(message.priority).toBe("standard");
+      expect(message.acknowledgementRequired).toBe(false);
+    }
+  });
+
   it("normalizes false, missing, and unexpected realtime forwarding markers to false", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>
@@ -1488,6 +1586,118 @@ describe("useMessages — WS message.created integration", () => {
     );
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
     expect(result.current.state.messages[0]).toEqual(msg);
+  });
+
+  // Issue #685: a system event (member added/removed, rename, archive, call
+  // started/ended) travels over the same connection as message.created, but
+  // — unlike a new user message — it never carries a payload: "the message id
+  // travels, the message does not". It is always resolved by the one
+  // authorized read, inserted if the timeline does not have it yet.
+  it("inserts a system event message via the authorized GET (channel)", async () => {
+    const evt = makeMessage({
+      id: "evt-member-added",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-2", displayName: "Bruno" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-evt", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-evt", "evt-member-added");
+    });
+
+    await waitFor(() =>
+      expect(mockFetchChannelMessage).toHaveBeenCalledWith(
+        "ch-evt",
+        "evt-member-added",
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0]).toEqual(evt);
+  });
+
+  it("inserts a system event message via the authorized GET (DM)", async () => {
+    const evt = makeMessage({
+      id: "evt-renamed",
+      kind: "system",
+      eventType: "conversation_renamed",
+      eventPayload: { oldName: "Piloto", newName: "Piloto NChat" },
+    });
+    mockFetchDMMessages.mockResolvedValue(emptyPage);
+    mockFetchDMMessage.mockResolvedValue(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "conv-evt", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("dm", "conv-evt", "evt-renamed");
+    });
+
+    await waitFor(() =>
+      expect(mockFetchDMMessage).toHaveBeenCalledWith(
+        "conv-evt",
+        "evt-renamed",
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+    expect(result.current.state.messages[0]).toEqual(evt);
+  });
+
+  it("ignores a conversation.event for a different conversation", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-mine", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-other", "evt-elsewhere");
+    });
+
+    expect(mockFetchChannelMessage).not.toHaveBeenCalled();
+    expect(result.current.state.messages).toHaveLength(0);
+  });
+
+  it("does not duplicate a system event redelivered while already in the timeline", async () => {
+    const evt = makeMessage({
+      id: "evt-already-here",
+      kind: "system",
+      eventType: "conversation_member_left",
+      eventPayload: {},
+    });
+    mockFetchChannelMessages.mockResolvedValue({ ...emptyPage, messages: [evt] });
+    mockFetchChannelMessage.mockResolvedValue(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-dup", currentUserId: "user-me" }),
+    );
+
+    await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-dup", "evt-already-here");
+    });
+
+    // The read still happens (it is unconditional, same as any other
+    // authoritative-read fallback), but the reducer's message_snapshot dedups
+    // by id: a redelivered event for a message already rendered must not
+    // produce a second row.
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(1));
+    expect(result.current.state.messages).toHaveLength(1);
   });
 
   it("records a recoverable realtime error when fallback GET fails", async () => {
@@ -2447,6 +2657,153 @@ describe("useMessages — toggleFavorite", () => {
 });
 
 describe("useMessages — message editing", () => {
+  /**
+   * Issue #823. What the server already knows about one urgent message that
+   * asked its recipients to confirm receipt. Distinctive counts, so the
+   * assertions below cannot pass against a default or a leftover.
+   */
+  const urgentSummary = {
+    messageId: "msg-edit",
+    required: true,
+    total: 7,
+    pending: 3,
+    acknowledged: 4,
+    responded: 0,
+    expired: 0,
+    cancelled: 0,
+    viewerState: "pending" as const,
+  };
+
+  /**
+   * The starting point both edit transitions below have to preserve: an urgent
+   * message that asked for confirmation, already in the timeline, with its
+   * summary already read.
+   *
+   * Returned only once the summary has landed, so a test that follows can tell
+   * "the edit kept it" apart from "it was never there".
+   */
+  async function renderUrgentAskingMessage() {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [
+        makeMessage({
+          id: "msg-edit",
+          bodyText: "reiniciar o cluster",
+          priority: "urgent",
+          acknowledgementRequired: true,
+        }),
+      ],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockResolvedValue({ "msg-edit": urgentSummary });
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["msg-edit"]).toBeDefined());
+    return result;
+  }
+
+  /**
+   * #820 states it as a rule: editing the text must not remove the priority,
+   * reset the acknowledgement, or recreate the message as standard. This runs
+   * the edit rather than rendering a fixture that was already marked edited —
+   * a fixture proves what a message looks like, never what a transition does
+   * to one.
+   *
+   * The PATCH response deliberately says nothing about either claim, which is
+   * exactly the shape an incomplete reconstruction of the message would have.
+   * The confirmed edit is applied *onto* the message the state already holds,
+   * so both survive; a confirmEditOnMessage that replaced instead of merging
+   * fails here.
+   */
+  it("keeps the priority and the confirmation request across a confirmed edit", async () => {
+    const result = await renderUrgentAskingMessage();
+    mockEditMessage.mockResolvedValue(
+      makeMessage({
+        id: "msg-edit",
+        bodyText: "reiniciar o cluster às 14h",
+        bodyFormat: "v3",
+        isEdited: true,
+        editCount: 1,
+        editedAt: "2026-09-15T14:00:00Z",
+      }),
+    );
+
+    await act(() =>
+      result.current.editMessageLocal("msg-edit", "reiniciar o cluster às 14h", "v3"),
+    );
+
+    expect(mockEditMessage).toHaveBeenCalledWith("msg-edit", "reiniciar o cluster às 14h", 3);
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-edit",
+      bodyText: "reiniciar o cluster às 14h",
+      isEdited: true,
+      editCount: 1,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+    // The summary is held beside the message rather than on it, so an edit must
+    // leave it alone too — losing the counts would be the same defect wearing a
+    // different hat.
+    expect(result.current.acknowledgements["msg-edit"]).toMatchObject({
+      total: 7,
+      acknowledged: 4,
+      viewerState: "pending",
+    });
+  });
+
+  /**
+   * The same rule on the path that rebuilds the message from a snapshot rather
+   * than merging into it: a refused edit reverts to the message captured before
+   * the optimistic write, and that snapshot has to be the whole message.
+   *
+   * The optimistic stage is asserted before the rejection lands, because a
+   * rollback that looked right only because nothing had changed would be no
+   * evidence at all.
+   */
+  it("restores the priority and the confirmation request when the edit is refused", async () => {
+    const result = await renderUrgentAskingMessage();
+    let rejectEdit!: (error: Error) => void;
+    mockEditMessage.mockImplementation(
+      () => new Promise<Message>((_resolve, reject) => (rejectEdit = reject)),
+    );
+
+    let request!: Promise<Message>;
+    act(() => {
+      request = result.current.editMessageLocal("msg-edit", "rascunho otimista", "v3");
+    });
+
+    // In flight: the body really changed, and neither claim was dropped on the
+    // way in.
+    expect(result.current.state.messages[0]).toMatchObject({
+      bodyText: "rascunho otimista",
+      isEdited: true,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+
+    const settled = request.catch((error: unknown) => error);
+    act(() => rejectEdit(new Error("PATCH recusado")));
+    // The rejection is the public contract — the caller keeps the draft from
+    // it — so it is asserted rather than swallowed.
+    expect(await settled).toEqual(new Error("PATCH recusado"));
+
+    await waitFor(() =>
+      expect(result.current.state.messages[0].bodyText).toBe("reiniciar o cluster"),
+    );
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "msg-edit",
+      isEdited: false,
+      editCount: 0,
+      priority: "urgent",
+      acknowledgementRequired: true,
+    });
+    expect(result.current.acknowledgements["msg-edit"]).toMatchObject({
+      total: 7,
+      acknowledged: 4,
+      viewerState: "pending",
+    });
+  });
+
   it("confirms server edit fields without clearing reactions or favorite state", async () => {
     const initial = makeMessage({
       id: "msg-edit",
@@ -4905,6 +5262,45 @@ describe("useMessages — reconnect authoritative security refresh", () => {
     await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("safe"));
   });
 
+  it("reads a DM's authoritative security state through the DM endpoint", async () => {
+    mockFetchDMMessages.mockResolvedValue({
+      messages: [makeMessage({ id: "dm-source", linkSafetyState: "inconclusive" })],
+      nextCursor: "",
+    });
+    mockFetchDMMessageSecuritySnapshots.mockResolvedValue([
+      {
+        messageId: "dm-source",
+        available: true,
+        status: "active",
+        linkSafetyState: "malicious",
+        updatedAt: "2099-08-18T12:00:00Z",
+      },
+    ]);
+    const { result } = renderHook(() =>
+      useMessages({ kind: "dm", targetId: "dm-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "dm",
+        target_id: "dm-1",
+      });
+      await Promise.resolve();
+    });
+
+    expect(mockFetchDMMessageSecuritySnapshots).toHaveBeenCalledWith(
+      "dm-1",
+      ["dm-source"],
+      expect.any(AbortSignal),
+    );
+    expect(mockFetchChannelMessageSecuritySnapshots).not.toHaveBeenCalled();
+    await waitFor(() => expect(result.current.state.messages[0].linkSafetyState).toBe("malicious"));
+    expect(result.current.state.messages[0].bodyText).toBe("");
+  });
+
   it("does not let an older reconnect snapshot overwrite a newer quote", async () => {
     mockFetchChannelMessages.mockResolvedValue({
       messages: [
@@ -5160,5 +5556,426 @@ describe("useMessages — inline attachment preview reconciliation", () => {
     });
 
     expect(result.current.state.messages[0].attachments?.[0].previewStatus).toBe("pending");
+  });
+});
+
+// ── Page reads that outlive their conversation ────────────────────────────────
+//
+// The initial page and the older pages are the two reads that are not triggered
+// by a realtime event, so nothing else cancels them. Each is aborted when the
+// reader leaves, and any completion that still arrives is discarded rather than
+// applied — a page of channel A appearing in channel B would be a cross-target
+// leak, and its cursor would silently corrupt B's pagination.
+
+describe("useMessages — page reads across a target change", () => {
+  const renderForTarget = (id: string) =>
+    renderHook(
+      ({ targetId }: { targetId: string }) =>
+        useMessages({ kind: "channel", targetId, currentUserId: "user-me" }),
+      { initialProps: { targetId: id } },
+    );
+
+  const pending = <T>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
+  it("aborts the in-flight initial page when the target changes", async () => {
+    let firstSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, signal) => {
+      firstSignal = signal;
+      return new Promise<MessagePage>(() => {});
+    });
+
+    const { rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(firstSignal).toBeDefined());
+    expect(firstSignal?.aborted).toBe(false);
+
+    mockFetchChannelMessages.mockResolvedValueOnce(emptyPage);
+    rerender({ targetId: "ch-b" });
+
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+  });
+
+  it("aborts the in-flight initial page on unmount", async () => {
+    let signal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, requestSignal) => {
+      signal = requestSignal;
+      return new Promise<MessagePage>(() => {});
+    });
+
+    const { unmount } = renderForTarget("ch-a");
+    await waitFor(() => expect(signal).toBeDefined());
+
+    unmount();
+
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("discards an initial page that resolves after the target changed", async () => {
+    const first = pending<MessagePage>();
+    mockFetchChannelMessages.mockImplementationOnce(() => first.promise);
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() =>
+      expect(mockFetchChannelMessages).toHaveBeenCalledWith(
+        "ch-a",
+        undefined,
+        expect.any(AbortSignal),
+      ),
+    );
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      first.resolve({ messages: [makeMessage({ id: "msg-a" })], nextCursor: "cursor-a" });
+      await first.promise;
+    });
+
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+    expect(result.current.state.nextCursor).toBe("");
+  });
+
+  it("ignores an initial page failure that arrives after the target changed", async () => {
+    let rejectFirst!: (error: unknown) => void;
+    mockFetchChannelMessages.mockImplementationOnce(
+      () =>
+        new Promise<MessagePage>((_resolve, reject) => {
+          rejectFirst = reject;
+        }),
+    );
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(mockFetchChannelMessages).toHaveBeenCalledTimes(1));
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(async () => {
+      rejectFirst(new Error("previous conversation is gone"));
+      await Promise.resolve();
+    });
+
+    expect(result.current.state.status).toBe("ready");
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+  });
+
+  it("aborts and discards an older page when the target changes mid-fetch", async () => {
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-a" })],
+      nextCursor: "cursor-a",
+    });
+
+    const { result, rerender } = renderForTarget("ch-a");
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    const older = pending<MessagePage>();
+    let olderSignal: AbortSignal | undefined;
+    mockFetchChannelMessages.mockImplementationOnce((_id, _cursor, signal) => {
+      olderSignal = signal;
+      return older.promise;
+    });
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(olderSignal).toBeDefined());
+
+    mockFetchChannelMessages.mockResolvedValueOnce({
+      messages: [makeMessage({ id: "msg-b" })],
+      nextCursor: "",
+    });
+    rerender({ targetId: "ch-b" });
+    await waitFor(() => expect(olderSignal?.aborted).toBe(true));
+    await waitFor(() =>
+      expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]),
+    );
+
+    await act(async () => {
+      older.resolve({ messages: [makeMessage({ id: "msg-older" })], nextCursor: "cursor-older" });
+      await older.promise;
+    });
+
+    expect(result.current.state.messages.map((message) => message.id)).toEqual(["msg-b"]);
+    expect(result.current.state.nextCursor).toBe("");
+  });
+});
+
+// ── The timeline never announces (issue #750) ────────────────────────────────
+//
+// useMessages is the other side of the boundary: it loads a conversation, pages
+// backwards through its history and applies live frames to the timeline, and
+// none of that is an announcement. The rule is enforced by eslint.config.js —
+// this module may not import notificationPresentation at all — and these cases
+// prove the behaviour that rule exists to protect, at the real seam: a hundred
+// messages arriving as state make no sound and raise no OS notification.
+
+describe("useMessages does not announce anything it loads", () => {
+  function history(count: number, prefix: string): Message[] {
+    return Array.from({ length: count }, (_, index) =>
+      makeMessage({ id: `${prefix}-${index}`, bodyText: `mensagem ${index}` }),
+    );
+  }
+
+  it("announces nothing for the initial hydration of a conversation", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: history(100, "hydrated"),
+      nextCursor: "",
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    expect(result.current.state.messages).toHaveLength(100);
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+
+  it("announces nothing for a page of older messages", async () => {
+    mockFetchChannelMessages
+      .mockResolvedValueOnce({ messages: history(20, "recent"), nextCursor: "older-cursor" })
+      .mockResolvedValueOnce({ messages: history(100, "older"), nextCursor: "" });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.state.messages.length).toBe(120));
+
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The resync this hook really has: `subscribed` is acknowledged and the hook
+   * reconciles what it holds against the server. It recovers state and
+   * announces nothing — and a live frame applied to the timeline is not an
+   * announcement either, because announcing is the sidebar's handler's job and
+   * this module cannot reach it.
+   */
+  it("announces nothing on a subscription resync or a live frame", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: history(5, "loaded"),
+      nextCursor: "",
+    });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() =>
+      capturedOnSubscribed?.({
+        type: "subscribed",
+        operation: "subscribe",
+        target_type: "channel",
+        target_id: "ch-1",
+      }),
+    );
+    act(() =>
+      capturedOnMessageCreated?.({
+        type: "message.created",
+        workspace_id: "ws-1",
+        target_type: "channel",
+        target_id: "ch-1",
+        message_id: "msg-live",
+        event_id: "evt-live",
+        created_at: new Date().toISOString(),
+        payload: makePayload({ id: "msg-live" }),
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.state.messages.some((m) => m.id === "msg-live")).toBe(true),
+    );
+
+    expect(mockPresentLiveMessageNotification).not.toHaveBeenCalled();
+  });
+});
+
+// ── acknowledgement realtime (issue #824) ────────────────────────────────────
+//
+// A committed acknowledgement elsewhere reaches this session as a hint naming
+// one message. What is asserted here is the wiring: the hint reaches the hook,
+// and it re-reads exactly the message it named.
+
+describe("useMessages acknowledgement realtime", () => {
+  function askingMessage(id: string): Message {
+    return makeMessage({ id, acknowledgementRequired: true });
+  }
+
+  function summaryFor(messageId: string, viewerState: "pending" | "acknowledged") {
+    return {
+      messageId,
+      required: true,
+      total: 2,
+      pending: viewerState === "pending" ? 2 : 1,
+      acknowledged: viewerState === "acknowledged" ? 1 : 0,
+      responded: 0,
+      expired: 0,
+      cancelled: 0,
+      viewerState,
+    };
+  }
+
+  /**
+   * Issue #823. The whole path a message takes when it arrives over realtime
+   * rather than over HTTP: the event lands, the message enters the timeline
+   * carrying both of its author's claims, the acknowledgement hook notices the
+   * confirmation request, reads the summary in the batch it already uses, and
+   * the answer lands keyed to that message.
+   *
+   * This is asserted end to end rather than at the mapper because the defect it
+   * guards against is a broken *link*, not a broken field: before #823 the
+   * realtime payload dropped `acknowledgement_required` entirely, so a message
+   * that asked for confirmation looked ordinary until the page was reloaded —
+   * a state in which every individual mapping is correct and the flow still
+   * produces nothing. A test that only read the message back off the state
+   * would have passed against exactly that bug.
+   */
+  it("reads the summary for an urgent message that arrived over realtime", async () => {
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    // Counts nothing else in this suite produces, so an assertion that passes
+    // here cannot be passing against a default or a leftover.
+    const summary = {
+      messageId: "urgente",
+      required: true,
+      total: 7,
+      pending: 3,
+      acknowledged: 4,
+      responded: 0,
+      expired: 0,
+      cancelled: 0,
+      viewerState: "pending" as const,
+    };
+    mockFetchMessageAcknowledgements.mockResolvedValue({ urgente: summary });
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    // The conversation loaded empty, so every read below is attributable to the
+    // event and to nothing else.
+    expect(mockFetchMessageAcknowledgements).not.toHaveBeenCalled();
+
+    act(() =>
+      fireWsEventWithPayload(
+        "channel",
+        "ch-1",
+        makePayload({
+          id: "urgente",
+          priority: "urgent",
+          acknowledgement_required: true,
+          persistent_notifications: true,
+        }),
+      ),
+    );
+
+    await waitFor(() => expect(result.current.acknowledgements.urgente).toBeDefined());
+
+    // The message is in the timeline, still carrying all three claims (issue
+    // #846: persistentNotifications must arrive on the same event as the other
+    // two, not only on a later reload).
+    expect(result.current.state.messages).toHaveLength(1);
+    expect(result.current.state.messages[0]).toMatchObject({
+      id: "urgente",
+      priority: "urgent",
+      acknowledgementRequired: true,
+      persistentNotifications: true,
+    });
+    // The existing batch read was used, once, and asked about exactly this
+    // message — not about the whole conversation, which is the read
+    // amplification this feature has to keep avoiding.
+    expect(mockFetchMessageAcknowledgements).toHaveBeenCalledTimes(1);
+    expect(mockFetchMessageAcknowledgements.mock.calls[0][0]).toEqual(["urgente"]);
+    // And the answer is keyed to that message, with the server's own counts and
+    // this reader's own state — which is everything the strip renders from.
+    expect(result.current.acknowledgements.urgente).toMatchObject({
+      messageId: "urgente",
+      required: true,
+      total: 7,
+      acknowledged: 4,
+      pending: 3,
+      viewerState: "pending",
+    });
+  });
+
+  it("re-reads only the message an acknowledgement event names", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1"), askingMessage("m-2")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+    await waitFor(() => expect(Object.keys(result.current.acknowledgements)).toHaveLength(2));
+    mockFetchMessageAcknowledgement.mockClear();
+    mockFetchMessageAcknowledgement.mockImplementation((id: string) =>
+      Promise.resolve(summaryFor(id, "acknowledged")),
+    );
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "m-1" }));
+
+    await waitFor(() =>
+      expect(result.current.acknowledgements["m-1"]?.viewerState).toBe("acknowledged"),
+    );
+    expect(mockFetchMessageAcknowledgement).toHaveBeenCalledTimes(1);
+    expect(mockFetchMessageAcknowledgement).toHaveBeenCalledWith("m-1", expect.anything());
+    // The other asking message was not asked about.
+    expect(result.current.acknowledgements["m-2"]?.viewerState).toBe("pending");
+  });
+
+  // A hint that names nothing has nothing to re-read.
+  it("ignores an acknowledgement event with no message id", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["m-1"]).toBeDefined());
+    mockFetchMessageAcknowledgement.mockClear();
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "" }));
+    expect(mockFetchMessageAcknowledgement).not.toHaveBeenCalled();
+  });
+
+  // The hint never records an acknowledgement on this reader's behalf.
+  it("never confirms anything because an event arrived", async () => {
+    mockFetchChannelMessages.mockResolvedValue({
+      messages: [askingMessage("m-1")],
+      nextCursor: "",
+    });
+    mockFetchMessageAcknowledgements.mockImplementation((ids: string[]) =>
+      Promise.resolve(Object.fromEntries(ids.map((id) => [id, summaryFor(id, "pending")]))),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "me" }),
+    );
+    await waitFor(() => expect(result.current.acknowledgements["m-1"]).toBeDefined());
+
+    act(() => capturedOnAcknowledgementUpdated?.({ message_id: "m-1" }));
+    await waitFor(() => expect(mockFetchMessageAcknowledgement).toHaveBeenCalled());
+    expect(mockAcknowledgeMessage).not.toHaveBeenCalled();
   });
 });

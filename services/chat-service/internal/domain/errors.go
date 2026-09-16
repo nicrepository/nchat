@@ -152,4 +152,18 @@ var (
 	// caller learns "too many," not "who."
 	ErrGroupAllMentionRecipientsExceeded = fmt.Errorf(
 		"%w: @all in a group is limited to %d recipients", ErrInvalidInput, MaxGroupAllMentionRecipients)
+	// ErrConversationNotificationLevelsDisabled reports that this deployment
+	// does not yet offer granular conversation notification levels (issue #136).
+	//
+	// It is a rollout gate and not a judgement about the caller or the value:
+	// `mentions_replies` is a perfectly valid mode that a build running beside a
+	// release slot from before #136 must not persist, because that slot reads
+	// any preference row as a mute and would silence somebody who asked to keep
+	// hearing mentions. So it maps to 503 rather than 400 or 403 — the
+	// deployment cannot do this *yet* — and it says nothing about the actor,
+	// the conversation or which other modes exist.
+	//
+	// Muting and unmuting are unaffected: both are representable in the old
+	// model and keep working while the gate is closed.
+	ErrConversationNotificationLevelsDisabled = errors.New("conversation notification levels are disabled")
 )

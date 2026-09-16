@@ -34,6 +34,7 @@ vi.mock("./filesApi", async () => {
 });
 
 import ChatComposer from "./ChatComposer";
+import { standardPriorityIntent } from "./messagePriority";
 import type { ChannelAttachment } from "./chatTypes";
 import type { SendResult } from "./useMessages";
 
@@ -145,7 +146,7 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("", ["att-1"]);
+    expect(onSend).toHaveBeenCalledWith("", ["att-1"], standardPriorityIntent);
     expect(mockDeleteAttachment).not.toHaveBeenCalled();
     // The bytes went up when the file was chosen. Pressing Enviar links a
     // reference; it must never upload anything again.
@@ -162,7 +163,7 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("veja isto", ["att-1"]);
+    expect(onSend).toHaveBeenCalledWith("veja isto", ["att-1"], standardPriorityIntent);
     expect(mockUploadAttachment).toHaveBeenCalledTimes(1);
   });
 
@@ -265,6 +266,6 @@ describe("composer attachment send", () => {
     await user.click(sendButton());
 
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-    expect(onSend).toHaveBeenCalledWith("nova conversa", undefined);
+    expect(onSend).toHaveBeenCalledWith("nova conversa", undefined, standardPriorityIntent);
   });
 });

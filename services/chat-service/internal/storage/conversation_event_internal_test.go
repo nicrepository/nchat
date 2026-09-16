@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -21,7 +22,7 @@ func TestDecodeConversationEvent(t *testing.T) {
 		}
 		// The payload is ignored outright: without an event type there is nothing
 		// it could belong to.
-		if message.EventPayload != (domain.ConversationEventPayload{}) {
+		if !reflect.DeepEqual(message.EventPayload, domain.ConversationEventPayload{}) {
 			t.Fatalf("payload = %+v, want it untouched", message.EventPayload)
 		}
 	})
@@ -52,7 +53,7 @@ func TestDecodeConversationEvent(t *testing.T) {
 		if message.EventType != "" {
 			t.Fatalf("event type = %q, want it cleared", message.EventType)
 		}
-		if message.EventPayload != (domain.ConversationEventPayload{}) {
+		if !reflect.DeepEqual(message.EventPayload, domain.ConversationEventPayload{}) {
 			t.Fatalf("payload = %+v, want nothing decoded for an unknown event", message.EventPayload)
 		}
 	})

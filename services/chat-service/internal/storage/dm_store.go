@@ -67,6 +67,14 @@ type DMStore interface {
 	// records the departure. Self-leave only — there is no target user
 	// parameter (issue #527).
 	LeaveGroupConversation(ctx context.Context, workspaceID, conversationID, callerID string) (LeaveConversationResult, error)
+	// RemoveGroupParticipant removes targetUserID from a group on callerID's
+	// behalf and records conversation_member_removed in the same transaction
+	// (issue #685). Only the group's creator may remove another participant —
+	// a group has no admin/moderator role to consult, so authority is narrower
+	// than a channel's — and removing oneself is LeaveGroupConversation's job,
+	// not this one. Idempotent: a target who does not currently participate
+	// yields a zero-value result and no error.
+	RemoveGroupParticipant(ctx context.Context, workspaceID, conversationID, callerID, targetUserID string) (RemoveGroupParticipantResult, error)
 	// ListParticipantProfiles returns up to limit active participants of
 	// conversationID in workspaceID plus the total number of active
 	// participants, in one round trip. The caller's access to the conversation
@@ -447,6 +455,16 @@ func (s *PGXDMStore) CreateGroupConversation(ctx context.Context, input CreateGr
 	if err != nil {
 		return domain.DMConversation{}, err
 	}
+	// issue #685: a group's creation is a conversation event like a rename or a
+	// departure, in the same transaction as the row it describes. A 1:1 direct
+	// conversation (createDirectConversation, above) never gets one — there is
+	// no roster to narrate for a conversation with no membership concept.
+	if _, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+		WorkspaceID: conversation.WorkspaceID, DMConversationID: conversation.ID,
+		ActorID: conversation.CreatedBy, Event: domain.ConversationEventCreated,
+	}); err != nil {
+		return domain.DMConversation{}, err
+	}
 	// The conversation was created by the statement above, so every participant
 	// here is new by construction and there is nothing to report separately.
 	if _, err := upsertEligibleDMMembers(ctx, tx, conversation.ID, input.WorkspaceID, input.ParticipantUserIDs); err != nil {
@@ -613,6 +631,26 @@ func (s *PGXDMStore) AddGroupParticipants(
 		return AddMembersResult{}, err
 	}
 
+	// issue #685: one conversation_member_added event per batch, mirroring
+	// AddChannelMembers — never emitted when addedUserIDs is empty (a batch
+	// that was entirely already-active participants changed nothing).
+	var eventMessageID string
+	if len(addedUserIDs) > 0 {
+		targets, err := resolveConversationEventTargetUsers(ctx, tx, addedUserIDs)
+		if err != nil {
+			return AddMembersResult{}, err
+		}
+		event, err := InsertConversationEvent(ctx, tx, ConversationEventInput{
+			WorkspaceID: input.WorkspaceID, DMConversationID: conversationID, ActorID: input.CallerID,
+			Event:   domain.ConversationEventMemberAdded,
+			Payload: domain.ConversationEventPayload{TargetUsers: targets},
+		})
+		if err != nil {
+			return AddMembersResult{}, err
+		}
+		eventMessageID = event.ID
+	}
+
 	total, err := countActiveDMParticipants(ctx, tx, conversationID)
 	if err != nil {
 		return AddMembersResult{}, err
@@ -627,6 +665,7 @@ func (s *PGXDMStore) AddGroupParticipants(
 		AlreadyMembers: len(input.UserIDs) - len(addedUserIDs),
 		TotalCount:     total,
 		AddedUserIDs:   addedUserIDs,
+		EventMessageID: eventMessageID,
 	}, nil
 }
 

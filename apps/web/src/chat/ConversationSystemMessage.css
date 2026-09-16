@@ -1,17 +1,29 @@
 /*
- * ConversationSystemMessage styles (issue #527).
+ * ConversationSystemMessage styles (issue #527, icon and call tone added by
+ * issue #685).
  *
  * The day divider's language — centred, small, neutral, low contrast — because
  * this is the same kind of thing: a marker in the timeline rather than a
  * message. Deliberately no destructive colour for a departure: someone leaving
  * is an event, not an error.
+ *
+ * The design reference for the tinted --call variant is the prototype's
+ * .syscall pill (prototype/claude-design-v1/nic-chat/dm.html): an icon, the
+ * sentence, in the brand's tint rather than the neutral pill every other
+ * event keeps. Colours come from this app's own tokens.css, not the
+ * prototype's — the two have diverged (teal primary here, purple there)
+ * since the mock was drawn, and this component follows the app it actually
+ * ships in.
  */
 
 .chat-system-message {
   align-self: center;
   max-width: min(90%, 44rem);
   margin: 10px 0 8px;
-  padding: 3px 12px;
+  padding: 4px 14px 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   text-align: center;
   font-size: 11.5px;
   line-height: 1.45;
@@ -23,6 +35,20 @@
   overflow-wrap: anywhere;
 }
 
+.chat-system-message__icon {
+  font-size: 14px;
+  flex-shrink: 0;
+  color: inherit;
+}
+
 .chat-system-message__text {
   font-weight: 500;
+}
+
+/* call_started / call_ended: the one event pair the design gives its own,
+ * higher-emphasis treatment — a live call is more actionable than a rename. */
+.chat-system-message--call {
+  color: var(--color-primary-strong, #155e75);
+  background: var(--color-primary-tint, #ecfeff);
+  border-color: var(--color-primary-tint, #ecfeff);
 }

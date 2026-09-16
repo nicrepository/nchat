@@ -33,6 +33,7 @@ vi.mock("./filesApi", async () => {
 });
 
 import ChatComposer from "./ChatComposer";
+import { standardPriorityIntent } from "./messagePriority";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { AttachmentUploadError } from "./filesApi";
 import type { SendResult } from "./useMessages";
@@ -499,6 +500,6 @@ describe("pasting text alongside an image", () => {
     expect(await screen.findByText("Pronto para enviar")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("chat-send-btn"));
 
-    expect(view.onSend).toHaveBeenCalledWith("legenda", ["a-1"]);
+    expect(view.onSend).toHaveBeenCalledWith("legenda", ["a-1"], standardPriorityIntent);
   });
 });

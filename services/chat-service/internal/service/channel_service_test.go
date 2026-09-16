@@ -719,6 +719,11 @@ func TestChannelService_ArchiveChannel_ManagerArchivesNonGeneral(t *testing.T) {
 	if got.Status != domain.ChannelStatusArchived || channels.archiveCalls != 1 {
 		t.Fatalf("expected archived channel, got=%+v calls=%d", got, channels.archiveCalls)
 	}
+	// issue #685: the conversation_archived event's actor is the caller the
+	// service re-derived management permission for, never something else.
+	if channels.lastArchiveActorID != "owner-1" {
+		t.Fatalf("archive actor = %q, want the caller", channels.lastArchiveActorID)
+	}
 }
 
 func TestChannelService_ArchiveChannel_StorageErrorPropagates(t *testing.T) {

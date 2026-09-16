@@ -15,6 +15,7 @@
  * layer at all.
  */
 
+import { isAudioAttachment } from "./attachmentAudioRules";
 import type { ChannelAttachment } from "./chatTypes";
 import { fetchAttachmentContent } from "./filesApi";
 
@@ -47,11 +48,6 @@ function recordedAtStamp(createdAt: string): string | null {
   return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}-${pad(at.getHours())}${pad(at.getMinutes())}`;
 }
 
-/** The real container extension, or null when the stored name carries none. */
-function extensionOf(filename: string): string | null {
-  return /\.([a-z0-9]{1,8})$/i.exec(filename)?.[1].toLowerCase() ?? null;
-}
-
 /**
  * A readable name for a saved voice message.
  *
@@ -61,15 +57,34 @@ function extensionOf(filename: string): string | null {
  * attachment of a message carries none of its own (see chatTypes'
  * parseMessageAttachment) — distinguishes them.
  *
- * The extension is the stored one and nothing else: it names the container the
- * bytes actually are — WebM, Ogg or MP4 — and no byte is converted to justify a
- * friendlier one. Every part of the result is constructed here (a fixed prefix,
- * digits and hyphens, plus an extension matched as `[a-z0-9]{1,8}`), so no
- * character of a server- or client-supplied name survives into it.
+ * The extension is always `.mp3`: file-service re-encodes every voice-message
+ * download to real MP3 regardless of the container it was recorded in — WebM,
+ * Ogg or MP4 (Nic-Gravador compatibility task) — so this names what the served
+ * bytes actually are, not what the browser happened to record. Every part of
+ * the result is constructed here (a fixed prefix, digits and hyphens, plus the
+ * fixed suffix), so no character of a server- or client-supplied name survives
+ * into it.
  */
-export function voiceMessageFilename(attachment: ChannelAttachment, sentAt: string): string {
+export function voiceMessageFilename(sentAt: string): string {
   const stamp = recordedAtStamp(sentAt);
   const base = stamp ? `mensagem-de-voz-${stamp}` : "mensagem-de-voz";
-  const extension = extensionOf(attachment.filename);
-  return extension ? `${base}.${extension}` : base;
+  return `${base}.mp3`;
+}
+
+/**
+ * The name to save an ordinary (non-voice) attachment's download under.
+ *
+ * For anything but audio this is just the stored filename, unchanged — the
+ * existing behaviour every other attachment type keeps. For an audio file
+ * (picked from disk, not recorded — a voice message never reaches this path;
+ * see VoiceMessageAttachment / voiceMessageFilename) the extension is swapped
+ * to `.mp3` for the same reason: file-service always serves real MP3 for audio
+ * downloads (Nic-Gravador compatibility task), so the saved name should match
+ * what the bytes actually are.
+ */
+export function attachmentDownloadFilename(attachment: ChannelAttachment): string {
+  if (!isAudioAttachment(attachment)) return attachment.filename || "arquivo";
+  const stored = attachment.filename || "audio";
+  const withoutExtension = stored.replace(/\.[a-z0-9]{1,8}$/i, "");
+  return `${withoutExtension || "audio"}.mp3`;
 }

@@ -2,6 +2,9 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach } from "vitest";
 
+import { resetAttachmentProximityObservers } from "./chat/lazyAttachment";
+import { resetPreviewScheduler } from "./chat/previewScheduler";
+
 // JSDOM has no layout, but ProseMirror reads geometry while pasting and scrolling.
 const emptyDOMRect = () => new DOMRect();
 Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
@@ -65,4 +68,11 @@ afterEach(() => {
   cleanup();
   resizeObservations.clear();
   resizeCallbacks.clear();
+  // Module state shared by every attachment (issue #675), and shared by every
+  // test in a file. A fetch mock that never settles would leave a concurrency
+  // slot held; an observer pair built around one test's IntersectionObserver
+  // double would be handed to the next test, which would then see every
+  // attachment as permanently far away.
+  resetPreviewScheduler();
+  resetAttachmentProximityObservers();
 });

@@ -10,6 +10,7 @@ import type { ResourceCallTarget } from "./useResourceCallSession";
 import type { Channel, DMConversation } from "./chatTypes";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SidebarState } from "./useChatSidebar";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
 
 /**
  * The sidebar's data, or empty stand-ins while it is still loading.
@@ -142,10 +143,19 @@ export interface ChatOutletContext {
   resourceCallSession?: ActiveResourceCallSession;
   /** Present only while a direct 1:1 call is active, media-connected, and locally owned (issue #673) — never merely ringing. */
   directCallSession?: ActiveDirectCallSession;
+  /**
+   * The per-conversation composer state (issue #769) — see
+   * AppShellOutletContext. Optional only so the many existing
+   * ChatOutletContext test fixtures that predate this field keep
+   * typechecking; ChatMessageArea falls back to noopConversationDrafts
+   * (never reached in production, where AppShell always provides the real
+   * store).
+   */
+  drafts?: ConversationDraftsApi;
 }
 
 export default function ChatShell() {
-  const { state, retry, markRead } = useOutletContext<AppShellOutletContext>();
+  const { state, retry, markRead, drafts } = useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
     calls,
@@ -250,6 +260,7 @@ export default function ChatShell() {
     dms: ready.dms,
     attachmentLimits: ready.attachmentLimits,
     markRead,
+    drafts,
     refreshConversations: retry,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,

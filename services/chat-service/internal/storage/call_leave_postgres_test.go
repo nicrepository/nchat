@@ -161,7 +161,7 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyLeavingParticipantsBusyStatusP
 	leaseTTL := now.Add(30 * time.Second)
 
 	// A starts the resource call.
-	call, created, participationA, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, created, participationA, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000f1",
 		CallerID:    leavePGUserA,
@@ -175,7 +175,7 @@ func TestPGXCallStoreLeaveResourceCallReleasesOnlyLeavingParticipantsBusyStatusP
 	}
 
 	// B joins the same, already-active resource call.
-	joined, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	joined, _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000f2",
 		CallerID:    leavePGUserB,
@@ -271,7 +271,7 @@ func TestPGXCallStoreLastLeaveNeverLeavesJoinerWithStaleActiveSnapshotPostgreSQL
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, _, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000a1",
 		CallerID:    leavePGUserA,
@@ -320,7 +320,7 @@ func TestPGXCallStoreLastLeaveNeverLeavesJoinerWithStaleActiveSnapshotPostgreSQL
 	var joinErr error
 	go func() {
 		defer close(joined)
-		joinedCall, _, _, joinErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+		joinedCall, _, _, _, joinErr = store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 			WorkspaceID: leavePGWorkspace,
 			RequestID:   "c5000000-0000-4000-8000-0000000000a2",
 			CallerID:    leavePGUserC,
@@ -405,7 +405,7 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 	ctx := context.Background()
 	leaseTTL := time.Now().UTC().Add(30 * time.Second)
 
-	call, _, participationA, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	call, _, participationA, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000b1",
 		CallerID:    leavePGUserA,
@@ -417,7 +417,7 @@ func TestPGXCallStoreTwoSimultaneousLastLeavesProduceExactlyOneEndedTransitionPo
 	if err != nil {
 		t.Fatalf("A starts resource call: %v", err)
 	}
-	_, _, participationB, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
+	_, _, participationB, _, err := store.CreateResourceCall(ctx, storage.CreateResourceCallInput{
 		WorkspaceID: leavePGWorkspace,
 		RequestID:   "c5000000-0000-4000-8000-0000000000b2",
 		CallerID:    leavePGUserB,

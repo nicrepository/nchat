@@ -30,6 +30,12 @@ type fakeDMProvider struct {
 	lastLeaveGroup    service.LeaveGroupInput
 	leaveGroupCalls   int
 
+	// Admin participant removal (issue #685).
+	removeParticipantResult storage.RemoveGroupParticipantResult
+	removeParticipantErr    error
+	lastRemoveParticipant   service.RemoveGroupParticipantInput
+	removeParticipantCalls  int
+
 	candidates       []domain.DMCandidate
 	searchErr        error
 	createOutput     service.CreateDirectConversationOutput
@@ -102,6 +108,17 @@ func (f *fakeDMProvider) LeaveGroup(_ context.Context, input service.LeaveGroupI
 	return storage.LeaveConversationResult{
 		Event: domain.Message{ID: "event-" + input.ConversationID, Kind: domain.MessageKindSystem},
 	}, nil
+}
+
+func (f *fakeDMProvider) RemoveGroupParticipant(
+	_ context.Context, input service.RemoveGroupParticipantInput,
+) (storage.RemoveGroupParticipantResult, error) {
+	f.removeParticipantCalls++
+	f.lastRemoveParticipant = input
+	if f.removeParticipantErr != nil {
+		return storage.RemoveGroupParticipantResult{}, f.removeParticipantErr
+	}
+	return f.removeParticipantResult, nil
 }
 
 func (f *fakeDMProvider) SearchDMCandidates(_ context.Context, input service.SearchDMCandidatesInput) ([]domain.DMCandidate, error) {

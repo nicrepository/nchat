@@ -76,6 +76,53 @@ func InsertConversationEvent(ctx context.Context, q channelQuerier, input Conver
 	return message, nil
 }
 
+// resolveConversationEventTargetUsers resolves display names for a
+// member.added/member.removed event's target_users, at write time, inside the
+// same transaction as the membership change (issue #685).
+//
+// This is the one deliberate exception to "the payload carries facts, never a
+// name" documented on domain.ConversationEventUser: a target has no other
+// column to be resolved from later the way an actor has sender_id, and a
+// renderer must never fetch a profile by id on its own. unnest(...) WITH
+// ORDINALITY keeps the result ordered exactly like userIDs, which is what
+// makes "who was added" deterministic for a batch. LEFT JOIN rather than
+// INNER: a user whose account vanished between the membership INSERT and this
+// read (a narrow race, not the common case) still gets an entry, with no name
+// — the same "Alguém" fallback an unresolved actor already gets, never a
+// dropped target.
+func resolveConversationEventTargetUsers(
+	ctx context.Context, q channelQuerier, userIDs []string,
+) ([]domain.ConversationEventUser, error) {
+	if len(userIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := q.Query(ctx, `
+		SELECT t.user_id::text,
+		       COALESCE(NULLIF(BTRIM(u.full_name), ''), NULLIF(BTRIM(u.display_name), ''), '')
+		FROM unnest($1::uuid[]) WITH ORDINALITY AS t(user_id, ord)
+		LEFT JOIN auth.users u ON u.id = t.user_id
+		ORDER BY t.ord`,
+		userIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve conversation event target users: %w", err)
+	}
+	defer rows.Close()
+
+	targets := make([]domain.ConversationEventUser, 0, len(userIDs))
+	for rows.Next() {
+		var target domain.ConversationEventUser
+		if err := rows.Scan(&target.UserID, &target.DisplayName); err != nil {
+			return nil, fmt.Errorf("scan conversation event target user: %w", err)
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("resolve conversation event target users: %w", err)
+	}
+	return targets, nil
+}
+
 // decodeConversationEvent fills a read message's structured event, if it has
 // one (issue #527).
 //

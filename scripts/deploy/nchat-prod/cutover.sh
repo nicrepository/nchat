@@ -134,7 +134,10 @@ main() {
   fi
   require_smoke_evidence "$target" "$target:$release"
   confirm "Move production traffic to slot $target"
-  if ! switch_services_to_slot "$target"; then
+  # Backends take the new slot before the browser is served the new bundle:
+  # a client is compatible with its own release or newer, never with an
+  # older backend. See service_switch_order.
+  if ! switch_services_to_slot "$target" backends-first; then
     echo "Cutover stopped part-way. Production is in a mixed state." >&2
     echo "Re-run 'cutover.sh --target $target' to finish converging, or" >&2
     echo "'rollback.sh --target <previous> <reason>' to go back. Do not leave it mixed." >&2

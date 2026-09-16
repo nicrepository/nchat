@@ -300,7 +300,7 @@ func (a *App) wireAttachments(
 
 	routerDeps.TokenValidator = validator
 	attachmentStore := storage.NewPGXAttachmentStore(pool)
-	routerDeps.Attachments = service.NewAttachmentService(
+	attachmentService := service.NewAttachmentService(
 		storage.NewPGXDestinationAuthorizer(pool),
 		attachmentStore,
 		objects,
@@ -310,6 +310,7 @@ func (a *App) wireAttachments(
 		attachmentMetrics,
 		logger,
 	)
+	routerDeps.Attachments = attachmentService
 	routerDeps.Admission = admission
 	routerDeps.RateLimiter = limiter
 	routerDeps.ReadinessPinger = pool
@@ -336,6 +337,10 @@ func (a *App) wireAttachments(
 	if err != nil {
 		return errDependenciesUnavailable
 	}
+	// Nic-Gravador compatibility task: the same sidecar client the preview
+	// pipeline already uses to rasterize documents also re-encodes audio to
+	// MP3 for download — one HTTP client, one base URL/timeout, two routes.
+	attachmentService.SetAudioTranscoder(converterClient)
 	a.startPreviewWorker(service.NewPreviewService(
 		storage.NewPGXPreviewStore(pool),
 		objects,

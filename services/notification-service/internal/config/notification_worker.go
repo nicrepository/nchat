@@ -172,8 +172,20 @@ func (c NotificationWorkerConfig) LeaseCoversProcessing() bool {
 }
 
 // NotificationWorkerReady returns (true, "") when the worker is either disabled
-// or configured coherently, and (false, reason) when it is enabled on numbers
-// that cannot work.
+// or configured coherently, and (false, reason) when it is enabled on a
+// configuration it cannot honour.
+//
+// The disabled case is first and answers true, which is what keeps an
+// unconfigured deployment from looking broken: Web Push is opt-in, and a
+// service that never enabled the worker is not misconfigured for having no
+// VAPID keys.
+//
+// Once the worker *is* enabled the channel is part of the readiness question,
+// because Web Push is the only channel it has (issue #746). Without this
+// clause a deployment with an unusable key pair reported ready while
+// startNotificationWorker had quietly declined to start anything — a green pod
+// with a growing backlog and nothing draining it, which is the failure a
+// readiness probe exists to make impossible.
 func (c Config) NotificationWorkerReady() (bool, string) {
 	if !c.NotificationWorker.Enabled {
 		return true, ""
@@ -183,6 +195,9 @@ func (c Config) NotificationWorkerReady() (bool, string) {
 	}
 	if !c.NotificationWorker.LeaseCoversProcessing() {
 		return false, "NOTIFICATION_WORKER_LEASE_SECONDS is shorter than one batch of deliveries"
+	}
+	if ready, reason := c.WebPush.Ready(); !ready {
+		return false, reason
 	}
 	return true, ""
 }
