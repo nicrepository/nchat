@@ -5,6 +5,7 @@ import type {
   MessageNotificationEvent,
   MessagePresentationContext,
 } from "./notificationPresentation";
+import type { SoundNotificationMode } from "./soundPreference";
 import type { WSNotificationPolicy } from "./useChatWebSocket";
 
 const {
@@ -289,6 +290,63 @@ describe("notificationPresentation — which sound plays", () => {
         policy: policy({ in_app: "deny", sound: "deny", named_user_ids: [currentUserId] }),
       }),
     ).toBeUndefined();
+  });
+
+  // ── Urgent replaces, and is never a licence (#831) ───────────────────────
+  //
+  // That urgent *wins* each pairing is settled above, one comparison at a
+  // time. What those cases cannot see is the shape of the win: they read the
+  // first key played, so an implementation that chimed urgent and then went on
+  // to chime the mention or the in-conversation feedback for the same message
+  // would satisfy every one of them. The class is substitutive, so the count is
+  // part of the assertion, and the three facts are stacked at once here rather
+  // than pairwise.
+  it("sounds urgent alone for a message that is urgent, a mention and attended", async () => {
+    expect(
+      await soundKeyFor(
+        { priority: "urgent", policy: policy({ named_user_ids: [currentUserId] }) },
+        { isActiveConversation: true },
+      ),
+    ).toBe("urgent");
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+  });
+
+  // One logical event, one chime, however many times it is delivered: an outbox
+  // retry and a reconnect both arrive as the same message id, which is what the
+  // presented-memory is keyed by. Urgency changes nothing about it — the event
+  // is not news a second time because its author marked it urgent.
+  it("does not chime again when the same urgent event is redelivered", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+    const urgent = event({ eventId: "urgent-1", priority: "urgent" });
+
+    void presentLiveMessageNotification(urgent, context(), surfaces);
+    await flush();
+    const disposition = await presentLiveMessageNotification(urgent, context(), surfaces);
+
+    expect(disposition).toBe("repeat");
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("urgent");
+  });
+
+  // The chime preference is the reader's, and urgency is the author's claim
+  // about their own message. An author cannot overrule the reader's setting:
+  // "off" silences everything, and the two mention-scoped modes silence room
+  // traffic the server did not classify as naming this reader — an urgent
+  // message among it is still room traffic to them.
+  it.each<SoundNotificationMode>(["off", "mentions", "mentions_and_dms"])(
+    "stays silent for an urgent message while the chime preference is %s",
+    async (mode) => {
+      mockGetSoundNotificationMode.mockReturnValue(mode);
+
+      expect(await soundKeyFor({ priority: "urgent" })).toBeUndefined();
+    },
+  );
+
+  // Marking a message urgent is not a way to make a browser chime at the person
+  // who wrote it.
+  it("stays silent for the reader's own urgent message", async () => {
+    expect(await soundKeyFor({ priority: "urgent", senderId: currentUserId })).toBeUndefined();
   });
 });
 
