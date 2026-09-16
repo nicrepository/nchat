@@ -62,6 +62,10 @@ func (s *integDMStore) LeaveGroupConversation(context.Context, string, string, s
 	return storage.LeaveConversationResult{}, nil
 }
 
+func (s *integDMStore) RemoveGroupParticipant(context.Context, string, string, string, string) (storage.RemoveGroupParticipantResult, error) {
+	return storage.RemoveGroupParticipantResult{}, nil
+}
+
 func (s *integChannelStore) LeaveChannelSelf(context.Context, string, string, string) (storage.LeaveConversationResult, error) {
 	return storage.LeaveConversationResult{}, nil
 }
@@ -69,7 +73,7 @@ func (s *integChannelStore) LeaveChannelSelf(context.Context, string, string, st
 func (s *integChannelStore) UpdateChannel(_ context.Context, _ storage.UpdateChannelInput) (storage.UpdateChannelResult, error) {
 	return storage.UpdateChannelResult{}, nil
 }
-func (s *integChannelStore) ArchiveChannel(_ context.Context, _, _ string) (domain.Channel, error) {
+func (s *integChannelStore) ArchiveChannel(_ context.Context, _, _, _ string) (domain.Channel, error) {
 	return domain.Channel{}, nil
 }
 
@@ -146,6 +150,10 @@ func (s *integMessageStore) ResolveAuthorizedMentionLabels(_ context.Context, _,
 }
 
 func (s *integMessageStore) CountEligibleAllMentionRecipientsUpTo(_ context.Context, _, _, _ string, _ int) (int, error) {
+	return 0, nil
+}
+
+func (s *integMessageStore) CountAcknowledgementRecipientsUpTo(_ context.Context, _, _, _, _ string, _ int) (int, error) {
 	return 0, nil
 }
 

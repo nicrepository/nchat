@@ -77,7 +77,7 @@ func groupConversation() withheldTarget {
 	return withheldTarget{
 		conversationID: notifyConversation,
 		parentSender:   notifyPeer,
-		idempotencyKey: "test-a",
+		idempotencyKey: "notify-741-withheld",
 	}
 }
 
@@ -393,7 +393,7 @@ func directConversation() withheldTarget {
 	return withheldTarget{
 		conversationID: notifyDirectConv,
 		parentSender:   notifyPeer,
-		idempotencyKey: "test-b",
+		idempotencyKey: "notify-741-withheld-direct",
 	}
 }
 

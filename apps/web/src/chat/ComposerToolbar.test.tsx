@@ -9,7 +9,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Editor } from "@tiptap/core";
 import type { Editor as EditorType } from "@tiptap/core";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ComposerToolbar from "./ComposerToolbar";
 import { emptyEmojiUsage } from "./emoji/emojiUsage";
 import RichTextRenderer from "./RichTextRenderer";
@@ -87,6 +87,38 @@ async function pickEmoji(user: ReturnType<typeof userEvent.setup>, label: string
 }
 
 // ── Direct format buttons ─────────────────────────────────────────────────────
+
+/**
+ * jsdom lays nothing out, and a picker is only placed against a button the
+ * reader can see (issue #839): the emoji button gets a box inside the window
+ * here, and nothing else changes.
+ */
+const emojiButtonBox = {
+  x: 300,
+  y: 500,
+  left: 300,
+  right: 330,
+  top: 500,
+  bottom: 530,
+  width: 30,
+  height: 30,
+  toJSON: () => ({}),
+} as DOMRect;
+const realGetBoundingClientRect = Element.prototype.getBoundingClientRect;
+let anchorBoxSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  anchorBoxSpy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: Element,
+  ) {
+    if (this.getAttribute("aria-label") === "Inserir emoji") return emojiButtonBox;
+    return realGetBoundingClientRect.call(this);
+  });
+});
+
+afterEach(() => {
+  anchorBoxSpy.mockRestore();
+});
 
 describe("ComposerToolbar — direct format buttons", () => {
   it("renders every format action directly without a format dropdown", () => {

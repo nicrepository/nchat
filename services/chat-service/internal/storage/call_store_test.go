@@ -57,6 +57,54 @@ func resourceCallRow(now time.Time, status domain.CallStatus, version int64) *pg
 	)
 }
 
+// resourceCallEndedRow is an already-ended resource call, accepted 5 seconds
+// before it ended, so a test can assert the event's computed duration.
+func resourceCallEndedRow(now time.Time) *pgxmock.Rows {
+	acceptedAt := now.Add(-5 * time.Second)
+	return pgxmock.NewRows(callColumns()).AddRow(
+		callID, callWorkspaceID, callRequestID, callCallerID, nil,
+		string(domain.CallTargetChannel), callCalleeID,
+		string(domain.CallTypeVideo), string(domain.CallStatusEnded), int64(2), now, now,
+		now.Add(30*time.Second), acceptedAt, now,
+	)
+}
+
+// expectCallStartedEvent registers the conversation_member... err,
+// call_started system message CreateResourceCall now writes in the same
+// transaction as the call it just admitted (issue #685), once — only for the
+// admission that actually created the row.
+func expectCallStartedEvent(mock pgxmock.PgxPoolIface) {
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{
+				"id", "workspace_id", "channel_id", "dm_conversation_id",
+				"sender_id", "kind", "event_type", "created_at",
+			}).AddRow("event-call-started", callWorkspaceID, callCalleeID, "", callCallerID, "system",
+				"call_started", time.Now()),
+		)
+}
+
+// expectCallEndedEvent registers the call_ended system message TransitionCall
+// now writes when the resource call's own caller ends it (issue #685).
+func expectCallEndedEvent(mock pgxmock.PgxPoolIface) {
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnRows(
+			pgxmock.NewRows([]string{
+				"id", "workspace_id", "channel_id", "dm_conversation_id",
+				"sender_id", "kind", "event_type", "created_at",
+			}).AddRow("event-call-ended", callWorkspaceID, callCalleeID, "", callCallerID, "system",
+				"call_ended", time.Now()),
+		)
+}
+
 func TestPGXCallStoreCreateSerializesParticipantsAndPersistsRinging(t *testing.T) {
 	mock := newCategoryMock(t)
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
@@ -208,9 +256,10 @@ func TestPGXCallStoreCreatesAuthorizedResourceAndInitialLease(t *testing.T) {
 	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
 		WithArgs(callID, callCallerID, pgxmock.AnyArg(), expiresAt).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	expectCallStartedEvent(mock)
 	mock.ExpectCommit()
 
-	call, created, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	call, created, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -252,7 +301,7 @@ func TestPGXCallStoreCreateResourceReplayStaysIdempotentAndDetectsMismatch(t *te
 				mock.ExpectRollback()
 			}
 
-			call, created, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+			call, created, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 				WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 				TargetType: domain.CallTargetChannel, TargetID: test.targetID,
 				Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
@@ -289,7 +338,7 @@ func TestPGXCallStoreCreateResourceReplayWithoutCurrentFenceFailsClosed(t *testi
 		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectRollback()
 
-	_, _, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	_, _, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: now.Add(30 * time.Second),
@@ -334,7 +383,7 @@ func TestPGXCallStoreCreateResourceRejectsBusyActorAndRollsBackTheNewCall(t *tes
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectRollback()
 
-	_, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	_, _, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -376,7 +425,7 @@ func TestPGXCallStoreCreateResourceExcludesTheSameCallFromItsOwnBusyCheck(t *tes
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
-	call, _, participationID, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+	call, _, participationID, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
 		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
 		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
 		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
@@ -675,6 +724,211 @@ func TestPGXCallStoreTransitionAcceptAndDuplicate(t *testing.T) {
 			requireMetExpectations(t, mock)
 		})
 	}
+}
+
+// A failure writing call_started rolls back the freshly-inserted chat.calls
+// row and its lease too — the call never exists without the event describing
+// it starting.
+func TestPGXCallStoreCreateResource_RollsBackWhenCallStartedEventInsertFails(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Second)
+	lockKey := callWorkspaceID + ":channel:" + callCalleeID
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callCallerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callCallerID, callRequestID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callCallerID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(`FROM chat.calls.*target_type.*status = 'active'`).
+		WithArgs(callWorkspaceID, string(domain.CallTargetChannel), callCalleeID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO chat.calls.*'active'`).
+		WithArgs(callWorkspaceID, callRequestID, callCallerID, string(domain.CallTargetChannel), callCalleeID, string(domain.CallTypeVideo), expiresAt).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callCallerID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
+		WithArgs(callID, callCallerID, pgxmock.AnyArg(), expiresAt).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	if _, _, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callCallerID,
+		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
+		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
+	}); err == nil {
+		t.Fatal("expected the event insert failure to surface")
+	}
+	requireMetExpectations(t, mock)
+}
+
+// Joining an already-active resource call is not a new call starting: the
+// admission that finds an existing active row must never write a second
+// call_started.
+func TestPGXCallStoreCreateResource_JoiningExistingCall_NoDuplicateEvent(t *testing.T) {
+	mock := newCategoryMock(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	expiresAt := now.Add(30 * time.Second)
+	lockKey := callWorkspaceID + ":channel:" + callCalleeID
+	mock.ExpectBegin()
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(lockKey).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`pg_advisory_xact_lock`).WithArgs(callOutsiderID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectQuery(`FROM chat.calls.*request_id`).WithArgs(callWorkspaceID, callOutsiderID, callRequestID).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectQuery(`chat\.channels.*channel_visible_to_user`).
+		WithArgs(callWorkspaceID, callOutsiderID, callCalleeID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(`FROM chat.calls.*target_type.*status = 'active'`).
+		WithArgs(callWorkspaceID, string(domain.CallTargetChannel), callCalleeID).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`call_participant_leases`).WithArgs(callWorkspaceID, callOutsiderID, callID).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`INSERT INTO chat.call_participant_leases`).
+		WithArgs(callID, callOutsiderID, pgxmock.AnyArg(), expiresAt).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	_, created, _, _, err := storage.NewPGXCallStore(mock).CreateResourceCall(context.Background(), storage.CreateResourceCallInput{
+		WorkspaceID: callWorkspaceID, RequestID: callRequestID, CallerID: callOutsiderID,
+		TargetType: domain.CallTargetChannel, TargetID: callCalleeID,
+		Type: domain.CallTypeVideo, ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateResourceCall: %v", err)
+	}
+	if created {
+		t.Fatalf("joining an existing call must not report created=true")
+	}
+	requireMetExpectations(t, mock)
+}
+
+// ── call_started / call_ended (issue #685) ──────────────────────────────────
+
+// The caller explicitly ending their own active resource call writes
+// call_ended in the same transaction, with the duration measured between
+// accepted_at and ended_at.
+func TestPGXCallStoreTransitionEndsResourceCallAndRecordsEvent(t *testing.T) {
+	now := time.Now().UTC()
+	mock := newCategoryMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`UPDATE chat.calls.*status = \$2`).
+		WithArgs(callID, string(domain.CallStatusEnded)).
+		WillReturnRows(resourceCallEndedRow(now))
+	expectCallEndedEvent(mock)
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXCallStore(mock).TransitionCall(context.Background(), storage.TransitionCallInput{
+		WorkspaceID: callWorkspaceID,
+		CallID:      callID,
+		ActorID:     callCallerID,
+		Action:      storage.CallActionEnd,
+	})
+	if err != nil {
+		t.Fatalf("TransitionCall: %v", err)
+	}
+	if result.Call.Status != domain.CallStatusEnded || !result.Changed {
+		t.Fatalf("unexpected transition: %+v", result)
+	}
+	requireMetExpectations(t, mock)
+}
+
+// Ending an already-ended resource call is the idempotent branch: it commits
+// without touching updateCallStatus at all, so no second call_ended is ever
+// written for a repeated end request.
+func TestPGXCallStoreTransitionEndResourceCall_AlreadyEnded_NoDuplicateEvent(t *testing.T) {
+	now := time.Now().UTC()
+	mock := newCategoryMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
+		WillReturnRows(resourceCallEndedRow(now))
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXCallStore(mock).TransitionCall(context.Background(), storage.TransitionCallInput{
+		WorkspaceID: callWorkspaceID,
+		CallID:      callID,
+		ActorID:     callCallerID,
+		Action:      storage.CallActionEnd,
+	})
+	if err != nil {
+		t.Fatalf("TransitionCall: %v", err)
+	}
+	if result.Changed {
+		t.Fatalf("a repeated end should be idempotent, got Changed=true")
+	}
+	requireMetExpectations(t, mock)
+}
+
+// A failure writing the event rolls back the status update too, so a call
+// never ends without the event describing it.
+func TestPGXCallStoreTransitionEndResourceCall_RollsBackWhenEventInsertFails(t *testing.T) {
+	now := time.Now().UTC()
+	mock := newCategoryMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
+		WillReturnRows(resourceCallRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`UPDATE chat.calls.*status = \$2`).
+		WithArgs(callID, string(domain.CallStatusEnded)).
+		WillReturnRows(resourceCallEndedRow(now))
+	mock.ExpectQuery(`(?s)INSERT INTO chat\.messages.*'system'.*RETURNING`).
+		WithArgs(
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
+		).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	if _, err := storage.NewPGXCallStore(mock).TransitionCall(context.Background(), storage.TransitionCallInput{
+		WorkspaceID: callWorkspaceID,
+		CallID:      callID,
+		ActorID:     callCallerID,
+		Action:      storage.CallActionEnd,
+	}); err == nil {
+		t.Fatal("expected the event insert failure to surface")
+	}
+	requireMetExpectations(t, mock)
+}
+
+// A direct (non-resource) call ending never writes call_ended: the event is
+// scoped to resource calls only, which have a conversation to attach to.
+func TestPGXCallStoreTransitionEndDirectCall_NoEvent(t *testing.T) {
+	now := time.Now().UTC()
+	mock := newCategoryMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs(callWorkspaceID, callID).
+		WillReturnRows(callRow(now, domain.CallStatusActive, 1))
+	mock.ExpectQuery(`UPDATE chat.calls.*status = \$2`).
+		WithArgs(callID, string(domain.CallStatusEnded)).
+		WillReturnRows(callRow(now, domain.CallStatusEnded, 2))
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXCallStore(mock).TransitionCall(context.Background(), storage.TransitionCallInput{
+		WorkspaceID: callWorkspaceID,
+		CallID:      callID,
+		ActorID:     callCallerID,
+		Action:      storage.CallActionEnd,
+	})
+	if err != nil {
+		t.Fatalf("TransitionCall: %v", err)
+	}
+	if !result.Changed {
+		t.Fatalf("expected the direct call to end")
+	}
+	requireMetExpectations(t, mock)
 }
 
 // ── JoinResourceCall (issue #622): admits an actor into an already-existing,

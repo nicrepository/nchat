@@ -80,6 +80,9 @@ type channelMemberManager interface {
 	AddChannelMembers(ctx context.Context, input service.AddChannelMembersInput) (storage.AddMembersResult, error)
 	// SearchChannelMemberCandidates lists people not already in the channel.
 	SearchChannelMemberCandidates(ctx context.Context, input service.SearchChannelMemberCandidatesInput) ([]domain.DMCandidate, error)
+	// RemoveMemberFromChannel is the admin-initiated removal (issue #685),
+	// distinct from the self-leave path Leave already serves.
+	RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) (domain.Message, error)
 }
 
 // membersBroadcaster publishes the post-commit "this target changed" signal.
@@ -290,10 +293,9 @@ type channelDetailsResponse struct {
 	MemberCount       int                        `json:"member_count"`
 	OnlineMemberCount int                        `json:"online_member_count"`
 	OnlineMembers     []channelDetailsMemberJSON `json:"online_members"`
-	// CanManageMembers is the legacy #398 name kept by hotfix #705. Its value is
-	// the add-members capability only; it is a hint for the UI and never a
-	// control. The add-members route re-derives the same decision from the
-	// session on every call. It is
+	// CanManageMembers lets the panel disable an action the server would refuse
+	// (issue #398). It is a hint for the UI and never a control: the add-members
+	// route re-derives the same decision from the session on every call. It is
 	// always sent, so a client that predates it reads absent-as-false and hides
 	// the action — the safe direction — rather than enabling it by default.
 	CanManageMembers bool `json:"can_manage_members"`
@@ -623,12 +625,68 @@ func (h *ChannelHandler) AddMembers(w http.ResponseWriter, r *http.Request) {
 		h.broadcast.PublishConversationAvailable(
 			r.Context(), workspace.ID, "channel", channelID, result.AddedUserIDs,
 		)
+		// members.added tells existing subscribers' member/details panels to
+		// refetch, but carries no system message — without this, "Fulano
+		// entrou no canal" only ever showed up on the next reload (issue #835
+		// realtime follow-up), same gap RemoveMember below already closed.
+		if result.EventMessageID != "" {
+			h.broadcast.PublishConversationEvent(r.Context(), workspace.ID, "channel", channelID, result.EventMessageID)
+		}
 	}
 	httputil.WriteJSON(w, http.StatusOK, addMembersResponse{
 		Added:          result.Added,
 		AlreadyMembers: result.AlreadyMembers,
 		MemberCount:    result.TotalCount,
 	})
+}
+
+// removeMemberRateLimit shares add-members' budget: removing one participant is
+// the same class of write as adding a batch of them, just narrower.
+const (
+	removeMemberRateLimit = 10
+	removeMemberAction    = "remove_member"
+)
+
+// RemoveMember handles DELETE /api/chat/channels/{channelID}/members/{userID}
+// (issue #685) — the admin-initiated counterpart to Leave. Authorization,
+// the #geral guard and idempotency for a non-member target all live in
+// MemberService.RemoveMemberFromChannel; this function decodes nothing from a
+// body, since there is none, and makes no decision of its own.
+//
+// The realtime signal is published only after the service returns
+// successfully and only when it actually removed someone — asking to remove a
+// user who was never a member changes nothing and announces nothing.
+func (h *ChannelHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.members == nil || h.limiter == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	targetUserID := r.PathValue("userID")
+	if !validateTargetID(w, targetUserID, "user_id") {
+		return
+	}
+	callerID, ok := h.admitChannelWriter(w, r, removeMemberAction, removeMemberRateLimit)
+	if !ok {
+		return
+	}
+	workspaceID, ok := h.resolveDefaultWorkspaceID(w, r)
+	if !ok {
+		return
+	}
+
+	event, err := h.members.RemoveMemberFromChannel(r.Context(), workspaceID, channelID, callerID, targetUserID)
+	if err != nil {
+		writeAddMembersError(w, err)
+		return
+	}
+	if h.broadcast != nil && event.ID != "" {
+		h.broadcast.PublishConversationEvent(r.Context(), workspaceID, "channel", channelID, event.ID)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // MemberCandidates handles GET /api/chat/channels/{channelID}/member-candidates.

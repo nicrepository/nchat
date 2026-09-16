@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearTokens, setTokens } from "../lib/authSession";
 import type { SelfProfile } from "../profile/profileApi";
 import { _resetSelfProfile } from "../profile/selfProfile";
-import { HeaderDM } from "./ChatMessageArea";
+import { HeaderDM } from "./message-area/ConversationHeader";
 import ChatSidebar from "./ChatSidebar";
 import { _resetChatSocket } from "./chatSocket";
 import type { Channel, ChannelDetails, DMConversation, Message } from "./chatTypes";

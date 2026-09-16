@@ -8,6 +8,7 @@
  * attachments have a preview to load and what to load for them.
  */
 
+import { useAttachmentGate } from "./lazyAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { fetchAttachmentPreview } from "./filesApi";
 import { isPreviewAvailable, isPreviewPending, type ChannelAttachment } from "./chatTypes";
@@ -75,10 +76,15 @@ export interface AttachmentPreview {
  * or the request failed — which is exactly when the caller draws its fallback.
  */
 export function useAttachmentPreview(attachment: ChannelAttachment): AttachmentPreview {
+  // Lazy hydration (issue #675) only ever *withholds*: outside a lazy container
+  // the gate is open, so the details panel's file list fetches exactly when it
+  // always did.
+  const gate = useAttachmentGate();
   const { url, onLoadError } = useAttachmentBlobUrl(
     attachment.id,
     canShowPreview(attachment),
     fetchAttachmentPreview,
+    { priority: gate.priority, active: gate.active },
   );
   return { previewUrl: url, onLoadError };
 }

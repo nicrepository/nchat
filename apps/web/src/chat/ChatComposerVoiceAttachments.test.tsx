@@ -36,6 +36,7 @@ vi.mock("./filesApi", async () => {
 
 import ChatComposer from "./ChatComposer";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
+import type { MessagePriorityIntent } from "./messagePriority";
 import type { SendResult } from "./useMessages";
 
 const MIB = 1024 * 1024;
@@ -65,7 +66,16 @@ const limits: WorkspaceAttachmentLimits = {
 };
 
 function renderComposer() {
-  const onSend = vi.fn<(body: string) => Promise<SendResult>>();
+  // Typed with every argument a send carries (issue #822), because the voice
+  // block below asserts the priority this composer states.
+  const onSend =
+    vi.fn<
+      (
+        body: string,
+        attachmentIds?: string[],
+        priority?: MessagePriorityIntent,
+      ) => Promise<SendResult>
+    >();
   onSend.mockResolvedValue({ status: "sent" });
   const view = render(
     <ChatComposer
@@ -275,5 +285,98 @@ describe("voice recording vs drag-and-drop attachments", () => {
     // The recording itself was completely undisturbed by the drop.
     expect(screen.getByTestId("chat-voice-recorder")).toBeInTheDocument();
     expect(screen.getByTestId("chat-voice-pauseresume")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Code review regression (issue #822): the applied priority must travel with a
+ * voice message, and must be retired on the same terms as a typed one.
+ *
+ * The defect: the voice path called `onSend("", [attachmentId])` with no third
+ * argument, so a recording made while URGENTE was displayed above the composer
+ * went out as standard — and, because nothing retired it either, the badge
+ * stayed on screen and escalated whatever was composed next. The payload and
+ * the screen disagreed in both directions at once.
+ */
+describe("voice message priority", () => {
+  /** States a priority through the popover, exactly as a reader would. */
+  function applyUrgentWithOptions() {
+    fireEvent.click(screen.getByTestId("toolbar-priority-btn"));
+    fireEvent.click(screen.getByTestId("priority-option-urgent"));
+    fireEvent.click(screen.getByTestId("priority-acknowledgement"));
+    fireEvent.click(screen.getByTestId("priority-persistent"));
+    fireEvent.click(screen.getByTestId("priority-apply"));
+  }
+
+  /** Records, stops and sends — the whole voice lifecycle, untouched. */
+  async function recordAndSend() {
+    await userEvent.click(recordButton());
+    await screen.findByTestId("chat-voice-pauseresume");
+    await userEvent.click(screen.getByTestId("chat-voice-stop"));
+    await userEvent.click(await screen.findByTestId("chat-voice-send"));
+  }
+
+  const urgentWithBoth = {
+    priority: "urgent",
+    acknowledgementRequired: true,
+    persistentNotifications: true,
+  };
+
+  it("carries the applied priority on the voice message", async () => {
+    const { onSend } = renderComposer();
+    applyUrgentWithOptions();
+
+    await recordAndSend();
+
+    await waitFor(() => expect(onSend).toHaveBeenCalled());
+    const [body, attachmentIds, priority] = onSend.mock.calls[0];
+    expect(body).toBe("");
+    expect(attachmentIds).toEqual(["a-1"]);
+    expect(priority).toEqual(urgentWithBoth);
+  });
+
+  it("retires the priority once the voice message is confirmed sent", async () => {
+    renderComposer();
+    applyUrgentWithOptions();
+    expect(screen.getByTestId("composer-priority-summary")).toHaveTextContent("Urgente");
+
+    await recordAndSend();
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("composer-priority-summary")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("toolbar-priority-btn")).toHaveAccessibleName(
+      "Prioridade da mensagem: Padrão",
+    );
+  });
+
+  // A send that did not happen must not consume the configuration: the reader
+  // still has an urgent message to send, and restating the priority after every
+  // dropped connection is how they end up sending it as standard by accident.
+  //
+  // The recorder's own lifecycle is untouched by this issue and is what makes
+  // the retry possible: a send that does not report `sent` keeps the recording
+  // in review with its error, so pressing Enviar again is the retry — and it
+  // must state exactly what the first attempt stated.
+  it("keeps the priority applied for the retry when a send does not report sent", async () => {
+    const { onSend } = renderComposer();
+    onSend.mockResolvedValue({ status: "stale" });
+    applyUrgentWithOptions();
+
+    await recordAndSend();
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend.mock.calls[0][2]).toEqual(urgentWithBoth);
+
+    // The retry, on a send that now succeeds.
+    onSend.mockResolvedValue({ status: "sent" });
+    await userEvent.click(await screen.findByTestId("chat-voice-send"));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2));
+    expect(onSend.mock.calls[1][2]).toEqual(urgentWithBoth);
+
+    // And only now is it retired.
+    await waitFor(() =>
+      expect(screen.queryByTestId("composer-priority-summary")).not.toBeInTheDocument(),
+    );
   });
 });

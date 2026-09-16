@@ -23,28 +23,29 @@ const (
 )
 
 type fakeCallStore struct {
-	mu               sync.Mutex
-	call             domain.Call
-	createInput      storage.CreateCallInput
-	resourceInput    storage.CreateResourceCallInput
-	presenceInput    storage.RenewCallPresenceInput
-	transitionInputs []storage.TransitionCallInput
-	leaveInputs      []storage.LeaveResourceCallInput
-	createCreated    bool
-	createErr        error
-	transitionResult storage.TransitionCallResult
-	transitionErr    error
-	leaveResult      storage.TransitionCallResult
-	leaveErr         error
-	currentErr       error
-	currentCallID    string
-	expired          []domain.Call
-	expireErr        error
-	joinInput        storage.JoinResourceCallInput
-	joinErr          error
-	participationID  string
-	syncResult       storage.ActiveResourceCallResult
-	syncErr          error
+	mu                   sync.Mutex
+	call                 domain.Call
+	createInput          storage.CreateCallInput
+	resourceInput        storage.CreateResourceCallInput
+	presenceInput        storage.RenewCallPresenceInput
+	transitionInputs     []storage.TransitionCallInput
+	leaveInputs          []storage.LeaveResourceCallInput
+	createCreated        bool
+	createErr            error
+	transitionResult     storage.TransitionCallResult
+	transitionErr        error
+	leaveResult          storage.TransitionCallResult
+	leaveErr             error
+	currentErr           error
+	currentCallID        string
+	expired              []domain.Call
+	expireErr            error
+	joinInput            storage.JoinResourceCallInput
+	joinErr              error
+	participationID      string
+	syncResult           storage.ActiveResourceCallResult
+	syncErr              error
+	createEventMessageID string
 }
 
 func (f *fakeCallStore) CreateCall(_ context.Context, input storage.CreateCallInput) (domain.Call, bool, error) {
@@ -54,11 +55,11 @@ func (f *fakeCallStore) CreateCall(_ context.Context, input storage.CreateCallIn
 	return f.call, f.createCreated, f.createErr
 }
 
-func (f *fakeCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, error) {
+func (f *fakeCallStore) CreateResourceCall(_ context.Context, input storage.CreateResourceCallInput) (domain.Call, bool, string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resourceInput = input
-	return f.call, f.createCreated, f.participationID, f.createErr
+	return f.call, f.createCreated, f.participationID, f.createEventMessageID, f.createErr
 }
 
 func (f *fakeCallStore) RenewCallPresence(_ context.Context, input storage.RenewCallPresenceInput) error {
@@ -100,15 +101,26 @@ func (f *fakeCallStore) ActiveResourceCall(context.Context, string, string, doma
 	return f.syncResult, f.syncErr
 }
 
+type conversationEventCall struct {
+	workspaceID, targetType, targetID, messageID string
+}
+
 type fakeCallPublisher struct {
-	mu    sync.Mutex
-	calls []domain.Call
+	mu                 sync.Mutex
+	calls              []domain.Call
+	conversationEvents []conversationEventCall
 }
 
 func (p *fakeCallPublisher) PublishCall(_ context.Context, call domain.Call) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls = append(p.calls, call)
+}
+
+func (p *fakeCallPublisher) PublishConversationEvent(_ context.Context, workspaceID, targetType, targetID, messageID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conversationEvents = append(p.conversationEvents, conversationEventCall{workspaceID, targetType, targetID, messageID})
 }
 
 func serviceCall(status domain.CallStatus, version int64) domain.Call {
@@ -224,6 +236,47 @@ func TestCallServiceStartsAuthorizedResourceActiveAndPublishes(t *testing.T) {
 		store.resourceInput.TargetID != serviceCallCallee {
 		t.Fatalf("resource input not canonical: %+v", store.resourceInput)
 	}
+	if len(publisher.conversationEvents) != 0 {
+		t.Fatalf("no system message was written, so no conversation.event should fire: %+v", publisher.conversationEvents)
+	}
+}
+
+// Issue #835 realtime follow-up: starting a resource call that actually
+// created one (the store returns a non-empty event message id) must
+// broadcast conversation.event, the same signal a rename or a departure
+// already sends — otherwise the timeline only picks up "chamada iniciada" on
+// the next reload.
+func TestCallServiceStartPublishesConversationEventWhenResourceCallCreated(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	resource := serviceCall(domain.CallStatusActive, 1)
+	resource.CalleeID = ""
+	resource.TargetType = domain.CallTargetChannel
+	resource.TargetID = serviceCallCallee
+	store := &fakeCallStore{
+		call: resource, createCreated: true, participationID: serviceParticipation,
+		createEventMessageID: "event-msg-1",
+	}
+	publisher := &fakeCallPublisher{}
+	svc := NewCallService(store, 30*time.Second, func() time.Time { return now }, publisher)
+
+	if _, _, err := svc.Start(context.Background(), StartCallInput{
+		WorkspaceID: serviceCallWorkspace,
+		RequestID:   serviceCallRequest,
+		CallerID:    serviceCallCaller,
+		TargetType:  domain.CallTargetChannel,
+		TargetID:    serviceCallCallee,
+		Type:        domain.CallTypeVideo,
+	}); err != nil {
+		t.Fatalf("Start resource: %v", err)
+	}
+	if len(publisher.conversationEvents) != 1 {
+		t.Fatalf("conversation events = %+v, want exactly one", publisher.conversationEvents)
+	}
+	got := publisher.conversationEvents[0]
+	if got.workspaceID != serviceCallWorkspace || got.targetType != "channel" ||
+		got.targetID != serviceCallCallee || got.messageID != "event-msg-1" {
+		t.Fatalf("conversation event = %+v", got)
+	}
 }
 
 func TestCallServiceRenewsOnlyAuthenticatedResourcePresence(t *testing.T) {
@@ -291,6 +344,30 @@ func TestCallServiceTransitionsUseAuthenticatedActorAndPublishOnlyChanges(t *tes
 			t.Fatal("duplicate transition published another event")
 		}
 	})
+}
+
+// Issue #835 realtime follow-up: End is the only transition that writes a
+// call_ended system message (authorizeCallTransition restricts it to a
+// resource call's own caller), so it is the only one that should ever
+// broadcast conversation.event — accept/decline/cancel write none, and must
+// not fire a stale/empty one.
+func TestCallServiceEndPublishesConversationEventFromTransitionResult(t *testing.T) {
+	call := serviceCall(domain.CallStatusEnded, 2)
+	store := &fakeCallStore{transitionResult: storage.TransitionCallResult{
+		Call: call, Changed: true, EventMessageID: "event-msg-2",
+	}}
+	publisher := &fakeCallPublisher{}
+	if _, err := NewCallService(store, 30*time.Second, nil, publisher).
+		End(context.Background(), serviceCallWorkspace, serviceCallCaller, serviceCallID); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	if len(publisher.conversationEvents) != 1 {
+		t.Fatalf("conversation events = %+v, want exactly one", publisher.conversationEvents)
+	}
+	got := publisher.conversationEvents[0]
+	if got.messageID != "event-msg-2" || got.targetType != string(call.TargetType) || got.targetID != call.TargetID {
+		t.Fatalf("conversation event = %+v", got)
+	}
 }
 
 func TestCallServiceLeavePublishesOnlyWhenTheCallActuallyEnds(t *testing.T) {

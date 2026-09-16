@@ -5,6 +5,9 @@
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "allowImportingTsExtensions": true,
+    // public/sw.js is a classic worker script, so it cannot be a module in
+    // src/; its behaviour test imports it directly (issue #747).
+    "allowJs": true,
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,

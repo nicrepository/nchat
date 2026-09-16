@@ -1,71 +1,118 @@
+/*
+ * SessionRow — the prototype's device row (sessoes.html, issue #859).
+ *
+ * Colours come from the shell's scoped tokens (AppShell.css), like the
+ * Notifications page (#729): the theme is the product's, not the operating
+ * system's, so there is no `prefers-color-scheme` block. The fallbacks are the
+ * prototype's own values (tokens.css).
+ */
+
 .session-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px 0;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  gap: 12px 14px;
+  padding: 14px 0;
   list-style: none;
 }
 
-.session-row:last-child {
-  border-bottom: 0;
+/* Dividers between rows only, so the card body keeps its own edge. */
+.session-row + .session-row {
+  border-top: 1px solid var(--color-border, #e8e3f0);
 }
 
+.session-row__icon {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.session-row__icon--current {
+  border-color: var(--color-primary-tint-strong, #e6d7f7);
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary, #6d28d9);
+}
+
+.session-row__icon .material-symbols-outlined {
+  font-size: 22px;
+}
+
+/* Takes the remaining width, and wraps the action below it on a phone rather
+   than squeezing the identity into a column of single words. */
 .session-row__info {
+  flex: 1 1 220px;
   min-width: 0;
 }
 
-.session-row__agent {
-  margin: 0 0 4px;
-  font-size: 14px;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-
-.session-row__meta {
+.session-row__name {
   margin: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  font-size: 13px;
-  color: #6b7280;
+  align-items: center;
+  row-gap: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  overflow-wrap: anywhere;
+}
+
+.session-row__name > span[aria-hidden="true"] {
+  white-space: pre;
 }
 
 .session-row__current-badge {
-  flex-shrink: 0;
-  padding: 4px 10px;
+  margin-left: 8px;
+  padding: 3px 10px;
   border-radius: 999px;
-  background: rgba(16, 122, 62, 0.12);
-  color: #107a3e;
-  font-size: 12px;
+  background: var(--color-success-tint, #dcfce7);
+  color: var(--color-success-ink, #166534);
+  font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.session-row__meta {
+  margin: 3px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: 13px;
+  color: var(--color-muted, #7c7390);
+  overflow-wrap: anywhere;
+}
+
+.session-row__dot {
+  opacity: 0.5;
 }
 
 .session-row__revoke {
-  flex-shrink: 0;
-  padding: 8px 14px;
-  border-radius: 8px;
-  border: 1px solid rgba(180, 35, 24, 0.35);
-  background: #fff;
-  color: #b42318;
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-height: 36px;
+  padding: 7px 14px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  color: var(--color-danger, #dc2626);
+  font: inherit;
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
 }
 
 .session-row__revoke:hover {
-  background: rgba(180, 35, 24, 0.06);
+  background: var(--color-danger-tint, #fee2e2);
 }
 
-@media (prefers-color-scheme: dark) {
-  .session-row {
-    border-bottom-color: rgba(255, 255, 255, 0.12);
-  }
-  .session-row__meta {
-    color: #d1d5db;
-  }
-  .session-row__revoke {
-    background: transparent;
-  }
+.session-row__revoke:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
 }

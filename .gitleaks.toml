@@ -63,3 +63,12 @@ id = "generic-api-key"
   paths = [
     '^infra/k8s/secrets/sealed/[^/]+/[^/]+\.ya?ml$',
   ]
+
+  [[rules.allowlists]]
+  description = "Notification outbox promotion PostgreSQL tests use inert idempotency-key fixtures; pinned to the exact test-only values and file so real credentials remain disallowed."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['idempotencyKey:\s*"notify-741-withheld(-direct)?"']
+  paths = [
+    '^services/chat-service/internal/storage/notification_outbox_promotion_postgres_test\.go$',
+  ]

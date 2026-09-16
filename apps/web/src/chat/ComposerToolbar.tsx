@@ -19,6 +19,13 @@ import type { Editor } from "@tiptap/core";
 
 import { useAnchoredPicker } from "./emoji/useAnchoredPicker";
 import { emptyEmojiUsage, type EmojiUsage } from "./emoji/emojiUsage";
+import MessagePriorityDialog from "./MessagePriorityDialog";
+import {
+  isDefaultPriorityIntent,
+  priorityTriggerLabel,
+  standardPriorityIntent,
+  type MessagePriorityIntent,
+} from "./messagePriority";
 
 /**
  * The picker and its catalog stay in the chunk the reactions already load, so
@@ -115,6 +122,22 @@ export interface ComposerToolbarProps {
   /** Controlled open state. Omitted, the toolbar manages its own. */
   pickerOpen?: boolean;
   onPickerOpenChange?: (open: boolean) => void;
+  /**
+   * What this message states about its own priority, and how to restate it
+   * (issue #822).
+   *
+   * One value rather than a control per flag: priority, the confirmation
+   * request (#824) and the persistent reminders (#825) are decided together in
+   * the popover this button opens, and a toolbar that could set one of them
+   * behind the others' backs is how a stale flag reaches the server. This
+   * absorbs the standalone acknowledgement toggle #824 left here for exactly
+   * this issue to take over.
+   *
+   * Omitted entirely by callers that do not support it (the inline editor), so
+   * the button simply is not drawn.
+   */
+  priority?: MessagePriorityIntent;
+  onPriorityChange?: (intent: MessagePriorityIntent) => void;
 }
 
 const noEmojiUse = () => undefined;
@@ -136,6 +159,73 @@ function useComposerEmoji(props: ComposerToolbarProps) {
     onToneChange: emoji?.onToneChange ?? noEmojiUse,
     onUsed: emoji?.onUsed ?? noEmojiUse,
   };
+}
+
+/**
+ * The priority button and the popover it owns (issue #822).
+ *
+ * Its own component, and its own open state, because the toolbar has no reason
+ * to know when a popover is open: the value is what the composer above cares
+ * about, and it arrives only through onChange. That also keeps the applied
+ * intent and the popover's draft in different components, so there is no way
+ * for an unapplied edit to leak upwards.
+ *
+ * Closing — Cancelar, Escape, a click outside or Aplicar — always hands focus
+ * back to this button, which is where the reader was before it opened.
+ */
+function ComposerPriorityControl({
+  intent,
+  disabled,
+  onChange,
+}: {
+  intent: MessagePriorityIntent;
+  disabled: boolean;
+  onChange: (intent: MessagePriorityIntent) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const stated = !isDefaultPriorityIntent(intent);
+
+  function close() {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        className={`composer-toolbar__btn${
+          stated ? ` composer-toolbar__btn--priority-${intent.priority}` : ""
+        }`}
+        // The whole applied state, in words: a screen reader hears the priority
+        // and the options that came with it, never the tint that also marks them.
+        aria-label={priorityTriggerLabel(intent)}
+        title={priorityTriggerLabel(intent)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        disabled={disabled}
+        data-testid="toolbar-priority-btn"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true" style={{ fontSize: 18 }}>
+          error
+        </span>
+      </button>
+      {open && (
+        <MessagePriorityDialog
+          intent={intent}
+          anchorRef={triggerRef}
+          onCancel={close}
+          onApply={(applied) => {
+            onChange(applied);
+            close();
+          }}
+        />
+      )}
+    </>
+  );
 }
 
 export default function ComposerToolbar(props: ComposerToolbarProps) {
@@ -205,6 +295,22 @@ export default function ComposerToolbar(props: ComposerToolbarProps) {
           </button>
         );
       })}
+
+      {/*
+        Issue #822. One button for the whole attention axis — priority, the
+        confirmation request and the persistent reminders — because they are
+        decided together and the server reads them together. It replaces the
+        standalone acknowledgement toggle #824 parked here until this popover
+        existed; the capability is unchanged, it simply lives inside the dialog
+        now instead of beside it.
+      */}
+      {props.onPriorityChange ? (
+        <ComposerPriorityControl
+          intent={props.priority ?? standardPriorityIntent}
+          disabled={disabled}
+          onChange={props.onPriorityChange}
+        />
+      ) : null}
 
       {/* ── Emoji button + picker ── */}
       <div className="composer-toolbar__wrap">

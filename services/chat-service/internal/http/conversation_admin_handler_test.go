@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
@@ -256,6 +257,210 @@ func TestDMHandler_LeaveGroup_RequiresAnAuthenticatedActorAndAWellFormedTarget(t
 			t.Fatalf("status = %d, calls = %d", recorder.Code, provider.leaveGroupCalls)
 		}
 	})
+}
+
+// ── Group admin removal (issue #685) ─────────────────────────────────────────
+
+const removeParticipantTargetID = "77777777-7777-7777-7777-777777777777"
+
+func groupRemoveParticipantRequest(conversationID, userID string) *http.Request {
+	r := requestWithUser(
+		http.MethodDelete, "/api/chat/dm/"+conversationID+"/participants/"+userID, nil,
+	)
+	r.Header.Set("Content-Type", "application/json")
+	r.SetPathValue("conversationID", conversationID)
+	r.SetPathValue("userID", userID)
+	return r
+}
+
+func removedParticipant() storage.RemoveGroupParticipantResult {
+	return storage.RemoveGroupParticipantResult{
+		Event: domain.Message{ID: "event-" + dmConversationID, Kind: domain.MessageKindSystem},
+	}
+}
+
+// The actor and the workspace come from the session, and the target comes
+// only from the path — never from a body, since there is none.
+func TestDMHandler_RemoveParticipant_DerivesActorWorkspaceAndTargetServerSide(t *testing.T) {
+	provider := &fakeDMProvider{removeParticipantResult: removedParticipant()}
+	recorder := httptest.NewRecorder()
+
+	dmTestHandler(provider).RemoveParticipant(
+		recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID),
+	)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", recorder.Code, recorder.Body)
+	}
+	if provider.lastRemoveParticipant.CallerID != msgTestUserID ||
+		provider.lastRemoveParticipant.WorkspaceID != testWorkspaceID ||
+		provider.lastRemoveParticipant.ConversationID != dmConversationID ||
+		provider.lastRemoveParticipant.TargetUserID != removeParticipantTargetID {
+		t.Fatalf("forwarded %+v", provider.lastRemoveParticipant)
+	}
+}
+
+func TestDMHandler_RemoveParticipant_RequiresAnAuthenticatedActorAndWellFormedTargets(t *testing.T) {
+	t.Run("anonymous", func(t *testing.T) {
+		provider := &fakeDMProvider{}
+		recorder := httptest.NewRecorder()
+		r := httptest.NewRequest(
+			http.MethodDelete, "/api/chat/dm/"+dmConversationID+"/participants/"+removeParticipantTargetID, nil,
+		)
+		r.SetPathValue("conversationID", dmConversationID)
+		r.SetPathValue("userID", removeParticipantTargetID)
+
+		dmTestHandler(provider).RemoveParticipant(recorder, r)
+
+		if recorder.Code != http.StatusUnauthorized || provider.removeParticipantCalls != 0 {
+			t.Fatalf("status = %d, calls = %d", recorder.Code, provider.removeParticipantCalls)
+		}
+	})
+
+	t.Run("malformed conversation id", func(t *testing.T) {
+		provider := &fakeDMProvider{}
+		recorder := httptest.NewRecorder()
+
+		dmTestHandler(provider).RemoveParticipant(
+			recorder, groupRemoveParticipantRequest("not-a-uuid", removeParticipantTargetID),
+		)
+
+		if recorder.Code != http.StatusBadRequest || provider.removeParticipantCalls != 0 {
+			t.Fatalf("status = %d, calls = %d", recorder.Code, provider.removeParticipantCalls)
+		}
+	})
+
+	t.Run("malformed target id", func(t *testing.T) {
+		provider := &fakeDMProvider{}
+		recorder := httptest.NewRecorder()
+
+		dmTestHandler(provider).RemoveParticipant(
+			recorder, groupRemoveParticipantRequest(dmConversationID, "not-a-uuid"),
+		)
+
+		if recorder.Code != http.StatusBadRequest || provider.removeParticipantCalls != 0 {
+			t.Fatalf("status = %d, calls = %d", recorder.Code, provider.removeParticipantCalls)
+		}
+	})
+}
+
+// A no-op removal (the target did not currently participate) still answers
+// 204, but publishes nothing — there is no event to announce.
+func TestDMHandler_RemoveParticipant_NoEvent_DoesNotPublish(t *testing.T) {
+	provider := &fakeDMProvider{removeParticipantResult: storage.RemoveGroupParticipantResult{}}
+	broadcast := &recordingBroadcaster{}
+	handler := dmTestHandlerWithLimiter(provider, &fakeDMRateLimiter{}).WithMembersBroadcast(broadcast)
+
+	recorder := httptest.NewRecorder()
+	handler.RemoveParticipant(recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID))
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", recorder.Code, recorder.Body)
+	}
+	if len(broadcast.conversationEvents) != 0 {
+		t.Fatalf("a no-op removal published %d event(s)", len(broadcast.conversationEvents))
+	}
+}
+
+// A committed removal publishes the event the service returned, so a live
+// viewer's timeline gains the entry without a reload.
+func TestDMHandler_RemoveParticipant_PublishesTheCommittedEvent(t *testing.T) {
+	provider := &fakeDMProvider{removeParticipantResult: removedParticipant()}
+	broadcast := &recordingBroadcaster{}
+	handler := dmTestHandlerWithLimiter(provider, &fakeDMRateLimiter{}).WithMembersBroadcast(broadcast)
+
+	recorder := httptest.NewRecorder()
+	handler.RemoveParticipant(recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID))
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204: %s", recorder.Code, recorder.Body)
+	}
+	if len(broadcast.conversationEvents) != 1 {
+		t.Fatalf("conversationEvents = %v, want exactly one publish", broadcast.conversationEvents)
+	}
+	got := broadcast.conversationEvents[0]
+	if got[1] != "dm" || got[2] != dmConversationID || got[3] != "event-"+dmConversationID {
+		t.Fatalf("published event = %v, want dm/%s/event-%s", got, dmConversationID, dmConversationID)
+	}
+}
+
+func TestDMHandler_RemoveParticipant_MapsRefusalsWithoutDescribingState(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "forbidden", err: domain.ErrForbidden, wantStatus: http.StatusForbidden},
+		{name: "not found", err: domain.ErrNotFound, wantStatus: http.StatusNotFound},
+		{name: "invalid input", err: domain.ErrInvalidInput, wantStatus: http.StatusBadRequest},
+		{name: "unexpected", err: errors.New("pq: deadlock detected (SQLSTATE 40P01)"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeDMProvider{removeParticipantErr: test.err}
+			recorder := httptest.NewRecorder()
+
+			dmTestHandler(provider).RemoveParticipant(
+				recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID),
+			)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+			if strings.Contains(recorder.Body.String(), "SQLSTATE") || strings.Contains(recorder.Body.String(), "deadlock") {
+				t.Fatalf("the response leaks database detail: %s", recorder.Body)
+			}
+		})
+	}
+}
+
+// Without a wired provider, the admin-removal path must fail the same way
+// every other DM/group endpoint does, rather than reach a nil provider.
+func TestDMHandler_RemoveParticipant_UnavailableWithoutDeps(t *testing.T) {
+	recorder := httptest.NewRecorder()
+
+	httpapi.NewDMHandler(nil, nil, nil).RemoveParticipant(
+		recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID),
+	)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+}
+
+// Group admin removal shares the group-admin budget: once it is spent, the
+// call must not reach the provider.
+func TestDMHandler_RemoveParticipant_EnforcesTheRateLimit(t *testing.T) {
+	provider := &fakeDMProvider{removeParticipantResult: removedParticipant()}
+	handler := dmTestHandlerWithLimiter(provider, &fakeDMRateLimiter{})
+
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 22; i++ {
+		last = httptest.NewRecorder()
+		handler.RemoveParticipant(last, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID))
+	}
+
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 once the budget is spent", last.Code)
+	}
+}
+
+// A workspace that cannot be resolved must refuse the removal before the
+// provider is ever called — the same guarantee every other DM write gives.
+func TestDMHandler_RemoveParticipant_MapsWorkspaceResolutionFailure(t *testing.T) {
+	provider := &fakeDMProvider{removeParticipantResult: removedParticipant()}
+	handler := httpapi.NewDMHandler(
+		&fakeWorkspaceResolver{err: errors.New("workspace lookup failed")}, provider, &fakeDMRateLimiter{},
+	)
+	recorder := httptest.NewRecorder()
+
+	handler.RemoveParticipant(recorder, groupRemoveParticipantRequest(dmConversationID, removeParticipantTargetID))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	if provider.removeParticipantCalls != 0 {
+		t.Fatal("the provider must not be called when the workspace cannot be resolved")
+	}
 }
 
 // ── Channel self-leave ──────────────────────────────────────────────────────

@@ -7,27 +7,32 @@
  * This one is the message list's own, and only for the four raster types
  * attachmentImageRules allows — SVG never reaches here.
  *
- * # Which bytes get fetched
+ * # Which bytes get fetched (issue #675)
  *
- * PNG and JPEG show the server's static preview when it is ready — the same
- * one AttachmentThumbnail already fetches, just drawn bigger. GIF and WebP are
- * different, and for different reasons (see attachmentImageRules): a GIF's
- * server preview is deliberately a single static frame, so animating it needs
- * the original; WebP has no server preview at all. Both are bounded by
- * MAX_INLINE_ORIGINAL_IMAGE_BYTES the same way AttachmentVideo bounds its own
- * blob fetch.
+ * The timeline draws derived previews and nothing else. A card is never worth
+ * an original: a screen of a busy channel would otherwise be tens of megabytes
+ * of full-resolution photographs to render thumbnails of them.
  *
- * PNG/JPEG fall back to that same original-fetch, under the same cap, when the
- * static preview is *not* ready — not only "unsupported"/"failed", but also
- * "pending". That last one matters more than it looks: a scan verdict
- * (`attachment.status`) reaching "clean" is pushed into an already-rendered
- * message over WebSocket, but a preview-worker completion is not — nothing
- * currently turns a message's `previewStatus: "pending"` into "ready" once the
- * message is on screen. Without this fallback, a PNG/JPEG sent in the current
- * session would sit on the loading skeleton until the conversation is
- * reloaded, even though the file itself is already clean and viewable. GIF and
- * WebP never had this problem because they never depend on `previewStatus` at
- * all.
+ * So a static image — PNG, JPEG, WebP alike — shows the server's preview when
+ * it is ready, and a shell when it is not. Two consequences are deliberate and
+ * were accepted with this issue:
+ *
+ * - a WebP has no server preview at all (see attachmentImageRules), so it draws
+ *   the file-type icon in the timeline. Opening it still shows the real image:
+ *   the viewer is where an original belongs, and AttachmentLightbox fetches it;
+ * - a PNG/JPEG whose preview is still "pending" keeps its skeleton until the
+ *   preview lands. A scan verdict is pushed over WebSocket but a preview-worker
+ *   completion is not, so an image sent in the current session can sit on that
+ *   skeleton until the conversation is reloaded. Fetching the original to cover
+ *   it is exactly the cost this issue exists to remove; the fix belongs in the
+ *   preview-ready notification, not here.
+ *
+ * The single exception is a GIF's animation, which has no derived form — the
+ * server's GIF preview is deliberately one static frame. So the animated
+ * original is fetched, under MAX_INLINE_ORIGINAL_IMAGE_BYTES, and *only while
+ * the row is actually on screen*. Scrolling away drops back to the static
+ * frame, which is what stops a timeline of GIFs from decoding in the
+ * background.
  *
  * # Reduced motion
  *
@@ -43,11 +48,8 @@
 
 import { type ReactNode, useState } from "react";
 
-import {
-  canShowOriginalInline,
-  isGifAttachment,
-  withinInlineOriginalCap,
-} from "./attachmentImageRules";
+import { canShowOriginalInline, isGifAttachment } from "./attachmentImageRules";
+import { useAttachmentGate } from "./lazyAttachment";
 import { useAttachmentBlobUrl } from "./useAttachmentBlobUrl";
 import { canShowPreview, isPreviewWorkPending } from "./useAttachmentPreview";
 import { usePrefersReducedMotion } from "./useReducedMotion";
@@ -57,9 +59,17 @@ import type { ChannelAttachment } from "./chatTypes";
 export interface AttachmentImageOpenPayload {
   /** The button the click/keypress came from — the lightbox returns focus here. */
   trigger: HTMLButtonElement;
-  /** Whichever URL the box was already showing, so the lightbox can reuse it. */
-  url: string;
-  /** True when `url` is already the original (GIF playing, or WebP). */
+  /**
+   * The bytes the box was already showing, so the viewer opens on them instead
+   * of a blank box.
+   *
+   * The blob rather than the object URL (issue #675): this card can be
+   * unmounted by the timeline's virtualization while the viewer is still open,
+   * and its URL is revoked on the way out. The blob outlives it, and the viewer
+   * mints — and revokes — an address of its own.
+   */
+  blob: Blob;
+  /** True when `blob` is already the original (GIF playing, or WebP). */
   isOriginal: boolean;
 }
 
@@ -84,34 +94,35 @@ export default function AttachmentImagePreview({
 }: AttachmentImagePreviewProps) {
   const gif = isGifAttachment(attachment);
   const reducedMotion = usePrefersReducedMotion();
+  // Issue #675: far from the viewport this stays a reserved box and fetches
+  // nothing. The gate never grants anything the rules below would have refused.
+  const gate = useAttachmentGate();
   // Not reset on an attachment change: the caller (MessageAttachments) keys
   // this component's parent by attachment.id, so a different attachment is
   // already a fresh mount with this back at its initial false — there is no
   // render in which the id changes under an existing instance.
   const [userPlayedGif, setUserPlayedGif] = useState(false);
 
-  const isWebp = attachment.contentType.toLowerCase() === "image/webp";
   const hasReadyPreview = canShowPreview(attachment);
 
-  // GIF/WebP always may use the original, unconditionally, for their own
-  // reasons (see the module comment). PNG/JPEG only fall back to it once the
-  // static preview turns out not to be ready — see the module comment on why
-  // that fallback is what keeps a freshly-sent image from stalling.
-  const gifOrWebpOriginal = canShowOriginalInline(attachment);
-  const pngJpegFallback =
-    !gif && !isWebp && !hasReadyPreview && withinInlineOriginalCap(attachment);
+  // The one original the timeline may still spend, and only while the row is
+  // genuinely on screen: a GIF's animation has no derived form. Everything
+  // else — PNG, JPEG, WebP — is preview-or-shell (issue #675).
+  const mayAnimate = canShowOriginalInline(attachment) && (!reducedMotion || userPlayedGif);
+  const animateGif = gif && mayAnimate && gate.proximity === "visible";
 
-  const animateGif = gif && gifOrWebpOriginal && (!reducedMotion || userPlayedGif);
-  const showOriginal = gif ? animateGif : isWebp ? gifOrWebpOriginal : pngJpegFallback;
+  const original = useAttachmentBlobUrl(attachment.id, animateGif, fetchAttachmentContent, {
+    priority: gate.priority,
+    active: gate.active,
+  });
 
-  const original = useAttachmentBlobUrl(attachment.id, showOriginal, fetchAttachmentContent);
-
-  // A GIF wants the static preview exactly when it is not currently showing
-  // the animated original; PNG/JPEG want it exactly when they are not falling
-  // back to the original; WebP never has one to want.
-  const wantsStaticPreview = gif ? !animateGif : !isWebp && !pngJpegFallback;
-  const previewEligible = wantsStaticPreview && hasReadyPreview;
-  const preview = useAttachmentBlobUrl(attachment.id, previewEligible, fetchAttachmentPreview);
+  // The static preview is what every card shows, except a GIF in the moment it
+  // is animating.
+  const previewEligible = !animateGif && hasReadyPreview;
+  const preview = useAttachmentBlobUrl(attachment.id, previewEligible, fetchAttachmentPreview, {
+    priority: gate.priority,
+    active: gate.active,
+  });
 
   if (attachment.status === "pending_scan") {
     return (
@@ -127,12 +138,13 @@ export default function AttachmentImagePreview({
     return null;
   }
 
-  if (showOriginal) {
+  if (animateGif) {
     if (original.failed) return <>{fallback}</>;
-    if (original.url === null) {
+    if (original.url === null || original.blob === null) {
       return <Skeleton attachmentId={attachment.id} />;
     }
     const url = original.url;
+    const blob = original.blob;
     return (
       <div className="chat-msg-area__attachment-preview">
         <button
@@ -140,7 +152,7 @@ export default function AttachmentImagePreview({
           className="chat-msg-area__attachment-preview-trigger"
           aria-label={`Ampliar ${attachment.filename}`}
           data-testid={`chat-message-attachment-image-${attachment.id}`}
-          onClick={(event) => onOpen({ trigger: event.currentTarget, url, isOriginal: true })}
+          onClick={(event) => onOpen({ trigger: event.currentTarget, blob, isOriginal: true })}
         >
           <img
             className="chat-msg-area__attachment-preview-img"
@@ -155,15 +167,18 @@ export default function AttachmentImagePreview({
     );
   }
 
-  if (wantsStaticPreview) {
-    if (preview.failed) return <>{fallback}</>;
-    if (preview.url === null) {
-      if (previewEligible || isPreviewWorkPending(attachment)) {
-        return <Skeleton attachmentId={attachment.id} />;
-      }
-      return <>{fallback}</>;
+  if (preview.failed) return <>{fallback}</>;
+  if (preview.url === null || preview.blob === null) {
+    // A shell, never an original: still loading, still being rendered by the
+    // preview worker, or waiting for this row to come near enough to ask.
+    if (previewEligible || isPreviewWorkPending(attachment)) {
+      return <Skeleton attachmentId={attachment.id} />;
     }
+    return <>{fallback}</>;
+  }
+  {
     const url = preview.url;
+    const blob = preview.blob;
     return (
       <div className="chat-msg-area__attachment-preview">
         <button
@@ -171,7 +186,7 @@ export default function AttachmentImagePreview({
           className="chat-msg-area__attachment-preview-trigger"
           aria-label={`Ampliar ${attachment.filename}`}
           data-testid={`chat-message-attachment-image-${attachment.id}`}
-          onClick={(event) => onOpen({ trigger: event.currentTarget, url, isOriginal: false })}
+          onClick={(event) => onOpen({ trigger: event.currentTarget, blob, isOriginal: false })}
         >
           <img
             className="chat-msg-area__attachment-preview-img"
@@ -182,7 +197,7 @@ export default function AttachmentImagePreview({
             onError={preview.onLoadError}
           />
         </button>
-        {gif && reducedMotion && !userPlayedGif && gifOrWebpOriginal && (
+        {gif && reducedMotion && !userPlayedGif && canShowOriginalInline(attachment) && (
           <button
             type="button"
             className="chat-msg-area__attachment-gif-toggle"
@@ -195,8 +210,6 @@ export default function AttachmentImagePreview({
       </div>
     );
   }
-
-  return <>{fallback}</>;
 }
 
 function Skeleton({ attachmentId }: { attachmentId: string }) {

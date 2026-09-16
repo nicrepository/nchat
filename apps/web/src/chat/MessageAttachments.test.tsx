@@ -229,6 +229,36 @@ describe("message attachments", () => {
     vi.unstubAllGlobals();
   });
 
+  it("saves an ordinary (non-voice) audio file's download as .mp3, matching what file-service always serves", async () => {
+    // Nic-Gravador compatibility task: file-service re-encodes every audio
+    // download to real MP3 regardless of the stored container, so the name
+    // the browser is offered must match — an .ogg file must not still be
+    // suggested as "clip.ogg" once the bytes it receives are genuinely MP3.
+    const user = userEvent.setup();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:att-1"),
+      revokeObjectURL: vi.fn(),
+    });
+
+    render(
+      <MessageAttachments
+        sentAt="2026-07-15T12:00:00.000Z"
+        attachments={[
+          attachment({ filename: "clip.ogg", contentType: "audio/ogg", status: "clean" }),
+        ]}
+      />,
+    );
+
+    await user.click(downloadButton() as HTMLElement);
+
+    await waitFor(() => expect(mockContent).toHaveBeenCalledWith("att-1"));
+    const anchor = click.mock.instances[0] as HTMLAnchorElement;
+    expect(anchor.download).toBe("clip.mp3");
+    vi.unstubAllGlobals();
+  });
+
   it("says a failed download failed, and keeps the row intact for another try", async () => {
     const user = userEvent.setup();
     mockContent.mockRejectedValue(new Error("403"));
@@ -552,18 +582,28 @@ describe("message attachments — image preview and lightbox", () => {
     expect(mockPreview).not.toHaveBeenCalled();
   });
 
-  it("wires a WebP attachment through to the original — there is no server preview for it", async () => {
+  it("leaves a WebP as a shell in the timeline — it has no derived preview, and the card is not worth an original", async () => {
     render(
       <MessageAttachments
         sentAt="2026-07-15T12:00:00.000Z"
         attachments={[
-          imageAttachment({ id: "webp-1", filename: "banner.webp", contentType: "image/webp" }),
+          imageAttachment({
+            id: "webp-1",
+            filename: "banner.webp",
+            contentType: "image/webp",
+            // The case that used to reach for the original: no derived preview
+            // exists for this file at all.
+            previewStatus: "unsupported",
+          }),
         ]}
       />,
     );
 
-    await screen.findByTestId("chat-message-attachment-image-webp-1");
-    expect(mockContent).toHaveBeenCalledWith("webp-1", expect.any(AbortSignal));
+    // The row itself still renders, with its name, size and Baixar action;
+    // issue #675 only removes the original download behind the picture.
+    await screen.findByTestId("chat-message-attachment-webp-1");
+    expect(screen.queryByTestId("chat-message-attachment-image-webp-1")).not.toBeInTheDocument();
+    expect(mockContent).not.toHaveBeenCalled();
   });
 
   it("groups contiguous images, keeps mixed document order and expands the +N remainder", async () => {
@@ -704,7 +744,9 @@ describe("message attachments — voice message download", () => {
     await waitFor(() => expect(mockContent).toHaveBeenCalledTimes(1));
     expect(mockContent).toHaveBeenCalledWith("voice-2");
     const anchor = click.mock.instances[0] as HTMLAnchorElement;
-    expect(anchor.download).toMatch(/^mensagem-de-voz-[\d-]+\.webm$/);
+    // file-service always re-encodes voice-message downloads to real MP3
+    // (Nic-Gravador compatibility task), regardless of the recorded container.
+    expect(anchor.download).toMatch(/^mensagem-de-voz-[\d-]+\.mp3$/);
   });
 
   it("does not start playback, and keeps the recording playable afterwards", async () => {

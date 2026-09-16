@@ -99,7 +99,12 @@ func NewNotificationWorker(cfg config.NotificationWorkerConfig, deps Notificatio
 	}
 	evaluator := deps.Evaluator
 	if evaluator == nil {
-		evaluator = DeliverEverything()
+		// The central policy, never a permissive stand-in. A missing Evaluator
+		// is a wiring omission, and the safe resolution of one is the authority
+		// every other caller already uses — not "deliver everything", which
+		// would make the absence of a policy indistinguishable from a policy
+		// that allowed it.
+		evaluator = NewPolicyEvaluator()
 	}
 	normalized := cfg.Normalized()
 	return &NotificationWorker{
@@ -163,8 +168,8 @@ func (w *NotificationWorker) Start(ctx context.Context) {
 	}
 }
 
-// runPass is one bounded unit of work: at most one batch evaluated and at most
-// one batch delivered.
+// runPass is one bounded unit of work: at most one batch of reminders
+// scheduled, at most one batch evaluated and at most one batch delivered.
 //
 // One pass per tick, deliberately. Draining the whole backlog in a loop would
 // turn a provider outage into a retry storm — every queued event attempted back
@@ -180,8 +185,84 @@ func (w *NotificationWorker) runPass() {
 
 	w.observeBacklog(ctx)
 	w.retireExhausted(ctx)
+	w.scheduleReminders(ctx)
+	w.retireResolvedReminders(ctx)
 	w.evaluatePending(ctx)
 	w.deliverDue(ctx)
+}
+
+// scheduleReminders produces the reminders that have come due (issue #825).
+//
+// It runs before evaluatePending on purpose: a reminder is an ordinary pending
+// outbox row, so scheduling it first lets the same pass put it through the
+// policy and deliver it, instead of leaving it a poll interval behind.
+//
+// The pass's own instant is what the scheduling rule reasons about, taken once
+// here and used for every row the statement touches, so one pass cannot judge
+// two recipients against two different clocks. UTC because the column is
+// timestamptz and the rest of this service normalises the same way.
+//
+// A failure is reported and the pass continues. Not scheduling this minute's
+// reminders delays them by one poll interval; refusing to drain the queue
+// because of it would delay everything else too.
+func (w *NotificationWorker) scheduleReminders(ctx context.Context) {
+	result, err := w.store.ScheduleDueReminders(ctx, time.Now().UTC(), w.cfg.BatchSize)
+	if err != nil {
+		w.logStoreFailure("schedule_reminders_failed")
+		return
+	}
+	w.metrics.Count(resultReminderScheduled, result.Scheduled)
+	w.metrics.Count(resultReminderDeduplicated, result.Deduplicated)
+	w.metrics.Count(resultReminderExpired, result.Expired)
+	w.logReminderPass(result)
+}
+
+// logReminderPass says what a scheduling pass did, at most once per pass.
+//
+// Per pass and never per recipient, which is the whole point: a message asking
+// two hundred people would otherwise write two hundred lines every five minutes,
+// and the retry of a failing delivery would multiply that again. #825 asks for
+// reminders to be observable without becoming log spam, and a count is what
+// that looks like.
+//
+// Silent when a pass found nothing, which is almost every pass in almost every
+// deployment. Info and not warning: reminders are the feature working. The two
+// counts that would worry an operator — repeats the index refused, requests that
+// ran out — are carried on the same line rather than raised, because a single
+// occurrence of either is normal and only a rate means anything.
+//
+// Counts only. No message id, no recipient, no workspace, no body: this line is
+// written every five minutes on a busy deployment, and an audit trail is not a
+// place to accumulate who is being paged about what.
+func (w *NotificationWorker) logReminderPass(result storage.ReminderScheduleResult) {
+	if result.Scheduled == 0 && result.Deduplicated == 0 && result.Expired == 0 {
+		return
+	}
+	w.logger.Info("urgent reminders scheduled",
+		"scheduled", result.Scheduled,
+		"deduplicated", result.Deduplicated,
+		"expired", result.Expired,
+		"worker_id", w.id)
+}
+
+// retireResolvedReminders suppresses reminders whose recipient answered after
+// they were scheduled (issue #825).
+//
+// It is cleanup and not enforcement: what stops such a reminder being delivered
+// is the predicate inside the claim, evaluated atomically with it. This keeps
+// the rows it leaves behind from sitting in the backlog for ever, and it runs
+// before the claim so the usual case is retired in the same pass it went stale.
+func (w *NotificationWorker) retireResolvedReminders(ctx context.Context) {
+	retired, err := w.store.SuppressResolvedReminders(ctx)
+	if err != nil {
+		w.logStoreFailure("suppress_resolved_reminders_failed")
+		return
+	}
+	if retired > 0 {
+		w.metrics.Count(resultReminderSuperseded, retired)
+		w.logger.Info("urgent reminders suppressed after their recipients resolved",
+			"count", retired, "worker_id", w.id)
+	}
 }
 
 // observeBacklog publishes the queue depth. A failure here is reported and
@@ -244,11 +325,44 @@ func (w *NotificationWorker) evaluateOne(ctx context.Context, event storage.Noti
 	if !verdict.Deliver {
 		state, result = notificationevent.StateSuppressed, resultSuppressed
 	}
+	w.logDecision(event.ID, state, verdict)
 	if err := w.store.MarkEvaluated(ctx, event.ID, state, verdict.Reason()); err != nil {
 		w.recordTransitionFailure("evaluate", event.ID, err)
 		return
 	}
 	w.metrics.Count(result, 1)
+}
+
+// logDecision records one policy decision against the notification it was about
+// (issue #744).
+//
+// It says "the policy produced this decision", and it is emitted *before*
+// MarkEvaluated for exactly that reason: every evaluation is observable,
+// including the ones whose write then loses a compare-and-set or hits a
+// database that is refusing. Emitting it afterwards made the two facts one, and
+// the decision that failed to persist — the case an operator most needs to see
+// — was the one that left no trace of which rules produced it.
+//
+// The two facts stay two events instead. What happened to the write is reported
+// by recordTransitionFailure, against the same notification_id, so a failed
+// persist is one correlation away from the decision that preceded it. A
+// notification decided twice logs twice, which is honest: it was decided twice.
+//
+// The policy version comes from the verdict, never from the build. During a
+// rollout two replicas run different rule sets, and "which rules decided this
+// notification" is exactly the question that cannot be answered from a version
+// the process stamped on itself.
+//
+// Every field is a reference or a closed vocabulary: an id, a version, a state,
+// a suppression code. No body, no recipient address, no subscription, no token
+// — the same restraint the outbox row itself is built on.
+func (w *NotificationWorker) logDecision(id string, state notificationevent.State, verdict Verdict) {
+	w.logger.Info("notification policy decision",
+		"notification_id", id,
+		"policy_version", verdict.PolicyVersion,
+		"state", string(state),
+		"reason", verdict.Reason(),
+		"worker_id", w.id)
 }
 
 // deliverDue claims a batch and delivers it.
@@ -354,7 +468,30 @@ func (w *NotificationWorker) recordOutcome(
 	}
 	return deliveryOutcome{result: resultRetry, category: category},
 		w.store.ScheduleRetry(ctx, notification.ID, notification.Attempt,
-			w.retry.Delay(notification.Attempt), category)
+			w.retryDelay(notification.Attempt, deliveryErr), category)
+}
+
+// retryDelay is when a failed attempt becomes due again.
+//
+// RetryPolicy decides it, and a provider that asked for longer gets it — as a
+// floor, bounded by the ceiling the configuration already sets:
+//
+//	max(backoff(attempt), Retry-After), capped at RetryMaxSeconds
+//
+// Both bounds are load-bearing. Taking the provider's value outright would let
+// a 429 answered with "1" replace an exponential backoff with a tight loop
+// against something that is already rate limiting us. Honouring it unbounded
+// would let one header park a notification past its own TTL, or past every
+// remaining attempt. Between those, the larger of the two respects a rate
+// limiter that genuinely needs more time than the backoff had reached, which is
+// the only thing Retry-After is for.
+func (w *NotificationWorker) retryDelay(attempt int, deliveryErr error) time.Duration {
+	delay := w.retry.Delay(attempt)
+	requested := requestedRetryDelay(deliveryErr)
+	if requested <= delay {
+		return delay
+	}
+	return min(requested, time.Duration(w.cfg.RetryMaxSeconds)*time.Second)
 }
 
 // logOutcome states what happened, in identifiers and categories only.

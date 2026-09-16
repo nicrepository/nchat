@@ -303,6 +303,7 @@ type Hub struct {
 	unregister      chan *Client
 	subReq          chan subscribeReq
 	revokeReq       chan revokeSubscriptionReq
+	recipientPolicy RecipientPolicy
 	bcast           chan broadcastReq
 	remoteBcast     chan broadcastReq // events received from the distributed bus
 	presenceSignal  chan struct{}     // capacity 1; wakes the presence fan-out
@@ -849,6 +850,51 @@ func (h *Hub) PublishConversationEvent(ctx context.Context, workspaceID string, 
 	}
 	if err := h.bus.Publish(ctx, evt); err != nil {
 		h.logger.WarnContext(ctx, "ws: conversation event bus publish failed", "error", err)
+	}
+}
+
+// PublishAcknowledgementUpdated broadcasts that one message's acknowledgement
+// changed (issue #824).
+//
+// Callers must invoke it only after the transition has committed, so nothing is
+// ever announced that the database did not accept.
+//
+// The event carries the route and the message id and stops there. Who answered,
+// how many are outstanding and which recipients they are travel over the
+// authorised HTTP read instead, where the server decides what this particular
+// reader may see — a broadcast has no such per-subscriber answer, so putting
+// the summary here would hand every subscriber the sender's view of it.
+//
+// Delivery follows conversation.event's route exactly: the local broadcast
+// queue re-checks each subscriber's authorization at fan-out, and the bus
+// publish is best-effort for other instances.
+func (h *Hub) PublishAcknowledgementUpdated(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID string,
+) {
+	if workspaceID == "" || targetID == "" || messageID == "" {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeAcknowledgementUpdated,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.acknowledgement_updated", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		h.logger.WarnContext(ctx, "ws: acknowledgement bus publish failed", "error", err)
 	}
 }
 
@@ -2609,7 +2655,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeConversationUpdated,
-		EventTypeConversationEvent, EventTypeAttachmentStatus,
+		EventTypeConversationEvent, EventTypeAcknowledgementUpdated, EventTypeAttachmentStatus,
 		EventTypePresenceUpdated, EventTypeTypingUpdated,
 		EventTypeCallRinging, EventTypeCallAccepted, EventTypeCallDeclined,
 		EventTypeCallCancelled, EventTypeCallTimedOut, EventTypeCallEnded:
@@ -3173,6 +3219,11 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 		return
 	}
 
+	// The delivery decision is per recipient, and this loop is the first place a
+	// recipient exists. See notification_policy_fanout.go: one query for the
+	// whole subscriber list, then the engine per recipient.
+	encodings := h.recipientEncodingsFor(req, subscriptions)
+
 	for _, subscription := range subscriptions {
 		c := subscription.client
 		if !h.subscriptionIsCurrent(subscription, key) {
@@ -3209,7 +3260,8 @@ func (h *Hub) handleBroadcast(req broadcastReq) {
 			continue
 		}
 
-		_, outboxFull := h.enqueueAuthorizedBroadcast(authCtx, subscription, key, req.data)
+		_, outboxFull := h.enqueueAuthorizedBroadcast(
+			authCtx, subscription, key, encodings.bytesFor(c.userID, req.data))
 		cancel()
 		if outboxFull {
 			// Outbox full: slow client. Drop connection and clean up.

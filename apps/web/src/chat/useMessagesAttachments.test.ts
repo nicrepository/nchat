@@ -114,6 +114,9 @@ describe("useMessages — attachments", () => {
       referencedMessageId: undefined,
       attachmentIds: ["att-1"],
       idempotencyKey: expect.any(String),
+      priority: "standard",
+      acknowledgementRequired: false,
+      persistentNotifications: false,
     });
     expect(result.current.state.messages[0]?.attachments).toEqual([attachment]);
   });

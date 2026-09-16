@@ -12,6 +12,7 @@ import (
 	"github.com/nicrepository/nchat/libs/go/platform/observability"
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 	httpapi "github.com/nicrepository/nchat/services/notification-service/internal/http"
+	"github.com/nicrepository/nchat/services/notification-service/internal/service"
 	"github.com/nicrepository/nchat/services/notification-service/internal/storage"
 	"github.com/nicrepository/nchat/services/notification-service/internal/worker"
 )
@@ -30,31 +31,31 @@ var (
 	}
 
 	// newNotificationDeliverer builds the channel the notification worker sends
-	// through (issue #742).
+	// through (issues #742, #746).
 	//
-	// It returns nil, and that is the honest state of the pipeline rather than an
-	// oversight. Web Push, the browser service worker and the e-mail digest are
-	// all explicitly out of this issue's scope, so no delivery channel for chat
-	// notifications exists yet — and a placeholder that "delivered" to a log line
-	// would be a fake in production, claiming recipients were told when nobody
-	// was. Until a real adapter lands here the worker declines to start and says
-	// why, which is a state an operator can see. Nothing else changes: the outbox
-	// keeps accumulating events, because that is precisely what a durable outbox
-	// is for.
-	newNotificationDeliverer = func(config.Config, *slog.Logger) worker.Deliverer {
-		return nil
-	}
-	newNotificationWorker = func(cfg config.Config, store storage.NotificationOutboxStore,
+	// Web Push is that channel, and it is the only one: a chat notification is
+	// delivered to the recipient's registered browsers or it is not delivered at
+	// all. The factory returns nil when it cannot be built, which is not a
+	// failure path bolted on — it is the same signal issue #742 designed the
+	// worker around. A worker with no channel declines to start and says why on
+	// the readiness probe, and the outbox keeps accumulating events, because
+	// that is precisely what a durable outbox is for.
+	newNotificationDeliverer = newWebPushDeliverer
+	newNotificationWorker    = func(cfg config.Config, store storage.NotificationOutboxStore,
 		deliverer worker.Deliverer, metrics *worker.NotificationMetrics, logger *slog.Logger) backgroundWorker {
-		return worker.NewNotificationWorker(cfg.NotificationWorker, worker.NotificationWorkerDeps{
-			Store:     store,
-			Deliverer: deliverer,
-			Metrics:   metrics,
-			Logger:    logger,
-		})
+		return worker.NewNotificationWorker(cfg.NotificationWorker,
+			notificationWorkerDeps(store, deliverer, metrics, logger))
 	}
 	startNotificationWorker = func(ctx context.Context, w backgroundWorker) {
 		w.Start(ctx)
+	}
+
+	// newTokenValidator builds the access-token validator the push subscription
+	// routes authenticate with (issue #745). A variable so a test can watch the
+	// wiring refuse an unusable configuration without owning a real secret.
+	newTokenValidator = func(cfg config.Config) (*httpapi.TokenValidator, error) {
+		return httpapi.NewTokenValidator(
+			cfg.AuthJWTHMACSecret, cfg.AuthJWTIssuer, cfg.AuthJWTAudience)
 	}
 )
 
@@ -264,10 +265,13 @@ func New(cfg config.Config) *App {
 	application.startNotificationWorker(cfg, pool, obsMetrics, logger)
 
 	application.Config = cfg
-	application.Handler = httpapi.NewRouter(cfg, logger,
+	options := []httpapi.Option{
 		httpapi.WithMetrics(obsMetrics),
 		httpapi.WithSMTPWorkerProbe(application.SMTPWorkerRunning),
-		httpapi.WithNotificationWorkerProbe(application.NotificationWorkerRunning))
+		httpapi.WithNotificationWorkerProbe(application.NotificationWorkerRunning),
+	}
+	application.Handler = httpapi.NewRouter(cfg, logger,
+		append(options, pushSubscriptionOptions(cfg, pool, logger)...)...)
 	application.TracingShutdown = shutdown
 	return application
 }
@@ -348,6 +352,27 @@ func (a *App) startSMTPWorker(cfg config.Config, pool storage.Pool, decryptor *e
 	logger.Info("smtp worker started")
 }
 
+// notificationWorkerDeps is what the production notification worker is built
+// with, and it exists as a named function so that one of those dependencies is
+// assertable: the policy.
+//
+// Evaluator is named here rather than left to the constructor's default, so the
+// production wiring says out loud which authority decides delivery (issue
+// #744). There is no other one to pass — the permissive stand-in that used to
+// live in the worker package is gone.
+func notificationWorkerDeps(
+	store storage.NotificationOutboxStore, deliverer worker.Deliverer,
+	metrics *worker.NotificationMetrics, logger *slog.Logger,
+) worker.NotificationWorkerDeps {
+	return worker.NotificationWorkerDeps{
+		Store:     store,
+		Evaluator: worker.NewPolicyEvaluator(),
+		Deliverer: deliverer,
+		Metrics:   metrics,
+		Logger:    logger,
+	}
+}
+
 // notificationDisabledReason names why the notification outbox worker cannot
 // run, or "" when it can. Each absence is its own logged reason rather than one
 // opaque failure, exactly as the SMTP worker's is.
@@ -364,7 +389,7 @@ func notificationDisabledReason(cfg config.Config, pool storage.Pool) string {
 // startNotificationWorker owns the decision to run the outbox worker: whether it
 // may, what it delivers through, and starting it.
 func (a *App) startNotificationWorker(
-	cfg config.Config, pool storage.Pool, metrics *observability.Metrics, logger *slog.Logger,
+	cfg config.Config, pool storage.Pool, obsMetrics *observability.Metrics, logger *slog.Logger,
 ) {
 	if !cfg.NotificationWorker.Enabled {
 		return
@@ -373,7 +398,11 @@ func (a *App) startNotificationWorker(
 		logger.Warn("notification worker disabled", "reason", reason)
 		return
 	}
-	deliverer := newNotificationDeliverer(cfg, logger)
+	// One NotificationMetrics for the worker and the channel it delivers
+	// through: both register on the shared registry, and building two would
+	// register the same collectors twice.
+	metrics := worker.NewNotificationMetrics(obsMetrics)
+	deliverer := newNotificationDeliverer(cfg, pool, metrics, logger)
 	if deliverer == nil {
 		// No channel to deliver through. Claiming events would move them into
 		// 'processing' and back out again with nothing sent, so the worker does
@@ -387,8 +416,13 @@ func (a *App) startNotificationWorker(
 	// pass is entitled to run and not a second less.
 	a.notification = a.launchWorker("notification",
 		newNotificationWorker(cfg, storage.NewPGXNotificationOutboxStore(pool),
-			deliverer, worker.NewNotificationMetrics(metrics), logger),
+			deliverer, metrics, logger),
 		startNotificationWorker, cfg.NotificationWorker.ProcessingBudget())
+	// No policy version here, deliberately. It belongs to a decision, not to a
+	// process: during a rollout two replicas run different rule sets, so a
+	// version stamped at startup would answer a question nobody asked and look
+	// like the answer to the one that matters. The worker logs it against each
+	// notification instead — see NotificationWorker.logDecision.
 	logger.Info("notification worker started")
 }
 
@@ -416,4 +450,74 @@ func (a *App) launchWorker(
 		start(ctx, w)
 	}()
 	return handle
+}
+
+// pushSubscriptionOptions mounts the Web Push subscription routes, or mounts
+// nothing and says why (issue #745).
+//
+// Both dependencies are hard requirements rather than degraded modes. Without a
+// database there is no session to validate a caller against and no table to
+// write; without a usable signing secret every token would be unverifiable. In
+// either case this returns no option at all, so the router never registers the
+// routes and a request for them is answered by the catch-all: 404. A surface
+// that answered anything else would be one authorising writes it could not
+// attribute to anybody.
+//
+// The refusal is in the log, not in the status code. An operator sees the reason
+// here; a client sees a route this build does not serve.
+func pushSubscriptionOptions(cfg config.Config, pool storage.Pool, logger *slog.Logger) []httpapi.Option {
+	if pool == nil {
+		logger.Warn("push subscription api disabled", "reason", "database_not_configured")
+		return nil
+	}
+	validator, err := newTokenValidator(cfg)
+	if err != nil {
+		// The reason is the category, never the configuration: naming the field
+		// that was short or missing would put a fact about the signing secret in
+		// a log line.
+		logger.Warn("push subscription api disabled", "reason", "access_token_validation_unavailable")
+		return nil
+	}
+	handler := httpapi.NewPushSubscriptionHandler(
+		service.NewPushSubscriptions(storage.NewPGXPushSubscriptionStore(pool)))
+	logger.Info("push subscription api enabled")
+	return []httpapi.Option{httpapi.WithPushSubscriptions(
+		validator, storage.NewPGXPrincipalResolver(pool), handler)}
+}
+
+// newWebPushDeliverer builds the Web Push channel, or reports why it cannot
+// (issue #746).
+//
+// Configuration is the whole of the decision, and it is made once here rather
+// than rediscovered on every send. A deployment with no VAPID keys, or with
+// keys that are not keys, gets no channel — so the worker does not start, the
+// readiness probe says so, and no half-configured send is ever attempted. The
+// reason names the variable and never its value: this function is the last
+// place a key could be turned into a log line, and it does not.
+func newWebPushDeliverer(
+	cfg config.Config, pool storage.Pool,
+	metrics *worker.NotificationMetrics, logger *slog.Logger,
+) worker.Deliverer {
+	if ready, reason := cfg.WebPush.Ready(); !ready {
+		logger.Warn("web push delivery disabled", "reason", reason)
+		return nil
+	}
+	if pool == nil {
+		logger.Warn("web push delivery disabled", "reason", "database_not_configured")
+		return nil
+	}
+	// The sender's HTTP timeout is the worker's own delivery budget. The
+	// delivery context bounds the fan-out to the same figure, so whichever
+	// expires first ends the attempt; the client's copy exists so a client
+	// without a context could not outlive the pass that owns it.
+	sender := worker.NewVAPIDSender(cfg.WebPush,
+		time.Duration(cfg.NotificationWorker.DeliveryTimeoutSeconds)*time.Second)
+	logger.Info("web push delivery enabled",
+		"ttl_seconds", cfg.WebPush.Normalized().TTLSeconds)
+	return worker.NewWebPushDeliverer(cfg.WebPush, worker.WebPushDeps{
+		Store:   storage.NewPGXPushDeliveryStore(pool),
+		Sender:  sender,
+		Metrics: metrics,
+		Logger:  logger,
+	})
 }

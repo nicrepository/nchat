@@ -1,8 +1,15 @@
 import { useCallback, useRef, useState } from "react";
 import type { FocusEvent as ReactFocusEvent, MouseEvent as ReactMouseEvent } from "react";
 
-import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
+import type { CallParticipantProfile } from "./chatApi";
+import type {
+  LinkSafetyRecheck,
+  MentionTarget,
+  Message,
+  MessageAcknowledgement,
+} from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
+import MessageAcknowledgementStrip from "./MessageAcknowledgement";
 import MessageContent from "./MessageContent";
 import MessageEditHistory from "./MessageEditHistory";
 import MessageToolbar from "./MessageToolbar";
@@ -10,6 +17,7 @@ import { formatTime, senderLabel } from "./messageDisplay";
 import { PersonAvatarImage } from "./PersonAvatarImage";
 import { presenceLabel, usePresence, type PresenceState } from "./presence";
 import PresenceDot from "./PresenceDot";
+import type { MentionInteraction } from "./RichTextRenderer";
 import { useMessageEditing } from "./useMessageEditing";
 
 function senderInitials(msg: Message): string {
@@ -58,6 +66,8 @@ export interface MessageBubbleProps {
   currentUserId: string;
   onOpenAuthorDM?: (message: Message) => void;
   openingAuthorDM?: boolean;
+  /** Opens a DM when a `@user` mention in the message body is clicked (issue #795). */
+  mentionInteraction?: MentionInteraction;
   reactionMenuVisible: boolean;
   onReactionMenuVisibleChange: (messageId: string, visible: boolean) => void;
   pickerOpen: boolean;
@@ -77,6 +87,31 @@ export interface MessageBubbleProps {
    * warning is the important half — the action is a convenience.
    */
   onReconcileLinkSafety?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
+  /**
+   * Issue #824. The server's own summary for this message, absent while it is
+   * still being read and for every message that asked nobody — which is almost
+   * all of them, so the strip below draws nothing at all in the common case.
+   */
+  acknowledgement?: MessageAcknowledgement;
+  /** True while this message's confirmation is in flight. */
+  acknowledging?: boolean;
+  /**
+   * Confirms receipt. Optional: without it the strip still reports the state,
+   * which is the half that matters — an action nobody wired is better absent
+   * than broken.
+   */
+  onAcknowledge?: (messageId: string) => void;
+  /**
+   * Issue #846. Reads this message's full per-recipient detail, for the
+   * details popover the sender's summary opens. Optional, like onAcknowledge:
+   * without it the summary counts still render, just without the popover.
+   */
+  onOpenAcknowledgementDetails?: (messageId: string) => void;
+  /** Issue #846. See TimelineRowContext.resolveRecipientIdentities. */
+  resolveRecipientIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
 }
 
 function MessageMeta({
@@ -277,7 +312,20 @@ function MessageBubbleBody({
           onQuoteJump={props.onQuoteJump}
           onReferenceJump={props.onReferenceJump}
           onReconcileLinkSafety={props.onReconcileLinkSafety}
+          mentionInteraction={props.mentionInteraction}
         />
+        {props.onAcknowledge ? (
+          <MessageAcknowledgementStrip
+            messageId={message.id}
+            acknowledgement={props.acknowledgement}
+            senderId={message.senderId}
+            currentUserId={props.currentUserId}
+            submitting={props.acknowledging ?? false}
+            onAcknowledge={props.onAcknowledge}
+            onOpenDetails={props.onOpenAcknowledgementDetails}
+            resolveIdentities={props.resolveRecipientIdentities}
+          />
+        ) : null}
       </div>
       <MessageToolbar
         message={message}

@@ -171,13 +171,3 @@ func TestVerdictReasonIsPresentExactlyWhenSuppressing(t *testing.T) {
 		t.Fatalf("reason = %q, want the policy's own", reason)
 	}
 }
-
-func TestDeliverEverythingSuppressesNothing(t *testing.T) {
-	verdict, err := DeliverEverything().Evaluate(context.Background(), Notification{ID: "n1"})
-	if err != nil {
-		t.Fatalf("Evaluate: %v", err)
-	}
-	if !verdict.Deliver || verdict.Reason() != "" {
-		t.Fatalf("verdict = %+v, want an unconditional delivery", verdict)
-	}
-}

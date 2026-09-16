@@ -42,13 +42,43 @@ type Runner interface {
 	Convert(context.Context, Format, []byte) ([]byte, error)
 }
 
-type Handler struct{ runner Runner }
+// AudioConverter re-encodes arbitrary audio (or an audio-only WebM/MP4
+// recording) into real MP3. Implemented by AudioRunner; a Handler with none
+// configured answers /v1/convert-audio with 503 rather than pretending the
+// route exists.
+type AudioConverter interface {
+	ConvertAudio(context.Context, AudioFormat, []byte) ([]byte, error)
+}
 
-func NewHandler(runner Runner) http.Handler { return &Handler{runner: runner} }
+type Handler struct {
+	runner      Runner
+	audioRunner AudioConverter
+}
+
+// HandlerOption configures an optional dependency on NewHandler without
+// disturbing its existing single-argument call sites.
+type HandlerOption func(*Handler)
+
+// WithAudioConverter wires the /v1/convert-audio route to a real converter.
+func WithAudioConverter(audio AudioConverter) HandlerOption {
+	return func(h *Handler) { h.audioRunner = audio }
+}
+
+func NewHandler(runner Runner, opts ...HandlerOption) http.Handler {
+	h := &Handler{runner: runner}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && (r.URL.Path == "/healthz" || r.URL.Path == "/readyz") {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/convert-audio" {
+		h.serveConvertAudio(w, r)
 		return
 	}
 	if r.Method != http.MethodPost || r.URL.Path != "/v1/convert" {
@@ -105,6 +135,105 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// pattern file-service's attachment_handler.go uses (see streamExactly) —
 	// avoids the exact taint shape gosec's G705 looks for.
 	_, _ = io.Copy(w, bytes.NewReader(pdf))
+}
+
+// serveConvertAudio re-encodes an uploaded audio/voice-message container into
+// real MP3 (Nic-Gravador compatibility task). It mirrors ServeHTTP's /v1/convert
+// path exactly: read bounded, sanity-check the container before ever invoking
+// the external process, classify the runner's own error, then sanity-check
+// the *output* too before ever answering 200 with it — a corrupt or
+// non-MP3 result is never served as a success.
+func (h *Handler) serveConvertAudio(w http.ResponseWriter, r *http.Request) {
+	if h.audioRunner == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
+	format := AudioFormat(strings.ToLower(strings.TrimSpace(r.Header.Get("X-Audio-Format"))))
+	if !format.valid() {
+		writeError(w, http.StatusUnprocessableEntity, "blocked")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxAudioInputBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_audio")
+		return
+	}
+	if len(body) > MaxAudioInputBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "output_too_large")
+		return
+	}
+	if err := validateAudio(format, body); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "blocked")
+		return
+	}
+	mp3, err := h.audioRunner.ConvertAudio(r.Context(), format, body)
+	if err != nil {
+		status, code := http.StatusInternalServerError, "conversion_failed"
+		switch {
+		case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+			status, code = http.StatusGatewayTimeout, "timeout"
+		case errors.Is(err, ErrOutputTooLarge):
+			status, code = http.StatusUnprocessableEntity, "output_too_large"
+		case errors.Is(err, ErrBlocked):
+			status, code = http.StatusUnprocessableEntity, "blocked"
+		}
+		writeError(w, status, code)
+		return
+	}
+	if len(mp3) > MaxAudioOutputBytes {
+		writeError(w, http.StatusUnprocessableEntity, "output_too_large")
+		return
+	}
+	if !validMP3(mp3) {
+		writeError(w, http.StatusInternalServerError, "conversion_failed")
+		return
+	}
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Length", fmt.Sprint(len(mp3)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, bytes.NewReader(mp3))
+}
+
+// validateAudio is a cheap magic-byte sanity gate run before the body ever
+// reaches ffmpeg — not a demuxer-level validator (ffmpeg itself is that), but
+// enough to refuse an obviously mislabeled or empty payload for free.
+func validateAudio(format AudioFormat, data []byte) error {
+	if len(data) == 0 {
+		return ErrBlocked
+	}
+	switch format {
+	case AudioFormatOgg:
+		if len(data) < 4 || !bytes.Equal(data[:4], []byte("OggS")) {
+			return ErrBlocked
+		}
+	case AudioFormatWav:
+		if len(data) < 12 || !bytes.Equal(data[:4], []byte("RIFF")) || !bytes.Equal(data[8:12], []byte("WAVE")) {
+			return ErrBlocked
+		}
+	case AudioFormatWebM:
+		if len(data) < 4 || !bytes.Equal(data[:4], []byte{0x1A, 0x45, 0xDF, 0xA3}) {
+			return ErrBlocked
+		}
+	case AudioFormatMP4:
+		if len(data) < 8 || !bytes.Equal(data[4:8], []byte("ftyp")) {
+			return ErrBlocked
+		}
+	default:
+		return ErrBlocked
+	}
+	return nil
+}
+
+// validMP3 reports whether data begins with an ID3v2 tag or an MPEG audio
+// frame sync word — the same shape check the client side of this route
+// (file-service's converter.Client) repeats on the response it receives, so
+// neither side ever treats an arbitrary byte string as a successful MP3.
+func validMP3(data []byte) bool {
+	if bytes.HasPrefix(data, []byte("ID3")) {
+		return true
+	}
+	return len(data) >= 2 && data[0] == 0xFF && data[1]&0xE0 == 0xE0
 }
 
 func (f Format) valid() bool {

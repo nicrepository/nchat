@@ -34,7 +34,10 @@ func TestPGXDeviceSessionStore_ListSessions_ReturnsMappedRows(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	deviceID := "device-uuid-1"
 
-	mock.ExpectQuery(`SELECT id, device_id`).
+	// host(), not ::text: inet::text appends "/32", which the handler's
+	// net.ParseIP-based mask rejects (issue #859; proven against PostgreSQL in
+	// device_session_pg_integration_test.go).
+	mock.ExpectQuery(`SELECT id, device_id.*host\(ip_address\), user_agent`).
 		WithArgs("user-1", false, 50).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "device_id", "created_at", "last_seen_at",

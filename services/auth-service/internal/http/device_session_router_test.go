@@ -166,6 +166,63 @@ func TestDeleteAllMySessions_InvalidCurrentSessionDoesNotRevokeOthers(t *testing
 	}
 }
 
+// This covers router wiring only: a valid Bearer token and UUID sid accepted
+// by the SessionManager reach GetMySessions. It does not exercise persisted
+// session state or prove that the DEV runtime has a coherent session row.
+func TestGetMySessions_ValidCurrentSession_Returns200ThroughRealRouter(t *testing.T) {
+	cfg := testConfigWithJWT()
+	userID := "123e4567-e89b-12d3-a456-426614174600"
+	sessionID := "123e4567-e89b-12d3-a456-426614174601"
+	token := signRouterAccessToken(t, cfg, userID, sessionID)
+	stub := &routerDeviceSessionStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, RouteAuthMeSessions, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if stub.lastValidateUserID != userID || stub.lastValidateSessionID != sessionID {
+		t.Fatalf("validated (%q, %q), want (%q, %q)", stub.lastValidateUserID, stub.lastValidateSessionID, userID, sessionID)
+	}
+	if stub.listSessionsCalls != 1 {
+		t.Fatalf("expected 1 listSessions call, got %d", stub.listSessionsCalls)
+	}
+	wantSequence := "validate,listSessions"
+	if got := strings.Join(stub.sequence, ","); got != wantSequence {
+		t.Fatalf("expected validation before listing, got %s", got)
+	}
+}
+
+// Like the GET test above, this proves only that accepted token context reaches
+// the handler and supplies the current sid; persistence remains stubbed.
+func TestDeleteAllMySessions_ValidCurrentSession_Returns204ThroughRealRouter(t *testing.T) {
+	cfg := testConfigWithJWT()
+	userID := "123e4567-e89b-12d3-a456-426614174700"
+	currentSID := "123e4567-e89b-12d3-a456-426614174701"
+	token := signRouterAccessToken(t, cfg, userID, currentSID)
+	stub := &routerDeviceSessionStub{}
+	router := NewRouter(cfg, platformlog.New("auth-service", "test"), nil, nil, nil, nil, nil, nil, stub, stub, nil, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, RouteAuthMeSessions, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if stub.lastExceptSessionID != currentSID {
+		t.Fatalf("expected current session %q preserved, got %q", currentSID, stub.lastExceptSessionID)
+	}
+	if stub.revokeAllCalls != 1 {
+		t.Fatalf("expected 1 revokeAll call, got %d", stub.revokeAllCalls)
+	}
+}
+
 func TestDeleteMySession_CurrentActiveSessionCanRevokeItself(t *testing.T) {
 	cfg := testConfigWithJWT()
 	userID := "123e4567-e89b-12d3-a456-426614174300"

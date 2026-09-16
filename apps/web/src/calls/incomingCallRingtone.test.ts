@@ -55,7 +55,7 @@ describe("incomingCallRingtone", () => {
 
     startIncomingCallRingtone("call-1");
 
-    expect(AudioMock).toHaveBeenCalledWith("/sounds/incoming-call.wav");
+    expect(AudioMock).toHaveBeenCalledWith("/sounds/nchat_lumen_incoming_call.wav");
     expect(audio.preload).toBe("auto");
     expect(audio.loop).toBe(false);
     expect(audio.currentTime).toBe(0);
@@ -176,6 +176,22 @@ describe("incomingCallRingtone", () => {
 
     expect(audio.play).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("preview replaces itself rather than layering a second copy", async () => {
+    const audio = fakeAudio();
+    const AudioMock = stubAudio(() => audio);
+    const { playIncomingCallRingtonePreview } = await import("./incomingCallRingtone");
+
+    playIncomingCallRingtonePreview();
+    playIncomingCallRingtonePreview();
+
+    // One element for both presses — exclusivity rewinds what is already
+    // playing instead of building a second ringtone over it.
+    expect(AudioMock).toHaveBeenCalledOnce();
+    expect(audio.pause).toHaveBeenCalledOnce();
+    expect(audio.play).toHaveBeenCalledTimes(2);
+    expect(audio.currentTime).toBe(0);
   });
 
   it("does not start automatic playback when its independent preference is off", async () => {

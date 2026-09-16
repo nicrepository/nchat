@@ -467,3 +467,147 @@ func TestPGXDMStore_LeaveGroupConversation_PropagatesFailures(t *testing.T) {
 		}
 	})
 }
+
+// ── Admin removal (issue #685) ───────────────────────────────────────────────
+
+const adminTarget = "user-2"
+
+// expectCreatorLocks registers the locks RemoveGroupParticipant always takes
+// before it may touch anything: the conversation FOR SHARE (this operation
+// never writes that row), then the actor's own participation and workspace
+// membership, both FOR SHARE — mirroring lockGroupForActor's order plus the
+// one extra fact this operation's authorization needs, created_by.
+func expectCreatorLocks(mock pgxmock.PgxPoolIface, callerID, createdBy string) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+		WithArgs(adminConv, adminWS).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "created_by"}).AddRow(adminConv, createdBy))
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dm\.status = 'active'.*FOR SHARE OF dm`).
+		WithArgs(adminConv, callerID).
+		WillReturnRows(pgxmock.NewRows([]string{"participates"}).AddRow(true))
+	mock.ExpectQuery(`(?s)FROM chat\.workspace_members wm.*wm\.status = 'active'.*FOR SHARE OF wm`).
+		WithArgs(adminWS, callerID).
+		WillReturnRows(pgxmock.NewRows([]string{"authorized"}).AddRow(true))
+}
+
+// The creator removing someone else: the target's participation is the only
+// row taken FOR UPDATE, since it is the only one this operation writes.
+func TestPGXDMStore_RemoveGroupParticipant_CreatorRemovesAnotherParticipant(t *testing.T) {
+	mock := newMock(t)
+	expectCreatorLocks(mock, adminActor, adminActor)
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dm\.status = 'active'.*FOR UPDATE OF dm`).
+		WithArgs(adminConv, adminTarget).
+		WillReturnRows(pgxmock.NewRows([]string{"participates"}).AddRow(true))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{adminTarget}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow(adminTarget, "Target"))
+	mock.ExpectQuery(`INSERT INTO chat\.messages`).
+		WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
+			string(domain.ConversationEventMemberRemoved), pgxmock.AnyArg()).
+		WillReturnRows(groupEventRows(domain.ConversationEventMemberRemoved))
+	mock.ExpectExec(`(?s)UPDATE chat\.dm_members.*SET status = 'left', left_at = now\(\).*status = 'active'`).
+		WithArgs(adminConv, adminTarget).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, adminTarget)
+	if err != nil {
+		t.Fatalf("RemoveGroupParticipant: %v", err)
+	}
+	if result.Event.EventType != string(domain.ConversationEventMemberRemoved) {
+		t.Fatalf("event = %+v, want a member-removed event", result.Event)
+	}
+	checkExpectations(t, mock)
+}
+
+// A participant who did not create the group is refused before the target's
+// row is ever touched — creatorship is the whole authority here, unlike a
+// channel, which has no admin/moderator role to fall back on.
+func TestPGXDMStore_RemoveGroupParticipant_RefusesANonCreator(t *testing.T) {
+	mock := newMock(t)
+	expectCreatorLocks(mock, adminActor, "user-9")
+	mock.ExpectRollback()
+
+	_, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, adminTarget)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("error = %v, want ErrForbidden", err)
+	}
+	checkExpectations(t, mock)
+}
+
+// Removing a user who does not currently participate is a no-op: nothing is
+// written, so there is nothing to announce, but the read-only locks taken to
+// establish that are still committed rather than rolled back as a failure.
+func TestPGXDMStore_RemoveGroupParticipant_TargetNotAParticipant_NoEvent(t *testing.T) {
+	mock := newMock(t)
+	expectCreatorLocks(mock, adminActor, adminActor)
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dm\.status = 'active'.*FOR UPDATE OF dm`).
+		WithArgs(adminConv, adminTarget).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectCommit()
+
+	result, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, adminTarget)
+	if err != nil {
+		t.Fatalf("a non-participant target should be idempotent, got: %v", err)
+	}
+	if result.Event.ID != "" {
+		t.Fatalf("event = %+v, want zero value for a no-op removal", result.Event)
+	}
+	checkExpectations(t, mock)
+}
+
+// A failure writing the event rolls back the membership update too, so a
+// removed participant never exists without the event describing it.
+func TestPGXDMStore_RemoveGroupParticipant_RollsBackWhenEventInsertFails(t *testing.T) {
+	mock := newMock(t)
+	expectCreatorLocks(mock, adminActor, adminActor)
+	mock.ExpectQuery(`(?s)FROM chat\.dm_members dm.*dm\.status = 'active'.*FOR UPDATE OF dm`).
+		WithArgs(adminConv, adminTarget).
+		WillReturnRows(pgxmock.NewRows([]string{"participates"}).AddRow(true))
+	mock.ExpectQuery(`(?s)FROM unnest\(\$1::uuid\[\]\) WITH ORDINALITY.*LEFT JOIN auth\.users`).
+		WithArgs([]string{adminTarget}).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id", "display_name"}).AddRow(adminTarget, "Target"))
+	mock.ExpectQuery(`INSERT INTO chat\.messages`).
+		WithArgs(adminWS, pgxmock.AnyArg(), pgxmock.AnyArg(), adminActor,
+			string(domain.ConversationEventMemberRemoved), pgxmock.AnyArg()).
+		WillReturnError(errors.New("event insert failed"))
+	mock.ExpectRollback()
+
+	if _, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, adminTarget); err == nil {
+		t.Fatal("expected the event insert failure to surface")
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXDMStore_RemoveGroupParticipant_UnlockableConversationIsNotFound(t *testing.T) {
+	mock := newMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)FROM chat\.dm_conversations dc.*dc\.type = 'group'.*FOR SHARE OF dc`).
+		WithArgs(adminConv, adminWS).
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
+
+	_, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, adminTarget)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("error = %v, want ErrNotFound", err)
+	}
+	checkExpectations(t, mock)
+}
+
+func TestPGXDMStore_RemoveGroupParticipant_RefusesAnEmptyActorOrTargetWithoutATransaction(t *testing.T) {
+	mock := newMock(t)
+	if _, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, "", adminTarget); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("empty actor: error = %v, want ErrForbidden", err)
+	}
+	if _, err := storage.NewPGXDMStore(mock).RemoveGroupParticipant(
+		context.Background(), adminWS, adminConv, adminActor, ""); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("empty target: error = %v, want ErrForbidden", err)
+	}
+	checkExpectations(t, mock)
+}

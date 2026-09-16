@@ -18,8 +18,14 @@ import { normalizeChatTargetId } from "./chatTargetId";
 import type { DMConversation, MentionTarget } from "./chatTypes";
 import type { CodecFormat } from "./tiptapSerializer";
 import { presenceTargetKey } from "./presence";
+import { noopConversationDrafts } from "./useConversationDrafts";
 
-const emptyOutletContext: ChatOutletContext = { currentUserId: "", channels: [], dms: [] };
+const emptyOutletContext: ChatOutletContext = {
+  currentUserId: "",
+  channels: [],
+  dms: [],
+  drafts: noopConversationDrafts,
+};
 
 function safeDecodeURIComponent(value: string): string {
   try {
