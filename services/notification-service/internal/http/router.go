@@ -93,7 +93,7 @@ func NewRouter(cfg config.Config, logger *slog.Logger, opts ...Option) http.Hand
 	mux.Handle(RouteReadyz, httputil.MethodNotAllowed(http.MethodGet, Readyz(cfg, options)))
 	mux.Handle(RouteVersion, httputil.MethodNotAllowed(http.MethodGet, Version(cfg)))
 	mux.Handle(RouteMetrics, metrics.Handler())
-	mountPushSubscriptionRoutes(mux, options)
+	mountPushSubscriptionRoutes(mux, cfg, options)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "not found")
 	})
@@ -102,7 +102,8 @@ func NewRouter(cfg config.Config, logger *slog.Logger, opts ...Option) http.Hand
 	return httputil.Recover(httputil.RequestID(httputil.SecurityHeaders(obs(mux))))
 }
 
-// mountPushSubscriptionRoutes registers the three push subscription routes.
+// mountPushSubscriptionRoutes registers the push subscription routes and the
+// push configuration they depend on.
 //
 // Every one of them goes through Authenticate, and there is no branch here that
 // mounts a handler without it: a route that could ever be reached unauthenticated
@@ -115,11 +116,15 @@ func NewRouter(cfg config.Config, logger *slog.Logger, opts ...Option) http.Hand
 // produce, because WithPushSubscriptions takes all three together; should a
 // caller construct it anyway, Authenticate refuses every request with 503 rather
 // than letting one through.
-func mountPushSubscriptionRoutes(mux *http.ServeMux, options routerOptions) {
+func mountPushSubscriptionRoutes(mux *http.ServeMux, cfg config.Config, options routerOptions) {
 	if options.pushSubscriptions == nil {
 		return
 	}
 	authenticate := Authenticate(options.tokenValidator, options.principalResolver)
+	// Mounted with the subscription routes and never without them: a key a
+	// browser cannot register a subscription for is a key it has no use for.
+	mux.Handle("GET "+RoutePushConfig,
+		authenticate(PushConfig(cfg, options.notificationWorkerProbe)))
 	mux.Handle("POST "+RoutePushSubscriptions,
 		authenticate(http.HandlerFunc(options.pushSubscriptions.Register)))
 	mux.Handle("GET "+RoutePushSubscriptions,

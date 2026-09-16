@@ -339,6 +339,36 @@ describe("notificationPresentation — the presentation matrix", () => {
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
+  // Issue #862: the page's half of the matrix, under the decision the realtime
+  // path actually publishes (web_push is always denied there — PresenceConnected,
+  // no push capability). The page never raises an OS notification of its own, so
+  // the Service Worker's push is the only one; and it draws the toast only when
+  // the window is visible *and* focused, which is exactly when sw.js suppresses
+  // the push. Visible without focus and hidden are both left to the push.
+  it.each([
+    ["visible and focused", "visible" as const, true, true],
+    ["visible but not focused", "visible" as const, false, false],
+    ["hidden", "hidden" as const, false, false],
+  ])(
+    "%s: toast only with focus, and never an OS surface of its own",
+    async (_, visibility, hasFocus, toast) => {
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue(visibility);
+      vi.spyOn(document, "hasFocus").mockReturnValue(hasFocus);
+      const { presentLiveMessageNotification } = await import("./notificationPresentation");
+      const surfaces = sinks();
+
+      void presentLiveMessageNotification(
+        event({ policy: policy({ in_app: "allow", sound: "allow", web_push: "deny" }) }),
+        context(),
+        surfaces,
+      );
+      await flush();
+
+      expect(surfaces.showInApp).toHaveBeenCalledTimes(toast ? 1 : 0);
+      expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    },
+  );
+
   it("never raises the OS surface over a window that is already in front", async () => {
     const { presentLiveMessageNotification } = await import("./notificationPresentation");
 

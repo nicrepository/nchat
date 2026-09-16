@@ -104,6 +104,51 @@ recusada por construcao: e para isso que `v` existe.
 > fechado; a alternativa seria mostrar algo derivado de um payload que nao
 > satisfaz o contrato.
 
+### Janela visivel e focada: nada (#862)
+
+Antes de mostrar, o worker pergunta `clients.matchAll({ type: "window",
+includeUncontrolled: true })`. So uma janela da propria origem com
+`visibilityState === "visible"` **e** `focused === true` faz o push terminar
+sem notificacao. E o mesmo teste que a pagina aplica antes de desenhar um toast
+(`isWindowFocused` em `notificationPresentation.ts`): uma pagina visivel e
+focada apresenta o que ve chegar — nada na conversa aberta, toast em outra —, e
+uma notificacao de SO por cima seria o alerta redundante que a #678 proibe. A
+outbox nao carrega sessao, entao o worker nao sabe qual conversa a pagina
+mostra; "existe janela visivel e focada" e o teste inteiro.
+
+Falha da Clients API conta como "nenhuma janela": suprimir por engano perde a
+notificacao, nao suprimir custa uma duplicata.
+
+### Visivel sem foco, ou oculta: o push
+
+Uma janela visivel mas sem foco, ou oculta, nao desenha toast
+(`shouldExecuteInAppNotification` exige foco), e a pagina nunca levanta uma
+notificacao de SO propria no backend atual: `showBrowserMessageNotification` so
+roda quando a decisao realtime autoriza `web_push`, e o chat-service nunca
+autoriza — o contexto do fan-out WebSocket e `PresenceConnected` com
+`WebPushAvailable` falso, e `surface(PresenceConnected)` do Policy Engine so
+admite `in_app` e `sound`. Nesses dois casos a notificacao do push e a unica
+superficie visual, entao o worker a mostra, e nao ha segunda notificacao de SO.
+
+| Janela do NChat       | Service Worker (push) | Toast da pagina              | Notificacao de SO da pagina |
+| --------------------- | --------------------- | ---------------------------- | --------------------------- |
+| visivel e focada      | suprime               | sim, fora da conversa aberta | nunca                       |
+| visivel sem foco      | mostra                | nao                          | nunca                       |
+| oculta                | mostra                | nao                          | nunca                       |
+| nenhuma (aba fechada) | mostra                | —                            | —                           |
+
+O som local continua sendo decidido pela pagina (policy, preferencia,
+cooldown) e pode tocar nos casos sem foco ao lado da notificacao do push. Isso e
+decisao de presenca do Policy Engine (#744/#749), que hoje nao observa foco nem
+visibilidade; esta camada nao a refaz.
+
+Testado dos dois lados: os casos de janela em `serviceWorker.test.ts` (focada,
+visivel sem foco, oculta, varias janelas), a matriz de atencao em
+`notificationPresentation.test.ts` e
+`TestRealtimeDecisionNeverAuthorisesTheOSSurfaceForAnyRecipient` no chat-service
+(mencao, resposta, mensagem de canal e DM). A apresentacao real no SO nao foi
+validada em browser.
+
 ### O que a notificacao mostra
 
 Titulo por `type`, escrito no proprio worker, de um conjunto fechado; tipo
@@ -186,5 +231,5 @@ desta issue.
 - Sem deep link por conversa, pelo motivo acima.
 - Sem cache, sem handler de `fetch`, sem offline. O worker existe para
   notificacao; PWA offline e outro assunto e outra issue.
-- Sem reconcile de `PushSubscription` no frontend (#745 entregou o backend); o
-  worker registra, mas ninguem ainda se inscreve.
+- A inscricao existe desde a #748, pelo reconcile do browser; este worker
+  continua sem saber quem se inscreveu.

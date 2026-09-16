@@ -7,6 +7,8 @@ trap 'rm -rf "$RENDERED_DIR"' EXIT
 export NCHAT_DEV_TOPOLOGY_FILE="${NCHAT_DEV_TOPOLOGY_FILE:-$ROOT_DIR/scripts/ci/testdata/nchat-dev-topology.env}"
 # shellcheck source=scripts/deploy/nchat-dev/lib.sh
 source "$ROOT_DIR/scripts/deploy/nchat-dev/lib.sh"
+# shellcheck source=scripts/ci/lib/k8s-public-egress.sh
+source "$ROOT_DIR/scripts/ci/lib/k8s-public-egress.sh"
 prepare_deploy_tree "$ROOT_DIR" "$RENDERED_DIR/tree"
 NCHAT_DEV_APPLICATION_OVERLAY="$RENDERED_DIR/tree/infra-k8s/overlays/nchat-dev-server"
 
@@ -625,14 +627,12 @@ validate_nchat_dev() {
   if grep -q 'secretRef:' "$application" "$data" "$migrations"; then return 1; fi
   if grep -q 'REPLACE_ME_' "$application" "$data" "$migrations"; then return 1; fi
   if grep -Eq 'port: 3478|containerPort: 3478' "$application" "$data" "$migrations"; then return 1; fi
-  # Public-internet egress is intentionally limited to exactly two policies:
-  # LiveKit API and RF-21 Cloudflare URL Scanner. Each policy is validated
-  # independently below; any additional 0.0.0.0/0 occurrence must fail CI.
+  # Public-internet egress is limited to the named policies in
+  # PUBLIC_INTERNET_EGRESS_POLICIES. Each is validated on its own below; any
+  # other 0.0.0.0/0 occurrence must fail CI.
   if grep -Eq '0\.0\.0\.0/0' "$data" "$migrations"; then return 1; fi
-  if [[ "$(grep -Ec '^[[:space:]]+cidr: 0\.0\.0\.0/0$' "$application")" -ne 2 ]]; then
-    echo "error: 0.0.0.0/0 is allowed exactly twice, for LiveKit API and link-safety egress" >&2
-    return 1
-  fi
+  validate_public_internet_egress_allowlist "$application"
+  validate_notification_webpush_egress "$application"
   if grep -R -Eq '/containers/0|/env/-' "$ROOT_DIR/infra/k8s/overlays/nchat-dev-server"; then return 1; fi
 
   policy_block="$(yaml_document "$application" NetworkPolicy nchat-allow-livekit-api-egress)"
@@ -784,6 +784,7 @@ validate_nchat_dev() {
     nchat-allow-media-postgres-egress \
     nchat-allow-migrations-postgres-egress \
     nchat-allow-notification-postgres-egress \
+    nchat-allow-notification-webpush-egress \
     nchat-allow-search-postgres-egress \
     nchat-allow-seaweedfs-volume-egress \
     nchat-allow-upload-guard-file-egress \
@@ -1151,6 +1152,10 @@ if [[ -z "${K8S_OVERLAY:-}" ]]; then
     infra/k8s/overlays/k3s-prod/shared \
     "${rendered_by_overlay[infra/k8s/overlays/k3s-prod/shared]}" \
     production
+  # Production composes the same least-privilege component, so the same
+  # public-internet allowlist holds there (issue #862).
+  validate_public_internet_egress_allowlist "${rendered_by_overlay[infra/k8s/overlays/k3s-prod/shared]}"
+  validate_notification_webpush_egress "${rendered_by_overlay[infra/k8s/overlays/k3s-prod/shared]}"
   validate_nchat_dev \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server]}" \
     "${rendered_by_overlay[infra/k8s/overlays/nchat-dev-server/data]}" \

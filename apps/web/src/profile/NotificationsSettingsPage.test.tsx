@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,8 @@ import type { AppShellOutletContext } from "../chat/AppShell";
 import type { SidebarState } from "../chat/useChatSidebar";
 import type { Channel, DMConversation } from "../chat/chatTypes";
 import { noopConversationDrafts } from "../chat/useConversationDrafts";
+import { requestBrowserNotificationPermission } from "../chat/browserNotification";
+import type { WebPushAvailableSnapshot, WebPushSnapshot } from "../notifications/webPushReconciler";
 
 const { mockGetRingtoneEnabled, mockSetRingtoneEnabled, mockPlayRingtonePreview } = vi.hoisted(
   () => ({
@@ -17,6 +19,46 @@ const { mockGetRingtoneEnabled, mockSetRingtoneEnabled, mockPlayRingtonePreview 
     mockPlayRingtonePreview: vi.fn(),
   }),
 );
+
+/**
+ * The Web Push health store (#748), replaced at its module boundary: this page
+ * is a consumer of the snapshot, and what the snapshot means for a real browser
+ * is proved in webPushReconciler.test.ts. `publish` is what the store does when
+ * a pass commits.
+ */
+const webPush = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  const store = {
+    snapshot: { status: "unavailable", reason: "unsupported" } as WebPushSnapshot,
+    listeners,
+    publish(next: WebPushSnapshot) {
+      store.snapshot = next;
+      for (const listener of listeners) listener();
+    },
+    enableWebPush: vi.fn(),
+  };
+  return store;
+});
+
+vi.mock("../notifications/webPushReconciler", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    enableWebPush: webPush.enableWebPush,
+    useWebPushHealth: () =>
+      useSyncExternalStore(
+        (listener) => {
+          webPush.listeners.add(listener);
+          return () => webPush.listeners.delete(listener);
+        },
+        () => webPush.snapshot,
+      ),
+  };
+});
+
+vi.mock("../chat/browserNotification", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../chat/browserNotification")>()),
+  requestBrowserNotificationPermission: vi.fn(),
+}));
 
 vi.mock("../calls/incomingCallRingtone", () => ({
   getIncomingCallRingtoneEnabled: mockGetRingtoneEnabled,
@@ -332,187 +374,315 @@ describe("NotificationsSettingsPage — 'Menções e mensagens diretas' sound mo
   });
 });
 
-describe("NotificationsSettingsPage — browser notification permission", () => {
-  /** jsdom does not implement Notification — stub it per test like elsewhere in the suite. */
-  class MockNotification {
-    static permission: NotificationPermission;
-    static requestPermission = vi.fn<() => Promise<NotificationPermission>>();
+describe("NotificationsSettingsPage — browser notifications (Web Push health, issue #862)", () => {
+  function available(overrides: Partial<WebPushAvailableSnapshot> = {}): WebPushSnapshot {
+    return {
+      status: "available",
+      permission: "granted",
+      worker: "active",
+      subscription: "present",
+      backend: "connected",
+      health: "healthy",
+      error: null,
+      ...overrides,
+    };
   }
 
-  function stubNotification(permission: NotificationPermission, secureContext = true) {
-    MockNotification.permission = permission;
-    MockNotification.requestPermission = vi.fn<() => Promise<NotificationPermission>>();
-    vi.stubGlobal("isSecureContext", secureContext);
-    vi.stubGlobal("Notification", MockNotification);
-    return MockNotification;
-  }
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
+  beforeEach(() => {
+    webPush.snapshot = available();
+    webPush.listeners.clear();
+    webPush.enableWebPush.mockResolvedValue(available());
   });
 
+  const row = () =>
+    screen
+      .getByText("Notificações do navegador")
+      .closest(".notifications-settings__row") as HTMLElement;
   const enableBtn = () =>
     screen.queryByRole("button", { name: /ativar notificações do navegador/i });
+  const reconnectBtn = () => screen.queryByRole("button", { name: /reconectar notificações/i });
+  const helpBtn = () => screen.queryByRole("button", { name: /como ativar notificações/i });
+  const noActions = () => {
+    expect(enableBtn()).toBeNull();
+    expect(reconnectBtn()).toBeNull();
+    expect(helpBtn()).toBeNull();
+  };
 
-  it("shows the enable button and prompt only when permission is 'default'", () => {
-    stubNotification("default");
+  it("shows connected only when the snapshot is healthy, with the axes behind it", () => {
     renderPage();
 
-    expect(enableBtn()).not.toBeNull();
-    expect(screen.getByText(/ative notificações do navegador/i)).toBeInTheDocument();
+    expect(
+      within(row()).getByText(/notificações do navegador estão ativadas/i),
+    ).toBeInTheDocument();
+    expect(within(row()).getByText("Registrado")).toBeInTheDocument();
+    expect(within(row()).getByText("Conectada")).toBeInTheDocument();
+    noActions();
   });
 
-  it("reflects 'granted' with no button", () => {
-    stubNotification("granted");
+  it.each<[string, WebPushSnapshot, RegExp]>([
+    [
+      "unsupported",
+      { status: "unavailable", reason: "unsupported" },
+      /não tem suporte a notificações nativas/i,
+    ],
+    [
+      "insecure_context",
+      { status: "unavailable", reason: "insecure_context" },
+      /não estão disponíveis neste endereço.*https ou localhost/i,
+    ],
+    [
+      "not_configured",
+      { status: "unavailable", reason: "not_configured" },
+      /ainda não estão disponíveis neste ambiente/i,
+    ],
+  ])("explains %s without offering an action or claiming it is on", (_, snapshot, message) => {
+    webPush.snapshot = snapshot;
     renderPage();
 
-    expect(enableBtn()).toBeNull();
-    expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument();
+    expect(within(row()).getByText(message)).toBeInTheDocument();
+    expect(screen.queryByText(/estão ativadas/i)).toBeNull();
+    expect(screen.queryByText(/bloqueadas/i)).toBeNull();
+    noActions();
   });
 
-  it("reflects 'denied' with instructions to change the browser's own setting, no retry/enable button", () => {
-    stubNotification("denied");
+  // Granted is not delivery: each of these has permission and is not connected.
+  it.each<[string, Partial<WebPushAvailableSnapshot>, string]>([
+    ["subscription absent", { subscription: "absent", backend: "disconnected" }, "Não registrado"],
+    ["backend disconnected", { backend: "disconnected" }, "Desconectada"],
+    ["backend invalid", { backend: "invalid" }, "Precisa ser refeita"],
+  ])("granted with %s is not shown as connected and offers a reconnect", (_, overrides, axis) => {
+    webPush.snapshot = available({ ...overrides, health: "reconnect_required" });
     renderPage();
 
-    expect(enableBtn()).toBeNull();
+    expect(screen.queryByText(/estão ativadas/i)).toBeNull();
+    expect(within(row()).getByText(/precisam ser reconectadas/i)).toBeInTheDocument();
+    expect(within(row()).getByText(axis)).toBeInTheDocument();
+    expect(reconnectBtn()).not.toBeNull();
+  });
+
+  it.each<[WebPushAvailableSnapshot["error"], RegExp]>([
+    ["backend", /não foi possível conectar ao serviço de notificações/i],
+    ["browser", /o navegador não conseguiu ativar/i],
+  ])("a %s error is explained in words and can be retried", (error, message) => {
+    webPush.snapshot = available({ health: "error", error, backend: "unavailable" });
+    renderPage();
+
+    expect(within(row()).getByText(message)).toBeInTheDocument();
+    expect(within(row()).getByText("Indisponível")).toBeInTheDocument();
+    expect(reconnectBtn()).not.toBeNull();
+  });
+
+  it("shows a verifying state while a pass runs, without an action and without claiming success", () => {
+    webPush.snapshot = available({ health: "reconciling" });
+    renderPage();
+
+    expect(within(row()).getByText(/verificando notificações do navegador/i)).toBeInTheDocument();
+    expect(screen.queryByText(/estão ativadas/i)).toBeNull();
+    noActions();
+  });
+
+  it("treats a worker that has not activated yet as verifying, not as broken", () => {
+    webPush.snapshot = available({ worker: "registering", health: "reconnect_required" });
+    renderPage();
+
+    expect(within(row()).getByText(/verificando/i)).toBeInTheDocument();
+    expect(within(row()).getByText("Iniciando")).toBeInTheDocument();
+  });
+
+  it("explains a worker that failed to register without offering a reconnect that cannot help", () => {
+    webPush.snapshot = available({ permission: "default", worker: "failed" });
+    renderPage();
+
+    expect(within(row()).getByText(/recarregue a página/i)).toBeInTheDocument();
+    noActions();
+  });
+
+  // Issue #862: a prompt is never offered before the deployment is known to use it.
+  it("default while the pass is still reconciling offers nothing yet", () => {
+    webPush.snapshot = available({
+      permission: "default",
+      subscription: "absent",
+      backend: "unknown",
+      health: "reconciling",
+    });
+    renderPage();
+
+    expect(within(row()).getByText(/verificando notificações do navegador/i)).toBeInTheDocument();
+    noActions();
     expect(screen.queryByRole("button", { name: /tentar novamente/i })).toBeNull();
-    expect(screen.getByText(/bloqueadas/i)).toBeInTheDocument();
-    expect(screen.getByText(/configurações do seu navegador/i)).toBeInTheDocument();
   });
 
-  it("'denied' never calls Notification.requestPermission(), on mount or on opening the help", async () => {
+  it("default with the configuration unreadable explains it and offers a retry, not an enable", async () => {
     const user = userEvent.setup();
-    const mock = stubNotification("denied");
+    webPush.snapshot = available({
+      permission: "default",
+      subscription: "absent",
+      backend: "unavailable",
+      health: "error",
+      error: "backend",
+    });
     renderPage();
 
-    await user.click(screen.getByRole("button", { name: /como ativar notificações/i }));
+    expect(within(row()).getByText(/não foi possível conectar ao serviço/i)).toBeInTheDocument();
+    expect(enableBtn()).toBeNull();
+    expect(reconnectBtn()).toBeNull();
 
-    expect(mock.requestPermission).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: /tentar novamente/i }));
+
+    // The retry is the central action, which decides whether to prompt; the page never does.
+    expect(webPush.enableWebPush).toHaveBeenCalledTimes(1);
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+  });
+
+  it("default on a deployment that is not configured offers no action", () => {
+    webPush.snapshot = { status: "unavailable", reason: "not_configured" };
+    renderPage();
+
+    expect(
+      within(row()).getByText(/ainda não estão disponíveis neste ambiente/i),
+    ).toBeInTheDocument();
+    noActions();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).toBeNull();
+  });
+
+  it("offers to enable while permission is default, and prompts for nothing on mount", () => {
+    webPush.snapshot = available({
+      permission: "default",
+      subscription: "absent",
+      health: "reconnect_required",
+    });
+    renderPage();
+
+    expect(within(row()).getByText(/ative notificações do navegador/i)).toBeInTheDocument();
+    expect(enableBtn()).not.toBeNull();
+    expect(webPush.enableWebPush).not.toHaveBeenCalled();
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+    // The diagnostics are for "allowed but not connected", which needs allowed first.
+    expect(within(row()).queryByText("Permissão do navegador")).toBeNull();
+  });
+
+  it("enables only on an explicit click, through the central action, and shows connected once the store says so", async () => {
+    const user = userEvent.setup();
+    webPush.snapshot = available({
+      permission: "default",
+      subscription: "absent",
+      health: "reconnect_required",
+    });
+    let resolveEnable!: () => void;
+    webPush.enableWebPush.mockImplementation(
+      () => new Promise<WebPushSnapshot>((resolve) => (resolveEnable = () => resolve(available()))),
+    );
+    renderPage();
+
+    await user.click(enableBtn()!);
+
+    expect(webPush.enableWebPush).toHaveBeenCalledTimes(1);
+    // The page never prompts on its own: the prompt belongs to enableWebPush.
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+    const busy = screen.getByRole("button", { name: /conectando/i });
+    expect(busy).toBeDisabled();
+
+    // Granted but not yet healthy is still not "on".
+    act(() => webPush.publish(available({ health: "reconciling" })));
+    expect(screen.queryByText(/estão ativadas/i)).toBeNull();
+
+    await act(async () => {
+      webPush.publish(available());
+      resolveEnable();
+    });
+    expect(within(row()).getByText(/estão ativadas/i)).toBeInTheDocument();
+    noActions();
+  });
+
+  it("reconnects through the same central action", async () => {
+    const user = userEvent.setup();
+    webPush.snapshot = available({ subscription: "absent", health: "reconnect_required" });
+    renderPage();
+
+    await user.click(reconnectBtn()!);
+
+    expect(webPush.enableWebPush).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(reconnectBtn()).not.toBeDisabled());
+  });
+
+  it("denied explains the browser setting, offers only help, and never enables or prompts", async () => {
+    const user = userEvent.setup();
+    webPush.snapshot = available({
+      permission: "denied",
+      subscription: "absent",
+      health: "reconnect_required",
+    });
+    renderPage();
+
+    expect(within(row()).getByText(/bloqueadas/i)).toBeInTheDocument();
+    expect(within(row()).getByText(/configurações do seu navegador/i)).toBeInTheDocument();
+    expect(enableBtn()).toBeNull();
+    expect(reconnectBtn()).toBeNull();
+
+    await user.click(helpBtn()!);
+
+    expect(webPush.enableWebPush).not.toHaveBeenCalled();
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
   });
 
   it("'Como ativar notificações' expands step-by-step instructions, and collapses again on a second click", async () => {
     const user = userEvent.setup();
-    stubNotification("denied");
+    webPush.snapshot = available({
+      permission: "denied",
+      subscription: "absent",
+      health: "reconnect_required",
+    });
     renderPage();
 
-    const helpBtn = screen.getByRole("button", { name: /como ativar notificações/i });
-    expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    const help = helpBtn()!;
+    expect(help).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText(/ícone de cadeado/i)).not.toBeInTheDocument();
 
-    await user.click(helpBtn);
+    await user.click(help);
 
-    expect(helpBtn).toHaveAttribute("aria-expanded", "true");
+    expect(help).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/ícone de cadeado/i)).toBeInTheDocument();
     expect(screen.getByText(/localize a permissão/i)).toBeInTheDocument();
     expect(screen.getByText(/permitir/i)).toBeInTheDocument();
     expect(screen.getByText(/recarregue a página/i)).toBeInTheDocument();
 
-    await user.click(helpBtn);
+    await user.click(help);
 
-    expect(helpBtn).toHaveAttribute("aria-expanded", "false");
+    expect(help).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByText(/ícone de cadeado/i)).not.toBeInTheDocument();
   });
 
-  it("re-reads the permission on window focus (denied -> granted)", async () => {
-    const mock = stubNotification("denied");
+  // Re-reading after the person changes the browser setting is the page-wide
+  // lifecycle's job (main.tsx); the page only has to follow the store.
+  it("follows the store when a revalidation outside the page changes the state (denied -> healthy)", () => {
+    webPush.snapshot = available({
+      permission: "denied",
+      subscription: "absent",
+      health: "reconnect_required",
+    });
     renderPage();
-    expect(screen.getByText(/bloqueadas/i)).toBeInTheDocument();
+    expect(within(row()).getByText(/bloqueadas/i)).toBeInTheDocument();
 
-    mock.permission = "granted";
-    fireEvent(window, new Event("focus"));
+    act(() => webPush.publish(available()));
 
-    await waitFor(() =>
-      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
-    );
+    expect(within(row()).getByText(/estão ativadas/i)).toBeInTheDocument();
   });
 
-  it("re-reads the permission on window focus (denied -> default) and brings back the enable button", async () => {
-    const mock = stubNotification("denied");
-    renderPage();
-    expect(enableBtn()).toBeNull();
-
-    mock.permission = "default";
-    fireEvent(window, new Event("focus"));
-
-    await waitFor(() => expect(enableBtn()).not.toBeNull());
-  });
-
-  it("removes the focus and visibilitychange listeners on unmount", () => {
+  it("registers no focus or visibilitychange listener of its own", () => {
     const windowAdd = vi.spyOn(window, "addEventListener");
-    const windowRemove = vi.spyOn(window, "removeEventListener");
     const documentAdd = vi.spyOn(document, "addEventListener");
-    const documentRemove = vi.spyOn(document, "removeEventListener");
-    stubNotification("denied");
-    const { unmount } = renderPage();
-
-    const focusHandler = windowAdd.mock.calls.find(([type]) => type === "focus")?.[1];
-    const visibilityHandler = documentAdd.mock.calls.find(
-      ([type]) => type === "visibilitychange",
-    )?.[1];
-    expect(focusHandler).toBeDefined();
-    expect(visibilityHandler).toBeDefined();
-
-    unmount();
-
-    expect(windowRemove).toHaveBeenCalledWith("focus", focusHandler);
-    expect(documentRemove).toHaveBeenCalledWith("visibilitychange", visibilityHandler);
-  });
-
-  it("reflects a genuinely unsupported browser (secure context, no API) with no button", () => {
-    vi.unstubAllGlobals();
-    vi.stubGlobal("isSecureContext", true);
     renderPage();
 
-    expect(enableBtn()).toBeNull();
-    expect(screen.getByText(/não tem suporte a notificações nativas/i)).toBeInTheDocument();
+    expect(windowAdd.mock.calls.some(([type]) => type === "focus")).toBe(false);
+    expect(documentAdd.mock.calls.some(([type]) => type === "visibilitychange")).toBe(false);
   });
 
-  it("shows the insecure-origin message — not the blocked/denied UI — when the origin isn't secure", () => {
-    stubNotification("denied", false);
+  it("keeps the rest of the page usable whatever push reports", () => {
+    webPush.snapshot = available({ health: "error", error: "backend", backend: "unavailable" });
     renderPage();
 
-    expect(
-      screen.getByText(/não estão disponíveis neste endereço.*https ou localhost/i),
-    ).toBeInTheDocument();
-    expect(screen.queryByText(/bloqueadas/i)).not.toBeInTheDocument();
-    expect(enableBtn()).toBeNull();
-    expect(screen.queryByRole("button", { name: /como ativar notificações/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /tentar novamente/i })).toBeNull();
-  });
-
-  it("never calls Notification.requestPermission() on mount", () => {
-    const mock = stubNotification("default");
-    renderPage();
-
-    expect(mock.requestPermission).not.toHaveBeenCalled();
-  });
-
-  it("requests permission only on explicit click and updates the UI with the result", async () => {
-    const user = userEvent.setup();
-    const mock = stubNotification("default");
-    mock.requestPermission.mockResolvedValue("granted");
-    renderPage();
-
-    await user.click(enableBtn()!);
-
-    expect(mock.requestPermission).toHaveBeenCalledTimes(1);
-    await waitFor(() =>
-      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
-    );
-    expect(enableBtn()).toBeNull();
-  });
-
-  it("re-reads the permission on visibilitychange without requiring a reload", async () => {
-    const mock = stubNotification("default");
-    renderPage();
-    expect(enableBtn()).not.toBeNull();
-
-    mock.permission = "granted";
-    fireEvent(document, new Event("visibilitychange"));
-
-    await waitFor(() =>
-      expect(screen.getByText(/notificações do navegador estão ativadas/i)).toBeInTheDocument(),
-    );
+    expect(screen.getByRole("radio", { name: "Desativado" })).toBeEnabled();
+    expect(screen.getByRole("heading", { name: "Notificações por canal" })).toBeInTheDocument();
   });
 });
 

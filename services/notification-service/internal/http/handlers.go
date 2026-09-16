@@ -63,14 +63,20 @@ func notificationWorkerCheck(cfg config.Config) health.Checker {
 // channel, or one that stopped, leaves the pod Ready with nothing draining the
 // backlog.
 func notificationWorkerLivenessCheck(cfg config.Config, probe func() bool) health.Checker {
-	if !cfg.NotificationWorker.Enabled || probe == nil {
-		return health.NewStaticChecker("notification-worker-running", true, health.CheckPass, "")
-	}
-	if !probe() {
+	if !notificationWorkerAlive(cfg, probe) {
 		return health.NewStaticChecker("notification-worker-running", true, health.CheckFail,
 			"notification worker is enabled but not running")
 	}
 	return health.NewStaticChecker("notification-worker-running", true, health.CheckPass, "")
+}
+
+// notificationWorkerAlive is the one answer to "is the outbox worker running
+// where it should be", shared by readiness and by GET /push/config (#862).
+//
+// Disabled on purpose is not a fault, and a caller with no probe to report — a
+// router built without an App — has nothing to observe beyond configuration.
+func notificationWorkerAlive(cfg config.Config, probe func() bool) bool {
+	return !cfg.NotificationWorker.Enabled || probe == nil || probe()
 }
 
 // smtpWorkerLivenessCheck answers "is the worker actually running", which the
