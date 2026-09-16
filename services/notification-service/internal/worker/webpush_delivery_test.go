@@ -3,7 +3,6 @@ package worker
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/nicrepository/nchat/services/notification-service/internal/config"
 	"github.com/nicrepository/nchat/services/notification-service/internal/domain"
+	"github.com/nicrepository/nchat/services/notification-service/internal/storage"
 )
 
 // Issue #746: the fan-out.
@@ -27,6 +27,9 @@ const (
 	testWorkspaceID  = "22222222-2222-2222-2222-222222222222"
 	testRecipientID  = "33333333-3333-3333-3333-333333333333"
 	testNotification = "11111111-1111-1111-1111-111111111111"
+	sensitiveSender  = "SENSITIVE-SENDER-870"
+	sensitiveContext = "SENSITIVE-CONTEXT-870"
+	sensitiveBody    = "SENSITIVE-BODY-870"
 )
 
 // deliveryFixture is one deliverer with its fakes to hand.
@@ -42,7 +45,12 @@ func newDeliveryFixture(t *testing.T, store *fakePushStore, sender *fakeSender) 
 	logs := &bytes.Buffer{}
 	return &deliveryFixture{
 		deliverer: NewWebPushDeliverer(
-			config.WebPushConfig{TTLSeconds: int(testTTL / time.Second)},
+			config.WebPushConfig{
+				TTLSeconds: int(testTTL / time.Second),
+				// Issue #870: the fixture runs the contract that carries the
+				// most, so a log assertion that passes here passes for v1 too.
+				PushPreviewEnabled: true,
+			},
 			WebPushDeps{
 				Store:  store,
 				Sender: sender,
@@ -73,6 +81,14 @@ func eligibleNotification() Notification {
 		Origin:      "live",
 		Attempt:     1,
 		OccurredAt:  time.Now().Add(-time.Minute),
+		// Issue #870. Present so the log assertions below have something
+		// to look for: a payload whose preview fields are empty proves
+		// nothing about a log that must never carry them.
+		Presentation: storage.MessagePresentation{
+			Sender:  sensitiveSender,
+			Context: sensitiveContext,
+			Body:    sensitiveBody,
+		},
 	}
 }
 
@@ -631,25 +647,47 @@ func TestAttemptLogsCarryReferencesAndNothingElse(t *testing.T) {
 	assertNoPayloadInLogs(t, logs)
 }
 
-// The payload never appears in a log line, whole or in part.
+// Compare values against the raw buffer: field names and serialization must
+// not affect detection. Sentinels fit the preview limits without escaping.
 func assertNoPayloadInLogs(t *testing.T, logs string) {
 	t.Helper()
-	payload, err := buildPushPayload(eligibleNotification())
-	if err != nil {
-		t.Fatalf("buildPushPayload: %v", err)
-	}
-	var fields map[string]any
-	if err := json.Unmarshal(payload, &fields); err != nil {
-		t.Fatalf("payload: %v", err)
-	}
-	// The notification id is deliberately in both; every other payload field is
-	// content the log has no business repeating.
-	delete(fields, "id")
-	for key, value := range fields {
-		rendered, _ := json.Marshal(value)
-		if strings.Contains(logs, `"`+key+`":`+string(rendered)) {
-			t.Fatalf("the log repeats the payload field %q:\n%s", key, logs)
+	presentation := presentationFor(eligibleNotification())
+	for _, value := range []string{
+		sensitiveSender, sensitiveContext, sensitiveBody, presentation.Title, presentation.Body,
+	} {
+		if value == "" {
+			t.Fatal("a sensitive log sentinel is empty")
 		}
+		if strings.Contains(logs, value) {
+			t.Fatal("a sensitive presentation value appeared in the raw log buffer")
+		}
+	}
+}
+
+func TestPushLogsExcludeSensitiveValuesAcrossOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result PushResult
+	}{
+		{"delivered", delivered()}, {"gone", gone()},
+		{"rate limited", rateLimited(time.Minute)}, {"unavailable", unavailable()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newDeliveryFixture(t, newFakePushStore().withTarget("sub-a"),
+				newFakeSender().answering("sub-a", test.result))
+			_ = f.deliver(t, eligibleNotification())
+			if f.sender.totalCalls() != 1 || f.logs.Len() == 0 {
+				t.Fatal("the fixture did not exercise a logged provider attempt")
+			}
+			logs := f.logs.String()
+			assertNoPayloadInLogs(t, logs)
+			target := f.store.targets[0]
+			for _, value := range []string{target.Endpoint, target.P256dh, target.Auth} {
+				if value == "" || strings.Contains(logs, value) {
+					t.Fatal("a missing sentinel or a leaked push credential invalidates the log check")
+				}
+			}
+		})
 	}
 }
 

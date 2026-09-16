@@ -311,6 +311,38 @@ case "$MODULE" in
       TestPushDeliveryStale410DoesNotRetireARotatedSubscriptionPostgreSQL
       TestPushDeliveryClassifiesEveryCompareAndSetOutcomePostgreSQL
       TestPushDeliveryEveryOutcomeIsClassifiedPostgreSQL
+      # Issue #870: the push preview's authorization, which is a WHERE clause
+      # spanning five tables and chat.channel_visible_to_user. Nothing but a real
+      # database can decide it, and the mock-level guard in
+      # notification_outbox_store_test.go only proves the predicates are present
+      # in the statement — not that they refuse what they are there to refuse.
+      # Every read-access revocation the projection must honour is here.
+      TestNotificationPresentationProjectsTheMessagePostgreSQL
+      TestNotificationPresentationDMReadAccessPostgreSQL
+      TestNotificationPresentationPreservesGroupKindWithAnyTitlePostgreSQL
+      TestNotificationPresentationRevokedReadAccessPostgreSQL
+      TestNotificationPresentationUsesTheOutboxRecipientPostgreSQL
+      TestNotificationPresentationStopsWhenAccessIsRevokedPostgreSQL
+      TestNotificationPresentationRefusesUnpublishableStatesPostgreSQL
+      TestNotificationPresentationIsScopedToTheTenantPostgreSQL
+      TestNotificationPresentationOfAnEmptyMessagePostgreSQL
+      TestNotificationPresentationBoundsTheBodyPostgreSQL
+      TestNotificationPresentationBoundsTheSenderAndContextPostgreSQL
+      TestNotificationPresentationClaimSnapshotPostgreSQL
+      TestNotificationPendingOmitsPresentationPostgreSQL
+      TestNotificationClaimWithoutPreviewPostgreSQL
+      # The rollout flag's cost, proved by EXPLAIN (ANALYZE) over the real claim:
+      # with previews off the presentation subquery is not executed at all.
+      TestNotificationPreviewClaimPlanPostgreSQL
+      # SR-001: the recipient's global account, which is not their workspace
+      # membership. Suspending somebody revokes their sessions and leaves the
+      # membership and the push subscription standing, so these are distinct
+      # from the workspace_members cases in RevokedReadAccess above and are
+      # named so nobody has to work that out from the body.
+      TestNotificationPresentationRejectsGloballySuspendedRecipientPostgreSQL
+      TestNotificationPresentationRejectsDeletedRecipientPostgreSQL
+      TestNotificationPresentationRetryRechecksGlobalAccountPostgreSQL
+      TestPushDeliveryFanOutExcludesGloballyInactiveAccountsPostgreSQL
     )
     ;;
   services/file-service)

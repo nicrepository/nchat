@@ -103,7 +103,7 @@ func seedReminders(t *testing.T, count int, dueAt time.Time, ackRequired bool) *
 }
 
 func (f *reminderFixture) store() *storage.PGXNotificationOutboxStore {
-	return storage.NewPGXNotificationOutboxStore(f.pool)
+	return storage.NewPGXNotificationOutboxStore(f.pool, false)
 }
 
 // reminderKeys reads the dedupe keys of every reminder written for this message,
@@ -453,7 +453,7 @@ func TestConcurrentSchedulersProduceOneReminderEachPostgreSQL(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			result, err := storage.NewPGXNotificationOutboxStore(fixture.pool).
+			result, err := storage.NewPGXNotificationOutboxStore(fixture.pool, false).
 				ScheduleDueReminders(t.Context(), due, 8)
 			scheduled[worker], errs[worker] = result.Scheduled, err
 		}()
@@ -652,7 +652,7 @@ func TestSuppressingResolvedRemindersSparesTheLiveOnesPostgreSQL(t *testing.T) {
 func TestOrdinaryNotificationsAreUnaffectedByTheReminderPredicatePostgreSQL(t *testing.T) {
 	fixture := seedOutbox(t, notificationevent.StateEligible, 2)
 
-	claimed, err := storage.NewPGXNotificationOutboxStore(fixture.pool).
+	claimed, err := storage.NewPGXNotificationOutboxStore(fixture.pool, false).
 		ClaimDue(t.Context(), 10, 5, time.Hour)
 	if err != nil {
 		t.Fatalf("ClaimDue: %v", err)
@@ -743,7 +743,7 @@ func (f *reminderFixture) claimIn(t *testing.T, tx pgx.Tx) bool {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	claimed, err := storage.NewPGXNotificationOutboxStore(tx).ClaimDue(ctx, 10, 5, time.Hour)
+	claimed, err := storage.NewPGXNotificationOutboxStore(tx, false).ClaimDue(ctx, 10, 5, time.Hour)
 	if err != nil {
 		t.Fatalf("ClaimDue: %v", err)
 	}
