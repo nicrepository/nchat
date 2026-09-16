@@ -482,6 +482,16 @@ export interface Message {
    */
   acknowledgementRequired?: boolean;
   /**
+   * The author asked this urgent message to keep reminding its recipients
+   * until they confirm, answer, or the reminders run out (issue #825), shown
+   * as the "Persistente" notice (issue #846).
+   *
+   * Optional for the same reason acknowledgementRequired is: absent means
+   * exactly what `false` means, and a missing flag can never invent a
+   * reminder policy that was never set.
+   */
+  persistentNotifications?: boolean;
+  /**
    * The author's stated priority (issue #821), as this message is rendered
    * (issue #823).
    *

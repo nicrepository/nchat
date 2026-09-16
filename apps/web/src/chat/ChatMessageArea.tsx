@@ -179,6 +179,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     acknowledgingId,
     acknowledgeError,
     acknowledge,
+    loadAcknowledgementDetail,
     reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,
@@ -450,6 +451,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onDeleteMessage: deleteMessageLocal,
     onTogglePin: togglePin,
     onAcknowledge: acknowledge,
+    onOpenAcknowledgementDetails: loadAcknowledgementDetail,
   };
 
   const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);

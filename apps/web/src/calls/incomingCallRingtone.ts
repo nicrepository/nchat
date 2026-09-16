@@ -1,44 +1,41 @@
-const RINGTONE_URL = "/sounds/incoming-call.wav";
+import { playNotificationSound, stopNotificationSound } from "../notifications/notificationSound";
+
 const RINGTONE_PREFERENCE_KEY = "nchat.notifications.calls.ringtone.enabled";
 const RINGTONE_LOCK_PREFIX = "nchat.calls.ringtone.presentation.";
 
-// The selected ~1.35s motif plus a ~2.15s pause before repeating — a ~3.5s
-// total cycle, in the middle of the target 3-4s ringing cadence.
-export const RINGTONE_REPEAT_MS = 3_500;
+/**
+ * How long one pass of the ringtone asset lasts, which is what decides when to
+ * start the next one (issue #827).
+ *
+ * The Lumen incoming-call asset is a composed *phrase*, not a single ring: four
+ * rings of ~1.4s followed by ~0.56s of silence, 6.00s end to end. Repeating it
+ * on any shorter interval restarts the file mid-phrase and turns a ring into a
+ * stutter, so the interval is the asset's own length — the pause the cadence
+ * needs is already inside the file, where the sound designer put it.
+ *
+ * It replaces the 3.5s interval the previous asset needed (a ~1.35s motif plus
+ * an externally-timed pause); the cadence a caller hears is unchanged in kind.
+ */
+export const RINGTONE_REPEAT_MS = 6_000;
 
-let audio: HTMLAudioElement | null = null;
 let activeCallId: string | null = null;
 let repeatTimer: number | null = null;
 let releasePresentationLock: (() => void) | null = null;
 
-function getAudio(): HTMLAudioElement | null {
-  if (audio) return audio;
-  try {
-    audio = new Audio(RINGTONE_URL);
-    audio.preload = "auto";
-    return audio;
-  } catch {
-    return null;
-  }
-}
-
-function playOnce(player: HTMLAudioElement): void {
-  try {
-    player.currentTime = 0;
-  } catch {
-    // Best-effort reset.
-  }
-  try {
-    player.play()?.catch(() => undefined);
-  } catch {
-    // Browser/media failures must never affect call lifecycle.
-  }
-}
-
+/**
+ * One pass, then the next.
+ *
+ * The callId is re-checked before every pass: a stop that lands between two
+ * passes must not be followed by a sixth ring, and `activeCallId` is what makes
+ * that true without the timer needing to be cancelled in the same tick.
+ *
+ * Playback itself is the central player's problem — see notifications/
+ * notificationSound: it owns the element, the autoplay rejection and the cache,
+ * and it cannot throw, which is why nothing here is wrapped.
+ */
 function playAndSchedule(callId: string): void {
-  const player = getAudio();
-  if (!player || activeCallId !== callId) return;
-  playOnce(player);
+  if (activeCallId !== callId) return;
+  playNotificationSound("incoming-call");
   repeatTimer = window.setTimeout(() => {
     repeatTimer = null;
     playAndSchedule(callId);
@@ -101,6 +98,13 @@ export function startIncomingCallRingtone(callId: string): void {
   claimPresentation(callId);
 }
 
+/**
+ * Silences the ringtone and releases everything this module holds.
+ *
+ * Only the incoming-call sound is stopped, never every sound: a chime for a
+ * message that arrived while the phone was ringing is a different surface with
+ * its own permission, and a call ending is not a reason to cut it off.
+ */
 export function stopIncomingCallRingtone(): void {
   activeCallId = null;
   if (repeatTimer !== null) {
@@ -111,20 +115,16 @@ export function stopIncomingCallRingtone(): void {
     releasePresentationLock();
     releasePresentationLock = null;
   }
-  if (!audio) return;
-  try {
-    audio.pause();
-  } catch {
-    // Best-effort pause.
-  }
-  try {
-    audio.currentTime = 0;
-  } catch {
-    // Best-effort reset.
-  }
+  stopNotificationSound("incoming-call");
 }
 
+/**
+ * The settings preview, which is the same sound through the same player.
+ *
+ * Exclusive because a preview is a deliberate act of listening: whatever else
+ * was audible is what the reader is trying to hear past, and a second press
+ * replaces the first rather than layering on it.
+ */
 export function playIncomingCallRingtonePreview(): void {
-  const player = getAudio();
-  if (player) playOnce(player);
+  playNotificationSound("incoming-call", { exclusive: true });
 }

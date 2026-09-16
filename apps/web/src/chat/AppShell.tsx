@@ -17,6 +17,7 @@ import type { Channel, DMConversation } from "./chatTypes";
 import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { onAuthChange } from "../lib/authSession";
+import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
 
 /**
  * Resolves a row menu's target to the details panel's own vocabulary.
@@ -208,7 +209,20 @@ export default function AppShell() {
   // both fire this — clearing on either direction is what keeps a second
   // user signing in on the same tab from ever seeing the first user's
   // drafts, without this component needing to know which direction fired.
-  useEffect(() => onAuthChange(() => drafts.clearAllDrafts()), [drafts]);
+  //
+  // The sound player is released on the same boundary (#827) and for the
+  // weaker of the two reasons: its elements hold no content, but a session
+  // that has ended has no business still owning decoded audio, and this is
+  // the identity boundary the app already has — no global handler is added
+  // for it.
+  useEffect(
+    () =>
+      onAuthChange(() => {
+        drafts.clearAllDrafts();
+        disposeNotificationSoundPlayer();
+      }),
+    [drafts],
+  );
   const {
     state,
     retry,

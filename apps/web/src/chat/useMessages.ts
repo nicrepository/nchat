@@ -144,6 +144,12 @@ export interface UseMessagesResult {
    */
   acknowledge: (messageId: string) => void;
   /**
+   * Reads one message's full acknowledgement detail, including the
+   * per-recipient list a sender is authorised to see (issue #846's details
+   * popover). See Acknowledgements.loadAcknowledgementDetail.
+   */
+  loadAcknowledgementDetail: (messageId: string) => void;
+  /**
    * RF-21 "Verificar novamente" (issue #135): asks the server to re-read what it
    * already knows about one message's unverified links. It never starts a new
    * scan. Resolves to the message's state afterwards, or `undefined` when the
@@ -290,6 +296,7 @@ export function useMessages({
     acknowledgingId: acknowledgements.pendingId,
     acknowledgeError: acknowledgements.error,
     acknowledge: acknowledgements.acknowledge,
+    loadAcknowledgementDetail: acknowledgements.loadAcknowledgementDetail,
     reconcileLinkSafety: reconciliation.reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,

@@ -72,10 +72,12 @@ export interface MessagePriorityBadge {
  * ordinary message, never as an alarm nobody here has reasoned about.
  */
 export const messagePriorityBadges: Partial<Record<MessagePriority, MessagePriorityBadge>> = {
-  important: { icon: "label_important", label: priorityLabels.important },
-  // The same ligature the composer's priority trigger uses, so the axis reads
-  // as one thing from the moment it is stated to the moment it is delivered.
-  urgent: { icon: "error", label: priorityLabels.urgent },
+  // Issue #846's Figma reference draws important as a plain upward arrow and
+  // urgent as a plain exclamation mark — arrow_upward/priority_high are the
+  // Material Symbols ligatures closest to those, rather than the bookmark-like
+  // label_important or the circled error glyph the previous pass used.
+  important: { icon: "arrow_upward", label: priorityLabels.important },
+  urgent: { icon: "priority_high", label: priorityLabels.urgent },
 };
 
 /**

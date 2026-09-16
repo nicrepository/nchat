@@ -35,6 +35,7 @@ import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
 import {
   isDefaultPriorityIntent,
+  messagePriorityBadges,
   priorityLabels,
   priorityOptionLabels,
   standardPriorityIntent,
@@ -649,6 +650,10 @@ function ComposerPrioritySummary({
 }) {
   if (isDefaultPriorityIntent(intent)) return null;
   const options = priorityOptionLabels(intent);
+  // Same icon the delivered message's own badge draws (issue #846), so the
+  // composer's preview and the sent message read as the same claim rather
+  // than as two differently-styled statements of it.
+  const badge = messagePriorityBadges[intent.priority];
   return (
     <div
       className={`chat-msg-area__composer-priority chat-msg-area__composer-priority--${intent.priority}`}
@@ -656,6 +661,11 @@ function ComposerPrioritySummary({
       data-testid="composer-priority-summary"
     >
       <span className="chat-msg-area__composer-priority-badge">
+        {badge && (
+          <span className="material-symbols-outlined" aria-hidden="true">
+            {badge.icon}
+          </span>
+        )}
         {priorityLabels[intent.priority]}
       </span>
       {options.length > 0 && <span>{options.join(" · ")}</span>}

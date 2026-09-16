@@ -324,6 +324,15 @@ type MessagePayload struct {
 	// state is are a separate, authorised read — broadcasting a recipient list
 	// to a conversation's subscribers is exactly the exposure #824 refuses.
 	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications says this urgent message keeps reminding its
+	// recipients until they confirm, answer, or the reminders run out (issue
+	// #825), mirroring the HTTP message contract's field of the same name.
+	//
+	// Same reasoning as AcknowledgementRequired above: a message inserted from
+	// this event and the same message after a reload must render identically
+	// (issue #846), so a flag carried by only one of the two paths would show
+	// the persistent-reminder notice after a refresh and not before it.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
 	// A subscriber uses it to decide whether to draw the "could not verify this
 	// link" notice on a message it is inserting. It authorises nothing — see
