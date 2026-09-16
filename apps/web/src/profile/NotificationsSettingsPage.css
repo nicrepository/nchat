@@ -126,6 +126,31 @@ label.notifications-settings__row-title {
   overflow-wrap: anywhere;
 }
 
+.notifications-settings__diagnostics {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-muted, #7c7390);
+}
+
+.notifications-settings__diagnostics div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.notifications-settings__diagnostics dt::after {
+  content: ":";
+}
+
+.notifications-settings__diagnostics dd {
+  margin: 0;
+  font-weight: 600;
+  color: var(--color-ink-2, #3d3550);
+}
+
 .notifications-settings__hint {
   margin: 12px 0;
   font-size: 13px;

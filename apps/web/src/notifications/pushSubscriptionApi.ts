@@ -16,6 +16,8 @@ const NOTIFICATIONS_BASE = import.meta.env.VITE_NOTIFICATIONS_API_BASE_URL ?? "/
 
 const SUBSCRIPTIONS_URL = `${NOTIFICATIONS_BASE}/push/subscriptions`;
 
+const CONFIG_URL = `${NOTIFICATIONS_BASE}/push/config`;
+
 /** `active` is deliverable; `invalid` was retired by the provider; `disabled` was switched off by its owner. */
 export type PushSubscriptionStatus = "active" | "invalid" | "disabled";
 
@@ -61,6 +63,28 @@ function fromResponse(row: PushSubscriptionRowResponse): PushSubscriptionRecord 
  */
 export function isPushEndpointConflict(error: unknown): boolean {
   return error instanceof ApiRequestError && error.code === "push_endpoint_conflict";
+}
+
+interface PushConfigResponse {
+  data: { vapid_public_key: string | null };
+}
+
+/**
+ * The VAPID public key this deployment signs with, or null when it delivers no
+ * Web Push at all (issue #862).
+ *
+ * Served by the process that holds the private half, so a browser can never
+ * subscribe with a key the sender does not sign with. Public by construction —
+ * every push service reads it — and still never logged: it identifies which
+ * deployment a subscription belongs to and nothing here needs to say so.
+ */
+export async function fetchPushVapidPublicKey(signal?: AbortSignal): Promise<string | null> {
+  const response = await authenticatedFetch<PushConfigResponse>(CONFIG_URL, {
+    method: "GET",
+    signal,
+  });
+  const key = response.data.vapid_public_key?.trim() ?? "";
+  return key === "" ? null : key;
 }
 
 /** The caller's own subscriptions, across every browser and device they use. */

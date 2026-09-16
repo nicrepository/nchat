@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useId, useState } from "react";
 import { useOutletContext } from "react-router";
 
 import "./NotificationsSettingsPage.css";
 import {
-  type BrowserNotificationPermission,
-  getBrowserNotificationPermission,
-  isBrowserNotificationSecureContext,
-  requestBrowserNotificationPermission,
-} from "../chat/browserNotification";
+  enableWebPush,
+  useWebPushHealth,
+  type WebPushAvailableSnapshot,
+  type WebPushBackendState,
+  type WebPushErrorCategory,
+  type WebPushSnapshot,
+  type WebPushUnavailableReason,
+  type WebPushWorkerState,
+} from "../notifications/webPushReconciler";
 import {
   getSoundNotificationMode,
   setSoundNotificationMode,
@@ -74,6 +78,215 @@ const SOUND_MODES: ReadonlyArray<{ value: SoundNotificationMode; id: string; lab
 ];
 
 const DIGEST_FREQUENCIES = ["Imediato", "Diário", "Semanal"] as const;
+
+/**
+ * What the browser-notifications row says, and the one action it offers.
+ *
+ * Every action that can change push state is `enableWebPush` (issue #748): it
+ * prompts only while the permission is still `default` and otherwise repairs,
+ * so "Ativar" and "Reconectar" are the same call under two honest labels.
+ * `help` changes nothing — `denied` cannot be undone from a page.
+ */
+interface WebPushView {
+  message: string;
+  action: WebPushConnectAction | "help" | null;
+}
+
+/** The three labels of `enableWebPush`: ask, repair, or try the deployment again. */
+type WebPushConnectAction = "enable" | "reconnect" | "retry";
+
+const WEB_PUSH_UNAVAILABLE: Record<WebPushUnavailableReason, string> = {
+  unsupported: "Seu navegador não tem suporte a notificações nativas.",
+  insecure_context:
+    "As notificações do navegador não estão disponíveis neste endereço. Acesse o NChat por HTTPS ou localhost.",
+  not_configured:
+    "As notificações do navegador ainda não estão disponíveis neste ambiente do NChat.",
+};
+
+const WEB_PUSH_ERROR: Record<WebPushErrorCategory, string> = {
+  backend:
+    "Não foi possível conectar ao serviço de notificações do NChat. Tente reconectar em instantes.",
+  browser: "O navegador não conseguiu ativar as notificações. Tente reconectar.",
+};
+
+const WEB_PUSH_WORKER_LABEL: Record<WebPushWorkerState, string> = {
+  registering: "Iniciando",
+  active: "Ativo",
+  failed: "Com falha",
+};
+
+const WEB_PUSH_BACKEND_LABEL: Record<WebPushBackendState, string> = {
+  unknown: "Verificando",
+  connected: "Conectada",
+  disconnected: "Desconectada",
+  invalid: "Precisa ser refeita",
+  unavailable: "Indisponível",
+};
+
+/**
+ * The snapshot in words. Connected means `health === "healthy"` and nothing
+ * else: a granted permission, an active worker or a present subscription on
+ * their own prove nothing about delivery (issue #862).
+ */
+function describeWebPush(snapshot: WebPushSnapshot): WebPushView {
+  if (snapshot.status === "unavailable") {
+    return { message: WEB_PUSH_UNAVAILABLE[snapshot.reason], action: null };
+  }
+  if (snapshot.permission === "denied") {
+    return {
+      message:
+        "Notificações do navegador foram bloqueadas. Para ativá-las, altere a permissão deste site nas configurações do seu navegador.",
+      action: "help",
+    };
+  }
+  if (snapshot.worker === "failed") {
+    return {
+      message:
+        "Não foi possível preparar as notificações neste navegador. Recarregue a página para tentar de novo.",
+      action: null,
+    };
+  }
+  // Nothing is offered until the pass has settled: whether this deployment can
+  // use a permission is not known yet, and a prompt spent early is not given
+  // back (issue #862). enableWebPush refuses to prompt then too; this only
+  // keeps the page from offering a button that would.
+  if (snapshot.health === "reconciling" || snapshot.worker === "registering") {
+    return { message: "Verificando notificações do navegador…", action: null };
+  }
+  if (snapshot.health === "error") {
+    return {
+      message: WEB_PUSH_ERROR[snapshot.error ?? "browser"],
+      action: snapshot.permission === "default" ? "retry" : "reconnect",
+    };
+  }
+  if (snapshot.permission === "default") {
+    return {
+      message:
+        "Ative notificações do navegador para ser avisado de novas mensagens mesmo com a aba em segundo plano.",
+      action: "enable",
+    };
+  }
+  return describeGrantedWebPush(snapshot);
+}
+
+function describeGrantedWebPush(snapshot: WebPushAvailableSnapshot): WebPushView {
+  if (snapshot.health === "healthy") {
+    return { message: "Notificações do navegador estão ativadas.", action: null };
+  }
+  return {
+    message:
+      "A permissão foi concedida, mas as notificações do navegador precisam ser reconectadas.",
+    action: "reconnect",
+  };
+}
+
+/**
+ * The browser-notifications row of "Notificações gerais" (issues #729, #862).
+ *
+ * It reads the one health store #748 publishes and never a browser API: no
+ * `Notification.permission`, no Service Worker, no PushManager, and no focus or
+ * visibility listener of its own — the page-wide lifecycle in main.tsx already
+ * re-reads all of it when the tab comes back, and `useWebPushHealth` refreshes
+ * on mount. Never a switch, because no switch on this page can turn "denied"
+ * back into "granted".
+ */
+function BrowserNotificationsRow() {
+  const snapshot = useWebPushHealth();
+  const view = describeWebPush(snapshot);
+  const [showHelp, setShowHelp] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+
+  // A gesture, and the only path to a permission prompt. enableWebPush never
+  // rejects; `finally` is here so the button cannot stay disabled regardless.
+  const onConnect = useCallback(() => {
+    setConnecting(true);
+    void enableWebPush().finally(() => setConnecting(false));
+  }, []);
+
+  return (
+    <>
+      <div className="notifications-settings__row notifications-settings__row--stacked">
+        <span className="notifications-settings__row-text">
+          <span className="notifications-settings__row-title">Notificações do navegador</span>
+          <span className="notifications-settings__row-sub" aria-live="polite">
+            {view.message}
+          </span>
+          {snapshot.status === "available" && snapshot.permission === "granted" && (
+            <WebPushDiagnostics snapshot={snapshot} />
+          )}
+        </span>
+        {view.action !== null && view.action !== "help" && (
+          <button
+            type="button"
+            className="notifications-settings__button notifications-settings__button--primary"
+            disabled={connecting}
+            aria-busy={connecting}
+            onClick={onConnect}
+          >
+            {connectLabel(view.action, connecting)}
+          </button>
+        )}
+        {view.action === "help" && (
+          <button
+            type="button"
+            className="notifications-settings__button"
+            aria-expanded={showHelp}
+            onClick={() => setShowHelp((shown) => !shown)}
+          >
+            Como ativar notificações
+          </button>
+        )}
+      </div>
+      {view.action === "help" && showHelp && (
+        <ol className="notifications-settings__help">
+          <li>Clique no ícone de cadeado ao lado do endereço do site.</li>
+          <li>Localize a permissão de notificações.</li>
+          <li>Remova o bloqueio ou selecione &quot;Permitir&quot;.</li>
+          <li>Recarregue a página ou volte ao NChat.</li>
+        </ol>
+      )}
+    </>
+  );
+}
+
+const CONNECT_LABEL: Record<WebPushConnectAction, string> = {
+  enable: "Ativar notificações do navegador",
+  reconnect: "Reconectar notificações",
+  retry: "Tentar novamente",
+};
+
+function connectLabel(action: WebPushConnectAction, connecting: boolean): string {
+  return connecting ? "Conectando…" : CONNECT_LABEL[action];
+}
+
+/**
+ * The axes behind the summary, in words, once permission is granted — the
+ * point at which "allowed" and "connected" can disagree and a person needs to
+ * see which one it is. Categories only; nothing here can name an endpoint or a
+ * key, because the snapshot has no field that holds one.
+ */
+function WebPushDiagnostics({ snapshot }: Readonly<{ snapshot: WebPushAvailableSnapshot }>) {
+  return (
+    <dl className="notifications-settings__diagnostics">
+      <div>
+        <dt>Permissão do navegador</dt>
+        <dd>Concedida</dd>
+      </div>
+      <div>
+        <dt>Serviço em segundo plano</dt>
+        <dd>{WEB_PUSH_WORKER_LABEL[snapshot.worker]}</dd>
+      </div>
+      <div>
+        <dt>Registro deste navegador</dt>
+        <dd>{snapshot.subscription === "present" ? "Registrado" : "Não registrado"}</dd>
+      </div>
+      <div>
+        <dt>Conexão com o NChat</dt>
+        <dd>{WEB_PUSH_BACKEND_LABEL[snapshot.backend]}</dd>
+      </div>
+    </dl>
+  );
+}
 
 /**
  * Card holding the per-conversation notification preference
@@ -326,10 +539,6 @@ export default function NotificationsSettingsPage() {
   const [incomingCallRingtoneEnabled, setIncomingCallRingtoneEnabledState] = useState(() =>
     getIncomingCallRingtoneEnabled(),
   );
-  const [browserPermission, setBrowserPermission] = useState<BrowserNotificationPermission>(() =>
-    getBrowserNotificationPermission(),
-  );
-  const [showBrowserNotificationHelp, setShowBrowserNotificationHelp] = useState(false);
   const digestNoteId = useId();
 
   const onChangeSoundMode = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
@@ -342,24 +551,6 @@ export default function NotificationsSettingsPage() {
     const enabled = event.currentTarget.checked;
     setIncomingCallRingtoneEnabled(enabled);
     setIncomingCallRingtoneEnabledState(enabled);
-  }, []);
-
-  const onEnableBrowserNotifications = useCallback(async () => {
-    const result = await requestBrowserNotificationPermission();
-    setBrowserPermission(result);
-  }, []);
-
-  useEffect(() => {
-    const refreshBrowserPermission = () => setBrowserPermission(getBrowserNotificationPermission());
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") refreshBrowserPermission();
-    };
-    window.addEventListener("focus", refreshBrowserPermission);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      window.removeEventListener("focus", refreshBrowserPermission);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
   }, []);
 
   // Both lists are exactly what the server returned for this session — no
@@ -407,65 +598,7 @@ export default function NotificationsSettingsPage() {
           </h3>
         </div>
         <div className="notifications-settings__card-body">
-          {/* The browser owns this one outright. It is a status plus, at most,
-              one explicit action — never a switch, because no switch on this
-              page can turn "denied" back into "granted". */}
-          <div className="notifications-settings__row notifications-settings__row--stacked">
-            <span className="notifications-settings__row-text">
-              <span className="notifications-settings__row-title">Notificações do navegador</span>
-              {browserPermission === "granted" && (
-                <span className="notifications-settings__row-sub">
-                  Notificações do navegador estão ativadas.
-                </span>
-              )}
-              {browserPermission === "denied" && (
-                <span className="notifications-settings__row-sub">
-                  Notificações do navegador foram bloqueadas. Para ativá-las, altere a permissão
-                  deste site nas configurações do seu navegador.
-                </span>
-              )}
-              {browserPermission === "unsupported" && (
-                <span className="notifications-settings__row-sub">
-                  {isBrowserNotificationSecureContext()
-                    ? "Seu navegador não tem suporte a notificações nativas."
-                    : "As notificações do navegador não estão disponíveis neste endereço. Acesse o NChat por HTTPS ou localhost."}
-                </span>
-              )}
-              {browserPermission === "default" && (
-                <span className="notifications-settings__row-sub">
-                  Ative notificações do navegador para ser avisado de novas mensagens mesmo com a
-                  aba em segundo plano.
-                </span>
-              )}
-            </span>
-            {browserPermission === "default" && (
-              <button
-                type="button"
-                className="notifications-settings__button notifications-settings__button--primary"
-                onClick={onEnableBrowserNotifications}
-              >
-                Ativar notificações do navegador
-              </button>
-            )}
-            {browserPermission === "denied" && (
-              <button
-                type="button"
-                className="notifications-settings__button"
-                aria-expanded={showBrowserNotificationHelp}
-                onClick={() => setShowBrowserNotificationHelp((shown) => !shown)}
-              >
-                Como ativar notificações
-              </button>
-            )}
-          </div>
-          {browserPermission === "denied" && showBrowserNotificationHelp && (
-            <ol className="notifications-settings__help">
-              <li>Clique no ícone de cadeado ao lado do endereço do site.</li>
-              <li>Localize a permissão de notificações.</li>
-              <li>Remova o bloqueio ou selecione &quot;Permitir&quot;.</li>
-              <li>Recarregue a página ou volte ao NChat.</li>
-            </ol>
-          )}
+          <BrowserNotificationsRow />
 
           {/* Four states, not two: a switch would have to drop two of them, so
               this stays a radio group and only its skin changed. */}

@@ -28,3 +28,24 @@ spec:
                   name: nchat-secrets
                   key: AUTH_JWT_HMAC_SECRET
                   optional: true
+            # The VAPID identity (issue #862), named key by key for the same
+            # reason, from the Secret only this Deployment mounts. Optional:
+            # without NOTIFICATION_WORKER_ENABLED nothing reads them.
+            - name: NOTIFICATION_VAPID_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-webpush
+                  key: NOTIFICATION_VAPID_PUBLIC_KEY
+                  optional: true
+            - name: NOTIFICATION_VAPID_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-webpush
+                  key: NOTIFICATION_VAPID_PRIVATE_KEY
+                  optional: true
+            - name: NOTIFICATION_VAPID_SUBJECT
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-webpush
+                  key: NOTIFICATION_VAPID_SUBJECT
+                  optional: true

@@ -7,6 +7,7 @@ import { ApiRequestError } from "../lib/api";
 import { _resetListeners, clearTokens, setTokens } from "../lib/authSession";
 import {
   deletePushSubscription,
+  fetchPushVapidPublicKey,
   listPushSubscriptions,
   registerPushSubscription,
   type PushSubscriptionRecord,
@@ -18,6 +19,7 @@ import {
   getWebPushDeviceId,
   readWebPushCredentials,
   readWebPushPermission,
+  subscribedWithKey,
   webPushCapability,
 } from "./webPushBrowser";
 import {
@@ -36,12 +38,14 @@ vi.mock("../chat/browserNotification");
 vi.mock("./webPushBrowser");
 vi.mock("./pushSubscriptionApi", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./pushSubscriptionApi")>()),
+  fetchPushVapidPublicKey: vi.fn(),
   listPushSubscriptions: vi.fn(),
   registerPushSubscription: vi.fn(),
   deletePushSubscription: vi.fn(),
 }));
 
 const DEVICE_ID = "device-a";
+const VAPID_KEY = "BDeploymentVapidPublicKey";
 const ENDPOINT_A = "https://push.example.com/s/aaa";
 const ENDPOINT_B = "https://push.example.com/s/bbb";
 
@@ -70,6 +74,8 @@ function healthyWorld(): void {
   vi.mocked(getWebPushDeviceId).mockReturnValue(DEVICE_ID);
   vi.mocked(getPushRegistration).mockResolvedValue(activeRegistration());
   vi.mocked(getLocalSubscription).mockResolvedValue(fakeSubscription(ENDPOINT_A));
+  vi.mocked(subscribedWithKey).mockReturnValue(true);
+  vi.mocked(fetchPushVapidPublicKey).mockResolvedValue(VAPID_KEY);
   vi.mocked(createLocalSubscription).mockResolvedValue(fakeSubscription(ENDPOINT_B));
   vi.mocked(readWebPushCredentials).mockImplementation((subscription) => ({
     endpoint: subscription.endpoint,
@@ -393,6 +399,231 @@ describe("reconcile", () => {
  * await each, proving the guard sits at every effect and not only at the
  * snapshot the pass publishes.
  */
+// Issue #862: a prompt is only worth spending once this session knows the
+// deployment can use the permission it asks for.
+describe("permission waits for the deployment", () => {
+  function promptableDefault(): void {
+    vi.mocked(readWebPushPermission).mockReturnValue("default");
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+  }
+
+  it("default while the first pass is still reconciling: waits for it before deciding", async () => {
+    promptableDefault();
+    vi.mocked(fetchPushVapidPublicKey).mockResolvedValue(null);
+    let answerConfig!: (key: string | null) => void;
+    vi.mocked(fetchPushVapidPublicKey).mockImplementationOnce(
+      () => new Promise((resolve) => (answerConfig = resolve)),
+    );
+
+    const running = reconcileWebPush();
+    expect(expectAvailable(getWebPushSnapshot()).health).toBe("reconciling");
+    const enabling = enableWebPush();
+    await Promise.resolve();
+
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+
+    answerConfig(null);
+    await running;
+    await expect(enabling).resolves.toEqual({ status: "unavailable", reason: "not_configured" });
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+  });
+
+  it("default with the configuration unreadable: no prompt, and the error is reported", async () => {
+    promptableDefault();
+    vi.mocked(fetchPushVapidPublicKey).mockRejectedValue(
+      new ApiRequestError(503, "push_delivery_unavailable", "down"),
+    );
+
+    const snapshot = expectAvailable(await enableWebPush());
+
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+    expect(snapshot).toMatchObject({ health: "error", error: "backend", permission: "default" });
+  });
+
+  it("default on a deployment that is not configured: no prompt", async () => {
+    promptableDefault();
+    vi.mocked(fetchPushVapidPublicKey).mockResolvedValue(null);
+    await reconcileWebPush();
+
+    await expect(enableWebPush()).resolves.toEqual({
+      status: "unavailable",
+      reason: "not_configured",
+    });
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+  });
+
+  it("default with the configuration confirmed: the explicit gesture prompts, after the key was read", async () => {
+    promptableDefault();
+    await reconcileWebPush();
+    vi.mocked(requestBrowserNotificationPermission).mockImplementation(async () => {
+      vi.mocked(readWebPushPermission).mockReturnValue("granted");
+      return "granted";
+    });
+
+    const snapshot = expectAvailable(await enableWebPush());
+
+    expect(requestBrowserNotificationPermission).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetchPushVapidPublicKey).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(requestBrowserNotificationPermission).mock.invocationCallOrder[0],
+    );
+    expect(snapshot.health).toBe("healthy");
+  });
+
+  it("a click with no diagnosis yet diagnoses first, and a recovered configuration then prompts", async () => {
+    promptableDefault();
+    vi.mocked(fetchPushVapidPublicKey)
+      .mockRejectedValueOnce(new ApiRequestError(503, "push_delivery_unavailable", "down"))
+      .mockResolvedValue(VAPID_KEY);
+    await reconcileWebPush();
+
+    await enableWebPush();
+
+    expect(requestBrowserNotificationPermission).toHaveBeenCalledTimes(1);
+  });
+
+  it("with the deployment already confirmed, the click prompts before anything is awaited", async () => {
+    promptableDefault();
+    await reconcileWebPush();
+    // A focus-triggered pass is in flight and stuck on the network.
+    let releaseConfig!: (key: string) => void;
+    vi.mocked(fetchPushVapidPublicKey).mockReturnValueOnce(
+      new Promise((resolve) => (releaseConfig = resolve)),
+    );
+    const running = reconcileWebPush();
+
+    const enabling = enableWebPush();
+    // Microtasks only — no timer, no network: the prompt has already been asked.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requestBrowserNotificationPermission).toHaveBeenCalledTimes(1);
+
+    releaseConfig(VAPID_KEY);
+    await running;
+    await enabling;
+  });
+
+  it("a confirmation belongs to the session that earned it", async () => {
+    promptableDefault();
+    await reconcileWebPush();
+    setTokens("session-b");
+    vi.mocked(fetchPushVapidPublicKey).mockResolvedValue(null);
+
+    await enableWebPush();
+
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+  });
+
+  it("does not prompt when the permission stopped being default while the diagnosis ran", async () => {
+    promptableDefault();
+    vi.mocked(fetchPushVapidPublicKey).mockImplementation(async () => {
+      vi.mocked(readWebPushPermission).mockReturnValue("denied");
+      return VAPID_KEY;
+    });
+
+    await enableWebPush();
+
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #862: the permission read at the start of a pass is several awaits old
+// by the time the pass acts or publishes on it.
+describe("a permission withdrawn while the pass is running", () => {
+  /** A promise this test resolves by hand, so the gap is exactly where the test puts it. */
+  function gate<T>() {
+    let open!: (value: T) => void;
+    const promise = new Promise<T>((resolve) => (open = resolve));
+    return { promise, open };
+  }
+
+  it("A: granted -> denied while the deployment key is pending: nothing minted or registered, denied published", async () => {
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    vi.mocked(listPushSubscriptions).mockResolvedValue([]);
+    const config = gate<string | null>();
+    vi.mocked(fetchPushVapidPublicKey).mockReturnValueOnce(config.promise);
+
+    const pass = reconcileWebPush();
+    await vi.waitFor(() => expect(fetchPushVapidPublicKey).toHaveBeenCalledTimes(1));
+    vi.mocked(readWebPushPermission).mockReturnValue("denied");
+    config.open(VAPID_KEY);
+    const snapshot = expectAvailable(await pass);
+
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).not.toHaveBeenCalled();
+    expect(snapshot).toMatchObject({ permission: "denied", health: "reconnect_required" });
+    expect(getWebPushSnapshot()).toBe(snapshot);
+  });
+
+  it("A: a healthy diagnosis is never published once the permission became denied", async () => {
+    expect(expectAvailable(await reconcileWebPush()).health).toBe("healthy");
+    const backend = gate<PushSubscriptionRecord[]>();
+    vi.mocked(listPushSubscriptions).mockReturnValueOnce(backend.promise);
+
+    const pass = reconcileWebPush();
+    await vi.waitFor(() => expect(listPushSubscriptions).toHaveBeenCalledTimes(2));
+    vi.mocked(readWebPushPermission).mockReturnValue("denied");
+    backend.open([record()]);
+    const snapshot = expectAvailable(await pass);
+
+    expect(snapshot).toMatchObject({ permission: "denied", health: "reconnect_required" });
+    expect(registerPushSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it("B: granted -> default while the backend is pending: no prompt and no subscription", async () => {
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    const backend = gate<PushSubscriptionRecord[]>();
+    vi.mocked(listPushSubscriptions).mockReturnValueOnce(backend.promise);
+
+    const pass = reconcileWebPush();
+    await vi.waitFor(() => expect(listPushSubscriptions).toHaveBeenCalledTimes(1));
+    vi.mocked(readWebPushPermission).mockReturnValue("default");
+    backend.open([]);
+    const snapshot = expectAvailable(await pass);
+
+    expect(requestBrowserNotificationPermission).not.toHaveBeenCalled();
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).not.toHaveBeenCalled();
+    expect(snapshot).toMatchObject({ permission: "default", health: "reconnect_required" });
+  });
+
+  it("C: granted that stays granted across the same gap converges to healthy", async () => {
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    const backend = gate<PushSubscriptionRecord[]>();
+    vi.mocked(listPushSubscriptions).mockReturnValueOnce(backend.promise);
+
+    const pass = reconcileWebPush();
+    await vi.waitFor(() => expect(listPushSubscriptions).toHaveBeenCalledTimes(1));
+    backend.open([]);
+    const snapshot = expectAvailable(await pass);
+
+    expect(createLocalSubscription).toHaveBeenCalledTimes(1);
+    expect(registerPushSubscription).toHaveBeenCalledTimes(1);
+    expect(snapshot).toMatchObject({ permission: "granted", health: "healthy" });
+  });
+
+  it("D: the session and the permission change together: nothing minted, registered or published", async () => {
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    vi.mocked(listPushSubscriptions).mockResolvedValue([]);
+    const config = gate<string | null>();
+    vi.mocked(fetchPushVapidPublicKey).mockReturnValueOnce(config.promise);
+
+    const pass = reconcileWebPush();
+    await vi.waitFor(() => expect(fetchPushVapidPublicKey).toHaveBeenCalledTimes(1));
+    const published = getWebPushSnapshot();
+    setTokens("session-b");
+    vi.mocked(readWebPushPermission).mockReturnValue("denied");
+    config.open(VAPID_KEY);
+    await pass;
+
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).not.toHaveBeenCalled();
+    // The store still holds what session A had published before the gap: no
+    // answer computed for A, stale permission or not, was adopted.
+    expect(getWebPushSnapshot()).toBe(published);
+    expect(expectAvailable(published).health).toBe("reconciling");
+  });
+});
+
 describe("a pass that outlives its session", () => {
   it("stops at the backend read: no subscribe, no registration, no snapshot", async () => {
     // Session A has no subscription and an empty backend, so an uninterrupted
@@ -423,6 +654,65 @@ describe("a pass that outlives its session", () => {
 
     expect(createLocalSubscription).toHaveBeenCalledTimes(1);
     expect(registerPushSubscription).not.toHaveBeenCalled();
+  });
+
+  // Issue #862: rotating the VAPID key cancels a subscription, and that cancel is
+  // a round trip the session can end in.
+  it("stops after cancelling a rotated subscription, and the next session reconciles on its own", async () => {
+    const rotated = fakeSubscription(ENDPOINT_A);
+    let finishUnsubscribe!: () => void;
+    vi.mocked(rotated.unsubscribe).mockImplementation(
+      () => new Promise<boolean>((resolve) => (finishUnsubscribe = () => resolve(true))),
+    );
+    vi.mocked(getLocalSubscription).mockResolvedValue(rotated);
+    vi.mocked(subscribedWithKey).mockImplementation((subscription) => subscription !== rotated);
+    vi.mocked(listPushSubscriptions).mockResolvedValue([record()]);
+
+    const passA = reconcileWebPush();
+    await vi.waitFor(() => expect(rotated.unsubscribe).toHaveBeenCalledTimes(1));
+
+    // The session changes while the push service is still cancelling A's subscription.
+    setTokens("session-b");
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    const passB = reconcileWebPush();
+    finishUnsubscribe();
+    await passA;
+
+    // A stopped at the check after the cancel: it minted nothing, registered
+    // nothing, and the store still shows B's pass in progress rather than an
+    // answer computed for A.
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).not.toHaveBeenCalled();
+    expect(expectAvailable(getWebPushSnapshot()).health).toBe("reconciling");
+
+    await passB;
+
+    // The one subscription and registration are B's, minted after A's cancel settled.
+    expect(createLocalSubscription).toHaveBeenCalledTimes(1);
+    expect(registerPushSubscription).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createLocalSubscription).mock.invocationCallOrder[0]).toBeGreaterThan(
+      vi.mocked(rotated.unsubscribe).mock.invocationCallOrder[0],
+    );
+    expect(expectAvailable(getWebPushSnapshot()).health).toBe("healthy");
+  });
+
+  it("stops after cancelling a conflicting endpoint without minting its replacement", async () => {
+    const conflicting = fakeSubscription(ENDPOINT_A);
+    vi.mocked(conflicting.unsubscribe).mockImplementation(async () => {
+      setTokens("session-b");
+      return true;
+    });
+    vi.mocked(getLocalSubscription).mockResolvedValue(conflicting);
+    vi.mocked(listPushSubscriptions).mockResolvedValue([]);
+    vi.mocked(registerPushSubscription).mockRejectedValueOnce(
+      new ApiRequestError(409, "push_endpoint_conflict", "taken"),
+    );
+
+    await reconcileWebPush();
+
+    expect(conflicting.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).toHaveBeenCalledTimes(1);
   });
 
   it("does not restore the endpoint the session change invalidated", async () => {
@@ -612,7 +902,7 @@ describe("one PushManager, many sessions", () => {
 });
 
 describe("browser states", () => {
-  it.each([["unsupported" as const], ["insecure_context" as const], ["not_configured" as const]])(
+  it.each([["unsupported" as const], ["insecure_context" as const]])(
     "reports %s without touching the network",
     async (reason) => {
       vi.mocked(webPushCapability).mockReturnValue(reason);
@@ -622,6 +912,80 @@ describe("browser states", () => {
       expect(listPushSubscriptions).not.toHaveBeenCalled();
     },
   );
+
+  // Issue #862: whether this deployment delivers push is the notification-service's
+  // answer, not a build-time guess, and it is known before any prompt is offered.
+  it.each([["granted" as const], ["default" as const], ["denied" as const]])(
+    "reports not_configured with permission %s when the deployment delivers no push",
+    async (permission) => {
+      vi.mocked(readWebPushPermission).mockReturnValue(permission);
+      vi.mocked(fetchPushVapidPublicKey).mockResolvedValue(null);
+
+      await expect(reconcileWebPush()).resolves.toEqual({
+        status: "unavailable",
+        reason: "not_configured",
+      });
+      expect(createLocalSubscription).not.toHaveBeenCalled();
+      expect(listPushSubscriptions).not.toHaveBeenCalled();
+      expect(registerPushSubscription).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not ask the deployment anything for an anonymous page", async () => {
+    clearTokens();
+
+    const snapshot = expectAvailable(await reconcileWebPush());
+
+    expect(fetchPushVapidPublicKey).not.toHaveBeenCalled();
+    expect(snapshot.health).toBe("reconnect_required");
+  });
+
+  it("reports a backend error, and subscribes nothing, when the key cannot be read", async () => {
+    vi.mocked(fetchPushVapidPublicKey).mockRejectedValue(
+      new ApiRequestError(503, "unavailable", "down"),
+    );
+
+    const snapshot = expectAvailable(await reconcileWebPush());
+
+    expect(snapshot).toMatchObject({ health: "error", error: "backend", backend: "unavailable" });
+    expect(createLocalSubscription).not.toHaveBeenCalled();
+    expect(registerPushSubscription).not.toHaveBeenCalled();
+  });
+
+  it("reports a browser error when the key request fails without a response", async () => {
+    vi.mocked(fetchPushVapidPublicKey).mockRejectedValue(new TypeError("network down"));
+
+    const snapshot = expectAvailable(await reconcileWebPush());
+
+    expect(snapshot).toMatchObject({ health: "error", error: "browser", backend: "unknown" });
+  });
+
+  it("subscribes with the key the deployment signs with", async () => {
+    vi.mocked(getLocalSubscription).mockResolvedValue(null);
+    const registration = activeRegistration();
+    vi.mocked(getPushRegistration).mockResolvedValue(registration);
+
+    await reconcileWebPush();
+
+    expect(createLocalSubscription).toHaveBeenCalledWith(registration, VAPID_KEY);
+  });
+
+  // A subscription minted for a rotated key still registers and is never
+  // deliverable, so it must not read as healthy.
+  it("replaces a subscription minted for a key the deployment no longer signs with", async () => {
+    const stale = fakeSubscription(ENDPOINT_A);
+    vi.mocked(getLocalSubscription).mockResolvedValue(stale);
+    vi.mocked(subscribedWithKey).mockImplementation((subscription) => subscription !== stale);
+
+    const snapshot = expectAvailable(await reconcileWebPush());
+
+    expect(stale.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(createLocalSubscription).toHaveBeenCalledTimes(1);
+    expect(registerPushSubscription).toHaveBeenCalledWith(
+      expect.objectContaining({ endpoint: ENDPOINT_B }),
+    );
+    expect(snapshot.health).toBe("healthy");
+  });
 
   it("reports unsupported when the Notification API itself cannot be read", async () => {
     vi.mocked(readWebPushPermission).mockReturnValue("unsupported");

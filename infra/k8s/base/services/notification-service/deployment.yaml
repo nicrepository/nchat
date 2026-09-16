@@ -53,6 +53,16 @@ spec:
             - secretRef:
                 name: nchat-secrets
                 optional: true
+            # The VAPID identity (issue #862): NOTIFICATION_VAPID_PUBLIC_KEY,
+            # NOTIFICATION_VAPID_PRIVATE_KEY and NOTIFICATION_VAPID_SUBJECT. Its
+            # own Secret, mounted by this Deployment alone, because every
+            # service mounts nchat-secrets and a signing key there would be
+            # handed to all of them. Optional: with NOTIFICATION_WORKER_ENABLED
+            # off nothing reads it, and with the worker on an absent or broken
+            # pair fails readiness instead of starting a worker.
+            - secretRef:
+                name: nchat-webpush
+                optional: true
           env:
             - name: PORT
               value: "8084"

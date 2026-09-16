@@ -5,6 +5,7 @@ import { getSessionGeneration, isAuthenticated, onAuthChange } from "../lib/auth
 import { requestBrowserNotificationPermission } from "../chat/browserNotification";
 import {
   deletePushSubscription,
+  fetchPushVapidPublicKey,
   isPushEndpointConflict,
   listPushSubscriptions,
   registerPushSubscription,
@@ -17,6 +18,7 @@ import {
   getWebPushDeviceId,
   readWebPushCredentials,
   readWebPushPermission,
+  subscribedWithKey,
   webPushCapability,
   type WebPushCapability,
 } from "./webPushBrowser";
@@ -47,7 +49,11 @@ import {
  * taken down by them.
  */
 
-/** Why push is impossible in this client — none of the three is the user's doing. */
+/**
+ * Why push is impossible in this client — none of the three is the user's doing.
+ * `not_configured` is the notification-service saying this deployment delivers
+ * no Web Push (issue #862), never a guess made in the browser.
+ */
 export type WebPushUnavailableReason = "unsupported" | "insecure_context" | "not_configured";
 
 export type WebPushPermissionState = "default" | "granted" | "denied";
@@ -125,6 +131,17 @@ const listeners = new Set<() => void>();
  * the same generation.
  */
 let lastRegisteredEndpoint: string | null = null;
+
+/**
+ * The session generation whose latest pass confirmed this deployment delivers
+ * Web Push — the notification-service answered with a key (issue #862).
+ *
+ * It is what stands between a click and a permission prompt: a browser must
+ * not be asked for a permission the deployment cannot use, and a prompt spent
+ * on "not configured" or on an outage is one the site does not get back. Keyed
+ * by generation, so a session change forgets it without a listener.
+ */
+let confirmedDeploymentGeneration: number | null = null;
 
 function unavailable(reason: WebPushUnavailableReason): WebPushSnapshot {
   return { status: "unavailable", reason };
@@ -271,6 +288,35 @@ function requireCurrentSession(generation: number): void {
 }
 
 /**
+ * Signals that the permission was withdrawn while the pass was running (#862).
+ *
+ * Also not a failure of push: the person changed a browser setting between two
+ * awaits, and the pass stops before acting on the permission it read earlier.
+ * The runner publishes the permission as it is now.
+ */
+class PermissionWithdrawn extends Error {
+  constructor() {
+    super("web push permission changed during the pass");
+    this.name = "PermissionWithdrawn";
+  }
+}
+
+/**
+ * Stops the pass unless it may still make this browser reachable: it belongs to
+ * the current session *and* the permission is still granted.
+ *
+ * The permission is read once at the start of a pass, and a pass is several
+ * awaits long — the registration, the deployment key, the local subscription,
+ * the backend. A person who blocks the site in any of those gaps must not have
+ * a subscription minted or registered on the strength of the earlier answer.
+ * Session first, so a pass that lost both reports neither.
+ */
+function requireEntitled(current: Pass): void {
+  requireCurrentSession(current.generation);
+  if (readWebPushPermission() !== "granted") throw new PermissionWithdrawn();
+}
+
+/**
  * Settled marker for the queue below. Never inspects the outcome: the queue
  * orders operations, it does not care whether they succeeded.
  */
@@ -313,16 +359,40 @@ function serializeBrowserMutation<T>(operation: () => Promise<T>): Promise<T> {
  */
 function getOrCreateLocalSubscription(
   registration: ServiceWorkerRegistration,
+  key: string,
   current: Pass,
 ): Promise<PushSubscription> {
   return serializeBrowserMutation(async () => {
     const existing = await getLocalSubscription(registration);
-    if (existing !== null) return existing;
-    // Waiting for the section is another gap the session can change in, and a
-    // pass that lost its session must not leave a subscription behind it.
-    requireCurrentSession(current.generation);
-    return createLocalSubscription(registration);
+    if (existing !== null && subscribedWithKey(existing, key)) return existing;
+    // A subscription minted for a rotated key can never be pushed to again, and
+    // the browser refuses to mint a second one beside it.
+    return mintReplacing(registration, existing, key, current);
   });
+}
+
+/**
+ * Cancels `stale`, when there is one, and mints the subscription that replaces
+ * it. Runs inside the PushManager queue, never outside it.
+ *
+ * The session is confirmed before each mutation, and again after the cancel:
+ * waiting for the queue is a gap the session can change in, and so is the
+ * round trip `unsubscribe()` makes to the push service. A pass that lost its
+ * session there has already cancelled nothing it did not own, and must not go
+ * on to subscribe this browser on behalf of an identity that no longer exists.
+ */
+async function mintReplacing(
+  registration: ServiceWorkerRegistration,
+  stale: PushSubscription | null,
+  key: string,
+  current: Pass,
+): Promise<PushSubscription> {
+  requireEntitled(current);
+  if (stale !== null) {
+    await stale.unsubscribe();
+    requireEntitled(current);
+  }
+  return createLocalSubscription(registration, key);
 }
 
 // ── The pass ────────────────────────────────────────────────────────────────
@@ -346,23 +416,69 @@ async function computeSnapshot(current: Pass): Promise<WebPushSnapshot> {
   // focus finds it active, and no timer had to exist for that to happen.
   if (registration.active === null) return notConnected(permission, "registering");
 
-  // Everything past here mutates. Neither condition is ever repaired from here:
-  // a permission is the user's to give, and an anonymous page has no account to
-  // register a browser against.
-  if (permission !== "granted") return notConnected(permission, "active");
+  // An anonymous page has no account to register a browser against, and no
+  // session to ask the notification-service anything with.
   if (!isAuthenticated()) return notConnected(permission, "active");
 
-  return convergeGranted(registration, current);
+  const key = await readDeploymentKey();
+  recordDeploymentConfirmation(current, typeof key === "string");
+  if (key === null) return unavailable("not_configured");
+  if (key instanceof Error) return configUnreadable(permission, key);
+
+  // Everything past here mutates, and a permission is the user's to give.
+  if (permission !== "granted") return notConnected(permission, "active");
+
+  return convergeGranted(registration, key, current);
+}
+
+/**
+ * Records what this pass learned about the deployment, for its own session only:
+ * a pass that outlived its session must neither grant nor revoke the next
+ * session's confirmation.
+ */
+function recordDeploymentConfirmation(current: Pass, confirmed: boolean): void {
+  if (current.generation !== getSessionGeneration()) return;
+  confirmedDeploymentGeneration = confirmed ? current.generation : null;
+}
+
+function deploymentConfirmed(): boolean {
+  return confirmedDeploymentGeneration === getSessionGeneration();
+}
+
+/** The key this deployment signs with, null when it delivers no push, or why it could not be read. */
+async function readDeploymentKey(): Promise<string | null | Error> {
+  try {
+    return await fetchPushVapidPublicKey();
+  } catch (error) {
+    return error instanceof Error ? error : new Error("web push configuration unreadable");
+  }
+}
+
+/**
+ * The deployment could not be asked which key it signs with. Nothing was
+ * mutated, and nothing may be: subscribing without the key would be guessing.
+ */
+function configUnreadable(
+  permission: WebPushPermissionState,
+  error: Error,
+): WebPushAvailableSnapshot {
+  return {
+    ...notConnected(permission, "active"),
+    backend: failedBackend("unknown", error),
+    health: "error",
+    error: categoryOf(error),
+  };
 }
 
 async function convergeGranted(
   registration: ServiceWorkerRegistration,
+  key: string,
   current: Pass,
 ): Promise<WebPushSnapshot> {
   let local: WebPushLocalSubscriptionState = "absent";
   let backend: WebPushBackendState = "unknown";
   try {
-    let subscription = await getLocalSubscription(registration);
+    let subscription = await usableLocalSubscription(registration, key);
     local = subscription === null ? "absent" : "present";
 
     const remote = ownDevice(await listPushSubscriptions());
@@ -378,19 +494,30 @@ async function convergeGranted(
     // The diagnosis above is the previous session's reading of the world if the
     // account changed while it was being read. Minting a subscription from it
     // would register this browser for whoever happens to be signed in now.
-    requireCurrentSession(current.generation);
-    subscription ??= await getOrCreateLocalSubscription(registration, current);
+    requireEntitled(current);
+    subscription ??= await getOrCreateLocalSubscription(registration, key, current);
     local = "present";
-    backend = backendStateOf(await registerLocalSubscription(registration, subscription, current));
+    backend = backendStateOf(
+      await registerLocalSubscription(registration, subscription, key, current),
+    );
     return granted(local, backend, null);
   } catch (error) {
     // A pass that outlived its session has no snapshot to offer and must not be
     // dressed up as a failure of push.
-    if (error instanceof SessionEnded) throw error;
+    if (error instanceof SessionEnded || error instanceof PermissionWithdrawn) throw error;
     // Whatever was already learned stays in the snapshot: "we know the backend
     // was unreachable" is more useful to a screen than a blanked-out state.
     return granted(local, failedBackend(backend, error), categoryOf(error));
   }
+}
+
+/** The local subscription, unless it was minted for a key this deployment no longer signs with. */
+async function usableLocalSubscription(
+  registration: ServiceWorkerRegistration,
+  key: string,
+): Promise<PushSubscription | null> {
+  const subscription = await getLocalSubscription(registration);
+  return subscription !== null && subscribedWithKey(subscription, key) ? subscription : null;
 }
 
 function failedBackend(backend: WebPushBackendState, error: unknown): WebPushBackendState {
@@ -404,6 +531,7 @@ function failedBackend(backend: WebPushBackendState, error: unknown): WebPushBac
 async function registerLocalSubscription(
   registration: ServiceWorkerRegistration,
   subscription: PushSubscription,
+  key: string,
   current: Pass,
 ): Promise<PushSubscriptionRecord> {
   try {
@@ -418,14 +546,13 @@ async function registerLocalSubscription(
   // Cancelling is itself a mutation, and the conflict took a round trip to
   // learn about, so the session is confirmed again before this browser loses a
   // subscription on behalf of a pass that may no longer own it.
-  requireCurrentSession(current.generation);
+  requireEntitled(current);
   // Cancelling and minting are one mutation of one PushManager: split, they
   // leave a window in which another pass reads "absent" and mints a second
   // subscription of its own.
-  const replacement = await serializeBrowserMutation(async () => {
-    await subscription.unsubscribe();
-    return createLocalSubscription(registration);
-  });
+  const replacement = await serializeBrowserMutation(() =>
+    mintReplacing(registration, subscription, key, current),
+  );
   return sendSubscription(replacement, current);
 }
 
@@ -441,7 +568,7 @@ async function sendSubscription(
   // and the bearer token this request carries is read when it is sent — so an
   // unchecked pass would register the previous session's diagnosis under the
   // current session's identity.
-  requireCurrentSession(current.generation);
+  requireEntitled(current);
   const record = await registerPushSubscription({
     deviceId: getWebPushDeviceId(),
     ...credentials,
@@ -527,8 +654,13 @@ function startPass(intent: PassIntent): Promise<WebPushSnapshot> {
 async function runPass(current: Pass): Promise<WebPushSnapshot> {
   commit(current.generation, reconciling(getWebPushSnapshot()));
   try {
-    return commit(current.generation, await computeSnapshot(current));
-  } catch {
+    return commit(current.generation, withCurrentPermission(await computeSnapshot(current)));
+  } catch (error) {
+    // The permission was withdrawn before a mutation: nothing was minted or
+    // registered, and what is published is the permission as it is now.
+    if (error instanceof PermissionWithdrawn) {
+      return commit(current.generation, withCurrentPermission(notConnected("granted", "active")));
+    }
     // The session this pass belonged to ended: it published nothing, changed
     // nothing, and the pass the new session starts is the one that answers.
     // Anything else that reached here is still not allowed to reject — push is
@@ -540,6 +672,23 @@ async function runPass(current: Pass): Promise<WebPushSnapshot> {
     // pass can already be the one running.
     if (inFlight?.pass === current) inFlight = null;
   }
+}
+
+/**
+ * The snapshot a pass may publish, given the permission as it is *now* (#862).
+ *
+ * A pass that needed no mutation reaches here on the permission it read at the
+ * start, several awaits ago. Anything it concluded under "granted" — healthy
+ * included — describes a browser that may since have been blocked, so it is
+ * re-read once, at the one place every pass publishes through. Only "granted"
+ * is re-read: a pass that started without it mutated nothing and prompted
+ * nothing, and the next focus reads a newly granted permission.
+ */
+function withCurrentPermission(next: WebPushSnapshot): WebPushSnapshot {
+  if (next.status !== "available" || next.permission !== "granted") return next;
+  const now = readWebPushPermission();
+  if (now === "granted") return next;
+  return now === "unsupported" ? unavailable("unsupported") : notConnected(now, next.worker);
 }
 
 /**
@@ -563,12 +712,35 @@ async function reconcileAfterChange(intent: PassIntent): Promise<WebPushSnapshot
  * ask again, and asking is how a site earns a permanent block. Both fall
  * straight through to a reconcile, which repairs what it can and reports the
  * rest.
+ *
+ * And only once this session knows the deployment can use it (issue #862). A
+ * pass still running is waited for; a session with no confirmation — never
+ * diagnosed, not configured, or the configuration unreadable last time — gets
+ * one diagnosis first. Not configured and unreadable do not prompt: the
+ * reconcile that follows reports them, and the next click asks again.
  */
 export async function enableWebPush(): Promise<WebPushSnapshot> {
-  if (webPushCapability() === "supported" && readWebPushPermission() === "default") {
+  if (await mayRequestPermission()) {
     await requestBrowserNotificationPermission();
   }
   return reconcileAfterChange("connect");
+}
+
+async function mayRequestPermission(): Promise<boolean> {
+  if (!promptablePermission()) return false;
+  // Fast path: a pass of this session already confirmed the deployment, so the
+  // prompt runs inside the same task as the click, with nothing awaited before
+  // it that could spend the gesture's transient activation.
+  if (deploymentConfirmed()) return true;
+  await inFlight?.result;
+  if (!deploymentConfirmed()) await reconcileAfterChange("diagnose");
+  // Re-read after the wait: the person may have answered a prompt from another
+  // tab, or blocked the site, while the diagnosis ran.
+  return deploymentConfirmed() && promptablePermission();
+}
+
+function promptablePermission(): boolean {
+  return webPushCapability() === "supported" && readWebPushPermission() === "default";
 }
 
 /**
@@ -677,5 +849,6 @@ export function _resetWebPushState(): void {
   browserMutationTail = Promise.resolve();
   lastTriggerAt = 0;
   lastRegisteredEndpoint = null;
+  confirmedDeploymentGeneration = null;
   listeners.clear();
 }

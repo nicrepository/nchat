@@ -14,6 +14,8 @@ type EventHandler = (event: unknown) => void;
 
 interface WindowClientStub {
   url: string | undefined;
+  visibilityState?: DocumentVisibilityState;
+  focused?: boolean;
   focus: ReturnType<typeof vi.fn>;
   navigate: ReturnType<typeof vi.fn>;
 }
@@ -245,6 +247,88 @@ describe("service worker: push", () => {
     await dispatchPush(harness, jsonData({ ...validPayload, source_id: value }));
 
     expect(harness.showNotification).not.toHaveBeenCalled();
+  });
+
+  // Issue #862 / #678: only a window that is visible and focused presents the
+  // event itself (a toast needs focus), so only then is the OS notification
+  // redundant. Visible without focus or hidden, the push is the visual surface.
+  async function pushWith(...windows: WindowClientStub[]) {
+    const harness = await loadServiceWorker({ matchAll: vi.fn().mockResolvedValue(windows) });
+    await dispatchPush(harness, jsonData(validPayload));
+    return harness;
+  }
+
+  it("shows nothing while an NChat window is visible and focused", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "visible", focused: true }),
+    );
+
+    expect(harness.matchAll).toHaveBeenCalledWith({ type: "window", includeUncontrolled: true });
+    expect(harness.showNotification).not.toHaveBeenCalled();
+  });
+
+  it("shows the notification when the NChat window is visible but not focused", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "visible", focused: false }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the notification when every NChat window is hidden", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "hidden", focused: false }),
+      windowClient("/profile", { visibilityState: "hidden", focused: false }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not trust a focus flag on a window that is not visible", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "hidden", focused: true }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows nothing when one of several NChat windows is visible and focused", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "hidden", focused: false }),
+      windowClient("/profile", { visibilityState: "visible", focused: false }),
+      windowClient("/chat/dm/x", { visibilityState: "visible", focused: true }),
+    );
+
+    expect(harness.showNotification).not.toHaveBeenCalled();
+  });
+
+  it("shows the notification when several NChat windows are visible but none is focused", async () => {
+    const harness = await pushWith(
+      windowClient("/chat", { visibilityState: "visible", focused: false }),
+      windowClient("/profile", { visibilityState: "visible", focused: false }),
+    );
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("is not silenced by a visible window of another origin", async () => {
+    const foreign = windowClient("/chat", { visibilityState: "visible", focused: true });
+    foreign.url = "https://nchat.example.com.evil.test/chat";
+    const harness = await loadServiceWorker({ matchAll: vi.fn().mockResolvedValue([foreign]) });
+
+    await dispatchPush(harness, jsonData(validPayload));
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("still shows the notification when the Clients API cannot be asked", async () => {
+    const harness = await loadServiceWorker({
+      matchAll: vi.fn().mockRejectedValue(new Error("clients unavailable")),
+    });
+
+    await dispatchPush(harness, jsonData(validPayload));
+
+    expect(harness.showNotification).toHaveBeenCalledTimes(1);
   });
 
   it("does not reject waitUntil when showNotification fails", async () => {
