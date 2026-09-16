@@ -241,6 +241,55 @@ describe("notificationPresentation — which sound plays", () => {
       "in-conversation",
     );
   });
+
+  // ── The mention is the policy's, never the body's (#830) ──────────────
+  //
+  // Which sound a mention plays is settled above; these say where the mention
+  // itself may come from. The server's codec decided it and put the answer on
+  // the wire as `named_user_ids`/`names_everyone` (soundRules' isNamedRecipient
+  // is the only reading of it); the body is a preview string this layer renders
+  // and never parses. The cases above already show the policy is *sufficient* —
+  // they name the reader over a body of "bom dia" — so what is left is that it
+  // is also *necessary*, which is the half a body-reading fallback would break
+  // without failing anything else in this file.
+  it("does not hear a mention in a body token the policy did not name", async () => {
+    expect(
+      await soundKeyFor({
+        bodyText: `@[Você](mention:user:${currentUserId}) olha isso`,
+        policy: policy({ named_user_ids: [senderId] }),
+      }),
+    ).toBe("message");
+  });
+
+  it("does not hear a mention in an @all token without names_everyone", async () => {
+    expect(
+      await soundKeyFor({
+        bodyText: `heads up @[all](mention:all:${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)})`,
+      }),
+    ).toBe("message");
+  });
+
+  // Naming the reader says how loud an event would be, never that it may be
+  // heard: a mention is subject to every gate an ordinary message is. The
+  // urgent half of this is in the burst matrix below; this is the mention half.
+  it("stays silent for the reader's own mention", async () => {
+    expect(
+      await soundKeyFor({
+        senderId: currentUserId,
+        policy: policy({ named_user_ids: [currentUserId] }),
+      }),
+    ).toBeUndefined();
+  });
+
+  // Mute and do-not-disturb reach this browser as a central deny on the
+  // channel. Being named personally is not a way around one.
+  it("stays silent when the policy denied sound to a message naming the reader", async () => {
+    expect(
+      await soundKeyFor({
+        policy: policy({ in_app: "deny", sound: "deny", named_user_ids: [currentUserId] }),
+      }),
+    ).toBeUndefined();
+  });
 });
 
 /**
