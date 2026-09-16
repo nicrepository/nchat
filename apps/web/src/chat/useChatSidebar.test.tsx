@@ -577,6 +577,17 @@ describe("useChatSidebar realtime unread", () => {
   });
 });
 
+/**
+ * The live seam: a `message.created` off the socket, all the way to the central
+ * player (issue #828).
+ *
+ * notificationPresentation.test.ts owns the class ladder as a matrix; what is
+ * asserted here is that this handler is wired to it — that an ordinary message
+ * the reader is not looking at arrives at the player as `"message"`, which is
+ * `nchat_lumen_message.wav` and nothing else. A count alone would pass just as
+ * happily for a mention chime on an ordinary message, so the cases that carry
+ * #828's rules name the key as well as the call.
+ */
 describe("useChatSidebar notification sound", () => {
   beforeEach(() => {
     websocket.onMessageCreated = null;
@@ -603,6 +614,7 @@ describe("useChatSidebar notification sound", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("message-1", channelA)));
 
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("message");
   });
 
   it("does not play a sound for the current user's own message", async () => {
@@ -687,6 +699,7 @@ describe("useChatSidebar notification sound", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("dm-message-1", dmC, "other-1", "dm")));
 
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("message");
   });
 
   it("does not play a sound for a DM message in the currently active DM", async () => {
@@ -1259,6 +1272,7 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     );
 
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("mention");
   });
 
   it("does not give mention priority to a mention of a different user", async () => {
@@ -1400,12 +1414,14 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     act(() => websocket.onMessageCreated?.(messageCreated("standard-1", channelB)));
     act(() => websocket.onMessageCreated?.(messageCreated("standard-2", channelB)));
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenLastCalledWith("message");
 
     act(() =>
       websocket.onMessageCreated?.(withPriority(messageCreated("urgent-1", channelB), "urgent")),
     );
 
     expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenLastCalledWith("urgent");
   });
 
   // A priority this build does not know must never be the one that escalates.
