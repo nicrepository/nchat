@@ -127,7 +127,7 @@ export function shouldExecuteSound(input: AlertExecutionInput): boolean {
 
   const soundClass = soundClassFor(input.policy, input.currentUserId);
   if (!localPreferenceAllows(input.localMode, soundClass)) return false;
-  return !alreadyInFrontOfTheReader(input, soundClass);
+  return !isAmbientActivityWhileAway(input, soundClass);
 }
 
 /**
@@ -220,16 +220,34 @@ function localPreferenceAllows(mode: SoundNotificationMode, soundClass: SoundCla
 }
 
 /**
- * The purely local gate: this tab is already showing the conversation.
+ * The purely local gate: room activity in a conversation the reader has open
+ * but is not actually watching.
  *
- * Focused, the message is in front of the reader and a chime adds nothing.
- * Unfocused, they are looking elsewhere, so something addressed to them
- * personally is still worth hearing while ambient room activity is not.
+ * Until issue #829 this gate also silenced the *attended* conversation — the
+ * reader was looking at the message, so a chime was held to add nothing. The
+ * Lumen family (#819) makes the opposite argument and wins it: an attended
+ * conversation gets its own deliberately quieter voice, `in-conversation`
+ * (0.42s, minimal reverb), which is feedback rather than a summons. Silence is
+ * no longer the discreet option available, so this gate stops claiming it and
+ * lets `notificationClass` (#826) decide which voice the event has.
+ *
+ * What remains is the case that has nothing to do with attention having been
+ * earned: the conversation is open in this tab, but the tab is hidden or the
+ * window is blurred. The reader is elsewhere, so something addressed to them
+ * personally is still worth hearing while ambient room activity is not — and an
+ * unknown class does not silence, for the same reason the preference above does
+ * not.
+ *
+ * `isWindowFocused` already carries both browser facts: the presentation layer
+ * fills it from `documentVisible && windowFocused` (see readAttentionContext),
+ * so `isActiveConversation && isWindowFocused` here is the very same condition
+ * #826 calls `isInConversation`. The two cannot drift apart into one layer
+ * chiming for an attention context the other does not recognise.
  */
-function alreadyInFrontOfTheReader(input: AlertExecutionInput, soundClass: SoundClass): boolean {
+function isAmbientActivityWhileAway(input: AlertExecutionInput, soundClass: SoundClass): boolean {
   if (!input.isActiveConversation) return false;
-  // Focused, the reader is looking at it whatever the class is. Unfocused, the
-  // class decides — and an unknown one does not silence, for the same reason
-  // the preference above does not.
-  return input.isWindowFocused || soundClass === "general";
+  // Attending it: heard as `in-conversation`, or as mention/urgent when those
+  // outrank it. Which one is not this file's question.
+  if (input.isWindowFocused) return false;
+  return soundClass === "general";
 }

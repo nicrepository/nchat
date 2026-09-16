@@ -26,20 +26,26 @@ The four message-side keys are spelled exactly like `NotificationClass`
 resolved class _be_ the sound key with no second mapping in between — the
 compiler checks it at the call site.
 
+### When `in-conversation` is heard (issue #829)
+
+Only when the reader is demonstrably attending the conversation — it is open in
+this tab, the tab is visible, and the window has focus, all three together. Any
+one of them missing and the event is not in-conversation at all; it falls back
+to whatever `notificationClass` resolves instead, which for ordinary room
+activity the reader is away from stays silent under `soundRules`' ambient gate.
+
+`urgent` and `mention` outrank it, so an urgent message in the attended
+conversation is `urgent` and never both. One logical event resolves to exactly
+one class, so `message` and `in-conversation` can never sound for the same
+message.
+
 ### Keys that are ready but not yet heard
 
-Three of the seven have an asset, a key and a player, and nothing calls them:
+Two of the seven have an asset, a key and a player, and nothing calls them:
 
 - **`call-start` / `call-end`** — no call-lifecycle consumer publishes these
   events yet. #827 scope is the assets and the player; wiring them belongs to
   the call lifecycle work, not here.
-- **`in-conversation`** — it resolves correctly, but the sound channel is
-  already closed before it can be reached: `soundRules.shouldExecuteSound`
-  (issue #744) silences _every_ class once the reader is demonstrably watching
-  the conversation (window focused, tab visible, conversation open). Making
-  this key audible means reopening that gate, which is a policy change with a
-  different owner. Covered by a test in `notificationPresentation.test.ts` that
-  asserts today's silence rather than a hoped-for chime.
 
 ## Format and provenance
 

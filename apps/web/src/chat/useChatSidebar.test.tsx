@@ -702,7 +702,10 @@ describe("useChatSidebar notification sound", () => {
     expect(mockPlayNotificationSound).toHaveBeenCalledWith("message");
   });
 
-  it("does not play a sound for a DM message in the currently active DM", async () => {
+  // Since #829 the attended conversation is heard rather than silenced, in its
+  // own quieter voice. A DM is no exception: being a DM raises no class of its
+  // own, so what the reader is attending decides.
+  it("plays the in-conversation sound for a DM message in the currently active DM", async () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     const { result } = renderHook(() => useChatSidebar(), {
       wrapper: wrapper(`/chat/dm/${dmC}`),
@@ -713,7 +716,7 @@ describe("useChatSidebar notification sound", () => {
       websocket.onMessageCreated?.(messageCreated("dm-message-active", dmC, "other-1", "dm")),
     );
 
-    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
   });
 
   it("does not play a sound for the current user's own DM message", async () => {
@@ -1364,7 +1367,11 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
-  it("plays a sound for a DM in the active conversation once the window loses focus", async () => {
+  // The visibility transition is what changes the class here, and nothing else
+  // does: one conversation, one sender, one kind of event, two sounds. It is
+  // driven by moving the browser fact the presentation layer reads, with no
+  // timer and no simulated event ordering.
+  it("swaps in-conversation for the ordinary message sound once the tab is hidden", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get");
     visibility.mockReturnValue("visible");
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
@@ -1373,14 +1380,16 @@ describe("useChatSidebar sound preference and DM/mention rules", () => {
     });
     await waitFor(() => expect(result.current.state.status).toBe("ready"));
 
-    // Focused + active: no sound (unchanged from the existing DM-active test).
+    // Visible, focused, open: the reader is attending it (#829).
     act(() => websocket.onMessageCreated?.(messageCreated("dm-focused", dmC, "other-1", "dm")));
-    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
 
-    // Same active DM, window now in the background: DM priority still plays.
+    // Same active DM, tab now in the background: no longer in-conversation, and
+    // a DM is still worth hearing while the reader is away.
     visibility.mockReturnValue("hidden");
     act(() => websocket.onMessageCreated?.(messageCreated("dm-unfocused", dmC, "other-1", "dm")));
-    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenLastCalledWith("message");
   });
 
   it("does not play a standard channel message in the active conversation even when the window is unfocused", async () => {
