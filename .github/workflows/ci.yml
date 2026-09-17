@@ -163,6 +163,16 @@ jobs:
       - name: Test Go
         run: bash scripts/ci/go-test.sh
 
+      - name: Test channel membership contracts (PostgreSQL)
+        working-directory: services/chat-service
+        env:
+          CHAT_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/membership_contract_test?sslmode=disable
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          # This suite drops chat; keep it separate from the coverage database.
+          docker exec "$POSTGRES_CONTAINER" createdb -U nchat membership_contract_test
+          go test ./internal/storage -run '^TestChannelMembershipContractPostgreSQL_' -count=1 -v
+
       - name: Run Go race tests
         run: bash scripts/ci/go-test.sh -race
 

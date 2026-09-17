@@ -69,6 +69,23 @@ offline nunca ocupa uma vaga da previa e um membro online nunca perde a vaga
 para um offline. Um cliente que precise da lista completa de membros do canal
 precisa de um contrato proprio -- este nao serve para isso.
 
+> **`member_count` conta `chat.channel_members`, nao quem alcanca o canal.**
+> Num canal publico as duas populacoes nao coincidem: todo papel que
+> `domain.CanReachPublicChannels` admite le o canal sem linha nenhuma em
+> `chat.channel_members`, e a criacao de canal publico nao escreve essa linha
+> nem para o criador. Um canal publico recem-criado responde `member_count: 0`
+> enquanto owner/admin/moderator/member ativos o alcancam implicitamente.
+> Guest nao ganha acesso por `workspace_members` apenas: precisa de
+> `channel_members` explicita. Canais privados exigem essa membership para
+> todos os papeis. Workspace desabilitado ou membership de workspace inativa
+> continuam bloqueando acesso. O diagnostico completo, a matriz por
+> superficie e a decisao pendente estao em
+> [chat-membership-contracts.md](../architecture/chat-membership-contracts.md)
+> (issue #881; o fix pertence a #883). Na fixture, canal privado com membro explicito e `#geral` apos sync
+> alinham acesso e membership persistida; antes do sync, `#geral` tambem pode
+> ter leitores implicitos sem linha. `online_members` continua sendo previa
+> de presenca, nunca roster.
+
 Campos de cada entrada:
 
 - `role` e o papel no canal (`member` | `moderator`) -- o unico atributo
@@ -100,10 +117,22 @@ alem do timeout) e **nao** e tratado como online; `PresenceOffline` nao tem
 entrada alguma no tracker. Nada e derivado de `last_seen` ou de atividade
 indireta.
 
-E estado por instancia: exato em deployment de instancia unica (todos os
-overlays em `infra/k8s` rodam chat-service com `replicas: 1`) e, se isso mudar,
-**sub**-reporta -- nunca super-reporta. Sem o tracker conectado, a previa volta
-vazia: ausencia de presenca nunca e lida como "online".
+E estado **por instancia**: o tracker so conhece as conexoes do proprio processo
+(`hub.go`, `h.presence.Connect`). Esta rota nao consulta o
+`ws.PresenceDirectory`, que e a resposta cluster-wide.
+
+Em deployment de instancia unica isso e exato -- `infra/k8s/base`, os overlays
+`k3s-dev`, `k3s-staging` e `nchat-dev-server` rodam chat-service com
+`replicas: 1`. **Producao nao e instancia unica**:
+`infra/k8s/overlays/k3s-prod/slots/workloads/runtime-patch.yaml` define
+`replicas: 2` por slot, entao la a previa e a contagem online **sub**-reportam.
+Sub-reportar e sempre a direcao segura -- nunca super-reporta -- mas a
+divergencia e real e esta registrada em
+[chat-membership-contracts.md](../architecture/chat-membership-contracts.md)
+(causa raiz R5, owner: issue #886).
+
+Sem o tracker conectado, a previa volta vazia: ausencia de presenca nunca e lida
+como "online".
 
 ### Erros
 
@@ -145,7 +174,10 @@ nunca aparecer.
 
 O predicado de participacao vive num lugar so (`active_members`) e e o mesmo de
 `SearchChannelMembers` (autocomplete de mencao), entao autocomplete, contagem
-total e previa nao podem divergir sobre quem esta no canal. O filtro
+total e previa nao podem divergir **entre si** sobre quem esta no canal. Os tres
+divergem, porem, de `chat.channel_visible_to_user` -- que e quem decide o
+acesso -- exatamente na medida em que canal publico tem membership implicita:
+ver o aviso sobre `member_count` acima. O filtro
 `chat.channels.workspace_id` impede um UUID de canal de outro tenant de resolver
 aqui, e o `user_id = ANY(...)` e uma **intersecao**: uma entrada de presenca de
 quem nao e membro deste canal nao seleciona nada.
@@ -166,13 +198,19 @@ aparece na rota: e resolvido no servidor a partir da sessao, como nas demais.
 
 ### Autorizacao
 
-`owner` ou `admin` ativo do workspace, via `domain.CanManageChannelMembers` --
-que delega a `CanManageWorkspace`, o mesmo gate de update/archive de canal e de
-categorias. **Nao** e "qualquer membro do canal": isso permitiria a quem apenas
-le um canal privado ampliar a audiencia dele, que e exatamente a propriedade que
-um canal privado tem. O papel `moderator` de `chat.channel_members` nao e
-consultado porque nenhum caminho de codigo o atribui; a divergencia esta
-registrada em `SECURITY.md`.
+`owner`, `admin` ou `moderator` ativo do workspace, via
+`domain.CanManageChannelMembers` -- que delega a `CanModerateWorkspace`, o mesmo
+gate das categorias de canal. RF-74 (migration 000022) foi o que criou o papel
+`moderator` de workspace e gastou essa costura; antes dela o predicado so
+admitia owner/admin. O store re-deriva a mesma lista dentro da transacao
+(`wm.role IN ('owner', 'admin', 'moderator')`).
+
+**Nao** e "qualquer membro do canal": isso permitiria a quem apenas le um canal
+privado ampliar a audiencia dele, que e exatamente a propriedade que um canal
+privado tem. O papel `moderator` de `chat.channel_members` e por canal e nunca e
+lido como autoridade de workspace -- nenhum caminho de codigo o atribui e nenhum
+o consulta para autorizar. A matriz completa esta em
+[rbac-matrix.md](../security/rbac-matrix.md).
 
 A autorizacao e verificada **antes** de o canal ser lido, entao um chamador sem
 permissao nao descobre pela resposta se um UUID de canal existe.
@@ -255,7 +293,7 @@ nao divergir de uma adicao concorrente.
 | ------ | --------------------- | ------------------------------------------------------------------------------------------------ |
 | 400    | `bad_request`         | `channelID` invalido, JSON malformado, campo desconhecido, lista vazia, ID nao-UUID, acima de 25 |
 | 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                                                         |
-| 403    | `forbidden`           | chamador nao e owner/admin, **ou** algum usuario nao e elegivel                                  |
+| 403    | `forbidden`           | chamador nao e owner/admin/moderator, **ou** algum usuario nao e elegivel                        |
 | 404    | `not_found`           | canal inexistente, arquivado, de outro workspace                                                 |
 | 415    | `bad_request`         | content type diferente de `application/json`                                                     |
 | 429    | `rate_limited`        | orcamento excedido                                                                               |
@@ -276,7 +314,7 @@ Parametros: `query` (2 a 64 caracteres) e `limit` opcional (padrao 20, maximo
 50, sempre clampado no servidor). Nada mais e aceito — workspace e ator vem da
 sessao, e um `workspace_id` na query string e simplesmente ignorado.
 
-Autorizacao: a mesma de `POST .../members` (`owner`/`admin` ativo), verificada
+Autorizacao: a mesma de `POST .../members` (`owner`/`admin`/`moderator` ativo), verificada
 **antes** de o canal ser lido. Isso e deliberado: a rota revela quem **nao** esta
 num canal, o que e um fato sobre a composicao de um canal privado.
 

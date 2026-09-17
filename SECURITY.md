@@ -183,9 +183,15 @@ Consequencias deliberadas para o Guest:
   o isolamento seria contornavel em uma requisicao;
 - **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
   `INSERT`;
-- **nao** e adicionado automaticamente a `#geral`; chega la sendo adicionado,
-  como a qualquer outro canal. O backfill `SyncGeneralMemberships` deixou de
-  criar essas linhas e nunca remove as existentes.
+- **nao** e adicionado automaticamente a `#geral`: `generalMembershipRoles`
+  exclui guest, tanto no sync individual quanto no backfill. Uma row explicita
+  existente (legada ou administrativa) pode satisfazer o predicate de
+  visibilidade, mantidas as demais condicoes de acesso; o sync nao a remove.
+  O fluxo de `MemberService.AddChannelMembers` no chat-service rejeita
+  `is_general`. Ha um caminho administrativo distinto: a API do admin-service,
+  com `admin.channels.manage`, chama `PGXChannelDirectoryStore.AddChannelMembers`,
+  que admite alvos elegiveis sem recusar `is_general`, inclusive guest.
+  Esta e a descricao CURRENT; a consolidacao futura pertence a #882.
 
 Canal privado continua exigindo membership de canal para **todos** os papeis:
 nem owner, nem admin, nem moderador leem um canal privado do qual nao

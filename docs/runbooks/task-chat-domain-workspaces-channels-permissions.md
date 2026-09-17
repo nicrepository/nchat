@@ -3,6 +3,15 @@
 **Branch:** feat/chat-channel-crud
 **Status:** MVP foundation + channel CRUD service/storage foundation
 
+> **Historical runbook.** It records the state at the time of the original task.
+> Two of its rules have since been superseded and are corrected in place below,
+> marked "superseded": channel-creation authorization (BUG #393, then RF-74) and
+> the `#geral` membership sync (RF-74, migration 000022 — guests are excluded).
+> The current authority is
+> [docs/security/rbac-matrix.md](../security/rbac-matrix.md) for roles and
+> [docs/architecture/chat-domain-model.md](../architecture/chat-domain-model.md)
+> for the schema; nothing else on this page was re-verified against today's code.
+
 ## What this implements
 
 - `chat` PostgreSQL schema with 5 tables: `workspaces`, `channel_categories`,
@@ -26,10 +35,18 @@
 - Archive is a status change (`status='archived'`), not a hard delete.
 - `#geral` is immutable through CRUD: callers cannot create slug `geral`, set
   `is_general`, edit the general channel, or archive it.
-- Mandatory `#geral` membership sync: active workspace members are inserted into
-  that workspace's `#geral` `channel_members` row during join/reactivation.
-  `SyncGeneralMemberships(ctx, workspaceID)` backfills missing rows for active
-  members only.
+- Mandatory `#geral` membership sync **(superseded by RF-74)**: active workspace
+  members are inserted into that workspace's `#geral` `channel_members` row
+  during join/reactivation, and `SyncGeneralMemberships(ctx, workspaceID)`
+  backfills missing rows. Since migration 000022 the sync covers the roles
+  `generalMembershipRoles` names — active `owner`, `admin`, `moderator` and
+  `member` — and **excludes `guest`**: a guest's workspace membership grants no
+  channel on its own, so it reaches only the channels it holds an explicit
+  `channel_members` row for. The backfill never removes a row, so a guest that
+  already holds one keeps it. RF-18 ("every user joins `#geral` automatically")
+  and this RF-74 exclusion have not been reconciled; issue #882 owns that
+  decision, and the current behaviour is characterized in
+  [chat-membership-contracts.md](../architecture/chat-membership-contracts.md).
 - Disabled workspaces deny channel list/read/write, category/channel creation,
   workspace membership auto-sync, and channel membership changes.
 - Database constraints enforce workspace/category consistency and exactly one
@@ -51,11 +68,15 @@ request to a verified caller:
 
 Current callable backend foundation:
 
-- `ChannelService.CreateChannel(ctx, input)` requires active workspace,
-  active caller membership, and manager role (`owner` or `admin`). The service
-  validates slug/display name/type/category, reserves slug `geral`, sets
-  `created_by` from the caller, and never accepts caller-provided `is_general`
-  or `status`.
+- `ChannelService.CreateChannel(ctx, input)` requires active workspace and active
+  caller membership. The manager-role requirement stated here is **superseded**:
+  BUG #393 removed it, so creation takes no management role, and RF-74 then
+  narrowed it by exactly one role via `domain.CanCreateChannel` (which delegates
+  to `domain.CanReachPublicChannels`) — active `owner`, `admin`, `moderator` and
+  `member` may create; `guest` may not. The store re-derives the same allowlist
+  inside the insert. The service validates slug/display name/type/category,
+  reserves slug `geral`, sets `created_by` from the caller, and never accepts
+  caller-provided `is_general` or `status`.
 - `ChannelService.ListChannels(ctx, workspaceID, callerID)` requires active
   workspace membership and delegates visibility to
   `ChannelStore.ListVisibleChannelsByUser`.
@@ -121,19 +142,26 @@ reactivates a workspace member, `chat-service` uses the storage transaction to:
 1. verify the workspace is active;
 2. create or activate the `workspace_members` row;
 3. load the active public general channel by the same `workspace_id`;
-4. insert the `channel_members` row with `ON CONFLICT DO NOTHING`.
+4. under CURRENT RF-74, insert the `channel_members` row with
+   `ON CONFLICT DO NOTHING` only for owner/admin/moderator/member; guest is
+   excluded by `generalMembershipRoles`.
 
 The join/reactivation and `#geral` insert are atomic in the pgx store. If the
 general channel is missing, the service returns `ErrGeneralChannelMissing`; it
 does not create `#geral` in the membership path. Unexpected database errors are
-propagated, and newly active members are not silently left unsynced. Duplicate
+propagated, and newly active members eligible for sync are not silently left
+unsynced. Guests remain excluded. Duplicate
 membership conflicts remain idempotent.
 
 Suspended and left workspace members are not synced into `#geral`. Disabled
-workspaces deny the sync. Authorization does not rely solely on the
-`channel_members` row: active workspace membership still grants access to
-`#geral`, so the sync row is a consistency aid rather than the only permission
-source.
+workspaces deny the sync. The original access rule was refined by RF-74:
+active workspace membership is necessary, but is not sufficient for every
+channel and role. Currently, owners, admins, moderators and members have implicit
+access to active public channels, including `#geral`; guests require explicit
+`channel_members`. Private channels require explicit channel membership for every
+role. Disabled workspaces and inactive workspace memberships still deny access.
+See the [current membership contract](../architecture/chat-membership-contracts.md);
+the future `#geral` decision remains with #882.
 
 ## Running tests
 
