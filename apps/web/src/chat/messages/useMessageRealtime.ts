@@ -251,13 +251,16 @@ export function useMessageRealtime({
 
   const handleSubscriptionError = useCallback(
     (event: WSClientErrorEvent) => {
-      dispatch({
-        type: "ws_fetch_error",
-        error:
-          event.code === "room_access_denied"
-            ? "Não foi possível acessar as atualizações em tempo real desta conversa."
-            : realtimeFallbackErrorMessage,
-      });
+      // Issue #475: a conversation open when membership is revoked learns
+      // about it here, via the same non-enumerating rejection the server
+      // already uses for subscribe (room_access_denied) — converge on the
+      // same access-denied state a fresh 404 produces, rather than reporting
+      // it as a realtime hiccup the reader could "tentar novamente".
+      if (event.code === "room_access_denied") {
+        dispatch({ type: "denied" });
+        return;
+      }
+      dispatch({ type: "ws_fetch_error", error: realtimeFallbackErrorMessage });
     },
     [dispatch],
   );

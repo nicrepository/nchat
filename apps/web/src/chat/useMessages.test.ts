@@ -886,7 +886,11 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.actionError).toMatch(/temporariamente indisponíveis/i);
   });
 
-  it("maps subscribe errors to realtime state without showing a reaction failure", async () => {
+  // Issue #475: a room_access_denied subscribe rejection means membership was
+  // lost while this conversation was open, not a transient realtime hiccup —
+  // it converges on the same access-denied state a 404 on the REST load
+  // produces, instead of surfacing as a "tentar novamente"-shaped banner.
+  it("maps a room_access_denied subscribe error to the access-denied state", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
     const { result } = renderHook(() =>
       useMessages({ kind: "channel", targetId: "ch-1", currentUserId: "user-me" }),
@@ -901,7 +905,9 @@ describe("useMessages — WS message.created integration", () => {
       }),
     );
 
-    expect(result.current.state.realtimeError).toMatch(/tempo real/i);
+    expect(result.current.state.status).toBe("denied");
+    expect(result.current.state.messages).toEqual([]);
+    expect(result.current.state.realtimeError).toBeNull();
     expect(result.current.state.actionError).toBeNull();
   });
 

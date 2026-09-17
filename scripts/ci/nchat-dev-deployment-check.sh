@@ -648,6 +648,17 @@ validate_configmap_key_value_assertion_contract() {
     $'data:\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid\n  AUTH_PUBLIC_WEB_BASE_URL: https://nchat-dev.example.invalid' \
     AUTH_PUBLIC_WEB_BASE_URL "https://$host" \
     || fail "ConfigMap: duplicate key accepted"
+  # quoted ConfigMap string -> passes
+  has_exact_key_value \
+    $'data:\n  NOTIFICATION_PUSH_PREVIEW_ENABLED: "true"' \
+    NOTIFICATION_PUSH_PREVIEW_ENABLED '"true"' \
+    || fail "ConfigMap: quoted Web Push preview value rejected"
+
+  # YAML boolean instead of ConfigMap string -> must fail
+  ! has_exact_key_value \
+    $'data:\n  NOTIFICATION_PUSH_PREVIEW_ENABLED: true' \
+    NOTIFICATION_PUSH_PREVIEW_ENABLED '"true"' \
+    || fail "ConfigMap: unquoted Web Push preview boolean accepted"
 }
 
 assert_rendered_replacements() {
@@ -664,7 +675,7 @@ assert_rendered_replacements() {
   has_exact_ingressroute_first_match "$document" "$host" || fail "IngressRoute/nchat-dev-uploads match replacement failed"
   document="$(yaml_document "$rendered" ConfigMap nchat-config)"
   has_exact_key_value "$document" AUTH_PUBLIC_WEB_BASE_URL "https://$host" || fail "ConfigMap/nchat-config public URL replacement failed"
-  has_exact_key_value "$document" NOTIFICATION_PUSH_PREVIEW_ENABLED "true" || fail "ConfigMap/nchat-config Web Push preview rollout must be explicitly enabled"
+  has_exact_key_value "$document" NOTIFICATION_PUSH_PREVIEW_ENABLED '"true"' || fail "ConfigMap/nchat-config Web Push preview rollout must be explicitly enabled"
   # The administrative console host (issue #578). Derived as admin.<host>, so
   # asserting the derivation here is what catches a topology pipeline that stops
   # deriving it — at which point the console would render with an unresolved
