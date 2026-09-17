@@ -56,6 +56,19 @@ type SidebarChannel struct {
 	// member silencing a channel changes nothing for anyone else. Always false
 	// for the general channel, which is not silenceable.
 	Muted bool
+	// NotificationLevel is the other half of that preference (issue #136): which
+	// events this user wants alerts for here, independently of whether alerts
+	// are silenced right now.
+	//
+	// Two fields and not one derived state, deliberately. They are the two
+	// columns the store holds, and keeping them apart all the way to the client
+	// is what lets the sidebar's mute shortcut leave the level alone — the
+	// invariant the whole issue rests on. The single state a UI shows is the
+	// precedence between them, applied where it is displayed.
+	//
+	// Always one of storage's declared levels; a conversation with no preference
+	// row at all reads as NotificationLevelAll.
+	NotificationLevel string
 }
 
 type sidebarChannelStore interface {
@@ -72,12 +85,61 @@ type SidebarService struct {
 	pins       storage.SidebarPinStore
 	readState  storage.ConversationReadStateStore
 	notifs     storage.NotificationPrefStore
+	// notificationLevelsEnabled is the issue #136 rollout gate. False is the
+	// default everywhere, including for a service assembled without the option
+	// below: a build that was never told the gate is open has not been told to
+	// write granular rows.
+	notificationLevelsEnabled bool
 }
 
 const (
 	ReadTargetChannel = storage.ConversationReadTargetChannel
 	ReadTargetDM      = storage.ConversationReadTargetDM
 )
+
+// The three notification modes the canonical preference endpoint accepts
+// (issue #136).
+//
+// This is the *public* vocabulary, and it is deliberately not the storage one.
+// A client says "silence this conversation" and the server decides what that
+// means in columns — which level to keep, which timestamp to write — so nothing
+// outside this service has to know that a mute is a nullable muted_at or that
+// the pure default is the absence of a row. Two of the three names coincide
+// with a stored level and the third does not exist as one at all, which is
+// exactly why the translation lives here.
+const (
+	// NotificationModeAll is every message: the default level, not silenced.
+	NotificationModeAll = "all"
+	// NotificationModeMentionsReplies is mentions and replies only, not
+	// silenced.
+	NotificationModeMentionsReplies = "mentions_replies"
+	// NotificationModeMuted is silenced, whatever level was chosen before. The
+	// level is preserved untouched, so turning notifications back on — from
+	// here or from the sidebar's shortcut — restores it.
+	NotificationModeMuted = "muted"
+)
+
+// ValidNotificationMode reports whether mode is one of the three above.
+//
+// A closed set, checked before anything is written, so an unknown mode is a
+// refusal and never a write that guesses at what the caller meant.
+//
+// There is deliberately no inverse rendering beside it: the sidebar payload
+// publishes the two stored fields — muted and the level — and not the mode
+// derived from them. That derivation is one line of precedence (a mute wins)
+// and it has to run on the client anyway, because the sidebar's mute shortcut
+// updates the row optimistically and the only honest optimistic update is
+// "muted changed, the level did not" — the invariant itself. A server-sent mode
+// would be stale the instant that happened, and re-deriving it locally on top
+// of a field the server also sends is two authorities for one value.
+func ValidNotificationMode(mode string) bool {
+	switch mode {
+	case NotificationModeAll, NotificationModeMentionsReplies, NotificationModeMuted:
+		return true
+	default:
+		return false
+	}
+}
 
 // WithPins adds the optional per-user preference store without changing the
 // existing constructor used by sidebar readers and tests.
@@ -97,6 +159,26 @@ func (s *SidebarService) WithReadState(readState storage.ConversationReadStateSt
 func (s *SidebarService) WithNotificationPrefs(notifs storage.NotificationPrefStore) *SidebarService {
 	s.notifs = notifs
 	return s
+}
+
+// WithConversationNotificationLevels opens or closes the issue #136 rollout
+// gate for *writes*.
+//
+// It is deliberately not an optional dependency like the stores above: reading
+// is never gated. Every read in this service already understands a granular row
+// whatever this says, which is what makes enabling the gate and rolling back to
+// this same build safe — a row written while it was open keeps its meaning
+// after it closes.
+func (s *SidebarService) WithConversationNotificationLevels(enabled bool) *SidebarService {
+	s.notificationLevelsEnabled = enabled
+	return s
+}
+
+// ConversationNotificationLevelsEnabled reports whether granular levels may be
+// written, so the sidebar payload can publish the capability instead of leaving
+// a client to guess at it.
+func (s *SidebarService) ConversationNotificationLevelsEnabled() bool {
+	return s.notificationLevelsEnabled
 }
 
 // MuteConversation and UnmuteConversation resolve the workspace from the same
@@ -122,6 +204,61 @@ func (s *SidebarService) UnmuteConversation(ctx context.Context, userID, targetT
 		return fmt.Errorf("notification preferences unavailable")
 	}
 	return s.notifs.Unmute(ctx, userID, targetType, targetID)
+}
+
+// SetConversationNotificationPreference applies one of the three public modes
+// (issue #136).
+//
+// It is the only place the public vocabulary is translated into stored columns,
+// and the translation is the whole function:
+//
+//	all               the default level, unsilenced — SetLevel removes the row
+//	mentions_replies  that level, unsilenced
+//	muted             silenced, level untouched
+//
+// The actor is the argument the handler took from the session and the workspace
+// is resolved here, from the same server-side sidebar context GET uses — so
+// nothing a client sends can name a user, a workspace or a role. The target is
+// re-authorised inside the store's own statement, including the general-channel
+// refusal that applies to the mute and only to the mute.
+func (s *SidebarService) SetConversationNotificationPreference(
+	ctx context.Context, userID, targetType, targetID, mode string,
+) error {
+	if !ValidNotificationMode(mode) {
+		return fmt.Errorf("%w: unknown notification mode %q", domain.ErrInvalidInput, mode)
+	}
+	// The rollout gate, and it is here rather than in the handler because this
+	// is the only place that writes (issue #136). `all` and `muted` pass while
+	// it is closed: both are states the pre-#136 model can represent — the
+	// default is the absence of a row and a mute is a row — so neither can
+	// produce something a release slot running that build would misread.
+	//
+	// `mentions_replies` is the one that can, and it is refused *before* the
+	// workspace is resolved or anything is written. There is no path to the
+	// store for it while the gate is closed, which is what makes the guarantee
+	// structural rather than a promise the UI keeps.
+	if mode == NotificationModeMentionsReplies && !s.notificationLevelsEnabled {
+		return domain.ErrConversationNotificationLevelsDisabled
+	}
+	workspace, _, err := s.authorizeWorkspaceMember(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if s.notifs == nil {
+		return fmt.Errorf("notification preferences unavailable")
+	}
+	switch mode {
+	case NotificationModeMuted:
+		return s.notifs.Mute(ctx, workspace.ID, userID, targetType, targetID)
+	case NotificationModeMentionsReplies:
+		return s.notifs.SetLevel(
+			ctx, workspace.ID, userID, targetType, targetID, storage.NotificationLevelMentionsReplies,
+		)
+	default:
+		return s.notifs.SetLevel(
+			ctx, workspace.ID, userID, targetType, targetID, storage.NotificationLevelAll,
+		)
+	}
 }
 
 func (s *SidebarService) MarkConversationRead(ctx context.Context, userID, targetType, targetID string, lastReadMessageID *string) error {
@@ -185,25 +322,45 @@ func (s *SidebarService) authorizeWorkspaceMember(ctx context.Context, userID st
 	return workspace, member, nil
 }
 
-// mutedTargets reads this user's silenced conversations into the same
-// "kind\x00id" keyed lookup GetSidebar uses for pins and unread counts, so the
-// projection below stays one map read per row rather than a scan.
+// notificationPrefTargets reads this user's expressed notification preferences
+// into the same "kind\x00id" keyed lookup GetSidebar uses for pins and unread
+// counts, so the projection below stays one map read per row rather than a scan.
 //
-// An unconfigured store means nothing is muted, which is the honest answer for a
-// build without the table rather than a failure to render a sidebar.
-func (s *SidebarService) mutedTargets(ctx context.Context, workspaceID, userID string) (map[string]bool, error) {
-	muted := map[string]bool{}
+// One statement for the whole sidebar, which is what keeps the level off the
+// list of things that could become a query per conversation (issue #136).
+//
+// An unconfigured store means nobody expressed anything, which is the honest
+// answer for a build without the table rather than a failure to render a
+// sidebar. A conversation absent from the map reads as the zero value, and the
+// zero value is exactly the default the missing row means: not muted, and a
+// level that normalises to "all".
+func (s *SidebarService) notificationPrefTargets(
+	ctx context.Context, workspaceID, userID string,
+) (map[string]storage.ConversationNotificationPref, error) {
+	prefs := map[string]storage.ConversationNotificationPref{}
 	if s.notifs == nil {
-		return muted, nil
+		return prefs, nil
 	}
-	items, err := s.notifs.ListMuted(ctx, workspaceID, userID)
+	items, err := s.notifs.ListPreferences(ctx, workspaceID, userID)
 	if err != nil {
-		return nil, fmt.Errorf("list muted conversations: %w", err)
+		return nil, fmt.Errorf("list conversation notification preferences: %w", err)
 	}
 	for _, item := range items {
-		muted[item.TargetType+"\x00"+item.TargetID] = true
+		prefs[item.TargetType+"\x00"+item.TargetID] = item
 	}
-	return muted, nil
+	return prefs, nil
+}
+
+// notificationLevelOr keeps a level this build does not recognise, and the
+// empty string a missing row yields, from reaching a client as a level.
+//
+// The normalisation is here rather than at the row, so both target kinds get the
+// same answer from the same line.
+func notificationLevelOr(level string) string {
+	if storage.ValidNotificationLevel(level) {
+		return level
+	}
+	return storage.NotificationLevelAll
 }
 
 func NewSidebarService(
@@ -274,7 +431,10 @@ func (s *SidebarService) GetSidebar(ctx context.Context, userID string) (Sidebar
 type sidebarDecorations struct {
 	pinnedAt map[string]time.Time
 	unread   map[string]int
-	muted    map[string]bool
+	// notifPrefs holds both halves of the notification preference — the mute and
+	// the level — because they are one row and reading them separately would be
+	// a second statement for no gain (issue #136).
+	notifPrefs map[string]storage.ConversationNotificationPref
 }
 
 func (s *SidebarService) loadSidebarDecorations(ctx context.Context, workspaceID, userID string) (sidebarDecorations, error) {
@@ -286,11 +446,11 @@ func (s *SidebarService) loadSidebarDecorations(ctx context.Context, workspaceID
 	if err != nil {
 		return sidebarDecorations{}, err
 	}
-	muted, err := s.mutedTargets(ctx, workspaceID, userID)
+	notifPrefs, err := s.notificationPrefTargets(ctx, workspaceID, userID)
 	if err != nil {
 		return sidebarDecorations{}, err
 	}
-	return sidebarDecorations{pinnedAt: pinnedAt, unread: unread, muted: muted}, nil
+	return sidebarDecorations{pinnedAt: pinnedAt, unread: unread, notifPrefs: notifPrefs}, nil
 }
 
 // A nil store is a sidebar assembled without that feature wired in, not an
@@ -331,16 +491,18 @@ func projectSidebarChannel(access storage.VisibleChannelAccess, member domain.Wo
 		pinnedCopy := pinned
 		pinnedPtr = &pinnedCopy
 	}
+	notifPref := decorations.notifPrefs[storage.NotificationPrefTargetChannel+"\x00"+access.Channel.ID]
 	return SidebarChannel{
 		Channel:  access.Channel,
 		CanWrite: domain.CanWriteChannel(&member, access.ChannelMember, access.Channel),
 		// The same predicate ChannelService.UpdateChannel enforces. The grouped
 		// category listing calls the identical function.
-		CanRename:     domain.CanRenameChannel(&member, access.Channel),
-		Muted:         decorations.muted[storage.NotificationPrefTargetChannel+"\x00"+access.Channel.ID],
-		LastMessageAt: access.LastMessageAt,
-		PinnedAt:      pinnedPtr,
-		UnreadCount:   decorations.unread[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID],
+		CanRename:         domain.CanRenameChannel(&member, access.Channel),
+		Muted:             notifPref.Muted,
+		NotificationLevel: notificationLevelOr(notifPref.Level),
+		LastMessageAt:     access.LastMessageAt,
+		PinnedAt:          pinnedPtr,
+		UnreadCount:       decorations.unread[storage.ConversationReadTargetChannel+"\x00"+access.Channel.ID],
 	}
 }
 
@@ -353,6 +515,8 @@ func decorateSidebarDMs(dms []domain.DMConversationWithParticipantIDs, decoratio
 			dms[i].PinnedAt = &pinnedCopy
 		}
 		dms[i].UnreadCount = decorations.unread[storage.ConversationReadTargetDM+"\x00"+dms[i].ID]
-		dms[i].Muted = decorations.muted[storage.NotificationPrefTargetDM+"\x00"+dms[i].ID]
+		notifPref := decorations.notifPrefs[storage.NotificationPrefTargetDM+"\x00"+dms[i].ID]
+		dms[i].Muted = notifPref.Muted
+		dms[i].NotificationLevel = notificationLevelOr(notifPref.Level)
 	}
 }

@@ -26,8 +26,8 @@ import (
 // schema that precedes it and then writes exactly what the old slot writes.
 
 const (
-	migrationUp50LinkTargets   = "000050_link_targets_convergence_and_previews.up.sql"
-	migrationDown50LinkTargets = "000050_link_targets_convergence_and_previews.down.sql"
+	migrationUp52LinkTargets   = "000052_link_targets_convergence_and_previews.up.sql"
+	migrationDown52LinkTargets = "000052_link_targets_convergence_and_previews.down.sql"
 
 	pendingDeadlineConstraint = "link_scans_pending_deadline_check"
 	pendingDeadlineTrigger    = "link_scans_pending_deadline"
@@ -109,7 +109,7 @@ func expire(t *testing.T, conn *pgx.Conn, urls ...string) {
 
 func TestLinkScanDeadlineBlueGreenPostgreSQL(t *testing.T) {
 	conn := newMigrationRoundTripDatabase(t)
-	applyMigrationsBefore(t, conn, migrationUp50LinkTargets)
+	applyMigrationsBefore(t, conn, migrationUp52LinkTargets)
 
 	// Before the migration: a pending row the old slot left waiting, and a
 	// terminal row with a verdict.
@@ -123,7 +123,7 @@ func TestLinkScanDeadlineBlueGreenPostgreSQL(t *testing.T) {
 	execOn(t, conn, `INSERT INTO chat.link_scans (canonical_url, status, scan_uuid, decided_at)
 		VALUES ($1, 'safe', 'scan-bg', now() - interval '2 days')`, terminalRow)
 
-	applyMigration(t, conn, migrationUp50LinkTargets)
+	applyMigration(t, conn, migrationUp52LinkTargets)
 
 	// A: the backfill gave the row that was already waiting an end.
 	assertFreshPendingDeadline(t, conn, waitingBefore, "row pending before the migration")
@@ -181,19 +181,19 @@ func TestLinkScanDeadlineBlueGreenPostgreSQL(t *testing.T) {
 	// Down refuses while unknown rows exist (the previous CHECK cannot hold
 	// them); once they are gone it removes everything this migration added, and
 	// up again restores the contract for the old writer.
-	if _, err := conn.Exec(t.Context(), readChatMigration(t, migrationDown50LinkTargets)); err == nil {
+	if _, err := conn.Exec(t.Context(), readChatMigration(t, migrationDown52LinkTargets)); err == nil {
 		t.Fatal("down must refuse while unknown targets exist")
 	}
 	execOn(t, conn, `ROLLBACK`)
 	execOn(t, conn, `DELETE FROM chat.link_scans`)
-	applyMigration(t, conn, migrationDown50LinkTargets)
+	applyMigration(t, conn, migrationDown52LinkTargets)
 	assertBool(t, hasColumn(t, conn, "chat", "link_scans", "deadline_at"), false, "down removes deadline_at")
 	assertBool(t, hasConstraint(t, conn, "chat.link_scans", pendingDeadlineConstraint), false, "down removes the pending-deadline check")
 	assertBool(t, hasTrigger(t, conn, "chat.link_scans", pendingDeadlineTrigger), false, "down removes the trigger")
 	assertBool(t, hasFunction(t, conn, "chat", pendingDeadlineTrigger), false, "down removes the trigger function")
 	execOn(t, conn, oldWriterInsert, waitingBefore)
 
-	applyMigration(t, conn, migrationUp50LinkTargets)
+	applyMigration(t, conn, migrationUp52LinkTargets)
 	assertBool(t, hasTrigger(t, conn, "chat.link_scans", pendingDeadlineTrigger), true, "up restores the trigger")
 	assertFreshPendingDeadline(t, conn, waitingBefore, "row pending across down/up")
 	execOn(t, conn, oldWriterInsert, oldInsert)
@@ -204,7 +204,7 @@ func TestLinkScanDeadlineBlueGreenPostgreSQL(t *testing.T) {
 // `interval '5 minutes'` in SQL, because a migration cannot import a constant —
 // so this holds every SQL occurrence to the Go value.
 func TestLinkScanPendingDeadlineMatchesTheSchema(t *testing.T) {
-	sql := readChatMigration(t, migrationUp50LinkTargets)
+	sql := readChatMigration(t, migrationUp52LinkTargets)
 	intervals := regexp.MustCompile(`now\(\) \+ interval '(\d+) minutes'`).FindAllStringSubmatch(sql, -1)
 	if len(intervals) < 3 {
 		t.Fatalf("expected the default, the backfill and the trigger to spell the deadline; found %d", len(intervals))

@@ -5,8 +5,8 @@
  * XSS resistance, and plain text pass-through.
  */
 
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import RichTextRenderer from "./RichTextRenderer";
 
 describe("RichTextRenderer", () => {
@@ -50,6 +50,98 @@ describe("RichTextRenderer", () => {
     );
     expect(container.textContent).toBe("@[Ana](mention:user:fake)");
     expect(container.querySelector(".rtr-mention")).toBeNull();
+  });
+
+  describe("mention click affordance (issue #795)", () => {
+    const ANA_ID = "11111111-1111-1111-1111-111111111111";
+    const mentionText = `Oi @[Ana](mention:user:${ANA_ID})`;
+
+    it("renders a user mention as an accessible, clickable control when opted in", () => {
+      const onMentionClick = vi.fn();
+      render(
+        <RichTextRenderer
+          text={mentionText}
+          bodyFormat="v3"
+          mention={{ currentUserId: "me", onMentionClick }}
+        />,
+      );
+      const mention = screen.getByRole("button", { name: "Abrir conversa com Ana" });
+      expect(mention).toHaveAttribute("data-mention-clickable", "true");
+      expect(mention).toHaveAttribute("tabIndex", "0");
+
+      fireEvent.click(mention);
+      expect(onMentionClick).toHaveBeenCalledWith("user", ANA_ID);
+    });
+
+    it("activates on Enter and Space", () => {
+      const onMentionClick = vi.fn();
+      render(
+        <RichTextRenderer
+          text={mentionText}
+          bodyFormat="v3"
+          mention={{ currentUserId: "me", onMentionClick }}
+        />,
+      );
+      const mention = screen.getByRole("button", { name: "Abrir conversa com Ana" });
+
+      fireEvent.keyDown(mention, { key: "Enter" });
+      fireEvent.keyDown(mention, { key: " " });
+      expect(onMentionClick).toHaveBeenCalledTimes(2);
+      expect(onMentionClick).toHaveBeenNthCalledWith(1, "user", ANA_ID);
+      expect(onMentionClick).toHaveBeenNthCalledWith(2, "user", ANA_ID);
+    });
+
+    it("marks a mention busy while its DM is resolving", () => {
+      const onMentionClick = vi.fn();
+      render(
+        <RichTextRenderer
+          text={mentionText}
+          bodyFormat="v3"
+          mention={{ currentUserId: "me", onMentionClick, openingIds: new Set([ANA_ID]) }}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "Abrir conversa com Ana" })).toHaveAttribute(
+        "aria-busy",
+        "true",
+      );
+    });
+
+    it("renders a mention of the reader themself as plain, inert text", () => {
+      const onMentionClick = vi.fn();
+      const { container } = render(
+        <RichTextRenderer
+          text={mentionText}
+          bodyFormat="v3"
+          mention={{ currentUserId: ANA_ID, onMentionClick }}
+        />,
+      );
+      const mention = container.querySelector(".rtr-mention");
+      expect(mention).not.toHaveAttribute("role");
+      expect(mention).not.toHaveAttribute("data-mention-clickable");
+      expect(screen.queryByRole("button", { name: /Abrir conversa/ })).toBeNull();
+    });
+
+    it("renders an @all mention as plain, inert text even when opted in", () => {
+      const onMentionClick = vi.fn();
+      const { container } = render(
+        <RichTextRenderer
+          text="Oi @[all](mention:all:00000000-0000-0000-0000-000000000000)"
+          bodyFormat="v3"
+          mention={{ currentUserId: "me", onMentionClick }}
+        />,
+      );
+      const mention = container.querySelector(".rtr-mention");
+      expect(mention).not.toHaveAttribute("role");
+      expect(mention).not.toHaveAttribute("data-mention-clickable");
+    });
+
+    it("renders a plain mention when the caller does not opt in", () => {
+      const { container } = render(<RichTextRenderer text={mentionText} bodyFormat="v3" />);
+      const mention = container.querySelector(".rtr-mention");
+      expect(mention).not.toHaveAttribute("role");
+      expect(mention).not.toHaveAttribute("data-mention-clickable");
+      expect(mention).toHaveTextContent("@Ana");
+    });
   });
 
   it.each([

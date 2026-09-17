@@ -63,6 +63,32 @@ const (
 
 	// resultError is a database or policy failure the worker could not act on.
 	resultError = "error"
+
+	// Persistent reminder outcomes (issue #825). Four values and no more,
+	// because the four are the questions an operator actually has about a
+	// feature whose whole risk is sending too much: how much reminding is
+	// happening, how much of it was a repeat the database refused, how much
+	// stopped because somebody answered, and how much stopped because it ran out.
+	//
+	// None of them is a new label — they are values of the same closed `result`
+	// label the counter already has, so the series count does not grow with the
+	// product. Nothing here is keyed by message, recipient or workspace: a
+	// reminder metric keyed by recipient would be a metric that grows with every
+	// urgent message ever sent, and would put an identity this service exists to
+	// keep private into a store that is scraped and retained differently from a
+	// log.
+	resultReminderScheduled = "reminder_scheduled"
+	// resultReminderDeduplicated is a due reminder whose row already existed, so
+	// the unique index refused a second one. Expected to be zero; a rising count
+	// means passes are repeating after their outbox write committed.
+	resultReminderDeduplicated = "reminder_deduplicated"
+	// resultReminderSuperseded is a scheduled reminder retired because its
+	// recipient stopped being pending before it was delivered. Distinct from
+	// resultSuppressed, which is the policy engine deciding: this one is the
+	// product working exactly as asked — somebody answered.
+	resultReminderSuperseded = "reminder_superseded"
+	// resultReminderExpired is a recipient who reached the reminder ceiling.
+	resultReminderExpired = "reminder_expired"
 )
 
 // NewNotificationMetrics registers the worker's collectors on the shared

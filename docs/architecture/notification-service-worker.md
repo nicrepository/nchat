@@ -85,18 +85,28 @@ erro.
 event.data ausente            -> nada
 JSON invalido                 -> nada
 nao e objeto                  -> nada
-v != 1                        -> nada
+v nao esta em {1, 2}          -> nada
 campo obrigatorio ausente/vazio -> nada
+v1                           -> ignora title e body_preview
+v2 sem title valido          -> titulo generico, sem corpo
+v2 com title valido          -> titulo recebido, corpo somente se valido
 ```
 
-Fail-closed em todos: nao existe default seguro para inventar. O payload e
+Envelope invalido ou versao desconhecida e recusado. Campos opcionais v2
+invalidos usam fallback sem o conteudo rejeitado. O payload e
 produzido pelo nosso proprio notification-service, mas chega por um terceiro e e
 decifrado pelo browser, entao e validado como se nao fosse nosso.
 
 Os cinco campos obrigatorios sao `id`, `type`, `source_type`, `source_id` e
-`occurred_at`, e `v` tem de ser exatamente `1` — o contrato de
+`occurred_at` — iguais nas duas versoes. `v` tem de ser `1` ou `2`, o contrato de
 [notification-web-push.md](notification-web-push.md). Uma versao desconhecida e
-recusada por construcao: e para isso que `v` existe.
+recusada por construcao: e para isso que `v` existe, e e por isso que a #870
+trocou a versao emitida por um interruptor de deployment em vez de subi-la — um
+worker anterior a ela recusaria a v2 e nao mostraria nada.
+
+Aceitar as duas nao e transicao: a v1 continua sendo o que um deployment sem
+preview emite, e o que uma notificacao ja em voo carrega quando o servidor e
+reconfigurado.
 
 > Um push com permissao concedida que nao chame `showNotification()` faz alguns
 > browsers exibirem a propria notificacao generica ("este site foi atualizado em
@@ -104,16 +114,114 @@ recusada por construcao: e para isso que `v` existe.
 > fechado; a alternativa seria mostrar algo derivado de um payload que nao
 > satisfaz o contrato.
 
+### Janela visivel e focada: nada (#862)
+
+Antes de mostrar, o worker pergunta `clients.matchAll({ type: "window",
+includeUncontrolled: true })`. So uma janela da propria origem com
+`visibilityState === "visible"` **e** `focused === true` faz o push terminar
+sem notificacao. E o mesmo teste que a pagina aplica antes de desenhar um toast
+(`isWindowFocused` em `notificationPresentation.ts`): uma pagina visivel e
+focada apresenta o que ve chegar — nada na conversa aberta, toast em outra —, e
+uma notificacao de SO por cima seria o alerta redundante que a #678 proibe. A
+outbox nao carrega sessao, entao o worker nao sabe qual conversa a pagina
+mostra; "existe janela visivel e focada" e o teste inteiro.
+
+Falha da Clients API conta como "nenhuma janela": suprimir por engano perde a
+notificacao, nao suprimir custa uma duplicata.
+
+### Visivel sem foco, ou oculta: o push
+
+Uma janela visivel mas sem foco, ou oculta, nao desenha toast
+(`shouldExecuteInAppNotification` exige foco), e a pagina nunca levanta uma
+notificacao de SO propria no backend atual: `showBrowserMessageNotification` so
+roda quando a decisao realtime autoriza `web_push`, e o chat-service nunca
+autoriza — o contexto do fan-out WebSocket e `PresenceConnected` com
+`WebPushAvailable` falso, e `surface(PresenceConnected)` do Policy Engine so
+admite `in_app` e `sound`. Nesses dois casos a notificacao do push e a unica
+superficie visual, entao o worker a mostra, e nao ha segunda notificacao de SO.
+
+| Janela do NChat       | Service Worker (push) | Toast da pagina              | Notificacao de SO da pagina |
+| --------------------- | --------------------- | ---------------------------- | --------------------------- |
+| visivel e focada      | suprime               | sim, fora da conversa aberta | nunca                       |
+| visivel sem foco      | mostra                | nao                          | nunca                       |
+| oculta                | mostra                | nao                          | nunca                       |
+| nenhuma (aba fechada) | mostra                | —                            | —                           |
+
+O som local continua sendo decidido pela pagina (policy, preferencia,
+cooldown) e pode tocar nos casos sem foco ao lado da notificacao do push. Isso e
+decisao de presenca do Policy Engine (#744/#749), que hoje nao observa foco nem
+visibilidade; esta camada nao a refaz.
+
+Testado dos dois lados: os casos de janela em `serviceWorker.test.ts` (focada,
+visivel sem foco, oculta, varias janelas), a matriz de atencao em
+`notificationPresentation.test.ts` e
+`TestRealtimeDecisionNeverAuthorisesTheOSSurfaceForAnyRecipient` no chat-service
+(mencao, resposta, mensagem de canal e DM). A apresentacao real no SO nao foi
+validada em browser.
+
 ### O que a notificacao mostra
 
-Titulo por `type`, escrito no proprio worker, de um conjunto fechado; tipo
-desconhecido cai num titulo generico. **Nao ha corpo**: a versao 1 nao carrega
-remetente nem preview, porque `chat.notification_outbox` nao guarda nenhum dos
-dois, entao nao existe texto vindo do payload que possa chegar a tela.
+Titulo e corpo sao **decididos pelo servidor** desde a #870. O worker nao infere
+apresentacao: ele recebe um titulo e um corpo que ja lhe disseram serem seguros,
+confere o formato, e mostra.
+
+```text
+v2 com title valido            -> e o titulo
+senao, titulo conhecido do type -> "Voce foi mencionado no NChat", etc.
+senao                           -> "Nova notificacao do NChat"
+
+v2 com title e body_preview validos -> e o corpo
+senao                           -> sem corpo nenhum
+```
+
+"Valido" sao quatro condicoes, todas obrigatorias:
+
+- e uma string;
+- nao excede o teto do contrato — 200 para titulo, 400 para preview, em unidades
+  UTF-16;
+- nao e composta apenas por whitespace;
+- nao e composta apenas por caracteres Unicode da categoria de formato (`Cf`).
+
+A ultima e a que cobre o que `trim()` sozinho nao pega: zero-width space
+(`U+200B`), BOM (`U+FEFF`), marcas direcionais (`U+200E`, `U+200F`) e os
+overrides bidirecionais. Nenhum deles e whitespace em JavaScript, entao um
+titulo feito so deles seria uma string nao vazia que o banner exibe em branco.
+
+A regra e **"apenas invisiveis"**, nao "contem um invisivel", e essa distincao e
+o ponto: texto real que carrega `Cf` continua valido, e uma sequencia ZWJ de
+emoji — `👨‍👩‍👦`, construida com `U+200D` entre os pictogramas — continua valida,
+porque os pictogramas ao lado nao estao na classe. Texto internacional, acentos
+combinantes (categoria `Mn`, nao `Cf`) e emojis com pares substitutos tambem
+passam inalterados.
+
+O servidor ja remove a categoria `Cf` inteira em `sanitizeLine`
+(`webpush_preview.go`), entao um payload nosso nunca chega aqui nesse estado. A
+conferencia no Service Worker e defesa adicional, para o payload inesperado: o
+push atravessa um terceiro e e decifrado pelo browser, e este arquivo valida
+como se o conteudo nao fosse nosso.
+
+Um campo que falha nao e **consertado** — nao ha modificacao por trim, slice ou
+substituicao: um campo que nao bate com o contrato nao e um campo com valor
+corrigivel, e corrigi-lo seria o worker decidindo apresentacao, que e o que a
+#870 moveu para o servidor.
+
+v1 ignora completamente title/body_preview, mesmo quando presentes.
+v2 permite somente title; body_preview exige title valido.
+
+O fallback e um so, e e alcancado identicamente por um payload v1, por um payload
+v2 que o servidor deixou em branco, e por um payload v2 cujo campo falhou na
+conferencia. Isso e deliberado: os motivos de nao haver preview (mensagem
+apagada, retida por link scan, acesso revogado, previews desligados) sao
+exatamente o que um banner nao pode revelar.
+
+Nada disso e markup. `showNotification()` renderiza texto — nao ha elemento, nao
+ha `innerHTML`, nao ha parser — entao uma tag no preview e a sequencia de
+caracteres que ela e. Ha teste explicito para isso, porque o dia em que alguem
+construir um DOM neste arquivo e o dia em que passa a importar.
 
 `icon` e `badge` sao assets locais (`/assets/nic-labs-icon.png`,
-`/assets/favicon.png`). Uma URL do payload nunca vira icone — e a versao 1 nem
-tem campo para uma.
+`/assets/favicon.png`). Uma URL do payload nunca vira icone — nenhuma das duas
+versoes tem campo para uma.
 
 `tag` e `nchat-notification-<id>`, entao uma reentrega at-least-once da **mesma**
 notificacao substitui a que ja esta na tela em vez de empilhar uma segunda.
@@ -186,5 +294,12 @@ desta issue.
 - Sem deep link por conversa, pelo motivo acima.
 - Sem cache, sem handler de `fetch`, sem offline. O worker existe para
   notificacao; PWA offline e outro assunto e outra issue.
-- Sem reconcile de `PushSubscription` no frontend (#745 entregou o backend); o
-  worker registra, mas ninguem ainda se inscreve.
+- A inscricao existe desde a #748, pelo reconcile do browser; este worker
+  continua sem saber quem se inscreveu.
+- O preview da #870 aparece no banner do sistema operacional, inclusive em tela
+  de bloqueio. Nao ha, nem antes nem depois dessa issue, preferencia por usuario
+  de "ocultar conteudo"; a politica MVP e o interruptor por deployment
+  `NOTIFICATION_PUSH_PREVIEW_ENABLED`, desligado por padrao.
+- Um Service Worker anterior a #870 recusa um payload v2 e nao mostra nada. Por
+  isso a versao emitida e configuravel: o worker vai primeiro, o interruptor
+  depois. Ver "Configuracao" em [notification-web-push.md](notification-web-push.md).

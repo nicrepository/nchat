@@ -1,18 +1,20 @@
 /**
  * Opening a DM with a message's author (moved out of ChatMessageArea, issue
- * #834).
+ * #834), or directly with any user id — e.g. a clicked @mention (issue #795).
  *
- * The whole of it: which authors have a request in flight, the one error line
- * a refusal shows, and the abort/generation bookkeeping that keeps a reply
- * arriving after a conversation switch from navigating somewhere nobody asked
- * for. It is one job with one lifetime, so it owns its own state rather than
- * leaving five refs and two effects lying around the page component.
+ * The whole of it: which recipients have a request in flight, the one error
+ * line a refusal shows, and the abort/generation bookkeeping that keeps a
+ * reply arriving after a conversation switch from navigating somewhere
+ * nobody asked for. It is one job with one lifetime, so it owns its own
+ * state rather than leaving five refs and two effects lying around the page
+ * component.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { getOrCreateDirectDM } from "../../chatApi";
 import type { Message } from "../../chatTypes";
+import { ApiRequestError } from "../../../lib/api";
 
 interface Params {
   currentUserId: string;
@@ -24,11 +26,13 @@ interface Params {
 }
 
 export interface AuthorDMState {
-  /** Authors whose DM is currently being resolved, for the pending affordance. */
+  /** Recipients whose DM is currently being resolved, for the pending affordance. */
   openingAuthorDMIds: Set<string>;
   /** The one refusal line, or null. */
   openDMError: string | null;
   openAuthorDM: (message: Message) => void;
+  /** Same open-DM flow, addressed directly by user id (e.g. a clicked mention). */
+  openMentionDM: (userId: string) => void;
 }
 
 export function useAuthorDM({
@@ -73,9 +77,8 @@ export function useAuthorDM({
     });
   }, [kind, targetId]);
 
-  const openAuthorDM = useCallback(
-    (message: Message) => {
-      const recipientId = message.senderId;
+  const resolveRecipientDM = useCallback(
+    (recipientId: string) => {
       if (
         !recipientId ||
         recipientId === currentUserId ||
@@ -101,9 +104,18 @@ export function useAuthorDM({
         })
         .catch((error: unknown) => {
           if (!isCurrent()) return;
-          if (!(error instanceof DOMException && error.name === "AbortError")) {
-            setOpenDMError("NÃ£o foi possÃ­vel abrir a conversa. Tente novamente.");
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          // The DM-creation endpoint answers a target that is forbidden,
+          // unknown, or workspace-ineligible (suspended/removed account
+          // included) with the same 404 "user not available" — deliberately
+          // undifferentiated server-side so the caller cannot enumerate why
+          // (issue #795 §10). This is the one case with copy of its own; any
+          // other failure (network, 500, ...) keeps the generic retry line.
+          if (error instanceof ApiRequestError && error.status === 404) {
+            setOpenDMError("Esta pessoa não está mais disponível para conversa direta.");
+            return;
           }
+          setOpenDMError("Não foi possível abrir a conversa. Tente novamente.");
         })
         .finally(() => {
           if (openingAuthorDMRef.current.get(recipientId) !== controller) return;
@@ -119,5 +131,14 @@ export function useAuthorDM({
     [currentUserId],
   );
 
-  return { openingAuthorDMIds, openDMError, openAuthorDM };
+  const openAuthorDM = useCallback(
+    (message: Message) => {
+      if (message.senderId) resolveRecipientDM(message.senderId);
+    },
+    [resolveRecipientDM],
+  );
+
+  const openMentionDM = resolveRecipientDM;
+
+  return { openingAuthorDMIds, openDMError, openAuthorDM, openMentionDM };
 }

@@ -187,7 +187,11 @@ func (b *bootstrap) wireServices(pool storage.Pool) {
 	b.services.sidebar = service.NewSidebarService(st.workspaces, st.channels, st.members, st.dms).
 		WithPins(st.sidebarPins).
 		WithReadState(st.conversationReadState).
-		WithNotificationPrefs(st.notificationPrefs)
+		WithNotificationPrefs(st.notificationPrefs).
+		// Issue #136's rollout gate. Off unless a deployment asks, and asked
+		// for in one place so the write path and the capability the payload
+		// publishes cannot disagree.
+		WithConversationNotificationLevels(cfg.ConversationNotificationLevelsEnabled)
 	b.services.message = service.NewMessageService(st.channels, st.dms, st.messages).
 		WithMessageAttachmentLimits(cfg.MaxMessageAttachments, cfg.MaxMessageAttachmentBytes)
 	// One MemberService instance for both consumers: mention autocomplete

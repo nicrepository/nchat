@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 
 /** Distance kept from every edge of the band a floating element is placed in. */
-const viewportPadding = 8;
+export const viewportPadding = 8;
 
 /** The band of screen an anchor is actually painted in. */
 export interface VisibleBounds {

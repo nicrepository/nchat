@@ -394,6 +394,12 @@ type DMConversationWithParticipantIDs struct {
 	// (issue #527), viewer-scoped like the counterpart fields above and never a
 	// property of the conversation itself.
 	Muted bool
+	// NotificationLevel is the other, independent half of that preference
+	// (issue #136): which events this viewer wants alerts for here. Viewer-scoped
+	// for the same reason, and orthogonal to Muted — silencing a conversation
+	// leaves this untouched, which is what lets turning it back on restore the
+	// level that was chosen.
+	NotificationLevel string
 }
 
 // DMCandidate is the minimal profile data exposed when starting a direct DM.

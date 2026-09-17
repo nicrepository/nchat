@@ -8,11 +8,20 @@ import {
   renameChannel as renameChannelRequest,
   renameGroup as renameGroupRequest,
   setConversationMuted,
+  setConversationNotificationMode,
   setSidebarConversationPinned,
 } from "./chatApi";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import { normalizeChatTargetId } from "./chatTargetId";
-import type { Channel, ChannelCategory, ConversationActivity, DMConversation } from "./chatTypes";
+import {
+  normalizeMessagePriority,
+  type Channel,
+  type ChannelCategory,
+  type ConversationActivity,
+  type ConversationNotificationLevel,
+  type ConversationNotificationMode,
+  type DMConversation,
+} from "./chatTypes";
 import { laterActivity } from "./sidebarOrder";
 import {
   loadPersistedUnread,
@@ -43,6 +52,21 @@ export type SidebarState =
       currentUserId: string;
       workspaceId: string;
       attachmentLimits?: WorkspaceAttachmentLimits;
+      /**
+       * Whether this deployment has opened the issue #136 rollout gate, as the
+       * server reported it in the same payload that hydrated this state.
+       *
+       * The settings page reads it to decide which control to render: the
+       * binary switch every build has always had, or the three-mode select.
+       * It is an affordance and never the control — the server re-derives the
+       * same answer on every write.
+       *
+       * Optional for the same reason `attachmentLimits` is: a state assembled
+       * without it — a fixture, or a build whose payload predates the field —
+       * reads as "off", which is the compatible control rather than an offer
+       * the server would refuse.
+       */
+      notificationLevelsEnabled?: boolean;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -54,6 +78,7 @@ type Action =
       currentUserId: string;
       workspaceId: string;
       attachmentLimits: WorkspaceAttachmentLimits;
+      notificationLevelsEnabled: boolean;
       channels: Channel[];
       dms: DMConversation[];
       categories: ChannelCategory[];
@@ -81,7 +106,11 @@ type Action =
     }
   | { type: "target_opened"; target: WSSubscriptionTarget }
   | { type: "pin_changed"; target: WSSubscriptionTarget; pinnedAt: string | null }
-  | { type: "mute_changed"; target: WSSubscriptionTarget; muted: boolean };
+  | {
+      type: "preference_changed";
+      target: WSSubscriptionTarget;
+      change: ConversationPreferenceChange;
+    };
 
 /**
  * Replaces the list with the server's, keeping each surviving item's activity
@@ -179,10 +208,24 @@ function bumpActivity<T extends ConversationActivity & { id: string }>(
  * nothing, because what this user may see is the server's decision and not an
  * event's.
  */
+/**
+ * One optimistic change to a conversation's notification preference.
+ *
+ * The two fields are optional and independent, which is the invariant of issue
+ * #136 expressed in the client's own state: silencing sets `muted` and says
+ * nothing about the level, so turning notifications back on shows the level
+ * that was already there rather than a guess. A change that sets only `muted`
+ * is *how* the sidebar shortcut stays non-destructive.
+ */
+interface ConversationPreferenceChange {
+  muted?: boolean;
+  notificationLevel?: ConversationNotificationLevel;
+}
+
 function applyPreference(
   state: SidebarState,
   target: WSSubscriptionTarget,
-  change: { muted?: boolean; pinnedAt?: string | null },
+  change: ConversationPreferenceChange | { pinnedAt: string | null },
 ): SidebarState {
   if (state.status !== "ready") return state;
   const update = <T extends { id: string }>(items: T[]): T[] =>
@@ -211,6 +254,7 @@ function applyLoaded(
     currentUserId: action.currentUserId,
     workspaceId: action.workspaceId,
     attachmentLimits: action.attachmentLimits,
+    notificationLevelsEnabled: action.notificationLevelsEnabled,
     channels: mergeUnread(channels, previous?.channels, "channel", action.persistedUnread),
     dms: mergeUnread(dms, previous?.dms, "dm", action.persistedUnread),
     categories: action.categories || [],
@@ -307,8 +351,8 @@ function reducer(state: SidebarState, action: Action): SidebarState {
       return applyMessageCreated(state, action);
     case "target_opened":
       return applyTargetOpened(state, action);
-    case "mute_changed":
-      return applyPreference(state, action.target, { muted: action.muted });
+    case "preference_changed":
+      return applyPreference(state, action.target, action.change);
     case "pin_changed":
       return applyPreference(state, action.target, { pinnedAt: action.pinnedAt });
   }
@@ -363,6 +407,9 @@ function notificationEventFrom(
       typeof payload.sender_avatar_url === "string" ? payload.sender_avatar_url : undefined,
     bodyText: payload.body_text ?? "",
     conversationName,
+    // Narrowed here, at the wire's edge, so the presentation layer receives one
+    // of three values and never a server string it has to interpret (#826).
+    priority: normalizeMessagePriority(payload.priority),
     policy: payload.notification_policy,
   };
 }
@@ -437,6 +484,7 @@ export function useChatSidebar() {
           channels,
           dms,
           categories,
+          notificationLevelsEnabled,
         }) => {
           if (mountedRef.current) {
             const persistedUnread =
@@ -450,6 +498,7 @@ export function useChatSidebar() {
                 maxFiles: maxFiles ?? 1,
                 maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
               },
+              notificationLevelsEnabled: notificationLevelsEnabled ?? false,
               channels,
               dms,
               categories,
@@ -543,6 +592,7 @@ export function useChatSidebar() {
             channels,
             dms,
             categories,
+            notificationLevelsEnabled,
           }) => {
             if (mountedRef.current)
               dispatch({
@@ -554,6 +604,7 @@ export function useChatSidebar() {
                   maxFiles: maxFiles ?? 1,
                   maxBytes: maxBytes ?? Number.MAX_SAFE_INTEGER,
                 },
+                notificationLevelsEnabled: notificationLevelsEnabled ?? false,
                 channels,
                 dms,
                 categories,
@@ -712,54 +763,127 @@ export function useChatSidebar() {
   );
 
   /**
-   * Conversations with a mute write in flight, keyed `kind:targetId`.
+   * Conversations with a notification-preference write in flight, keyed
+   * `kind:targetId`.
+   *
+   * One set for every writer of this preference, not one per entry point. The
+   * sidebar's mute shortcut and the settings page's select change the same row
+   * through two different endpoints (issue #136), and two independent guards
+   * would each police only their own surface — leaving the one interleaving that
+   * matters, a click in each, completely unguarded.
    *
    * A ref rather than state: nothing renders from it, and it has to be read and
    * written synchronously inside one call — a state update would land a render
    * later, which is exactly the window two clicks slip through.
    */
-  const muteInFlight = useRef<Set<string>>(new Set());
+  const preferenceInFlight = useRef<Set<string>>(new Set());
+
+  /**
+   * Writes one conversation's notification preference, optimistically and with
+   * at most one write per conversation in flight.
+   *
+   * The one coordination primitive both public setters below go through
+   * (issue #136), because both change the same row and the property has to hold
+   * across them rather than within each:
+   *
+   *  - optimistic first, because this is a private preference the server either
+   *    accepts or refuses outright, so showing it immediately and rolling back
+   *    on failure is honest;
+   *  - the refetch after a confirmed write reconciles with what was actually
+   *    persisted, which is what makes the server — not the click — the last
+   *    word. That matters most for the mute shortcut, whose restored level this
+   *    client never predicted;
+   *  - a second call for a conversation already being written is dropped, not
+   *    queued: the endpoints behind this have no ordering guarantee in flight,
+   *    and the refetch that follows the first one converges the row anyway;
+   *  - the key is the target, so different conversations are independent and
+   *    never wait on each other, and the entry is released in `finally` even
+   *    when the error is re-thrown for the caller to render.
+   *
+   * `rollback` is the caller's, because only the caller knows which fields its
+   * optimistic change touched — reverting a field the write never claimed would
+   * undo something somebody else wrote.
+   */
+  const writePreference = useCallback(
+    async (
+      target: WSSubscriptionTarget,
+      optimistic: ConversationPreferenceChange,
+      rollback: ConversationPreferenceChange,
+      request: () => Promise<void>,
+    ) => {
+      const key = `${target.kind}:${target.targetId}`;
+      if (preferenceInFlight.current.has(key)) return;
+      preferenceInFlight.current.add(key);
+      dispatch({ type: "preference_changed", target, change: optimistic });
+      try {
+        await request();
+        refreshSidebar();
+      } catch (error) {
+        dispatch({ type: "preference_changed", target, change: rollback });
+        throw error;
+      } finally {
+        preferenceInFlight.current.delete(key);
+      }
+    },
+    [refreshSidebar],
+  );
 
   /**
    * Silences or restores one conversation for this user only (issue #527).
    *
-   * Optimistic like the pin, and for the same reason: it is a private
-   * preference the server either accepts or refuses outright, so showing the
-   * new state immediately and rolling back on failure is honest. The refetch
-   * after a confirmed write reconciles with what was actually persisted —
-   * without it the optimistic guess would be the last word, which is what the
-   * comment above this function already claimed and the code did not do.
-   *
-   * One write per conversation at a time (issue #729). Two surfaces reach this
-   * same function — the sidebar row menu and the notifications settings page,
-   * both mounted together on /profile — so a per-target guard here is what
-   * makes the property hold wherever the click came from, rather than each
-   * surface policing only itself. A second call for a conversation already
-   * being written is dropped, not queued: POST and DELETE to the same mute
-   * endpoint have no ordering guarantee in flight, and the refetch that follows
-   * the first one converges the row with the server anyway. Different
-   * conversations are independent and never wait on each other.
+   * The sidebar's quick shortcut, and it touches `muted` only — on the wire and
+   * in the optimistic state alike. That is the invariant of issue #136: the
+   * level the user chose in their profile is not this action's to change, so
+   * silencing a conversation and turning it back on returns them to the level
+   * they had, and the row shows it immediately rather than after a round trip.
    */
   const setMuted = useCallback(
     async (target: WSSubscriptionTarget, muted: boolean) => {
       if (state.status !== "ready") return;
-      const key = `${target.kind}:${target.targetId}`;
-      if (muteInFlight.current.has(key)) return;
       const items = target.kind === "channel" ? state.channels : state.dms;
       const previous = Boolean(items.find((item) => item.id === target.targetId)?.muted);
-      muteInFlight.current.add(key);
-      dispatch({ type: "mute_changed", target, muted });
-      try {
-        await setConversationMuted(target.kind, target.targetId, muted);
-        refreshSidebar();
-      } catch (error) {
-        dispatch({ type: "mute_changed", target, muted: previous });
-        throw error;
-      } finally {
-        muteInFlight.current.delete(key);
-      }
+      await writePreference(target, { muted }, { muted: previous }, () =>
+        setConversationMuted(target.kind, target.targetId, muted),
+      );
     },
-    [refreshSidebar, state],
+    [state, writePreference],
+  );
+
+  /**
+   * Sets the whole notification preference of one conversation (issue #136).
+   *
+   * The settings page's control, against the canonical endpoint. It shares
+   * `writePreference` with the mute shortcut above, so the two cannot be used
+   * out of order against the same conversation even while both surfaces are
+   * mounted together on /profile.
+   *
+   * The optimistic change states both dimensions, because this mode decides
+   * both: `muted` names the third mode and the other two are levels that also
+   * lift a mute. Choosing what to hear is choosing to hear something, which is
+   * what the server does too.
+   *
+   * The `muted` mode is the exception, and deliberately: it leaves the level
+   * alone, exactly like the shortcut, so the profile select and the row menu
+   * agree about what silencing costs.
+   */
+  const setNotificationMode = useCallback(
+    async (target: WSSubscriptionTarget, mode: ConversationNotificationMode) => {
+      if (state.status !== "ready") return;
+      const items = target.kind === "channel" ? state.channels : state.dms;
+      const current = items.find((item) => item.id === target.targetId);
+      const previous: ConversationPreferenceChange = {
+        muted: Boolean(current?.muted),
+        notificationLevel: current?.notificationLevel ?? "all",
+      };
+      const optimistic: ConversationPreferenceChange =
+        mode === "muted"
+          ? { muted: true }
+          : { muted: false, notificationLevel: mode as ConversationNotificationLevel };
+      await writePreference(target, optimistic, previous, () =>
+        setConversationNotificationMode(target.kind, target.targetId, mode),
+      );
+    },
+    [state, writePreference],
   );
 
   /**
@@ -814,6 +938,7 @@ export function useChatSidebar() {
     renameChannel,
     renameGroup,
     setMuted,
+    setNotificationMode,
     leaveConversation,
     inAppAlert,
     dismissInAppAlert,

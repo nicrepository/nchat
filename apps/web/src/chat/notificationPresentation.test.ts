@@ -5,18 +5,24 @@ import type {
   MessageNotificationEvent,
   MessagePresentationContext,
 } from "./notificationPresentation";
+import type { SoundNotificationMode } from "./soundPreference";
 import type { WSNotificationPolicy } from "./useChatWebSocket";
 
-const { mockPlayMessageSound, mockShowBrowserMessageNotification, mockGetSoundNotificationMode } =
-  vi.hoisted(() => ({
-    mockPlayMessageSound: vi.fn(),
-    mockShowBrowserMessageNotification: vi.fn(() => ({ shown: true })),
-    mockGetSoundNotificationMode: vi.fn(
-      () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
-    ),
-  }));
+const {
+  mockPlayNotificationSound,
+  mockShowBrowserMessageNotification,
+  mockGetSoundNotificationMode,
+} = vi.hoisted(() => ({
+  mockPlayNotificationSound: vi.fn(),
+  mockShowBrowserMessageNotification: vi.fn(() => ({ shown: true })),
+  mockGetSoundNotificationMode: vi.fn(
+    () => "all" as "off" | "all" | "mentions" | "mentions_and_dms",
+  ),
+}));
 
-vi.mock("./messageSound", () => ({ playMessageSound: mockPlayMessageSound }));
+vi.mock("../notifications/notificationSound", () => ({
+  playNotificationSound: mockPlayNotificationSound,
+}));
 vi.mock("./browserNotification", () => ({
   showBrowserMessageNotification: mockShowBrowserMessageNotification,
 }));
@@ -28,7 +34,7 @@ const channelId = "11111111-1111-4111-8111-111111111111";
 
 function policy(overrides: Partial<WSNotificationPolicy> = {}): WSNotificationPolicy {
   return {
-    policy_version: 1,
+    policy_version: 2,
     in_app: "allow",
     sound: "allow",
     web_push: "deny",
@@ -46,6 +52,7 @@ function event(overrides: Partial<MessageNotificationEvent> = {}): MessageNotifi
     senderDisplayName: "Ana",
     bodyText: "bom dia",
     conversationName: "geral",
+    priority: "standard",
     policy: policy(),
     ...overrides,
   };
@@ -66,8 +73,24 @@ function sinks() {
 
 /** Reader in front of this window, looking at some other conversation. */
 function setFocused(focused: boolean) {
-  vi.spyOn(document, "visibilityState", "get").mockReturnValue(focused ? "visible" : "hidden");
-  vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+  setAttention({ documentVisible: focused, windowFocused: focused });
+}
+
+/**
+ * The two browser facts, moved independently (issue #829).
+ *
+ * `setFocused` moves them together, which is every pre-#829 case and reads
+ * better for them. It cannot express the two states #829 turns on, though — a
+ * visible tab whose window lost focus, and a focused window whose tab is
+ * hidden — and those are precisely where in-conversation must *not* apply.
+ * Both are real browser states, and each is set here the way the browser
+ * reports it rather than simulated through a timer.
+ */
+function setAttention(attention: { documentVisible: boolean; windowFocused: boolean }) {
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue(
+    attention.documentVisible ? "visible" : "hidden",
+  );
+  vi.spyOn(document, "hasFocus").mockReturnValue(attention.windowFocused);
 }
 
 /**
@@ -137,6 +160,341 @@ function resetEnvironment() {
   Reflect.deleteProperty(navigator, "locks");
 }
 
+/**
+ * Which Lumen sound a permitted event plays (#827).
+ *
+ * The key is the resolved notification class and nothing else, so these cases
+ * are the class ladder read back through the surface that consumes it. They
+ * assert the *argument*, not just that something was heard: a player that was
+ * called with the wrong key is exactly as audible as one called with the right
+ * one, and no other assertion in this file would notice.
+ */
+describe("notificationPresentation — which sound plays", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    setFocused(true);
+    installLockManager();
+  });
+
+  afterEach(resetEnvironment);
+
+  async function soundKeyFor(
+    eventOverrides: Partial<MessageNotificationEvent>,
+    contextOverrides: Partial<MessagePresentationContext> = {},
+  ): Promise<string | undefined> {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    void presentLiveMessageNotification(event(eventOverrides), context(contextOverrides), sinks());
+    await flush();
+    return mockPlayNotificationSound.mock.calls[0]?.[0] as string | undefined;
+  }
+
+  it("plays the ordinary message sound for an ordinary message", async () => {
+    expect(await soundKeyFor({})).toBe("message");
+  });
+
+  it("plays the mention sound when the message names this reader", async () => {
+    expect(await soundKeyFor({ policy: policy({ named_user_ids: [currentUserId] }) })).toBe(
+      "mention",
+    );
+  });
+
+  it("plays the mention sound for a message that names everyone", async () => {
+    expect(await soundKeyFor({ policy: policy({ names_everyone: true }) })).toBe("mention");
+  });
+
+  it("plays the urgent sound, outranking a mention", async () => {
+    expect(
+      await soundKeyFor({
+        priority: "urgent",
+        policy: policy({ named_user_ids: [currentUserId] }),
+      }),
+    ).toBe("urgent");
+  });
+
+  it("gives an important message the same sound as a standard one", async () => {
+    // #826 is explicit that "important" introduces no class of its own, so it
+    // must not have acquired a sound of its own here either.
+    expect(await soundKeyFor({ priority: "important" })).toBe("message");
+  });
+
+  it("plays the in-conversation sound while the reader is attending the conversation", async () => {
+    expect(await soundKeyFor({}, { isActiveConversation: true })).toBe("in-conversation");
+  });
+
+  it("keeps urgent ahead of in-conversation in the attended conversation", async () => {
+    expect(await soundKeyFor({ priority: "urgent" }, { isActiveConversation: true })).toBe(
+      "urgent",
+    );
+  });
+
+  it("keeps a mention ahead of in-conversation in the attended conversation", async () => {
+    expect(
+      await soundKeyFor(
+        { policy: policy({ named_user_ids: [currentUserId] }) },
+        { isActiveConversation: true },
+      ),
+    ).toBe("mention");
+  });
+
+  it("gives an important message in the attended conversation no sound of its own", async () => {
+    expect(await soundKeyFor({ priority: "important" }, { isActiveConversation: true })).toBe(
+      "in-conversation",
+    );
+  });
+
+  // ── The mention is the policy's, never the body's (#830) ──────────────
+  //
+  // Which sound a mention plays is settled above; these say where the mention
+  // itself may come from. The server's codec decided it and put the answer on
+  // the wire as `named_user_ids`/`names_everyone` (soundRules' isNamedRecipient
+  // is the only reading of it); the body is a preview string this layer renders
+  // and never parses. The cases above already show the policy is *sufficient* —
+  // they name the reader over a body of "bom dia" — so what is left is that it
+  // is also *necessary*, which is the half a body-reading fallback would break
+  // without failing anything else in this file.
+  it("does not hear a mention in a body token the policy did not name", async () => {
+    expect(
+      await soundKeyFor({
+        bodyText: `@[Você](mention:user:${currentUserId}) olha isso`,
+        policy: policy({ named_user_ids: [senderId] }),
+      }),
+    ).toBe("message");
+  });
+
+  it("does not hear a mention in an @all token without names_everyone", async () => {
+    expect(
+      await soundKeyFor({
+        bodyText: `heads up @[all](mention:all:${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)})`,
+      }),
+    ).toBe("message");
+  });
+
+  // Naming the reader says how loud an event would be, never that it may be
+  // heard: a mention is subject to every gate an ordinary message is. The
+  // urgent half of this is in the burst matrix below; this is the mention half.
+  it("stays silent for the reader's own mention", async () => {
+    expect(
+      await soundKeyFor({
+        senderId: currentUserId,
+        policy: policy({ named_user_ids: [currentUserId] }),
+      }),
+    ).toBeUndefined();
+  });
+
+  // Mute and do-not-disturb reach this browser as a central deny on the
+  // channel. Being named personally is not a way around one.
+  it("stays silent when the policy denied sound to a message naming the reader", async () => {
+    expect(
+      await soundKeyFor({
+        policy: policy({ in_app: "deny", sound: "deny", named_user_ids: [currentUserId] }),
+      }),
+    ).toBeUndefined();
+  });
+
+  // ── Urgent replaces, and is never a licence (#831) ───────────────────────
+  //
+  // That urgent *wins* each pairing is settled above, one comparison at a
+  // time. What those cases cannot see is the shape of the win: they read the
+  // first key played, so an implementation that chimed urgent and then went on
+  // to chime the mention or the in-conversation feedback for the same message
+  // would satisfy every one of them. The class is substitutive, so the count is
+  // part of the assertion, and the three facts are stacked at once here rather
+  // than pairwise.
+  it("sounds urgent alone for a message that is urgent, a mention and attended", async () => {
+    expect(
+      await soundKeyFor(
+        { priority: "urgent", policy: policy({ named_user_ids: [currentUserId] }) },
+        { isActiveConversation: true },
+      ),
+    ).toBe("urgent");
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+  });
+
+  // One logical event, one chime, however many times it is delivered: an outbox
+  // retry and a reconnect both arrive as the same message id, which is what the
+  // presented-memory is keyed by. Urgency changes nothing about it — the event
+  // is not news a second time because its author marked it urgent.
+  it("does not chime again when the same urgent event is redelivered", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+    const urgent = event({ eventId: "urgent-1", priority: "urgent" });
+
+    void presentLiveMessageNotification(urgent, context(), surfaces);
+    await flush();
+    const disposition = await presentLiveMessageNotification(urgent, context(), surfaces);
+
+    expect(disposition).toBe("repeat");
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("urgent");
+  });
+
+  // The chime preference is the reader's, and urgency is the author's claim
+  // about their own message. An author cannot overrule the reader's setting:
+  // "off" silences everything, and the two mention-scoped modes silence room
+  // traffic the server did not classify as naming this reader — an urgent
+  // message among it is still room traffic to them.
+  it.each<SoundNotificationMode>(["off", "mentions", "mentions_and_dms"])(
+    "stays silent for an urgent message while the chime preference is %s",
+    async (mode) => {
+      mockGetSoundNotificationMode.mockReturnValue(mode);
+
+      expect(await soundKeyFor({ priority: "urgent" })).toBeUndefined();
+    },
+  );
+
+  // Marking a message urgent is not a way to make a browser chime at the person
+  // who wrote it.
+  it("stays silent for the reader's own urgent message", async () => {
+    expect(await soundKeyFor({ priority: "urgent", senderId: currentUserId })).toBeUndefined();
+  });
+});
+
+/**
+ * Attention is three facts, and in-conversation needs all three (issue #829).
+ *
+ * The conversation being open is the one the app knows; the other two belong to
+ * the browser, and a reader with the conversation open in a hidden tab, or in a
+ * window they have clicked away from, is not attending it however selected it
+ * is. Each case below moves exactly one fact and asserts the sound, because the
+ * failure this guards against is a key that is right for the wrong reason.
+ */
+describe("notificationPresentation — in-conversation needs the reader's attention", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.resetModules();
+    installLockManager();
+  });
+
+  afterEach(resetEnvironment);
+
+  async function soundKeyWhenAttending(
+    attention: { documentVisible: boolean; windowFocused: boolean },
+    eventOverrides: Partial<MessageNotificationEvent> = {},
+  ): Promise<string | undefined> {
+    setAttention(attention);
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    void presentLiveMessageNotification(
+      event(eventOverrides),
+      context({ isActiveConversation: true }),
+      sinks(),
+    );
+    await flush();
+    return mockPlayNotificationSound.mock.calls[0]?.[0] as string | undefined;
+  }
+
+  // Case A.
+  it("is in-conversation with the conversation open, the tab visible and the window focused", async () => {
+    expect(await soundKeyWhenAttending({ documentVisible: true, windowFocused: true })).toBe(
+      "in-conversation",
+    );
+  });
+
+  // Case B: the tab is hidden. The reader is somewhere else entirely, so this
+  // is room activity they are away from and soundRules' ambient gate keeps it
+  // silent — what matters here is that it is not in-conversation.
+  it("is not in-conversation while the tab is hidden", async () => {
+    expect(await soundKeyWhenAttending({ documentVisible: false, windowFocused: true })).not.toBe(
+      "in-conversation",
+    );
+  });
+
+  // Case C: the tab is visible but the window lost focus — another window is in
+  // front. Same conclusion, reached through the other fact.
+  it("is not in-conversation while the window is not focused", async () => {
+    expect(await soundKeyWhenAttending({ documentVisible: true, windowFocused: false })).not.toBe(
+      "in-conversation",
+    );
+  });
+
+  // And the fallback is a real class, not a dropped event: something addressed
+  // to the reader personally still reaches them while they are away, as its own
+  // sound rather than the discreet one.
+  it("falls back to the mention sound while the reader is away from the open conversation", async () => {
+    const named = { policy: policy({ named_user_ids: [currentUserId] }) };
+    expect(
+      await soundKeyWhenAttending({ documentVisible: false, windowFocused: true }, named),
+    ).toBe("mention");
+  });
+
+  // Case D: attention alone is not the conversation. A reader watching this tab
+  // intently is still not attending a conversation they do not have open.
+  it("is the ordinary message sound for a conversation this tab is not showing", async () => {
+    setAttention({ documentVisible: true, windowFocused: true });
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    void presentLiveMessageNotification(event(), context(), sinks());
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledWith("message");
+  });
+
+  // The exclusivity #829 states outright: one logical event, one sound. The
+  // class is resolved once and handed down, so there is no path on which both
+  // keys are reached — and a single call is what proves it.
+  it("never sounds both message and in-conversation for one event", async () => {
+    setAttention({ documentVisible: true, windowFocused: true });
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+
+    void presentLiveMessageNotification(event(), context({ isActiveConversation: true }), sinks());
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
+  });
+
+  // The mirror of the visibility transition covered in useChatSidebar: the
+  // window keeps the conversation on screen and simply loses focus between two
+  // events. Attention is read per event, from the browser, so there is no state
+  // to go stale and no listener to have missed the change.
+  it("stops being in-conversation once the window loses focus between events", async () => {
+    setAttention({ documentVisible: true, windowFocused: true });
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+    const attended = context({ isActiveConversation: true });
+
+    void presentLiveMessageNotification(event({ eventId: "focused" }), attended, surfaces);
+    await flush();
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
+
+    setAttention({ documentVisible: true, windowFocused: false });
+    void presentLiveMessageNotification(
+      event({ eventId: "blurred", policy: policy({ named_user_ids: [currentUserId] }) }),
+      attended,
+      surfaces,
+    );
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenLastCalledWith("mention");
+  });
+
+  it("stays silent in the attended conversation for the reader's own message", async () => {
+    expect(
+      await soundKeyWhenAttending(
+        { documentVisible: true, windowFocused: true },
+        { senderId: currentUserId },
+      ),
+    ).toBeUndefined();
+  });
+
+  // Mute and do-not-disturb reach the browser as a central deny on this
+  // channel. Attending the conversation is not a way around one.
+  it("stays silent in the attended conversation when the policy denied sound", async () => {
+    expect(
+      await soundKeyWhenAttending(
+        { documentVisible: true, windowFocused: true },
+        { policy: policy({ in_app: "deny", sound: "deny" }) },
+      ),
+    ).toBeUndefined();
+  });
+
+  it("stays silent in the attended conversation when the chime preference is off", async () => {
+    mockGetSoundNotificationMode.mockReturnValue("off");
+    expect(
+      await soundKeyWhenAttending({ documentVisible: true, windowFocused: true }),
+    ).toBeUndefined();
+  });
+});
+
 describe("notificationPresentation — the presentation matrix", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -159,23 +517,28 @@ describe("notificationPresentation — the presentation matrix", () => {
     expect(surfaces.showInApp).toHaveBeenCalledWith(
       expect.objectContaining({ messageId: "message-1", conversationName: "geral" }),
     );
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // Case A: the conversation is open, right here, and the reader is looking.
-  it("presents nothing for the conversation this tab is already showing", async () => {
-    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+  // Since #829 that is heard — quietly — and still never drawn: a toast over
+  // the message the reader is watching announces what is already on screen.
+  it("only chimes for the conversation this tab is already showing", async () => {
+    const { presentLiveMessageNotification, PRESENTATION_CLAIM_HOLD_MS } =
+      await import("./notificationPresentation");
     const surfaces = sinks();
 
-    const disposition = await presentLiveMessageNotification(
+    const claim = presentLiveMessageNotification(
       event(),
       context({ isActiveConversation: true }),
       surfaces,
     );
+    await vi.advanceTimersByTimeAsync(PRESENTATION_CLAIM_HOLD_MS);
 
-    expect(disposition).toBe("suppressed");
+    await expect(claim).resolves.toBe("acquired");
     expect(surfaces.showInApp).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
   });
 
   // Case D/E: outside working hours, a reaction, an imported event — all of
@@ -192,7 +555,7 @@ describe("notificationPresentation — the presentation matrix", () => {
 
     expect(disposition).toBe("suppressed");
     expect(surfaces.showInApp).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
@@ -201,7 +564,11 @@ describe("notificationPresentation — the presentation matrix", () => {
     const locks = installLockManager();
     const { presentLiveMessageNotification } = await import("./notificationPresentation");
 
-    await presentLiveMessageNotification(event(), context({ isActiveConversation: true }), sinks());
+    await presentLiveMessageNotification(
+      event({ policy: policy({ in_app: "deny", sound: "deny", web_push: "deny" }) }),
+      context(),
+      sinks(),
+    );
 
     expect(locks.request).not.toHaveBeenCalled();
   });
@@ -215,7 +582,7 @@ describe("notificationPresentation — the presentation matrix", () => {
     await flush();
 
     expect(surfaces.showInApp).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("never toasts a window nobody is looking at", async () => {
@@ -243,7 +610,7 @@ describe("notificationPresentation — the presentation matrix", () => {
     await flush();
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 
   it("falls back to the chime when the OS surface did not appear", async () => {
@@ -258,8 +625,38 @@ describe("notificationPresentation — the presentation matrix", () => {
     );
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
+
+  // Issue #862: the page's half of the matrix, under the decision the realtime
+  // path actually publishes (web_push is always denied there — PresenceConnected,
+  // no push capability). The page never raises an OS notification of its own, so
+  // the Service Worker's push is the only one; and it draws the toast only when
+  // the window is visible *and* focused, which is exactly when sw.js suppresses
+  // the push. Visible without focus and hidden are both left to the push.
+  it.each([
+    ["visible and focused", "visible" as const, true, true],
+    ["visible but not focused", "visible" as const, false, false],
+    ["hidden", "hidden" as const, false, false],
+  ])(
+    "%s: toast only with focus, and never an OS surface of its own",
+    async (_, visibility, hasFocus, toast) => {
+      vi.spyOn(document, "visibilityState", "get").mockReturnValue(visibility);
+      vi.spyOn(document, "hasFocus").mockReturnValue(hasFocus);
+      const { presentLiveMessageNotification } = await import("./notificationPresentation");
+      const surfaces = sinks();
+
+      void presentLiveMessageNotification(
+        event({ policy: policy({ in_app: "allow", sound: "allow", web_push: "deny" }) }),
+        context(),
+        surfaces,
+      );
+      await flush();
+
+      expect(surfaces.showInApp).toHaveBeenCalledTimes(toast ? 1 : 0);
+      expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
+    },
+  );
 
   it("never raises the OS surface over a window that is already in front", async () => {
     const { presentLiveMessageNotification } = await import("./notificationPresentation");
@@ -302,7 +699,7 @@ describe("notificationPresentation — the presentation matrix", () => {
 
     expect(disposition).toBe("suppressed");
     expect(surfaces.showInApp).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 });
 
@@ -317,7 +714,7 @@ describe("notificationPresentation — audio failure is contained", () => {
   afterEach(resetEnvironment);
 
   it("absorbs a chime that fails and still presents the toast", async () => {
-    mockPlayMessageSound.mockImplementationOnce(() => {
+    mockPlayNotificationSound.mockImplementationOnce(() => {
       throw new Error("autoplay blocked");
     });
     const { presentLiveMessageNotification, PRESENTATION_CLAIM_HOLD_MS } =
@@ -347,7 +744,7 @@ describe("notificationPresentation — audio failure is contained", () => {
     await vi.advanceTimersByTimeAsync(PRESENTATION_CLAIM_HOLD_MS);
 
     await expect(claim).resolves.toBe("acquired");
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -373,7 +770,7 @@ describe("notificationPresentation — Web Locks is the exclusion", () => {
 
     expect(await claimB).toBe("contended");
     expect(presentationCount([sinksA, sinksB])).toBe(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(tabA.PRESENTATION_CLAIM_HOLD_MS);
     expect(await claimA).toBe("acquired");
@@ -394,7 +791,7 @@ describe("notificationPresentation — Web Locks is the exclusion", () => {
     expect(dispositions.filter((value) => value === "acquired")).toHaveLength(1);
     expect(dispositions.filter((value) => value === "contended")).toHaveLength(2);
     expect(presentationCount(tabSinks)).toBe(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -422,7 +819,7 @@ describe("notificationPresentation — Web Locks is the exclusion", () => {
     expect(await claimLate).toBe("contended");
     expect(lateSinks.showInApp).not.toHaveBeenCalled();
     expect(presentationCount([earlySinks, lateSinks])).toBe(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(early.PRESENTATION_CLAIM_HOLD_MS);
     expect(await claimEarly).toBe("acquired");
@@ -536,7 +933,7 @@ describe("notificationPresentation — fails closed without coordination", () =>
 
     expect(disposition).toBe("unavailable");
     expect(presentationCount([sinksA, sinksB])).toBe(0);
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(mockShowBrowserMessageNotification).not.toHaveBeenCalled();
   });
 
@@ -558,7 +955,7 @@ describe("notificationPresentation — fails closed without coordination", () =>
     expect(request).toHaveBeenCalledTimes(1);
     expect(disposition).toBe("unavailable");
     expect(surfaces.showInApp).not.toHaveBeenCalled();
-    expect(mockPlayMessageSound).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
     expect(unhandled).not.toHaveBeenCalled();
   });
 
@@ -661,7 +1058,7 @@ describe("notificationPresentation — redelivery of a known event", () => {
 
     expect(disposition).toBe("repeat");
     expect(surfaces.showInApp).toHaveBeenCalledTimes(1);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   // Identity is the id and nothing derived from the delivery: a redelivery that
@@ -689,8 +1086,11 @@ describe("notificationPresentation — redelivery of a known event", () => {
     const surfaces = sinks();
 
     await presentLiveMessageNotification(
-      event({ eventId: "message-1" }),
-      context({ isActiveConversation: true }),
+      event({
+        eventId: "message-1",
+        policy: policy({ in_app: "deny", sound: "deny", web_push: "deny" }),
+      }),
+      context(),
       surfaces,
     );
     void presentLiveMessageNotification(event({ eventId: "message-1" }), context(), surfaces);
@@ -729,7 +1129,27 @@ describe("notificationPresentation — sound burst suppression", () => {
 
     await burst(presentLiveMessageNotification, surfaces, 50);
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+  });
+
+  // The conversation being attended is the case a burst is most likely in — a
+  // fast exchange the reader is part of — and it goes through the same central
+  // cooldown as every other class, not one of its own. #829 asks for exactly
+  // that: a short sound repeating freely is a wall of audio.
+  it("collapses a rajada in the attended conversation through the same cooldown", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    for (let index = 0; index < 50; index += 1) {
+      void presentLiveMessageNotification(
+        event({ eventId: `attended-${index}` }),
+        context({ isActiveConversation: true }),
+        surfaces,
+      );
+    }
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledExactlyOnceWith("in-conversation");
   });
 
   // The toast is not silenced with the chime: it is replaced, which is the
@@ -757,7 +1177,7 @@ describe("notificationPresentation — sound burst suppression", () => {
     void presentLiveMessageNotification(event({ eventId: "after-window" }), context(), surfaces);
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 
   it("stays silent at the last instant of the window", async () => {
@@ -770,7 +1190,7 @@ describe("notificationPresentation — sound burst suppression", () => {
     void presentLiveMessageNotification(event({ eventId: "inside-window" }), context(), surfaces);
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
   });
 
   it("does not silence a different conversation", async () => {
@@ -785,7 +1205,7 @@ describe("notificationPresentation — sound burst suppression", () => {
     );
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 
   // A room going fast is exactly when being named personally has to stay
@@ -802,7 +1222,7 @@ describe("notificationPresentation — sound burst suppression", () => {
     );
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 
   // The cooldown is a sound decision and only a sound decision. It never
@@ -818,7 +1238,62 @@ describe("notificationPresentation — sound burst suppression", () => {
     });
 
     expect(mockShowBrowserMessageNotification).toHaveBeenCalledTimes(5);
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+  });
+
+  // The resolved notification class is what splits the budget (#826), so an
+  // event the author marked urgent is not spent by the room's ordinary traffic.
+  it("still chimes for an urgent message in the same busy room", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    await burst(presentLiveMessageNotification, surfaces, 20);
+    void presentLiveMessageNotification(
+      event({ eventId: "urgent", priority: "urgent" }),
+      context(),
+      surfaces,
+    );
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
+  });
+
+  // #826 is explicit that `important` introduces no class of its own, and the
+  // budget is the observable consequence: it shares the ordinary message's.
+  it("does not give an important message a sound budget of its own", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    await burst(presentLiveMessageNotification, surfaces, 20);
+    void presentLiveMessageNotification(
+      event({ eventId: "important", priority: "important" }),
+      context(),
+      surfaces,
+    );
+    await flush();
+
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
+  });
+
+  // The class says how loud an event would be, never whether it may be heard.
+  // A central deny ends the matter, and the strongest class cannot reopen it.
+  it("does not let an urgent class execute a surface the policy denied", async () => {
+    const { presentLiveMessageNotification } = await import("./notificationPresentation");
+    const surfaces = sinks();
+
+    const disposition = await presentLiveMessageNotification(
+      event({
+        eventId: "denied",
+        priority: "urgent",
+        policy: policy({ in_app: "deny", sound: "deny" }),
+      }),
+      context(),
+      surfaces,
+    );
+
+    expect(disposition).toBe("suppressed");
+    expect(surfaces.showInApp).not.toHaveBeenCalled();
+    expect(mockPlayNotificationSound).not.toHaveBeenCalled();
   });
 });
 
@@ -870,7 +1345,7 @@ describe("notificationPresentation — bursts across tabs", () => {
     }
     await flush();
 
-    expect(mockPlayMessageSound.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(mockPlayNotificationSound.mock.calls.length).toBeLessThanOrEqual(2);
   });
 });
 
@@ -928,14 +1403,14 @@ describe("notificationPresentation — memory belongs to a session", () => {
     const { auth, present } = await loadSession();
     void present(event({ eventId: "message-1" }), context(), sinks());
     await flush();
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(1);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(1);
 
     auth.clearTokens();
     auth.setTokens("session-b");
     void present(event({ eventId: "message-2" }), context(), sinks());
     await flush();
 
-    expect(mockPlayMessageSound).toHaveBeenCalledTimes(2);
+    expect(mockPlayNotificationSound).toHaveBeenCalledTimes(2);
   });
 
   // The other half, and the one that matters more: the boundary is identity,

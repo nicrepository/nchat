@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -45,6 +46,15 @@ const (
 	// leave columns behind that 000042's down cannot remove.
 	migrationUp44   = "000044_notification_outbox_worker_claim.up.sql"
 	migrationDown44 = "000044_notification_outbox_worker_claim.down.sql"
+	// Issue #825 closes the expand window 000042 opened: the legacy unique is
+	// what capped a message at one notification of a given kind, and a reminder
+	// is exactly the kind that must have many. It belongs to the same round trip
+	// for the same reason 000044 does — its down has to restore something an
+	// earlier migration created, and only a round trip proves that it can.
+	migrationUp50   = "000050_persistent_urgent_notifications.up.sql"
+	migrationDown50 = "000050_persistent_urgent_notifications.down.sql"
+	migrationUp51   = "000051_validate_persistent_urgent_notifications.up.sql"
+	migrationDown51 = "000051_validate_persistent_urgent_notifications.down.sql"
 
 	// The constraints 000042 adds NOT VALID and 000043 validates. Their state is
 	// the whole difference between the two migrations, so it is what the
@@ -63,6 +73,12 @@ const (
 	outboxClaimableIndex         = "idx_notification_outbox_claimable"
 	outboxLegacyPendingIndex     = "idx_notification_outbox_pending"
 	outboxLegacyUniqueConstraint = "notification_outbox_message_recipient_unique"
+
+	// The objects 000050 adds and 000051 validates (issue #825).
+	reminderPriorityConstraint = "messages_persistent_notifications_priority_check"
+	reminderCountConstraint    = "message_acknowledgements_reminder_count_check"
+	reminderDueIndex           = "idx_message_acknowledgements_due"
+	acknowledgementTable       = "chat.message_acknowledgements"
 )
 
 var outboxValidatedConstraints = []string{
@@ -166,6 +182,7 @@ func migrationsRoot(t *testing.T) string {
 // other up migration is baseline.
 var migrationsUnderTest = map[string]struct{}{
 	migrationUp42: {}, migrationUp43: {}, migrationUp44: {},
+	migrationUp50: {}, migrationUp51: {},
 }
 
 // baselineMigrations lists every up migration the canonical runner applies
@@ -387,8 +404,10 @@ const (
 	// constraint over (message_id, recipient_user_id, kind).
 	roundTripLegacyUser = "74100000-0000-4000-8000-0000000000b3"
 	// The workspace and #geral channel migration 000001 seeds.
-	roundTripWorkspace = "00000000-0000-0000-0000-000000000001"
-	roundTripChannel   = "00000000-0000-0000-0000-000000000002"
+	// The sender of the urgent, reminding message issue #825's round trip writes.
+	roundTripReminderUser = "74100000-0000-4000-8000-0000000000b4"
+	roundTripWorkspace    = "00000000-0000-0000-0000-000000000001"
+	roundTripChannel      = "00000000-0000-0000-0000-000000000002"
 )
 
 func execOn(t *testing.T, conn *pgx.Conn, sql string, args ...any) {
@@ -650,4 +669,142 @@ func TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL(t 
 	execOn(t, conn, `DELETE FROM chat.notification_outbox WHERE id = $1::uuid`, notificationID)
 	applyMigration(t, conn, migrationDown42)
 	assertLegacyContract(t, conn)
+}
+
+// ── issue #825: the contract release ────────────────────────────────────────
+
+// assertReminderContract describes chat.messages and chat.message_acknowledgements
+// after 000050, and the legacy unique's absence from the outbox.
+//
+// present is what makes the same function serve both halves of the round trip.
+func assertReminderContract(t *testing.T, conn *pgx.Conn, present bool) {
+	t.Helper()
+	assertBool(t, hasColumn(t, conn, "chat", "messages", "persistent_notifications"), present,
+		"the author's reminder intent belongs to 000050")
+	for _, column := range []string{"next_reminder_at", "reminder_count"} {
+		assertBool(t, hasColumn(t, conn, "chat", "message_acknowledgements", column), present,
+			"column "+column+" belongs to 000050")
+	}
+	assertBool(t, hasIndex(t, conn, reminderDueIndex), present,
+		"the due-reminder index belongs to 000050")
+	assertBool(t, hasConstraint(t, conn, acknowledgementTable, reminderCountConstraint), present,
+		"the reminder count bound belongs to 000050")
+	assertBool(t, hasConstraint(t, conn, "chat.messages", reminderPriorityConstraint), present,
+		"the urgent-only rule belongs to 000050")
+	// The legacy unique is the one thing 000050 removes, and restoring it is the
+	// one thing its down has to get right: a message may now carry many
+	// reminders, and that constraint says it may carry one notification per kind.
+	assertBool(t, hasConstraint(t, conn, outboxTable, outboxLegacyUniqueConstraint), !present,
+		"000050 removes the legacy unique and its down restores it")
+	assertBool(t, queryBool(t, conn, `
+		SELECT pg_get_constraintdef(oid) LIKE '%urgent_reminder%'
+		FROM pg_constraint WHERE conname = $1 AND conrelid = to_regclass($2)`,
+		outboxKindConstraint, outboxTable), present,
+		"the reminder event type belongs to 000050's vocabulary")
+}
+
+// The reminder contract is applied, reverted and applied again, on top of the
+// event contract it extends and with real reminder rows in the table.
+func TestPersistentReminderMigrationRoundTripPostgreSQL(t *testing.T) {
+	conn := newMigrationRoundTripDatabase(t)
+
+	applyBaselineMigrations(t, conn)
+	applyMigration(t, conn, migrationUp42)
+	applyMigration(t, conn, migrationUp43)
+	applyMigration(t, conn, migrationUp44)
+	assertCurrentContract(t, conn, true)
+	assertReminderContract(t, conn, false)
+
+	applyMigration(t, conn, migrationUp50)
+	assertReminderContract(t, conn, true)
+	assertReminderConstraintsValidated(t, conn, false)
+
+	applyMigration(t, conn, migrationUp51)
+	assertReminderConstraintsValidated(t, conn, true)
+	assertRemindersAreWritable(t, conn)
+
+	// 000051 owns nothing but the validation, so its down must leave every object
+	// 000050 created standing.
+	applyMigration(t, conn, migrationDown51)
+	assertReminderContract(t, conn, true)
+	assertReminderConstraintsValidated(t, conn, false)
+
+	applyMigration(t, conn, migrationDown50)
+	assertReminderContract(t, conn, false)
+	// The event contract beneath is untouched, which is what makes the two
+	// releases independently revertible.
+	assertCurrentContract(t, conn, true)
+
+	// Re-up. Anything the down forgot to remove surfaces here as an "already
+	// exists", which is the failure mode a text-matching test cannot see.
+	applyMigration(t, conn, migrationUp50)
+	applyMigration(t, conn, migrationUp51)
+	assertReminderContract(t, conn, true)
+	assertReminderConstraintsValidated(t, conn, true)
+	assertRemindersAreWritable(t, conn)
+}
+
+func assertReminderConstraintsValidated(t *testing.T, conn *pgx.Conn, validated bool) {
+	t.Helper()
+	assertBool(t, constraintValidated(t, conn, "chat.messages", reminderPriorityConstraint), validated,
+		"the urgent-only rule's validation belongs to 000051")
+	assertBool(t, constraintValidated(t, conn, acknowledgementTable, reminderCountConstraint), validated,
+		"the reminder count bound's validation belongs to 000051")
+	assertBool(t, constraintValidated(t, conn, outboxTable, outboxKindConstraint), validated,
+		"the widened kind vocabulary's validation belongs to 000051")
+}
+
+// assertRemindersAreWritable proves the contract is not merely present but
+// working: several reminders for one recipient, which the legacy unique would
+// have refused, and an unauthorised combination the new CHECK refuses.
+func assertRemindersAreWritable(t *testing.T, conn *pgx.Conn) {
+	t.Helper()
+	messageID := seedReminderMessage(t, conn)
+	for occurrence := 1; occurrence <= 3; occurrence++ {
+		if _, err := conn.Exec(t.Context(), `
+			INSERT INTO chat.notification_outbox
+				(workspace_id, message_id, recipient_user_id, kind, status,
+				 source_type, occurred_at, priority, origin, dedupe_key)
+			SELECT $1::uuid, $2::uuid, $3::uuid, 'urgent_reminder', 'pending',
+			       'message', m.created_at, 'high', 'live',
+			       'message:' || m.id::text || ':urgent_reminder:' || $4::text
+			FROM chat.messages m WHERE m.id = $2::uuid`,
+			roundTripWorkspace, messageID, roundTripLegacyUser, strconv.Itoa(occurrence)); err != nil {
+			t.Fatalf("write reminder %d: %v", occurrence, err)
+		}
+	}
+
+	// And the rule that bounds the whole feature: reminders exist only on an
+	// urgent message, whatever writes them.
+	if _, err := conn.Exec(t.Context(), `
+		UPDATE chat.messages SET priority = 'important' WHERE id = $1::uuid`,
+		messageID); err == nil {
+		t.Fatal("the urgent-only rule accepted a reminding message demoted to important")
+	}
+}
+
+// seedReminderMessage writes an urgent message that asks to keep reminding,
+// beside the rows seedCompatibleRows already created.
+func seedReminderMessage(t *testing.T, conn *pgx.Conn) string {
+	t.Helper()
+	execOn(t, conn, `INSERT INTO auth.users (id, email, display_name) VALUES
+		($1, 'round-trip-825@e.test', 'Reminder sender')
+		ON CONFLICT (id) DO NOTHING`, roundTripReminderUser)
+	execOn(t, conn, `INSERT INTO chat.workspace_members (workspace_id, user_id, status)
+		VALUES ($1, $2, 'active') ON CONFLICT DO NOTHING`,
+		roundTripWorkspace, roundTripReminderUser)
+	execOn(t, conn, `INSERT INTO auth.users (id, email, display_name) VALUES
+		($1, 'round-trip-825-legacy@e.test', 'Reminder recipient')
+		ON CONFLICT (id) DO NOTHING`, roundTripLegacyUser)
+	var messageID string
+	if err := conn.QueryRow(t.Context(), `
+		INSERT INTO chat.messages
+			(workspace_id, channel_id, sender_id, kind, body_text, body_format, status,
+			 priority, persistent_notifications)
+		VALUES ($1, $2, $3, 'user', 'round trip 825', 'v2', 'active', 'urgent', true)
+		RETURNING id::text`,
+		roundTripWorkspace, roundTripChannel, roundTripReminderUser).Scan(&messageID); err != nil {
+		t.Fatalf("seed reminding message: %v", err)
+	}
+	return messageID
 }

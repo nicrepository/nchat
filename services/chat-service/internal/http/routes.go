@@ -15,6 +15,18 @@ const (
 	// SQL, not by omitting the route.
 	RouteChannelMute = "/api/chat/channels/{channelID}/mute"
 	RouteDMMute      = "/api/chat/dm/{conversationID}/mute"
+	// Issue #136 notification preference: the canonical surface for the whole
+	// per-conversation preference, where /mute above is the sidebar's shortcut
+	// for one dimension of it.
+	//
+	// PUT and not POST, because the request states the complete desired state of
+	// one named sub-resource rather than appending anything: sending the same
+	// body twice is the same preference, which is what the settings page needs
+	// when a user clicks around a select. The same prefixes and the same absence
+	// of a workspace segment as every other chat route — the workspace and the
+	// actor come from the session.
+	RouteChannelNotificationPreference = "/api/chat/channels/{channelID}/notification-preference"
+	RouteDMNotificationPreference      = "/api/chat/dm/{conversationID}/notification-preference"
 	// Issue #527 self-leave. DELETE on the actor's own membership, and the path
 	// names no user precisely because it cannot affect anyone else's: the actor
 	// is the session. The administrative removal of *another* member keeps its
@@ -137,7 +149,19 @@ const (
 	// read — and it answers with summaries only, never the per-recipient detail,
 	// which stays on the message-scoped route.
 	RouteMessageAcknowledgements = "/api/chat/messages/acknowledgements"
-	RouteWorkspaceSettings       = "/api/v1/workspaces/{workspaceID}/settings"
+	// Issue #825 persistent notifications. Message-scoped and target-free on the
+	// same terms as the acknowledgement route above, and with no user segment
+	// for a stronger version of the same reason: the only person who may act
+	// here is the message's own sender, and the server knows who that is — a
+	// path segment naming an actor would invite the belief that some other value
+	// belongs there.
+	//
+	// DELETE, because the request withdraws a policy and carries no body at all.
+	// There is no POST counterpart: reminders are started by sending the
+	// message, never by a second call, so there is no endpoint through which an
+	// already-sent message can be made to start paging people.
+	RouteMessagePersistentNotifications = "/api/chat/messages/{messageID}/persistent-notifications"
+	RouteWorkspaceSettings              = "/api/v1/workspaces/{workspaceID}/settings"
 	// RF-19 anti-spam policy (issue #419). It lives under /api/chat because that
 	// is the only prefix the gateways forward to chat-service (Traefik local and
 	// every k8s overlay route /api/chat, /api/auth, /api/admin, …, never

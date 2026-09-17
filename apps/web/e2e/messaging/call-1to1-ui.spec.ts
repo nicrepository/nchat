@@ -779,14 +779,14 @@ async function instrumentIncomingCallRingtone(page: Page) {
     const originalPlay = HTMLMediaElement.prototype.play;
     const originalPause = HTMLMediaElement.prototype.pause;
     HTMLMediaElement.prototype.play = function () {
-      if (this.src.endsWith("/sounds/incoming-call.wav")) {
+      if (this.src.endsWith("/sounds/nchat_lumen_incoming_call.wav")) {
         target.__e2eIncomingCallRingtone.play += 1;
         return Promise.resolve();
       }
       return originalPlay.call(this);
     };
     HTMLMediaElement.prototype.pause = function () {
-      if (this.src.endsWith("/sounds/incoming-call.wav")) {
+      if (this.src.endsWith("/sounds/nchat_lumen_incoming_call.wav")) {
         target.__e2eIncomingCallRingtone.pause += 1;
         return;
       }

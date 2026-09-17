@@ -82,6 +82,34 @@ func TestTheFanOutFiltersInTheStatement(t *testing.T) {
 	}
 }
 
+// SR-001, defense-in-depth: the fan-out asks the same question about the
+// recipient's global account that the preview projection asks, in the same
+// words.
+//
+// The two predicates are written out twice, once per statement, and the risk of
+// writing a rule twice is that the copies drift. So both are pinned here to the
+// same literals — alias included — that
+// TestPresentationProjectionIsScopedAndGuarded pins on the projection side.
+// Changing one without the other fails one of the two tests.
+func TestTheFanOutChecksTheRecipientsGlobalAccount(t *testing.T) {
+	for name, predicate := range map[string]string{
+		"a globally suspended recipient": `recipient_user\.id = \$3::uuid\s+AND recipient_user\.status = 'active'`,
+		"a soft-deleted recipient":       `recipient_user\.deleted_at IS NULL`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := newPushMock(t)
+			mock.ExpectQuery(predicate).
+				WithArgs(testNotificationID, testWorkspace, testUser).
+				WillReturnRows(deliveryRows())
+
+			if _, err := storage.NewPGXPushDeliveryStore(mock).ListDeliverable(
+				context.Background(), testNotificationID, testWorkspace, testUser); err != nil {
+				t.Fatalf("the fan-out does not carry %s: %v", name, err)
+			}
+		})
+	}
+}
+
 // An empty answer is an empty slice, never nil. A caller that ranged over nil
 // would behave identically, but one that checked `== nil` to mean "the query
 // failed" would not.

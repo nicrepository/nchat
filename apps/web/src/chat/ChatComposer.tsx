@@ -33,6 +33,14 @@ import VoiceRecorderPanel from "./VoiceRecorderPanel";
 import type { WorkspaceAttachmentLimits } from "./chatApi";
 import type { SendResult } from "./useMessages";
 import ComposerToolbar, { type ComposerEmojiOptions } from "./ComposerToolbar";
+import {
+  isDefaultPriorityIntent,
+  messagePriorityBadges,
+  priorityLabels,
+  priorityOptionLabels,
+  standardPriorityIntent,
+  type MessagePriorityIntent,
+} from "./messagePriority";
 import { useChatEditor } from "./useChatEditor";
 import { noopConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import type { CodecFormat } from "./tiptapSerializer";
@@ -94,7 +102,8 @@ export interface ChatComposerProps {
   onSend: (
     body: string,
     attachmentIds?: string[],
-    acknowledgementRequired?: boolean,
+    /** Issue #822: what this message states about its own priority. */
+    priority?: MessagePriorityIntent,
   ) => Promise<SendResult>;
   /**
    * Destination for attachments (RF-32, issue #458). One prop serves channels
@@ -623,6 +632,58 @@ interface ComposerVoiceOptions {
   onStart: () => void;
 }
 
+/**
+ * The applied priority, restated above the text (issue #822).
+ *
+ * The button's tint is not allowed to be the only way to notice that the next
+ * Enter sends an urgent message, so this says it in words — the priority first,
+ * then whatever options came with it — and offers the one action that undoes
+ * it. Drawn only when there is something to say; a standard message shows
+ * nothing, exactly as before this issue.
+ */
+function ComposerPrioritySummary({
+  intent,
+  onRemove,
+}: {
+  intent: MessagePriorityIntent;
+  onRemove: () => void;
+}) {
+  if (isDefaultPriorityIntent(intent)) return null;
+  const options = priorityOptionLabels(intent);
+  // Same icon the delivered message's own badge draws (issue #846), so the
+  // composer's preview and the sent message read as the same claim rather
+  // than as two differently-styled statements of it.
+  const badge = messagePriorityBadges[intent.priority];
+  return (
+    <div
+      className={`chat-msg-area__composer-priority chat-msg-area__composer-priority--${intent.priority}`}
+      role="status"
+      data-testid="composer-priority-summary"
+    >
+      <span className="chat-msg-area__composer-priority-badge">
+        {badge && (
+          <span className="material-symbols-outlined" aria-hidden="true">
+            {badge.icon}
+          </span>
+        )}
+        {priorityLabels[intent.priority]}
+      </span>
+      {options.length > 0 && <span>{options.join(" · ")}</span>}
+      <button
+        type="button"
+        className="chat-msg-area__composer-quote-close"
+        aria-label="Remover prioridade da mensagem"
+        data-testid="composer-priority-remove"
+        onClick={onRemove}
+      >
+        <span className="material-symbols-outlined" aria-hidden="true">
+          close
+        </span>
+      </button>
+    </div>
+  );
+}
+
 /** The row under the editor: formatting, emoji, attachment, voice, send. */
 function ComposerBar({
   editor,
@@ -634,17 +695,17 @@ function ComposerBar({
   voice,
   canSend,
   onSend,
-  acknowledgementRequired,
-  onAcknowledgementRequiredChange,
+  priority,
+  onPriorityChange,
 }: {
   editor: Editor | null;
   disabled: boolean;
   emoji?: ComposerEmojiOptions;
   pickerOpen: boolean;
   onPickerOpenChange: (open: boolean) => void;
-  /** Issue #824: whether the next send asks for confirmation, and its toggle. */
-  acknowledgementRequired: boolean;
-  onAcknowledgementRequiredChange: (required: boolean) => void;
+  /** Issue #822: what the next send states about its priority, and how to restate it. */
+  priority: MessagePriorityIntent;
+  onPriorityChange: (intent: MessagePriorityIntent) => void;
   /** Absent when this composer has nowhere to put a file. */
   attach: ComposerAttachOptions | null;
   /** Absent when this composer has no destination, or the browser cannot record. */
@@ -660,8 +721,8 @@ function ComposerBar({
         emoji={emoji}
         pickerOpen={pickerOpen}
         onPickerOpenChange={onPickerOpenChange}
-        acknowledgementRequired={acknowledgementRequired}
-        onAcknowledgementRequiredChange={onAcknowledgementRequiredChange}
+        priority={priority}
+        onPriorityChange={onPriorityChange}
       />
       {attach && <ComposerAttachButton {...attach} />}
       {voice && (
@@ -744,6 +805,23 @@ function voiceOptions(
   };
 }
 
+/**
+ * Whether focus currently sits inside a surface that owns it — a menu or a
+ * dialog — and would be dismissed by having it taken away.
+ *
+ * The composer's opening focus is a convenience: it saves a click when a
+ * conversation is opened and nothing else wants focus. It is never worth
+ * dismissing something the reader deliberately opened, and a menu is exactly
+ * that — it closes when focus leaves it, so taking focus from one destroys it.
+ *
+ * Asked of the roles rather than of any particular component, so every popup
+ * that already announces itself correctly is covered by the same rule and no
+ * new coupling to the sidebar is introduced here.
+ */
+function focusIsOwnedByOverlay(active: Element | null): boolean {
+  return Boolean(active?.closest("[role='menu'], [role='dialog']"));
+}
+
 export default function ChatComposer({
   placeholder,
   mentionTarget,
@@ -798,10 +876,49 @@ export default function ChatComposer({
   // this; a voice recording does not merge with it (issue #670 code review),
   // so recording must not even start while it is non-empty.
   const hasComposerAttachments = upload.items.length > 0;
-  // A voice recording is sent through the same onSend as any other message:
-  // an empty body plus the one attachment that upload just produced. See
-  // handleComposerSend below for why an attachment-only send is already the
-  // composer's normal shape.
+  /**
+   * What the next send states about its own priority (issue #822), including
+   * the confirmation request (#824) and the persistent reminders (#825) that
+   * travel with it.
+   *
+   * Composer state, not conversation state: it describes the draft, so it
+   * resets with the draft and never outlives the message it was set for. Always
+   * the *applied* value — the popover's own draft never reaches here.
+   */
+  const [priority, setPriority] = useState<MessagePriorityIntent>(standardPriorityIntent);
+
+  /**
+   * The one place a send states the composer's priority, and the one place
+   * that priority is retired (issue #822).
+   *
+   * Both paths go through it — the editor's send and the voice recorder's —
+   * because "which messages carry the applied priority" must not have two
+   * answers. A voice note recorded while URGENTE is displayed above the
+   * composer is an urgent message: the badge is a promise about the next send,
+   * not about the next *typed* send, and a voice note that quietly went out as
+   * standard while that badge stayed on screen is the state divergence this
+   * exists to prevent.
+   *
+   * Retired only on a confirmed `sent`, exactly as the pending attachment is:
+   * a refusal, a `stale` result or a thrown error leaves the configuration
+   * applied, so a retry states what the first attempt stated.
+   */
+  const sendStatingPriority = async (
+    body: string,
+    attachmentIds?: string[],
+  ): Promise<SendResult> => {
+    const result = await onSend(body, attachmentIds, priority);
+    // The priority belongs to the message that carried it, not to the
+    // composer: leaving it applied would silently escalate everything composed
+    // afterwards (issues #822, #824).
+    if (result.status === "sent") setPriority(standardPriorityIntent);
+    return result;
+  };
+
+  // A voice recording is sent through the same path as any other message:
+  // an empty body plus the one attachment that upload just produced, stating
+  // the same priority (issue #822). See handleComposerSend below for why an
+  // attachment-only send is already the composer's normal shape.
   const recorder = useVoiceRecorder({
     // Both props are optional on ChatComposerProps and neither is defaulted
     // in the destructuring above (issue #682 removed the old defaults), so
@@ -809,20 +926,13 @@ export default function ChatComposer({
     target: uploadTarget ?? null,
     maxUploadBytes: attachmentLimits?.maxUploadBytes ?? null,
     onUploaded: async (attachmentId) => {
-      const result = await onSend("", [attachmentId]);
+      const result = await sendStatingPriority("", [attachmentId]);
       return result.status === "sent";
     },
     drafts: draftsProp,
     draftKey,
   });
   const recording = recorder.phase !== "idle";
-  /**
-   * Whether the next send asks its recipients to confirm receipt (issue #824).
-   *
-   * Composer state, not conversation state: it describes the draft, so it
-   * resets with the draft and never outlives the message it was set for.
-   */
-  const [acknowledgementRequired, setAcknowledgementRequired] = useState(false);
   const pendingAttachments = upload.items
     .map((item) => item.attachment)
     .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
@@ -858,20 +968,15 @@ export default function ChatComposer({
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
     const revisionAtSubmit = drafts.getDraft(draftKey ?? "")?.revision ?? noRevision;
-    const result = await onSend(
+    const result = await sendStatingPriority(
       body,
       pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
-      acknowledgementRequired,
     );
     if (result.status === "sent") {
       shouldClearTextRef.current =
         (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
       upload.resetAfterPublish();
       setEmojiPickerOpen(false);
-      // The request belongs to the message that carried it, not to the
-      // composer: leaving it on would silently ask for confirmation of
-      // everything typed afterwards (issue #824).
-      setAcknowledgementRequired(false);
     }
     return result;
   };
@@ -917,7 +1022,22 @@ export default function ChatComposer({
     }
     const frame = requestAnimationFrame(() => {
       if (!editor.isEditable) return;
-      if (document.activeElement !== initialFocusOwnerRef.current) {
+      // Somebody moved focus while the editor was still being built: it is
+      // theirs, not ours.
+      //
+      // The second test is not the same statement as the first. The baseline
+      // above is whatever was focused when *this composer mounted*, and the
+      // composer does not mount when the conversation opens — it mounts when
+      // the editor is ready, which on a slow first paint can be a second or
+      // more later. Anything already holding focus by then is adopted as the
+      // baseline, and "focus has not moved since I arrived" silently becomes
+      // "nothing owns focus" — which is false. An open row menu was already
+      // focused, so the composer took focus off it and the menu, which closes
+      // when focus leaves it, closed under the reader's cursor.
+      if (
+        document.activeElement !== initialFocusOwnerRef.current ||
+        focusIsOwnedByOverlay(document.activeElement)
+      ) {
         initialFocusHandledRef.current = true;
         return;
       }
@@ -970,6 +1090,10 @@ export default function ChatComposer({
           <VoiceRecorderPanel recorder={recorder} />
         ) : (
           <>
+            <ComposerPrioritySummary
+              intent={priority}
+              onRemove={() => setPriority(standardPriorityIntent)}
+            />
             <ComposerEditor editor={activeEditor} placeholder={placeholder} />
             {/* No target, no items and no drag to report: the panel draws nothing. */}
             <ComposerUploadPanel upload={upload} dragActive={drop.active} />
@@ -993,8 +1117,8 @@ export default function ChatComposer({
               // sending now would post a message without it.
               canSend={canSend && !uploading}
               onSend={handleSend}
-              acknowledgementRequired={acknowledgementRequired}
-              onAcknowledgementRequiredChange={setAcknowledgementRequired}
+              priority={priority}
+              onPriorityChange={setPriority}
             />
           </>
         )}

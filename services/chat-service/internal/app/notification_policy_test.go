@@ -6,10 +6,19 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/nicrepository/nchat/libs/go/platform/notificationevent"
 	"github.com/nicrepository/nchat/libs/go/platform/notificationpolicy"
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
+	"github.com/nicrepository/nchat/services/chat-service/internal/service"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 	"github.com/nicrepository/nchat/services/chat-service/internal/ws"
+)
+
+// The mention tokens below are the codec's own canonical form, so what these
+// tests exercise is the real classification and not a shape invented for them.
+const (
+	bobUserID    = "11111111-1111-1111-1111-111111111111"
+	allMentionID = "00000000-0000-0000-0000-000000000000"
 )
 
 // Issue #744: the realtime event carries the central decision.
@@ -118,6 +127,37 @@ func (tc classificationCase) check(t *testing.T) {
 	}
 	if policy.NamesEveryone != tc.wantEveryone {
 		t.Fatalf("names_everyone = %v, want %v", policy.NamesEveryone, tc.wantEveryone)
+	}
+}
+
+// Issue #862: the OS notification of an event the notification outbox also
+// delivers belongs to Web Push alone. The realtime decision never authorises
+// it, for any recipient of any classification the outbox produces — so a page
+// open in a hidden tab raises no native notification of its own beside the
+// Service Worker's, and none is left for a client to suppress.
+func TestRealtimeDecisionNeverAuthorisesTheOSSurfaceForAnyRecipient(t *testing.T) {
+	reply := channelMessage(mentionOfBob)
+	reply.ReplyToSenderID = "user-3"
+	for _, test := range []struct {
+		name        string
+		message     domain.Message
+		recipientID string
+	}{
+		{name: "mention", message: reply, recipientID: bobUserID},
+		{name: "reply", message: reply, recipientID: "user-3"},
+		{name: "channel message", message: reply, recipientID: "user-4"},
+		{name: "direct message", message: directMessage("oi"), recipientID: "user-4"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := recipientPolicy{}.PolicyFor(
+				domainMessageToWSPayload(test.message), test.recipientID, ws.RecipientPreferenceNone)
+			if policy == nil || policy.InApp != ws.NotificationAllow {
+				t.Fatalf("policy = %+v, want an in-app allow so the web_push denial is not vacuous", policy)
+			}
+			if policy.WebPush != ws.NotificationDeny {
+				t.Fatalf("web_push = %q, want %q", policy.WebPush, ws.NotificationDeny)
+			}
+		})
 	}
 }
 
@@ -340,7 +380,7 @@ func TestDecisionDivergesBetweenRecipientsOfTheSameEvent(t *testing.T) {
 // RecipientID on a decision made for somebody specific is an audit record that
 // names nobody.
 func TestRecipientIdentityReachesTheEngine(t *testing.T) {
-	ctx := realtimeContext(channelMessage("hello"), recipientFacts{id: "user-7", muted: true})
+	ctx := realtimeContext(channelMessage("hello"), recipientFacts{id: "user-7", muted: true}, nil, false)
 	if ctx.RecipientID != "user-7" {
 		t.Fatalf("RecipientID = %q, want the recipient the decision is for", ctx.RecipientID)
 	}
@@ -355,7 +395,7 @@ func TestRecipientIdentityReachesTheEngine(t *testing.T) {
 // What the server does not know must not be stated as though it did. Presence is
 // the case that matters: this path can see the socket and cannot see the reader.
 func TestRealtimeContextDoesNotClaimFactsItCannotObserve(t *testing.T) {
-	ctx := realtimeContext(channelMessage("hello"), recipientFacts{id: "user-1"})
+	ctx := realtimeContext(channelMessage("hello"), recipientFacts{id: "user-1"}, nil, false)
 
 	if ctx.Presence != notificationpolicy.PresenceConnected {
 		t.Fatalf("Presence = %q, want %q: an open socket is not an observed focus",
@@ -394,16 +434,16 @@ type fakeMutedPrefs struct {
 	storage.NotificationPrefStore
 	targetType string
 	users      []string
-	muted      []string
+	stored     []storage.UserConversationNotificationPref
 	err        error
 }
 
-func (f *fakeMutedPrefs) FilterMutedUsers(
+func (f *fakeMutedPrefs) PreferencesForUsers(
 	_ context.Context, _, targetType, _ string, userIDs []string,
-) ([]string, error) {
+) ([]storage.UserConversationNotificationPref, error) {
 	f.targetType = targetType
 	f.users = userIDs
-	return f.muted, f.err
+	return f.stored, f.err
 }
 
 // The fan-out's read has to reach the preference table under the target kind
@@ -413,17 +453,19 @@ func TestMutedUsersAsksThePreferenceStoreForTheRightTargetKind(t *testing.T) {
 		ws.TargetTypeChannel: storage.NotificationPrefTargetChannel,
 		ws.TargetTypeDM:      storage.NotificationPrefTargetDM,
 	} {
-		prefs := &fakeMutedPrefs{muted: []string{"user-2"}}
-		muted, err := recipientPolicy{prefs: prefs}.MutedUsers(
+		prefs := &fakeMutedPrefs{stored: []storage.UserConversationNotificationPref{
+			{UserID: "user-2", Level: storage.NotificationLevelAll, Muted: true},
+		}}
+		resolved, err := recipientPolicy{prefs: prefs}.RecipientPreferences(
 			context.Background(), "ws-1", targetType, "target-1", []string{"user-1", "user-2"})
 		if err != nil {
-			t.Fatalf("MutedUsers: %v", err)
+			t.Fatalf("RecipientPreferences: %v", err)
 		}
 		if prefs.targetType != want {
 			t.Fatalf("asked for %q, want %q", prefs.targetType, want)
 		}
-		if len(muted) != 1 || muted[0] != "user-2" {
-			t.Fatalf("muted = %v, want [user-2]", muted)
+		if len(resolved) != 1 || resolved["user-2"] != ws.RecipientPreferenceMuted {
+			t.Fatalf("resolved = %v, want only user-2 muted", resolved)
 		}
 		if len(prefs.users) != 2 {
 			t.Fatalf("passed %v, want the whole subscriber list in one call", prefs.users)
@@ -431,14 +473,43 @@ func TestMutedUsersAsksThePreferenceStoreForTheRightTargetKind(t *testing.T) {
 	}
 }
 
+// The two stored columns collapse into the fan-out's states, and a row that
+// says nothing this build acts on has to be indistinguishable from no row at
+// all — otherwise the mere existence of a preference row would change a
+// decision (issue #136).
+func TestRecipientPreferencesCollapseTheStoredPair(t *testing.T) {
+	prefs := &fakeMutedPrefs{stored: []storage.UserConversationNotificationPref{
+		{UserID: "muted-with-level", Level: storage.NotificationLevelMentionsReplies, Muted: true},
+		{UserID: "level-only", Level: storage.NotificationLevelMentionsReplies},
+		{UserID: "default-row", Level: storage.NotificationLevelAll},
+	}}
+	resolved, err := recipientPolicy{prefs: prefs}.RecipientPreferences(
+		context.Background(), "ws-1", ws.TargetTypeChannel, "chan-1",
+		[]string{"muted-with-level", "level-only", "default-row"})
+	if err != nil {
+		t.Fatalf("RecipientPreferences: %v", err)
+	}
+	// A mute wins over the level it is hiding, and the level stays in the row:
+	// that is what makes turning notifications back on restore it.
+	if resolved["muted-with-level"] != ws.RecipientPreferenceMuted {
+		t.Fatalf("a muted recipient with a level resolved as %v", resolved["muted-with-level"])
+	}
+	if resolved["level-only"] != ws.RecipientPreferenceMentionsReplies {
+		t.Fatalf("an unmuted level resolved as %v", resolved["level-only"])
+	}
+	if _, present := resolved["default-row"]; present {
+		t.Fatal("a row expressing only the default changed the decision for its recipient")
+	}
+}
+
 // A target kind the preference table cannot describe has no preferences to
 // report, and saying so is not the same as failing.
 func TestMutedUsersReportsNobodyForATargetThatCannotBeMuted(t *testing.T) {
 	prefs := &fakeMutedPrefs{}
-	muted, err := recipientPolicy{prefs: prefs}.MutedUsers(
+	resolved, err := recipientPolicy{prefs: prefs}.RecipientPreferences(
 		context.Background(), "ws-1", ws.TargetTypeUser, "user-9", []string{"user-1"})
-	if err != nil || muted != nil {
-		t.Fatalf("MutedUsers = (%v, %v), want (nil, nil)", muted, err)
+	if err != nil || resolved != nil {
+		t.Fatalf("RecipientPreferences = (%v, %v), want (nil, nil)", resolved, err)
 	}
 	if prefs.users != nil {
 		t.Fatal("queried the preference table for a target it does not describe")
@@ -511,5 +582,151 @@ func TestRecipientFactsKeepUnavailableDistinctFromMuted(t *testing.T) {
 	}
 	if id := unavailable.id; id != "user-1" {
 		t.Fatalf("recipient identity lost: %q", id)
+	}
+}
+
+// Issue #136: the conversation level, and the per-recipient classification it
+// needs to be judged against.
+
+// The level has to reach the engine, and it has to reach it as the recipient's
+// own: two members of one channel with different levels get different
+// decisions from the same message.
+func TestConversationLevelReachesTheEngine(t *testing.T) {
+	ctx := realtimeContext(channelMessage("hello"),
+		recipientFacts{id: "user-7", level: notificationpolicy.ConversationLevelMentionsReplies},
+		nil, false)
+	if ctx.Preferences.ConversationLevel != notificationpolicy.ConversationLevelMentionsReplies {
+		t.Fatalf("ConversationLevel = %q, want the recipient's own level",
+			ctx.Preferences.ConversationLevel)
+	}
+}
+
+// The classification is per recipient, because that is what the level is judged
+// against: one message is a mention for the person it names and an ordinary
+// channel message for everybody else.
+//
+// Every fact it reads is server-derived — the mention codec's own output and
+// the quoted message's author — so nothing here inspects a body for an "@".
+func TestEventTypeIsClassifiedPerRecipient(t *testing.T) {
+	message := channelMessage(mentionOfBob)
+	// The canonical reply fact, as the store reads it from the persisted parent
+	// — never the visual quote beside it (issue #136).
+	message.ReplyToSenderID = "user-3"
+	namedIDs, everyone := service.NamedRecipients(mentionOfBob)
+	if len(namedIDs) != 1 || namedIDs[0] != bobUserID {
+		t.Fatalf("the mention codec resolved %v, want exactly [%s]", namedIDs, bobUserID)
+	}
+
+	for _, test := range []struct {
+		name        string
+		recipientID string
+		want        notificationevent.EventType
+	}{
+		{name: "the person the message names", recipientID: bobUserID,
+			want: notificationevent.EventTypeMention},
+		{name: "the author of the message being answered", recipientID: "user-3",
+			want: notificationevent.EventTypeReply},
+		{name: "anybody else in the channel", recipientID: "user-4",
+			want: notificationevent.EventTypeChannelMessage},
+		// The publisher's own broadcast encoding: no recipient is resolved yet,
+		// so the only honest answer is the one every recipient shares.
+		{name: "no recipient resolved", recipientID: "",
+			want: notificationevent.EventTypeChannelMessage},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := service.NotificationEventTypeFor(message, test.recipientID, namedIDs, everyone)
+			if got != test.want {
+				t.Fatalf("event type = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// Being named beats being answered, which is the precedence the outbox's own
+// recipient CTE uses (rank 1 before rank 2). One classification per recipient,
+// and it is the strongest one that applies.
+func TestMentionOutranksReplyForTheSameRecipient(t *testing.T) {
+	message := channelMessage(mentionOfBob)
+	message.ReplyToSenderID = bobUserID
+	named, everyone := service.NamedRecipients(mentionOfBob)
+
+	if got := service.NotificationEventTypeFor(message, bobUserID, named, everyone); got != notificationevent.EventTypeMention {
+		t.Fatalf("event type = %q, want a mention", got)
+	}
+}
+
+// @all is a mention only where issue #776 gave it that meaning: a group DM.
+// Reading a channel-wide @all as a personal mention here would allow an alert
+// the outbox classifies as an ordinary message — the divergence between the
+// realtime and push consumers this design exists to avoid.
+func TestEveryoneMentionIsScopedToGroupConversations(t *testing.T) {
+	body := "@[todos](mention:all:" + allMentionID + ") bom dia"
+	_, everyone := service.NamedRecipients(body)
+	if !everyone {
+		t.Fatal("the mention codec did not recognise the @all token")
+	}
+
+	group := directMessage(body)
+	if got := service.NotificationEventTypeFor(group, "user-4", nil, everyone); got != notificationevent.EventTypeMention {
+		t.Fatalf("in a group, event type = %q, want a mention", got)
+	}
+	channel := channelMessage(body)
+	if got := service.NotificationEventTypeFor(channel, "user-4", nil, everyone); got != notificationevent.EventTypeChannelMessage {
+		t.Fatalf("in a channel, event type = %q, want an ordinary channel message", got)
+	}
+}
+
+// The two decisions the level produces, through the real adapter: the person
+// the message names keeps their alert and everybody else in the same narrowed
+// conversation does not.
+func TestNarrowedConversationKeepsTheMentionAndDropsTheRest(t *testing.T) {
+	payload := domainMessageToWSPayload(channelMessage(mentionOfBob))
+
+	mentioned := recipientPolicy{}.PolicyFor(payload, bobUserID, ws.RecipientPreferenceMentionsReplies)
+	if mentioned.InApp != ws.NotificationAllow || mentioned.Sound != ws.NotificationAllow {
+		t.Fatalf("the named recipient lost a surface: %+v", mentioned)
+	}
+	other := recipientPolicy{}.PolicyFor(payload, "user-4", ws.RecipientPreferenceMentionsReplies)
+	if other.InApp != ws.NotificationDeny || other.Sound != ws.NotificationDeny {
+		t.Fatalf("an ordinary message still interrupted: %+v", other)
+	}
+	if len(other.Reasons) != 1 ||
+		other.Reasons[0] != string(notificationpolicy.ReasonConversationLevel) {
+		t.Fatalf("reasons = %v, want exactly [%s]",
+			other.Reasons, notificationpolicy.ReasonConversationLevel)
+	}
+}
+
+// The reply half of the same decision, and the reason it needs the quoted
+// author: without that fact carried onto the policy's message, answering
+// somebody in a narrowed conversation would be indistinguishable from posting.
+func TestNarrowedConversationKeepsAReplyToTheRecipient(t *testing.T) {
+	message := channelMessage("uma resposta")
+	message.ReplyToSenderID = "user-5"
+	payload := domainMessageToWSPayload(message)
+	if payload.ReplyToSenderID != "user-5" {
+		t.Fatalf("the payload lost the canonical reply author: %q", payload.ReplyToSenderID)
+	}
+
+	answered := recipientPolicy{}.PolicyFor(payload, "user-5", ws.RecipientPreferenceMentionsReplies)
+	if answered.InApp != ws.NotificationAllow || answered.Sound != ws.NotificationAllow {
+		t.Fatalf("the answered recipient lost a surface: %+v", answered)
+	}
+	bystander := recipientPolicy{}.PolicyFor(payload, "user-6", ws.RecipientPreferenceMentionsReplies)
+	if bystander.InApp != ws.NotificationDeny {
+		t.Fatalf("a bystander of the reply still interrupted: %+v", bystander)
+	}
+}
+
+// A mute silences the mention a level would have kept, through the adapter:
+// precedence holds on this path too, not only inside the engine.
+func TestAMutedConversationSilencesEvenAMention(t *testing.T) {
+	payload := domainMessageToWSPayload(channelMessage(mentionOfBob))
+	decision := recipientPolicy{}.PolicyFor(payload, bobUserID, ws.RecipientPreferenceMuted)
+	if decision.InApp != ws.NotificationDeny || decision.Sound != ws.NotificationDeny {
+		t.Fatalf("a muted conversation kept a surface for a mention: %+v", decision)
+	}
+	if len(decision.Reasons) != 1 || decision.Reasons[0] != string(notificationpolicy.ReasonMuted) {
+		t.Fatalf("reasons = %v, want exactly [%s]", decision.Reasons, notificationpolicy.ReasonMuted)
 	}
 }

@@ -15,7 +15,7 @@ const ME = "user-me";
 
 function policy(overrides: Partial<WSNotificationPolicy> = {}): WSNotificationPolicy {
   return {
-    policy_version: 1,
+    policy_version: 2,
     // Allowed on the realtime path today: the evaluation runs on the foreground
     // surface, which is exactly the one the toast and the chime live on.
     in_app: "allow",
@@ -100,11 +100,15 @@ describe("an event from a server that predates the policy contract", () => {
     expect(shouldExecuteSound(execution({ ...legacy, isOwnMessage: true }))).toBe(false);
     expect(shouldExecuteSound(execution({ ...legacy, isDuplicate: true }))).toBe(false);
     expect(shouldExecuteSound(execution({ ...legacy, isMutedConversation: true }))).toBe(false);
+    // The attended conversation is deliberately absent from this list since
+    // #829: it is no longer a restriction on any path, legacy included. What
+    // the ambient gate still removes is room activity the reader is away from,
+    // and an unclassified event is not restricted on a class nobody sent.
     expect(
       shouldExecuteSound(
-        execution({ ...legacy, isActiveConversation: true, isWindowFocused: true }),
+        execution({ ...legacy, isActiveConversation: true, isWindowFocused: false }),
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("does not restrict on a class it was never told", () => {
@@ -228,9 +232,55 @@ describe("the local chime preference", () => {
 });
 
 describe("the conversation this tab is already showing", () => {
-  it("does not chime while the reader is looking at it", () => {
+  // Issue #829: the attended conversation is no longer silence. It has its own
+  // quieter voice, and this gate's job is only to stop taking that voice away
+  // — which class it turns out to be is notificationClass' answer, not this
+  // file's, so what is asserted here is the channel staying open.
+  it("chimes while the reader is attending it, so in-conversation can be heard", () => {
     expect(
       shouldExecuteSound(execution({ isActiveConversation: true, isWindowFocused: true })),
+    ).toBe(true);
+  });
+
+  it("chimes for a mention in the conversation the reader is attending", () => {
+    expect(
+      shouldExecuteSound(
+        execution({
+          policy: policy({ named_user_ids: [ME] }),
+          isActiveConversation: true,
+          isWindowFocused: true,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  // The attended conversation is open on the strength of attention, never on
+  // the strength of the event: a central deny is still the end of it.
+  it("stays silent while attending it when the central decision denied sound", () => {
+    expect(
+      shouldExecuteSound(
+        execution({
+          policy: policy({ sound: "deny" }),
+          isActiveConversation: true,
+          isWindowFocused: true,
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("stays silent while attending it for the reader's own message", () => {
+    expect(
+      shouldExecuteSound(
+        execution({ isOwnMessage: true, isActiveConversation: true, isWindowFocused: true }),
+      ),
+    ).toBe(false);
+  });
+
+  it("stays silent while attending it when the chime preference is off", () => {
+    expect(
+      shouldExecuteSound(
+        execution({ localMode: "off", isActiveConversation: true, isWindowFocused: true }),
+      ),
     ).toBe(false);
   });
 

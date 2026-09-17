@@ -30,6 +30,7 @@
 import { useCallback, useEffect, useMemo, useReducer } from "react";
 
 import type { LinkSafetyRecheck, Message, MessageAcknowledgement } from "./chatTypes";
+import type { MessagePriorityIntent } from "./messagePriority";
 import { messagesGateway } from "./messages/messagesGateway";
 import { reducer } from "./messages/reducer";
 import { initialState } from "./messages/types";
@@ -109,8 +110,8 @@ export interface UseMessagesResult {
     body: string,
     referencedMessageId?: string,
     attachmentIds?: string[],
-    /** Issue #824: ask this message's recipients to confirm receipt. */
-    acknowledgementRequired?: boolean,
+    /** Issue #822: the priority, confirmation request and reminder policy. */
+    priority?: MessagePriorityIntent,
   ) => Promise<SendResult>;
   retry: () => void;
   loadMore: () => void;
@@ -142,6 +143,12 @@ export interface UseMessagesResult {
    * this hook calls it, so reading a message can never produce one.
    */
   acknowledge: (messageId: string) => void;
+  /**
+   * Reads one message's full acknowledgement detail, including the
+   * per-recipient list a sender is authorised to see (issue #846's details
+   * popover). See Acknowledgements.loadAcknowledgementDetail.
+   */
+  loadAcknowledgementDetail: (messageId: string) => void;
   /**
    * RF-21 "Verificar novamente" (issue #135): asks the server to re-read what it
    * already knows about one message's unverified links. It never starts a new
@@ -289,6 +296,7 @@ export function useMessages({
     acknowledgingId: acknowledgements.pendingId,
     acknowledgeError: acknowledgements.error,
     acknowledge: acknowledgements.acknowledge,
+    loadAcknowledgementDetail: acknowledgements.loadAcknowledgementDetail,
     reconcileLinkSafety: reconciliation.reconcileLinkSafety,
     editMessageLocal,
     deleteMessageLocal,

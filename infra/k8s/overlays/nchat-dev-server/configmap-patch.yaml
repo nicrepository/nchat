@@ -6,6 +6,9 @@ metadata:
 data:
   LIVEKIT_ENABLED: "true"
   APP_ENV: nchat-dev
+  # #870: Web Push v2 preview rollout validated in nchat-dev.
+  # Explicit environment decision; the application default remains false.
+  NOTIFICATION_PUSH_PREVIEW_ENABLED: "true"
   AUTH_PUBLIC_WEB_BASE_URL: REPLACE_ME_PUBLIC_URL
   AUTH_TRUSTED_PROXY_CIDRS: 10.42.0.0/16
   VALKEY_WS_BROADCAST_ENABLED: "true"

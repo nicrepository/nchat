@@ -1357,3 +1357,19 @@ func TestHubBroadcasterPublishesPerLinkUpdate(t *testing.T) {
 		t.Fatalf("no links must map to a nil slice, got %+v", got)
 	}
 }
+
+// Issue #825/#846. message.created carries the flag, for the same reason
+// AcknowledgementRequired does: a message inserted from this event and the same
+// message after a reload must render identically, so the persistent-reminder
+// notice must not appear only after a refresh.
+func TestDomainMessageToWSPayloadCarriesPersistentNotifications(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		got := domainMessageToWSPayload(domain.Message{
+			ID: "message-1", SenderID: "user-1", BodyText: "keep reminding me",
+			PersistentNotifications: persistent,
+		})
+		if got.PersistentNotifications != persistent {
+			t.Fatalf("payload persistent_notifications = %v, want %v", got.PersistentNotifications, persistent)
+		}
+	}
+}

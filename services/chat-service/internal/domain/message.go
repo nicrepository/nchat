@@ -246,6 +246,35 @@ func NormalizeMessagePriority(priority MessagePriority) (MessagePriority, error)
 	return priority, nil
 }
 
+// ErrPersistentNotificationsRequireUrgent reports a send that asked for
+// persistent notifications on a message that is not urgent (issue #825).
+//
+// Wraps ErrInvalidInput so the generic 400 mapping applies with no new HTTP
+// case, exactly as ErrAcknowledgementRecipientsExceeded does. The message
+// states the rule and nothing about the message it refused.
+var ErrPersistentNotificationsRequireUrgent = fmt.Errorf(
+	"%w: persistent notifications require an urgent message", ErrInvalidInput)
+
+// ValidatePersistentNotifications enforces the one rule that binds the reminder
+// policy to the priority axis (issue #825, from #820: "disponível apenas para
+// mensagens Urgent").
+//
+// Refused rather than silently ignored. A sender who ticked the box on an
+// important message asked for something this version does not do, and quietly
+// sending without reminders would leave them believing the message keeps asking
+// when it does not — the one failure mode a persistent notification has.
+//
+// It lives in the domain so an internal caller that never sees an HTTP request
+// is held to the same rule, and chat.messages repeats it as
+// messages_persistent_notifications_priority_check; that is defence in depth,
+// not the primary control.
+func ValidatePersistentNotifications(priority MessagePriority, persistent bool) error {
+	if persistent && priority.OrStandard() != MessagePriorityUrgent {
+		return ErrPersistentNotificationsRequireUrgent
+	}
+	return nil
+}
+
 // MessageBodyFormat selects the grammar used to render BodyText.
 type MessageBodyFormat string
 
@@ -293,6 +322,21 @@ type Message struct {
 	// nothing — the per-recipient rows it causes to be written are derived in
 	// the database from membership, never from anything a client sends.
 	AcknowledgementRequired bool
+	// PersistentNotifications is the author asking an urgent message to keep
+	// asking until each recipient confirms it, answers it, or the reminders run
+	// out (issue #825). Set once, when the message is created; no edit path
+	// changes it.
+	//
+	// It is an intent and not a schedule. What it causes is a server-side
+	// reminder lifecycle whose interval, ceiling and per-recipient state are
+	// all decided by the server — see notificationevent.UrgentReminderInterval
+	// and MaxUrgentReminders — so there is nothing here a client names and
+	// nothing it can lengthen.
+	//
+	// Independent of AcknowledgementRequired, which #820 states outright: a
+	// message may keep asking without asking for a button to be pressed, and a
+	// message may ask for confirmation without ever reminding anybody.
+	PersistentNotifications bool
 	// LinkSafety is the link-safety axis, independent of Status. See
 	// MessageLinkSafety: it is what a client needs to decide whether to draw the
 	// "could not verify" notice, and what nothing in this service may read as
@@ -335,7 +379,28 @@ type Message struct {
 
 	// Quoted is the immediate parent message preview for quote-reply.
 	// It is intentionally one level only; nested parent quotes are not populated.
+	//
+	// It is a *presentation* DTO and must not be read as a semantic authority:
+	// it is blanked for a removed message, withheld for a condemned body, and
+	// absent from every projection that does not join the parent. Whether this
+	// message answers somebody is ReplyToSenderID, below.
 	Quoted *QuotedMessage
+
+	// ReplyToSenderID is the author of the message this one replies to, read
+	// from the persisted parent row (issue #136).
+	//
+	// It exists because a notification policy has to know "does this answer
+	// somebody" and Quoted cannot be asked: it is shaped by what a reader may
+	// see, so a deleted parent or a condemned body would silently turn a reply
+	// into an ordinary message. This field is the fact, and survives every rule
+	// that governs the preview.
+	//
+	// The same fact chat.notification_outbox's recipient CTE reads as
+	// parent.sender_id, so the realtime path and the push path classify one
+	// message identically. Empty when this message replies to nothing, or when
+	// the projection that produced it did not join the parent — never derived
+	// from anything a client sent.
+	ReplyToSenderID string
 
 	// Reference is the caller-authorized RF-09 preview. When the message has a
 	// reference but the caller cannot currently read its origin, Available is false

@@ -1,4 +1,4 @@
--- 000050_link_targets_convergence_and_previews.up.sql
+-- 000052_link_targets_convergence_and_previews.up.sql
 -- Issue #807: Link Safety per URL target with mandatory convergence, and the
 -- workspace-scoped rich preview store.
 --

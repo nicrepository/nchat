@@ -2187,6 +2187,81 @@
   margin-top: 8px;
 }
 
+/* ── Applied message priority (issue #822) ───────────────────────────────── */
+
+/*
+ * The composer's own statement of what the next send carries. It borrows the
+ * reply quote's geometry so the composer keeps one language for "something is
+ * attached to this message", and states the priority as text: the tint is a
+ * second signal, never the only one.
+ */
+.chat-msg-area__composer-priority {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 9px 10px 0;
+  padding: 7px 9px;
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-left: 3px solid var(--color-muted, #7c7390);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface-2, #faf8fd);
+  font-size: 12.5px;
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-msg-area__composer-priority-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.chat-msg-area__composer-priority-badge .material-symbols-outlined {
+  font-size: 14px;
+}
+
+/* Moderate emphasis: the design system's own accent, not an alarm. Same
+   colours the delivered message's own priority chip uses (issue #846), so
+   the composer's preview and the sent message read as one statement. */
+.chat-msg-area__composer-priority--important {
+  border-left-color: var(--color-primary, #6d28d9);
+}
+
+.chat-msg-area__composer-priority--important .chat-msg-area__composer-priority-badge {
+  color: var(--color-primary-strong, #5b21b6);
+  background: var(--color-primary-tint, #f3ebfb);
+}
+
+/* A warm warning tone, not the semantic danger red — matching the delivered
+   message's own urgent chip (issue #846); red is reserved for the separate
+   "Persistente" notice, not for urgent itself. */
+.chat-msg-area__composer-priority--urgent {
+  border-left-color: var(--color-warning-ink, #92400e);
+}
+
+.chat-msg-area__composer-priority--urgent .chat-msg-area__composer-priority-badge {
+  color: var(--color-warning-ink, #92400e);
+  background: var(--color-warning-tint, #fef3c7);
+}
+
+/* The toolbar trigger echoes the same two states, and adds nothing of its own:
+   its accessible name already carries the whole applied configuration. */
+.composer-toolbar__btn--priority-important {
+  background: var(--color-primary-tint, #f3ebfb);
+  color: var(--color-primary-strong, #5b21b6);
+}
+
+.composer-toolbar__btn--priority-urgent {
+  background: var(--color-warning-tint, #fef3c7);
+  color: var(--color-warning-ink, #92400e);
+}
+
 .chat-msg-area__composer-quote {
   display: flex;
   align-items: flex-start;
@@ -2364,6 +2439,22 @@
   border-radius: 4px;
   padding: 1px 3px;
   font-weight: 600;
+}
+
+/* Issue #795: opening a DM from a mention gets only an interaction
+   affordance — no font, size, color, background, padding or line-height
+   change versus the shared .rtr-mention rule above. */
+.rtr-mention[data-mention-clickable="true"] {
+  cursor: pointer;
+}
+
+.rtr-mention[data-mention-clickable="true"]:hover {
+  text-decoration: underline;
+}
+
+.rtr-mention[data-mention-clickable="true"]:focus-visible {
+  outline: 2px solid var(--color-focus-ring, currentColor);
+  outline-offset: 1px;
 }
 
 .mention-popup {
@@ -3257,6 +3348,107 @@
   }
 }
 
+/* ── Stated priority on the message (issues #823, #846) ─────────────────────
+   Issue #846's "Mattermost-inspired compact" Figma reference draws the
+   priority as a lighter rounded chip (.chat-msg-area__priority-chip) with the
+   complementary claims — "Requer confirmação", "Persistente" — as plain
+   muted words beside it. No dark bar behind the row: the chip is the only
+   thing carrying background colour, so the badge stays a marker on the
+   message rather than a bar drawn across it.
+
+   Every colour is an existing token from this app's own theme
+   (apps/web/src/chat/AppShell.css), not a palette invented for this badge.
+   Colour is the last of three signals — the label is visible text and the
+   icon sits beside it — so the whole thing still reads with colour removed.
+
+   The bubble's own surface is untouched: an urgent message is a message with a
+   marker on it, never a red panel, and its body keeps the same contrast every
+   other message's body has. */
+.chat-msg-area__priority {
+  /* flex, not inline-flex: RichTextRenderer's plain-paragraph output is bare
+     inline text with no wrapping block element, so an inline-level badge
+     could end up sharing a line with the body that follows it instead of
+     sitting on its own row above it. */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  /* Wraps rather than stretching the bubble on a narrow viewport. */
+  max-width: 100%;
+}
+
+.chat-msg-area__priority-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+
+.chat-msg-area__priority .material-symbols-outlined {
+  font-size: 14px;
+}
+
+/* The uppercasing is scoped to the visible word rather than applied to the row.
+   The row also carries the visually-hidden "Prioridade da mensagem:" prefix,
+   and some screen readers announce a text-transform:uppercase string letter by
+   letter — which would turn the one piece of text written for them into
+   spelling. */
+.chat-msg-area__priority-label {
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Complementary claims beside the chip (issue #846): "Requer confirmação" and
+   "Persistente", each a plain muted word rather than the priority chip's own
+   uppercase/letter-spacing — they are metadata about the badge, not a second
+   badge, and the "•" is drawn by CSS so it is never read to a screen reader
+   as a bullet list. */
+.chat-msg-area__priority-tag {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--color-muted, #7c7390);
+}
+
+.chat-msg-area__priority-tag::before {
+  content: "•";
+  margin: 0 4px;
+  opacity: 0.7;
+}
+
+/* The one tag that is not neutral metadata: a reminder policy is still
+   running, which is closer to a warning than to a plain fact — the Figma
+   reference keeps this the only red element in the whole badge. */
+.chat-msg-area__priority-tag--persistent {
+  color: var(--color-danger, #dc2626);
+}
+
+/* The product's own accent, never an alarm.
+
+   Bordered, not just tinted: on the reader's own message the bubble itself
+   is var(--color-primary-tint) — the exact fill this chip would otherwise
+   use — so a fill alone disappears into the bubble it sits on. The border
+   is what keeps the chip legible regardless of which bubble colour is
+   behind it. */
+.chat-msg-area__priority--important .chat-msg-area__priority-chip {
+  background: var(--color-primary-tint, #f3ebfb);
+  border: 1px solid var(--color-primary, #6d28d9);
+  color: var(--color-primary-strong, #5b21b6);
+}
+
+/* A warm warning tone, not the semantic danger red — issue #846's Figma
+   reference reserves red for the separate "Persistente" notice, so an urgent
+   message that is not also persistent shows no red at all. Bordered for the
+   same reason important is, and for consistency between the two. */
+.chat-msg-area__priority--urgent .chat-msg-area__priority-chip {
+  background: var(--color-warning-tint, #fef3c7);
+  border: 1px solid var(--color-warning-ink, #92400e);
+  color: var(--color-warning-ink, #92400e);
+}
+
 /* ── Acknowledgement (issue #824) ───────────────────────────────────────────
    One row under the message body, never a card: #820's rendering rules keep
    the request attached to the message rather than wrapping it, and a panel per
@@ -3273,26 +3465,61 @@
   font-size: 12px;
 }
 
+/* A compact action, not a bordered button (issue #846): the footer reads as
+   one line of text with a live word in it, matching the Mattermost-inspired
+   reference — "Confirmar recebimento" is a call to action, not a card. */
 .chat-msg-ack__action {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--color-border, #e8e3f0);
-  border-radius: 999px;
-  background: var(--color-surface, #fff);
-  color: var(--color-ink, #16121f);
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-primary-strong, #155e75);
   font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
   cursor: pointer;
 }
 
 .chat-msg-ack__action:hover:not(:disabled) {
-  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-primary, #0e7490);
+}
+
+.chat-msg-ack__action:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 4px);
 }
 
 .chat-msg-ack__action:disabled {
   cursor: default;
   opacity: 0.6;
+  text-decoration: none;
+}
+
+/* The sender's summary count, when it doubles as the popover's trigger. */
+.chat-msg-ack__count--action {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-ink, #16121f);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.chat-msg-ack__count--action:hover {
+  color: var(--color-primary-strong, #155e75);
+}
+
+.chat-msg-ack__count--action:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 4px);
 }
 
 /* The resolved states carry their own words (see MessageAcknowledgement), so

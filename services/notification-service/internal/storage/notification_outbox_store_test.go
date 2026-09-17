@@ -40,12 +40,31 @@ func notificationRows() *pgxmock.Rows {
 // (issue #744). A parameter rather than a second literal, so the column can
 // never be present in one helper and forgotten in the other.
 func mutedNotificationRows(muted bool) *pgxmock.Rows {
-	return pgxmock.NewRows([]string{
+	return preferenceNotificationRows(muted, "all")
+}
+
+// notificationColumnNames is the projection's column list, in order, declared
+// once so a column added to the store cannot be added to one row helper and
+// forgotten in another (issue #136 added notification_level to it, #870 the presentation).
+func notificationColumnNames() []string {
+	return []string{
 		"id", "workspace_id", "recipient_user_id", "kind", "priority",
 		"source_type", "message_id", "origin", "dedupe_key", "attempts", "occurred_at",
-		"muted",
-	}).AddRow("n1", "ws-1", "user-1", "mention", "high",
-		"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), muted)
+		"muted", "notification_level", "presentation",
+	}
+}
+
+// preferenceNotificationRows is one row carrying both halves of the recipient's
+// conversation preference, which is what the projection resolves and the policy
+// engine reads (issues #744 and #136).
+func preferenceNotificationRows(muted bool, level string) *pgxmock.Rows {
+	return pgxmock.NewRows(notificationColumnNames()).
+		AddRow("n1", "ws-1", "user-1", "mention", "high",
+			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), muted, level,
+			// NULL: the presentation is absent unless a test is about it, which
+			// is also what the projection returns for every notification whose
+			// message the recipient may not see (issue #870).
+			nil)
 }
 
 // The mute the policy engine reads has to survive the projection, and it is the
@@ -59,7 +78,7 @@ func TestListPendingProjectsTheRecipientsMute(t *testing.T) {
 			WithArgs(10).
 			WillReturnRows(mutedNotificationRows(muted))
 
-		events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10)
+		events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
 		if err != nil {
 			t.Fatalf("ListPending: %v", err)
 		}
@@ -69,6 +88,70 @@ func TestListPendingProjectsTheRecipientsMute(t *testing.T) {
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatalf("unmet expectations: %v", err)
 		}
+	}
+}
+
+// The level travels with the mute, from the same row and the same statement
+// (issue #136).
+//
+// Its loss is as invisible as the mute's and worse in the other direction: a
+// dropped column scans as the empty string, which the engine normalises to "all
+// messages", so every recipient who asked to hear only about mentions would
+// quietly start being alerted for everything again.
+func TestListPendingProjectsTheConversationLevel(t *testing.T) {
+	for _, level := range []string{"all", "mentions_replies"} {
+		mock := newNotificationMock(t)
+		mock.ExpectQuery(`FROM chat\.notification_outbox`).
+			WithArgs(10).
+			WillReturnRows(preferenceNotificationRows(false, level))
+
+		events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
+		if err != nil {
+			t.Fatalf("ListPending: %v", err)
+		}
+		if len(events) != 1 || events[0].NotificationLevel != level {
+			t.Fatalf("NotificationLevel = %+v, want %q", events, level)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet expectations: %v", err)
+		}
+	}
+}
+
+// The mute is the timestamp and no longer the existence of the row (issue #136).
+//
+// Asserted against the statement text because that is the whole of the change:
+// a row with a NULL muted_at is somebody who asked to keep hearing about
+// mentions, and reading its presence as a mute would silence every one of them.
+func TestMuteProjectionTestsTheTimestampAndNotTheRow(t *testing.T) {
+	mock := newNotificationMock(t)
+	mock.ExpectQuery(`p\.muted_at IS NOT NULL`).WithArgs(10).WillReturnRows(notificationRows())
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10); err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A recipient with no preference row at all must read as the product default,
+// which is what the COALESCE in the level projection is for: without it the
+// column would come back NULL and fail the scan for every unconfigured
+// recipient — which is almost all of them.
+func TestLevelProjectionDefaultsToAll(t *testing.T) {
+	mock := newNotificationMock(t)
+	mock.ExpectQuery(`COALESCE\(\(\s*SELECT p\.notification_level`).
+		WithArgs(10).
+		WillReturnRows(notificationRows())
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(events) != 1 || events[0].NotificationLevel != "all" {
+		t.Fatalf("NotificationLevel = %+v, want the default", events)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
@@ -92,7 +175,7 @@ func TestMuteProjectionIsScopedToRecipientWorkspaceAndConversation(t *testing.T)
 		`p\.dm_conversation_id = m\.dm_conversation_id`,
 	} {
 		mock.ExpectQuery(predicate).WithArgs(10).WillReturnRows(notificationRows())
-		if _, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10); err != nil {
+		if _, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10); err != nil {
 			t.Fatalf("ListPending (%s): %v", predicate, err)
 		}
 	}
@@ -106,21 +189,17 @@ func TestMuteProjectionIsScopedToRecipientWorkspaceAndConversation(t *testing.T)
 // many events issues exactly the one query a batch of one does.
 func TestListPendingResolvesEveryMuteInOneQuery(t *testing.T) {
 	mock := newNotificationMock(t)
-	rows := pgxmock.NewRows([]string{
-		"id", "workspace_id", "recipient_user_id", "kind", "priority",
-		"source_type", "message_id", "origin", "dedupe_key", "attempts", "occurred_at",
-		"muted",
-	})
+	rows := pgxmock.NewRows(notificationColumnNames())
 	const batch = 25
 	for i := 0; i < batch; i++ {
 		rows.AddRow("n"+strconv.Itoa(i), "ws-1", "user-1", "mention", "high",
-			"message", "msg-1", "live", "", 1, time.Now(), i%2 == 0)
+			"message", "msg-1", "live", "", 1, time.Now(), i%2 == 0, "all", nil)
 	}
 	// Exactly one ExpectQuery is registered. pgxmock fails any further query,
 	// so a per-event lookup could not pass this test.
 	mock.ExpectQuery(`FROM chat\.notification_outbox`).WithArgs(batch).WillReturnRows(rows)
 
-	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), batch)
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), batch)
 	if err != nil {
 		t.Fatalf("ListPending: %v", err)
 	}
@@ -143,7 +222,7 @@ func TestListPendingReadsTheEventContract(t *testing.T) {
 		WithArgs(10).
 		WillReturnRows(notificationRows())
 
-	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10)
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("ListPending: %v", err)
 	}
@@ -169,7 +248,7 @@ func TestListPendingProjectsTheOrigin(t *testing.T) {
 		WithArgs(10).
 		WillReturnRows(notificationRows())
 
-	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 10)
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
 	if err != nil {
 		t.Fatalf("ListPending: %v", err)
 	}
@@ -186,7 +265,7 @@ func TestListPendingProjectsTheOrigin(t *testing.T) {
 func TestListPendingRefusesANonPositiveLimit(t *testing.T) {
 	mock := newNotificationMock(t)
 
-	events, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 0)
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 0)
 	if err != nil || events != nil {
 		t.Fatalf("ListPending(0) = (%v, %v), want (nil, nil)", events, err)
 	}
@@ -201,7 +280,7 @@ func TestListPendingPropagatesAQueryFailure(t *testing.T) {
 		WithArgs(5).
 		WillReturnError(errors.New("connection reset"))
 
-	if _, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 5); err == nil {
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 5); err == nil {
 		t.Fatal("expected an error")
 	}
 }
@@ -212,7 +291,7 @@ func TestListPendingReportsAScanFailure(t *testing.T) {
 		WithArgs(5).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("n1"))
 
-	if _, err := storage.NewPGXNotificationOutboxStore(mock).ListPending(context.Background(), 5); err == nil {
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 5); err == nil {
 		t.Fatal("a row that does not match the projection was accepted")
 	}
 }
@@ -235,7 +314,7 @@ func TestMarkEvaluatedAppliesThePolicyDecision(t *testing.T) {
 				WithArgs("n1", string(tc.state), tc.reason).
 				WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-			store := storage.NewPGXNotificationOutboxStore(mock)
+			store := storage.NewPGXNotificationOutboxStore(mock, false)
 			if err := store.MarkEvaluated(context.Background(), "n1", tc.state, tc.reason); err != nil {
 				t.Fatalf("MarkEvaluated: %v", err)
 			}
@@ -263,7 +342,7 @@ func TestMarkEvaluatedRefusesTransitionsTheMachineDoesNotAllow(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			mock := newNotificationMock(t)
-			store := storage.NewPGXNotificationOutboxStore(mock)
+			store := storage.NewPGXNotificationOutboxStore(mock, false)
 
 			err := store.MarkEvaluated(context.Background(), "n1", tc.state, tc.reason)
 			if !errors.Is(err, storage.ErrInvalidNotificationTransition) {
@@ -304,7 +383,7 @@ func TestTransitionsReportAConflictWhenTheRowMovedOn(t *testing.T) {
 				WithArgs(tc.args...).
 				WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 
-			err := tc.call(storage.NewPGXNotificationOutboxStore(mock))
+			err := tc.call(storage.NewPGXNotificationOutboxStore(mock, false))
 			if !errors.Is(err, storage.ErrNotificationStateConflict) {
 				t.Fatalf("err = %v, want a state conflict", err)
 			}
@@ -321,7 +400,7 @@ func TestTransitionsSurfaceTheDatabasesOwnRefusal(t *testing.T) {
 		WithArgs("n1", 1).
 		WillReturnError(&pgconn.PgError{Code: "23514", Message: "transition is not allowed"})
 
-	err := storage.NewPGXNotificationOutboxStore(mock).MarkDelivered(context.Background(), "n1", 1)
+	err := storage.NewPGXNotificationOutboxStore(mock, false).MarkDelivered(context.Background(), "n1", 1)
 	if !errors.Is(err, storage.ErrInvalidNotificationTransition) {
 		t.Fatalf("err = %v, want an invalid transition", err)
 	}
@@ -336,7 +415,7 @@ func TestTransitionsPropagateAnUnexpectedDatabaseError(t *testing.T) {
 		WithArgs("n1", 1, "delivery_transient").
 		WillReturnError(errors.New("connection reset"))
 
-	err := storage.NewPGXNotificationOutboxStore(mock).MarkFailed(context.Background(), "n1", 1, "delivery_transient")
+	err := storage.NewPGXNotificationOutboxStore(mock, false).MarkFailed(context.Background(), "n1", 1, "delivery_transient")
 	if err == nil || errors.Is(err, storage.ErrNotificationStateConflict) ||
 		errors.Is(err, storage.ErrInvalidNotificationTransition) {
 		t.Fatalf("err = %v, want the database's own failure", err)
@@ -346,7 +425,7 @@ func TestTransitionsPropagateAnUnexpectedDatabaseError(t *testing.T) {
 func TestTransitionsRefuseAnEmptyIdentity(t *testing.T) {
 	mock := newNotificationMock(t)
 
-	err := storage.NewPGXNotificationOutboxStore(mock).MarkDelivered(context.Background(), "", 1)
+	err := storage.NewPGXNotificationOutboxStore(mock, false).MarkDelivered(context.Background(), "", 1)
 	if !errors.Is(err, storage.ErrInvalidNotificationTransition) {
 		t.Fatalf("err = %v, want an invalid transition", err)
 	}
@@ -362,10 +441,10 @@ func TestClaimDuePassesTheBatchLeaseAndCeiling(t *testing.T) {
 	// lead on the persisted availability instant, with occurred_at only as the
 	// tie-break.
 	mock.ExpectQuery(`ORDER BY o\.next_attempt_at, o\.occurred_at, o\.id`).
-		WithArgs(7, 60.0, 5).
+		WithArgs(7, 60.0, 5, false).
 		WillReturnRows(notificationRows())
 
-	events, err := storage.NewPGXNotificationOutboxStore(mock).
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).
 		ClaimDue(context.Background(), 7, 5, 60*time.Second)
 	if err != nil {
 		t.Fatalf("ClaimDue: %v", err)
@@ -380,7 +459,7 @@ func TestClaimDuePassesTheBatchLeaseAndCeiling(t *testing.T) {
 
 func TestClaimDueRefusesADegenerateRequest(t *testing.T) {
 	mock := newNotificationMock(t)
-	store := storage.NewPGXNotificationOutboxStore(mock)
+	store := storage.NewPGXNotificationOutboxStore(mock, false)
 
 	for _, args := range []struct{ batch, attempts int }{{0, 5}, {5, 0}, {-1, -1}} {
 		events, err := store.ClaimDue(context.Background(), args.batch, args.attempts, time.Minute)
@@ -396,10 +475,10 @@ func TestClaimDueRefusesADegenerateRequest(t *testing.T) {
 func TestClaimDuePropagatesAQueryFailure(t *testing.T) {
 	mock := newNotificationMock(t)
 	mock.ExpectQuery(`FOR UPDATE SKIP LOCKED`).
-		WithArgs(5, 60.0, 5).
+		WithArgs(5, 60.0, 5, false).
 		WillReturnError(errors.New("deadlock detected"))
 
-	if _, err := storage.NewPGXNotificationOutboxStore(mock).
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).
 		ClaimDue(context.Background(), 5, 5, time.Minute); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -411,7 +490,7 @@ func TestFailExhaustedReportsHowManyWereRetired(t *testing.T) {
 		WithArgs(5).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 3))
 
-	retired, err := storage.NewPGXNotificationOutboxStore(mock).FailExhausted(context.Background(), 5)
+	retired, err := storage.NewPGXNotificationOutboxStore(mock, false).FailExhausted(context.Background(), 5)
 	if err != nil {
 		t.Fatalf("FailExhausted: %v", err)
 	}
@@ -423,7 +502,7 @@ func TestFailExhaustedReportsHowManyWereRetired(t *testing.T) {
 func TestFailExhaustedRefusesANonPositiveCeiling(t *testing.T) {
 	mock := newNotificationMock(t)
 
-	retired, err := storage.NewPGXNotificationOutboxStore(mock).FailExhausted(context.Background(), 0)
+	retired, err := storage.NewPGXNotificationOutboxStore(mock, false).FailExhausted(context.Background(), 0)
 	if retired != 0 || err != nil {
 		t.Fatalf("FailExhausted(0) = (%d, %v), want (0, nil)", retired, err)
 	}
@@ -438,7 +517,7 @@ func TestFailExhaustedPropagatesAFailure(t *testing.T) {
 		WithArgs(5).
 		WillReturnError(errors.New("connection reset"))
 
-	if _, err := storage.NewPGXNotificationOutboxStore(mock).
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).
 		FailExhausted(context.Background(), 5); err == nil {
 		t.Fatal("expected an error")
 	}
@@ -449,7 +528,7 @@ func TestBacklogCountsTheNonTerminalStates(t *testing.T) {
 	mock.ExpectQuery(`SELECT count\(\*\)`).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(42))
 
-	backlog, err := storage.NewPGXNotificationOutboxStore(mock).Backlog(context.Background())
+	backlog, err := storage.NewPGXNotificationOutboxStore(mock, false).Backlog(context.Background())
 	if err != nil {
 		t.Fatalf("Backlog: %v", err)
 	}
@@ -463,7 +542,94 @@ func TestBacklogPropagatesAFailure(t *testing.T) {
 	mock.ExpectQuery(`SELECT count\(\*\)`).
 		WillReturnError(errors.New("connection reset"))
 
-	if _, err := storage.NewPGXNotificationOutboxStore(mock).Backlog(context.Background()); err == nil {
+	if _, err := storage.NewPGXNotificationOutboxStore(mock, false).Backlog(context.Background()); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// The presentation the claim resolved survives the projection (issue #870).
+//
+// It is scanned from a jsonb value, so the failure this guards against is not a
+// dropped column — that would be a scan error — but a decode that silently
+// produced the zero value, which is indistinguishable from "the recipient may
+// see nothing" and would turn every banner generic without failing anything.
+func TestClaimDueDecodesTheApprovedPresentation(t *testing.T) {
+	mock := newNotificationMock(t)
+	rows := pgxmock.NewRows(notificationColumnNames()).
+		AddRow("n1", "ws-1", "user-1", "mention", "high",
+			"message", "msg-1", "live", "message:msg-1:mention", 2, time.Now(), false, "all",
+			[]byte(`{"sender":"Ana Ribeiro","context":"#geral","body":"subiu o hotfix","attachment":true}`))
+	mock.ExpectQuery(`FOR UPDATE SKIP LOCKED`).WithArgs(10, 60.0, 5, true).WillReturnRows(rows)
+
+	events, err := storage.NewPGXNotificationOutboxStore(mock, true).ClaimDue(context.Background(), 10, 5, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	want := storage.MessagePresentation{
+		Sender: "Ana Ribeiro", Context: "#geral",
+		Body: "subiu o hotfix", Attachment: true,
+	}
+	if len(events) != 1 || events[0].Presentation != want {
+		t.Fatalf("Presentation = %+v, want %+v", events, want)
+	}
+}
+
+// ListPending deliberately returns no presentation before policy evaluation.
+func TestListPendingReadsAnAbsentPresentationAsNothing(t *testing.T) {
+	mock := newNotificationMock(t)
+	mock.ExpectQuery(`FROM chat\.notification_outbox`).
+		WithArgs(10).WillReturnRows(notificationRows())
+
+	events, err := storage.NewPGXNotificationOutboxStore(mock, false).ListPending(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListPending: %v", err)
+	}
+	if len(events) != 1 || events[0].Presentation != (storage.MessagePresentation{}) {
+		t.Fatalf("Presentation = %+v, want nothing at all", events)
+	}
+}
+
+// The projection scopes the presentation by the outbox row's own tenant and
+// recipient, and refuses every state in which the message is not readable. The
+// statement is asserted here; TestNotificationPresentationIsScopedPostgreSQL
+// proves the behaviour against a real database.
+func TestPresentationProjectionIsScopedAndGuarded(t *testing.T) {
+	for name, predicate := range map[string]string{
+		"the tenant":            `m\.workspace_id = o\.workspace_id`,
+		"the message":           `m\.id = o\.message_id`,
+		"a deleted message":     `m\.deleted_at IS NULL`,
+		"a withheld message":    `m\.status = 'active'`,
+		"a condemned message":   `m\.link_safety_state <> 'malicious'`,
+		"a system message":      `m\.kind = 'user'`,
+		"channel visibility":    `chat\.channel_visible_to_user\(m\.channel_id, o\.recipient_user_id\)`,
+		"conversation membersh": `dm\.user_id = o\.recipient_user_id`,
+		// The four status predicates that align this projection with
+		// chat-service's own ListChannelMessages and ListDMMessages. They are
+		// the difference between "the recipient was told about this once" and
+		// "the recipient may read this now", and each one is a state a
+		// workspace, a membership or a target can enter after the outbox row
+		// was written.
+		"a disabled workspace":     `w\.status = 'active'`,
+		"a revoked membership":     `wm\.status = 'active'`,
+		"an archived channel":      `c\.status = 'active'`,
+		"an archived conversation": `d\.status = 'active'`,
+		// SR-001. The recipient's *global account*, which is a different fact
+		// from their membership of this workspace: an operator suspending
+		// somebody revokes their sessions and leaves the membership standing.
+		// Both patterns name the recipient_user alias explicitly, so neither can
+		// be satisfied by the sender's auth.users join — which is what the
+		// projection already had, and what made the gap invisible.
+		"a globally suspended recipient": `recipient_user\.id = o\.recipient_user_id\s+AND recipient_user\.status = 'active'`,
+		"a soft-deleted recipient":       `recipient_user\.deleted_at IS NULL`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := newNotificationMock(t)
+			mock.ExpectQuery(predicate).WithArgs(10, 60.0, 5, true).WillReturnRows(notificationRows())
+
+			if _, err := storage.NewPGXNotificationOutboxStore(mock, true).
+				ClaimDue(context.Background(), 10, 5, time.Minute); err != nil {
+				t.Fatalf("the projection does not carry %s: %v", name, err)
+			}
+		})
 	}
 }

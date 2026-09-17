@@ -11,8 +11,10 @@
 
 import type { RefObject } from "react";
 
+import type { CallParticipantProfile } from "../../chatApi";
 import ConversationSystemMessage from "../../ConversationSystemMessage.tsx";
 import MessageBubble, { type MessageBubbleProps } from "../../MessageBubble";
+import type { MentionType } from "../../richTextMarkers";
 import type { MentionTarget, Message, MessageAcknowledgement } from "../../chatTypes";
 import type { SystemMessageScope } from "../../conversationSystemMessage";
 import type { EmojiUsage } from "../../emoji/emojiUsage";
@@ -29,6 +31,8 @@ export interface TimelineMessageActions {
   onReferenceJump: (reference: NonNullable<Message["reference"]>) => void;
   onQuoteJump: (messageId: string) => void;
   onOpenAuthorDM?: MessageBubbleProps["onOpenAuthorDM"];
+  /** Opens a DM when a `@user` mention in a message body is clicked (issue #795). */
+  onMentionClick?: (mentionType: MentionType, id: string) => void;
   onToggleFavorite: (messageId: string, isFavorited: boolean) => void;
   /** RF-21 "Verificar novamente" (issue #135); see MessageBubbleProps. */
   onReconcileLinkSafety?: MessageBubbleProps["onReconcileLinkSafety"];
@@ -39,6 +43,12 @@ export interface TimelineMessageActions {
   onTogglePin?: (messageId: string, pin: boolean) => void;
   /** Issue #824: confirms receipt of one message. See MessageBubbleProps. */
   onAcknowledge?: (messageId: string) => void;
+  /**
+   * Issue #846: reads one message's full per-recipient detail, for the details
+   * popover a sender opens from the acknowledgement summary. See
+   * MessageBubbleProps.
+   */
+  onOpenAcknowledgementDetails?: (messageId: string) => void;
 }
 
 /** The same actions, minus the one the viewport supplies (see MessageList). */
@@ -74,6 +84,16 @@ export interface TimelineRowContext {
   acknowledgements?: Record<string, MessageAcknowledgement>;
   /** The message whose confirmation is in flight, if any. */
   acknowledgingId?: string | null;
+  /**
+   * Resolves recipient identities (display name, avatar) for the details
+   * popover (issue #846), scoped to the conversation on screen. Undefined for
+   * a 1:1 DM, which never offers the popover (issue #846's own rule against
+   * "0 de 1"/"1 de 1" language).
+   */
+  resolveRecipientIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
 }
 
 interface Props {
@@ -176,6 +196,8 @@ function TimelineMessageRow({
       acknowledgement={context.acknowledgements?.[message.id]}
       acknowledging={context.acknowledgingId === message.id}
       onAcknowledge={actions.onAcknowledge}
+      onOpenAcknowledgementDetails={actions.onOpenAcknowledgementDetails}
+      resolveRecipientIdentities={context.resolveRecipientIdentities}
       onReconcileLinkSafety={actions.onReconcileLinkSafety}
       onEditMessage={actions.onEditMessage}
       onEditForbidden={actions.onEditForbidden}
@@ -199,6 +221,15 @@ function TimelineMessageRow({
       onReferenceJump={actions.onReferenceJump}
       onOpenAuthorDM={actions.onOpenAuthorDM}
       openingAuthorDM={context.openingAuthorDMIds?.has(message.senderId) ?? false}
+      mentionInteraction={
+        actions.onMentionClick
+          ? {
+              currentUserId: context.currentUserId,
+              onMentionClick: actions.onMentionClick,
+              openingIds: context.openingAuthorDMIds,
+            }
+          : undefined
+      }
       isHighlighted={highlightedMessageId === message.id}
       setMessageRef={setMessageRef}
     />

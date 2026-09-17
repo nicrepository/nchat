@@ -66,6 +66,28 @@ type Notification struct {
 	// because the policy does, and the policy is the only thing that may decide
 	// what a mute means.
 	Muted bool
+	// NotificationLevel is the other half of that preference (issue #136), from
+	// the same projection and carried for the same reason: the policy reads it,
+	// nothing here does, and the empty string is a recipient who expressed no
+	// level at all.
+	NotificationLevel string
+	// Presentation is the one exception to "references only" above, and it is a
+	// narrow one (issue #870).
+	//
+	// It is not the message. It is a bounded, already-authorized projection of
+	// what a native notification banner may say about it — the author's display
+	// name, the conversation it happened in, and at most the first few hundred
+	// characters of the body — resolved by the same claim statement against the
+	// recipient's access at the claim snapshot, and empty whenever they may see nothing. An
+	// adapter therefore still holds nothing a reader of the message had not
+	// already been granted, which is the property this struct's restraint was
+	// protecting.
+	//
+	// Raw, deliberately: it is sanitised and truncated by webpush_preview.go on
+	// its way into a payload, so no adapter can present more of it than the
+	// rules there allow. It is never logged, never a metric label and never part
+	// of an error — see logOutcome here and logAttempt in webpush_delivery.go.
+	Presentation storage.MessagePresentation
 }
 
 // IdempotencyKey is what an adapter must present to a provider that supports
@@ -86,18 +108,20 @@ func (n Notification) IdempotencyKey() string { return n.ID }
 // notificationFrom converts a claimed row into what the ports are given.
 func notificationFrom(event storage.NotificationEvent) Notification {
 	return Notification{
-		ID:          event.ID,
-		WorkspaceID: event.WorkspaceID,
-		RecipientID: event.RecipientID,
-		EventType:   event.EventType,
-		Priority:    event.Priority,
-		SourceType:  event.SourceType,
-		SourceID:    event.SourceID,
-		Origin:      event.Origin,
-		DedupeKey:   event.DedupeKey,
-		Attempt:     event.Attempts,
-		OccurredAt:  event.OccurredAt,
-		Muted:       event.Muted,
+		ID:                event.ID,
+		WorkspaceID:       event.WorkspaceID,
+		RecipientID:       event.RecipientID,
+		EventType:         event.EventType,
+		Priority:          event.Priority,
+		SourceType:        event.SourceType,
+		SourceID:          event.SourceID,
+		Origin:            event.Origin,
+		DedupeKey:         event.DedupeKey,
+		Attempt:           event.Attempts,
+		OccurredAt:        event.OccurredAt,
+		Muted:             event.Muted,
+		NotificationLevel: event.NotificationLevel,
+		Presentation:      event.Presentation,
 	}
 }
 

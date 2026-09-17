@@ -1,8 +1,9 @@
-import type {
-  MessageAcknowledgement,
-  MessageAcknowledgementRecipient,
-  MessageAcknowledgementState,
-} from "./chatTypes";
+import { useRef, useState } from "react";
+
+import type { CallParticipantProfile } from "./chatApi";
+import type { MessageAcknowledgement, MessageAcknowledgementState } from "./chatTypes";
+import MessageAcknowledgementDetails from "./MessageAcknowledgementDetails";
+import { formatTime } from "./messageDisplay";
 
 /**
  * The acknowledgement strip under a message that asked for confirmation
@@ -37,6 +38,18 @@ export interface MessageAcknowledgementProps {
   /** True while this message's confirmation is in flight. */
   submitting: boolean;
   onAcknowledge: (messageId: string) => void;
+  /**
+   * Reads this message's full per-recipient detail (issue #846), called when
+   * the sender opens the details popover. Optional: without it the popover
+   * still opens once recipients happen to already be cached, just without a
+   * fresh read to fill a gap.
+   */
+  onOpenDetails?: (messageId: string) => void;
+  /** Resolves recipient identities for the popover. See MessageBubbleProps. */
+  resolveIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
 }
 
 /**
@@ -70,74 +83,126 @@ function viewerRole(
  * Each terminal state gets its own sentence because they do not mean the same
  * thing to the person who was asked: they confirmed, they answered instead, the
  * request was withdrawn, or it stopped being asked.
+ *
+ * `responded` is deliberately distinct from `acknowledged` (issue #846): a
+ * reply is not a confirmation, and the checkmark on `acknowledged` alone would
+ * read the two as the same outcome to a sender scanning the timeline. Neither
+ * carries "confirmou"/"você confirmou" for the same reason.
  */
 const resolvedLabels: Record<Exclude<MessageAcknowledgementState, "pending">, string> = {
   acknowledged: "✓ Recebimento confirmado",
-  responded: "✓ Resolvido pela sua resposta",
+  responded: "Respondido",
   expired: "Confirmação expirada",
   cancelled: "Confirmação cancelada",
 };
 
 /**
- * How one recipient's answer reads in the sender's list. The same four words
- * the recipient sees for their own state, so the two views agree.
+ * The sender's line for a message with exactly one recipient (issue #846): a
+ * DM's "0 de 1"/"1 de 1" reads as a fraction of a person, so a single
+ * recipient gets the same direct wording their own view would show them,
+ * mirrored back to the sender.
+ *
+ * Prefers the per-recipient detail's own resolvedAt when it happens to be
+ * loaded already (the sender opened the popover, or a realtime event refreshed
+ * it); falls back to the aggregate counts alone otherwise; recipients is never
+ * fetched just to find a timestamp for this line, since a page of a hundred DMs
+ * must not cost a hundred extra reads.
  */
-const recipientLabels: Record<MessageAcknowledgementState, string> = {
-  pending: "Pendente",
-  acknowledged: "Confirmou",
-  responded: "Respondeu",
-  expired: "Expirou",
-  cancelled: "Cancelado",
-};
+function directRecipientLabel(acknowledgement: MessageAcknowledgement): string {
+  const { pending, acknowledged, responded, expired, cancelled, recipients } = acknowledgement;
+  const detail = recipients?.[0];
+  if (pending > 0) return "Aguardando confirmação";
+  if (acknowledged > 0) {
+    const at = detail?.state === "acknowledged" ? formatResolvedAt(detail.resolvedAt) : null;
+    return at ? `✓ Confirmado às ${at}` : "✓ Confirmado";
+  }
+  if (responded > 0) return "Respondido";
+  if (expired > 0) return "Confirmação expirada";
+  if (cancelled > 0) return "Confirmação cancelada";
+  return "Aguardando confirmação";
+}
+
+function formatResolvedAt(iso?: string): string | null {
+  if (!iso) return null;
+  const formatted = formatTime(iso);
+  return formatted || null;
+}
 
 /**
- * The sender's line, and — on demand — who is behind it.
+ * The sender's line, and — for more than one recipient — a summary that opens
+ * the details popover (issue #846).
  *
- * A summary strip with a disclosure rather than a modal or a table: the numbers
- * are what a sender reads while scrolling, and the names are what they ask for
- * when a number looks wrong. <details> is the platform's own disclosure, so it
- * is keyboard-operable and announced as expandable without a line of script.
- *
- * The list is drawn only from `recipients`, which is present only when the
- * server chose to send it. There is no second request to try, no fallback, and
- * no local decision about who may see it: absent means the disclosure is not
- * offered at all.
+ * A single recipient never offers the popover: there is nothing a list of one
+ * name tells a sender that the line itself does not already say, and the
+ * task's own rule against "0 de 1"/"1 de 1" applies to the affordance too, not
+ * only to the wording.
  */
-function SenderSummary({ acknowledgement }: { acknowledgement: MessageAcknowledgement }) {
-  const { total, acknowledged, pending, recipients } = acknowledgement;
+function SenderSummary({
+  messageId,
+  acknowledgement,
+  onOpenDetails,
+  resolveIdentities,
+}: {
+  messageId: string;
+  acknowledgement: MessageAcknowledgement;
+  onOpenDetails?: (messageId: string) => void;
+  resolveIdentities?: (
+    userIds: string[],
+    signal?: AbortSignal,
+  ) => Promise<CallParticipantProfile[]>;
+}) {
+  const { total, acknowledged, recipients } = acknowledgement;
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+
+  if (total === 1) {
+    return (
+      <p className="chat-msg-ack__state" data-testid="acknowledgement-summary">
+        {directRecipientLabel(acknowledgement)}
+      </p>
+    );
+  }
+
+  const canOpenDetails = Boolean(resolveIdentities);
+  const openDetails = () => {
+    if (!canOpenDetails) return;
+    onOpenDetails?.(messageId);
+    setDetailsOpen(true);
+  };
+
   return (
     <div className="chat-msg-ack__summary" data-testid="acknowledgement-summary">
-      <p className="chat-msg-ack__counts">
+      {canOpenDetails ? (
+        <button
+          type="button"
+          ref={triggerRef}
+          className="chat-msg-ack__count chat-msg-ack__count--action"
+          aria-haspopup="dialog"
+          aria-expanded={detailsOpen}
+          aria-label={`${acknowledged} de ${total} pessoas confirmaram. Ver confirmações.`}
+          onClick={openDetails}
+        >
+          {acknowledged} de {total} confirmaram
+        </button>
+      ) : (
         <span className="chat-msg-ack__count">
           {acknowledged} de {total} confirmaram
         </span>
-        {pending > 0 ? <span className="chat-msg-ack__pending">{pending} pendente(s)</span> : null}
-      </p>
-      {recipients?.length ? <RecipientList recipients={recipients} /> : null}
+      )}
+      {detailsOpen && resolveIdentities ? (
+        <MessageAcknowledgementDetails
+          total={total}
+          acknowledged={acknowledged}
+          recipients={recipients}
+          anchorRef={triggerRef}
+          resolveIdentities={resolveIdentities}
+          onClose={(restoreFocus) => {
+            setDetailsOpen(false);
+            if (restoreFocus) triggerRef.current?.focus();
+          }}
+        />
+      ) : null}
     </div>
-  );
-}
-
-function RecipientList({ recipients }: { recipients: MessageAcknowledgementRecipient[] }) {
-  return (
-    <details className="chat-msg-ack__details" data-testid="acknowledgement-details">
-      <summary className="chat-msg-ack__details-toggle">Ver detalhes</summary>
-      <ul className="chat-msg-ack__recipients">
-        {recipients.map((recipient) => (
-          <li
-            key={recipient.recipientId}
-            className="chat-msg-ack__recipient"
-            data-state={recipient.state}
-            data-testid="acknowledgement-recipient"
-          >
-            <span className="chat-msg-ack__recipient-id">{recipient.recipientId}</span>
-            <span className="chat-msg-ack__recipient-state">
-              {recipientLabels[recipient.state]}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </details>
   );
 }
 
@@ -189,6 +254,8 @@ export default function MessageAcknowledgementStrip({
   currentUserId,
   submitting,
   onAcknowledge,
+  onOpenDetails,
+  resolveIdentities,
 }: MessageAcknowledgementProps) {
   // Nothing to draw until the server has answered, and nothing to draw for a
   // message whose request it reports as asking nobody.
@@ -208,7 +275,12 @@ export default function MessageAcknowledgementStrip({
           onAcknowledge={onAcknowledge}
         />
       ) : (
-        <SenderSummary acknowledgement={acknowledgement} />
+        <SenderSummary
+          messageId={messageId}
+          acknowledgement={acknowledgement}
+          onOpenDetails={onOpenDetails}
+          resolveIdentities={resolveIdentities}
+        />
       )}
     </div>
   );

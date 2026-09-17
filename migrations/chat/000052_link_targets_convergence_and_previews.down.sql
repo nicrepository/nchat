@@ -1,4 +1,4 @@
--- 000050_link_targets_convergence_and_previews.down.sql
+-- 000052_link_targets_convergence_and_previews.down.sql
 -- Reverses the issue #807 schema. Refuses to run while `unknown` targets
 -- exist: the previous version's CHECK cannot represent them, and rewriting them
 -- to `pending` would resurrect exactly the eternal-pending state this migration

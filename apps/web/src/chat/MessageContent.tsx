@@ -15,6 +15,7 @@ import InlineMessageEditor from "./InlineMessageEditor";
 import { hasLinkProjection } from "./messages/linkSafetyCorrections";
 import LinkInterstitialDialog from "./LinkInterstitialDialog";
 import LinkPreviewCard from "./LinkPreviewCard";
+import { messagePriorityBadges } from "./messagePriority";
 import MessageAttachments from "./MessageAttachments";
 import {
   findLinkOccurrence,
@@ -23,6 +24,7 @@ import {
   type MessageLink,
 } from "./messageLinks";
 import RichTextRenderer from "./RichTextRenderer";
+import type { MentionInteraction } from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
 /**
@@ -269,6 +271,98 @@ function LinkSafetyNotice({
 }
 
 /**
+ * The author's stated priority, drawn on the message itself (issue #823).
+ *
+ * # Why it lives here and not in the meta row
+ *
+ * Priority is a property of what was said, not of who said it. Drawing it
+ * beside the name, the timestamp or the presence dot would read as an attribute
+ * of the sender — #823 rules that out explicitly — so it sits inside the bubble,
+ * with the other things that qualify the content, and a grouped message keeps
+ * its own badge because the message is what carries the claim.
+ *
+ * # What it is not
+ *
+ * It is not a security signal and it authorises nothing. `urgent` is the
+ * author's claim about their own message; no reader gains an action, a
+ * permission or a view because of it, and nothing here decides what may be seen.
+ *
+ * The badge is text and an icon first. The stylesheet tints it — the
+ * product's own accent colour for `important`, a warm warning tone for
+ * `urgent` (issue #846's Figma reference keeps the strong danger red for the
+ * separate "Persistente" notice, not for the priority chip itself) — but
+ * removing every colour from this page would leave both states fully legible,
+ * which is the requirement. The bubble's own surface is never repainted: an
+ * urgent message stays as readable as any other.
+ *
+ * Composition follows the "Mattermost-inspired compact" Figma reference
+ * (issue #846): the priority itself is a lighter rounded chip, and the
+ * complementary claims — "Requer confirmação", "Persistente" — are plain
+ * muted words beside it, never a second chip and never a dark bar behind
+ * the row.
+ */
+/**
+ * The complementary claims a priority badge carries alongside it (issue #846):
+ * a request for confirmation and, when the message is also persistent, the
+ * reminder policy. Rendered only beside an actual priority badge — `standard`
+ * still draws nothing at all, so a message this build has no reason to flag
+ * never grows a metadata row it did not have before.
+ *
+ * Neither tag is inferred from the priority (issue #846's own rule): each
+ * reads its own field, and an urgent message with neither flag set shows
+ * neither tag.
+ */
+function MessagePriorityTags({ message }: { message: Message }) {
+  return (
+    <>
+      {message.acknowledgementRequired && (
+        <span className="chat-msg-area__priority-tag" data-testid="chat-message-priority-ack-tag">
+          Requer confirmação
+        </span>
+      )}
+      {message.persistentNotifications && (
+        <span
+          className="chat-msg-area__priority-tag chat-msg-area__priority-tag--persistent"
+          data-testid="chat-message-priority-persistent-tag"
+        >
+          Persistente
+        </span>
+      )}
+    </>
+  );
+}
+
+function MessagePriorityBadge({ message }: { message: Message }) {
+  // A removed message is replaced by its placeholder, and the claim its author
+  // made about it goes with everything else the placeholder replaces.
+  if (message.isRemoved) return null;
+  // Absent for `standard`, which is the one that must draw nothing at all.
+  const badge = messagePriorityBadges[message.priority ?? "standard"];
+  if (!badge) return null;
+  return (
+    <div
+      className={`chat-msg-area__priority chat-msg-area__priority--${message.priority}`}
+      data-testid="chat-message-priority"
+      data-priority={message.priority}
+    >
+      <span className="chat-msg-area__priority-chip">
+        <span className="material-symbols-outlined" aria-hidden="true">
+          {badge.icon}
+        </span>
+        {/* The visible word alone is "Urgente", which is unambiguous next to
+            the message it labels but not when a screen reader reaches it out
+            of that context. This names the axis; the label below is the
+            value, and the icon says nothing, so the state is announced
+            exactly once. */}
+        <span className="sr-only">Prioridade da mensagem:</span>
+        <span className="chat-msg-area__priority-label">{badge.label}</span>
+      </span>
+      <MessagePriorityTags message={message} />
+    </div>
+  );
+}
+
+/**
  * RF-21 (issue #135). Above the content, so a reader sees the caveat before the
  * link it is about. The two link-safety states are deliberately different in
  * tone and in consequence:
@@ -295,6 +389,10 @@ function MessageNotices({
 }) {
   return (
     <>
+      {/* First, because it qualifies the whole message: a reader scanning a busy
+          channel should see what the author claimed before reading what they
+          wrote. */}
+      <MessagePriorityBadge message={message} />
       {message.status === "pending_link_scan" && (
         <div className="chat-msg-area__pending-scan" data-testid="chat-message-pending-scan">
           <span className="material-symbols-outlined" aria-hidden="true">
@@ -394,10 +492,17 @@ function MessageBodyContent({
   onSaveEdit,
   onCancelEdit,
   onEditForbidden,
+  mentionInteraction,
   onOpenUnverified,
 }: Pick<
   MessageContentProps,
-  "message" | "mentionTarget" | "editing" | "onSaveEdit" | "onCancelEdit" | "onEditForbidden"
+  | "message"
+  | "mentionTarget"
+  | "editing"
+  | "onSaveEdit"
+  | "onCancelEdit"
+  | "onEditForbidden"
+  | "mentionInteraction"
 > & { onOpenUnverified: (link: MessageLink, trigger: HTMLElement) => void }) {
   const links = message.links;
   const rendering = useMemo(
@@ -420,7 +525,12 @@ function MessageBodyContent({
     );
   }
   return (
-    <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} links={rendering} />
+    <RichTextRenderer
+      text={message.bodyText}
+      bodyFormat={message.bodyFormat}
+      links={rendering}
+      mention={mentionInteraction}
+    />
   );
 }
 
@@ -485,6 +595,8 @@ export interface MessageContentProps {
   onQuoteJump?: (messageId: string) => void;
   onReferenceJump?: (reference: NonNullable<Message["reference"]>) => void;
   onReconcileLinkSafety?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
+  /** Opens a DM when a `@user` mention in the message body is clicked (issue #795). */
+  mentionInteraction?: MentionInteraction;
 }
 
 export default function MessageContent(props: MessageContentProps) {

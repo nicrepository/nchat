@@ -9,6 +9,11 @@ import {
 } from "../chatApi";
 import { markPresenceActivity } from "../chatSocket";
 import type { Message } from "../chatTypes";
+import {
+  normalizePriorityIntent,
+  standardPriorityIntent,
+  type MessagePriorityIntent,
+} from "../messagePriority";
 import { randomId } from "../../lib/randomId";
 import { sendErrorMessage } from "./composerReducer";
 import type { MessagesGateway } from "./messagesGateway";
@@ -45,8 +50,8 @@ export interface MessageMutations {
     body: string,
     referencedMessageId?: string,
     attachmentIds?: string[],
-    /** Issue #824: ask this message's recipients to confirm receipt. */
-    acknowledgementRequired?: boolean,
+    /** Issue #822: the priority, confirmation request and reminder policy. */
+    priority?: MessagePriorityIntent,
   ) => Promise<SendResult>;
   editMessageLocal: (
     messageId: string,
@@ -93,7 +98,7 @@ export function useMessageMutations({
       body: string,
       referencedMessageId?: string,
       attachmentIds?: string[],
-      acknowledgementRequired?: boolean,
+      priority?: MessagePriorityIntent,
     ): Promise<SendResult> => {
       if (!scope.targetId || !hasContent(body, attachmentIds)) return stale;
 
@@ -102,6 +107,18 @@ export function useMessageMutations({
       // tracker, which only sees WebSocket frames (issue #444).
       markPresenceActivity();
 
+      // The send boundary, and the one place the stated intent is made
+      // coherent: normalizePriorityIntent is the single rule that says the
+      // urgent-only options cannot survive a priority that is not urgent, and
+      // it runs here rather than in the request builder so that the *same*
+      // value feeds both the retry signature and the payload. Split them and a
+      // send could be fingerprinted as one message and serialised as another —
+      // or, worse, post `persistent_notifications` under `important` and be
+      // refused by a server that is right to refuse it.
+      //
+      // Also why a caller that says nothing and a caller that says "standard"
+      // are one message here rather than two with different idempotency keys.
+      const intent = normalizePriorityIntent(priority ?? standardPriorityIntent);
       const sendKey = scope.key;
       const parentMessageId = scope.replyTo()?.id;
       dispatch({ type: "sending" });
@@ -114,21 +131,24 @@ export function useMessageMutations({
           parentMessageId,
           referencedMessageId,
           attachmentIds: attachmentIds ?? [],
-          // Part of the draft's identity (issue #824): the same text sent once
-          // plainly and once asking for confirmation are two different messages,
-          // and must not share a retry key. The server draws the same line in
-          // its own create fingerprint.
-          acknowledgementRequired: acknowledgementRequired ?? false,
+          // Part of the draft's identity (issues #824, #822): the same text sent
+          // once plainly and once as urgent asking for confirmation are two
+          // different messages, and must not share a retry key. The server draws
+          // the same line in its own create fingerprint.
+          priority: intent,
         });
         const options: PostMessageOptions = {
           parentMessageId,
           referencedMessageId,
           attachmentIds,
           idempotencyKey: idempotencyKeyFor(signature),
-          // Passed unconditionally rather than spread behind a test: the request
-          // builder already omits a falsy flag from the payload, so a branch here
-          // would buy nothing and cost this function a decision point.
-          acknowledgementRequired,
+          // All three passed unconditionally rather than spread behind a test:
+          // the request builder already omits each one at its default, so a
+          // branch here would buy nothing and cost this function a decision
+          // point.
+          priority: intent.priority,
+          acknowledgementRequired: intent.acknowledgementRequired,
+          persistentNotifications: intent.persistentNotifications,
           ...(scope.kind === "dm" ? { bodyFormat } : {}),
         };
 

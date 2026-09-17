@@ -214,12 +214,20 @@ export interface MessagingScenario {
       parent_message_id?: string;
       referenced_message_id?: string;
       attachment_ids?: string[];
+      /** The attention axis a send may state (issues #821, #824, #825). */
+      priority?: string;
+      acknowledgement_required?: boolean;
+      persistent_notifications?: boolean;
     }>;
     dmPosts: Array<{
       body_text?: string;
       parent_message_id?: string;
       referenced_message_id?: string;
       attachment_ids?: string[];
+      /** The attention axis a send may state (issues #821, #824, #825). */
+      priority?: string;
+      acknowledgement_required?: boolean;
+      persistent_notifications?: boolean;
     }>;
     forwards: Array<{
       destinationChannelId: string;
@@ -2547,14 +2555,25 @@ async function handleTargetMessagesRoute(
       parent_message_id?: string;
       referenced_message_id?: string;
       attachment_ids?: string[];
+      priority?: string;
+      acknowledgement_required?: boolean;
+      persistent_notifications?: boolean;
     };
     const requests =
       routeKind === "channel" ? scenario.requests.channelPosts : scenario.requests.dmPosts;
+    // Every field a spec may assert on has to be copied here by name: this is a
+    // reconstruction, not the request object, so a field the recorder does not
+    // know about reads back as `undefined` and looks exactly like a client that
+    // never sent it. The attention axis (issues #821, #824, #825) is recorded
+    // for both routes at once, because one send path serves channels and DMs.
     requests.push({
       body_text: body.body_text,
       parent_message_id: body.parent_message_id,
       referenced_message_id: body.referenced_message_id,
       attachment_ids: body.attachment_ids,
+      priority: body.priority,
+      acknowledgement_required: body.acknowledgement_required,
+      persistent_notifications: body.persistent_notifications,
     });
 
     const parent = messages.find((message) => message.id === body.parent_message_id);

@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ErrInvalidIdentity is returned when an event identity cannot be turned into a
@@ -61,8 +62,8 @@ var ErrInvalidTransition = errors.New("invalid notification state transition")
 // rows today: the table's CHECK constraint has to be widened by a migration,
 // and a contract that has to be migrated every time a producer is connected is
 // a contract that will be worked around instead. Connected in issue #741:
-// mention, reply, direct_message. Declared and not yet produced:
-// channel_message, reaction, call.
+// mention, reply, direct_message. Connected in issue #825: urgent_reminder.
+// Declared and not yet produced: channel_message, reaction, call.
 type EventType string
 
 const (
@@ -84,6 +85,16 @@ const (
 	// EventTypeCall is a call the recipient is being invited to. Declared, not
 	// produced.
 	EventTypeCall EventType = "call"
+	// EventTypeUrgentReminder is an urgent message asking again, because this
+	// recipient has neither confirmed it nor answered it (issue #825).
+	//
+	// Its own type rather than a repeat of the message's original event, because
+	// they are different facts and three consumers have to tell them apart: the
+	// metric that counts reminders against deliveries, the operator reading why
+	// one was suppressed, and the browser choosing what to put on screen. It is
+	// also what makes a reminder recognisable in the outbox itself, months
+	// later, without joining anything.
+	EventTypeUrgentReminder EventType = "urgent_reminder"
 )
 
 var eventTypes = map[EventType]struct{}{
@@ -93,6 +104,7 @@ var eventTypes = map[EventType]struct{}{
 	EventTypeChannelMessage: {},
 	EventTypeReaction:       {},
 	EventTypeCall:           {},
+	EventTypeUrgentReminder: {},
 }
 
 // Valid reports whether e is one of the declared event types. The zero value is
@@ -387,6 +399,64 @@ func validateSegment(name, value string, optional bool) error {
 // the separator, whitespace, and every control character.
 func isUnsafeSegmentRune(r rune) bool {
 	return r == ':' || r <= ' ' || r == 0x7f
+}
+
+// UrgentReminderInterval is how long an urgent message waits before asking
+// again (issue #825, parent #820).
+//
+// Five minutes, fixed. #820 states it as a product decision and puts a
+// configurable interval out of scope for this version, so it is a constant of
+// this package rather than a column, a setting or a request field: there is no
+// payload in which a sender names a shorter one, and no deployment in which an
+// operator can turn the product into an alarm clock.
+//
+// It is nominal, not a guarantee. A reminder becomes *due* at this interval and
+// is delivered by the ordinary outbox worker on its next pass, so the observed
+// spacing is this plus one poll interval, plus whatever the delivery policy and
+// the push provider add. Naming it nominal is the honest version; promising
+// exactly five minutes would be promising something no queue can keep.
+const UrgentReminderInterval = 5 * time.Minute
+
+// MaxUrgentReminders is how many times one recipient may be reminded before the
+// request stops being asked (issue #825).
+//
+// #825 requires reminders to be finite and leaves the bound to this
+// implementation. Twelve at UrgentReminderInterval is one hour of asking, which
+// is the span an urgent notice is plausibly still urgent for: past it, somebody
+// who has not answered is not going to be persuaded by a thirteenth push, and
+// what is left is a notification the product is sending to itself.
+//
+// A count rather than a deadline, because a count needs no second timestamp and
+// no second comparison against a clock: the ceiling is exact, it is reached by
+// arithmetic the scheduler is already doing, and reaching it is what produces
+// the `expired` state migration 000049 declared and deliberately left without a
+// producer.
+//
+// Server-side and not configurable, on the same terms as the interval.
+const MaxUrgentReminders = 12
+
+// UrgentReminderDedupeKeySQL is the SQL expression that builds the dedupe key of
+// the nth reminder for one message, for the scheduler that writes its rows
+// set-based and therefore never sees an individual row in Go.
+//
+// It produces exactly what Identity.DedupeKey would for the same event:
+//
+//	message:<message id>:urgent_reminder:<occurrence>
+//
+// The occurrence is the discriminator, and it is the whole of the deduplication
+// invariant #825 asks for. Two workers scheduling the same reminder, a
+// scheduler restarted mid-pass, and a pass replayed after a crash all compute
+// the same key for the same logical reminder, so the unique index over
+// (workspace_id, recipient_user_id, dedupe_key) — and not a preceding SELECT, and
+// not a flag in memory — is what decides that one of them exists. Without the
+// occurrence the key would be the same for every reminder of a message, and the
+// second one would be silently swallowed as a duplicate of the first.
+//
+// The arguments are SQL expressions naming columns, supplied by the calling
+// statement and never by a request, exactly as in MessageDedupeKeySQL.
+func UrgentReminderDedupeKeySQL(messageIDExpr, occurrenceExpr string) string {
+	return "'" + string(SourceTypeMessage) + ":' || " + messageIDExpr +
+		"::text || ':" + string(EventTypeUrgentReminder) + ":' || " + occurrenceExpr + "::text"
 }
 
 // SuppressedReasonMaxLen bounds a suppression reason.

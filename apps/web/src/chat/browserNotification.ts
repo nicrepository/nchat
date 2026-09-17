@@ -1,6 +1,6 @@
 /**
  * Native browser Notification for a new message while the tab is in the
- * background — the page-open counterpart to messageSound.ts. No Service
+ * background — the page-open counterpart to the notification sound player. No Service
  * Worker, no Push API: `window.Notification` only works while this tab is
  * alive, which is exactly the scope of this module.
  *

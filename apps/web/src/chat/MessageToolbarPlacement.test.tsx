@@ -25,7 +25,7 @@ import { useReactionMenu } from "./message-area/timeline/useReactionMenu";
 
 const MENU = { width: 246, height: 36 };
 /** The distance the toolbar keeps from the bubble (MessageToolbar's toolbarGap). */
-const GAP = 6;
+const GAP = 3;
 /** What the toolbar's top edge sits above the bubble's when placed above it. */
 const ABOVE = MENU.height + GAP;
 /** The list's band on screen: inside a 1024×768 window, below a header. */
@@ -160,13 +160,152 @@ describe("reaction toolbar placement", () => {
     expectClearOfBubble();
   });
 
-  // Mirrored for the reader's own message: it ends at the bubble's middle, and
-  // a toolbar wider than a short bubble simply extends to the left of it —
-  // never squeezed to the bubble's width, never centred on it.
+  /** How much room a neighbor must leave for the toolbar to fit beside it. */
+  const REQUIRED_NEIGHBOR_SPACE = MENU.height + GAP;
+
+  /**
+   * Renders a target message between an optional previous and next one, with
+   * each bubble's rect keyed by message id — the geometry issue #852 needs,
+   * and more than `layout.bubble` alone can express with more than one
+   * bubble in play. `previousReactions` extends the previous message's own
+   * footprint the way its reaction badges do, past its bubble's bottom.
+   */
+  function renderWithNeighbors(previous?: DOMRect, next?: DOMRect, previousReactions?: DOMRect) {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.classList.contains("chat-msg-area__list")) return rect(LIST);
+      const id = this.closest("[data-message-id]")?.getAttribute("data-message-id");
+      if (
+        this.classList.contains("chat-msg-area__reactions") &&
+        id === "msg-0" &&
+        previousReactions
+      ) {
+        return previousReactions;
+      }
+      if (this.classList.contains("chat-msg-area__msg-bubble")) {
+        if (id === "msg-0" && previous) return previous;
+        if (id === "msg-2" && next) return next;
+        return layout.bubble;
+      }
+      if (this.getAttribute("role") === "toolbar") return box(0, 0, MENU.width, MENU.height);
+      if (this.getAttribute("aria-label") === "Mais reações") return box(300, 500, 30, 30);
+      return rect({});
+    });
+    const previousReactionList = previousReactions
+      ? [
+          {
+            emoji: "👍",
+            count: 1,
+            reactedByMe: false,
+            users: [{ userId: "user-2", displayName: "Outra pessoa" }],
+          },
+        ]
+      : [];
+    render(
+      <div className="chat-msg-area__list">
+        {previous && (
+          <MessageBubble
+            {...propsWith({
+              message: messageWith({ id: "msg-0", reactions: previousReactionList }),
+              reactionMenuVisible: false,
+            })}
+          />
+        )}
+        <MessageBubble {...propsWith()} />
+        {next && (
+          <MessageBubble
+            {...propsWith({ message: messageWith({ id: "msg-2" }), reactionMenuVisible: false })}
+          />
+        )}
+      </div>,
+    );
+  }
+
+  // The main regression of issue #852: a pair grouped closer together than
+  // the toolbar needs above it (its own height plus its gap, 39px) has no
+  // room without crossing into the message before it — 20px here, well
+  // under that. The toolbar falls back below its own bubble instead, exactly
+  // as it already does for the list's own top edge, rather than reading as
+  // belonging to the wrong message.
+  it("falls back below rather than cross into a closely grouped previous message", () => {
+    const previous = box(200, 313, 511);
+    layout.bubble = box(previous.bottom + 20, 313, 511);
+    renderWithNeighbors(previous);
+
+    const toolbarTop = Number.parseFloat(toolbar().style.top);
+    expect(toolbarTop, "toolbar não invade a bolha anterior").toBeGreaterThanOrEqual(
+      previous.bottom,
+    );
+    expect(toolbarTop, "toolbar abaixo da bolha atual, sem encostar").toBeGreaterThanOrEqual(
+      layout.bubble.bottom,
+    );
+    expect(toolbarTop - layout.bubble.bottom, "gap positivo e compacto").toBe(GAP);
+  });
+
+  // The common case: plenty of room between the two bubbles (60px, well over
+  // the 39px this pair needs), so the toolbar keeps the preferred placement
+  // above the target — the previous message narrowing the band must not push
+  // every consecutive pair below when it does not have to.
+  it("stays above the target when the previous message leaves enough room", () => {
+    const previous = box(100, 313, 511);
+    layout.bubble = box(previous.bottom + 60, 313, 511);
+    renderWithNeighbors(previous);
+
+    expect(toolbar()).toHaveStyle({ top: `${layout.bubble.top - ABOVE}px`, visibility: "visible" });
+    const toolbarTop = Number.parseFloat(toolbar().style.top);
+    expect(toolbarTop, "toolbar não invade a bolha anterior").toBeGreaterThanOrEqual(
+      previous.bottom,
+    );
+  });
+
+  // A second regression of issue #852: the previous message's bubble alone
+  // leaves 60px, comfortably above the 39px needed — but its reaction
+  // badges, rendered below the bubble, push its real bottom edge down by
+  // another 26px, to only 34px of true room. Reading just the bubble would
+  // have placed the toolbar over those badges.
+  it("does not cross into the previous message's reaction badges", () => {
+    const previous = box(100, 313, 511);
+    const previousReactions = box(previous.bottom, 313, 100, 26);
+    layout.bubble = box(previous.bottom + 60, 313, 511);
+    renderWithNeighbors(previous, undefined, previousReactions);
+
+    const toolbarTop = Number.parseFloat(toolbar().style.top);
+    expect(toolbarTop, "toolbar não invade as reações da bolha anterior").toBeGreaterThanOrEqual(
+      previousReactions.bottom,
+    );
+  });
+
+  // Mirrors the main regression for the fallback itself: squeezed on both
+  // sides by messages grouped close together (20px above, 20px below — both
+  // under the 39px the toolbar needs), there is nowhere to put it without
+  // crossing one bubble or the other. It stays closed rather than pick a
+  // side and overlap silently.
+  it("hides rather than cross the next message when squeezed on both sides", () => {
+    const previous = box(200, 313, 511);
+    layout.bubble = box(previous.bottom + 20, 313, 511);
+    const next = box(layout.bubble.bottom + 20, 313, 511);
+    expect(REQUIRED_NEIGHBOR_SPACE, "20px de folga não é suficiente").toBeGreaterThan(20);
+    renderWithNeighbors(previous, next);
+
+    expect(hiddenToolbar()).toHaveStyle({ visibility: "hidden" });
+  });
+
+  // Mirrored for the reader's own message: it ends at the bubble's middle,
+  // and a toolbar wider than a short bubble simply extends to the left of
+  // it — never squeezed to the bubble's width, never centred on it. Placed
+  // close enough to the list's own left edge that beside it (now preferred,
+  // issue #852) has nowhere to go, so this exercises the above placement
+  // this formula belongs to.
   it("ends at the middle of the reader's own short message, keeping its own width", () => {
-    layout.bubble = box(300, 900, 80);
+    // Close enough to the list's left edge that beside (now preferred,
+    // issue #852) has no room on the left of a short bubble — 430 - 3 - 246
+    // = 181, short of LIST.left(200) + PADDING(8) — so this exercises the
+    // midX formula above belongs to, not beside's own left/width math.
+    layout.bubble = box(300, 430, 80);
     renderToolbar({ isMine: true });
-    expect(toolbar()).toHaveStyle({ top: `${300 - ABOVE}px`, left: `${940 - MENU.width}px` });
+    const midX = 430 + 40;
+    expect(toolbar()).toHaveStyle({ top: `${300 - ABOVE}px`, left: `${midX - MENU.width}px` });
   });
 
   it("stays whole inside the list's band at either side", () => {

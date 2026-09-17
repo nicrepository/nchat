@@ -4,7 +4,8 @@
 # Originally the RF-21 Link Safety suite, now also issue #741's notification
 # outbox suite, issue #742's worker claim suite, issue #745's push subscription
 # suite, issue #746's Web Push delivery ledger, issue #821's message priority
-# column and issue #824's per-recipient acknowledgement: all of them prove
+# column, issue #824's per-recipient acknowledgement and issue #825's persistent
+# reminder scheduler: all of them prove
 # properties only a database can hold —
 # atomicity across one statement, a unique index deciding what counts as the same
 # event or the same subscription, an ON CONFLICT that refuses to move ownership,
@@ -112,6 +113,21 @@ case "$MODULE" in
       TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
+      # Issue #136. The first three read the migrated schema and the fixture the
+      # outbox suite above already seeds; the fourth creates and drops a database
+      # of its own, exactly like the #741 round trip two lines up.
+      TestRealtimeAndOutboxClassifyTheSameMessageIdenticallyPostgreSQL
+      TestAReplyStaysAReplyWithoutAVisibleQuotePostgreSQL
+      TestAnOrdinaryGroupMessageClassifiesIdenticallyPostgreSQL
+      TestConversationNotificationLevelMigrationRoundTripPostgreSQL
+      # Mute and Unmute racing on one row, from two connections, plus the
+      # database's own refusal of the state the race used to produce. Only a
+      # real PostgreSQL can hold either property: one is an interleaving and the
+      # other is a CHECK constraint.
+      TestPGXNotificationPrefStoreMuteUnmuteRacePostgreSQL
+      TestPGXNotificationPrefStoreRacePreservesTheLevelPostgreSQL
+      TestConversationNotificationPrefsRefuseTheSparseDefaultPostgreSQL
+      TestConversationNotificationPrefsAllowAnUnsilencedLevelPostgreSQL
       # Issue #824. Per-recipient acknowledgement: a recipient set derived in
       # the same statement as the INSERT, a primary key that is the reason two
       # clicks cannot become two rows, conditional UPDATEs that make an
@@ -157,6 +173,30 @@ case "$MODULE" in
       # counts and the recipients they count can no longer be observed
       # half-applied while a concurrent transition commits between them.
       TestReadAcknowledgementNeverMixesSnapshotsPostgreSQL
+      # Issue #825. The reminder schedule written by the same statement as the
+      # message, the CHECK that makes reminders on a non-urgent message
+      # unreachable, the conditional UPDATEs that decide which of two concurrent
+      # resolutions wins, and the sender-only cancellation whose authorization is
+      # a predicate of the statement rather than a read before it.
+      TestPersistentReminderMigrationRoundTripPostgreSQL
+      TestPersistentNotificationsAbsentLeavesNoScheduleWhatsoeverPostgreSQL
+      TestUrgentWithoutPersistentNotificationsSchedulesNothingPostgreSQL
+      TestPersistentNotificationsScheduleTheFirstReminderPostgreSQL
+      TestPersistentNotificationsRequireUrgentInTheSchemaPostgreSQL
+      TestReplyStopsOnlyTheRepliersRemindersPostgreSQL
+      TestAcknowledgementStopsTheAcknowledgersRemindersPostgreSQL
+      TestDeletingAMessageStopsItsRemindersPostgreSQL
+      TestRemindersDoNotAppearInTheAcknowledgementSummaryPostgreSQL
+      TestARemindedRecipientCannotAcknowledgePostgreSQL
+      TestOnlyTheSenderCanCancelRemindersPostgreSQL
+      TestARecipientCannotCancelSomebodyElsesRemindersPostgreSQL
+      TestCancellingRemindersIsScopedToTheWorkspacePostgreSQL
+      TestCancellingRemindersIsIdempotentPostgreSQL
+      TestCancellingRemindersPreservesAnswersAlreadyGivenPostgreSQL
+      TestCancellingRemindersOnAQuietMessageIsNotFoundPostgreSQL
+      TestAWithheldMessageSchedulesNoRemindersPostgreSQL
+      TestPublishingAWithheldMessageStartsItsRemindersPostgreSQL
+      TestPromotingTwiceDoesNotRestartTheReminderClockPostgreSQL
     )
     ;;
   services/notification-service)
@@ -234,6 +274,35 @@ case "$MODULE" in
       # under genuine concurrency with no read before any write, a fan-out whose
       # exclusions are a join rather than a filter in Go, and two cascades that
       # are the whole of this table's retention policy.
+      # Issue #825. The reminder scheduler: a due-reminder claim two schedulers
+      # cannot both take, a unique index deciding whether the nth reminder
+      # already exists, one statement writing both the outbox row and the
+      # schedule, a ceiling that produces the EXPIRED state 000049 declared, and
+      # a claim predicate that refuses a reminder whose recipient answered.
+      TestReminderWindowBoundaryIsExactPostgreSQL
+      TestDueReminderIsScheduledAndTheWindowAdvancesPostgreSQL
+      TestScheduledReminderEntersTheOrdinaryQueuePostgreSQL
+      TestSeveralReminderCyclesUseTheExactWindowPostgreSQL
+      # The claim's linearization point: two real transactions proving that a
+      # PENDING -> terminal transition and the claim are serialized on the
+      # recipient's own row, in both orders.
+      TestReminderClaimLosesToACommittedTerminalTransitionPostgreSQL
+      TestReminderClaimRefusesARecipientBeingResolvedConcurrentlyPostgreSQL
+      TestReminderClaimHoldsTheLinearizationPointAgainstATransitionPostgreSQL
+      TestOnlyAPendingRecipientProducesAReminderPostgreSQL
+      TestResolvingOneRecipientLeavesTheOthersRemindedPostgreSQL
+      TestADeletedMessageRemindsNobodyPostgreSQL
+      TestAMessageThatNoLongerAsksRemindsNobodyPostgreSQL
+      TestRepeatingAReminderPassCreatesNoSecondEventPostgreSQL
+      TestConcurrentSchedulersProduceOneReminderEachPostgreSQL
+      TestReminderSchedulingRespectsTheBatchSizePostgreSQL
+      TestRemindersStopAtTheCeilingPostgreSQL
+      TestTheCeilingDoesNotWithdrawAConfirmationRequestPostgreSQL
+      TestAResolvedRecipientsReminderIsNotClaimablePostgreSQL
+      TestAResolvedRecipientsReminderIsSuppressedPostgreSQL
+      TestSuppressingResolvedRemindersSparesTheLiveOnesPostgreSQL
+      TestOrdinaryNotificationsAreUnaffectedByTheReminderPredicatePostgreSQL
+      TestUrgentReminderDedupeKeyMatchesSQLPostgreSQL
       TestPushDeliveryFanOutReturnsEveryActiveBrowserPostgreSQL
       TestPushDeliveryFanOutIsScopedToTheRecipientPostgreSQL
       TestPushDeliveryFanOutExcludesRetiredBrowsersPostgreSQL
@@ -251,6 +320,38 @@ case "$MODULE" in
       TestPushDeliveryStale410DoesNotRetireARotatedSubscriptionPostgreSQL
       TestPushDeliveryClassifiesEveryCompareAndSetOutcomePostgreSQL
       TestPushDeliveryEveryOutcomeIsClassifiedPostgreSQL
+      # Issue #870: the push preview's authorization, which is a WHERE clause
+      # spanning five tables and chat.channel_visible_to_user. Nothing but a real
+      # database can decide it, and the mock-level guard in
+      # notification_outbox_store_test.go only proves the predicates are present
+      # in the statement — not that they refuse what they are there to refuse.
+      # Every read-access revocation the projection must honour is here.
+      TestNotificationPresentationProjectsTheMessagePostgreSQL
+      TestNotificationPresentationDMReadAccessPostgreSQL
+      TestNotificationPresentationPreservesGroupKindWithAnyTitlePostgreSQL
+      TestNotificationPresentationRevokedReadAccessPostgreSQL
+      TestNotificationPresentationUsesTheOutboxRecipientPostgreSQL
+      TestNotificationPresentationStopsWhenAccessIsRevokedPostgreSQL
+      TestNotificationPresentationRefusesUnpublishableStatesPostgreSQL
+      TestNotificationPresentationIsScopedToTheTenantPostgreSQL
+      TestNotificationPresentationOfAnEmptyMessagePostgreSQL
+      TestNotificationPresentationBoundsTheBodyPostgreSQL
+      TestNotificationPresentationBoundsTheSenderAndContextPostgreSQL
+      TestNotificationPresentationClaimSnapshotPostgreSQL
+      TestNotificationPendingOmitsPresentationPostgreSQL
+      TestNotificationClaimWithoutPreviewPostgreSQL
+      # The rollout flag's cost, proved by EXPLAIN (ANALYZE) over the real claim:
+      # with previews off the presentation subquery is not executed at all.
+      TestNotificationPreviewClaimPlanPostgreSQL
+      # SR-001: the recipient's global account, which is not their workspace
+      # membership. Suspending somebody revokes their sessions and leaves the
+      # membership and the push subscription standing, so these are distinct
+      # from the workspace_members cases in RevokedReadAccess above and are
+      # named so nobody has to work that out from the body.
+      TestNotificationPresentationRejectsGloballySuspendedRecipientPostgreSQL
+      TestNotificationPresentationRejectsDeletedRecipientPostgreSQL
+      TestNotificationPresentationRetryRechecksGlobalAccountPostgreSQL
+      TestPushDeliveryFanOutExcludesGloballyInactiveAccountsPostgreSQL
     )
     ;;
   services/file-service)

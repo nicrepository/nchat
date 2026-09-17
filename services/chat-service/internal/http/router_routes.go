@@ -95,6 +95,12 @@ func (r *routeSet) registerSidebarRoutes(sidebar *SidebarHandler) {
 	r.handle("DELETE "+RouteDMMute, r.pinAction, sidebar.UnmuteDM)
 	r.handle("POST "+RouteChannelRead, r.pinAction, sidebar.MarkChannelRead)
 	r.handle("POST "+RouteDMRead, r.pinAction, sidebar.MarkDMRead)
+	// The canonical whole-preference write (issue #136) shares the pin-action
+	// budget with the mute shortcut above, deliberately: they change the same
+	// row, so giving the newer route its own budget would only mean a caller
+	// could spend twice as much by alternating between them.
+	r.handle("PUT "+RouteChannelNotificationPreference, r.pinAction, sidebar.SetChannelNotificationPreference)
+	r.handle("PUT "+RouteDMNotificationPreference, r.pinAction, sidebar.SetDMNotificationPreference)
 }
 
 // registerMessageRoutes: channel and DM message listing, creation, single
@@ -222,6 +228,9 @@ func (r *routeSet) registerMessageLifecycleRoutes(messages *MessageHandler) {
 	r.handle("POST "+RouteMessageAcknowledgement, r.post, messages.AcknowledgeMessage)
 	r.handle("POST "+RouteMessageAcknowledgements, r.list, messages.GetMessageAcknowledgements)
 	r.handle("GET "+RouteMessageAcknowledgement, r.getSingle, messages.GetMessageAcknowledgement)
+	// Issue #825: the author stops their own reminders. A write, on the
+	// ordinary write budget like the acknowledgement it undoes.
+	r.handle("DELETE "+RouteMessagePersistentNotifications, r.post, messages.CancelPersistentNotifications)
 	r.handle("GET "+RouteMessageEditHistory, r.list, messages.GetMessageEditHistory)
 }
 

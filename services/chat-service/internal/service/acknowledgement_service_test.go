@@ -30,6 +30,11 @@ type fakeAcknowledgementStore struct {
 	lastBatch        storage.ReadAcknowledgementBatchInput
 	lastAcknowledge  storage.AcknowledgeInput
 	lastRead         storage.ReadAcknowledgementInput
+
+	// Issue #825.
+	stopped     int
+	cancelCalls int
+	lastCancel  storage.CancelPersistentNotificationsInput
 }
 
 func (f *fakeAcknowledgementStore) Acknowledge(
@@ -49,6 +54,17 @@ func (f *fakeAcknowledgementStore) ReadAcknowledgement(
 	f.readCalls++
 	f.lastRead = input
 	return f.summary, f.err
+}
+
+func (f *fakeAcknowledgementStore) CancelPersistentNotifications(
+	_ context.Context, input storage.CancelPersistentNotificationsInput,
+) (storage.CancelPersistentNotificationsResult, error) {
+	f.cancelCalls++
+	f.lastCancel = input
+	if f.err != nil {
+		return storage.CancelPersistentNotificationsResult{}, f.err
+	}
+	return storage.CancelPersistentNotificationsResult{Stopped: f.stopped}, nil
 }
 
 func (f *fakeAcknowledgementStore) ReadAcknowledgementBatch(
@@ -277,5 +293,80 @@ func TestAcknowledgementService_ReadBatch_AcceptsExactlyTheBound(t *testing.T) {
 	}
 	if len(store.lastBatch.MessageIDs) != service.MaxAcknowledgementBatchSize {
 		t.Fatalf("storage received %d ids", len(store.lastBatch.MessageIDs))
+	}
+}
+
+// ── Persistent notifications (issue #825) ─────────────────────────────────────
+
+// The sender the store is asked about is the actor the handler resolved from the
+// session. This is the assertion that matters most here: a cancellation is an
+// authorization decision, and the only identity it may rest on is the
+// authenticated one — there is no field on the input a client could fill in.
+func TestAcknowledgementService_CancelUsesTheAuthenticatedActorAsTheSender(t *testing.T) {
+	store := &fakeAcknowledgementStore{stopped: 4}
+	outcome, err := service.NewAcknowledgementService(store).
+		CancelPersistentNotifications(context.Background(), ackAction())
+	if err != nil {
+		t.Fatalf("CancelPersistentNotifications: %v", err)
+	}
+	if store.lastCancel.SenderID != ackActorID {
+		t.Fatalf("sender = %q, want the authenticated actor %q", store.lastCancel.SenderID, ackActorID)
+	}
+	if store.lastCancel.WorkspaceID != ackWorkspaceID || store.lastCancel.MessageID != ackMessageID {
+		t.Fatalf("scope = %+v, want the resolved workspace and the path message", store.lastCancel)
+	}
+	if outcome.Stopped != 4 {
+		t.Fatalf("stopped = %d, want the store's answer", outcome.Stopped)
+	}
+}
+
+// Incomplete input never reaches the database. A cancellation missing its
+// workspace, its message or its actor is a request that could not name a row,
+// and spending a statement on it would be a statement whose predicate is empty.
+func TestAcknowledgementService_CancelRefusesIncompleteInputWithoutTouchingTheStore(t *testing.T) {
+	for name, input := range map[string]service.AcknowledgementActionInput{
+		"no workspace": {MessageID: ackMessageID, ActorUserID: ackActorID},
+		"no message":   {WorkspaceID: ackWorkspaceID, ActorUserID: ackActorID},
+		"no actor":     {WorkspaceID: ackWorkspaceID, MessageID: ackMessageID},
+		"all blank":    {WorkspaceID: "  ", MessageID: " ", ActorUserID: "\t"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeAcknowledgementStore{}
+			_, err := service.NewAcknowledgementService(store).
+				CancelPersistentNotifications(context.Background(), input)
+			if !errors.Is(err, domain.ErrInvalidInput) {
+				t.Fatalf("err = %v, want ErrInvalidInput", err)
+			}
+			if store.cancelCalls != 0 {
+				t.Fatal("an incomplete request must not reach the store")
+			}
+		})
+	}
+}
+
+// The store's refusal is the service's refusal, unchanged. A message that does
+// not exist, belongs to another workspace, was sent by somebody else or never
+// asked for reminders all arrive here as ErrNotFound, and this layer must not
+// turn any of them into something a caller could tell apart.
+func TestAcknowledgementService_CancelPropagatesTheStoreRefusal(t *testing.T) {
+	store := &fakeAcknowledgementStore{err: domain.ErrNotFound}
+	_, err := service.NewAcknowledgementService(store).
+		CancelPersistentNotifications(context.Background(), ackAction())
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// A second cancellation is a legitimate request that stopped nothing, not an
+// error. It is how a client that lost the first response finds out it arrived.
+func TestAcknowledgementService_CancelIsIdempotentFromTheCallersSide(t *testing.T) {
+	store := &fakeAcknowledgementStore{stopped: 0}
+	outcome, err := service.NewAcknowledgementService(store).
+		CancelPersistentNotifications(context.Background(), ackAction())
+	if err != nil {
+		t.Fatalf("a repeat cancellation must not be an error, got %v", err)
+	}
+	if outcome.Stopped != 0 {
+		t.Fatalf("stopped = %d, want 0", outcome.Stopped)
 	}
 }

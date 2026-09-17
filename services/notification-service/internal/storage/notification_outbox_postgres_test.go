@@ -167,7 +167,7 @@ func execFixture(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 }
 
 func (f *outboxFixture) store() *storage.PGXNotificationOutboxStore {
-	return storage.NewPGXNotificationOutboxStore(f.pool)
+	return storage.NewPGXNotificationOutboxStore(f.pool, false)
 }
 
 // state reads one row's current state straight from the table.
@@ -488,7 +488,7 @@ func TestNotificationBacklogSurvivesAWorkerRestartPostgreSQL(t *testing.T) {
 	}
 	fixture.expireLease(t, fixture.ids[0])
 
-	restarted := storage.NewPGXNotificationOutboxStore(newNotificationTestPool(t))
+	restarted := storage.NewPGXNotificationOutboxStore(newNotificationTestPool(t), false)
 	claimed, err := restarted.ClaimDue(context.Background(), 10, 5, notifyWorkerLease)
 	if err != nil {
 		t.Fatalf("claim after the restart: %v", err)
@@ -1123,4 +1123,600 @@ func newIsolatedWorkspace(t *testing.T, pool *pgxpool.Pool) string {
 			`DELETE FROM chat.workspaces WHERE id = $1::uuid`, workspace)
 	})
 	return workspace
+}
+
+// ---------------------------------------------------------------------------
+// The approved presentation, against a real database (issue #870)
+// ---------------------------------------------------------------------------
+//
+// None of this can be proved with a mock. What is under test is a WHERE clause
+// spanning five tables and a SECURITY-relevant SQL function, and a fake would
+// have to reimplement all of it — and would then be testing itself. The
+// question every test below asks is the same one: can text belonging to one
+// (workspace, recipient, message) reach a payload addressed to another, or
+// reach one at all before the recipient is allowed to read it.
+
+// presentationFixture is one channel message and one notification about it,
+// addressed to a recipient who is a member of the workspace.
+type presentationFixture struct {
+	*outboxFixture
+	recipient      string
+	workspaceID    string
+	channelID      string
+	conversationID string
+}
+
+func seedPresentation(t *testing.T) *presentationFixture {
+	t.Helper()
+	fixture := seedOutbox(t, notificationevent.StatePending, 1)
+	recipient := fixture.recipientOf(t, fixture.ids[0])
+	workspace := newIsolatedWorkspace(t, fixture.pool)
+	var channel string
+	if err := fixture.pool.QueryRow(t.Context(), `
+		INSERT INTO chat.channels (workspace_id, slug, display_name, type)
+		VALUES ($1::uuid, 'preview', 'Preview', 'private') RETURNING id::text`, workspace).Scan(&channel); err != nil {
+		t.Fatalf("seed preview channel: %v", err)
+	}
+	execFixture(t, fixture.pool, `
+		INSERT INTO chat.workspace_members (workspace_id, user_id, role, status)
+		VALUES ($1::uuid, $2::uuid, 'member', 'active')`, workspace, recipient)
+	execFixture(t, fixture.pool, `INSERT INTO chat.channel_members (channel_id, user_id)
+		VALUES ($1::uuid, $2::uuid)`, channel, recipient)
+	execFixture(t, fixture.pool, `UPDATE chat.messages SET workspace_id = $1::uuid,
+		channel_id = $2::uuid WHERE id = $3::uuid`, workspace, channel, fixture.messageID)
+	execFixture(t, fixture.pool, `UPDATE chat.notification_outbox SET workspace_id = $1::uuid
+		WHERE id = $2::uuid`, workspace, fixture.ids[0])
+	return &presentationFixture{outboxFixture: fixture, recipient: recipient, workspaceID: workspace, channelID: channel}
+}
+
+func (f *presentationFixture) useDM(t *testing.T, kind string, title *string) {
+	t.Helper()
+	if err := f.pool.QueryRow(t.Context(), `
+		INSERT INTO chat.dm_conversations (workspace_id, type, title, created_by, direct_pair_key)
+		VALUES ($1::uuid, $2, $3, $4::uuid,
+		        CASE WHEN $2 = 'direct' THEN LEAST($4::text, $5::text) || ':' || GREATEST($4::text, $5::text) END)
+		RETURNING id::text`, f.workspaceID, kind, title, f.users[0], f.recipient).Scan(&f.conversationID); err != nil {
+		t.Fatalf("seed preview DM: %v", err)
+	}
+	execFixture(t, f.pool, `INSERT INTO chat.dm_members (conversation_id, user_id)
+		VALUES ($1::uuid, $2::uuid), ($1::uuid, $3::uuid)`, f.conversationID, f.users[0], f.recipient)
+	execFixture(t, f.pool, `UPDATE chat.messages SET channel_id = NULL, dm_conversation_id = $1::uuid
+		WHERE id = $2::uuid`, f.conversationID, f.messageID)
+}
+
+// claimFirst makes this fixture's notification the oldest claimable row.
+//
+// ClaimDue orders by (next_attempt_at, occurred_at, id) and takes a bounded
+// batch, while both MarkEvaluated and ScheduleRetry stamp next_attempt_at with
+// now() — which sorts this row *last*, behind anything another test left
+// claimable, so whether the batch contained it was incidental.
+//
+// Backdating both scheduling columns makes it first by construction. It writes
+// no status, so the transition trigger 000042 installs is not involved, and it
+// changes nothing in production code to accommodate a test.
+func (f *presentationFixture) claimFirst(t *testing.T) {
+	t.Helper()
+	execFixture(t, f.pool, `
+		UPDATE chat.notification_outbox
+		SET next_attempt_at = TIMESTAMPTZ '1970-01-01 00:00:00+00',
+		    occurred_at     = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+		WHERE id = $1::uuid`, f.ids[0])
+}
+
+// claimOwn runs the real delivery claim and returns this fixture's own event,
+// whatever else the batch picked up.
+func (f *presentationFixture) claimOwn(
+	t *testing.T, store *storage.PGXNotificationOutboxStore,
+) storage.NotificationEvent {
+	t.Helper()
+	f.claimFirst(t)
+	events, err := store.ClaimDue(t.Context(), 50, 5, notifyWorkerLease)
+	if err != nil {
+		t.Fatalf("ClaimDue: %v", err)
+	}
+	for _, event := range events {
+		if event.ID == f.ids[0] {
+			return event
+		}
+	}
+	t.Fatalf("the seeded notification was not in the claimed batch of %d", len(events))
+	return storage.NotificationEvent{}
+}
+
+// presentation uses the real delivery claim, not the pre-policy read.
+func (f *presentationFixture) presentation(t *testing.T) storage.MessagePresentation {
+	t.Helper()
+	store := storage.NewPGXNotificationOutboxStore(f.pool, true)
+	if err := store.MarkEvaluated(t.Context(), f.ids[0], notificationevent.StateEligible, ""); err != nil {
+		t.Fatalf("MarkEvaluated: %v", err)
+	}
+	return f.claimOwn(t, store).Presentation
+}
+
+// recipientOf reads a notification's recipient back from the row, so a test
+// never has to assume which of the fixture's users it addressed.
+func (f *outboxFixture) recipientOf(t *testing.T, id string) string {
+	t.Helper()
+	var recipient string
+	if err := f.pool.QueryRow(t.Context(), `
+		SELECT recipient_user_id::text FROM chat.notification_outbox WHERE id = $1::uuid`,
+		id).Scan(&recipient); err != nil {
+		t.Fatalf("read recipient: %v", err)
+	}
+	return recipient
+}
+
+// The channel happy path.
+func TestNotificationPresentationProjectsTheMessagePostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+
+	got := fixture.presentation(t)
+
+	if got.Body != "worker fixture" {
+		t.Fatalf("body = %q, want the message the fixture wrote", got.Body)
+	}
+	if got.Sender == "" {
+		t.Fatal("the sender's display name is missing")
+	}
+	if got.Context == "" || got.Context[0] != '#' {
+		t.Fatalf("context = %q, want the channel it was said in", got.Context)
+	}
+}
+
+func TestNotificationPresentationDMReadAccessPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"direct", "group"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := seedPresentation(t)
+			fixture.useDM(t, kind, nil)
+			got := fixture.presentation(t)
+			if got.Sender != "Outbox sender" || got.Body != "worker fixture" || got.GroupDM != (kind == "group") {
+				t.Fatalf("active DM member received %+v", got)
+			}
+		})
+	}
+}
+
+func TestNotificationPresentationPreservesGroupKindWithAnyTitlePostgreSQL(t *testing.T) {
+	named, empty, whitespace := "Plantão", "", " \t\n\u00a0 "
+	for _, test := range []struct {
+		name  string
+		title *string
+	}{
+		{"null", nil}, {"named", &named}, {"empty", &empty}, {"whitespace", &whitespace},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedPresentation(t)
+			fixture.useDM(t, "group", test.title)
+			got := fixture.presentation(t)
+			wantContext := ""
+			if test.title != nil {
+				wantContext = *test.title
+			}
+			if !got.GroupDM || got.Context != wantContext {
+				t.Fatalf("group kind or raw title lost: %+v", got)
+			}
+		})
+	}
+}
+
+func TestNotificationPresentationRevokedReadAccessPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		for _, test := range []struct{ name, target, query string }{
+			{"workspace disabled", "workspace", `UPDATE chat.workspaces SET status = 'disabled' WHERE id = $1::uuid`},
+			{"workspace member removed", "recipient", `DELETE FROM chat.workspace_members WHERE user_id = $1::uuid`},
+			{"workspace member suspended", "recipient", `UPDATE chat.workspace_members SET status = 'suspended' WHERE user_id = $1::uuid`},
+			{"workspace member left", "recipient", `UPDATE chat.workspace_members SET status = 'left' WHERE user_id = $1::uuid`},
+			{"channel archived", "channel", `UPDATE chat.channels SET status = 'archived' WHERE id = $1::uuid`},
+			{"channel access revoked", "channel", `DELETE FROM chat.channel_members WHERE channel_id = $1::uuid`},
+			{"DM archived", "dm", `UPDATE chat.dm_conversations SET status = 'archived' WHERE id = $1::uuid`},
+			{"DM member left", "dm", `UPDATE chat.dm_members SET status = 'left', left_at = now() WHERE conversation_id = $1::uuid`},
+		} {
+			if (kind == "channel" && test.target == "dm") || (kind != "channel" && test.target == "channel") {
+				continue
+			}
+			t.Run(kind+"/"+test.name, func(t *testing.T) {
+				fixture := seedPresentation(t)
+				if kind != "channel" {
+					fixture.useDM(t, kind, nil)
+				}
+				id := map[string]string{
+					"workspace": fixture.workspaceID, "recipient": fixture.recipient,
+					"channel": fixture.channelID, "dm": fixture.conversationID,
+				}[test.target]
+				execFixture(t, fixture.pool, test.query, id)
+				if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+					t.Fatalf("revoked access still projected %+v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestNotificationPresentationUsesTheOutboxRecipientPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := seedPresentation(t)
+			if kind != "channel" {
+				fixture.useDM(t, kind, nil)
+			}
+			other := newFixtureUser(t, fixture.pool, "non-member")
+			fixture.users = append(fixture.users, other)
+			execFixture(t, fixture.pool, `INSERT INTO chat.workspace_members (workspace_id, user_id)
+				VALUES ($1::uuid, $2::uuid)`, fixture.workspaceID, other)
+			execFixture(t, fixture.pool, `UPDATE chat.notification_outbox SET recipient_user_id = $1::uuid
+				WHERE id = $2::uuid`, other, fixture.ids[0])
+			if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+				t.Fatalf("a different recipient received the member's preview: %+v", got)
+			}
+		})
+	}
+}
+
+// A recipient who is no longer in the workspace gets no preview. The outbox row
+// was written when they were, so this is the case that proves the projection
+// re-derives access at claim time rather than trusting the row.
+func TestNotificationPresentationStopsWhenAccessIsRevokedPostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+
+	execFixture(t, fixture.pool, `
+		DELETE FROM chat.workspace_members
+		WHERE workspace_id = $1::uuid AND user_id = $2::uuid`,
+		fixture.workspaceID, fixture.recipient)
+
+	if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+		t.Fatalf("a former member was shown %+v", got)
+	}
+}
+
+// Every state in which a message is not readable produces no preview, and the
+// notification itself is unaffected: it is still claimed, still delivered, and
+// still says something generic.
+func TestNotificationPresentationRefusesUnpublishableStatesPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		for name, mutation := range map[string]string{
+			"withheld by a link scan": `UPDATE chat.messages SET status = 'pending_link_scan' WHERE id = $1::uuid`,
+			"deleted":                 `UPDATE chat.messages SET status = 'deleted', deleted_at = now() WHERE id = $1::uuid`,
+			"condemned":               `UPDATE chat.messages SET link_safety_state = 'malicious' WHERE id = $1::uuid`,
+			// A system message carries its text in event_payload, which 000038
+			// requires and which is not a person speaking. No producer writes a
+			// notification for one today; this is what keeps a future one from
+			// putting an event payload on a lock screen.
+			"a system message": `UPDATE chat.messages
+		                        SET kind = 'system', event_type = 'member_joined',
+		                            event_payload = '{}'::jsonb
+		                      WHERE id = $1::uuid`,
+		} {
+			t.Run(kind+"/"+name, func(t *testing.T) {
+				fixture := seedPresentation(t)
+				if kind != "channel" {
+					fixture.useDM(t, kind, nil)
+				}
+				execFixture(t, fixture.pool, mutation, fixture.messageID)
+
+				if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+					t.Fatalf("a %s message was previewed as %+v", name, got)
+				}
+			})
+		}
+	}
+}
+
+// The tenant scopes the lookup, so no arrangement of ids can make a message
+// resolve for a notification another workspace owns.
+//
+// The outbox row is moved to a second workspace while still naming this
+// message. That is not a state a producer can write — the workspace comes from
+// the message — so it is written directly, which is exactly the point: even if
+// one appeared, through an import, a repair script or a defect, the projection
+// refuses it rather than putting one tenant's text in another's push.
+func TestNotificationPresentationIsScopedToTheTenantPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := seedPresentation(t)
+			if kind != "channel" {
+				fixture.useDM(t, kind, nil)
+			}
+			other := newIsolatedWorkspace(t, fixture.pool)
+
+			execFixture(t, fixture.pool, `
+		UPDATE chat.notification_outbox SET workspace_id = $1::uuid WHERE id = $2::uuid`,
+				other, fixture.ids[0])
+
+			if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+				t.Fatalf("a cross-workspace notification was previewed as %+v", got)
+			}
+		})
+	}
+}
+
+// A message with no text and no files carries a sender and a place and nothing
+// else, so the banner can say who and where without claiming to quote anybody.
+func TestNotificationPresentationOfAnEmptyMessagePostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+	execFixture(t, fixture.pool,
+		`UPDATE chat.messages SET body_text = '' WHERE id = $1::uuid`, fixture.messageID)
+
+	got := fixture.presentation(t)
+
+	if got.Body != "" {
+		t.Fatalf("body = %q, want nothing", got.Body)
+	}
+	if got.Attachment {
+		t.Fatal("a message with no files reported one")
+	}
+	if got.Sender == "" {
+		t.Fatal("the sender is still known and should still be projected")
+	}
+}
+
+// The body is bounded by the statement, so a batch claim never pulls the 40000
+// characters a message may carry, times the batch size, to discard almost all
+// of it.
+func TestNotificationPresentationBoundsTheBodyPostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+	execFixture(t, fixture.pool,
+		`UPDATE chat.messages SET body_text = repeat('a', 40000) WHERE id = $1::uuid`,
+		fixture.messageID)
+
+	if got := len(fixture.presentation(t).Body); got > 1000 {
+		t.Fatalf("the projection returned %d characters of message body", got)
+	}
+}
+
+// The sender is bounded by the statement too, and the two names are not clipped.
+//
+// The three strings the projection carries are bounded differently because the
+// schema bounds them differently, and the test has to follow that rather than
+// pretend otherwise:
+//
+//   - auth.users.display_name has *no* database CHECK. It is the one column an
+//     oversized value can genuinely reach, so it is the one written oversized
+//     here — straight to the table, because the point is that the projection
+//     bounds what it reads rather than trusting whichever writer produced it.
+//   - chat.channels.display_name (1..100) and chat.dm_conversations.title
+//     (<= 120) are bounded by their own CHECKs. Writing past them is impossible
+//     without dropping a constraint, and a test that drops one is a test that
+//     can leave the schema broken when it fails. What is worth asserting for
+//     those two is the other direction: a value at the column's own ceiling
+//     arrives whole, so the SQL bound can never be set low enough to clip a
+//     name somebody legitimately chose.
+func TestNotificationPresentationBoundsTheSenderAndContextPostgreSQL(t *testing.T) {
+	t.Run("an unbounded display name is cut", func(t *testing.T) {
+		fixture := seedPresentation(t)
+		execFixture(t, fixture.pool, `UPDATE auth.users SET display_name = repeat('n', 5000)
+			WHERE id = $1::uuid`, fixture.users[0])
+
+		got := fixture.presentation(t)
+
+		if len(got.Sender) == 0 || len(got.Sender) > 200 {
+			t.Fatalf("the projection returned %d characters of display name", len(got.Sender))
+		}
+	})
+
+	t.Run("a channel name at its own ceiling is whole", func(t *testing.T) {
+		fixture := seedPresentation(t)
+		name := strings.Repeat("c", 100)
+		execFixture(t, fixture.pool, `UPDATE chat.channels SET display_name = $2
+			WHERE id = $1::uuid`, fixture.channelID, name)
+
+		if got := fixture.presentation(t); got.Context != "#"+name {
+			t.Fatalf("a %d-character channel name arrived as %d characters",
+				len(name), len(got.Context))
+		}
+	})
+
+	t.Run("a group title at its own ceiling is whole", func(t *testing.T) {
+		fixture := seedPresentation(t)
+		title := strings.Repeat("g", 120)
+		fixture.useDM(t, "group", &title)
+
+		if got := fixture.presentation(t); got.Context != title {
+			t.Fatalf("a %d-character group title arrived as %d characters",
+				len(title), len(got.Context))
+		}
+	})
+}
+
+func TestNotificationPendingOmitsPresentationPostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+	events, err := storage.NewPGXNotificationOutboxStore(fixture.pool, true).ListPending(t.Context(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.ID == fixture.ids[0] {
+			if event.Presentation != (storage.MessagePresentation{}) {
+				t.Fatalf("pre-policy read loaded message content: %+v", event.Presentation)
+			}
+			return
+		}
+	}
+	t.Fatal("pending notification missing")
+}
+
+func TestNotificationClaimWithoutPreviewPostgreSQL(t *testing.T) {
+	fixture := seedPresentation(t)
+	store := fixture.store()
+	if err := store.MarkEvaluated(t.Context(), fixture.ids[0], notificationevent.StateEligible, ""); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ClaimDue(t.Context(), 50, 5, notifyWorkerLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Presentation != (storage.MessagePresentation{}) {
+		t.Fatalf("preview-disabled claim loaded presentation: %+v", events)
+	}
+}
+
+// A claim is a snapshot. A later retry must resolve access again.
+func TestNotificationPresentationClaimSnapshotPostgreSQL(t *testing.T) {
+	for _, mutation := range []string{
+		`UPDATE chat.messages SET status = 'deleted', deleted_at = now() WHERE id = $1::uuid`,
+		`DELETE FROM chat.workspace_members WHERE user_id = $2::uuid AND workspace_id = (SELECT workspace_id FROM chat.messages WHERE id = $1::uuid)`,
+	} {
+		t.Run(mutation, func(t *testing.T) {
+			fixture := seedPresentation(t)
+			claimed := fixture.presentation(t)
+			if strings.HasPrefix(mutation, "UPDATE") {
+				execFixture(t, fixture.pool, mutation, fixture.messageID)
+			} else {
+				execFixture(t, fixture.pool, mutation, fixture.messageID, fixture.recipient)
+			}
+			if claimed.Body != "worker fixture" {
+				t.Fatal("claim did not retain its snapshot")
+			}
+			store := storage.NewPGXNotificationOutboxStore(fixture.pool, true)
+			if err := store.ScheduleRetry(t.Context(), fixture.ids[0], 1, 0, "delivery_transient"); err != nil {
+				t.Fatal(err)
+			}
+			retried := fixture.claimOwn(t, store)
+			if retried.Attempts != 2 || retried.Presentation != (storage.MessagePresentation{}) {
+				t.Fatalf("retry retained revoked preview: %+v", retried)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SR-001: the recipient's own account, not just their membership
+// ---------------------------------------------------------------------------
+//
+// A workspace membership and a global account are two different things, and
+// only one of them an operator revokes when they suspend somebody. Sessions are
+// revoked with the account — authsession.ActiveSessionCTE refuses any session
+// whose user is not `status = 'active'` with `deleted_at IS NULL` — but the
+// push subscription and the workspace membership survive, and the outbox row
+// that was already written survives with them.
+//
+// So the projection has to ask the same question the session contract asks,
+// about o.recipient_user_id. Without it a suspended account still had message
+// text delivered to a browser it had already registered, at a moment when the
+// authenticated UI would have refused the same person outright.
+//
+// These are deliberately *not* the workspace_members tests above. Those revoke
+// `chat.workspace_members.status`, which is membership of one tenant; these
+// revoke `auth.users.status` and `auth.users.deleted_at`, which is the person.
+
+// setAccount puts the recipient's global account into one state, by writing the
+// two columns ActiveSessionCTE reads and nothing else.
+func (f *presentationFixture) setAccount(t *testing.T, status string, deleted bool) {
+	t.Helper()
+	execFixture(t, f.pool, `
+		UPDATE auth.users
+		SET status = $2::text,
+		    deleted_at = CASE WHEN $3::boolean THEN now() END
+		WHERE id = $1::uuid`, f.recipient, status, deleted)
+}
+
+// presentationForKind seeds one conversation of the given kind and returns the
+// fixture, so each account-state case below reads as one line.
+func presentationForKind(t *testing.T, kind string) *presentationFixture {
+	t.Helper()
+	fixture := seedPresentation(t)
+	if kind != "channel" {
+		fixture.useDM(t, kind, nil)
+	}
+	return fixture
+}
+
+// A globally suspended recipient gets no preview, in every kind of conversation.
+//
+// The `active` row of each table is the control: without it the test would pass
+// just as well against a projection that never produces a preview at all.
+func TestNotificationPresentationRejectsGloballySuspendedRecipientPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		for _, test := range []struct {
+			name    string
+			status  string
+			preview bool
+		}{
+			{name: "active", status: "active", preview: true},
+			{name: "suspended", status: "suspended"},
+			// Not asked for, and worth one line: the predicate is an allowlist
+			// of one value, so every other state the CHECK permits is refused
+			// by the same rule rather than by a list somebody has to maintain.
+			{name: "locked", status: "locked"},
+			{name: "invited", status: "invited"},
+		} {
+			t.Run(kind+"/"+test.name, func(t *testing.T) {
+				fixture := presentationForKind(t, kind)
+				fixture.setAccount(t, test.status, false)
+
+				got := fixture.presentation(t)
+
+				if test.preview {
+					if got.Body != "worker fixture" || got.Sender == "" {
+						t.Fatalf("an active account was refused its preview: %+v", got)
+					}
+					return
+				}
+				if got != (storage.MessagePresentation{}) {
+					t.Fatalf("a %s account was shown %+v", test.status, got)
+				}
+			})
+		}
+	}
+}
+
+// A soft-deleted recipient gets no preview either, and that is a separate
+// column: a deleted account can still read `status = 'active'` — deletion is
+// recorded by deleted_at — so testing only the status would leave the half of
+// the contract that ActiveSessionCTE spells out second.
+func TestNotificationPresentationRejectsDeletedRecipientPostgreSQL(t *testing.T) {
+	for _, kind := range []string{"channel", "direct", "group"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := presentationForKind(t, kind)
+			// status stays 'active' on purpose. Only deleted_at is set, so what
+			// this proves is that deleted_at alone is disqualifying.
+			fixture.setAccount(t, "active", true)
+
+			if got := fixture.presentation(t); got != (storage.MessagePresentation{}) {
+				t.Fatalf("a soft-deleted account was shown %+v", got)
+			}
+		})
+	}
+}
+
+// The global account is re-read on every claim, not snapshotted with the first.
+//
+// This is the case SR-001 actually describes: the notification is produced and
+// claimed while the account is fine, delivery fails transiently, and the
+// suspension lands in between. The retry must resolve the account again and
+// find nothing to show — the same guarantee the message state and the workspace
+// membership already had, for the one predicate that was missing.
+func TestNotificationPresentationRetryRechecksGlobalAccountPostgreSQL(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		status  string
+		deleted bool
+	}{
+		{name: "suspended", status: "suspended"},
+		{name: "soft deleted", status: "active", deleted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedPresentation(t)
+
+			claimed := fixture.presentation(t)
+			if claimed.Body != "worker fixture" {
+				t.Fatalf("the first claim, while the account was active, saw %+v", claimed)
+			}
+
+			fixture.setAccount(t, test.status, test.deleted)
+
+			store := storage.NewPGXNotificationOutboxStore(fixture.pool, true)
+			if err := store.ScheduleRetry(t.Context(), fixture.ids[0], 1, 0, "delivery_transient"); err != nil {
+				t.Fatalf("ScheduleRetry: %v", err)
+			}
+			retried := fixture.claimOwn(t, store)
+
+			if retried.Attempts != 2 {
+				t.Fatalf("attempts = %d, want the second claim", retried.Attempts)
+			}
+			if retried.Presentation != (storage.MessagePresentation{}) {
+				t.Fatalf("the retry kept a preview for a %s account: %+v",
+					test.name, retried.Presentation)
+			}
+		})
+	}
 }

@@ -222,25 +222,85 @@ function renderInlineText(text: string, keyPrefix: string, rendering?: LinkRende
   return rendering ? linkifyPlain(text, keyPrefix, rendering) : text;
 }
 
+/**
+ * Opt-in "open a DM" affordance for individual user mentions (issue #795).
+ *
+ * Omitted entirely for `@all`/other non-`"user"` mentions and for a mention
+ * of the reader themself — those render exactly as before: a plain `<span>`,
+ * inert and unfocusable, never a no-op control.
+ */
+export interface MentionInteraction {
+  /**
+   * Required, not optional: the self-mention guard below is entirely
+   * `token.id !== currentUserId`, so a caller that forgot this field would
+   * silently make every mention clickable, including of the reader.
+   */
+  currentUserId: string;
+  onMentionClick: (mentionType: MentionType, id: string) => void;
+  /** Mentions whose DM is currently being resolved, for a discreet busy state. */
+  openingIds?: Set<string>;
+}
+
+/**
+ * A `@user` mention token: inert text, or — when the caller opted into mention
+ * navigation (issue #795) and the mention is of somebody else — a button that
+ * opens the DM. Never an anchor, and never linkified: its destination is a
+ * mention id, not a URL.
+ */
+function renderMentionToken(
+  token: Extract<InlineToken, { type: "mention" }>,
+  key: string,
+  mention?: MentionInteraction,
+): ReactNode {
+  const clickable =
+    mention !== undefined && token.mentionType === "user" && token.id !== mention.currentUserId;
+  if (!clickable) {
+    return (
+      <span
+        key={key}
+        className="rtr-mention"
+        data-mention-type={token.mentionType}
+        data-mention-id={token.id}
+      >
+        @{token.text}
+      </span>
+    );
+  }
+  const activate = () => mention.onMentionClick(token.mentionType, token.id);
+  return (
+    <span
+      key={key}
+      className="rtr-mention"
+      data-mention-type={token.mentionType}
+      data-mention-id={token.id}
+      data-mention-clickable="true"
+      role="button"
+      tabIndex={0}
+      aria-label={`Abrir conversa com ${token.text}`}
+      aria-busy={mention.openingIds?.has(token.id) || undefined}
+      onClick={activate}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate();
+        }
+      }}
+    >
+      @{token.text}
+    </span>
+  );
+}
+
 function renderTokens(
   tokens: InlineToken[],
   keyPrefix: string,
   rendering?: LinkRendering,
+  mention?: MentionInteraction,
 ): ReactNode[] {
   return tokens.map((token, index): ReactNode => {
     const key = `${keyPrefix}-${index}`;
     if (typeof token === "string") return renderInlineText(token, key, rendering);
-    if (token.type === "mention")
-      return (
-        <span
-          key={key}
-          className="rtr-mention"
-          data-mention-type={token.mentionType}
-          data-mention-id={token.id}
-        >
-          @{token.text}
-        </span>
-      );
+    if (token.type === "mention") return renderMentionToken(token, key, mention);
     if (token.type === "bold")
       return <strong key={key}>{renderInlineText(token.text, key, rendering)}</strong>;
     if (token.type === "boldItalic")
@@ -368,12 +428,13 @@ function renderListItems(
   keyPrefix: string,
   format: MessageBodyFormat,
   rendering?: LinkRendering,
+  mention?: MentionInteraction,
 ): ReactNode[] {
   return items.map((item, index) => (
     <li key={index}>
-      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`, rendering)}
+      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`, rendering, mention)}
       {item.children.map((child, childIndex) =>
-        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format, rendering),
+        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format, rendering, mention),
       )}
     </li>
   ));
@@ -384,8 +445,9 @@ function renderList(
   key: string,
   format: MessageBodyFormat,
   rendering?: LinkRendering,
+  mention?: MentionInteraction,
 ): ReactNode {
-  const items = renderListItems(block.items, key, format, rendering);
+  const items = renderListItems(block.items, key, format, rendering, mention);
   return block.type === "ul" ? (
     <ul key={key} className="rtr-list">
       {items}
@@ -412,12 +474,20 @@ export interface RichTextRendererProps {
    * text itself.
    */
   links?: LinkRendering;
+  /**
+   * Enables the "click a mention to open a DM" affordance (issue #795).
+   * Omitted by default for the same reason as `links`: only a caller that
+   * actually wants mention navigation (the primary message body, not a
+   * quote/reference/edit-history preview) should opt in.
+   */
+  mention?: MentionInteraction;
 }
 
 export default function RichTextRenderer({
   text,
   bodyFormat = "v1",
   links,
+  mention,
 }: RichTextRendererProps) {
   if (!text) return null;
 
@@ -432,7 +502,7 @@ export default function RichTextRenderer({
           );
         }
         if (block.type !== "para") {
-          return renderList(block, String(blockIndex), bodyFormat, links);
+          return renderList(block, String(blockIndex), bodyFormat, links, mention);
         }
         return (
           <Fragment key={blockIndex}>
@@ -442,6 +512,7 @@ export default function RichTextRenderer({
                   tokenizeInline(line, bodyFormat),
                   `${blockIndex}-${lineIndex}`,
                   links,
+                  mention,
                 )}
                 {lineIndex < lines.length - 1 && <br />}
               </Fragment>

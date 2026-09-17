@@ -32,6 +32,11 @@ const maxBodyBytes = 1 << 16 // 64 KiB
 const (
 	errCodeMaliciousURL         = "malicious_url"
 	errCodeLinkCheckUnavailable = "link_check_unavailable"
+	// Its own code, so a client can tell "this deployment has not enabled
+	// granular notification levels yet" from "the sidebar service is missing"
+	// (issue #136). Both are 503; only one of them changes when an operator
+	// opens the rollout gate.
+	errCodeNotificationLevelsUnavailable = "notification_levels_unavailable"
 	// errCodeLinkCheckPending says the links are being scanned right now and
 	// the operation should be retried shortly. It is only ever returned by
 	// editing: creating and forwarding accept the message and withhold it
@@ -250,6 +255,16 @@ type messageJSON struct {
 	// message list stays one query and a timeline of a hundred messages does not
 	// aggregate a hundred recipient sets it will not draw.
 	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications says this urgent message keeps reminding the
+	// recipients who have neither confirmed nor answered it (issue #825). Always
+	// present, on the same terms as the two fields above.
+	//
+	// It says only that the policy was asked for. Whether any reminder is still
+	// outstanding, for whom, and how many have been sent are deliberately absent:
+	// they are per-recipient state, they change without the message changing, and
+	// a timeline of a hundred messages must not aggregate a hundred reminder
+	// schedules it will not draw.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// LinkSafetyState is the link-safety axis and is independent of Status
 	// (issue #135): a published message whose links could not all be verified is
 	// `active` and carries "inconclusive" here. It is what the client draws the
@@ -481,6 +496,25 @@ type createMessageRequest struct {
 	// editing a message neither adds a confirmation request nor withdraws one,
 	// and — the rule #824 states — never resets an answer already given.
 	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications asks this message to keep reminding every recipient
+	// who has neither confirmed nor answered it (issue #825).
+	//
+	// A plain bool, like AcknowledgementRequired and for the same reason: absence
+	// and false are the same request. It is refused on a message that is not
+	// urgent — see domain.ValidatePersistentNotifications — rather than ignored,
+	// because a sender who asked for reminders and silently got none would
+	// believe their message was still asking when it had stopped.
+	//
+	// There is deliberately no interval, deadline or attempt-count field beside
+	// it. #820 puts a configurable interval out of scope for this version, and
+	// the whole schedule is a server-side constant, so there is nothing here a
+	// client can lengthen, shorten or restart.
+	//
+	// Accepted on create only. editMessageRequest has no counterpart and
+	// decodeStrictJSON rejects unknown fields, so a PATCH carrying it is a 400:
+	// editing a message neither starts reminders nor stops them, and #820 states
+	// outright that editing must not restart a timer.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// AttachmentIDs binds already-uploaded files to this message (RF-32).
 	//
 	// A list, even though the product rule is one attachment per message, so
@@ -635,6 +669,7 @@ func mapToMessageJSON(m domain.Message) messageJSON {
 		Status:                  string(m.Status),
 		Priority:                string(m.Priority.OrStandard()),
 		AcknowledgementRequired: m.AcknowledgementRequired,
+		PersistentNotifications: m.PersistentNotifications,
 		LinkSafetyState:         string(m.LinkSafety),
 		CreatedAt:               m.CreatedAt,
 		UpdatedAt:               m.UpdatedAt,
@@ -1365,6 +1400,7 @@ func (h *MessageHandler) CreateChannelMessage(w http.ResponseWriter, r *http.Req
 		AttachmentIDs:           req.AttachmentIDs,
 		Priority:                priority,
 		AcknowledgementRequired: req.AcknowledgementRequired,
+		PersistentNotifications: req.PersistentNotifications,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1527,6 +1563,7 @@ func (h *MessageHandler) CreateDMMessage(w http.ResponseWriter, r *http.Request)
 		AttachmentIDs:           req.AttachmentIDs,
 		Priority:                priority,
 		AcknowledgementRequired: req.AcknowledgementRequired,
+		PersistentNotifications: req.PersistentNotifications,
 	})
 	if err != nil {
 		mapServiceError(w, err)
@@ -1960,6 +1997,12 @@ func mapServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrURLCheckUnavailable):
 		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeLinkCheckUnavailable,
 			"the link could not be checked for safety, try again")
+	case errors.Is(err, domain.ErrConversationNotificationLevelsDisabled):
+		// 503 and not 400: the mode is valid and the caller did nothing wrong —
+		// this deployment has not opened the rollout gate yet. The body names
+		// neither the flag nor the environment variable behind it.
+		httputil.WriteError(w, http.StatusServiceUnavailable, errCodeNotificationLevelsUnavailable,
+			"granular notification levels are not available in this deployment")
 	case errors.Is(err, domain.ErrURLCheckPending):
 		// 409 and not 503: nothing is broken, the scan this request queued is
 		// simply not finished. The already-published version of the message is

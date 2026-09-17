@@ -13,6 +13,10 @@ vi.mock("./chatApi", () => ({
 import ChatComposer from "./ChatComposer";
 import RichTextRenderer from "./RichTextRenderer";
 import type { SendResult } from "./useMessages";
+import { useConversationDrafts } from "./useConversationDrafts";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
+import { loadDraftPersistence } from "./chatDraftPersistence";
+import type { AttachmentUploadItem } from "./useAttachmentUpload";
 
 function clipboardData(html: string, plain: string): DataTransfer {
   return {
@@ -140,6 +144,42 @@ describe("ChatComposer focus", () => {
     rerender(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
     await waitFor(() => expect(other).toHaveFocus());
     other.remove();
+  });
+
+  /**
+   * The composer's opening focus is a convenience, and it must never be worth
+   * dismissing something the reader deliberately opened.
+   *
+   * The menu is focused *before* the composer mounts, which is the case the
+   * "focus moved while loading" guard above cannot see: the composer adopts
+   * whatever holds focus when it arrives as its baseline, so "focus has not
+   * moved since I mounted" reads as "nobody wants it" — and it is wrong,
+   * because a menu closes when focus leaves it. On a slow first paint the
+   * editor is not ready for a second or more, which is long enough for a
+   * reader to open a sidebar row's menu and have it shut under their cursor.
+   */
+  it("never takes the opening focus from a menu that already owns it", async () => {
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    const item = document.createElement("button");
+    item.setAttribute("role", "menuitem");
+    menu.append(item);
+    document.body.append(menu);
+    item.focus();
+
+    render(<ChatComposer bodyFormat="v2" placeholder="Mensagem..." onSend={vi.fn()} />);
+    const input = await screen.findByTestId("chat-composer-input");
+    // The opening focus is scheduled on a frame. Queueing one behind it is what
+    // makes this an assertion about the decision rather than about the clock:
+    // callbacks run in order, so by the time this one resolves the composer's
+    // has already either taken focus or declined to.
+    await act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    });
+
+    expect(item).toHaveFocus();
+    expect(input).not.toHaveFocus();
+    menu.remove();
   });
 
   it("keeps focus after Enter and preserves it with the draft on failure", async () => {
@@ -625,5 +665,100 @@ describe("ChatComposer emoji picker", () => {
     await send(onSend);
 
     await waitFor(() => expect(screen.queryByTestId("toolbar-emoji-picker")).toBeNull());
+  });
+});
+
+// Issue #845: ChatComposer wired to a real (non-noop) ConversationDraftsApi,
+// the same way AppShell/ChatMessageArea wire it in production — as opposed
+// to every test above, which relies on the default noop store and therefore
+// never exercises the draft-consumption/ACK-race guard at all.
+describe("ChatComposer with a real draft store (issue #845)", () => {
+  const draftKey = "dm:caio";
+
+  function DraftedComposer({
+    onSend,
+    onDrafts,
+  }: {
+    onSend: (body: string) => Promise<SendResult>;
+    onDrafts: (drafts: ConversationDraftsApi) => void;
+  }) {
+    const drafts = useConversationDrafts("u1");
+    onDrafts(drafts);
+    return (
+      <ChatComposer
+        bodyFormat="v2"
+        placeholder="Mensagem..."
+        onSend={onSend}
+        uploadTarget={{ kind: "dm", id: "caio" }}
+        drafts={drafts}
+      />
+    );
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("send + navigate + return: a confirmed send consumes the draft, and a debounce in flight cannot resurrect it", async () => {
+    const onSend = vi.fn<(body: string) => Promise<SendResult>>().mockResolvedValue({
+      status: "sent",
+    });
+    let drafts!: ConversationDraftsApi;
+    render(<DraftedComposer onSend={onSend} onDrafts={(d) => (drafts = d)} />);
+
+    const input = await paste("", "mensagem enviada");
+    input.focus();
+    // A debounced sessionStorage write for "mensagem enviada" is now
+    // pending (400ms) — deliberately not awaited before sending.
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+    await waitFor(() => expect(drafts.getDraft(draftKey)).toBeUndefined());
+    expect(loadDraftPersistence("u1", draftKey)).toBeNull();
+
+    // Simulates the reader navigating away and back (an unmount/remount
+    // does not touch sessionStorage) while the stale pre-send debounce
+    // timer, if it survived, would still be in flight.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(loadDraftPersistence("u1", draftKey)).toBeNull();
+    expect(drafts.getDraft(draftKey)).toBeUndefined();
+  });
+
+  it("ACK atrasado: a draft mutation that lands while a send is still in flight leaves the editor untouched once that send confirms", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    const onSend = vi
+      .fn<(body: string) => Promise<SendResult>>()
+      .mockReturnValue(new Promise((resolve) => (resolveSend = resolve)));
+    let drafts!: ConversationDraftsApi;
+    render(<DraftedComposer onSend={onSend} onDrafts={(d) => (drafts = d)} />);
+
+    const input = await paste("", "A");
+    input.focus();
+    fireEvent.keyDown(input, { key: "Enter", code: "Enter" });
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
+
+    // While A's send is still pending, something else touches this
+    // conversation's draft — e.g. an attachment upload that started before
+    // the send resolves (issue #845, "vale também para novo attachment,
+    // novo reply, nova voice message adicionados após o submit").
+    const fakeAttachment: AttachmentUploadItem = {
+      localId: "a1",
+      file: new File(["x"], "a1.txt"),
+      status: "queued",
+      progress: null,
+      error: null,
+      attachment: null,
+    };
+    act(() => drafts.setAttachments(draftKey, [fakeAttachment]));
+
+    // A's send now confirms.
+    await act(async () => resolveSend({ status: "sent" }));
+
+    // The guard must see that the draft moved on since A was submitted and
+    // must NOT clear the editor — clearing here would silently drop
+    // whatever the reader has added since pressing Enter (issue #845, "ACK
+    // ATRASADO").
+    await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
+    expect(input.textContent?.trim()).toBe("A");
   });
 });

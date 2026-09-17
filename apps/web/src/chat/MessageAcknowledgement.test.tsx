@@ -11,8 +11,8 @@
  * assert that the client does not second-guess it.
  */
 
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import MessageAcknowledgementStrip from "./MessageAcknowledgement";
 import MessageBubble, { type MessageBubbleProps } from "./MessageBubble";
@@ -96,7 +96,9 @@ describe("message acknowledgement strip", () => {
   // person who was asked.
   it.each([
     ["acknowledged", /recebimento confirmado/i],
-    ["responded", /resolvido pela sua resposta/i],
+    // Issue #846: distinct from "acknowledged" and never worded as a
+    // confirmation — a reply is not the same outcome.
+    ["responded", /^respondido$/i],
     ["expired", /confirmação expirada/i],
     ["cancelled", /confirmação cancelada/i],
   ] as const)("reports %s without offering the action again", (state, label) => {
@@ -127,14 +129,13 @@ describe("message acknowledgement strip", () => {
     });
     const summary = screen.getByTestId("acknowledgement-summary");
     expect(summary).toHaveTextContent("4 de 7 confirmaram");
-    expect(summary).toHaveTextContent("2 pendente");
     // The sender is not a recipient of their own message, so no action is drawn.
     expect(screen.queryByRole("button", { name: /confirmar recebimento/i })).toBeNull();
   });
 
-  // Nothing outstanding is a state worth reading plainly: the pending line is
-  // omitted rather than rendered as "0 pendente(s)".
-  it("omits the pending line once everybody has answered", () => {
+  // Issue #846: the compact footer is one line — no separate pending count, no
+  // "confirmação parcial" block — whatever the counts are.
+  it("keeps the summary to one line regardless of how many are still pending", () => {
     renderAsSender({ acknowledgement: summaryWith({ total: 3, acknowledged: 3, pending: 0 }) });
     const summary = screen.getByTestId("acknowledgement-summary");
     expect(summary).toHaveTextContent("3 de 3 confirmaram");
@@ -219,60 +220,95 @@ describe("acknowledgement viewer roles", () => {
   });
 });
 
-// ── the sender's detail ──────────────────────────────────────────────────────
+// ── the sender's detail (issue #846's popover) ────────────────────────────────
 
 describe("acknowledgement detail", () => {
+  // useAnchoredPicker treats a zero-size anchor as off-screen and dismisses
+  // immediately (the same geometry MessageToolbarPlacement.test.tsx stubs for
+  // the reaction toolbar's own picker) — jsdom's real getBoundingClientRect is
+  // all zeros, so without this the popover would open and instantly close.
+  beforeEach(() => {
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      top: 100,
+      bottom: 130,
+      left: 100,
+      right: 200,
+      width: 100,
+      height: 30,
+      x: 100,
+      y: 100,
+      toJSON: () => ({}),
+    } as DOMRect);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   const detail = [
     { recipientId: "u-1", state: "acknowledged" as const, resolvedAt: "2026-09-11T13:00:00Z" },
     { recipientId: "u-2", state: "pending" as const },
     { recipientId: "u-3", state: "responded" as const, resolvedAt: "2026-09-11T14:00:00Z" },
   ];
 
-  it("lets the sender open the list the server authorised", () => {
+  function profilesFor(ids: string[]) {
+    const names: Record<string, string> = {
+      "u-1": "Ana Souza",
+      "u-2": "Caio Lima",
+      "u-3": "Bia Rocha",
+    };
+    return Promise.resolve(
+      ids.filter((id) => names[id]).map((id) => ({ userId: id, displayName: names[id] })),
+    );
+  }
+
+  // The summary is the popover's trigger only once there is somewhere for the
+  // list to come from (issue #846: a single recipient never offers it either,
+  // covered by the one-to-one test below).
+  it("lets the sender open the list the server authorised", async () => {
     renderAsSender({
       acknowledgement: summaryWith({ total: 3, acknowledged: 1, recipients: detail }),
+      resolveIdentities: profilesFor,
     });
-    expect(screen.getByTestId("acknowledgement-details")).toBeInTheDocument();
-    const rows = screen.getAllByTestId("acknowledgement-recipient");
-    expect(rows).toHaveLength(3);
-    expect(rows[0]).toHaveTextContent("u-1");
-    expect(rows[0]).toHaveTextContent("Confirmou");
-    expect(rows[1]).toHaveTextContent("Pendente");
-    expect(rows[2]).toHaveTextContent("Respondeu");
+    fireEvent.click(screen.getByRole("button", { name: /confirmaram.*ver confirmações/i }));
+    expect(await screen.findByTestId("ack-details-dialog")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByTestId("ack-details-recipient")).toHaveLength(3));
+    const rows = screen.getAllByTestId("ack-details-recipient");
+    // Never the raw id (issue #846's own rule) — the resolved name instead.
+    expect(rows[0]).toHaveTextContent("Ana Souza");
+    expect(rows[0]).not.toHaveTextContent("u-1");
   });
 
-  it("names each individual state, not just a colour", () => {
+  // A resolve that never returns a name for an id — not authorised, or gone —
+  // degrades to a neutral placeholder, never the raw id.
+  it("never shows a raw recipient id, even when identity does not resolve", async () => {
     renderAsSender({
-      acknowledgement: summaryWith({
-        recipients: [
-          { recipientId: "u-4", state: "expired" },
-          { recipientId: "u-5", state: "cancelled" },
-        ],
-      }),
+      acknowledgement: summaryWith({ total: 3, acknowledged: 1, recipients: detail }),
+      resolveIdentities: () => Promise.resolve([]),
     });
-    const rows = screen.getAllByTestId("acknowledgement-recipient");
-    expect(rows[0]).toHaveTextContent("Expirou");
-    expect(rows[0]).toHaveAttribute("data-state", "expired");
-    expect(rows[1]).toHaveTextContent("Cancelado");
+    fireEvent.click(screen.getByRole("button", { name: /confirmaram.*ver confirmações/i }));
+    await screen.findByTestId("ack-details-dialog");
+    await waitFor(() => expect(screen.getAllByTestId("ack-details-recipient")).toHaveLength(3));
+    for (const row of screen.getAllByTestId("ack-details-recipient")) {
+      expect(row).not.toHaveTextContent(/^u-\d$/);
+    }
   });
 
-  // The server decides who may see the list. When it sends none, the sender
-  // still gets the counts and the disclosure is simply not offered — no second
-  // request, no fallback, no locally-inferred authorisation.
-  it("degrades to counts alone when the server sent no list", () => {
-    renderAsSender({ acknowledgement: summaryWith({ recipients: undefined }) });
-    expect(screen.getByTestId("acknowledgement-summary")).toBeInTheDocument();
-    expect(screen.queryByTestId("acknowledgement-details")).toBeNull();
+  // The server decides who may see the list. When it sends none yet, the
+  // popover shows a neutral loading state rather than an empty one that reads
+  // as "nobody has done anything".
+  it("shows a loading state until the detail read lands", async () => {
+    renderAsSender({
+      acknowledgement: summaryWith({ total: 3, acknowledged: 1, recipients: undefined }),
+      resolveIdentities: profilesFor,
+    });
+    fireEvent.click(screen.getByRole("button", { name: /confirmaram.*ver confirmações/i }));
+    expect(await screen.findByTestId("ack-details-dialog")).toHaveTextContent(/carregando/i);
   });
 
-  it("offers no disclosure for an empty list", () => {
-    renderAsSender({ acknowledgement: summaryWith({ recipients: [] }) });
-    expect(screen.queryByTestId("acknowledgement-details")).toBeNull();
-  });
-
-  // A 1:1 DM is the degenerate group: one recipient, and the sender must still
-  // be able to tell which of the five states they are in.
-  it("reads clearly for a one-to-one conversation", () => {
+  // A 1:1 DM is the degenerate group: one recipient, told directly rather than
+  // as "0 de 1"/"1 de 1" — and never offered a popover for a list of one.
+  it("reads clearly for a one-to-one conversation, without a popover", () => {
     renderAsSender({
       acknowledgement: summaryWith({
         total: 1,
@@ -280,9 +316,26 @@ describe("acknowledgement detail", () => {
         pending: 1,
         recipients: [{ recipientId: "u-only", state: "pending" }],
       }),
+      resolveIdentities: profilesFor,
     });
-    expect(screen.getByTestId("acknowledgement-summary")).toHaveTextContent("0 de 1 confirmaram");
-    expect(screen.getAllByTestId("acknowledgement-recipient")[0]).toHaveTextContent("Pendente");
+    expect(screen.getByTestId("acknowledgement-summary")).toHaveTextContent(
+      "Aguardando confirmação",
+    );
+    expect(screen.queryByRole("button", { name: /ver confirmações/i })).toBeNull();
+  });
+
+  it("tells a one-to-one sender the exact confirmation time when it is known", () => {
+    renderAsSender({
+      acknowledgement: summaryWith({
+        total: 1,
+        acknowledged: 1,
+        pending: 0,
+        recipients: [
+          { recipientId: "u-only", state: "acknowledged", resolvedAt: "2026-09-11T20:10:00Z" },
+        ],
+      }),
+    });
+    expect(screen.getByTestId("acknowledgement-summary")).toHaveTextContent(/confirmado às/i);
   });
 });
 

@@ -46,6 +46,69 @@ scripts/secrets/sealed-secrets-seal.sh \
 Add the generated file to `infra/k8s/secrets/sealed/nchat-dev/kustomization.yaml`
 and delete the unsealed copy.
 
+## Web Push: nchat-webpush (#862)
+
+Web Push stays off until an operator does all of this for one environment.
+Nothing in the repository enables it: the Deployment mounts `nchat-webpush` as
+optional, and `NOTIFICATION_WORKER_ENABLED` defaults to `false`.
+
+1. **Generate one VAPID pair for the environment, once.** Into the ignored
+   unsealed copy, never to the terminal:
+
+   ```
+   cp infra/k8s/secrets/templates/nchat-webpush.template.yaml \
+      infra/k8s/secrets/unsealed/nchat-webpush.yaml
+   umask 077
+   openssl ecparam -name prime256v1 -genkey -noout -out /tmp/vapid.pem
+   PRIV="$(openssl ec -in /tmp/vapid.pem -outform DER 2>/dev/null | tail -c +8 | head -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+   PUB="$(openssl ec -in /tmp/vapid.pem -pubout -outform DER 2>/dev/null | tail -c 65 | base64 | tr '+/' '-_' | tr -d '=\n')"
+   sed -i "s|NOTIFICATION_VAPID_PUBLIC_KEY: \"\"|NOTIFICATION_VAPID_PUBLIC_KEY: \"$PUB\"|; s|NOTIFICATION_VAPID_PRIVATE_KEY: \"\"|NOTIFICATION_VAPID_PRIVATE_KEY: \"$PRIV\"|" \
+     infra/k8s/secrets/unsealed/nchat-webpush.yaml
+   shred -u /tmp/vapid.pem; unset PRIV PUB
+   ```
+
+   Fill `NOTIFICATION_VAPID_SUBJECT` with the operating team's `mailto:` or
+   `https:` contact and set `metadata.namespace`. Seal with steps 1-3 above
+   (`nchat-dev` for nchat-dev-server), add the file to the environment's sealed
+   kustomization and delete the unsealed copy.
+
+2. **Keep the pair.** Every browser subscription is bound to the public key.
+   Redeploys and restarts keep it because it lives in the Secret; a new pair
+   orphans every subscription until each browser visits again and re-subscribes.
+   Rotate only on compromise, and never copy one environment's pair to another.
+
+3. **Egress to the push services is versioned.** `nchat-default-deny-egress`
+   covers notification-service; `nchat-allow-notification-webpush-egress` in
+   `infra/k8s/components/least-privilege-network-policies` gives it TCP/443 to
+   the public internet only, minus the private, cluster, link-local and reserved
+   ranges, in every overlay that composes that component (nchat-dev-server and
+   k3s-prod). `pnpm k8s:ci` validates its selector, direction, port and
+   exclusions, and fails on any `0.0.0.0/0` outside the three authorised
+   policies. Confirm it is applied before enabling the worker:
+   `kubectl -n <namespace> get networkpolicy nchat-allow-notification-webpush-egress`.
+   The sender refuses private destinations at dial time as well; the policy is
+   the outer layer.
+
+4. **Enable the worker.** `NOTIFICATION_WORKER_ENABLED: "true"` in the
+   environment's ConfigMap, then restart notification-service. The outbox backlog
+   written while the worker was off is not replayed as pushes: anything older than
+   `NOTIFICATION_PUSH_TTL_SECONDS` (4h default) expires without a provider call.
+
+5. **Verify without printing a key.**
+   - notification-service `/readyz` is 200. An absent, malformed or mismatched
+     pair fails it and names the variable, never the value.
+   - Authenticated `GET /api/notifications/push/config` returns a non-null
+     `vapid_public_key`. `null` means the worker is off or its configuration is
+     not ready, and the browser reports "not configured". A `503
+push_delivery_unavailable` means it is configured but not running — the
+     same fact `/readyz` reports — and the browser offers to try again.
+   - Perfil > Notificações shows "Notificações do navegador estão ativadas" after
+     "Ativar" in a real browser.
+
+Rollback: set `NOTIFICATION_WORKER_ENABLED` back to `false`. Browsers report
+"not configured" on their next visit; subscriptions are kept, so re-enabling with
+the same pair needs no re-subscription. Do not delete the Secret to roll back.
+
 ## Prohibitions
 
 - Do not commit the original unsealed Secret.

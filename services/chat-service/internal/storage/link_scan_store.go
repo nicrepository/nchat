@@ -823,6 +823,7 @@ var resolvePendingMessagesQuery = `
 		   AND COALESCE(m.link_safety_fingerprint, '') = COALESCE(candidate.fingerprint, '')
 		   AND (candidate.blocked OR candidate.all_terminal)
 		RETURNING m.id, m.workspace_id, m.sender_id, m.created_at,
+		          m.persistent_notifications,
 		          NOT candidate.blocked AS published,
 		          candidate.has_inconclusive,
 		          COALESCE(m.channel_id::text, '') AS channel_id,
@@ -925,6 +926,36 @@ var resolvePendingMessagesQuery = `
 		  )
 		ON CONFLICT DO NOTHING
 		RETURNING message_id
+	),
+	reminders_started AS (
+		-- The persistent reminder clock starts when the message becomes visible,
+		-- not when it was typed (issue #825).
+		--
+		-- CreateMessage deliberately leaves next_reminder_at NULL for a withheld
+		-- message, on the same terms as the notifications parked above: a message
+		-- nobody may see yet must produce no side effect aimed at its recipients.
+		-- So the schedule is started here, in the statement that publishes it, and
+		-- a message the scan condemns never starts one at all — its rows keep a
+		-- NULL and stay out of the due-reminder index entirely.
+		--
+		-- Counted from now() rather than from created_at: a scan that took ten
+		-- minutes must not make the first reminder due the instant the message
+		-- appears, which is what counting from the send would do.
+		--
+		-- next_reminder_at IS NULL is a compare-and-set against a double
+		-- promotion: a row whose schedule has already been started keeps the one
+		-- it has instead of being pushed five minutes further out. state =
+		-- 'pending' is the other half — a recipient who somehow resolved while the
+		-- message was withheld is not given a reminder on the way out.
+		UPDATE chat.message_acknowledgements a
+		   SET next_reminder_at = now() + ($3 * interval '1 second')
+		  FROM promoted
+		 WHERE promoted.published
+		   AND promoted.persistent_notifications
+		   AND a.message_id = promoted.id
+		   AND a.state = 'pending'
+		   AND a.next_reminder_at IS NULL
+		RETURNING a.message_id
 	)
 	SELECT id::text, published, has_inconclusive FROM promoted`
 
@@ -943,7 +974,8 @@ var resolvePendingMessagesQuery = `
 // a double promotion could only ever produce one event.
 func (s *PGXMessageStore) ResolveDecidedMessages(ctx context.Context) (ResolveSummary, error) {
 	rows, err := s.pool.Query(ctx, resolvePendingMessagesQuery,
-		maxPendingResolveBatch, urlsafety.VerdictTTL.Seconds())
+		maxPendingResolveBatch, urlsafety.VerdictTTL.Seconds(),
+		notificationevent.UrgentReminderInterval.Seconds())
 	if err != nil {
 		return ResolveSummary{}, fmt.Errorf("resolve decided messages: %w", err)
 	}

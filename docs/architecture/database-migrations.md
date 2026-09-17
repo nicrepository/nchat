@@ -93,8 +93,8 @@ both k3s overlays, are changed.
 
 notification-service's tables consequently live in `chat`, alongside the ones it
 already owns — `chat.notification_outbox` (`000006`/`000042`/`000044`),
-`chat.conversation_notification_prefs` (`000037`) and `chat.push_subscriptions`
-(`000045`). `scripts/ci/migrations-check.sh` enforces this: a down migration may
+`chat.conversation_notification_prefs` (`000037`, extended with a notification
+level by `000050`/`000051`) and `chat.push_subscriptions` (`000045`). `scripts/ci/migrations-check.sh` enforces this: a down migration may
 only drop tables in the schema named by its own domain directory.
 
 ## Tooling

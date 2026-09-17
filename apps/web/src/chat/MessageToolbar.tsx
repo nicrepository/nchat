@@ -15,7 +15,14 @@ import type { Message } from "./chatTypes";
 import type { EmojiUsage } from "./emoji/emojiUsage";
 import ReactionBadge from "./ReactionBadge";
 import { useReactionPresence } from "./useReactionPresence";
-import { placeAgainstAnchor, useAnchoredPicker, visibleBounds } from "./emoji/useAnchoredPicker";
+import {
+  anchorIsVisible,
+  placeAgainstAnchor,
+  useAnchoredPicker,
+  viewportPadding,
+  visibleBounds,
+  type VisibleBounds,
+} from "./emoji/useAnchoredPicker";
 
 /**
  * The full picker and its catalog are a chunk of their own (issue #496): a
@@ -38,11 +45,12 @@ const popoverSupported =
 /**
  * Distance kept between the toolbar and the bubble, above it and below it.
  *
- * The same six pixels the reaction-authors tooltip keeps from its badge: the
- * toolbar reads as attached to the message without touching it, and the gap is
- * the same wherever the timeline puts the bubble.
+ * Small enough that the toolbar reads as attached to its own bubble rather
+ * than the one above it (issue #852) — six pixels of border/shadow around the
+ * toolbar already read as separation, so the gap itself only needs to keep it
+ * from touching the bubble, not carry the whole visual distance on its own.
  */
-const toolbarGap = 6;
+const toolbarGap = 3;
 
 export interface MessageToolbarProps {
   message: Message;
@@ -206,6 +214,97 @@ interface Placement {
 }
 
 /**
+ * The bottom edge of a message's own content — its reaction badges when it
+ * has any, since those sit below its bubble and are still part of what
+ * reads as belonging to it, or its bubble otherwise. `null` for a shell with
+ * neither, such as a system event's own layout.
+ */
+function messageBottom(shell: Element): number | null {
+  const box =
+    shell.querySelector(".chat-msg-area__reactions") ??
+    shell.querySelector(".chat-msg-area__msg-bubble");
+  return box ? box.getBoundingClientRect().bottom : null;
+}
+
+/**
+ * The bottom edge of the previous message, if one is mounted right before
+ * this one (issue #852): placing the toolbar above the target must leave
+ * that message alone too, not just the list's own edges, or a pair grouped
+ * close together reads as the toolbar belonging to the wrong message.
+ *
+ * A virtualized row wraps the message shell in its own translated container
+ * (issue #839), so the sibling that matters is the wrapper's, not the
+ * shell's — walking the shell's own siblings would see nothing between rows.
+ * A non-message row in between (a day divider) has nothing to compare
+ * against, so it counts as no previous message rather than reaching past it.
+ */
+function previousBubbleBottom(anchor: Element): number | null {
+  const shell = anchor.closest("[data-message-id]");
+  const row = shell?.closest(".chat-msg-area__virtual-row") ?? shell;
+  const sibling = row?.previousElementSibling;
+  if (!sibling) return null;
+  const previousShell = sibling.matches("[data-message-id]")
+    ? sibling
+    : sibling.querySelector("[data-message-id]");
+  return previousShell ? messageBottom(previousShell) : null;
+}
+
+/**
+ * The top edge of the next message's bubble, mirroring
+ * {@link previousBubbleBottom} for the fallback placed below the target
+ * (issue #852): a bubble the toolbar drops below must not then cross into
+ * the one that comes after it either.
+ */
+function nextBubbleTop(anchor: Element): number | null {
+  const shell = anchor.closest("[data-message-id]");
+  const row = shell?.closest(".chat-msg-area__virtual-row") ?? shell;
+  const sibling = row?.nextElementSibling;
+  if (!sibling) return null;
+  const nextShell = sibling.matches("[data-message-id]")
+    ? sibling
+    : sibling.querySelector("[data-message-id]");
+  const bubble = nextShell?.querySelector(".chat-msg-area__msg-bubble");
+  return bubble ? bubble.getBoundingClientRect().top : null;
+}
+
+/**
+ * Places the toolbar beside its own bubble instead of above or below it
+ * (issue #852): a normal single-line message sits closer to its neighbors
+ * than the toolbar is tall, so above and below both cross into one of them
+ * more often than not — squeezing the toolbar into that vertical band would
+ * mean shrinking it or the row, and doing either changes what the timeline
+ * is for a fix this small. The row's own horizontal room is usually wider
+ * than the bubble, so sitting beside it — vertically centred on it, never
+ * past the reader's own band — is the side that actually has space.
+ */
+function placeBeside(
+  element: HTMLElement,
+  anchor: DOMRect,
+  box: DOMRect,
+  isMine: boolean,
+  gap: number,
+  bounds: VisibleBounds,
+): boolean {
+  const left = isMine ? anchor.left - gap - box.width : anchor.right + gap;
+  const fits = isMine
+    ? left >= bounds.left + viewportPadding
+    : left + box.width <= bounds.right - viewportPadding;
+  if (!anchorIsVisible(anchor, bounds) || !fits) {
+    element.style.visibility = "hidden";
+    return false;
+  }
+  const centered = anchor.top + anchor.height / 2 - box.height / 2;
+  const top = Math.min(
+    Math.max(bounds.top + viewportPadding, centered),
+    bounds.bottom - box.height - viewportPadding,
+  );
+  element.style.left = `${left}px`;
+  element.style.top = `${top}px`;
+  element.style.visibility = "visible";
+  return true;
+}
+
+/**
  * Where the hover toolbar sits, and when the picker it holds closes.
  *
  * The toolbar floats outside the message's own box, so it cannot be placed by
@@ -246,21 +345,54 @@ function useReactionPickerPlacement({
     const box = menu.getBoundingClientRect();
     const midX = bubble.left + bubble.width / 2;
     const left = isMine ? midX - box.width : midX;
-    // Confined to what the reader can see of the list, so a bubble near its
-    // top edge gets the toolbar below it rather than over the header — and a
-    // bubble out of that band, or filling it with no room on either side, gets
-    // no toolbar rather than one drawn where its message is not. Validated
-    // here, on every commit, and not only when something scrolls: a row the
-    // virtualizer remounts past the edge never gets a toolbar to begin with.
-    const placed = placeAgainstAnchor(
-      menu,
-      bubble,
-      box,
-      left,
-      toolbarGap,
-      toolbarGap,
-      visibleBounds(anchor),
-    );
+    // Beside its own bubble is where the toolbar sits by default (issue
+    // #852): a stack of messages almost always sits closer together than
+    // the toolbar is tall, so above/below either cross into a neighbor
+    // outright or leave only a pointer's-width of clearance to aim at — a
+    // hitbox the reader cannot reliably hit without opening the wrong
+    // message's toolbar instead. The row's own horizontal room is usually
+    // wider than the bubble, so that is the side that actually has space,
+    // and it is the same regardless of what sits above or below.
+    const bounds = visibleBounds(anchor);
+    let placed = placeBeside(menu, bubble, box, isMine, toolbarGap, bounds);
+    // No horizontal room beside it: the list's own top/bottom edge, or a
+    // neighboring message's bubble, is where it goes instead — confined to
+    // what the reader can see of the list, so a bubble near its top edge
+    // gets the toolbar below it rather than over the header, and narrowed
+    // further by the immediate neighbor so a pair grouped close together
+    // does not cross into it (with the same edge padding the list's own
+    // edges get, for the same aiming reason placeBeside is now preferred).
+    // A bubble with no room on any side gets no toolbar rather than one
+    // drawn where its message is not.
+    if (!placed) {
+      const previousBottom = previousBubbleBottom(anchor);
+      const nextTop = nextBubbleTop(anchor);
+      // A message genuinely before or after this one ends or begins at its
+      // own edge; a reading that crosses into this one's own box is not one
+      // to trust — it says nothing sane about the timeline — so the list's
+      // own edge stays the bound instead of forcing a fallback the layout
+      // does not call for.
+      const constrainedBounds = {
+        ...bounds,
+        top:
+          previousBottom !== null && previousBottom > bounds.top && previousBottom <= bubble.top
+            ? previousBottom
+            : bounds.top,
+        bottom:
+          nextTop !== null && nextTop < bounds.bottom && nextTop >= bubble.bottom
+            ? nextTop
+            : bounds.bottom,
+      };
+      placed = placeAgainstAnchor(
+        menu,
+        bubble,
+        box,
+        left,
+        toolbarGap,
+        toolbarGap,
+        constrainedBounds,
+      );
+    }
     if (!placed) dismiss();
   }, [bubbleRef, dismiss, isMine, reactionMenuVisible]);
 

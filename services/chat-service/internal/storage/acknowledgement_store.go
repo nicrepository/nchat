@@ -114,6 +114,14 @@ type AcknowledgementStore interface {
 	ReadAcknowledgementBatch(
 		ctx context.Context, input ReadAcknowledgementBatchInput,
 	) (map[string]domain.AcknowledgementSummary, error)
+
+	// CancelPersistentNotifications stops one message's reminders on its
+	// sender's authority (issue #825). See the statement below for why the
+	// sender is the only authority and why a message that also asked for
+	// confirmation keeps asking for it.
+	CancelPersistentNotifications(
+		ctx context.Context, input CancelPersistentNotificationsInput,
+	) (CancelPersistentNotificationsResult, error)
 }
 
 // PGXAcknowledgementStore implements AcknowledgementStore using a pgx pool.
@@ -155,6 +163,31 @@ var acknowledgementAuthorizedCTE = `
 		  AND ` + messageAccessPredicate("$2") + `
 	)`
 
+// askedForConfirmation restricts a per-recipient row to a message that actually
+// asked for confirmation (issue #825).
+//
+// chat.message_acknowledgements holds one row per recipient for two different
+// requests now — "confirm this" and "keep reminding me about this" — because
+// they share one state machine and one recipient set (#820). The #824 endpoints
+// are about the first of them only, so every one of them applies this predicate
+// and a message that asked only for reminders answers exactly as it did before
+// the column existed: all counts zero, no viewer state, nothing to acknowledge.
+//
+// It is spelled once and used by all five reads for the reason every shared
+// predicate in this file is: a rule stated in five places has five answers, and
+// the one that drifts is whichever nobody is looking at.
+//
+// acknowledgeStatement below is the sixth application and the one that matters
+// most, and it writes the predicate itself rather than referencing this constant
+// because it binds the message to `m` rather than to the authorized CTE. Without
+// it a recipient could POST an acknowledgement to a message that never asked
+// them for one, silently resolving their row and stopping their reminders
+// through an endpoint that would then answer 404.
+//
+// The alias is fixed because both read shapes bind the message row to `a`: the
+// authorized CTE in the message-scoped queries, and the same CTE in the batch.
+const askedForConfirmation = `a.acknowledgement_required`
+
 // acknowledgementSummaryQuery is how a write reports what it did: the counts
 // and the writer's own state, with no per-recipient detail, because the person
 // confirming a message is not the person entitled to the list.
@@ -178,12 +211,14 @@ var acknowledgementSummaryQuery = acknowledgementAuthorizedCTE + `
 		       count(*) FILTER (WHERE ma.state = 'cancelled')::int    AS cancelled
 		FROM chat.message_acknowledgements ma
 		WHERE ma.message_id = a.id
+		  AND ` + askedForConfirmation + `
 	) counts ON true
 	-- The viewer's own row, by full primary key. Absent for the sender of a
 	-- group message and for anybody who joined after it was sent, and absent is
 	-- reported as the empty string rather than as a state.
 	LEFT JOIN chat.message_acknowledgements mine
-	  ON mine.message_id = a.id AND mine.recipient_id = $2::uuid`
+	  ON mine.message_id = a.id AND mine.recipient_id = $2::uuid
+	 AND ` + askedForConfirmation
 
 // acknowledgementBatchQuery answers for a page of messages in one statement.
 //
@@ -220,13 +255,13 @@ var acknowledgementBatchQuery = `
 		       count(*) FILTER (WHERE ma.state = 'expired')::int       AS expired,
 		       count(*) FILTER (WHERE ma.state = 'cancelled')::int     AS cancelled
 		FROM chat.message_acknowledgements ma
-		JOIN authorized a ON a.id = ma.message_id
+		JOIN authorized a ON a.id = ma.message_id AND ` + askedForConfirmation + `
 		GROUP BY ma.message_id
 	),
 	mine AS (
 		SELECT ma.message_id, ma.state
 		FROM chat.message_acknowledgements ma
-		JOIN authorized a ON a.id = ma.message_id
+		JOIN authorized a ON a.id = ma.message_id AND ` + askedForConfirmation + `
 		WHERE ma.recipient_id = $2::uuid
 	)
 	SELECT a.id::text,
@@ -260,7 +295,7 @@ var acknowledgementReadQuery = acknowledgementAuthorizedCTE + `,
 	asked AS (
 		SELECT ma.recipient_id, ma.state, ma.resolved_at
 		FROM chat.message_acknowledgements ma
-		JOIN authorized a ON a.id = ma.message_id
+		JOIN authorized a ON a.id = ma.message_id AND ` + askedForConfirmation + `
 	)
 	SELECT a.acknowledgement_required,
 	       a.sender_id = $2::uuid,
@@ -304,7 +339,7 @@ var acknowledgementReadQuery = acknowledgementAuthorizedCTE + `,
 // write in behind a read that still said yes.
 var acknowledgeStatement = `
 	UPDATE chat.message_acknowledgements a
-	SET state = 'acknowledged', resolved_at = now()
+	SET state = 'acknowledged', resolved_at = now(), next_reminder_at = NULL
 	WHERE a.message_id = $3::uuid
 	  AND a.recipient_id = $2::uuid
 	  AND a.state = 'pending'
@@ -312,6 +347,7 @@ var acknowledgeStatement = `
 		SELECT 1
 		FROM chat.messages m` + messageAccessJoins("$2") + `
 		WHERE m.workspace_id = $1 AND m.id = $3::uuid
+		  AND m.acknowledgement_required
 		  AND ` + messageVisibilityPredicate("m", "$2") + `
 		  AND ` + messageAccessPredicate("$2") + `
 	  )`
@@ -512,4 +548,129 @@ func messageRoute(channelID, conversationID string) AcknowledgementRoute {
 		return AcknowledgementRoute{TargetType: "channel", TargetID: channelID}
 	}
 	return AcknowledgementRoute{TargetType: "dm", TargetID: conversationID}
+}
+
+// ── Persistent notifications (issue #825) ─────────────────────────────────────
+
+// CancelPersistentNotificationsInput identifies the message whose reminders the
+// authenticated sender is stopping.
+//
+// SenderID is the authenticated principal and nothing else. There is no field
+// for a recipient, a state, an attempt count or a deadline: the only thing a
+// caller may say is "stop mine", and everything the statement below decides —
+// which rows, which terminal state, which instant — is decided from the stored
+// row.
+type CancelPersistentNotificationsInput struct {
+	WorkspaceID string
+	MessageID   string
+	SenderID    string
+}
+
+// CancelPersistentNotificationsResult is what one cancellation did.
+//
+// Stopped counts the recipients whose reminders this call ended, so a repeat
+// answers zero. It is the sender's own information about their own message and
+// is a count rather than a list: which named colleague had not answered is the
+// #824 read's question, decided there against that endpoint's own rules.
+type CancelPersistentNotificationsResult struct {
+	Stopped int
+}
+
+// cancelPersistentNotificationsQuery stops the reminders of one message.
+//
+// # Authorization
+//
+// sender_id = $3 is the whole rule, and $3 is the authenticated principal: only
+// the person who started the reminders may stop them. workspace_id = $1 is the
+// tenant scope, taken from the resolved workspace and never from the request
+// body, so a message id belonging to another workspace matches nothing — the
+// same answer a message id that does not exist gets, which is what keeps the
+// endpoint from enumerating.
+//
+// The shared message-access predicate is deliberately *not* applied. Every other
+// message-scoped surface re-checks that the caller can still reach the
+// conversation, because those surfaces read or write something inside it. This
+// one only takes something away: a sender who has since left the channel is
+// still the person whose message is paging people every five minutes, and
+// refusing them the off switch would leave the reminders running for the one
+// reason nobody would accept. Nothing is disclosed either — the answer is a
+// count of rows the caller's own send created.
+//
+// # What it changes, and what it must not
+//
+// next_reminder_at = NULL always: that column *is* the schedule, so clearing it
+// is what ends the reminders, and it takes the row out of
+// idx_message_acknowledgements_due in the same write.
+//
+// The state moves to 'cancelled' only for a message that asked for nothing else.
+// #825 is explicit that cancelling reminders neither deletes the message nor
+// erases acknowledgements, and on a message that also asked for confirmation the
+// row carries both requests: resolving it would silently withdraw a question the
+// sender never withdrew, and would tell them "cancelled" where somebody was
+// still going to answer. So the confirmation survives and only the reminding
+// stops. Where reminders are the only reason the row exists, the state machine
+// #820 specifies is followed exactly and the recipient becomes CANCELLED.
+//
+// # Concurrency
+//
+// state = 'pending' AND next_reminder_at IS NOT NULL is a compare-and-set
+// against the row the statement locks. An acknowledgement, a reply, a deletion
+// or the scheduler's own expiry that committed first stands, and is not
+// rewritten; a second cancellation matches nothing and reports zero, which is
+// the whole of the idempotency contract. Nothing here can return a terminal row
+// to pending.
+//
+// The two counts come from one statement and therefore one snapshot: `authorized`
+// answers "may this caller do this at all" and `stopped` answers "what did it
+// do", so a caller can never be told 404 for a message whose rows this same
+// statement just changed.
+var cancelPersistentNotificationsQuery = `
+	WITH authorized AS (
+		SELECT m.id, m.acknowledgement_required
+		FROM chat.messages m
+		WHERE m.workspace_id = $1::uuid
+		  AND m.id = $2::uuid
+		  AND m.sender_id = $3::uuid
+		  AND m.persistent_notifications
+	),
+	stopped AS (
+		UPDATE chat.message_acknowledgements a
+		SET next_reminder_at = NULL,
+		    state = CASE WHEN authorized.acknowledgement_required
+		                 THEN a.state ELSE 'cancelled' END,
+		    resolved_at = CASE WHEN authorized.acknowledgement_required
+		                       THEN a.resolved_at ELSE now() END
+		FROM authorized
+		WHERE a.message_id = authorized.id
+		  AND a.state = 'pending'
+		  AND a.next_reminder_at IS NOT NULL
+		RETURNING a.recipient_id
+	)
+	SELECT (SELECT count(*) FROM authorized)::int,
+	       (SELECT count(*) FROM stopped)::int`
+
+// CancelPersistentNotifications stops the reminders of one message on its
+// sender's authority (issue #825).
+//
+// Returns ErrNotFound when the message does not exist, belongs to another
+// workspace, was sent by somebody else, or never asked for reminders at all —
+// one answer for all four, so the endpoint cannot be used to discover which
+// messages exist or who sent them.
+//
+// Idempotent: a second call finds nothing left to stop and reports zero, and no
+// recipient who has already answered is touched by either call.
+func (s *PGXAcknowledgementStore) CancelPersistentNotifications(
+	ctx context.Context, input CancelPersistentNotificationsInput,
+) (CancelPersistentNotificationsResult, error) {
+	var authorized, stopped int
+	err := s.pool.QueryRow(ctx, cancelPersistentNotificationsQuery,
+		input.WorkspaceID, input.MessageID, input.SenderID,
+	).Scan(&authorized, &stopped)
+	if err != nil {
+		return CancelPersistentNotificationsResult{}, fmt.Errorf("cancel persistent notifications: %w", err)
+	}
+	if authorized == 0 {
+		return CancelPersistentNotificationsResult{}, domain.ErrNotFound
+	}
+	return CancelPersistentNotificationsResult{Stopped: stopped}, nil
 }

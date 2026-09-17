@@ -173,14 +173,35 @@ type Config struct {
 	// one metric label and nothing else; reconciliation continues either way.
 	LinkSafetySubmitUncertainTimeoutSeconds int
 
-	linkSafetyEnabledInvalid  bool
-	linkPreviewEnabledInvalid bool
+	// ConversationNotificationLevelsEnabled gates the granular per-conversation
+	// notification level introduced by issue #136: `mentions_replies` beside the
+	// mute that already existed.
+	//
+	// Off by default, and that default is the rollout contract rather than
+	// caution. Production runs two release slots against one database, and a
+	// slot from before #136 reads *any* row of
+	// chat.conversation_notification_prefs as a mute. A row saying "mentions and
+	// replies, not silenced" would therefore silence that person on the old slot
+	// — a notification lost by a schema they cannot see. So the reader half
+	// ships first and understands the new shape, the writer half stays closed,
+	// and a deployment opens it once no such reader is left.
+	//
+	// It gates writes only. Every reader in this build already understands a
+	// granular row, with the flag in either position, so enabling it and rolling
+	// back to this same build cannot reinterpret a row that was already written.
+	ConversationNotificationLevelsEnabled bool
+
+	linkSafetyEnabledInvalid                     bool
+	linkPreviewEnabledInvalid                    bool
+	conversationNotificationLevelsEnabledInvalid bool
 }
 
 func Load() Config {
 	wsDefaults := ws.DefaultHandlerConfig()
 	linkSafetyEnabled, linkSafetyEnabledInvalid := configuredBool("CHAT_LINK_SAFETY_ENABLED", false)
 	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("CHAT_LINK_PREVIEW_ENABLED", false)
+	notificationLevelsEnabled, notificationLevelsInvalid := configuredBool(
+		"CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED", false)
 	return Config{
 		ServiceName:                 serviceName,
 		Env:                         platformconfig.GetString("APP_ENV", "development"),
@@ -218,7 +239,6 @@ func Load() Config {
 		WSMaxInvalidMessages:        getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 		LinkSafetyEnabled:           linkSafetyEnabled,
 		LinkPreviewEnabled:          linkPreviewEnabled,
-		linkPreviewEnabledInvalid:   linkPreviewEnabledInvalid,
 		LinkSafetyCloudflareAccount: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", ""),
 		// Never logged, echoed in an error, or sent to a client.
 		LinkSafetyCloudflareToken: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
@@ -232,7 +252,11 @@ func Load() Config {
 			"CHAT_LINK_SAFETY_PROVIDER_SUBMIT_WINDOW_SECONDS", 60),
 		LinkSafetySubmitUncertainTimeoutSeconds: platformconfig.GetInt(
 			"CHAT_LINK_SAFETY_SUBMIT_UNCERTAIN_TIMEOUT_SECONDS", 900),
-		linkSafetyEnabledInvalid: linkSafetyEnabledInvalid,
+		ConversationNotificationLevelsEnabled: notificationLevelsEnabled,
+
+		linkSafetyEnabledInvalid:                     linkSafetyEnabledInvalid,
+		linkPreviewEnabledInvalid:                    linkPreviewEnabledInvalid,
+		conversationNotificationLevelsEnabledInvalid: notificationLevelsInvalid,
 	}
 }
 
@@ -278,6 +302,13 @@ func (c Config) validateLinkSafety() error {
 	}
 	if c.linkPreviewEnabledInvalid {
 		return errors.New("CHAT_LINK_PREVIEW_ENABLED must be a valid boolean")
+	}
+	// A typo in the rollout gate must not read as "off" *or* as "on": the first
+	// would hide a deliberate enablement, the second would open a writer nobody
+	// asked to open. Refusing to start is the only answer that cannot be
+	// mistaken for either.
+	if c.conversationNotificationLevelsEnabledInvalid {
+		return errors.New("CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED must be a valid boolean")
 	}
 	if !c.LinkSafetyEnabled {
 		return nil

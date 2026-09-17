@@ -17,11 +17,11 @@
  *
  * A plain `Map` in a ref, not React state: nothing here needs a render from a
  * single keystroke (the composer reads its own `editor.getJSON()` for that).
- * `summaries` is the one piece of real state, and it is deliberately coarse —
- * it changes only when a draft's sidebar-relevant *kind* changes (empty <->
- * has-text, attachment count, voice present/absent), never on every
- * character, which is what keeps ChatSidebar from re-rendering on every
- * keystroke (issue #769, "PERFORMANCE DA SIDEBAR").
+ * `summaries` is the one piece of real state, and it carries presence only
+ * (issue #845: no text, kind or attachment count) — it changes only at the
+ * EMPTY <-> HAS_DRAFT boundary, never on every character, which is what
+ * keeps ChatSidebar from re-rendering on every keystroke (issue #769,
+ * "PERFORMANCE DA SIDEBAR"; tightened by issue #845, "PERFORMANCE").
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -53,12 +53,18 @@ export interface ConversationDraft {
   updatedAt: number;
 }
 
-export type DraftSummaryKind = "text" | "attachments" | "voice" | "mixed";
-
+/**
+ * Sidebar-relevant summary — issue #845: presence only, never content.
+ * The sidebar's "Rascunho" badge only needs to know a draft exists; it must
+ * never receive text, a preview, a filename or a voice description (issue
+ * #845, "PRIVACIDADE"). Because this carries no content, it is also
+ * trivially the same value across every mutation of a still-non-empty
+ * draft, which is what keeps `summaries` from changing identity on every
+ * keystroke (issue #845, "PERFORMANCE") — it now only flips at the
+ * EMPTY<->HAS_DRAFT boundary.
+ */
 export interface DraftSummary {
-  kind: DraftSummaryKind;
-  text: string | null;
-  attachmentCount: number;
+  hasDraft: true;
 }
 
 export interface ConversationDraftsApi {
@@ -106,23 +112,6 @@ function isTextMeaningful(node: TTNode | null): boolean {
   return (node.content ?? []).some(isTextMeaningful);
 }
 
-function firstLine(node: TTNode | null): string | null {
-  if (!node) return null;
-  const parts: string[] = [];
-  const walk = (n: TTNode) => {
-    if (n.type === "mention") {
-      const label = n.attrs?.label;
-      if (typeof label === "string") parts.push(`@${label}`);
-    } else if (n.text) {
-      parts.push(n.text);
-    }
-    for (const child of n.content ?? []) walk(child);
-  };
-  walk(node);
-  const text = parts.join("").trim();
-  return text.length > 0 ? text : null;
-}
-
 /** Draft #769 "REGRA DE DRAFT VAZIO": empty only when none of these hold. */
 function isDraftEmpty(draft: ConversationDraft): boolean {
   return (
@@ -133,22 +122,8 @@ function isDraftEmpty(draft: ConversationDraft): boolean {
   );
 }
 
-function summaryOf(draft: ConversationDraft): DraftSummary {
-  const hasText = isTextMeaningful(draft.text);
-  const hasAttachments = draft.attachments.length > 0;
-  const hasVoice = draft.voiceMessage !== null;
-  const kinds = [hasText, hasAttachments, hasVoice].filter(Boolean).length;
-  const kind: DraftSummaryKind =
-    kinds > 1 ? "mixed" : hasVoice ? "voice" : hasAttachments ? "attachments" : "text";
-  return {
-    kind,
-    text: hasText ? firstLine(draft.text) : null,
-    attachmentCount: draft.attachments.length,
-  };
-}
-
-function sameSummary(a: DraftSummary | undefined, b: DraftSummary): boolean {
-  return a?.kind === b.kind && a?.text === b.text && a?.attachmentCount === b.attachmentCount;
+function summaryOf(): DraftSummary {
+  return { hasDraft: true };
 }
 
 /**
@@ -177,6 +152,20 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     userIdRef.current = userId;
   });
   const persistTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  // Issue #845: the one place a pending debounced persist for a draftKey is
+  // invalidated. Used both by an explicit clearDraft and by applyMutation's
+  // own EMPTY transition — without this, a timer scheduled while the draft
+  // still had text can outlive a send that emptied it, and fire afterwards
+  // with the pre-send text closed over at schedule time, writing it back
+  // into sessionStorage ("sent draft resurrects" — issue #845 bug 1).
+  const cancelPersist = useCallback((draftKey: string) => {
+    const timer = persistTimersRef.current.get(draftKey);
+    if (timer) {
+      clearTimeout(timer);
+      persistTimersRef.current.delete(draftKey);
+    }
+  }, []);
 
   // Issue #769: hydrates every persisted draft for this user up front, once
   // a real userId is known (login, or an F5 that lands back in an
@@ -208,8 +197,8 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     if (!changed) return;
     setSummaries((prev) => {
       const copy = new Map(prev);
-      for (const [draftKey, draft] of draftsRef.current) {
-        if (!copy.has(draftKey)) copy.set(draftKey, summaryOf(draft));
+      for (const draftKey of draftsRef.current.keys()) {
+        if (!copy.has(draftKey)) copy.set(draftKey, summaryOf());
       }
       return copy;
     });
@@ -222,12 +211,21 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     const timers = persistTimersRef.current;
     const existing = timers.get(draftKey);
     if (existing) clearTimeout(existing);
+    const scheduledRevision = draft.revision;
     timers.set(
       draftKey,
       setTimeout(() => {
         timers.delete(draftKey);
         const uid = userIdRef.current;
         if (!uid) return;
+        // Issue #845 defense-in-depth: the primary fix is that every path
+        // that empties/replaces this draft cancels this timer outright (see
+        // cancelPersist). This is a second, independent guard in case some
+        // future mutation path forgets to — if the draft in memory is gone
+        // or has moved past the revision this timer was scheduled for,
+        // something else already superseded what this timer would write,
+        // so it must not write at all.
+        if (draftsRef.current.get(draftKey)?.revision !== scheduledRevision) return;
         // Only text + the id of what is being replied to ever leave memory
         // (issue #769, "NÃO USE LOCALSTORAGE PARA BLOBS" / narrow F5 exception
         // to the "no message content in storage" invariant — see
@@ -250,6 +248,10 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
 
       if (isDraftEmpty(next)) {
         draftsRef.current.delete(draftKey);
+        // Issue #845 bug 1: a debounce timer scheduled while this draft
+        // still had text (e.g. right before a send cleared it) must not be
+        // allowed to outlive this transition and write stale text back.
+        cancelPersist(draftKey);
         clearDraftPersistence(userIdRef.current, draftKey);
       } else {
         draftsRef.current.set(draftKey, next);
@@ -264,22 +266,21 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
         }
       }
 
-      const nextSummary = isDraftEmpty(next) ? undefined : summaryOf(next);
+      // Issue #845, "PERFORMANCE": the summary carries no content, so it can
+      // only ever meaningfully change at the EMPTY<->HAS_DRAFT boundary —
+      // never mid-draft, which is what previously made this fire (and
+      // re-render every sidebar row) on every keystroke.
+      const hasDraft = !isDraftEmpty(next);
       setSummaries((prev) => {
-        const prevSummary = prev.get(draftKey);
-        if (nextSummary === undefined) {
-          if (prevSummary === undefined) return prev;
-          const copy = new Map(prev);
-          copy.delete(draftKey);
-          return copy;
-        }
-        if (sameSummary(prevSummary, nextSummary)) return prev;
+        const hadDraft = prev.has(draftKey);
+        if (hasDraft === hadDraft) return prev;
         const copy = new Map(prev);
-        copy.set(draftKey, nextSummary);
+        if (hasDraft) copy.set(draftKey, summaryOf());
+        else copy.delete(draftKey);
         return copy;
       });
     },
-    [schedulePersist],
+    [schedulePersist, cancelPersist],
   );
 
   const getDraft = useCallback((draftKey: string): ConversationDraft | undefined => {
@@ -347,23 +348,22 @@ export function useConversationDrafts(userId: string): ConversationDraftsApi {
     [applyMutation],
   );
 
-  const clearDraft = useCallback((draftKey: string) => {
-    const existing = draftsRef.current.get(draftKey);
-    if (existing?.voiceMessage) URL.revokeObjectURL(existing.voiceMessage.previewUrl);
-    const timer = persistTimersRef.current.get(draftKey);
-    if (timer) {
-      clearTimeout(timer);
-      persistTimersRef.current.delete(draftKey);
-    }
-    draftsRef.current.delete(draftKey);
-    clearDraftPersistence(userIdRef.current, draftKey);
-    setSummaries((prev) => {
-      if (!prev.has(draftKey)) return prev;
-      const copy = new Map(prev);
-      copy.delete(draftKey);
-      return copy;
-    });
-  }, []);
+  const clearDraft = useCallback(
+    (draftKey: string) => {
+      const existing = draftsRef.current.get(draftKey);
+      if (existing?.voiceMessage) URL.revokeObjectURL(existing.voiceMessage.previewUrl);
+      cancelPersist(draftKey);
+      draftsRef.current.delete(draftKey);
+      clearDraftPersistence(userIdRef.current, draftKey);
+      setSummaries((prev) => {
+        if (!prev.has(draftKey)) return prev;
+        const copy = new Map(prev);
+        copy.delete(draftKey);
+        return copy;
+      });
+    },
+    [cancelPersist],
+  );
 
   const clearAllDrafts = useCallback(() => {
     for (const timer of persistTimersRef.current.values()) clearTimeout(timer);

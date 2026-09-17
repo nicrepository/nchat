@@ -98,6 +98,35 @@ export interface WSMessagePayload {
   link_safety_state?: unknown;
   /** Issue #807 per-link entities, the same shape the HTTP contract carries. */
   links?: unknown;
+  /**
+   * The author's stated priority (issue #821): standard, important or urgent.
+   * Typed unknown because it is a value this client classifies rather than
+   * trusts a shape of — normalizeMessagePriority narrows it, and anything it
+   * does not recognise is read as an ordinary message. Absent on a pre-#840
+   * server.
+   */
+  priority?: unknown;
+  /**
+   * The message asked its recipients to confirm receipt (issue #824). Only the
+   * flag — who was asked and who answered is a separate authorised read, and
+   * broadcasting a recipient list to a conversation's subscribers is exactly
+   * the exposure #824 refuses.
+   *
+   * Carried here so a message inserted from this event and the same message
+   * after a reload render identically (issue #823); absent on a pre-#824
+   * server, which asked nobody.
+   */
+  acknowledgement_required?: unknown;
+  /**
+   * The message asked to keep reminding its recipients until they confirm,
+   * answer, or the reminders run out (issue #825), shown as the
+   * "Persistente" notice (issue #846).
+   *
+   * Carried here for the same reason acknowledgement_required is: a message
+   * inserted from this event and the same message after a reload must render
+   * identically. Absent on a pre-#846 server.
+   */
+  persistent_notifications?: unknown;
   /** The central delivery decision. See WSNotificationPolicy. */
   notification_policy?: WSNotificationPolicy;
   is_removed: boolean;

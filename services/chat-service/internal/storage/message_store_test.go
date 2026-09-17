@@ -77,6 +77,9 @@ func messageCols() []string {
 		// Whether the author asked for explicit confirmation (issue #824).
 		// NOT NULL DEFAULT false, on the same terms.
 		"acknowledgement_required",
+		// Whether the author asked for persistent reminders (issue #825).
+		// NOT NULL DEFAULT false, on the same terms again.
+		"persistent_notifications",
 	}
 }
 
@@ -97,6 +100,8 @@ func messageRow(id, workspaceID, channelID, dmID string, now time.Time) []any {
 		// The priority almost every message carries.
 		"standard",
 		// Almost no message asks for confirmation.
+		false,
+		// Fewer still ask to keep reminding.
 		false,
 	}
 }
@@ -180,6 +185,8 @@ func expectCreate(mock pgxmock.PgxPoolIface, rows *pgxmock.Rows) {
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(rows)
 }
@@ -251,6 +258,8 @@ func TestPGXMessageStore_CreateMessageMapsAttachmentConstraintErrors(t *testing.
 					pgxmock.AnyArg(), // priority (issue #821)
 					pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 					pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(), // persistent_notifications (issue #825)
+					pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 				).
 				WillReturnError(dbErr)
 
@@ -602,7 +611,9 @@ func TestPGXMessageStore_CreateMessage_SQLContainsAuthGuards(t *testing.T) {
 					pgxmock.AnyArg(),  // max_group_all_mention_recipients (issue #776 SR-002)
 					pgxmock.AnyArg(),  // priority (issue #821)
 					pgxmock.AnyArg(),  // acknowledgement_required (issue #824)
-					pgxmock.AnyArg()). // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(),  // max_acknowledgement_recipients (issue #824)
+					pgxmock.AnyArg(),  // persistent_notifications (issue #825)
+					pgxmock.AnyArg()). // urgent reminder interval seconds (issue #825)
 				WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 			store := storage.NewPGXMessageStore(mock)
 			_, err := store.CreateMessage(context.Background(), tc.input)
@@ -631,6 +642,8 @@ func TestPGXMessageStore_CreateMessage_ValidatesMentionsAndWritesDirectedOutbox(
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-mention", "ws-1", "ch-1", "", now)...))
@@ -680,6 +693,8 @@ func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound
 			pgxmock.AnyArg(),                    // priority (issue #821)
 			pgxmock.AnyArg(),                    // acknowledgement_required (issue #824)
 			domain.MaxAcknowledgementRecipients, // the bound, never a literal in SQL
+			pgxmock.AnyArg(),                    // persistent_notifications (issue #825)
+			pgxmock.AnyArg(),                    // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-bounded", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -711,6 +726,8 @@ func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOu
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
 			AddRow(listMessageWithQuoteRow("msg-group-mention", "ws-1", "", "33333333-3333-3333-3333-333333333333", now)...))
@@ -742,6 +759,8 @@ func TestPGXMessageStore_CreateMessage_UserOutsideChannelIsRejected(t *testing.T
 			pgxmock.AnyArg(), // priority (issue #821)
 			pgxmock.AnyArg(), // acknowledgement_required (issue #824)
 			pgxmock.AnyArg(), // max_acknowledgement_recipients (issue #824)
+			pgxmock.AnyArg(), // persistent_notifications (issue #825)
+			pgxmock.AnyArg(), // urgent reminder interval seconds (issue #825)
 		).
 		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()))
 
@@ -946,6 +965,8 @@ func TestPGXMessageStore_CreateMessage_WithEditedAt_ScansBothTimestamps(t *testi
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
 		"standard",
+		false,
+		// persistent_notifications (issue #825).
 		false,
 		"Test User", "test@example.com", "", false,
 	}
@@ -1530,6 +1551,59 @@ func TestPGXMessageStore_ListChannelMessages_JoinsQuotedParent(t *testing.T) {
 	checkExpectations(t, mock)
 }
 
+// The canonical reply fact is filled on every projection that joins the parent,
+// not only on the single-message read (issue #136).
+//
+// It is asserted on the listing specifically because that is the path where the
+// two used to disagree: the assignment lived in scanMessageWithSenderAndQuote
+// and not in the listing's collector, so whether a message "answered somebody"
+// depended on which query produced it. Both now go through quoteOptionals.attach
+// and there is one answer.
+//
+// ReplyToSenderID is the parent's author, and deliberately not read off
+// msg.Quoted: that preview is blanked for a removed parent and withheld for a
+// condemned body, and neither changes who was answered.
+func TestPGXMessageStore_ListChannelMessages_CarriesTheCanonicalReplyFact(t *testing.T) {
+	mock := newMock(t)
+	now := time.Now()
+	mock.ExpectQuery(`SELECT`).
+		WithArgs("ws-1", "ch-1", "user-1", 51).
+		WillReturnRows(pgxmock.NewRows(listMessageWithQuoteCols()).
+			AddRow(listMessageRowWithQuote(
+				"msg-child", "ws-1", "ch-1", "", now,
+				quoteRow("msg-parent", "user-parent", "parent body", "v1", "active", nil, now),
+			)...).
+			AddRow(listMessageWithQuoteRow("msg-orphan", "ws-1", "ch-1", "", now)...))
+	expectReactionBatch(mock, emptyReactionRows())
+	expectAttachmentBatch(mock, emptyAttachmentRows())
+
+	result, err := storage.NewPGXMessageStore(mock).ListChannelMessages(
+		context.Background(), storage.ListChannelMessagesInput{
+			WorkspaceID: "ws-1", ChannelID: "ch-1", UserID: "user-1",
+		})
+	if err != nil {
+		t.Fatalf("ListChannelMessages: %v", err)
+	}
+	if len(result.Messages) != 2 {
+		t.Fatalf("listed %d messages, want 2", len(result.Messages))
+	}
+	// Addressed by id rather than by position: the listing owns its own order,
+	// and this test is about the fact each row carries, not about where it lands.
+	byID := map[string]domain.Message{}
+	for _, msg := range result.Messages {
+		byID[msg.ID] = msg
+	}
+	if got := byID["msg-child"].ReplyToSenderID; got != "user-parent" {
+		t.Fatalf("ReplyToSenderID = %q, want the parent's author", got)
+	}
+	// A message that quotes nothing answered nobody, and must not borrow another
+	// row's fact.
+	if got := byID["msg-orphan"].ReplyToSenderID; got != "" {
+		t.Fatalf("a message with no parent reported ReplyToSenderID = %q", got)
+	}
+	checkExpectations(t, mock)
+}
+
 func TestPGXMessageStore_ListChannelMessages_EmptyReturnsEmptySlice(t *testing.T) {
 	mock := newMock(t)
 	mock.ExpectQuery(`SELECT`).
@@ -1566,6 +1640,8 @@ func TestPGXMessageStore_ListChannelMessages_WithEditedAt_ScansBothTimestamps(t 
 		// No conversation event: this is a user message (issue #527).
 		"", []byte(nil),
 		"standard",
+		false,
+		// persistent_notifications (issue #825).
 		false,
 		"Test User", "test@example.com", "", false,
 	}

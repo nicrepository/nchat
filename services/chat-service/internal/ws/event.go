@@ -367,6 +367,15 @@ type MessagePayload struct {
 	// state is are a separate, authorised read — broadcasting a recipient list
 	// to a conversation's subscribers is exactly the exposure #824 refuses.
 	AcknowledgementRequired bool `json:"acknowledgement_required"`
+	// PersistentNotifications says this urgent message keeps reminding its
+	// recipients until they confirm, answer, or the reminders run out (issue
+	// #825), mirroring the HTTP message contract's field of the same name.
+	//
+	// Same reasoning as AcknowledgementRequired above: a message inserted from
+	// this event and the same message after a reload must render identically
+	// (issue #846), so a flag carried by only one of the two paths would show
+	// the persistent-reminder notice after a refresh and not before it.
+	PersistentNotifications bool `json:"persistent_notifications"`
 	// LinkSafetyState is the link-safety axis, independent of Status (issue #135).
 	// A subscriber uses it to decide whether to draw the "could not verify this
 	// link" notice on a message it is inserting. It authorises nothing — see
@@ -376,14 +385,29 @@ type MessagePayload struct {
 	// Links are the per-occurrence link entities (issue #807), the same shape
 	// the HTTP contract carries. Like Attachments they are dropped from the event
 	// relayed over the bus, where a remote instance re-reads the message.
-	Links       []LinkPayload `json:"links,omitempty"`
-	IsRemoved   bool          `json:"is_removed"`
-	CreatedAt   time.Time     `json:"created_at"`
-	UpdatedAt   time.Time     `json:"updated_at"`
-	EditedAt    *time.Time    `json:"edited_at,omitempty"`
-	DeletedAt   *time.Time    `json:"deleted_at,omitempty"`
-	Quoted      *QuotePayload `json:"quoted,omitempty"`
-	IsForwarded bool          `json:"is_forwarded"`
+	Links     []LinkPayload `json:"links,omitempty"`
+	IsRemoved bool          `json:"is_removed"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+	EditedAt  *time.Time    `json:"edited_at,omitempty"`
+	DeletedAt *time.Time    `json:"deleted_at,omitempty"`
+	Quoted    *QuotePayload `json:"quoted,omitempty"`
+	// ReplyToSenderID is the author of the message this one answers, as the
+	// server read it from the persisted parent (issue #136).
+	//
+	// It is carried beside Quoted rather than taken from it because the two are
+	// different kinds of thing: Quoted is the preview a reader is allowed to
+	// see, and this is the fact a delivery decision is made from.
+	// RecipientPolicy.PolicyFor reads it to tell "this answers you" from "this
+	// was posted here", which is what a conversation level turns on — so a
+	// payload that inferred it from the preview would lose the classification
+	// for exactly the messages whose preview is withheld.
+	//
+	// It grants nothing and identifies nobody a subscriber is not already
+	// reading messages beside. Omitted for the overwhelming majority of
+	// messages, which answer nothing.
+	ReplyToSenderID string `json:"reply_to_sender_id,omitempty"`
+	IsForwarded     bool   `json:"is_forwarded"`
 	// Attachments lets a subscriber render a message that carries a file without
 	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
 	// metadata the list endpoints publish and grants nothing: content and preview

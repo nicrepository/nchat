@@ -4,8 +4,9 @@
  * Everything that interrupts the reader for an incoming message goes through
  * `presentLiveMessageNotification`: the in-app toast, the chime, the OS-level
  * notification. No component plays audio, opens a channel, or decides on its
- * own whether an event deserves a surface — this module is the only importer of
- * messageSound.ts, and the only place the three surfaces are executed.
+ * own whether an event deserves a surface — this module is the only caller of
+ * the notification sound player from the message path, and the only place the
+ * three surfaces are executed.
  *
  * What it deliberately does **not** own, because each already has an owner:
  *
@@ -119,11 +120,17 @@
  */
 
 import { showBrowserMessageNotification } from "./browserNotification";
+import type { MessagePriority } from "./chatTypes";
 import type { InAppAlert } from "./InAppMessageAlert";
 import { buildMessagePreview } from "./messagePreview";
-import { playMessageSound } from "./messageSound";
+import { playNotificationSound } from "../notifications/notificationSound";
 import { sessionScoped } from "../lib/sessionScoped";
 import { createBurstGate } from "./notificationBurst";
+import {
+  resolveNotificationClass,
+  type AttentionContext,
+  type NotificationClass,
+} from "./notificationClass";
 import { getSoundNotificationMode } from "./soundPreference";
 import {
   isNamedRecipient,
@@ -162,6 +169,13 @@ export interface MessageNotificationEvent {
   senderAvatarUrl?: string;
   bodyText: string;
   conversationName: string;
+  /**
+   * The author's stated priority (#821), already normalised by the caller — a
+   * server that predates the axis therefore arrives as "standard". It decides
+   * the notification class and nothing else: it is a claim about attention, not
+   * an authorisation, and no gate below reads it.
+   */
+  priority: MessagePriority;
   /** The central decision (#744). Absent means a server that predates it. */
   policy: WSNotificationPolicy | undefined;
 }
@@ -191,13 +205,26 @@ interface AuthorisedSurfaces {
   sound: boolean;
 }
 
+/**
+ * Reads the browser facts the attention context is made of, at the edge.
+ *
+ * This is the only place `document` is consulted for them. The policy that uses
+ * them (notificationClass) receives them already resolved, which is what keeps
+ * the precedence matrix testable without a browser — and keeps the two facts
+ * apart: a hidden tab and an unfocused window are different states, and #826
+ * requires both to disqualify a conversation from counting as attended.
+ */
+function readAttentionContext(context: MessagePresentationContext): AttentionContext {
+  return {
+    conversationOpen: context.isActiveConversation,
+    documentVisible: document.visibilityState === "visible",
+    windowFocused: typeof document.hasFocus === "function" && document.hasFocus(),
+  };
+}
+
 /** Whether this window is in front of the reader right now. */
-function isWindowFocused(): boolean {
-  return (
-    document.visibilityState === "visible" &&
-    typeof document.hasFocus === "function" &&
-    document.hasFocus()
-  );
+function isWindowFocused(attention: AttentionContext): boolean {
+  return attention.documentVisible && attention.windowFocused;
 }
 
 /**
@@ -208,8 +235,9 @@ function isWindowFocused(): boolean {
 function authorisedSurfaces(
   event: MessageNotificationEvent,
   context: MessagePresentationContext,
+  attention: AttentionContext,
 ): AuthorisedSurfaces {
-  const focused = isWindowFocused();
+  const focused = isWindowFocused(attention);
   const execution = {
     policy: event.policy,
     currentUserId: context.currentUserId,
@@ -266,13 +294,20 @@ function raiseNative(event: MessageNotificationEvent, sinks: MessagePresentation
 /**
  * Executes whichever surfaces were authorised.
  *
- * The chime is last and is swallowed whole: playMessageSound() already never
- * throws and already absorbs the autoplay rejection, and this is the guarantee
- * that a failed sound stays a failed sound — it cannot alter unread, cannot
- * stop the event being processed, and is never retried.
+ * The chime is last and is swallowed whole: playNotificationSound() already
+ * never throws and already absorbs the autoplay rejection, and this is the
+ * guarantee that a failed sound stays a failed sound — it cannot alter unread,
+ * cannot stop the event being processed, and is never retried.
+ *
+ * Which of the Lumen sounds plays is the resolved class and nothing else
+ * (#826/#827): `NotificationClass` is assignable to `NotificationSound`, so the
+ * class this event was already given *is* the key, checked by the compiler.
+ * There is no second classification here, and no file name either — this module
+ * has never known where a sound lives and still does not.
  */
 function executeSurfaces(
   event: MessageNotificationEvent,
+  notificationClass: NotificationClass,
   surfaces: AuthorisedSurfaces,
   sinks: MessagePresentationSinks,
 ): void {
@@ -280,7 +315,7 @@ function executeSurfaces(
   const nativeShown = surfaces.native && raiseNative(event, sinks);
   if (nativeShown || !surfaces.sound) return;
   try {
-    playMessageSound();
+    playNotificationSound(notificationClass);
   } catch {
     // Swallowed on purpose: see above.
   }
@@ -350,17 +385,20 @@ const presentationMemory = sessionScoped(() => createBurstGate());
  * rest of the app for it would hide unrelated activity — the cheapest way to
  * turn a fix for noise into a fix for hearing anything at all.
  *
- * Split by whether the message names this recipient, because a room going fast
- * is exactly when a message addressed to them personally must still be audible.
- * That split is not a new priority: it is `named_user_ids`/`names_everyone`,
- * decided by the server's own mention codec and already read by soundRules.
+ * Split by the notification class, because a room going fast is exactly when a
+ * message that outranks ambient activity — one that names this reader, one its
+ * author marked urgent — must still be audible. The class is the resolved one
+ * (#826), not a second reading of the event here: this module asks for it once
+ * and every use of it downstream is the same answer.
  *
  * Nothing else composes the key. Adding the sender would let one person per
  * room chime freely; adding the message would be no cooldown at all.
  */
-function soundCooldownKey(event: MessageNotificationEvent, currentUserId: string): string {
-  const named = isNamedRecipient(event.policy, currentUserId);
-  return `${event.targetKind}:${event.targetId}:${named ? "named" : "room"}`;
+function soundCooldownKey(
+  event: MessageNotificationEvent,
+  notificationClass: NotificationClass,
+): string {
+  return `${event.targetKind}:${event.targetId}:${notificationClass}`;
 }
 
 /**
@@ -373,14 +411,14 @@ function soundCooldownKey(event: MessageNotificationEvent, currentUserId: string
  */
 function presentOnce(
   event: MessageNotificationEvent,
-  context: MessagePresentationContext,
+  notificationClass: NotificationClass,
   surfaces: AuthorisedSurfaces,
   sinks: MessagePresentationSinks,
 ): void {
   const memory = presentationMemory();
   memory.markPresented(event.eventId);
-  const sound = surfaces.sound && memory.allowSound(soundCooldownKey(event, context.currentUserId));
-  executeSurfaces(event, { ...surfaces, sound }, sinks);
+  const sound = surfaces.sound && memory.allowSound(soundCooldownKey(event, notificationClass));
+  executeSurfaces(event, notificationClass, { ...surfaces, sound }, sinks);
 }
 
 /**
@@ -448,9 +486,19 @@ export async function presentLiveMessageNotification(
   // This client's own memory first. Checked before the claim so a tab that
   // already announced an event does not take it from one that has not.
   if (presentationMemory().hasPresented(event.eventId)) return "repeat";
-  const surfaces = authorisedSurfaces(event, context);
+  const attention = readAttentionContext(context);
+  const surfaces = authorisedSurfaces(event, context, attention);
   // Nothing to present is not a claim: a tab with the conversation open must
   // not take the event away from a tab that would actually announce it.
   if (!surfaces.inApp && !surfaces.native && !surfaces.sound) return "suppressed";
-  return await claimAndPresent(event.eventId, () => presentOnce(event, context, surfaces, sinks));
+  // Resolved once, here, and handed down. Every surface below is told which
+  // class this event has; none of them works it out again (#826).
+  const notificationClass = resolveNotificationClass({
+    priority: event.priority,
+    namesRecipient: isNamedRecipient(event.policy, context.currentUserId),
+    attention,
+  });
+  return await claimAndPresent(event.eventId, () =>
+    presentOnce(event, notificationClass, surfaces, sinks),
+  );
 }

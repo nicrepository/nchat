@@ -1,51 +1,97 @@
+/*
+ * SessionsSettingsPage — /profile/sessions (issues #672 §4.3, #859).
+ *
+ * Same page anatomy as NotificationsSettingsPage (#729): no width of its own —
+ * ProfileSettingsShell already centres the settings column — and colours from
+ * the shell's scoped tokens, so no `prefers-color-scheme` block. The card is the
+ * prototype's "Dispositivos conectados" section (sessoes.html).
+ */
+
 .sessions-settings {
-  max-width: 640px;
-  margin: 0 auto;
-  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .sessions-settings__header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .sessions-settings__title {
-  font-size: 22px;
-  font-weight: 700;
   margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
 }
 
 .sessions-settings__scope {
-  margin: 0 0 16px;
-  color: rgba(0, 0, 0, 0.62);
+  margin: 0;
+  font-size: 14px;
+  color: var(--color-muted, #7c7390);
+}
+
+/* ── Card ──────────────────────────────────────────────────────────────────── */
+
+.sessions-settings__card {
+  background: var(--color-surface, #ffffff);
+  border: 1px solid var(--color-border, #e8e3f0);
+  border-radius: var(--radius-lg, 14px);
+  overflow: hidden;
+}
+
+.sessions-settings__card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 14px 20px;
+  background: var(--color-surface-2, #faf8fd);
+  border-bottom: 1px solid var(--color-border, #e8e3f0);
+}
+
+.sessions-settings__card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-ink, #16121f);
+}
+
+.sessions-settings__card-sub {
+  margin: 2px 0 0;
   font-size: 13px;
+  color: var(--color-muted, #7c7390);
 }
 
 .sessions-settings__revoke-all {
-  padding: 8px 16px;
-  border-radius: 8px;
-  border: 1px solid rgba(180, 35, 24, 0.35);
-  background: #fff;
-  color: #b42318;
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  color: var(--color-danger, #dc2626);
+  font: inherit;
   font-size: 13px;
   font-weight: 600;
-  cursor: pointer;
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .sessions-settings__revoke-all:hover {
-  background: rgba(180, 35, 24, 0.06);
+  background: var(--color-danger-tint, #fee2e2);
+}
+
+.sessions-settings__revoke-all:focus-visible,
+.sessions-settings__error button:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
 }
 
 .sessions-settings__list {
   margin: 0;
-  padding: 0;
-  border: 1px solid rgba(0, 0, 0, 0.08);
-  border-radius: 12px;
-  padding: 0 20px;
+  padding: 4px 20px;
 }
 
 .sessions-settings__loading {
@@ -55,34 +101,30 @@
 }
 
 .sessions-settings__error {
-  display: flex;
-  flex-direction: column;
   align-items: flex-start;
   gap: 12px;
+  color: var(--color-ink, #16121f);
+}
+
+.sessions-settings__error p {
+  margin: 0;
 }
 
 .sessions-settings__error button {
   padding: 8px 16px;
-  border-radius: 8px;
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  background: #fff;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #ffffff);
+  color: inherit;
+  font: inherit;
   font-size: 14px;
   cursor: pointer;
 }
 
-@media (prefers-color-scheme: dark) {
-  .sessions-settings__scope {
-    color: rgba(255, 255, 255, 0.68);
-  }
+@media (max-width: 479.98px) {
+  .sessions-settings__card-head,
   .sessions-settings__list {
-    border-color: rgba(255, 255, 255, 0.12);
-  }
-  .sessions-settings__revoke-all {
-    background: transparent;
-  }
-  .sessions-settings__error button {
-    background: transparent;
-    border-color: rgba(255, 255, 255, 0.2);
-    color: inherit;
+    padding-left: 16px;
+    padding-right: 16px;
   }
 }

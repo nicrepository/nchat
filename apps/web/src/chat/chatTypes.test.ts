@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { parseDMConversationType, partitionDMs, type DMConversation } from "./chatTypes";
+import {
+  conversationNotificationMode,
+  normalizeMessagePriority,
+  parseDMConversationType,
+  partitionDMs,
+  type DMConversation,
+} from "./chatTypes";
 
 function dm(id: string, type: DMConversation["type"], name = id): DMConversation {
   return { id, type, name, participants: [] };
@@ -121,6 +127,75 @@ describe("parseDMConversationType", () => {
       { type: "direct" },
     ]) {
       expect(parseDMConversationType(value)).toBeUndefined();
+    }
+  });
+});
+
+describe("normalizeMessagePriority", () => {
+  it("keeps each of the three values the server persists", () => {
+    expect(normalizeMessagePriority("standard")).toBe("standard");
+    expect(normalizeMessagePriority("important")).toBe("important");
+    expect(normalizeMessagePriority("urgent")).toBe("urgent");
+  });
+
+  // Absent is a chat-service that predates the axis (#840), which is the
+  // behaviour every message had before it existed.
+  it("reads an absent priority as standard", () => {
+    expect(normalizeMessagePriority()).toBe("standard");
+    expect(normalizeMessagePriority(undefined)).toBe("standard");
+    expect(normalizeMessagePriority(null)).toBe("standard");
+  });
+
+  // The fail-closed direction for this axis: the only thing a priority can do
+  // is escalate an alert, so a value this build does not understand must never
+  // be the one that escalates it.
+  it("refuses to escalate on anything it does not recognise", () => {
+    for (const value of [
+      "URGENT",
+      " urgent",
+      "urgent ",
+      "critical",
+      "",
+      "  ",
+      0,
+      1,
+      true,
+      {},
+      [],
+      ["urgent"],
+      { priority: "urgent" },
+    ]) {
+      expect(normalizeMessagePriority(value)).toBe("standard");
+    }
+  });
+});
+
+// The one shared derivation both surfaces read (issue #136). It has to live in
+// exactly one place: the profile select and the sidebar row menu would
+// otherwise be two answers to "what is this conversation set to".
+describe("conversationNotificationMode", () => {
+  it("reads the level when nothing is silenced", () => {
+    expect(conversationNotificationMode({ notificationLevel: "all" })).toBe("all");
+    expect(conversationNotificationMode({ notificationLevel: "mentions_replies" })).toBe(
+      "mentions_replies",
+    );
+  });
+
+  it("lets the mute win over whatever level it is hiding", () => {
+    expect(conversationNotificationMode({ muted: true, notificationLevel: "all" })).toBe("muted");
+    expect(
+      conversationNotificationMode({ muted: true, notificationLevel: "mentions_replies" }),
+    ).toBe("muted");
+  });
+
+  it("reads a conversation nobody configured as the product default", () => {
+    expect(conversationNotificationMode({})).toBe("all");
+    expect(conversationNotificationMode({ muted: false })).toBe("all");
+  });
+
+  it("never invents silence out of a level it cannot interpret", () => {
+    for (const level of ["", "mentions_only", "MUTED", "muted", "all "]) {
+      expect(conversationNotificationMode({ notificationLevel: level })).toBe("all");
     }
   });
 });

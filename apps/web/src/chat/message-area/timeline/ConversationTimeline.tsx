@@ -7,6 +7,13 @@
  * the page around it.
  */
 
+import { useMemo } from "react";
+
+import type { CallParticipantProfile } from "../../chatApi";
+import {
+  fetchChannelCallParticipantProfiles,
+  fetchGroupCallParticipantProfiles,
+} from "../../chatApi";
 import type { MentionTarget, MessageAcknowledgement } from "../../chatTypes";
 import type { ViewportAnchor } from "../../chatViewportPersistence";
 import { systemScopeFor } from "../../conversationSystemMessage";
@@ -49,8 +56,31 @@ export interface ConversationTimelineProps {
   onReachedBottom: () => void;
 }
 
+/**
+ * Resolves recipient identities for the acknowledgement details popover
+ * (issue #846), scoped to whichever aggregate this conversation actually is.
+ *
+ * Undefined for a 1:1 DM: that view never offers the popover (see
+ * MessageAcknowledgement's direct wording for a single recipient), so there is
+ * nothing here for it to call.
+ */
+function recipientIdentityResolver(
+  kind: "channel" | "dm",
+  targetId: string,
+  detailsKind: ConversationDetailsKind | null,
+): ((userIds: string[], signal?: AbortSignal) => Promise<CallParticipantProfile[]>) | undefined {
+  if (!targetId || detailsKind === "direct" || detailsKind === null) return undefined;
+  return kind === "channel"
+    ? (userIds, signal) => fetchChannelCallParticipantProfiles(targetId, userIds, signal)
+    : (userIds, signal) => fetchGroupCallParticipantProfiles(targetId, userIds, signal);
+}
+
 export default function ConversationTimeline(props: ConversationTimelineProps) {
   const { kind, targetId, name, state, actions } = props;
+  const resolveRecipientIdentities = useMemo(
+    () => recipientIdentityResolver(kind, targetId, props.detailsKind),
+    [kind, targetId, props.detailsKind],
+  );
   if (state.status === "loading") return <LoadingSkeleton />;
   if (state.status === "error") return <ErrorState onRetry={props.onRetry} />;
   if (state.status !== "ready") return null;
@@ -78,6 +108,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       openingAuthorDMIds={props.openingAuthorDMIds}
       acknowledgements={props.acknowledgements}
       acknowledgingId={props.acknowledgingId}
+      resolveRecipientIdentities={resolveRecipientIdentities}
       recentReactionEmojis={props.recentReactionEmojis}
       emojiUsage={props.emojiUsage}
       onEmojiToneChange={props.onEmojiToneChange}

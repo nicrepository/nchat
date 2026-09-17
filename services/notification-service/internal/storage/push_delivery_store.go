@@ -88,12 +88,41 @@ type PushDeliveryStore interface {
 // the push service's own 404 or 410 retires one, and that is already recorded
 // as status. Reading failure_count here would be a second, quieter retirement
 // policy disagreeing with the first.
+//
+// # The recipient's global account (SR-001, defense-in-depth)
+//
+// The control that matters for SR-001 is in presentationProjection: message
+// text must not be *materialised* for a suspended account, and a filter here
+// would be too late for that — the claim has already read it.
+//
+// This is the second layer, and it answers a different question: should a
+// suspended or deleted account receive a push at all, even the generic one
+// version 1 sends? No. Suspending somebody revokes their sessions
+// (authsession.ActiveSessionCTE) but leaves chat.push_subscriptions standing,
+// so without this an account the product has stopped serving still learns that
+// activity concerning them exists, and when.
+//
+// The predicate is character-for-character the one in presentationProjection,
+// including the alias, because two answers to "is this account active" that can
+// drift apart is the shape of the original defect. TestListDeliverableGuards
+// pins both.
+//
+// A recipient filtered out here returns no targets, which the deliverer already
+// treats as errPushNoTarget — permanent, logged, terminal. That is the correct
+// reading: nobody was told, and under this account nobody should be.
 const listDeliverableQuery = `
 	SELECT s.id::text, s.generation, s.endpoint, s.p256dh, s.auth
 	FROM chat.push_subscriptions s
 	WHERE s.workspace_id = $2::uuid
 	  AND s.user_id = $3::uuid
 	  AND s.status = 'active'
+	  AND EXISTS (
+	      SELECT 1
+	      FROM auth.users recipient_user
+	      WHERE recipient_user.id = $3::uuid
+	        AND recipient_user.status = 'active'
+	        AND recipient_user.deleted_at IS NULL
+	  )
 	  AND NOT EXISTS (
 	      SELECT 1
 	      FROM chat.notification_push_deliveries d

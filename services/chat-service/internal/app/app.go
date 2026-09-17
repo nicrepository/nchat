@@ -687,6 +687,11 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		// Carried on a removed message too, like Priority above: what a message
 		// asked for is not content, and the removal path blanks content.
 		AcknowledgementRequired: msg.AcknowledgementRequired,
+		// PersistentNotifications mirrors the HTTP message contract's field of
+		// the same name (issue #825), for the same reason AcknowledgementRequired
+		// does: a message inserted from this event and the same message after a
+		// reload must render identically.
+		PersistentNotifications: msg.PersistentNotifications,
 		LinkSafetyState:         string(msg.LinkSafety),
 		Links:                   domainLinksToWSPayload(msg.Links),
 		IsRemoved:               removed,
@@ -695,10 +700,14 @@ func domainMessageToWSPayload(msg domain.Message) ws.MessagePayload {
 		EditedAt:                editedAt,
 		DeletedAt:               deletedAt,
 		Quoted:                  quoted,
-		Attachments:             attachments,
-		IsForwarded:             msg.ForwardedFromMessageID != "",
-		NotificationPolicy:      notificationPolicyFor(msg, removed, recipientFacts{}),
-		HasReference:            msg.ReferencedMessageID != "",
+		// Carried whatever `removed` did to the preview above: who was answered
+		// is not a presentation detail, and a deleted message still answered
+		// somebody (issue #136).
+		ReplyToSenderID:    msg.ReplyToSenderID,
+		Attachments:        attachments,
+		IsForwarded:        msg.ForwardedFromMessageID != "",
+		NotificationPolicy: notificationPolicyFor(msg, removed, recipientFacts{}),
+		HasReference:       msg.ReferencedMessageID != "",
 	}
 }
 

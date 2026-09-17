@@ -647,3 +647,210 @@ func TestTheZeroPreferenceStatusIsResolved(t *testing.T) {
 		t.Fatal("the zero value of Preferences must mean its fields are the recipient's own")
 	}
 }
+
+// The conversation-level matrix (issue #136), stated as the issue states it.
+//
+// Presence is foreground throughout, so what the rows differ in is only the
+// preference and the event's own server-side classification — never a guess
+// about the body. The `all` rows exist to prove the default alerts for
+// everything, which is what makes the mentions_replies rows a narrowing rather
+// than a change of default.
+func TestEvaluateConversationLevelMatrix(t *testing.T) {
+	mentionsReplies := func(c *notificationpolicy.Context) {
+		c.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+	}
+	muted := func(c *notificationpolicy.Context) { c.Preferences.Muted = true }
+	// A channel message rather than the fixture's direct message, so the row is
+	// the "ordinary message in a channel" case the profile page configures.
+	channelMessage := func(c *notificationpolicy.Context) {
+		c.EventType = notificationevent.EventTypeChannelMessage
+		c.Conversation = notificationpolicy.ConversationChannel
+	}
+	mention := func(c *notificationpolicy.Context) { c.EventType = notificationevent.EventTypeMention }
+	reply := func(c *notificationpolicy.Context) { c.EventType = notificationevent.EventTypeReply }
+	with := func(mutators ...func(*notificationpolicy.Context)) func(*notificationpolicy.Context) {
+		return func(c *notificationpolicy.Context) {
+			for _, mutate := range mutators {
+				mutate(c)
+			}
+		}
+	}
+	levelDenied := []notificationpolicy.Reason{notificationpolicy.ReasonConversationLevel}
+	mutedDenied := []notificationpolicy.Reason{notificationpolicy.ReasonMuted}
+
+	run(t, []policyCase{{
+		name:        "all + ordinary channel message alerts",
+		mutate:      channelMessage,
+		wantChannel: foreground,
+	}, {
+		name:        "all + mention alerts",
+		mutate:      with(channelMessage, mention),
+		wantChannel: foreground,
+	}, {
+		name:        "all + reply alerts",
+		mutate:      with(channelMessage, reply),
+		wantChannel: foreground,
+	}, {
+		name:        "mentions_replies + ordinary channel message is suppressed",
+		mutate:      with(channelMessage, mentionsReplies),
+		wantChannel: nothing,
+		wantReasons: levelDenied,
+	}, {
+		name:        "mentions_replies + mention still alerts",
+		mutate:      with(channelMessage, mention, mentionsReplies),
+		wantChannel: foreground,
+	}, {
+		name:        "mentions_replies + reply still alerts",
+		mutate:      with(channelMessage, reply, mentionsReplies),
+		wantChannel: foreground,
+	}, {
+		name:        "muted + ordinary channel message is suppressed",
+		mutate:      with(channelMessage, muted),
+		wantChannel: nothing,
+		wantReasons: mutedDenied,
+	}, {
+		name:        "muted + mention is suppressed",
+		mutate:      with(channelMessage, mention, muted),
+		wantChannel: nothing,
+		wantReasons: mutedDenied,
+	}, {
+		name:        "muted + reply is suppressed",
+		mutate:      with(channelMessage, reply, muted),
+		wantChannel: nothing,
+		wantReasons: mutedDenied,
+	}, {
+		// The mute wins, and the reason says so: an event both silenced and
+		// narrowed is recorded as the mute, which is the decision about the
+		// whole conversation.
+		name:        "muted outranks the level it is hiding",
+		mutate:      with(channelMessage, muted, mentionsReplies),
+		wantChannel: nothing,
+		wantReasons: mutedDenied,
+	}, {
+		// An ordinary direct message is an ordinary message: the level is a
+		// per-conversation setting and a group is a conversation.
+		name:        "mentions_replies + ordinary direct message is suppressed",
+		mutate:      mentionsReplies,
+		wantChannel: nothing,
+		wantReasons: levelDenied,
+	}, {
+		// A level this build does not recognise is a preference nobody can act
+		// on, and the answer is the product default rather than silence.
+		name: "an unrecognised level falls back to every message",
+		mutate: func(c *notificationpolicy.Context) {
+			c.Preferences.ConversationLevel = "somente_mencoes"
+		},
+		wantChannel: foreground,
+	}, {
+		// A call is not a message. Narrowing which messages interrupt must not
+		// stop the phone ringing; muting the conversation still does.
+		name:        "mentions_replies leaves a call alone",
+		mutate:      with(mentionsReplies, func(c *notificationpolicy.Context) { c.EventType = notificationevent.EventTypeCall }),
+		wantChannel: foreground,
+	}, {
+		name: "muted silences a call",
+		mutate: with(muted, func(c *notificationpolicy.Context) {
+			c.EventType = notificationevent.EventTypeCall
+		}),
+		wantChannel: nothing,
+		wantReasons: mutedDenied,
+	}})
+}
+
+// The level narrows push exactly as it narrows the in-app surfaces: the
+// notification worker and the realtime publisher read the same field from the
+// same table, so an ordinary message must not reach an OS notification for
+// somebody who asked only about mentions.
+func TestConversationLevelAppliesToPush(t *testing.T) {
+	run(t, []policyCase{{
+		name: "mentions_replies + ordinary message, offline recipient",
+		mutate: func(c *notificationpolicy.Context) {
+			c.Presence = notificationpolicy.PresenceOffline
+			c.EventType = notificationevent.EventTypeChannelMessage
+			c.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+		},
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonConversationLevel},
+	}, {
+		name: "mentions_replies + mention, offline recipient",
+		mutate: func(c *notificationpolicy.Context) {
+			c.Presence = notificationpolicy.PresenceOffline
+			c.EventType = notificationevent.EventTypeMention
+			c.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+		},
+		wantChannel: pushOnly,
+	}})
+}
+
+// The level cannot reopen anything a stronger rule closed. Each row pairs it
+// with a rule of a different class and asserts both the outcome and which rule
+// owns the explanation — the level never does, because it changed nothing that
+// was still open.
+func TestConversationLevelNeverReopensADeniedChannel(t *testing.T) {
+	mentionNarrowed := func(extra func(*notificationpolicy.Context)) func(*notificationpolicy.Context) {
+		return func(c *notificationpolicy.Context) {
+			// A mention, which this level allows: if the level could grant
+			// anything back, this is the case where it would show.
+			c.EventType = notificationevent.EventTypeMention
+			c.Preferences.ConversationLevel = notificationpolicy.ConversationLevelMentionsReplies
+			extra(c)
+		}
+	}
+	run(t, []policyCase{{
+		name: "outside working hours stays closed for a mention the level allows",
+		mutate: mentionNarrowed(func(c *notificationpolicy.Context) {
+			c.WorkSchedule = workschedule.StateOutsideWorkHours
+		}),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonOutsideWorkHours},
+	}, {
+		name:        "a duplicate stays closed",
+		mutate:      mentionNarrowed(func(c *notificationpolicy.Context) { c.Duplicate = true }),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonDuplicate},
+	}, {
+		name:        "a burst cooldown stays closed",
+		mutate:      mentionNarrowed(func(c *notificationpolicy.Context) { c.BurstCooldown = true }),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonBurstCooldown},
+	}, {
+		name: "an open conversation stays closed",
+		mutate: mentionNarrowed(func(c *notificationpolicy.Context) {
+			c.ConversationOpen = true
+			c.Presence = notificationpolicy.PresenceForeground
+		}),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonConversationOpen},
+	}, {
+		name: "unreadable preferences stay closed, and are not reported as a level",
+		mutate: mentionNarrowed(func(c *notificationpolicy.Context) {
+			c.Preferences.Status = notificationpolicy.PreferenceStatusUnavailable
+		}),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonPreferencesUnavailable},
+	}, {
+		name: "an imported event stays closed",
+		mutate: mentionNarrowed(func(c *notificationpolicy.Context) {
+			c.Origin = notificationevent.OriginImport
+		}),
+		wantChannel: nothing,
+		wantReasons: []notificationpolicy.Reason{notificationpolicy.ReasonHistoricalOrImported},
+	}})
+}
+
+// A read that never happened is not a level of "every message": the fail-closed
+// rule owns that case, and it must not be mistaken for a recipient who
+// expressed nothing.
+func TestUnreadablePreferencesAreNotTreatedAsADefaultLevel(t *testing.T) {
+	c := live()
+	c.EventType = notificationevent.EventTypeChannelMessage
+	c.Preferences.Status = notificationpolicy.PreferenceStatusUnavailable
+	decision := notificationpolicy.Evaluate(c)
+	if decision.Eligible() {
+		t.Fatalf("channels = %+v, want nothing when the preferences could not be read", decision.Channels)
+	}
+	if len(decision.Reasons) != 1 ||
+		decision.Reasons[0] != notificationpolicy.ReasonPreferencesUnavailable {
+		t.Fatalf("reasons = %v, want the fault to own the explanation", decision.Reasons)
+	}
+}

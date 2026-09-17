@@ -241,7 +241,7 @@ provider; os targets convergem pelo deadline. Gauge
   target e ocorrencia; `scan_uuid` passa a ser o `provider_ref` opaco.
 - Mensagens `pending_link_scan` de releases anteriores sao drenadas pelo
   resolver legado (`ResolveDecidedMessages`), que agora trata `unknown` como
-  terminal; a migration `chat/000050` da deadline a todo pending existente.
+  terminal; a migration `chat/000052` da deadline a todo pending existente.
   **Condicao de remocao do resolver legado:** nenhum ambiente com linhas
   `status = 'pending_link_scan'`.
 - O `link_safety_state` agregado da mensagem continua sendo mantido como

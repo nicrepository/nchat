@@ -128,6 +128,7 @@ inventario e do NChat, nao do console.
 
 | Variavel                                                                                           | Servico dono         | Impacto                                      |
 | -------------------------------------------------------------------------------------------------- | -------------------- | -------------------------------------------- |
+| `CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED`                                                    | chat-service         | #136; gate de rollout do writer granular     |
 | `CHAT_LINK_SAFETY_ENABLED`                                                                         | chat-service         | RF-21; sem credencial o servico nao sobe     |
 | `CHAT_LINK_SAFETY_WORKSPACE_BUDGET`                                                                | chat-service         | Orcamento de URLs novas por janela           |
 | `CHAT_LINK_SAFETY_BUDGET_WINDOW_SECONDS`                                                           | chat-service         | Janela do orcamento                          |
@@ -158,6 +159,8 @@ inventario e do NChat, nao do console.
 | `SMTP_TLS_MODE`                                                                                    | notification-service | **Perigoso**: enfraquecer o TLS do relay     |
 | `SMTP_TIMEOUT_SECONDS` / `SMTP_MAX_ATTEMPTS` / `SMTP_BACKOFF_SECONDS` / `SMTP_WORKER_POLL_SECONDS` | notification-service | Politica de entrega                          |
 | `AUTH_PUBLIC_WEB_BASE_URL`                                                                         | notification-service | Base dos links enviados por e-mail           |
+| `NOTIFICATION_WORKER_ENABLED`                                                                      | notification-service | #742/#862; liga a entrega Web Push da outbox |
+| `NOTIFICATION_PUSH_TTL_SECONDS`                                                                    | notification-service | #746; validade de um push                    |
 | `AUTH_ACCESS_TOKEN_TTL_SECONDS` / `AUTH_REFRESH_TOKEN_TTL_SECONDS`                                 | auth-service         | Vida dos tokens de chat                      |
 | `AUTH_TOKEN_ENDPOINT_RATE_LIMIT_PER_MINUTE` / `_BURST`                                             | auth-service         | Limite do endpoint de token                  |
 | `AUTH_AVATAR_DIR` / `AUTH_AVATAR_BASE_URL`                                                         | auth-service         | Armazenamento de avatar                      |
@@ -212,6 +215,13 @@ diff o mostra e o historico de versoes e estruturalmente incapaz de armazena-lo
 | `secret.livekit_api_secret`         | `LIVEKIT_API_SECRET`               | `nchat-secrets`         | media-service              |
 | `secret.file_encryption_master_key` | —                                  | `nchat-file-encryption` | file-service               |
 | `secret.link_safety_api_token`      | —                                  | `nchat-link-safety`     | chat-service, file-service |
+
+O par VAPID da #862 (`NOTIFICATION_VAPID_PUBLIC_KEY`,
+`NOTIFICATION_VAPID_PRIVATE_KEY`, `NOTIFICATION_VAPID_SUBJECT`) fica no Secret
+proprio `nchat-webpush`, montado so pelo notification-service, e nao e chave da
+Admin API. A chave publica chega ao browser por
+`GET /api/notifications/push/config`, nunca por `VITE_*`: a imagem web e a mesma
+em todos os ambientes, e a chave privada nao sai do servico.
 
 As duas ultimas sao montadas **apenas** pelos servicos donos, por decisao
 deliberada da issue de criptografia de anexos e da RF-21. O `admin-service` nao

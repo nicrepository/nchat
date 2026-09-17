@@ -544,6 +544,7 @@ func TestEveryRouteRefusesAnUnauthenticatedRequest(t *testing.T) {
 		{http.MethodPost, RoutePushSubscriptions, registerBody()},
 		{http.MethodGet, RoutePushSubscriptions, ""},
 		{http.MethodDelete, RoutePushSubscriptions + "/" + ownedSubscript, ""},
+		{http.MethodGet, RoutePushConfig, ""},
 	}
 	for _, header := range []string{"", "Bearer", "Bearer ", "Basic abc", "token"} {
 		for _, request := range requests {

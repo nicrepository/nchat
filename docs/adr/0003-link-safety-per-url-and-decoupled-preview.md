@@ -38,7 +38,7 @@ levou ao desligamento da feature.
 ## Consequências
 
 - `chat.link_scans`/`chat.message_link_scans` viram target/ocorrencia; nova
-  `chat.link_previews`; migration `chat/000050`.
+  `chat.link_previews`; migration `chat/000052`.
 - URL maliciosa nao recusa mais o envio: bloqueia so o proprio link, com o span
   retirado do corpo em leitura; citacoes/referencias seguem retendo o corpo
   inteiro (projecao agregada mantida).

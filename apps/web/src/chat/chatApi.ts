@@ -18,6 +18,7 @@ import {
   normalizeAcknowledgementState,
   normalizeBodyFormat,
   normalizeLinkSafety,
+  normalizeMessagePriority,
   parseDMConversationType,
   parseMessageAttachments,
   parseReactionUsers,
@@ -26,6 +27,8 @@ import {
   type ChannelCategory,
   type ChannelDetails,
   type ChannelMemberProfile,
+  type ConversationNotificationLevel,
+  type ConversationNotificationMode,
   type GroupDetails,
   type GroupParticipantProfile,
   type DMCandidate,
@@ -43,6 +46,7 @@ import {
   type MessageAcknowledgementRecipient,
   type MessageEditHistoryEntry,
   type MessagePage,
+  type MessagePriority,
   type MessageSecuritySnapshot,
   type PinnedItem,
   type ConversationEventPayload,
@@ -70,6 +74,8 @@ interface SidebarChannelResponse {
   can_rename?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
   /** Validated as `unknown`: absent on pre-#414 responses, null when empty. */
   created_at?: unknown;
   last_message_at?: unknown;
@@ -97,6 +103,8 @@ interface SidebarDMResponse {
   unread_count?: unknown;
   /** This viewer's own notification preference (issue #527). */
   muted?: unknown;
+  /** The level half of that preference (issue #136); absent on older servers. */
+  notification_level?: unknown;
 }
 
 interface SidebarResponse {
@@ -111,6 +119,11 @@ interface SidebarResponse {
   };
   channels: SidebarChannelResponse[];
   dm_conversations: SidebarDMResponse[];
+  /**
+   * The issue #136 rollout gate, as the server reports it. Absent on a server
+   * that predates the field, which is read as "off" — the compatible answer.
+   */
+  conversation_notification_levels_enabled?: unknown;
 }
 
 interface SidebarEnvelope {
@@ -228,11 +241,25 @@ function mapSidebarChannel(ch: SidebarChannelResponse): Channel {
     // the capabilities above: anything that is not an explicit `true` is "no".
     isGeneral: ch.is_general === true,
     muted: ch.muted === true,
+    notificationLevel: parseNotificationLevel(ch.notification_level),
     createdAt: sidebarTimestamp(ch.created_at),
     lastMessageAt: sidebarTimestamp(ch.last_message_at),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(ch.unread_count) ? { unreadCount: ch.unread_count } : {}),
   };
+}
+
+/**
+ * Reads the conversation notification level off the wire (issue #136).
+ *
+ * Only the one non-default value is recognised; everything else — absent, null,
+ * a level a newer server added, a string a proxy rewrote — becomes "all". That
+ * is the same strictness `muted` and `can_write` are parsed with, and it fails
+ * in the direction that keeps a conversation audible: a level this build cannot
+ * interpret must not silence anything.
+ */
+function parseNotificationLevel(value: unknown): ConversationNotificationLevel {
+  return value === "mentions_replies" ? "mentions_replies" : "all";
 }
 
 function isUnreadCount(value: unknown): value is number {
@@ -344,6 +371,7 @@ function mapSidebarDM(dm: SidebarDMResponse): DMConversation | undefined {
     createdAt: sidebarTimestamp(dm.created_at),
     lastMessageAt: sidebarTimestamp(dm.last_message_at),
     muted: dm.muted === true,
+    notificationLevel: parseNotificationLevel(dm.notification_level),
     ...(pinnedAt ? { pinnedAt } : {}),
     ...(isUnreadCount(dm.unread_count) ? { unreadCount: dm.unread_count } : {}),
   };
@@ -434,6 +462,9 @@ export async function fetchSidebarData(): Promise<{
   maxUploadBytes?: number | null;
   maxFiles?: number;
   maxBytes?: number;
+  // Optional in the signature for the same reason the limits above are: a
+  // caller with a partial fixture reads it as absent, and absent is "off".
+  notificationLevelsEnabled?: boolean;
   channels: Channel[];
   dms: DMConversation[];
   categories: ChannelCategory[];
@@ -491,6 +522,12 @@ export async function fetchSidebarData(): Promise<{
       typeof rawMaxBytes === "number" && Number.isSafeInteger(rawMaxBytes) && rawMaxBytes > 0
         ? rawMaxBytes
         : Number.MAX_SAFE_INTEGER,
+    // Strict equality, like every other capability on this payload: anything
+    // that is not an explicit `true` — absent, null, a truthy string from a
+    // proxy that rewrote the response — is "off". The server re-derives the
+    // same answer on every write, so a client that got this wrong would only
+    // change which error it receives (issue #136).
+    notificationLevelsEnabled: sidebar.conversation_notification_levels_enabled === true,
     channels,
     dms,
     categories,
@@ -758,6 +795,38 @@ export async function setConversationMuted(
 }
 
 /**
+ * Sets the whole notification preference of one conversation (issue #136).
+ *
+ * The canonical surface, where the two `/mute` calls above are the sidebar's
+ * shortcut for one dimension of it. A per-user preference, so the request
+ * carries no user: the actor is the session and the workspace is resolved
+ * server-side.
+ *
+ * PUT with the complete desired state, so sending the same mode twice is the
+ * same preference — what a settings select needs when somebody clicks around.
+ * The server owns the translation into storage: this client never sends a level
+ * and a mute separately, and never learns that a mute is a timestamp.
+ *
+ * The general channel refuses `muted` server-side, in SQL; this client never
+ * decides that.
+ */
+export async function setConversationNotificationMode(
+  targetType: "channel" | "dm",
+  targetId: string,
+  mode: ConversationNotificationMode,
+): Promise<void> {
+  const target =
+    targetType === "channel"
+      ? `${CHAT_BASE}/channels/${encodeURIComponent(targetId)}/notification-preference`
+      : `${CHAT_BASE}/dm/${encodeURIComponent(targetId)}/notification-preference`;
+  await authenticatedFetch(target, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+}
+
+/**
  * Renames a group conversation (issue #527).
  *
  * Groups only. A 1:1 conversation reaches nothing on the server — the statement
@@ -882,6 +951,14 @@ interface MessageResponse {
   attachments?: unknown;
   /** Issue #824. Absent on a pre-#824 server, which asked nobody to confirm. */
   acknowledgement_required?: unknown;
+  /** Issue #825. Absent on a pre-#825 server, which never reminded anybody. */
+  persistent_notifications?: unknown;
+  /**
+   * Issue #821. Typed unknown because it is classified rather than trusted:
+   * normalizeMessagePriority narrows it, and a pre-#821 server sends nothing —
+   * which is `standard`, the behaviour every message had before the axis.
+   */
+  priority?: unknown;
 }
 
 interface QuoteResponse {
@@ -1184,6 +1261,11 @@ function mapMessage(r: MessageResponse): Message {
     // value this build does not understand — both read as "asked nobody". The
     // safe direction: an absent flag never invents a confirmation request.
     acknowledgementRequired: r.acknowledgement_required === true,
+    persistentNotifications: r.persistent_notifications === true,
+    // Issue #823. Narrowed rather than trusted: an unrecognised value reads as
+    // `standard` and draws nothing, so a priority this build has not reasoned
+    // about can never be the one that raises a reader's attention.
+    priority: normalizeMessagePriority(r.priority),
   };
 }
 
@@ -1322,6 +1404,16 @@ export interface PostMessageOptions {
   /** DMs default to v2; group composers opt into the existing v3 codec. */
   bodyFormat?: "v2" | "v3";
   /**
+   * The author's stated priority (issue #821).
+   *
+   * Omitted from the request when it is `standard`, which is what an absent
+   * priority already means to chat-service. Deliberately not sent as the empty
+   * string: the service treats `""` as a stated-but-invalid priority and
+   * answers 400, because a client that filled the field in wrongly must not be
+   * silently demoted to standard.
+   */
+  priority?: MessagePriority;
+  /**
    * Ask this message's recipients to confirm receipt explicitly (issue #824).
    *
    * Omitted from the request entirely when false, so a send that asks for
@@ -1329,6 +1421,15 @@ export interface PostMessageOptions {
    * server is unaffected.
    */
   acknowledgementRequired?: boolean;
+  /**
+   * Keep reminding the recipients who neither confirmed nor answered (#825).
+   *
+   * Omitted when false, on the same terms. The service refuses it on a message
+   * that is not urgent rather than ignoring it, so this is only ever sent
+   * alongside `priority: "urgent"` — see normalizePriorityIntent, which is what
+   * guarantees the pair rather than a check at this layer.
+   */
+  persistentNotifications?: boolean;
   signal?: AbortSignal;
 }
 
@@ -1341,7 +1442,9 @@ function postMessageBody(bodyText: string, bodyFormat: string, options: PostMess
     // Omitted entirely when there is none, so a text-only request is the exact
     // payload it has always been.
     ...(options.attachmentIds?.length ? { attachment_ids: options.attachmentIds } : {}),
+    ...(options.priority && options.priority !== "standard" ? { priority: options.priority } : {}),
     ...(options.acknowledgementRequired ? { acknowledgement_required: true } : {}),
+    ...(options.persistentNotifications ? { persistent_notifications: true } : {}),
   });
 }
 
