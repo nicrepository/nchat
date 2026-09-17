@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"bytes"
@@ -27,7 +27,7 @@ import (
 const publicAddr = "93.184.216.34"
 
 // fixedResolver answers every lookup with the same addresses.
-func fixedResolver(addrs ...string) resolver {
+func fixedResolver(addrs ...string) Resolver {
 	parsed := make([]netip.Addr, 0, len(addrs))
 	for _, raw := range addrs {
 		parsed = append(parsed, netip.MustParseAddr(raw))
@@ -39,7 +39,7 @@ func fixedResolver(addrs ...string) resolver {
 
 // hostResolver answers per hostname, for the redirect cases where the first hop
 // is public and a later one is not.
-func hostResolver(byHost map[string]string) resolver {
+func hostResolver(byHost map[string]string) Resolver {
 	return func(_ context.Context, host string) ([]netip.Addr, error) {
 		raw, ok := byHost[host]
 		if !ok {
@@ -72,16 +72,16 @@ func (c *recordingConnector) addresses() []string {
 
 // fetchAgainst runs one fetch of rawURL against server, using resolve.
 func fetchAgainst(
-	t *testing.T, server *httptest.Server, resolve resolver, rawURL string,
+	t *testing.T, server *httptest.Server, resolve Resolver, rawURL string,
 ) (*recordingConnector, *url.URL, []byte, error) {
 	t.Helper()
 	connector := &recordingConnector{target: strings.TrimPrefix(server.URL, "http://")}
-	target, err := canonicalURL(rawURL)
+	target, err := ParseURL(rawURL)
 	if err != nil {
-		t.Fatalf("canonicalURL(%q): %v", rawURL, err)
+		t.Fatalf("ParseURL(%q): %v", rawURL, err)
 	}
-	fetcher := newFetcherWith(5*time.Second, resolve, connector.connect)
-	final, body, err := fetcher.fetch(context.Background(), target)
+	fetcher := NewFetcherWith(5*time.Second, resolve, connector.connect)
+	final, body, err := fetcher.FetchDocument(context.Background(), target, nil)
 	return connector, final, body, err
 }
 
@@ -272,8 +272,8 @@ func TestFetchRefusesTooManyRedirects(t *testing.T) {
 	if !errors.Is(err, ErrUpstream) {
 		t.Fatalf("expected the hop limit to be enforced, got %v", err)
 	}
-	if hops > maxRedirects+1 {
-		t.Fatalf("expected at most %d hops, server saw %d", maxRedirects+1, hops)
+	if hops > MaxRedirects+1 {
+		t.Fatalf("expected at most %d hops, server saw %d", MaxRedirects+1, hops)
 	}
 }
 
@@ -395,20 +395,20 @@ func TestFetchBodyLimit(t *testing.T) {
 		wantErr       error
 	}{
 		// A: exactly at the limit is a complete document and is accepted.
-		"exactly at the limit": {int(maxBodyBytes), true, false, nil},
-		"one below the limit":  {int(maxBodyBytes) - 1, true, false, nil},
+		"exactly at the limit": {int(MaxDocumentBytes), true, false, nil},
+		"one below the limit":  {int(MaxDocumentBytes) - 1, true, false, nil},
 		// B: one byte past it is not.
-		"one byte over the limit": {int(maxBodyBytes) + 1, true, false, ErrUpstream},
+		"one byte over the limit": {int(MaxDocumentBytes) + 1, true, false, ErrUpstream},
 		// C: chunked, so the declared length cannot be what catches it.
-		"chunked over the limit": {int(maxBodyBytes) * 3, false, false, ErrUpstream},
-		"chunked one byte over":  {int(maxBodyBytes) + 1, false, false, ErrUpstream},
+		"chunked over the limit": {int(MaxDocumentBytes) * 3, false, false, ErrUpstream},
+		"chunked one byte over":  {int(MaxDocumentBytes) + 1, false, false, ErrUpstream},
 		// D: no declared length, within the limit, must still work.
-		"chunked within the limit": {int(maxBodyBytes) / 2, false, false, nil},
+		"chunked within the limit": {int(MaxDocumentBytes) / 2, false, false, nil},
 		// E and F: the limit is judged on the decompressed size. A body that
 		// compresses to a few kilobytes and expands past the limit is refused.
-		"gzip expanding over limit": {int(maxBodyBytes) * 4, false, true, ErrUpstream},
-		"gzip within the limit":     {int(maxBodyBytes) / 2, false, true, nil},
-		"gzip exactly at the limit": {int(maxBodyBytes), false, true, nil},
+		"gzip expanding over limit": {int(MaxDocumentBytes) * 4, false, true, ErrUpstream},
+		"gzip within the limit":     {int(MaxDocumentBytes) / 2, false, true, nil},
+		"gzip exactly at the limit": {int(MaxDocumentBytes), false, true, nil},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -447,7 +447,7 @@ func TestFetchBodyLimit(t *testing.T) {
 // produce a preview. The whole document is still refused, and no metadata is
 // extracted from it.
 func TestFetchRefusesOversizedBodyWhoseMetadataFitsBeforeTheCut(t *testing.T) {
-	document := htmlOfSize(t, int(maxBodyBytes)*2)
+	document := htmlOfSize(t, int(MaxDocumentBytes)*2)
 	if !strings.Contains(document[:200], `og:title`) {
 		t.Fatal("the fixture must carry its metadata before the cut to be meaningful")
 	}
@@ -468,9 +468,9 @@ func TestFetchRefusesOversizedBodyWhoseMetadataFitsBeforeTheCut(t *testing.T) {
 func TestFetchRefusesDeclaredOversizedBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Header().Set("Content-Length", fmt.Sprint(maxBodyBytes*4))
+		w.Header().Set("Content-Length", fmt.Sprint(MaxDocumentBytes*4))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(make([]byte, maxBodyBytes*4))
+		_, _ = w.Write(make([]byte, MaxDocumentBytes*4))
 	}))
 	t.Cleanup(server.Close)
 
@@ -489,14 +489,14 @@ func TestReadBoundedBody(t *testing.T) {
 	}{
 		"empty":            {0, false},
 		"small":            {16, false},
-		"one below limit":  {int(maxBodyBytes) - 1, false},
-		"exactly at limit": {int(maxBodyBytes), false},
-		"one byte over":    {int(maxBodyBytes) + 1, true},
-		"far over":         {int(maxBodyBytes) * 3, true},
+		"one below limit":  {int(MaxDocumentBytes) - 1, false},
+		"exactly at limit": {int(MaxDocumentBytes), false},
+		"one byte over":    {int(MaxDocumentBytes) + 1, true},
+		"far over":         {int(MaxDocumentBytes) * 3, true},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
-			data, err := readBoundedBody(bytes.NewReader(make([]byte, testCase.size)))
+			data, err := readBoundedBody(bytes.NewReader(make([]byte, testCase.size)), MaxDocumentBytes)
 			if testCase.wantErr {
 				if !errors.Is(err, ErrUpstream) {
 					t.Fatalf("expected ErrUpstream, got %v", err)
@@ -524,7 +524,7 @@ func TestReadBoundedBodyPropagatesReadFailures(t *testing.T) {
 		iotest.ErrReader(errors.New("connection reset")),
 	)
 
-	if _, err := readBoundedBody(broken); !errors.Is(err, ErrUpstream) {
+	if _, err := readBoundedBody(broken, MaxDocumentBytes); !errors.Is(err, ErrUpstream) {
 		t.Fatalf("expected ErrUpstream, got %v", err)
 	}
 }
@@ -544,15 +544,15 @@ func TestFetchTimesOutOnSlowResponseHeaders(t *testing.T) {
 	})
 
 	connector := &recordingConnector{target: strings.TrimPrefix(server.URL, "http://")}
-	target, err := canonicalURL("http://example.com/page")
+	target, err := ParseURL("http://example.com/page")
 	if err != nil {
 		t.Fatalf("canonicalURL: %v", err)
 	}
 	// A budget far below responseHeaderTimeout, so the test is quick and still
 	// exercises the classification a stalled server produces.
-	fetcher := newFetcherWith(150*time.Millisecond, fixedResolver(publicAddr), connector.connect)
+	fetcher := NewFetcherWith(150*time.Millisecond, fixedResolver(publicAddr), connector.connect)
 
-	_, _, err = fetcher.fetch(context.Background(), target)
+	_, _, err = fetcher.FetchDocument(context.Background(), target, nil)
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("expected a timeout, got %v", err)
 	}
@@ -617,13 +617,13 @@ func TestFetchVerifiesTLS(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	connector := &recordingConnector{target: strings.TrimPrefix(server.URL, "https://")}
-	target, err := canonicalURL("https://example.com/page")
+	target, err := ParseURL("https://example.com/page")
 	if err != nil {
 		t.Fatalf("canonicalURL: %v", err)
 	}
-	fetcher := newFetcherWith(5*time.Second, fixedResolver(publicAddr), connector.connect)
+	fetcher := NewFetcherWith(5*time.Second, fixedResolver(publicAddr), connector.connect)
 
-	_, body, err := fetcher.fetch(context.Background(), target)
+	_, body, err := fetcher.FetchDocument(context.Background(), target, nil)
 	if err == nil {
 		t.Fatalf("expected an untrusted certificate to be refused, read %q", body)
 	}
@@ -639,10 +639,10 @@ func TestFetchVerifiesTLS(t *testing.T) {
 }
 
 func TestCheckContentType(t *testing.T) {
-	if err := checkContentType("text/html;charset=ISO-8859-1"); err != nil {
+	if err := checkContentType("text/html;charset=ISO-8859-1", documentKind.allowed); err != nil {
 		t.Fatalf("expected a charset parameter to be ignored, got %v", err)
 	}
-	if err := checkContentType("text/htmlx"); !errors.Is(err, ErrUnsupportedContentType) {
+	if err := checkContentType("text/htmlx", documentKind.allowed); !errors.Is(err, ErrUnsupportedContentType) {
 		t.Fatalf("expected a near-miss type to be refused, got %v", err)
 	}
 }

@@ -311,8 +311,8 @@ const refreshMessageLinkSafetyQuery = `
 		SELECT candidate.id, candidate.fingerprint,
 		       CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END AS state
@@ -327,15 +327,15 @@ const refreshMessageLinkSafetyQuery = `
 		-- work and the caller's drain is guaranteed to make progress.
 		HAVING CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END IS DISTINCT FROM candidate.link_safety_state
 		   AND CASE
 		         WHEN bool_or(ls.status = 'malicious') THEN 'malicious'
-		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive'))
-		          AND bool_or(ls.status = 'inconclusive') THEN 'inconclusive'
+		         WHEN bool_and(ls.status IN ('safe', 'malicious', 'inconclusive', 'unknown'))
+		          AND bool_or(ls.status IN ('inconclusive', 'unknown')) THEN 'inconclusive'
 		         WHEN bool_and(ls.status = 'safe') THEN 'safe'
 		         ELSE NULL
 		       END IS NOT NULL

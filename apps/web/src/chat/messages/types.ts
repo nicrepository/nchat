@@ -6,6 +6,7 @@
  * React or performs I/O.
  */
 
+import type { MessageLink } from "../messageLinks";
 import type {
   ChannelAttachment,
   Message,
@@ -118,6 +119,13 @@ export type Action =
       state: Message["linkSafetyState"];
       updatedAt: string;
     }
+  /**
+   * Issue #807: one link of a message this view holds changed state. The
+   * payload is the target-level entity; every occurrence of that URL in the
+   * message is patched, a stale update is ignored, and a message that no longer
+   * names the URL is untouched.
+   */
+  | { type: "link_updated"; messageId: string; link: MessageLink }
   | { type: "security_snapshots_refreshed"; snapshots: MessageSecuritySnapshot[] }
   | { type: "prepending" }
   | { type: "prepended"; page: MessagePage }

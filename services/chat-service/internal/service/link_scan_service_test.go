@@ -70,6 +70,13 @@ type fakeQueue struct {
 	providerReserved int
 	reserveErr       error
 	prunes           int
+
+	// Issue #807 convergence state.
+	expired         []string
+	terminalizeErr  error
+	terminalErr     error
+	drainedDisabled []string
+	policyTerminals map[string]string
 }
 
 func newFakeQueue(jobs ...storage.LinkScanJob) *fakeQueue {
@@ -260,6 +267,38 @@ func (q *fakeQueue) PublishOutboxBacklog(_ context.Context) (int, time.Duration,
 	return len(q.events), 0, nil
 }
 
+// Issue #807 convergence methods. The fake has no deadlines, so nothing expires
+// unless a test stages it.
+func (q *fakeQueue) TerminalizeExpiredLinkScans(_ context.Context) ([]string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	expired := q.expired
+	q.expired = nil
+	return expired, q.terminalizeErr
+}
+
+func (q *fakeQueue) TerminalizePendingLinkScansDisabled(_ context.Context) ([]string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var drained []string
+	for _, job := range q.jobs {
+		drained = append(drained, job.CanonicalURL)
+	}
+	q.jobs = nil
+	q.drainedDisabled = append(q.drainedDisabled, drained...)
+	return drained, nil
+}
+
+func (q *fakeQueue) RecordLinkTargetTerminal(_ context.Context, canonicalURL, reason string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.policyTerminals == nil {
+		q.policyTerminals = map[string]string{}
+	}
+	q.policyTerminals[canonicalURL] = reason
+	return q.terminalErr
+}
+
 func (q *fakeQueue) LinkScanBacklog(_ context.Context) (map[string]int, time.Duration, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -325,6 +364,33 @@ func (p *fakeProvider) Poll(_ context.Context, _, _ string) (urlsafety.Verdict, 
 	defer p.mu.Unlock()
 	p.polls++
 	return p.verdict, p.pollErr
+}
+
+// Check adapts the two-step fake to the provider-agnostic contract the worker
+// now speaks (issue #807): no ref submits, a ref polls. The tests below keep
+// their Submit/Poll vocabulary because that is the provider shape they pin.
+func (p *fakeProvider) Check(ctx context.Context, canonicalURL, providerRef string) (urlsafety.ReputationResult, error) {
+	if providerRef == "" {
+		scanID, err := p.Submit(ctx, canonicalURL)
+		if err != nil {
+			return urlsafety.ReputationResult{}, err
+		}
+		return urlsafety.ReputationResult{ProviderRef: scanID}, urlsafety.ErrCheckInProgress
+	}
+	verdict, err := p.Poll(ctx, canonicalURL, providerRef)
+	switch {
+	case errors.Is(err, urlsafety.ErrScanPending):
+		return urlsafety.ReputationResult{ProviderRef: providerRef}, urlsafety.ErrCheckInProgress
+	case errors.Is(err, urlsafety.ErrScanInconclusive):
+		return urlsafety.ReputationResult{ProviderRef: providerRef, Verdict: urlsafety.ReputationUnknown}, nil
+	case err != nil:
+		return urlsafety.ReputationResult{}, err
+	case !verdict.IsFinal():
+		// Exactly what the real adapter does: a zero, unknown or future Verdict
+		// is a failed exchange, never a terminal answer.
+		return urlsafety.ReputationResult{}, urlsafety.ErrUnavailable
+	}
+	return urlsafety.ReputationResult{ProviderRef: providerRef, Verdict: urlsafety.ReputationVerdict(verdict)}, nil
 }
 
 func (p *fakeProvider) counts() (int, int) {

@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"bytes"
@@ -19,7 +19,24 @@ const (
 	maxSiteNameRunes    = 100
 )
 
-// extract reads the Open Graph metadata out of an HTML document.
+// Metadata is what a document declares about itself, as plain text. None of it
+// is markup and none of it may be rendered as such. ImageURL is the resolved,
+// scheme-checked og:image; it has not been fetched.
+type Metadata struct {
+	Title       string
+	Description string
+	ImageURL    string
+	SiteName    string
+}
+
+// HasMetadata reports whether there is anything worth showing. Every field is
+// counted here rather than at each call site, so adding a field to Metadata
+// without adding it below is the mistake this method exists to make hard.
+func (m Metadata) HasMetadata() bool {
+	return m.Title != "" || m.Description != "" || m.ImageURL != "" || m.SiteName != ""
+}
+
+// Extract reads the Open Graph metadata out of an HTML document.
 //
 // It tokenises rather than building a tree: nothing but <head> is of interest,
 // so there is no reason to materialise a document, and stopping at <body> means
@@ -28,7 +45,7 @@ const (
 // missing fields are simply absent.
 //
 // Nothing here executes, resolves or fetches anything. The document is text.
-func extract(base *url.URL, body []byte) Preview {
+func Extract(base *url.URL, body []byte) Metadata {
 	var collector metadataCollector
 	tokenizer := html.NewTokenizer(bytes.NewReader(body))
 	for {
@@ -56,11 +73,16 @@ func extract(base *url.URL, body []byte) Preview {
 // both must be read as having declared the Open Graph one — a <meta
 // name="description"> appearing first in the document must not win by position.
 type metadataCollector struct {
-	preview         Preview
+	preview         Metadata
 	rawImage        string
 	htmlTitle       string
 	htmlDescription string
 	inTitleTag      bool
+	// Twitter Card equivalents, applied between Open Graph and the HTML
+	// fallbacks: a page that declares only twitter:* still gets a card.
+	twitterTitle       string
+	twitterDescription string
+	twitterImage       string
 }
 
 // openTag handles a start tag and reports whether the part of the document
@@ -102,28 +124,32 @@ func (c *metadataCollector) applyMeta(tag metaTag) {
 		keepFirst(&c.preview.Title, tag.content)
 	case "og:description":
 		keepFirst(&c.preview.Description, tag.content)
-	case "og:image", "og:image:url":
+	case "og:image", "og:image:url", "og:image:secure_url":
 		keepFirst(&c.rawImage, tag.content)
 	case "og:site_name":
 		keepFirst(&c.preview.SiteName, tag.content)
+	case "twitter:title":
+		keepFirst(&c.twitterTitle, tag.content)
+	case "twitter:description":
+		keepFirst(&c.twitterDescription, tag.content)
+	case "twitter:image", "twitter:image:src":
+		keepFirst(&c.twitterImage, tag.content)
 	case "description":
 		keepFirst(&c.htmlDescription, tag.content)
 	}
 }
 
 // finalize normalises the collected values into the response.
-func (c *metadataCollector) finalize(base *url.URL) Preview {
+func (c *metadataCollector) finalize(base *url.URL) Metadata {
 	preview := c.preview
-	preview.Title = normalize(preview.Title, maxTitleRunes)
-	if preview.Title == "" {
-		preview.Title = normalize(c.htmlTitle, maxTitleRunes)
-	}
-	preview.Description = normalize(preview.Description, maxDescriptionRunes)
-	if preview.Description == "" {
-		preview.Description = normalize(c.htmlDescription, maxDescriptionRunes)
-	}
+	preview.Title = firstNormalized(maxTitleRunes, preview.Title, c.twitterTitle, c.htmlTitle)
+	preview.Description = firstNormalized(maxDescriptionRunes,
+		preview.Description, c.twitterDescription, c.htmlDescription)
 	preview.SiteName = normalize(preview.SiteName, maxSiteNameRunes)
 	preview.ImageURL = imageURL(base, c.rawImage)
+	if preview.ImageURL == "" {
+		preview.ImageURL = imageURL(base, c.twitterImage)
+	}
 	return preview
 }
 
@@ -189,6 +215,18 @@ func keepFirst(field *string, value string) {
 	}
 }
 
+// firstNormalized returns the first candidate that normalises to something
+// non-empty, so the Open Graph value wins over the Twitter Card value over the
+// plain HTML fallback regardless of the order the page declared them in.
+func firstNormalized(maxRunes int, candidates ...string) string {
+	for _, candidate := range candidates {
+		if normalized := normalize(candidate, maxRunes); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
 // normalize turns remote text into something safe to carry as data.
 //
 // Invalid UTF-8 is dropped rather than replaced, so the value stays encodable;
@@ -215,13 +253,12 @@ func normalize(value string, maxRunes int) string {
 // held to the same scheme rule as everything else — which is what stops
 // og:image from being a javascript:, data: or file: URL handed to a browser.
 //
-// It is not fetched. This service makes exactly one remote request per preview,
-// and adding a second one driven by a value the remote page controls would
-// reintroduce the SSRF the rest of this package removes. The client requests
-// the image itself, as it would any other image on the web. A literal address
-// that is not public is still dropped here, because that case costs nothing to
-// check and there is no legitimate page whose image lives on the reader's own
-// loopback.
+// It is not fetched here. A caller that wants the bytes goes through
+// Fetcher.FetchImage, which applies the whole address policy again to this URL
+// as its own destination — the value is remote-controlled, so it is exactly the
+// kind of URL that policy exists for. A literal address that is not public is
+// still dropped here, because that case costs nothing to check and there is no
+// legitimate page whose image lives on the reader's own loopback.
 func imageURL(base *url.URL, raw string) string {
 	raw = strings.TrimSpace(strings.ToValidUTF8(raw, ""))
 	if raw == "" || len(raw) > MaxURLLength {
@@ -238,7 +275,7 @@ func imageURL(base *url.URL, raw string) string {
 	if resolved.User != nil || resolved.Hostname() == "" {
 		return ""
 	}
-	if addr, err := netip.ParseAddr(resolved.Hostname()); err == nil && !addrAllowed(addr) {
+	if addr, err := netip.ParseAddr(resolved.Hostname()); err == nil && !AddrAllowed(addr) {
 		return ""
 	}
 	resolved.Fragment = ""

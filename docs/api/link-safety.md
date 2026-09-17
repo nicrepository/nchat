@@ -1,9 +1,264 @@
 # Bloqueio de links maliciosos (RF-21)
 
+> **Issue #807 — modelo por URL.** A partir desta versao a mensagem **nunca e
+> retida nem recusada** por causa dos seus links. Cada URL e uma entidade com
+> estado proprio (`pending`, `safe`, `malicious`, `unknown`), o backend e a
+> autoridade sobre o que e link e o que pode ser clicado, e o preview e um
+> pipeline separado que so entra depois de `safe` explicito. A primeira secao
+> abaixo descreve esse contrato; as secoes seguintes descrevem o pipeline de
+> verdict, que continua valendo por URL, e marcam o que passou a ser
+> compatibilidade (mensagens `pending_link_scan` de releases anteriores).
+
+## Link Safety por URL, clicabilidade e preview (issue #807)
+
+### Quatro eixos, nenhum e proxy do outro
+
+```
+Message.status         active | deleted           lifecycle da mensagem
+links[].safety         pending | safe | malicious | unknown   por target (URL canonica)
+links[].click          none | direct | interstitial          o que a policy autoriza
+links[].preview.state  none | queued | fetching | ready | unsupported | failed
+```
+
+Invariante: `message.status` nao diz nada sobre links; `safety` de uma URL nao
+diz nada sobre outra URL da mesma mensagem; `preview` nunca altera `safety`.
+
+### Fluxo
+
+```
+mensagem enviada
+  -> backend extrai e canonicaliza as URLs (scanURLCandidates + CanonicalizeURL)
+  -> INSERT da mensagem (status = active) + chat.message_link_scans no mesmo statement
+  -> targets sem verdict fresco entram em chat.link_scans como pending, com deadline_at
+  -> a mensagem e publicada agora (message.created ja carrega links[])
+  -> o worker decide cada target de forma assincrona e emite message.link_updated
+```
+
+Enquanto `pending`, o texto da URL e visivel, nao ha `href`, nao ha preview e
+nenhum fetch server-side acontece. O provider indisponivel nao segura nada:
+**todo `pending` tem `deadline_at`** (`LinkScanPendingDeadline`, 5 min) e a
+varredura do worker o converte em `unknown` com `terminal_reason = deadline`.
+A varredura roda **independentemente da flag**; com `CHAT_LINK_SAFETY_ENABLED=false`
+todo `pending` converge imediatamente para `unknown/disabled`. O deadline e
+invariante da **maquina de estados**, nao cortesia da varredura: claim,
+intencao de submissao, gravacao do scan id e veredito (`safe`, `malicious`,
+`inconclusive`) sao predicados em `status = 'pending' AND deadline_at > now()`
+(`pendingWithinDeadlineSQL`) no proprio UPDATE — uma resposta do provider que
+chega depois do prazo perde o compare-and-set (`ErrLinkScanConflict`, tratado
+como lease perdida) e a unica transicao restante e a da varredura
+(`unknown/deadline`); um backlog maior que o batch da varredura (200) nao deixa
+resto reclamavel. O mesmo vale para previews: claim, `CompleteLinkPreview` e
+`FailLinkPreview` exigem `state IN (queued, fetching) AND deadline_at > now()`
+alem de `claim_id`; `TerminalizeExpiredLinkPreviews` e a unica saida de um
+preview vencido (indice dedicado `idx_link_previews_deadline`). A invariante e
+tambem do schema, nao so do codigo: `deadline_at` tem `DEFAULT now() + 5 min`, um trigger
+`BEFORE INSERT OR UPDATE` da um deadline novo a toda linha que entra em `pending`
+sem o statement definir um, e um CHECK `status <> 'pending' OR deadline_at IS
+NOT NULL` fecha o contrato — entao o slot da release anterior (blue-green), que
+insere `link_scans (canonical_url)` e reabre vereditos vencidos sem conhecer a
+coluna, produz linhas que convergem igual. Os 5 minutos aparecem em SQL e em
+`storage.LinkScanPendingDeadline`; `TestLinkScanPendingDeadlineMatchesTheSchema`
+e `TestLinkScanDeadlineBlueGreenPostgreSQL` mantem os dois iguais.
+
+### Policy `balanced` (`domain.LinkAccess`)
+
+| safety      | mensagem | clique                          | preview server-side |
+| ----------- | -------- | ------------------------------- | ------------------- |
+| `pending`   | publica  | nao (`click = none`)            | nao                 |
+| `safe`      | publica  | sim (`direct`, com `href`)      | sim                 |
+| `malicious` | publica  | nao; span da URL retirado       | nunca               |
+| `unknown`   | publica  | interstitial (`url` sem `href`) | nunca               |
+
+`unknown` cobre: provider que respondeu sem verdict (`inconclusive`), deadline
+vencido, URL sensivel (`terminal_reason = sensitive`), host interno
+(`internal`) e feature desligada (`disabled`). O preview e um allowlist de um
+unico valor: `safe`.
+
+### Contrato HTTP: `links[]`
+
+Toda mensagem servida (lista, leitura, criacao, edicao, `message.created`,
+`message.updated`, snapshots de seguranca) carrega:
+
+```json
+"links": [
+  { "ordinal": 0, "target_key": "<32 hex>", "text": "https://Example.com/A#frag", "url": "https://example.com/A",
+    "hostname": "example.com", "safety": "safe", "click": "direct",
+    "href": "https://example.com/A", "updated_at": "...",
+    "preview": { "state": "ready", "hostname": "example.com", "site_name": "...",
+                 "title": "...", "description": "...", "image_id": "<uuid>",
+                 "image_width": 480, "image_height": 240 } },
+  { "ordinal": 1, "target_key": "<32 hex>", "text": "https://desconhecido.example/x", "url": "...", "hostname": "...",
+    "safety": "unknown", "click": "interstitial", "updated_at": "..." },
+  { "ordinal": 2, "target_key": "<32 hex>", "safety": "malicious", "click": "none", "updated_at": "..." }
+]
+```
+
+Regras:
+
+- `target_key` e a identidade estavel do alvo (`domain.LinkTargetKey`: 128 bits
+  do SHA-256 da URL canonica, em hex). Toda ocorrencia carrega uma — inclusive
+  a `malicious`, que nao carrega `url` — e todo `message.link_updated` tambem.
+  A identidade de uma ocorrencia e `(target_key, ordinal)`, nunca a URL
+  visivel, que pode sumir (redacao) e voltar (recheck safe).
+
+- `href` existe **somente** quando `click = direct`. Sua presenca **e** a
+  autorizacao; o cliente nunca deriva um anchor de texto.
+- o cliente casa os spans renderizados com `links[].text` (texto exato como
+  escrito); um span sem entidade e texto literal (under-link e aceitavel,
+  over-link nao).
+- um link `malicious` nao carrega `text`, `url` nem `hostname`, e o
+  `body_text` chega com o span substituido por U+FFFC (`LinkBlockedMarker`). O
+  resto do texto e preservado. Citacoes, referencias e historico de edicao
+  continuam retendo o corpo inteiro em SQL quando o agregado e `malicious`.
+- o agregado `link_safety_state` e **projecao de compatibilidade**: numa
+  mensagem com `links[]` ele nunca manda reter o corpo inteiro — o cliente
+  preserva o `body_text` projetado pelo servidor (`bodyUnderAggregate`, usado
+  pelo evento `message.link_safety_changed`, pela correcao retida e pelo
+  snapshot de reconexao). So uma mensagem legada, sem `links[]`, mantem a
+  retencao integral historica; citacoes e referencias (sem `links[]` por
+  construcao) idem.
+- a classificacao de links roda sobre o **corpo persistido**: mentions sao
+  resolvidas e reescritas antes (`persistedBody`), e esse mesmo texto e
+  classificado, fingerprintado e gravado em create (canal e DM) e edit — um URL
+  digitado como label de mention nunca vira target, associacao, entidade ou
+  agregado, e a hidratacao encontra exatamente as ocorrencias gravadas.
+- ocorrencias sao derivadas do corpo **em leitura** pelo mesmo scanner que
+  gravou as associacoes, entao uma edicao `A + B -> A + C` re-deriva as
+  entidades: B some, C nasce `pending`, e um callback tardio de B nao encontra
+  ocorrencia para atualizar.
+- o backend hidrata `preview` em **toda** ocorrencia `safe` que tem uma; o
+  limite de dois cards por mensagem e visual e vive so no cliente
+  (`MAX_PREVIEW_CARDS`, `previewCards`): dedupe por `target_key`, ordem de
+  ocorrencia, no maximo dois — um terceiro alvo com preview ja chega
+  descrito e ocupa a vaga quando um dos dois primeiros deixa de ser elegivel.
+
+### Realtime
+
+`message.link_updated` (enderecado a conversa, sobrevive ao bus apos
+revalidacao dos conjuntos fechados):
+
+```json
+{ "type": "message.link_updated", "message_id": "...",
+  "link_update": { "message_id": "...", "link": { "target_key": "<32 hex>", "url": "...", "safety": "safe",
+                   "click": "direct", "href": "...", "updated_at": "...", "preview": { ... } } } }
+```
+
+O cliente aplica a todas as ocorrencias com aquele `target_key` (nunca por
+`url`), ignora eventos cujo `updated_at` e um instante anterior ao que ja
+desenha (comparacao cronologica com precisao de nanossegundo, nao lexica; um
+`updated_at` ilegivel e tratado como stale), e rele a mensagem no endpoint
+autoritativo quando o evento e `malicious` (nao traz `url`) **ou** quando
+libera uma ocorrencia que o cliente tem redigida (o texto retido so o servidor
+devolve). Os snapshots de reconexao seguem a **mesma** ordem de versao, por
+ocorrencia (`mergeSnapshotLinks`): o estado de cada `(target_key, ordinal)` e
+o mais novo entre snapshot e o que ja esta desenhado, entao um snapshot HTTP
+iniciado antes de um evento WS nao o regride; o _conjunto_ de ocorrencias
+segue a versao da mensagem (`updated_at`): um snapshot pelo menos tao novo
+quanto a mensagem desenhada remove ocorrencias editadas fora, um mais antigo
+nao adiciona nem remove. Um snapshot que revela uma redacao levantada (ou uma
+condenacao nova, ou a citacao liberada) dispara a re-leitura autoritativa;
+snapshots que so confirmam o desenhado nao custam requisicao. Uma
+reconciliacao mais nova aborta a anterior (`RequestRegistry`). O interstitial deriva o link da ocorrencia atual a cada render e
+fecha quando ela deixa de ser `interstitial` ou some. Um evento sem
+`target_key` e recusado no bus e no cliente. `message.link_safety_changed`
+continua existindo para o agregado (citacoes). Snapshots de reconexao
+(`message-security-snapshots`) passam a carregar `links[]`.
+
+**Fan-out bounded.** O anuncio a cada mensagem que nomeia o alvo roda uma
+pagina (`linkFanoutPage = 200`) por chamada e persiste o cursor em
+`chat.link_fanouts` (uma linha por `(canonical_url, workspace, kind)`, cursor
+por `message_id` em ordem deterministica, lease de 60 s, ate 10 tentativas sem
+progresso, `claim_id` gerado a cada claim e a cada reinicio: `Advance`/`Finish`
+fazem compare-and-set em `id + claim_id` e um claimant superado — lease vencida
+e reclamada, ou fan-out reiniciado por decisao mais nova — recebe
+`ErrLinkFanoutConflict` e nao move, nao encerra nem apaga a continuacao
+atual). O worker de scan continua os fan-outs pendentes a cada passada
+(`LinkTargetAnnouncer.Continue`: ate 5 rodadas x 10 fan-outs, em ordem de
+espera), entao um alvo em milhares de mensagens converge em passadas
+limitadas, sem monopolizar scan/deadline/reconcile, e uma falha no meio
+retoma do cursor. Uma nova decisao sobre o mesmo alvo reinicia o cursor. Toda
+pagina rele o estado atual do alvo, entao repetir uma pagina e inofensivo.
+
+### Provider abstraction
+
+`urlsafety.URLReputationProvider` e o unico contrato que o pipeline conhece:
+
+```go
+type URLReputationProvider interface {
+    Name() string
+    Check(ctx, canonicalURL, providerRef string) (ReputationResult, error)
+}
+```
+
+Respostas: `ReputationSafe`, `ReputationMalicious`, `ReputationUnknown`
+(terminal sem verdict) ou erro (`ErrUnavailable`, retentavel; `ErrCheckInProgress`
+com `ProviderRef` para providers assincronos). O Cloudflare URL Scanner e o
+unico adapter implementado (`CloudflareScanner.Check` = submit/poll por tras
+do contrato); ele **so** devolve SAFE com `hasVerdicts=true && malicious=false`.
+`finished` sem verdict e UNKNOWN. O contrato foi validado apenas contra as
+fixtures reais sanitizadas ja existentes em `cloudflare_test.go`; nenhuma
+validacao online foi feita nesta entrega (sem secret disponivel).
+
+Pipeline por target, nesta ordem: policy local (sensivel/interna: nunca vai ao
+provider) -> cache/verdict fresco (`VerdictTTL`) -> fast deny
+(`files.link_fetch_denylist`, so nega, nunca libera) -> provider -> deadline.
+
+### Circuit breaker
+
+`urlsafety.Breaker` (CLOSED -> OPEN apos 5 falhas consecutivas: timeout, 429,
+5xx, malformado -> HALF_OPEN apos 1 min com uma unica sonda). Aberto, `Check`
+devolve `ErrCircuitOpen` (que `errors.Is` `ErrUnavailable`) sem tocar o
+provider; os targets convergem pelo deadline. Gauge
+`nchat_link_safety_circuit_state{state}`.
+
+### Classificacao antes do provider (`urlsafety.ClassifyURL`)
+
+- `SENSITIVE`: query com `token`, `access_token`, `sig`, `X-Amz-Signature`,
+  `otp`, `invite`... ou path com `reset-password`, `magic-link`, `oauth`,
+  `invite`... -> `unknown/sensitive`, nunca enviado ao provider, nunca preview.
+- `INTERNAL`: sufixos `.internal`, `.local`, `.lan`, `.corp`, `.home.arpa`...
+  ou host que **resolve** para faixa privada (mesma politica de IP do fetcher)
+  -> `unknown/internal`.
+- IP literal, credenciais na URL, host sem ponto: nao e link (texto literal).
+
+### Flags
+
+| Variavel                    | Efeito                                                                                                                |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `CHAT_LINK_SAFETY_ENABLED`  | provider consultado. Off: sweeper continua; pending -> `unknown/disabled`                                             |
+| `CHAT_LINK_PREVIEW_ENABLED` | fetch OG + imagem derivada. Off: cards nao servidos, fila drenada (`failed/disabled`), links safe continuam clicaveis |
+
+### Metricas novas (labels de conjunto fechado)
+
+`nchat_link_scan_attempts_total{operation="resolve",result="deadline"}`,
+`{operation="submit",result="policy"}`, `nchat_link_safety_circuit_state{state}`,
+`nchat_link_previews_total{result}` (`queued|ready|failed|unsupported|timeout|blocked|redirect_refused|image_rejected|deadline|revoked`),
+`nchat_link_preview_pending`.
+
+### Compatibilidade
+
+- `chat.link_scans` e `chat.message_link_scans` sao reutilizadas como tabelas de
+  target e ocorrencia; `scan_uuid` passa a ser o `provider_ref` opaco.
+- Mensagens `pending_link_scan` de releases anteriores sao drenadas pelo
+  resolver legado (`ResolveDecidedMessages`), que agora trata `unknown` como
+  terminal; a migration `chat/000050` da deadline a todo pending existente.
+  **Condicao de remocao do resolver legado:** nenhum ambiente com linhas
+  `status = 'pending_link_scan'`.
+- O `link_safety_state` agregado da mensagem continua sendo mantido como
+  projecao derivada (citacoes/referencias/historico), nunca como autoridade.
+
+---
+
+## Historico: o pipeline de verdict por URL
+
 Antes de mostrar a alguem uma mensagem que carrega um link, e antes de buscar a
 pagina de um preview, o backend decide a **URL completa** -- scheme, host, path e
 query -- no Cloudflare URL Scanner. URL reportada como maliciosa: a operacao e
 recusada.
+
+> As secoes a seguir descrevem o pipeline por URL (submit/poll, uncertain,
+> reconciliacao, denylist, capacidade). Onde elas falam em "mensagem retida"
+> ou "recusada", leia "link pendente" ou "link bloqueado" (issue #807).
 
 O provedor e submit-then-poll (`POST .../urlscanner/v2/scan` devolve um UUID;
 `GET .../urlscanner/v2/result/{id}` responde 404 enquanto o scan roda, e a

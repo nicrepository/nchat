@@ -9,34 +9,14 @@
 // any other subresource is ever requested, and no browser is involved. The only
 // thing that reaches the network is the document itself.
 //
-// # Threat posture
+// # Where the hardening lives
 //
-// The URL is attacker-controlled by definition, so the controls below are the
-// feature rather than hardening around it:
-//
-//   - the destination is judged by the IP address the connection will use, not
-//     by its hostname. The dialer resolves, checks every answer, and connects
-//     to an address it has already accepted, so there is no window in which a
-//     name could resolve to something else — DNS rebinding has nowhere to
-//     happen. A name that answers with several addresses is refused if any one
-//     of them is private;
-//   - every redirect is a new connection through that same dialer, so the whole
-//     policy applies again at every hop, and the hop count is bounded;
-//   - the environment's proxy settings are ignored: a proxy would resolve and
-//     connect on this service's behalf, which is precisely the decision the
-//     dialer exists to make;
-//   - TLS is verified normally, against the original hostname. Nothing here
-//     relaxes certificate validation;
-//   - the response must declare text/html, the body is read through a limit,
-//     and parsing stops at <body>. A slow server, an endless body and a
-//     compression bomb all end at a bound;
-//   - the extracted strings are data, never markup. They are validity-checked,
-//     whitespace-normalised and truncated, and nothing in this service turns
-//     them into HTML.
-//
-// Errors are classified rather than described: a caller learns that a
-// destination was refused, never which one or why, so the endpoint cannot be
-// used to map a network it is not supposed to reach.
+// The dialer, the address policy, the bounded reader and the Open Graph parser
+// are libs/go/platform/linkfetch, shared with chat-service's rich-preview
+// pipeline (issue #807). This package adds what is specific to the interactive
+// route: the reputation gate in front of the fetch, the response cache and the
+// error classes the HTTP layer maps. See that package for the threat posture;
+// nothing here relaxes any part of it.
 package linkpreview
 
 import (
@@ -45,6 +25,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/linkfetch"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/file-service/internal/service"
 )
@@ -52,20 +33,24 @@ import (
 // Error classes. They are the contract with the HTTP layer, which maps each to
 // a status code and a fixed message. No error produced by this package carries
 // a hostname, an address or an upstream message.
+//
+// The transport and policy classes are the shared fetcher's own values, not
+// copies: an error the fetcher produces *is* the error the handler compares
+// against, so the mapping cannot drift between the two packages.
 var (
 	// ErrInvalidURL marks a request that is not a usable URL at all.
-	ErrInvalidURL = errors.New("link preview: invalid url")
+	ErrInvalidURL = linkfetch.ErrInvalidURL
 	// ErrURLNotAllowed marks a well-formed URL this service refuses to fetch:
 	// a scheme, a port or — the case that matters — a destination that is not
 	// public. It never says which.
-	ErrURLNotAllowed = errors.New("link preview: url not allowed")
+	ErrURLNotAllowed = linkfetch.ErrURLNotAllowed
 	// ErrUnsupportedContentType marks a response that is not HTML.
-	ErrUnsupportedContentType = errors.New("link preview: unsupported content type")
+	ErrUnsupportedContentType = linkfetch.ErrUnsupportedContentType
 	// ErrTimeout marks a remote server that did not answer within the budget.
-	ErrTimeout = errors.New("link preview: upstream timed out")
+	ErrTimeout = linkfetch.ErrTimeout
 	// ErrUpstream marks any other failure of the remote server: refused
 	// connection, unusable status, oversized body, unreadable stream.
-	ErrUpstream = errors.New("link preview: upstream failed")
+	ErrUpstream = linkfetch.ErrUpstream
 	// ErrNoMetadata marks a document that was fetched and parsed and carried
 	// nothing worth showing. It is an expected outcome, not a failure.
 	ErrNoMetadata = errors.New("link preview: no metadata")
@@ -95,6 +80,10 @@ var (
 	// clearance, and nothing is fetched in either case.
 	ErrSafetyCapacity = errors.New("link preview: safety scan capacity exceeded")
 )
+
+// MaxURLLength bounds what a client may submit. It is the shared fetcher's
+// ceiling, re-exported so the HTTP layer's request bound stays in step.
+const MaxURLLength = linkfetch.MaxURLLength
 
 // Preview is what the client receives. Every field is plain text or a plain
 // URL; none of it is markup and none of it may be rendered as such.
@@ -185,7 +174,7 @@ type URLSafetyChecker interface {
 
 // Service answers preview requests, in front of a cache.
 type Service struct {
-	fetcher  *fetcher
+	fetcher  *linkfetch.Fetcher
 	cache    *cache
 	ttl      time.Duration
 	observer Observer
@@ -198,13 +187,13 @@ type Service struct {
 // NewService builds the service. timeout bounds one whole remote exchange and
 // ttl is how long a successful preview is reused.
 func NewService(timeout, ttl time.Duration, observer Observer) *Service {
-	return newService(newFetcher(timeout, lookupAddrs), ttl, observer, time.Now)
+	return newService(linkfetch.NewFetcher(timeout), ttl, observer, time.Now)
 }
 
 // newService is NewService with the fetcher and the clock supplied, so a test
 // can drive cache expiry without sleeping and reach a local server without the
 // address policy being weakened for it.
-func newService(f *fetcher, ttl time.Duration, observer Observer, now func() time.Time) *Service {
+func newService(f *linkfetch.Fetcher, ttl time.Duration, observer Observer, now func() time.Time) *Service {
 	return &Service{
 		fetcher:  f,
 		cache:    newCache(maxCacheEntries, now),
@@ -231,7 +220,7 @@ func (s *Service) WithScanCapacity(capacity service.LinkScanCapacity) *Service {
 
 // Preview returns the metadata for rawURL.
 func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
-	target, err := canonicalURL(rawURL)
+	target, err := linkfetch.ParseURL(rawURL)
 	if err != nil {
 		// A URL that never became canonical has no cache key, so this one case
 		// is answered before the cache rather than through it.
@@ -287,16 +276,21 @@ func (s *Service) Preview(ctx context.Context, rawURL string) (Preview, error) {
 // whether this deployment may connect to the destination at all, and it still
 // runs, at every hop, for every URL that gets this far.
 func (s *Service) load(ctx context.Context, key string, target *url.URL) (Preview, error) {
-	final, body, err := s.fetcher.fetch(ctx, target)
+	// No hop policy beyond the address rules: this route answers one
+	// interactive request about one URL and has no per-hop verdict to consult.
+	// The chat-service pipeline, which does, passes one.
+	final, body, err := s.fetcher.FetchDocument(ctx, target, nil)
 	if err != nil {
 		return Preview{}, err
 	}
-	preview := extract(final, body)
-	if !preview.hasMetadata() {
+	metadata := linkfetch.Extract(final, body)
+	if !metadata.HasMetadata() {
 		return Preview{}, ErrNoMetadata
 	}
-	preview.URL = key
-	return preview, nil
+	return Preview{
+		URL: key, Title: metadata.Title, Description: metadata.Description,
+		ImageURL: metadata.ImageURL, SiteName: metadata.SiteName,
+	}, nil
 }
 
 // checkSafety refuses a URL the provider condemned, and refuses one it could

@@ -174,3 +174,16 @@ func TestCacheIsConcurrencySafe(t *testing.T) {
 	}
 	group.Wait()
 }
+
+// Zero values fall back to the package defaults, and the public constructor
+// wires a real fetcher and cache behind them.
+func TestConstructorsFallBackToDefaults(t *testing.T) {
+	cache := newCache(0, nil)
+	if cache.maxEntries != maxCacheEntries || cache.now == nil {
+		t.Fatalf("newCache(0, nil) = %+v", cache)
+	}
+	svc := NewService(time.Second, time.Minute, nil)
+	if svc.fetcher == nil || svc.cache == nil || svc.ttl != time.Minute {
+		t.Fatalf("NewService = %+v", svc)
+	}
+}

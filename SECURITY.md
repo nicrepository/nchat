@@ -618,9 +618,13 @@ O scan em si e assincrono (RF-22) e falha fechada em todas as direcoes:
 ## Regras para fetch de conteudo externo
 
 Vale para toda requisicao de saida cujo destino e escolhido, direta ou
-indiretamente, por um usuario. Hoje o unico caso e o preview de links por Open
-Graph (RF-10) no file-service; a regra e permanente e vale para qualquer feature
-futura com a mesma forma.
+indiretamente, por um usuario. Hoje sao dois casos, ambos sobre o mesmo fetcher
+(`libs/go/platform/linkfetch`): o preview de links por Open Graph (RF-10) no
+file-service e os rich previews de mensagens no chat-service (issue #807), que
+so buscam uma URL depois de um verdict `safe` explicito e nunca entregam ao
+browser um asset remoto — a `og:image` vira thumbnail derivado servido pelo
+NChat. A regra e permanente e vale para qualquer feature futura com a mesma
+forma.
 
 - O destino e julgado pelo **endereco IP que a conexao vai usar**, nunca pelo
   hostname. Resolver, verificar **todas** as respostas e conectar ao endereco ja

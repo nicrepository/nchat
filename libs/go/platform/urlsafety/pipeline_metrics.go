@@ -66,6 +66,13 @@ const (
 	// down. The provider may or may not have accepted it; the row is left for
 	// reconciliation rather than submitted again.
 	AttemptUncertain = "uncertain"
+	// AttemptDeadline marks a pending target the sweep terminalised as unknown
+	// because nobody answered in time (issue #807). It is the count of links that
+	// became interstitials for want of a verdict.
+	AttemptDeadline = "deadline"
+	// AttemptPolicy marks a target terminalised without asking the provider: a
+	// sensitive URL or an internal host (issue #807).
+	AttemptPolicy = "policy"
 	// AttemptInconclusive marks a poll whose scan the provider confirms is
 	// finished but produced no usable verdict. Distinct from AttemptRetry and
 	// AttemptError: nothing failed and nothing will be retried — the row is
@@ -162,6 +169,9 @@ type PipelineMetrics struct {
 	admissions      *prometheus.CounterVec
 	reconciliations *prometheus.CounterVec
 	verdictRecon    *prometheus.CounterVec
+	circuit         *prometheus.GaugeVec
+	previews        *prometheus.CounterVec
+	previewPending  *prometheus.GaugeVec
 }
 
 // NewPipelineMetrics registers the pipeline collectors for one service.
@@ -238,9 +248,27 @@ func NewPipelineMetrics(metrics *observability.Metrics, service string) *Pipelin
 		Help: "Attempts to obtain a verdict for a scan that finished without one.",
 	}, []string{"service", "source", "result"})
 
+	// The breaker's position (issue #807): one series per state, 1 for the
+	// current one. An operator alerts on open; half_open flapping is a provider
+	// that recovers and fails in turns.
+	circuit := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nchat_link_safety_circuit_state",
+		Help: "Reputation provider circuit breaker position, 1 for the current state.",
+	}, []string{"service", "state"})
+	// The preview pipeline's outcomes (issue #807 §39). Closed set; blocked and
+	// redirect_refused are the SSRF and hop-policy refusals worth alerting on.
+	previews := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nchat_link_previews_total",
+		Help: "Rich preview pipeline outcomes.",
+	}, []string{"service", "result"})
+	previewPending := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nchat_link_preview_pending",
+		Help: "Previews queued or being fetched.",
+	}, []string{"service"})
+
 	if !registerAll(metrics,
 		pending, oldestAge, attempts, providerMs, outboxPending, outboxAge, revalidations,
-		admissions, reconciliations, verdictRecon,
+		admissions, reconciliations, verdictRecon, circuit, previews, previewPending,
 	) {
 		return nil
 	}
@@ -250,8 +278,53 @@ func NewPipelineMetrics(metrics *observability.Metrics, service string) *Pipelin
 		outboxPending: outboxPending, outboxAge: outboxAge,
 		revalidations: revalidations,
 		admissions:    admissions, reconciliations: reconciliations,
-		verdictRecon: verdictRecon,
+		verdictRecon: verdictRecon, circuit: circuit, previews: previews, previewPending: previewPending,
 	}
+}
+
+// Preview outcomes. A closed set; no URL, host or reason text ever joins it.
+const (
+	PreviewQueued          = "queued"
+	PreviewReady           = "ready"
+	PreviewFailed          = "failed"
+	PreviewUnsupported     = "unsupported"
+	PreviewTimeout         = "timeout"
+	PreviewBlocked         = "blocked"
+	PreviewRedirectRefused = "redirect_refused"
+	PreviewImageRejected   = "image_rejected"
+	PreviewDeadline        = "deadline"
+	PreviewRevoked         = "revoked"
+)
+
+// ObserveCircuitState publishes the breaker's position: the named state at 1,
+// the others at 0, so a dashboard reads one series per state.
+func (m *PipelineMetrics) ObserveCircuitState(state string) {
+	if m == nil {
+		return
+	}
+	for _, known := range []BreakerState{BreakerClosed, BreakerOpen, BreakerHalfOpen} {
+		value := 0.0
+		if string(known) == state {
+			value = 1
+		}
+		m.circuit.WithLabelValues(m.service, string(known)).Set(value)
+	}
+}
+
+// ObservePreview counts one preview pipeline outcome.
+func (m *PipelineMetrics) ObservePreview(result string) {
+	if m == nil {
+		return
+	}
+	m.previews.WithLabelValues(m.service, result).Inc()
+}
+
+// ObservePreviewBacklog publishes the number of non-terminal previews.
+func (m *PipelineMetrics) ObservePreviewBacklog(pending int) {
+	if m == nil {
+		return
+	}
+	m.previewPending.WithLabelValues(m.service).Set(float64(pending))
 }
 
 // Reconciliation sources. A closed two-value set: who asked.

@@ -280,6 +280,10 @@ export interface LinkSafetyRecheck {
   retryAfterSeconds: number;
 }
 
+import type { MessageLink } from "./messageLinks";
+
+export type { LinkPreview, LinkSafety, LinkClick, MessageLink } from "./messageLinks";
+
 export type MessageBodyFormat = "v1" | "v2" | "v3";
 
 export function normalizeBodyFormat(raw?: string): MessageBodyFormat {
@@ -377,6 +381,15 @@ export interface Message {
    * `"unknown"` — a state that authorises nothing.
    */
   linkSafetyState?: MessageLinkSafety;
+  /**
+   * Per-link entities (issue #807): what in the body is a link, where it
+   * points, what is known about it and what the reader may do with it. The
+   * server is the authority; the renderer matches rendered spans against
+   * `links[].text` and draws an anchor only where an `href` was sent. Absent
+   * means the body has no links this server described, and every URL-looking
+   * span renders as literal text.
+   */
+  links?: MessageLink[];
   deletedAt?: string | null;
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
@@ -601,6 +614,8 @@ export type MessageSecuritySnapshot =
       status: MessageStatus;
       linkSafetyState: MessageLinkSafety;
       updatedAt: string;
+      /** The authoritative per-link state (issue #807); absent when the message has no links. */
+      links?: MessageLink[];
       quoted?: {
         messageId: string;
         status: MessageStatus;

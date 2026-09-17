@@ -1352,6 +1352,51 @@ describe("useChatWebSocket", () => {
     expect(onLinkSafetyChanged).not.toHaveBeenCalled();
   });
 
+  it("routes a per-link update and drops one that names another message (issue #807)", () => {
+    const onLinkUpdated = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onMessageLinkUpdated: onLinkUpdated,
+      }),
+    );
+    const link = {
+      ordinal: 0,
+      target_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      url: "https://example.test/a",
+      hostname: "example.test",
+      safety: "safe",
+      click: "direct",
+      href: "https://example.test/a",
+      updated_at: "2026-08-18T12:00:00Z",
+    };
+    const event = {
+      type: "message.link_updated",
+      target_type: "channel",
+      target_id: "ch-1",
+      message_id: "msg-1",
+      link_update: { message_id: "msg-1", link },
+    };
+
+    act(() => {
+      FakeWebSocket.instances[0].simulateOpen();
+      FakeWebSocket.instances[0].simulateMessage(event);
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_update: { message_id: "msg-2", link },
+      });
+      FakeWebSocket.instances[0].simulateMessage({
+        ...event,
+        link_update: { message_id: "msg-1" },
+      });
+    });
+
+    expect(onLinkUpdated).toHaveBeenCalledTimes(1);
+    expect(onLinkUpdated).toHaveBeenCalledWith(event);
+  });
+
   it("routes every supported message.updated body format only for the active target", () => {
     const onMessageUpdated = vi.fn<(event: WSMessageUpdatedEvent) => void>();
     renderHook(() =>

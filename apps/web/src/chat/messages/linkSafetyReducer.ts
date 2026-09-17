@@ -8,7 +8,12 @@
  */
 
 import type { Message } from "../chatTypes";
-import { applyLinkSafetyCorrection, isOlderSecurityVersion } from "./linkSafetyCorrections";
+import { applyLinkUpdate, type MessageLink } from "../messageLinks";
+import {
+  applyLinkSafetyCorrection,
+  bodyUnderAggregate,
+  isOlderSecurityVersion,
+} from "./linkSafetyCorrections";
 import type { Action, ActionOf, LinkSafetyChange, MessagesState } from "./types";
 
 type Changed = ActionOf<"link_safety_changed">;
@@ -51,19 +56,18 @@ function linkSafetyChangeIsStale(state: MessagesState, action: Changed): boolean
   return state.messages.some((message) => holdsNewerVersionOf(message, action));
 }
 
-/** The message body's own correction: nothing when it is already applied. */
-function correctMessageBody(message: Message, action: Changed, malicious: boolean): Message {
+/**
+ * The message body's own correction: nothing when it is already applied. The
+ * aggregate never withholds the body of a message that carries links[] — that
+ * body is the server's own span-level projection (bodyUnderAggregate).
+ */
+function correctMessageBody(message: Message, action: Changed): Message {
+  const bodyText = bodyUnderAggregate(message, action.state);
   const unchanged =
-    (message.linkSafetyState ?? "") === (action.state ?? "") &&
-    !(malicious && message.bodyText !== "");
+    (message.linkSafetyState ?? "") === (action.state ?? "") && bodyText === message.bodyText;
   if (message.id !== action.messageId || unchanged) return message;
   if (isOlderSecurityVersion(action.updatedAt, message.updatedAt)) return message;
-  return {
-    ...message,
-    linkSafetyState: action.state,
-    bodyText: malicious ? "" : message.bodyText,
-    updatedAt: action.updatedAt,
-  };
+  return { ...message, linkSafetyState: action.state, bodyText, updatedAt: action.updatedAt };
 }
 
 /** The same correction applied to the quote preview this message carries. */
@@ -135,7 +139,7 @@ function applyLinkSafetyChanged(state: MessagesState, action: Changed): Messages
   const malicious = action.state === "malicious";
   const messages = state.messages.map((message) =>
     correctReferencePreview(
-      correctQuotedPreview(correctMessageBody(message, action, malicious), action, malicious),
+      correctQuotedPreview(correctMessageBody(message, action), action, malicious),
       action,
       malicious,
     ),
@@ -147,7 +151,31 @@ function applyLinkSafetyChanged(state: MessagesState, action: Changed): Messages
   return { ...state, messages, replyTo, linkSafetyCorrections, lastMutation: "none" };
 }
 
+/**
+ * Issue #807: a per-link update, applied to every occurrence of its URL in the
+ * one message it names. Nothing else moves — not the body, not the aggregate
+ * marker — because the update describes a target, not the message. A condemned
+ * target never arrives here: it carries no URL, and the hook re-reads the
+ * message instead so the redacted body arrives with the links.
+ */
+function applyLinkUpdated(state: MessagesState, action: ActionOf<"link_updated">): MessagesState {
+  let changed = false;
+  const messages = state.messages.map((message) => {
+    if (message.id !== action.messageId || !message.links) return message;
+    const links = applyLinkUpdate(message.links, action.link);
+    if (!links || linksEqual(links, message.links)) return message;
+    changed = true;
+    return { ...message, links };
+  });
+  return changed ? { ...state, messages, lastMutation: "none" } : state;
+}
+
+function linksEqual(a: readonly MessageLink[], b: readonly MessageLink[]): boolean {
+  return a.length === b.length && a.every((link, index) => link === b[index]);
+}
+
 /** RF-21 verdicts about a published message's links. */
 export function reduceLinkSafety(state: MessagesState, action: Action): MessagesState | undefined {
+  if (action.type === "link_updated") return applyLinkUpdated(state, action);
   return action.type === "link_safety_changed" ? applyLinkSafetyChanged(state, action) : undefined;
 }

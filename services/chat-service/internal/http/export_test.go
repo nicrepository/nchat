@@ -10,3 +10,7 @@ var (
 	// BearerAuth middleware. Tests use this constant instead of raw string literals.
 	ExportBearerScheme = bearerScheme
 )
+
+// ExportMapToMessageJSON exposes the message serializer so the per-link
+// contract (issue #807) can be asserted field for field.
+var ExportMapToMessageJSON = mapToMessageJSON

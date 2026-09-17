@@ -3319,3 +3319,254 @@
   font-weight: 600;
   color: var(--color-ink, #16121f);
 }
+
+/*
+ * Per-link states (issue #807).
+ *
+ * Four states, four shapes, and none of them relies on colour alone: the safe
+ * anchor keeps its underline, the unverified link is a button with a glyph and
+ * the words "não verificado" in its accessible name, the pending link is plain
+ * text followed by a status note, and the blocked chip carries its own label.
+ * Every long URL wraps with `overflow-wrap: anywhere` so nothing widens the
+ * column.
+ */
+.rtr-link--unverified {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--color-ink-2, #264653);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.rtr-link--unverified .material-symbols-outlined {
+  font-size: 14px;
+  vertical-align: -2px;
+  margin-right: 2px;
+  color: var(--color-muted, #5c7380);
+}
+
+.rtr-link-pending {
+  overflow-wrap: anywhere;
+}
+
+.rtr-link-pending__text {
+  color: var(--color-ink-2, #264653);
+}
+
+.rtr-link-pending__note {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  color: var(--color-muted, #5c7380);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.rtr-link-pending__note .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.rtr-link-blocked {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--color-danger-tint, #fee2e2);
+  color: var(--color-danger-ink, #991b1b);
+  font-size: 12px;
+  font-weight: 700;
+  vertical-align: baseline;
+}
+
+.rtr-link-blocked .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/*
+ * Rich preview cards (issue #807 §24). Secondary to the text: a quiet surface
+ * with a left rule, the real hostname first, and an image that never dominates
+ * the column. At most two per message, each at most the bubble's width.
+ */
+.chat-msg-area__link-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  max-width: min(100%, 440px);
+}
+
+.link-card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  border: 1px solid var(--color-border, #dbe7eb);
+  border-left: 3px solid var(--color-primary-soft, #67e8f9);
+  border-radius: var(--radius-lg, 8px);
+  background: var(--color-surface-2, #f8fbfc);
+  color: var(--color-ink, #102a33);
+}
+
+.link-card--placeholder {
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  color: var(--color-muted, #5c7380);
+  font-size: 12px;
+}
+
+.link-card__body {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  color: inherit;
+  text-decoration: none;
+  border-radius: inherit;
+}
+
+.link-card__body:hover .link-card__title {
+  text-decoration: underline;
+}
+
+.link-card__body:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: -2px;
+}
+
+.link-card__host {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-muted, #5c7380);
+  overflow-wrap: anywhere;
+}
+
+.link-card__site {
+  font-weight: 500;
+}
+
+.link-card__title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--color-primary, #0e7490);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.link-card__description {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-ink-2, #264653);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.link-card__media {
+  margin-top: 6px;
+  border-radius: var(--radius-md, 6px);
+  overflow: hidden;
+  background: var(--color-border, #dbe7eb);
+}
+
+.link-card__image {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  object-fit: cover;
+}
+
+.link-card__placeholder-text {
+  font-style: italic;
+}
+
+.link-card__menu-host {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 6px 6px 0 0;
+}
+
+.link-card__menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--radius-md, 6px);
+  background: none;
+  color: var(--color-muted, #5c7380);
+  cursor: pointer;
+}
+
+.link-card__menu-trigger:hover,
+.link-card__menu-trigger[aria-expanded="true"] {
+  background: var(--color-primary-tint, #ecfeff);
+  color: var(--color-primary, #0e7490);
+}
+
+.link-card__menu-trigger:focus-visible {
+  outline: 2px solid var(--color-primary, #0e7490);
+  outline-offset: 2px;
+}
+
+.link-card__menu {
+  position: absolute;
+  top: 100%;
+  right: 6px;
+  z-index: 30;
+  min-width: 190px;
+  padding: 4px;
+  border: 1px solid var(--color-border, #dbe7eb);
+  border-radius: var(--radius-lg, 8px);
+  background: var(--color-surface, #fff);
+  box-shadow: var(--shadow-md, 0 6px 18px rgba(16, 42, 51, 0.08));
+  display: flex;
+  flex-direction: column;
+}
+
+.link-card__menu-item {
+  display: block;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-md, 6px);
+  background: none;
+  color: var(--color-ink, #102a33);
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.link-card__menu-item:hover,
+.link-card__menu-item:focus-visible {
+  background: var(--color-primary-tint, #ecfeff);
+  outline: none;
+}
+
+@media (max-width: 640px) {
+  .chat-msg-area__link-cards {
+    max-width: 100%;
+  }
+
+  .link-card__image {
+    max-height: 180px;
+  }
+}

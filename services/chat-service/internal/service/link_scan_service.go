@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
+	"github.com/nicrepository/nchat/libs/go/platform/linkfetch"
 	"github.com/nicrepository/nchat/libs/go/platform/urlsafety"
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
@@ -62,19 +64,40 @@ type LinkScanQueue interface {
 	ResolveDecidedMessages(ctx context.Context) (storage.ResolveSummary, error)
 	ReopenExpiredVerdicts(ctx context.Context) (int, error)
 	LinkScanBacklog(ctx context.Context) (map[string]int, time.Duration, error)
+	// Issue #807: convergence and policy terminals.
+	TerminalizeExpiredLinkScans(ctx context.Context) ([]string, error)
+	TerminalizePendingLinkScansDisabled(ctx context.Context) ([]string, error)
+	RecordLinkTargetTerminal(ctx context.Context, canonicalURL, reason string) error
 	ClaimPublishEvents(ctx context.Context, batchSize int) ([]storage.PublishEvent, error)
 	MarkPublished(ctx context.Context, messageID string) error
 	CancelPublishEvent(ctx context.Context, messageID string) error
 	PublishOutboxBacklog(ctx context.Context) (int, time.Duration, error)
 }
 
-// LinkScanProvider is the provider half. *urlsafety.Service satisfies it, which
-// is what keeps the strictness rule — only Safe and Malicious are answers — in
-// one place shared with file-service.
+// LinkScanProvider is the provider half, in the provider-agnostic contract of
+// issue #807. *urlsafety.Service satisfies it, which is what keeps the
+// strictness rule — only an explicit clearance or condemnation is an answer —
+// and the circuit breaker in one place shared with file-service.
+//
+// Check with an empty ref starts a check; ErrCheckInProgress hands back the ref
+// to persist and retry with. A synchronous provider answers on the first call
+// and the worker records the verdict in the same pass.
 type LinkScanProvider interface {
-	Submit(ctx context.Context, canonicalURL string) (string, error)
-	Poll(ctx context.Context, canonicalURL, scanID string) (urlsafety.Verdict, error)
+	Check(ctx context.Context, canonicalURL, providerRef string) (urlsafety.ReputationResult, error)
 }
+
+// circuitReporter is the optional half a provider exposes for the breaker gauge.
+type circuitReporter interface {
+	CircuitState() urlsafety.BreakerState
+}
+
+// hostResolver resolves a hostname for the pre-provider internal-network check.
+type hostResolver = linkfetch.Resolver
+
+// directProviderRef is the ref persisted for a provider that answered on the
+// first call: there is no remote id, and the verdict compare-and-set still
+// binds the write to this attempt.
+const directProviderRef = "direct"
 
 // LinkScanSearcher is the recovery half, and is deliberately optional.
 //
@@ -109,6 +132,8 @@ const (
 	attemptResultThrottled    = urlsafety.AttemptThrottled
 	attemptResultUncertain    = urlsafety.AttemptUncertain
 	attemptResultInconclusive = urlsafety.AttemptInconclusive
+	attemptResultDeadline     = urlsafety.AttemptDeadline
+	attemptResultPolicy       = urlsafety.AttemptPolicy
 )
 
 // How the worker behaves in the submission window, and how much a deployment is
@@ -179,6 +204,16 @@ type LinkScanService struct {
 	// id the provider already accepted. A field so a test can drive the retry
 	// without waiting on a clock.
 	persistRetryDelay time.Duration
+
+	// announcer converges a decided target into the messages naming it (issue
+	// #807). Nil means only the aggregate drain runs, through publisher.
+	announcer *LinkTargetAnnouncer
+	// resolve is the DNS lookup for the internal-network check. Nil disables the
+	// check; production wires linkfetch.LookupAddrs.
+	resolve hostResolver
+	// safetyEnabled gates provider exchanges. Off, every pending target is
+	// terminalised as unknown/disabled on the next pass rather than waiting.
+	safetyEnabled bool
 }
 
 // LinkScanWorkerCapacity is the worker's half of the capacity configuration:
@@ -222,7 +257,27 @@ func NewLinkScanService(
 		queue: queue, provider: provider, publisher: publisher, logger: logger,
 		persistRetryDelay: submitPersistRetryDelay,
 		capacity:          LinkScanWorkerCapacity{UncertainTimeout: defaultUncertainTimeout},
+		safetyEnabled:     provider != nil,
 	}
+}
+
+// SetAnnouncer attaches the per-link convergence (issue #807).
+func (s *LinkScanService) SetAnnouncer(announcer *LinkTargetAnnouncer) {
+	s.announcer = announcer
+}
+
+// SetHostResolver enables the internal-network check before a provider is
+// asked: a hostname that resolves into a private range is terminalised as
+// internal and never leaves the deployment.
+func (s *LinkScanService) SetHostResolver(resolve hostResolver) {
+	s.resolve = resolve
+}
+
+// SetSafetyEnabled records whether the provider may be consulted. Off, the
+// sweep still runs — a flag that stranded rows would be the failure mode issue
+// #566 documented — and every pending target converges as unknown/disabled.
+func (s *LinkScanService) SetSafetyEnabled(enabled bool) {
+	s.safetyEnabled = enabled && s.provider != nil
 }
 
 // SetPersistRetryDelay overrides the pause between attempts to write down a
@@ -292,13 +347,20 @@ func (s *LinkScanService) SetPublisher(publisher MessageEventPublisher) {
 // retry storm — and what makes a withheld message stay withheld rather than
 // being released by an error.
 func (s *LinkScanService) ProcessDue(ctx context.Context) (int, error) {
-	// Lapsed verdicts first: a URL whose clearance expired must be scanned again
+	// Convergence first (issue #807): pending targets past their deadline become
+	// unknown, and with the provider switched off every pending target does.
+	// This runs whether or not the provider does, so nothing is ever stranded.
+	s.terminalizeExpired(ctx)
+	// Fan-outs that did not finish in the pass that began them (issue #807):
+	// bounded pages, continued from their durable cursor.
+	s.announcer.Continue(ctx)
+	// Lapsed verdicts next: a URL whose clearance expired must be scanned again
 	// before the claim runs, or the withheld message waiting on it would sit
 	// decided-but-stale forever — promotable by nothing, re-scanned by nothing.
 	s.reopenExpired(ctx)
 
 	moved := 0
-	for moved < linkScanBatchSize && ctx.Err() == nil {
+	for s.safetyEnabled && moved < linkScanBatchSize && ctx.Err() == nil {
 		job, ok, err := s.claimOne(ctx)
 		if err != nil {
 			return moved, err
@@ -320,6 +382,27 @@ func (s *LinkScanService) ProcessDue(ctx context.Context) (int, error) {
 		s.logger.WarnContext(ctx, "prune link scan budget", slog.String("error", err.Error()))
 	}
 	return moved, nil
+}
+
+// terminalizeExpired ends every pending target that has waited long enough,
+// and announces each one so the links it holds up become interstitials.
+func (s *LinkScanService) terminalizeExpired(ctx context.Context) {
+	urls, err := s.queue.TerminalizeExpiredLinkScans(ctx)
+	if err == nil && !s.safetyEnabled {
+		var disabled []string
+		disabled, err = s.queue.TerminalizePendingLinkScansDisabled(ctx)
+		urls = append(urls, disabled...)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.WarnContext(ctx, "terminalize pending link scans", slog.String("error", err.Error()))
+		}
+		return
+	}
+	for _, url := range urls {
+		s.observeAttempt(operationResolve, attemptResultDeadline)
+		s.announcer.Announce(ctx, url)
+	}
 }
 
 // reopenExpired requeues verdicts that lapsed while a message waited on them.
@@ -351,6 +434,9 @@ func (s *LinkScanService) observeBacklog(ctx context.Context) {
 	// and there is nowhere to put their results.
 	if s.metrics == nil || ctx.Err() != nil {
 		return
+	}
+	if reporter, ok := s.provider.(circuitReporter); ok {
+		s.metrics.ObserveCircuitState(string(reporter.CircuitState()))
 	}
 	byState, oldest, err := s.queue.LinkScanBacklog(ctx)
 	if err != nil {
@@ -422,6 +508,10 @@ func (s *LinkScanService) advance(ctx context.Context, job storage.LinkScanJob) 
 // attempt outstanding means the next pass asks the provider what happened
 // instead of assuming nothing did.
 func (s *LinkScanService) submitClaim(ctx context.Context, job storage.LinkScanJob) {
+	if reason := s.refusedByPolicy(ctx, job.CanonicalURL); reason != "" {
+		s.recordPolicyTerminal(ctx, job, reason)
+		return
+	}
 	if !s.acquireProviderSubmitCapacity(ctx, job) {
 		return
 	}
@@ -442,17 +532,72 @@ func (s *LinkScanService) submitClaim(ctx context.Context, job storage.LinkScanJ
 	}
 
 	started := time.Now()
-	scanID, err := s.provider.Submit(ctx, job.CanonicalURL)
+	result, err := s.provider.Check(ctx, job.CanonicalURL, "")
 	s.observeProvider(operationSubmit, started)
-	if err != nil {
+	switch {
+	case errors.Is(err, urlsafety.ErrCheckInProgress):
+		s.persistScanID(ctx, job, generation, result.ProviderRef)
+	case err != nil:
 		// The attempt stays outstanding. It may have been accepted — a timeout
 		// after acceptance looks identical from here — so the next pass
 		// reconciles rather than submits.
 		s.observeAttempt(operationSubmit, attemptResultError)
 		s.logFailure(ctx, "submit link scan", job, err)
-		return
+	default:
+		// A synchronous provider answered outright. The ref is bound first so the
+		// verdict write goes through the same compare-and-set every poll uses.
+		job.ScanUUID = directProviderRef
+		if result.ProviderRef != "" {
+			job.ScanUUID = result.ProviderRef
+		}
+		if s.persistScanID(ctx, job, generation, job.ScanUUID) {
+			s.recordVerdict(ctx, job, result.Verdict.LegacyVerdict())
+		}
 	}
-	s.persistScanID(ctx, job, generation, scanID)
+}
+
+// refusedByPolicy names the reason a URL must not be handed to a public
+// provider at all — a sensitive URL, an internal host by name, or a host that
+// resolves into a private range — or "" when it may. Nothing here is a verdict
+// about the link; it is a statement about what this deployment is willing to
+// send outside (issue #807 §22-23).
+func (s *LinkScanService) refusedByPolicy(ctx context.Context, canonicalURL string) string {
+	switch urlsafety.ClassifyURL(canonicalURL) {
+	case urlsafety.URLClassSensitive:
+		return storage.TerminalReasonSensitive
+	case urlsafety.URLClassInternal:
+		return storage.TerminalReasonInternal
+	}
+	if s.resolve == nil {
+		return ""
+	}
+	parsed, err := url.Parse(canonicalURL)
+	if err != nil {
+		return ""
+	}
+	_, err = linkfetch.ResolveAndValidate(ctx, s.resolve, parsed.Hostname())
+	if errors.Is(err, linkfetch.ErrURLNotAllowed) {
+		return storage.TerminalReasonInternal
+	}
+	// A name that does not resolve is not an internal one. The provider may
+	// still know it; the preview fetcher will refuse it on its own.
+	return ""
+}
+
+// recordPolicyTerminal ends a target the policy refused to ask about, and
+// announces it so its links become interstitials now rather than at the
+// deadline.
+func (s *LinkScanService) recordPolicyTerminal(ctx context.Context, job storage.LinkScanJob, reason string) {
+	switch err := s.queue.RecordLinkTargetTerminal(ctx, job.CanonicalURL, reason); {
+	case err == nil:
+		s.observeAttempt(operationSubmit, attemptResultPolicy)
+		s.announcer.Announce(ctx, job.CanonicalURL)
+	case errors.Is(err, storage.ErrLinkScanConflict):
+		s.observeAttempt(operationSubmit, attemptResultLeaseLost)
+	default:
+		s.observeAttempt(operationSubmit, attemptResultError)
+		s.logFailure(ctx, "record policy terminal", job, err)
+	}
 }
 
 // persistScanID writes down an id the provider has already given us, trying
@@ -468,18 +613,18 @@ func (s *LinkScanService) submitClaim(ctx context.Context, job storage.LinkScanJ
 // next pass reconciles it.
 func (s *LinkScanService) persistScanID(
 	ctx context.Context, job storage.LinkScanJob, generation int, scanID string,
-) {
+) bool {
 	for attempt := 0; attempt < submitPersistAttempts; attempt++ {
 		err := s.queue.RecordLinkScanSubmission(ctx, job.CanonicalURL, scanID, generation)
 		switch {
 		case err == nil:
 			s.observeAttempt(operationSubmit, attemptResultSuccess)
-			return
+			return true
 		case errors.Is(err, storage.ErrLinkScanConflict):
 			// The row moved on: decided, or a newer attempt owns it. This scan is
 			// orphaned at the provider, and submitting again would only add a third.
 			s.observeAttempt(operationSubmit, attemptResultLeaseLost)
-			return
+			return false
 		}
 		s.logFailure(ctx, "record link scan submission", job, err)
 		if ctx.Err() != nil || attempt == submitPersistAttempts-1 {
@@ -487,7 +632,7 @@ func (s *LinkScanService) persistScanID(
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(s.persistRetryDelay):
 		}
 	}
@@ -495,6 +640,7 @@ func (s *LinkScanService) persistScanID(
 	// rather than as an error, because an operator needs to see the uncertainty
 	// window filling up — it is the thing that eventually costs a duplicate.
 	s.observeAttempt(operationSubmit, attemptResultUncertain)
+	return false
 }
 
 // acquireProviderSubmitCapacity takes one submission from the deployment-wide
@@ -607,36 +753,34 @@ func (s *LinkScanService) reportStaleAttempt(job storage.LinkScanJob) {
 // pollClaim reads a scan already submitted and records a final verdict.
 func (s *LinkScanService) pollClaim(ctx context.Context, job storage.LinkScanJob) {
 	started := time.Now()
-	verdict, err := s.provider.Poll(ctx, job.CanonicalURL, job.ScanUUID)
+	result, err := s.provider.Check(ctx, job.CanonicalURL, job.ScanUUID)
 	s.observeProvider(operationPoll, started)
 	switch {
-	case errors.Is(err, urlsafety.ErrScanPending):
+	case errors.Is(err, urlsafety.ErrCheckInProgress):
 		// Still running. Not an outcome, not an error, and above all not a
 		// clearance — the row stays pending and is read again next time.
 		s.observeAttempt(operationPoll, attemptResultPending)
-		return
-	case errors.Is(err, urlsafety.ErrScanInconclusive):
-		// The provider confirms this exact scan finished and produced no usable
-		// verdict — the production incident this branch exists for. It is
-		// terminal and fail-closed: recorded once, below, and never polled again.
-		// There is no path from here into resubmission.
-		s.recordVerdict(ctx, job, urlsafety.VerdictInconclusive)
 		return
 	case err != nil:
 		s.observeAttempt(operationPoll, attemptResultRetry)
 		s.logFailure(ctx, "poll link scan", job, err)
 		return
-	case !verdict.IsFinal():
-		// The provider layer already refuses anything that is not an explicit
-		// clearance or condemnation, and this refuses it again before writing.
-		// Belt and braces on purpose: this is the one call that turns a provider
-		// answer into a row a message is released by, so a future provider
-		// implementation returning a zero value with a nil error must not be able
-		// to write one.
+	}
+	verdict := result.Verdict.LegacyVerdict()
+	if !verdict.IsFinal() && result.Verdict != urlsafety.ReputationUnknown {
+		// The provider layer already refuses anything that is not one of the three
+		// known answers, and this refuses it again before writing. Belt and braces
+		// on purpose: this is the one call that turns a provider answer into a row
+		// a link is released by, so a provider returning a zero value with a nil
+		// error must not be able to write one.
 		s.observeAttempt(operationPoll, attemptResultError)
 		s.logFailure(ctx, "poll link scan", job, urlsafety.ErrUnavailable)
 		return
 	}
+	// ReputationUnknown is the provider confirming a finished check with no
+	// usable verdict — the production incident this branch exists for. It is
+	// terminal and fail-closed: recorded once as inconclusive, never polled
+	// again, and there is no path from here into resubmission.
 	s.recordVerdict(ctx, job, verdict)
 }
 
@@ -653,11 +797,7 @@ func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkSca
 	switch err := s.queue.RecordLinkVerdict(ctx, job.CanonicalURL, job.ScanUUID, verdict); {
 	case err == nil:
 		s.observeAttempt(operationPoll, result)
-		publisher, _ := s.publisher.(LinkSafetyChangePublisher)
-		if err := drainMessageLinkSafety(ctx, s.queue, job.CanonicalURL, publisher); err != nil && ctx.Err() == nil {
-			s.logger.WarnContext(ctx, "converge ordinary link verdict",
-				slog.String("error", err.Error()))
-		}
+		s.converge(ctx, job.CanonicalURL)
 	case errors.Is(err, storage.ErrLinkScanConflict):
 		// This worker's lease had already been lost and the row now carries a
 		// different scan. Its answer describes a scan nobody is waiting on.
@@ -668,8 +808,25 @@ func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkSca
 	}
 }
 
+// converge propagates a decided target into its messages: the per-link
+// announcer when wired (issue #807), else the aggregate drain alone.
+func (s *LinkScanService) converge(ctx context.Context, canonicalURL string) {
+	if s.announcer != nil {
+		s.announcer.Announce(ctx, canonicalURL)
+		return
+	}
+	publisher, _ := s.publisher.(LinkSafetyChangePublisher)
+	if err := drainMessageLinkSafety(ctx, s.queue, canonicalURL, publisher); err != nil && ctx.Err() == nil {
+		s.logger.WarnContext(ctx, "converge ordinary link verdict", slog.String("error", err.Error()))
+	}
+}
+
 // releaseDecided promotes or blocks every withheld message whose links are all
 // decided, then delivers the events those promotions wrote.
+//
+// Since issue #807 no new message is withheld; this drains the rows the
+// previous release left in pending_link_scan, whose targets now all converge.
+// Remove once no deployment has such rows.
 //
 // The two halves are deliberately separate. The promotion and its event are one
 // transaction, so a crash can never leave a message active with nobody told

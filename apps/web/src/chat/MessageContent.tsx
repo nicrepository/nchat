@@ -7,13 +7,21 @@
  * are all answers to "what goes inside the bubble".
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
-import { linkSafetyAllowsAnchors } from "./chatTypes";
 import type { LinkSafetyRecheck, MentionTarget, Message } from "./chatTypes";
 import InlineMessageEditor from "./InlineMessageEditor";
+import { hasLinkProjection } from "./messages/linkSafetyCorrections";
+import LinkInterstitialDialog from "./LinkInterstitialDialog";
+import LinkPreviewCard from "./LinkPreviewCard";
 import MessageAttachments from "./MessageAttachments";
+import {
+  findLinkOccurrence,
+  previewCards,
+  type LinkOccurrenceRef,
+  type MessageLink,
+} from "./messageLinks";
 import RichTextRenderer from "./RichTextRenderer";
 import type { CodecFormat } from "./tiptapSerializer";
 
@@ -316,6 +324,11 @@ function LinkSafetyBanner({
   onReconcile?: (messageId: string) => Promise<LinkSafetyRecheck | undefined>;
 }) {
   if (message.isRemoved) return null;
+  // Issue #807: a message whose links the server described carries its state
+  // on each link — the interstitial, the blocked chip — and a banner over the
+  // whole message would say the same thing twice. The banners remain for a
+  // payload from a server that predates the entities.
+  if (message.links) return null;
   if (message.linkSafetyState === "inconclusive") {
     return <LinkSafetyNotice messageId={message.id} onReconcile={onReconcile} />;
   }
@@ -367,10 +380,12 @@ function MessageContextBlocks({
 /**
  * The body itself, in the one of four forms the message's state calls for.
  *
- * A condemned body is withheld rather than rendered with the link struck
- * through: the body *is* the link, as far as the risk goes, and a URL a reader
- * can select and paste is a URL the block did not stop. Nothing there is
- * clickable and nothing is fetched.
+ * Since issue #807 a condemned link is withheld by the server *span by span*:
+ * the body arrives with the blocked marker where the URL was, and the rest of
+ * the text as written. A body the server withheld wholesale — a legacy payload
+ * with the aggregate marker and no entities — is still shown as the tombstone.
+ * Nothing here is clickable unless the server sent an href, and nothing is
+ * fetched.
  */
 function MessageBodyContent({
   message,
@@ -379,12 +394,18 @@ function MessageBodyContent({
   onSaveEdit,
   onCancelEdit,
   onEditForbidden,
+  onOpenUnverified,
 }: Pick<
   MessageContentProps,
   "message" | "mentionTarget" | "editing" | "onSaveEdit" | "onCancelEdit" | "onEditForbidden"
->) {
+> & { onOpenUnverified: (link: MessageLink, trigger: HTMLElement) => void }) {
+  const links = message.links;
+  const rendering = useMemo(
+    () => (links ? { links, onOpenUnverified } : undefined),
+    [links, onOpenUnverified],
+  );
   if (message.isRemoved) return "Mensagem removida.";
-  if (message.linkSafetyState === "malicious") {
+  if (message.linkSafetyState === "malicious" && !hasLinkProjection(links)) {
     return <span className="chat-msg-area__link-blocked-body">{withheldBodyNotice}</span>;
   }
   if (editing) {
@@ -398,23 +419,58 @@ function MessageBodyContent({
       />
     );
   }
-  // The state test is linkSafetyAllowsAnchors, an allowlist of exactly the two
-  // states representing a *completed* check. Everything else — the legacy empty
-  // state, and `unknown`, which is what the decoder produces for a server value
-  // this build does not recognise — renders as literal text.
-  //
-  // `status === "active"` is still required, because a withheld message was
-  // never published and has no public link, but it is never sufficient on its
-  // own: since #135 a published message is not a verified one.
-  const linksClickable =
-    message.status === "active" && linkSafetyAllowsAnchors(message.linkSafetyState ?? "");
   return (
-    <RichTextRenderer
-      text={message.bodyText}
-      bodyFormat={message.bodyFormat}
-      linksClickable={linksClickable}
-    />
+    <RichTextRenderer text={message.bodyText} bodyFormat={message.bodyFormat} links={rendering} />
   );
+}
+
+/**
+ * The rich cards under a message (issue #807 §24-27): at most two, one per
+ * distinct target, in occurrence order, and only for links the server cleared
+ * and described. A failed preview is a link staying an ordinary anchor, so
+ * nothing is drawn for it — and nothing is said about it either.
+ */
+function LinkPreviewCards({ message }: { message: Message }) {
+  if (message.isRemoved) return null;
+  const cards = previewCards(message.links);
+  if (cards.length === 0) return null;
+  return (
+    <div className="chat-msg-area__link-cards" data-testid="chat-message-link-cards">
+      {cards.map((link) => (
+        <LinkPreviewCard key={link.targetKey} messageId={message.id} link={link} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The interstitial an unverified link opens (issue #807 §13). One at a time per
+ * message, and the trigger is remembered so focus goes back to it.
+ *
+ * Only the occurrence's identity is kept — which target, which position — and
+ * the link itself is resolved from the message on every render. What the
+ * dialog shows and offers is therefore always the current state, never the
+ * snapshot taken at the click: a verdict that arrives while it is open changes
+ * it, and an occurrence that stops being an interstitial — cleared, condemned,
+ * sent back for a recheck, or edited away — closes it.
+ */
+function useUnverifiedLink(links: readonly MessageLink[] | undefined) {
+  const [pending, setPending] = useState<{ ref: LinkOccurrenceRef; trigger: HTMLElement } | null>(
+    null,
+  );
+  const open = useCallback(
+    (link: MessageLink, trigger: HTMLElement) =>
+      setPending({ ref: { targetKey: link.targetKey, ordinal: link.ordinal }, trigger }),
+    [],
+  );
+  const close = useCallback(() => setPending(null), []);
+  const current = pending ? findLinkOccurrence(links, pending.ref) : undefined;
+  const link = current?.click === "interstitial" ? current : undefined;
+  // Forgotten as soon as it stops being an interstitial, so a later verdict
+  // that brings the same occurrence back to unverified does not reopen a
+  // dialog nobody asked for. Adjusted during render, the way derived state is.
+  if (pending && !link) setPending(null);
+  return { link, trigger: pending?.trigger ?? null, open, close };
 }
 
 export interface MessageContentProps {
@@ -432,7 +488,12 @@ export interface MessageContentProps {
 }
 
 export default function MessageContent(props: MessageContentProps) {
-  const { message } = props;
+  const { message, onReconcileLinkSafety } = props;
+  const unverified = useUnverifiedLink(message.links);
+  const recheck = useMemo(
+    () => (onReconcileLinkSafety ? () => onReconcileLinkSafety(message.id) : undefined),
+    [message.id, onReconcileLinkSafety],
+  );
   return (
     <>
       <MessageNotices message={message} onReconcile={props.onReconcileLinkSafety} />
@@ -443,7 +504,16 @@ export default function MessageContent(props: MessageContentProps) {
         onQuoteJump={props.onQuoteJump}
         onReferenceJump={props.onReferenceJump}
       />
-      <MessageBodyContent {...props} />
+      <MessageBodyContent {...props} onOpenUnverified={unverified.open} />
+      <LinkPreviewCards message={message} />
+      {unverified.link && (
+        <LinkInterstitialDialog
+          link={unverified.link}
+          trigger={unverified.trigger}
+          onClose={unverified.close}
+          onRecheck={recheck}
+        />
+      )}
       {/* RF-32. Below the body, so an attachment sent with text reads as part of
           the same message, and hidden for a removed one along with everything
           else the placeholder replaces. Editing does not touch attachments, so

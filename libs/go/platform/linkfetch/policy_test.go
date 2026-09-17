@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"errors"
@@ -14,7 +14,7 @@ func TestCanonicalURLAcceptsPublicHTTPAndHTTPS(t *testing.T) {
 		"http://example.com:80/",
 		"https://sub.example.co.uk/path/to/page",
 	} {
-		if _, err := canonicalURL(raw); err != nil {
+		if _, err := ParseURL(raw); err != nil {
 			t.Fatalf("expected %q to be accepted, got %v", raw, err)
 		}
 	}
@@ -30,9 +30,9 @@ func TestCanonicalURLNormalizesForCacheKey(t *testing.T) {
 	}
 	var first string
 	for index, raw := range sameKey {
-		parsed, err := canonicalURL(raw)
+		parsed, err := ParseURL(raw)
 		if err != nil {
-			t.Fatalf("canonicalURL(%q): %v", raw, err)
+			t.Fatalf("ParseURL(%q): %v", raw, err)
 		}
 		if index == 0 {
 			first = parsed.String()
@@ -43,7 +43,7 @@ func TestCanonicalURLNormalizesForCacheKey(t *testing.T) {
 		}
 	}
 
-	differing, err := canonicalURL("https://example.com/page?a=2")
+	differing, err := ParseURL("https://example.com/page?a=2")
 	if err != nil {
 		t.Fatalf("canonicalURL: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestCanonicalURLRefusesInvalidInput(t *testing.T) {
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := canonicalURL(testCase.raw)
+			_, err := ParseURL(testCase.raw)
 			if !errors.Is(err, testCase.want) {
 				t.Fatalf("expected %v for %q, got %v", testCase.want, testCase.raw, err)
 			}
@@ -113,7 +113,7 @@ func TestCanonicalURLRefusesNonPublicLiterals(t *testing.T) {
 		"http://[2002:7f00:1::]/",
 		"http://[ff02::1]/",
 	} {
-		if _, err := canonicalURL(raw); !errors.Is(err, ErrURLNotAllowed) {
+		if _, err := ParseURL(raw); !errors.Is(err, ErrURLNotAllowed) {
 			t.Fatalf("expected %q to be refused, got %v", raw, err)
 		}
 	}
@@ -140,7 +140,7 @@ func TestAddrAllowed(t *testing.T) {
 	}
 	for _, raw := range blocked {
 		addr := netip.MustParseAddr(raw)
-		if addrAllowed(addr) {
+		if AddrAllowed(addr) {
 			t.Fatalf("expected %s to be blocked", raw)
 		}
 	}
@@ -152,7 +152,7 @@ func TestAddrAllowed(t *testing.T) {
 	}
 	for _, raw := range allowed {
 		addr := netip.MustParseAddr(raw)
-		if !addrAllowed(addr) {
+		if !AddrAllowed(addr) {
 			t.Fatalf("expected %s to be allowed", raw)
 		}
 	}
@@ -162,13 +162,13 @@ func TestAddrAllowed(t *testing.T) {
 // interface on this host and is never a public destination.
 func TestAddrAllowedRefusesZonedAddresses(t *testing.T) {
 	addr := netip.MustParseAddr("2606:4700:4700::1111").WithZone("eth0")
-	if addrAllowed(addr) {
+	if AddrAllowed(addr) {
 		t.Fatal("expected a zoned address to be blocked")
 	}
 }
 
 func TestAddrAllowedRefusesInvalidAddress(t *testing.T) {
-	if addrAllowed(netip.Addr{}) {
+	if AddrAllowed(netip.Addr{}) {
 		t.Fatal("expected the zero address to be blocked")
 	}
 }

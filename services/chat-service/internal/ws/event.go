@@ -52,6 +52,13 @@ const (
 	// The payload is a message id and a state from a closed set. No URL, no scan
 	// uuid, no provider text — see MessageLinkSafetyPayload.
 	EventTypeMessageLinkSafetyChanged EventType = "message.link_safety_changed"
+	// EventTypeMessageLinkUpdated tells the subscribers of a conversation that
+	// one link of a message they hold changed state (issue #807): its safety,
+	// what the reader may do with it, or its preview. The payload is the link
+	// entity for one canonical target; a client patches every occurrence of
+	// that URL in the message. A condemned target arrives without its URL and
+	// the client re-reads the message for the redacted body.
+	EventTypeMessageLinkUpdated EventType = "message.link_updated"
 )
 
 // MessageLinkSafetyPayload carries the new link-safety state of one published
@@ -79,6 +86,42 @@ type MessageLinkSafetyPayload struct {
 	// say about links has nothing to correct.
 	State     string    `json:"state"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// LinkPayload is one link entity on the wire, mirroring the HTTP contract's
+// `links[]` item field for field so a message inserted from an event renders
+// exactly as one loaded over HTTP.
+type LinkPayload struct {
+	Ordinal   int                 `json:"ordinal"`
+	TargetKey string              `json:"target_key"`
+	Text      string              `json:"text,omitempty"`
+	URL       string              `json:"url,omitempty"`
+	Hostname  string              `json:"hostname,omitempty"`
+	Safety    string              `json:"safety"`
+	Click     string              `json:"click"`
+	Href      string              `json:"href,omitempty"`
+	UpdatedAt time.Time           `json:"updated_at"`
+	Preview   *LinkPreviewPayload `json:"preview,omitempty"`
+}
+
+// LinkPreviewPayload is the card, as data. image_id names a derived asset on
+// chat-service; there is deliberately no field that could carry a remote URL
+// for the browser to load.
+type LinkPreviewPayload struct {
+	State       string `json:"state"`
+	Hostname    string `json:"hostname"`
+	SiteName    string `json:"site_name,omitempty"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	ImageID     string `json:"image_id,omitempty"`
+	ImageWidth  int    `json:"image_width,omitempty"`
+	ImageHeight int    `json:"image_height,omitempty"`
+}
+
+// MessageLinkUpdatePayload is the body of message.link_updated.
+type MessageLinkUpdatePayload struct {
+	MessageID string      `json:"message_id"`
+	Link      LinkPayload `json:"link"`
 }
 
 // MessageBlockedReasonMaliciousLink and MessageBlockedReasonLinkCheckInconclusive
@@ -329,14 +372,18 @@ type MessagePayload struct {
 	// link" notice on a message it is inserting. It authorises nothing — see
 	// domain.MessageLinkSafety — and is omitted for the overwhelming majority of
 	// messages, which carry no links at all.
-	LinkSafetyState string        `json:"link_safety_state,omitempty"`
-	IsRemoved       bool          `json:"is_removed"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
-	EditedAt        *time.Time    `json:"edited_at,omitempty"`
-	DeletedAt       *time.Time    `json:"deleted_at,omitempty"`
-	Quoted          *QuotePayload `json:"quoted,omitempty"`
-	IsForwarded     bool          `json:"is_forwarded"`
+	LinkSafetyState string `json:"link_safety_state,omitempty"`
+	// Links are the per-occurrence link entities (issue #807), the same shape
+	// the HTTP contract carries. Like Attachments they are dropped from the event
+	// relayed over the bus, where a remote instance re-reads the message.
+	Links       []LinkPayload `json:"links,omitempty"`
+	IsRemoved   bool          `json:"is_removed"`
+	CreatedAt   time.Time     `json:"created_at"`
+	UpdatedAt   time.Time     `json:"updated_at"`
+	EditedAt    *time.Time    `json:"edited_at,omitempty"`
+	DeletedAt   *time.Time    `json:"deleted_at,omitempty"`
+	Quoted      *QuotePayload `json:"quoted,omitempty"`
+	IsForwarded bool          `json:"is_forwarded"`
 	// Attachments lets a subscriber render a message that carries a file without
 	// a follow-up GET, exactly like BodyText and Quoted (RF-32). It is the same
 	// metadata the list endpoints publish and grants nothing: content and preview
@@ -440,19 +487,23 @@ type NotificationPolicyPayload struct {
 
 // MessageUpdatedPayload carries authoritative edit or deletion fields.
 type MessageUpdatedPayload struct {
-	MessageID       string     `json:"message_id"`
-	ChannelID       string     `json:"channel_id,omitempty"`
-	DMID            string     `json:"dm_id,omitempty"`
-	Body            string     `json:"body"`
-	BodyFormat      string     `json:"body_format"`
-	LinkSafetyState string     `json:"link_safety_state"`
-	EditedAt        time.Time  `json:"edited_at"`
-	EditCount       int        `json:"edit_count"`
-	IsEdited        bool       `json:"is_edited"`
-	Status          string     `json:"status"`
-	IsRemoved       bool       `json:"is_removed"`
-	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	MessageID       string `json:"message_id"`
+	ChannelID       string `json:"channel_id,omitempty"`
+	DMID            string `json:"dm_id,omitempty"`
+	Body            string `json:"body"`
+	BodyFormat      string `json:"body_format"`
+	LinkSafetyState string `json:"link_safety_state"`
+	// Links are the edited body's link entities (issue #807), so a subscriber
+	// applying the new body applies the states that go with it rather than
+	// keeping the old body's.
+	Links     []LinkPayload `json:"links,omitempty"`
+	EditedAt  time.Time     `json:"edited_at"`
+	EditCount int           `json:"edit_count"`
+	IsEdited  bool          `json:"is_edited"`
+	Status    string        `json:"status"`
+	IsRemoved bool          `json:"is_removed"`
+	DeletedAt *time.Time    `json:"deleted_at,omitempty"`
+	UpdatedAt time.Time     `json:"updated_at"`
 }
 
 // MessageAttachmentPayload mirrors the attachment metadata the HTTP message
@@ -711,6 +762,9 @@ type Event struct {
 	// from every other event type on arrival — an event carrying one alongside an
 	// unrelated type is relaying a state nobody asked it about.
 	LinkSafety *MessageLinkSafetyPayload `json:"link_safety,omitempty"`
+	// LinkUpdate carries one link's new state (issue #807). Set only for
+	// message.link_updated and stripped from every other type on arrival.
+	LinkUpdate *MessageLinkUpdatePayload `json:"link_update,omitempty"`
 	// Typing carries one user's typing state in a channel or DM.
 	Typing *TypingEventPayload `json:"typing,omitempty"`
 	// RecipientUserID routes a user-scoped event to exactly one user.

@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import { normalizeLinkSafety } from "../chatTypes";
+import { linkUpdateNeedsSnapshot, parseMessageLink } from "../messageLinks";
 import {
   useChatWebSocket,
   type WSAttachmentStatusEvent,
@@ -11,6 +12,7 @@ import {
   type WSMessageBlockedEvent,
   type WSMessageCreatedEvent,
   type WSMessageLinkSafetyChangedEvent,
+  type WSMessageLinkUpdatedEvent,
   type WSMessageUpdatedEvent,
   type WSPinUpdatedEvent,
   type WSTypingUpdatedEvent,
@@ -179,6 +181,33 @@ export function useMessageRealtime({
   );
 
   /**
+   * Issue #807: one link of a message changed state. Every occurrence is
+   * matched by the target's stable key, which survives redaction. A condemned
+   * target arrives without its URL — nothing in the event could tell this
+   * client which span to withhold — and a target released from condemnation
+   * needs the text the server withheld; both are re-read from the
+   * authoritative endpoint, which answers with the body and the links. Every
+   * other update patches the occurrences in place; a malformed entity is
+   * dropped, and the next read converges it.
+   */
+  const handleLinkUpdated = useCallback(
+    (event: WSMessageLinkUpdatedEvent) => {
+      const link = parseMessageLink(event.link_update.link);
+      if (!link) return;
+      // A condemnation, or the release of an occurrence this client holds
+      // blocked, needs the body only the server can produce: the redacted
+      // text, or the text it withheld. Either way the message is re-read.
+      const rendered = scope.messages().find((message) => message.id === event.message_id);
+      if (linkUpdateNeedsSnapshot(rendered?.links, link)) {
+        readMessageSnapshot(event.message_id, false);
+        return;
+      }
+      dispatch({ type: "link_updated", messageId: event.message_id, link });
+    },
+    [dispatch, readMessageSnapshot, scope],
+  );
+
+  /**
    * An update that carries what it announces.
    *
    * The tombstone is recorded before anything else, so a read already in flight
@@ -321,6 +350,7 @@ export function useMessageRealtime({
     onMessageCreated: handleMessageCreated,
     onMessageBlocked: handleMessageBlocked,
     onMessageLinkSafetyChanged: handleLinkSafetyChanged,
+    onMessageLinkUpdated: handleLinkUpdated,
     onMessageUpdated: handleMessageUpdated,
     onReactionUpdated: reactions.handleReactionUpdated,
     onTypingUpdated: handleTypingUpdated,

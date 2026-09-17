@@ -22,6 +22,8 @@ import {
 import type { InlineMarkerType, ListType, MentionType } from "./richTextMarkers";
 import { findAutolinks } from "./autolink";
 import type { MessageBodyFormat } from "./chatTypes";
+import { LINK_BLOCKED_MARKER, linkForText, type MessageLink } from "./messageLinks";
+import MessageLinkSpan, { BlockedLinkChip } from "./MessageLinkSpan";
 
 type InlineToken =
   | string
@@ -141,56 +143,93 @@ const tokenizeInline = (text: string, format: MessageBodyFormat): InlineToken[] 
       : tokenizeV1Inline(text);
 
 /**
- * Splits one plain text run into text and anchors (RF-21 / issue #135).
- *
- * Applied only to the plain-string tokens. A URL inside an inline `code` span or
- * a fenced code block is a *different* token type and never reaches here, which
- * is the behaviour anyone writing `` `https://…` `` is asking for.
- *
- * Nothing is fetched. The anchor is ordinary browser navigation on click, and
- * `target="_blank"` carries `rel="noopener noreferrer"`: noopener so the opened
- * page cannot reach back through `window.opener`, noreferrer so this workspace's
- * URL — which names a channel or a conversation — is not handed to whatever the
- * link points at.
- *
- * The text is a React child and the href a React attribute, so both are escaped
- * by React. There is no `dangerouslySetInnerHTML` anywhere in this file.
+ * The link entities and the interstitial callback, threaded through the
+ * renderer as one value so the recursion over lists does not grow a parameter
+ * per feature.
  */
-function linkifyPlain(text: string, keyPrefix: string): ReactNode {
-  const spans = findAutolinks(text);
-  if (spans.length === 0) return text;
+export interface LinkRendering {
+  links: readonly MessageLink[];
+  onOpenUnverified?: (link: MessageLink, trigger: HTMLElement) => void;
+}
 
+/**
+ * Splits one plain text run into text and link spans (issue #807).
+ *
+ * The scanner locates URL-looking spans in the text; it decides nothing. Each
+ * span is looked up in the server's link entities by its exact text, and drawn
+ * the way the entity says — anchor, interstitial button, pending note. A span
+ * the server did not describe stays literal text: under-linking is the accepted
+ * direction, over-linking to an address nobody checked is the one that must
+ * not happen. The blocked marker the server substituted for a condemned URL is
+ * drawn as the blocked chip.
+ *
+ * Applied to every text run — plain, bold, italic, bold-italic — through
+ * renderInlineText. A URL inside an inline `code` span or a fenced code block
+ * is a *different* token type and never reaches here.
+ *
+ * Nothing is fetched. The text is a React child and the href a React attribute,
+ * so both are escaped by React. There is no `dangerouslySetInnerHTML` anywhere
+ * in this file.
+ */
+function linkifyPlain(text: string, keyPrefix: string, rendering: LinkRendering): ReactNode {
   const parts: ReactNode[] = [];
   let cursor = 0;
-  spans.forEach((span, index) => {
-    if (span.start > cursor) parts.push(text.slice(cursor, span.start));
+  const emit = (end: number) => {
+    if (end > cursor)
+      parts.push(...withBlockedChips(text.slice(cursor, end), `${keyPrefix}-t${cursor}`));
+  };
+  findAutolinks(text).forEach((span, index) => {
+    const link = linkForText(rendering.links, span.href);
+    if (!link) return;
+    emit(span.start);
     parts.push(
-      <a
+      <MessageLinkSpan
         key={`${keyPrefix}-a${index}`}
-        className="rtr-link"
-        href={span.href}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        {span.href}
-      </a>,
+        link={link}
+        text={span.href}
+        onOpenUnverified={rendering.onOpenUnverified}
+      />,
     );
     cursor = span.end;
   });
-  if (cursor < text.length) parts.push(text.slice(cursor));
-  return <Fragment key={`${keyPrefix}-link`}>{parts}</Fragment>;
+  emit(text.length);
+  return parts.length === 1 && typeof parts[0] === "string" ? (
+    parts[0]
+  ) : (
+    <Fragment key={`${keyPrefix}-link`}>{parts}</Fragment>
+  );
+}
+
+/** Text with every blocked marker replaced by the chip. */
+function withBlockedChips(text: string, keyPrefix: string): ReactNode[] {
+  if (!text.includes(LINK_BLOCKED_MARKER)) return [text];
+  return text
+    .split(LINK_BLOCKED_MARKER)
+    .flatMap((piece, index) =>
+      index === 0 ? [piece] : [<BlockedLinkChip key={`${keyPrefix}-b${index}`} />, piece],
+    );
+}
+
+/**
+ * One pipeline for every run of text a link may appear in: plain text and the
+ * text inside bold, italic and bold-italic all go through the same
+ * segmentation, so an emphasised URL is the same span — same entity, same
+ * anchor or interstitial, same chip — as a plain one, only wrapped. Without
+ * link entities the text is drawn as is. Inline code is not a text run here:
+ * it keeps its literal content, deliberately.
+ */
+function renderInlineText(text: string, keyPrefix: string, rendering?: LinkRendering): ReactNode {
+  return rendering ? linkifyPlain(text, keyPrefix, rendering) : text;
 }
 
 function renderTokens(
   tokens: InlineToken[],
   keyPrefix: string,
-  linksClickable: boolean,
+  rendering?: LinkRendering,
 ): ReactNode[] {
   return tokens.map((token, index): ReactNode => {
-    if (typeof token === "string") {
-      return linksClickable ? linkifyPlain(token, `${keyPrefix}-${index}`) : token;
-    }
     const key = `${keyPrefix}-${index}`;
+    if (typeof token === "string") return renderInlineText(token, key, rendering);
     if (token.type === "mention")
       return (
         <span
@@ -202,11 +241,12 @@ function renderTokens(
           @{token.text}
         </span>
       );
-    if (token.type === "bold") return <strong key={key}>{token.text}</strong>;
+    if (token.type === "bold")
+      return <strong key={key}>{renderInlineText(token.text, key, rendering)}</strong>;
     if (token.type === "boldItalic")
       return (
         <strong key={key}>
-          <em>{token.text}</em>
+          <em>{renderInlineText(token.text, key, rendering)}</em>
         </strong>
       );
     if (token.type === "code")
@@ -215,7 +255,7 @@ function renderTokens(
           {token.text}
         </code>
       );
-    return <em key={key}>{token.text}</em>;
+    return <em key={key}>{renderInlineText(token.text, key, rendering)}</em>;
   });
 }
 
@@ -327,13 +367,13 @@ function renderListItems(
   items: ListItemBlock[],
   keyPrefix: string,
   format: MessageBodyFormat,
-  linksClickable: boolean,
+  rendering?: LinkRendering,
 ): ReactNode[] {
   return items.map((item, index) => (
     <li key={index}>
-      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`, linksClickable)}
+      {renderTokens(tokenizeInline(item.text, format), `${keyPrefix}-${index}`, rendering)}
       {item.children.map((child, childIndex) =>
-        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format, linksClickable),
+        renderList(child, `${keyPrefix}-${index}-${childIndex}`, format, rendering),
       )}
     </li>
   ));
@@ -343,9 +383,9 @@ function renderList(
   block: ListBlock,
   key: string,
   format: MessageBodyFormat,
-  linksClickable: boolean,
+  rendering?: LinkRendering,
 ): ReactNode {
-  const items = renderListItems(block.items, key, format, linksClickable);
+  const items = renderListItems(block.items, key, format, rendering);
   return block.type === "ul" ? (
     <ul key={key} className="rtr-list">
       {items}
@@ -361,28 +401,23 @@ export interface RichTextRendererProps {
   text: string;
   bodyFormat?: MessageBodyFormat;
   /**
-   * Whether http(s) URLs in the body may be drawn as anchors (RF-21 / issue
-   * #135).
+   * The server's link entities for this body (issue #807), and the callback an
+   * unverified link opens the interstitial with.
    *
-   * **Defaults to `false`, and that default is the point.** Making a link
-   * clickable is a decision about link safety, and only a caller that has
-   * consulted `message.linkSafetyState` is in a position to make it. A new call
-   * site — a quote preview, a reference card, an edit history entry — therefore
-   * renders URLs as plain text until somebody deliberately opts it in, rather
-   * than inheriting a permission nobody thought about.
-   *
-   * Never derive this from `message.status`. A published message is not a
-   * verified one: since issue #135 a message whose links could not be verified is
-   * `active` and delivered to everyone, and it is `linkSafetyState` — not
-   * `status` — that says what may be done with its links.
+   * **Absent by default, and that default is the point.** A URL is drawn as a
+   * link only when the server described it, so a new call site — a quote
+   * preview, a reference card, an edit history entry — renders URLs as plain
+   * text until somebody deliberately passes the entities the server sent for
+   * that surface. Nothing is ever derived from `message.status` or from the
+   * text itself.
    */
-  linksClickable?: boolean;
+  links?: LinkRendering;
 }
 
 export default function RichTextRenderer({
   text,
   bodyFormat = "v1",
-  linksClickable = false,
+  links,
 }: RichTextRendererProps) {
   if (!text) return null;
 
@@ -397,7 +432,7 @@ export default function RichTextRenderer({
           );
         }
         if (block.type !== "para") {
-          return renderList(block, String(blockIndex), bodyFormat, linksClickable);
+          return renderList(block, String(blockIndex), bodyFormat, links);
         }
         return (
           <Fragment key={blockIndex}>
@@ -406,7 +441,7 @@ export default function RichTextRenderer({
                 {renderTokens(
                   tokenizeInline(line, bodyFormat),
                   `${blockIndex}-${lineIndex}`,
-                  linksClickable,
+                  links,
                 )}
                 {lineIndex < lines.length - 1 && <br />}
               </Fragment>

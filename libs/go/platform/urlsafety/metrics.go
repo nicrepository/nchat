@@ -18,6 +18,7 @@ const (
 	resultMalicious    = "malicious"
 	resultError        = "error"
 	resultInconclusive = "inconclusive"
+	resultCircuitOpen  = "circuit_open"
 )
 
 // Metrics counts verdict outcomes.
