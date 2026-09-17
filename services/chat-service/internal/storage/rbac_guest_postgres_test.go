@@ -76,6 +76,7 @@ func newRBACPool(t *testing.T) *pgxpool.Pool {
 			id UUID PRIMARY KEY,
 			email TEXT NOT NULL DEFAULT '',
 			display_name TEXT NOT NULL DEFAULT '',
+			avatar_url TEXT,
 			status TEXT NOT NULL DEFAULT 'active',
 			deleted_at TIMESTAMPTZ
 		)`); err != nil {
@@ -303,6 +304,22 @@ func TestPGXPinStore_GuestPinFollowsReadAccessPostgreSQL(t *testing.T) {
 		err := store.AddPin(ctx, rbacWorkspace, "channel", rbacPrivate, rbacPrivateMsg, rbacAdmin)
 		if !errors.Is(err, domain.ErrNotFound) {
 			t.Fatalf("AddPin for a non-member admin = %v, want ErrNotFound", err)
+		}
+	})
+
+	// Issue #475: a non-member listing pins must get the same non-enumerating
+	// ErrNotFound every other read gets — never a database error. ListPins's
+	// "no visible pins" branch is a hand-maintained literal row that has to
+	// mirror messageColumns/listMessageColumns column-for-column (see the
+	// comment above it in pin_store.go); it fell out of sync with three
+	// feature migrations and every non-member request started failing the
+	// query outright (a real 500) instead of reaching the ErrNotFound this
+	// admin, with pins visible nowhere in the private channel, is the case
+	// that reliably exercises: its authorized_pins CTE is always empty.
+	t.Run("admin listing pins in a private channel it does not belong to gets ErrNotFound, not a query error", func(t *testing.T) {
+		_, err := store.ListPins(ctx, rbacWorkspace, "channel", rbacPrivate, rbacAdmin)
+		if !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("ListPins for a non-member admin = %v, want ErrNotFound", err)
 		}
 	})
 }

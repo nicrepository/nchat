@@ -14,7 +14,7 @@ import type {
 } from "../chatTypes";
 import type { WSMessageUpdatedEvent, WSReactionUpdatedEvent } from "../useChatWebSocket";
 
-export type MessagesStatus = "idle" | "loading" | "ready" | "error";
+export type MessagesStatus = "idle" | "loading" | "ready" | "error" | "denied";
 
 /**
  * Explicit record of the most recent messages mutation.
@@ -93,6 +93,15 @@ export type Action =
   | { type: "loading" }
   | { type: "loaded"; page: MessagePage }
   | { type: "error" }
+  /**
+   * Issue #475: the server's non-enumerating 404 for a target this reader is
+   * not a member of, or a WebSocket room_access_denied for one that was open
+   * when membership was lost. Distinct from "error" so the UI can show a
+   * dedicated access-denied state instead of a retry affordance, and clears
+   * any messages already in state so a removed member's client stops
+   * displaying history it no longer has a right to.
+   */
+  | { type: "denied" }
   | { type: "sending" }
   | { type: "sent"; message: Message }
   | { type: "send_error"; error: string }

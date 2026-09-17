@@ -37,8 +37,15 @@ function safeDecodeURIComponent(value: string): string {
 
 /**
  * The conversation's display name, from the sidebar payload the header already
- * has. Falls back to the target's own id rather than to a blank, so a
- * conversation the sidebar has not delivered yet is still identifiable.
+ * has.
+ *
+ * Issue #475: this used to fall back to the target's own route id, on the
+ * theory that a conversation the sidebar has not delivered yet should still
+ * be identifiable. But a conversation absent from the sidebar payload is
+ * exactly what a non-member's target looks like, and the route id is a raw
+ * UUID/slug — showing it as a title would leak the very identifier the
+ * backend's non-enumerating 404 is designed to hide. Falls back to an empty
+ * string instead; callers show a neutral placeholder while it is empty.
  */
 function conversationName(
   kind: "channel" | "dm",
@@ -47,9 +54,9 @@ function conversationName(
   activeDM: DMConversation | undefined,
 ): string {
   if (kind === "channel") {
-    return ctx.channels.find((channel) => channel.id === targetId)?.name ?? targetId;
+    return ctx.channels.find((channel) => channel.id === targetId)?.name ?? "";
   }
-  return activeDM?.name ?? targetId;
+  return activeDM?.name ?? "";
 }
 
 export interface ConversationTarget {
@@ -97,7 +104,7 @@ export function useConversationTarget(kind: "channel" | "dm"): ConversationTarge
     // destination the reader just navigated away from.
     uploadTarget: targetId ? { kind, id: targetId } : null,
     composerPlaceholder: isChannel
-      ? `Mensagem para #${resolvedName}…`
-      : `Mensagem para ${resolvedName}…`,
+      ? `Mensagem para #${resolvedName || "canal"}…`
+      : `Mensagem para ${resolvedName || "conversa"}…`,
   };
 }

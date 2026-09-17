@@ -55,6 +55,7 @@ import { senderLabel } from "./messageDisplay";
 import ConversationHeader from "./message-area/ConversationHeader";
 import ConversationCallBars from "./message-area/ConversationCallBars";
 import ConversationNotices from "./message-area/ConversationNotices";
+import { AccessDeniedState } from "./message-area/ConversationStates";
 import PinnedBar from "./message-area/PinnedBar";
 import ConversationDialogs from "./message-area/dialogs/ConversationDialogs";
 import ConversationTimeline from "./message-area/timeline/ConversationTimeline";
@@ -455,6 +456,20 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   };
 
   const directCallBarProps = directCallBar(kind, ctx.directCallSession, activeDM?.counterpart);
+
+  // Issue #475: a conversation this reader is not a member of renders nothing
+  // of the conversation column — no header (name/avatar/participants), no
+  // timeline (messages/attachments/pins/system events), no composer, no
+  // details panel/dialogs. Returning early here, before any of that JSX, is
+  // what makes "nothing renders" a property of the code rather than of every
+  // descendant remembering to check state.status on its own.
+  if (state.status === "denied") {
+    return (
+      <div className="chat-msg-area chat-msg-area--denied" data-testid="chat-message-area">
+        <AccessDeniedState onBack={() => navigate("/chat")} />
+      </div>
+    );
+  }
 
   return (
     <div

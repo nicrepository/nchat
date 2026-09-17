@@ -1891,6 +1891,22 @@
   background: var(--color-surface-2, #faf8fd);
 }
 
+/* ── Access denied state (issue #475) ────────────────────────────────────────── */
+/* Shares the error state's layout and the retry button's visual style — a
+   restricted conversation is not a "something broke" moment, so its icon uses
+   a neutral tone instead of the error state's danger red. */
+
+.chat-msg-area__denied-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* ── Send error banner ───────────────────────────────────────────────────────── */
 
 .chat-msg-area__send-error,

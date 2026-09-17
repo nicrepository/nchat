@@ -67,6 +67,24 @@ export function reduceHistory(state: MessagesState, action: Action): MessagesSta
       return applyLoaded(state, action);
     case "error":
       return { ...state, status: "error", sending: false, lastMutation: "none" };
+    case "denied":
+      // Clears messages rather than just flipping status: a client that had
+      // already loaded history before losing access must not keep showing it
+      // underneath the access-denied state (issue #475).
+      return {
+        ...state,
+        status: "denied",
+        messages: [],
+        nextCursor: "",
+        sendError: null,
+        sending: false,
+        loadingMore: false,
+        lastMutation: "none",
+        realtimeError: null,
+        actionError: null,
+        pendingReactions: new Map(),
+        replyTo: null,
+      };
     case "prepending":
       return { ...state, loadingMore: true, lastMutation: "none" };
     case "prepended":

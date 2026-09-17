@@ -843,7 +843,26 @@ describe("ChatMessageArea — RF-08 forwarding", () => {
 describe("ChatMessageArea — channel header", () => {
   it("renders channel header with channel name", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    renderChannelArea("geral");
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [{ id: "geral", name: "geral", type: "public", canWrite: true }],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
 
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toBeInTheDocument();
@@ -852,7 +871,26 @@ describe("ChatMessageArea — channel header", () => {
 
   it("renders DM header with DM name", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
-    renderDMArea("dm-juliane");
+    render(
+      <MemoryRouter initialEntries={["/chat/dm/dm-juliane"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [],
+                  dms: [{ id: "dm-juliane", type: "1:1", name: "dm-juliane", participants: [] }],
+                }}
+              />
+            }
+          >
+            <Route path="dm/:id" element={<ChatMessageArea kind="dm" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
 
     const header = await screen.findByTestId("chat-msg-header");
     expect(header).toBeInTheDocument();
@@ -2402,24 +2440,46 @@ describe("ChatMessageArea — error state", () => {
     });
   });
 
-  it("inaccessible channel route shows safe error state and disables composer", async () => {
-    mockFetchChannelMessages.mockRejectedValue(new Error("not_found"));
-    renderChannelArea("private-target");
+  // Issue #475: the backend answers a non-member with the same
+  // non-enumerating 404 it uses for an id that does not exist at all (see
+  // chat-service's mapServiceError) — this is that response reaching the
+  // client, distinct from the generic network/5xx failure covered above.
+  it("inaccessible channel route shows the access-denied state, leaks nothing, and 'voltar' navigates to /chat", async () => {
+    mockFetchChannelMessages.mockRejectedValue(new ApiRequestError(404, "not_found", "not found"));
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chat/channel/private-target"]}>
+        <Routes>
+          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route path="/chat" element={<div data-testid="chat-index" />} />
+        </Routes>
+      </MemoryRouter>,
+    );
 
-    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
-    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+    expect(await screen.findByTestId("chat-msg-access-denied")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /você não tem acesso a esta conversa/i }),
+    ).toBeInTheDocument();
+    // Nothing from the old generic-error UX, and nothing that could enumerate
+    // or otherwise expose the conversation this reader cannot see into.
+    expect(screen.queryByTestId("chat-msg-error")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /tentar novamente/i })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-header")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-input")).not.toBeInTheDocument();
+    expect(screen.queryByText("private-target")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /voltar para minhas conversas/i }));
+    expect(await screen.findByTestId("chat-index")).toBeInTheDocument();
   });
 
-  it("inaccessible DM route shows safe error state and disables composer", async () => {
-    mockFetchDMMessages.mockRejectedValue(new Error("not_found"));
+  it("inaccessible DM route shows the access-denied state, not a generic error", async () => {
+    mockFetchDMMessages.mockRejectedValue(new ApiRequestError(404, "not_found", "not found"));
     renderDMArea("dm-private-target");
 
-    expect(await screen.findByTestId("chat-msg-error")).toBeInTheDocument();
-    expect(screen.queryByTestId("chat-msg-empty")).not.toBeInTheDocument();
-    expect(screen.getByTestId("chat-composer-input")).toHaveAttribute("aria-disabled", "true");
-    expect(screen.getByTestId("chat-send-btn")).toBeDisabled();
+    expect(await screen.findByTestId("chat-msg-access-denied")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-msg-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-composer-input")).not.toBeInTheDocument();
+    expect(screen.queryByText("dm-private-target")).not.toBeInTheDocument();
   });
 
   it("shows a discreet realtime instability banner without technical details", async () => {
@@ -5381,16 +5441,36 @@ describe("ChatMessageArea — route decoding", () => {
   it("decodes percent-encoded channel ID correctly", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 
+    // Proves decoding happens before the id is matched against the sidebar
+    // payload: the route carries the encoded form, the fixture only the
+    // decoded one, so the header can resolve the name only if the two IDs
+    // were reconciled correctly (issue #475 removed the raw-id fallback that
+    // used to make this indirection unnecessary to prove).
     render(
       <MemoryRouter initialEntries={["/chat/channel/equipe%20infra"]}>
         <Routes>
-          <Route path="/chat/channel/:id" element={<ChatMessageArea kind="channel" />} />
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{
+                  currentUserId: "me-123",
+                  channels: [
+                    { id: "equipe infra", name: "Equipe Infra", type: "public", canWrite: true },
+                  ],
+                  dms: [],
+                }}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
         </Routes>
       </MemoryRouter>,
     );
 
     const header = await screen.findByTestId("chat-msg-header");
-    expect(header).toHaveTextContent("equipe infra");
+    expect(header).toHaveTextContent("Equipe Infra");
   });
 
   it("does not crash with malformed percent-encoded ID", async () => {
@@ -6227,12 +6307,16 @@ describe("ChatMessageArea — resolved display name", () => {
     expect(input).toHaveAttribute("aria-label", "Mensagem para #geral…");
   });
 
-  it("falls back to raw targetId when channel not found in context", async () => {
+  // Issue #475: a channel absent from the sidebar payload used to fall back to
+  // showing its raw route id as the header title — exactly what a non-member's
+  // target looks like. It must never leak that id, even while status is still
+  // "loading"/"ready" and unrelated to the dedicated access-denied state.
+  it("never falls back to the raw targetId when the channel is not in context", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
-    renderChannelArea("geral");
+    renderChannelArea("ch-not-in-sidebar");
 
     const header = await screen.findByTestId("chat-msg-header");
-    expect(header).toHaveTextContent("geral");
+    expect(header).not.toHaveTextContent("ch-not-in-sidebar");
   });
 });
 
