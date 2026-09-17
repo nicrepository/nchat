@@ -724,7 +724,13 @@ describe("ChatComposer with a real draft store (issue #845)", () => {
     expect(drafts.getDraft(draftKey)).toBeUndefined();
   });
 
-  it("ACK atrasado: a draft mutation that lands while a send is still in flight leaves the editor untouched once that send confirms", async () => {
+  // Issue #845 wrote this the other way round — any draft mutation in flight
+  // vetoed the clear — and issue #875 is the bill for it: consuming a reply
+  // or an attachment *is* a draft mutation, so a send that did either left
+  // the message it had just delivered sitting in the composer. The guard
+  // that matters is the editor's own document (see useChatEditor's #875
+  // tests); a mutation of everything around it is not an edit.
+  it("ACK atrasado: a non-textual draft mutation in flight does not stop the sent text from being consumed", async () => {
     let resolveSend!: (result: SendResult) => void;
     const onSend = vi
       .fn<(body: string) => Promise<SendResult>>()
@@ -738,9 +744,8 @@ describe("ChatComposer with a real draft store (issue #845)", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
 
     // While A's send is still pending, something else touches this
-    // conversation's draft — e.g. an attachment upload that started before
-    // the send resolves (issue #845, "vale também para novo attachment,
-    // novo reply, nova voice message adicionados após o submit").
+    // conversation's draft — an attachment, a reply being consumed, a voice
+    // recording. None of it is a change to the text that was submitted.
     const fakeAttachment: AttachmentUploadItem = {
       localId: "a1",
       file: new File(["x"], "a1.txt"),
@@ -754,11 +759,11 @@ describe("ChatComposer with a real draft store (issue #845)", () => {
     // A's send now confirms.
     await act(async () => resolveSend({ status: "sent" }));
 
-    // The guard must see that the draft moved on since A was submitted and
-    // must NOT clear the editor — clearing here would silently drop
-    // whatever the reader has added since pressing Enter (issue #845, "ACK
-    // ATRASADO").
+    // A was delivered, so A leaves the composer — the draft having moved on
+    // around it says nothing about the text (issue #875). What that mutation
+    // itself carried is preserved by identity, proven against a real dropped
+    // file in ChatComposerSentCleanup.test.tsx.
     await waitFor(() => expect(input).toHaveAttribute("aria-disabled", "false"));
-    expect(input.textContent?.trim()).toBe("A");
+    expect(input.textContent?.trim()).toBe("");
   });
 });

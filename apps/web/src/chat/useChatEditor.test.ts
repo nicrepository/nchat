@@ -390,3 +390,60 @@ describe("useChatEditor — bodyFormat switch on the same mounted composer", () 
     );
   });
 });
+
+// ── Clearing exactly what was sent (issue #875) ───────────────────────────────
+
+/**
+ * The editor owns its own text, so "may I clear it?" is a question only the
+ * document can answer: has *it* changed since this send was submitted? Issue
+ * #875: the composer used to ask the conversation's draft instead, and the
+ * draft is bumped by reply/attachment/voice mutations too — so consuming the
+ * reply a message answered read as "the reader typed something new" and the
+ * text that had just been sent stayed on screen.
+ */
+describe("useChatEditor — clearing exactly what was sent (issue #875)", () => {
+  it("clears the sent text when the document did not change while the send was in flight", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    mockOnSend.mockReturnValue(new Promise<SendResult>((resolve) => (resolveSend = resolve)));
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    await fill(result, "mensagem enviada");
+
+    const sendPromise = result.current.handleSend();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolveSend({ status: "sent" });
+      await sendPromise;
+    });
+
+    expect(result.current.editor?.getText()).toBe("");
+  });
+
+  it("leaves the editor alone when the document itself changed while the send was in flight", async () => {
+    let resolveSend!: (result: SendResult) => void;
+    mockOnSend.mockReturnValue(new Promise<SendResult>((resolve) => (resolveSend = resolve)));
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+    await fill(result, "A");
+
+    const sendPromise = result.current.handleSend();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The reader starts the next message before A's acknowledgement lands.
+    act(() => {
+      result.current.editor!.commands.insertContent("B");
+    });
+
+    await act(async () => {
+      resolveSend({ status: "sent" });
+      await sendPromise;
+    });
+
+    expect(result.current.editor?.getText()).toContain("B");
+  });
+});

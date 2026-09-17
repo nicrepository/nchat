@@ -95,15 +95,6 @@ export interface UseChatEditorOptions {
    * switch reads it.
    */
   onTextChange?: (doc: TTNode) => void;
-  /**
-   * Issue #769, "ACK ATRASADO": evaluated once the send this handleSend call
-   * started has resolved with `{status: "sent"}`, right before clearing the
-   * editor. If it returns false, the editor content is left exactly as it
-   * is — the reader has already written something new since pressing Enter,
-   * and clearing now would erase that, not the message that was actually
-   * sent. Absent, the pre-existing unconditional-clear behavior is kept.
-   */
-  shouldClearOnSent?: () => boolean;
 }
 
 // ── Shared extension factory ──────────────────────────────────────────────────
@@ -148,7 +139,6 @@ export function useChatEditor({
   onSend,
   onActivity,
   onTextChange,
-  shouldClearOnSent,
 }: UseChatEditorOptions) {
   const [sending, setSending] = useState(false);
   const [hasContent, setHasContent] = useState(false);
@@ -169,6 +159,23 @@ export function useChatEditor({
   useEffect(() => {
     onTextChangeRef.current = onTextChange;
   });
+
+  /**
+   * Issue #769 "ACK ATRASADO", corrected by issue #875: how many times this
+   * editor's *document* has actually changed. handleSend records it at
+   * submit and compares it when the send resolves, so it clears only the
+   * text that was actually sent — and never text the reader wrote in the
+   * meantime.
+   *
+   * It counts document changes specifically, and that is the whole point.
+   * #769 asked the conversation's draft the same question through its
+   * `revision`, but that is bumped by every mutation of the draft, including
+   * the ones a confirmed send performs itself: consuming the reply the
+   * message answered, and consuming the attachments it published. Those read
+   * as "the reader typed something new" and left the just-sent text in the
+   * editor (issue #875).
+   */
+  const textRevisionRef = useRef(0);
 
   // Ref keeps the latest handleSend accessible to the submitOnEnter extension
   // without causing the extension (useMemo'd) to be recreated on every render.
@@ -209,6 +216,10 @@ export function useChatEditor({
         },
       },
       onUpdate: ({ editor: e }) => {
+        // TipTap fires this only on a real document mutation — never on
+        // cursor movement, selection or focus — which is exactly the signal
+        // handleSend needs below (issue #875).
+        textRevisionRef.current += 1;
         const hasContentNow = !e.isEmpty;
         setHasContent(hasContentNow);
         onActivityRef.current?.(hasContentNow);
@@ -272,10 +283,17 @@ export function useChatEditor({
     const body = tiptapDocToMarkdown(editor.getJSON(), bodyFormat).trim();
     if (!body && !canSendEmpty) return;
     restoreFocusAfterSendRef.current = editor.isFocused;
+    const textRevisionAtSubmit = textRevisionRef.current;
     setSending(true);
     try {
       const result = await onSend(body);
-      if (result.status === "sent" && clearOnSend && (shouldClearOnSent?.() ?? true)) {
+      // Unchanged revision means the document still holds exactly what went
+      // out, so clearing it removes the sent message and nothing else. A
+      // changed one means the reader has moved on to the next message, and
+      // this acknowledgement has no claim on it (issue #769 "ACK ATRASADO",
+      // issue #875).
+      const stillHoldsWhatWasSent = textRevisionRef.current === textRevisionAtSubmit;
+      if (result.status === "sent" && clearOnSend && stillHoldsWhatWasSent) {
         // emitUpdate=true fires the onUpdate above, which is what mirrors
         // the now-empty document back into the draft (issue #769).
         editor.commands.clearContent(true);
