@@ -33,6 +33,8 @@ const { api } = vi.hoisted(() => ({
     postDMMessage: vi.fn(),
     fetchMentionCandidates: vi.fn(),
     getOrCreateDirectDM: vi.fn(),
+    fetchChannelDetails: vi.fn(),
+    fetchConversationAttachments: vi.fn(),
   },
 }));
 
@@ -47,6 +49,14 @@ vi.mock("./chatApi", async (importOriginal) => ({
   postDMMessage: api.postDMMessage,
   fetchMentionCandidates: api.fetchMentionCandidates,
   getOrCreateDirectDM: api.getOrCreateDirectDM,
+  fetchChannelDetails: api.fetchChannelDetails,
+}));
+
+// The details panel's files section lives in a second service; this suite is
+// about the socket, so both of its reads answer trivially.
+vi.mock("./filesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./filesApi")>()),
+  fetchConversationAttachments: api.fetchConversationAttachments,
 }));
 
 // ── WebSocket fake ────────────────────────────────────────────────────────────
@@ -236,6 +246,18 @@ beforeEach(() => {
   api.postDMMessage.mockResolvedValue(message("m-new", "enviada"));
   api.fetchMentionCandidates.mockResolvedValue([]);
   api.getOrCreateDirectDM.mockResolvedValue({ conversationId: dmId, created: false });
+  api.fetchChannelDetails.mockResolvedValue({
+    id: channelId,
+    slug: "geral",
+    name: "geral",
+    type: "public",
+    createdAt: "2026-01-01T10:00:00Z",
+    memberCount: 1,
+    onlineCount: 0,
+    onlineMembers: [],
+    canManageMembers: false,
+  });
+  api.fetchConversationAttachments.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -496,6 +518,45 @@ describe("navigating between DM and channel targets", () => {
     await waitFor(() => expect(window.location.pathname).toBe(`/chat/channel/${channelId}`));
     expect(await screen.findByText(channelText)).toBeInTheDocument();
     expect(screen.queryByText(dmText)).not.toBeInTheDocument();
+  });
+});
+
+// ── Superfície de detalhes vs. conexão (issue #891) ──────────────────────────
+
+describe("the details panel never restarts the conversation's realtime", () => {
+  it("opens and closes without a new connection or a single extra frame", async () => {
+    renderAt(`/chat/channel/${channelId}`);
+    expect(await screen.findByText(channelText)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(socket().subscriptions()).toContainEqual({
+        type: "subscribe",
+        target_type: "channel",
+        target_id: channelId,
+      }),
+    );
+
+    // Every subscription-lifecycle frame sent so far. The connection's own
+    // keepalive is deliberately not part of this: it ticks on a timer and has
+    // nothing to do with what the reader is looking at.
+    const lifecycleFrames = () =>
+      socket()
+        .subscriptions()
+        .filter((frame) => frame.type === "subscribe" || frame.type === "unsubscribe");
+    const framesBefore = lifecycleFrames();
+    const toggle = screen.getByRole("button", { name: "Detalhes do canal" });
+
+    await user.click(toggle);
+    expect(await screen.findByTestId("chat-conversation-details")).toBeInTheDocument();
+    await user.click(toggle);
+    await waitFor(() =>
+      expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument(),
+    );
+
+    // One socket, still open, and it neither resubscribed nor released the
+    // target the reader never left.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(socket().closed).toBe(false);
+    expect(lifecycleFrames()).toEqual(framesBefore);
   });
 });
 

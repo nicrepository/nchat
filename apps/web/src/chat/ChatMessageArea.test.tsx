@@ -8074,6 +8074,97 @@ describe("ChatMessageArea — painel de detalhes do canal (#435)", () => {
   });
 });
 
+// ── Ciclo de vida da superfície de detalhes (issue #891) ─────────────────────
+//
+// #435/#441/#443 already cover what the panel *shows* and that opening it does
+// not throw the draft away. What was never pinned down is the rest of the
+// shell's promise: that the toggle is the only authority for open/closed, that
+// closing through it leaves the reader where they were, and that the reading
+// position and the reply in progress survive the surface coming and going.
+
+describe("ChatMessageArea — ciclo de vida do painel de detalhes (#891)", () => {
+  it("keeps focus on the trigger when the panel is closed through it", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    // The panel took focus on open; closing through the header control has to
+    // hand it back to that control rather than drop it on <body>.
+    expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
+
+    await userEvent.click(detailsToggle());
+
+    expect(screen.queryByTestId("chat-conversation-details")).not.toBeInTheDocument();
+    expect(detailsToggle()).toHaveFocus();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("keeps the reading position and the scroll-to-bottom affordance across a toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ id: "m1", bodyText: "Antiga" })]),
+    );
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    const list = screen.getByRole("log", { name: "Mensagens" });
+    settleListLayout(list, 1000, 400);
+    userScrollTo(list, 240);
+    await screen.findByRole("button", { name: "Ir para o final da conversa" });
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(detailsToggle());
+
+    // Same element, same offset: nothing remounted the scrollport, and no
+    // scroll authority treated the panel's arrival as a reason to re-position.
+    expect(screen.getByRole("log", { name: "Mensagens" })).toBe(list);
+    expect(list.scrollTop).toBe(240);
+    expect(screen.getByRole("button", { name: "Ir para o final da conversa" })).toBeInTheDocument();
+  });
+
+  it("keeps the reply in progress across a toggle", async () => {
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ id: "m1", senderDisplayName: "Ana", bodyText: "mensagem respondida" }),
+      ]),
+    );
+    renderChannelAreaForUser();
+
+    const bubble = await screen.findByTestId("chat-msg-bubble");
+    fireEvent.mouseEnter(bubble);
+    await userEvent.click(screen.getByRole("button", { name: "Responder" }));
+    expect(screen.getByTestId("chat-composer-quote")).toHaveTextContent("Ana");
+
+    await userEvent.click(detailsToggle());
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(detailsToggle());
+
+    const quote = screen.getByTestId("chat-composer-quote");
+    expect(quote).toHaveTextContent("Ana");
+    expect(quote).toHaveTextContent("mensagem respondida");
+  });
+
+  it("keeps the draft through open, close and open again", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderChannelAreaForUser();
+    await screen.findByTestId("chat-msg-bubble");
+
+    await fillEditor(screen.getByTestId("chat-composer-input"), "rascunho entre aberturas");
+    const toggle = detailsToggle();
+
+    await userEvent.click(toggle);
+    await screen.findByTestId("chat-conversation-details");
+    await userEvent.click(toggle);
+    await userEvent.click(toggle);
+
+    expect(await screen.findByTestId("chat-conversation-details")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("chat-composer-input")).toHaveTextContent("rascunho entre aberturas");
+  });
+});
+
 // ── Painel de detalhes do grupo (issue #441) ─────────────────────────────────
 
 const groupConversationId = "grupo-infra";

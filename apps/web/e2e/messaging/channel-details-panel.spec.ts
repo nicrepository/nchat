@@ -189,6 +189,112 @@ test.describe("painel de detalhes do canal", () => {
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 
+  /**
+   * ISSUE #891 — the shell's promise across a full toggle cycle, in the one
+   * place only a browser can answer it: opening the panel narrows the
+   * conversation column on a wide desktop, so the timeline genuinely reflows.
+   * What has to survive that is the reader's context — the message they were
+   * reading and the draft they were writing — not a pixel offset, which a
+   * reflow legitimately changes.
+   *
+   * Forty messages: enough history for a reading position well away from the
+   * tail, and still under VIRTUALIZE_MIN_ROWS, so the anchor is a real element
+   * throughout rather than one the virtualizer may unmount.
+   */
+  test("alterna pelo mesmo controle preservando rascunho, âncora da timeline e foco", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-details-toggle");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Alternância",
+      messages: Array.from({ length: 40 }, (_, i) =>
+        makeMessage({
+          id: `${targetId}-m${i}`,
+          body_text: `Mensagem ${i}`,
+          created_at: `2026-07-15T09:${String(i).padStart(2, "0")}:00.000Z`,
+        }),
+      ),
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(
+        channel.id,
+        channelDetailsFixture(channel, [
+          {
+            user_id: CURRENT_USER_ID,
+            display_name: CURRENT_USER_NAME,
+            role: "member",
+            presence: "online",
+          },
+        ]),
+      );
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const timeline = page.getByRole("log", { name: "Mensagens" });
+    const composer = page.getByTestId("chat-composer-input");
+    await expect(timeline).toBeVisible();
+    await expect(composer).toBeVisible();
+
+    // Uma posição de leitura não trivial, com uma mensagem concreta como
+    // âncora lógica — é ela, e não um scrollTop, que o leitor perceberia.
+    const anchor = page.locator(`[data-message-id="${targetId}-m8"]`);
+    await anchor.scrollIntoViewIfNeeded();
+    await expect(anchor).toBeInViewport();
+    expect(await timeline.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+
+    await composer.click();
+    await page.keyboard.insertText("rascunho que atravessa o toggle");
+    await expect(composer).toContainText("rascunho que atravessa o toggle");
+
+    const toggle = page.getByTestId("chat-details-toggle");
+    const panel = page.getByTestId("chat-conversation-details");
+    const closeButton = panel.getByRole("button", { name: "Fechar detalhes do canal" });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const restingBackground = await toggle.evaluate((el) => getComputedStyle(el).backgroundColor);
+
+    // ── fechado → aberto ────────────────────────────────────────────────
+    await toggle.click();
+    await expect(panel).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    // O estado visual ativo acompanha a abertura, e não é o de repouso.
+    expect(await toggle.evaluate((el) => getComputedStyle(el).backgroundColor)).not.toBe(
+      restingBackground,
+    );
+    // O foco entra no painel; nada além dele fica preso.
+    await expect(closeButton).toBeFocused();
+
+    // A conversa continua ao lado, com o leitor onde estava.
+    await expect(timeline).toBeVisible();
+    await expect(composer).toBeVisible();
+    await expect(composer).toContainText("rascunho que atravessa o toggle");
+    await expect(anchor).toBeInViewport();
+
+    // ── aberto → fechado pelo mesmo controle ────────────────────────────
+    await toggle.click();
+    await expect(panel).toHaveCount(0);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    // Sem estado visual residual.
+    await expect(toggle).toHaveCSS("background-color", restingBackground);
+    // O foco fica no acionador que o leitor acabou de usar, nunca no <body>.
+    await expect(toggle).toBeFocused();
+    await expect(anchor).toBeInViewport();
+    await expect(composer).toContainText("rascunho que atravessa o toggle");
+
+    // ── reabrir e fechar pelo X ─────────────────────────────────────────
+    await toggle.click();
+    await expect(panel).toBeVisible();
+    await closeButton.click();
+    await expect(panel).toHaveCount(0);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toBeFocused();
+    await expect(anchor).toBeInViewport();
+    await expect(composer).toContainText("rascunho que atravessa o toggle");
+  });
+
   test("distingue 'ninguém online' de 'canal sem membros'", async ({ page }, testInfo) => {
     const targetId = uniqueId(testInfo, "channel-details-empty");
     const scenario = createScenario({
