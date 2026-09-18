@@ -65,6 +65,15 @@ import OutgoingCallPopup from "./OutgoingCallPopup";
 
 type OwnerState = "none" | "local" | "remote";
 
+/** A malformed URL must not prevent the chat shell from rendering. */
+function decodeRouteSegment(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
 export interface CallDirectory {
   currentUserId: string;
   channels: Channel[];
@@ -303,7 +312,8 @@ export default function CallSessionProvider({ children }: { children?: ReactNode
   const routeResourceMatch = /^\/chat\/(channel|dm)\/([^/]+)/.exec(location.pathname);
   const routeResourceTarget = useMemo(() => {
     if (!routeResourceMatch || !directory) return null;
-    const id = decodeURIComponent(routeResourceMatch[2]);
+    const id = decodeRouteSegment(routeResourceMatch[2]);
+    if (!id) return null;
     if (routeResourceMatch[1] === "channel") {
       return directory.channels.some((channel) => channel.id === id)
         ? { kind: "channel" as const, id }

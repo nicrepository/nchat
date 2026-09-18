@@ -22,6 +22,7 @@ import Code from "@tiptap/extension-code";
 import CodeBlock from "@tiptap/extension-code-block";
 import Document from "@tiptap/extension-document";
 import HardBreak from "@tiptap/extension-hard-break";
+import History from "@tiptap/extension-history";
 import Italic from "@tiptap/extension-italic";
 import ListItem from "@tiptap/extension-list-item";
 import OrderedList from "@tiptap/extension-ordered-list";
@@ -119,6 +120,7 @@ export function createChatEditorExtensions(enableMentions = true) {
     OrderedList,
     ChatListItem,
     HardBreak,
+    History,
   ];
   return enableMentions
     ? [...extensions, MentionTargetContext, createMentionExtension()]

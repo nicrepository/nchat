@@ -1681,6 +1681,31 @@ describe("useMessages — WS message.created integration", () => {
     expect(result.current.state.messages[0]).toEqual(evt);
   });
 
+  it("retries the auto-add system event once without showing a realtime failure", async () => {
+    const evt = makeMessage({
+      id: "evt-auto-added-member",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-auto-add", "evt-auto-added-member");
+    });
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toEqual([evt]));
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
   it("ignores a conversation.event for a different conversation", async () => {
     mockFetchChannelMessages.mockResolvedValue(emptyPage);
 

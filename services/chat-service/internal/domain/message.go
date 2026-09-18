@@ -423,6 +423,10 @@ type Message struct {
 	// after commit, and the create response exposes only this ID so the author
 	// can reconcile that same event when its own realtime echo is unavailable.
 	CreatedConversationEventID string
+	// AutoAddedMemberIDs and MemberCount are transient create metadata for the
+	// post-commit realtime publication. They never reach HTTP projections.
+	AutoAddedMemberIDs []string
+	MemberCount        int
 }
 
 // MaxMessageAttachments bounds how many attachments one message may be created

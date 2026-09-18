@@ -952,6 +952,15 @@ var createMessageQuery = `
 			SELECT DISTINCT id::uuid AS channel_id
 			FROM unnest($12::text[]) AS ids(id)
 		),
+		existing_members AS MATERIALIZED (
+			SELECT member.user_id
+			FROM chat.channel_members member
+			WHERE member.channel_id = $2::uuid
+			UNION ALL
+			SELECT member.user_id
+			FROM chat.dm_members member
+			WHERE member.conversation_id = $3::uuid AND member.status = 'active'
+		),
 		authorized_user_mentions AS MATERIALIZED (
 			SELECT um.user_id
 			FROM user_mentions um
@@ -1353,7 +1362,7 @@ var createMessageQuery = `
 			       ))
 			FROM inserted
 			WHERE EXISTS (SELECT 1 FROM auto_added_members)
-			RETURNING id
+			RETURNING id, event_payload
 		),
 		-- The per-recipient state of everything this message asks for
 		-- (issues #824, #825).
@@ -1647,6 +1656,8 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 		return domain.Message{}, mapCreateMessageError(err)
 	}
 	msg.CreatedConversationEventID = msg.EventPayload.CreatedConversationEventID
+	msg.AutoAddedMemberIDs = msg.EventPayload.AutoAddedMemberIDs
+	msg.MemberCount = msg.EventPayload.MemberCount
 	msg.EventPayload = domain.ConversationEventPayload{}
 	return s.hydrateAttachments(ctx, msg, input.AttachmentIDs)
 }
@@ -1660,7 +1671,10 @@ func createMessageResultColumns() string {
 	columns := listMessageWithQuoteColumns("m", "$4", "q")
 	return strings.Replace(columns,
 		"COALESCE(m.event_payload, '{}'::jsonb)",
-		"jsonb_build_object('_created_conversation_event_id', COALESCE((SELECT id::text FROM membership_event), ''))",
+		"jsonb_build_object("+
+			"'_created_conversation_event_id', COALESCE((SELECT id::text FROM membership_event), ''), "+
+			"'_auto_added_member_ids', COALESCE((SELECT jsonb_path_query_array(event_payload, '$.target_users[*].user_id') FROM membership_event), '[]'::jsonb), "+
+			"'_member_count', COALESCE((SELECT count(*) FROM existing_members), 0) + COALESCE((SELECT jsonb_array_length(event_payload->'target_users') FROM membership_event), 0))",
 		1,
 	)
 }

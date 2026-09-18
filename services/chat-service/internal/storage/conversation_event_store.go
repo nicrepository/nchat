@@ -139,12 +139,16 @@ func decodeConversationEvent(message *domain.Message, payload []byte) error {
 		// that create-result metadata and is cleared by the caller immediately.
 		if len(payload) > 0 {
 			var metadata struct {
-				CreatedConversationEventID string `json:"_created_conversation_event_id"`
+				CreatedConversationEventID string   `json:"_created_conversation_event_id"`
+				AutoAddedMemberIDs         []string `json:"_auto_added_member_ids"`
+				MemberCount                int      `json:"_member_count"`
 			}
 			if err := json.Unmarshal(payload, &metadata); err != nil {
 				return fmt.Errorf("decode create message metadata: %w", err)
 			}
 			message.EventPayload.CreatedConversationEventID = metadata.CreatedConversationEventID
+			message.EventPayload.AutoAddedMemberIDs = metadata.AutoAddedMemberIDs
+			message.EventPayload.MemberCount = metadata.MemberCount
 		}
 		return nil
 	}

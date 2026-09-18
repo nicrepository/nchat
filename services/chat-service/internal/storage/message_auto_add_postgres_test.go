@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -71,6 +72,9 @@ func TestPGXCreateMessageAutoAddsMentionedChannelMemberAtomicallyPostgreSQL(t *t
 	if message.CreatedConversationEventID == "" {
 		t.Fatal("persisted membership event ID was not returned for realtime publication")
 	}
+	if !slices.Equal(message.AutoAddedMemberIDs, []string{amActive1}) || message.MemberCount != 2 {
+		t.Fatalf("auto-add realtime metadata = ids=%v count=%d, want [%s] and 2", message.AutoAddedMemberIDs, message.MemberCount, amActive1)
+	}
 	if got := countChannelMembers(t, pool, ctx, amPrivate); got != 2 {
 		t.Fatalf("successful message memberships = %d, want sender plus mentioned target", got)
 	}
@@ -124,6 +128,9 @@ func TestPGXCreateMessageAutoAddsMentionedGroupParticipantAtomicallyPostgreSQL(t
 	}
 	if message.CreatedConversationEventID == "" {
 		t.Fatal("persisted membership event ID was not returned for realtime publication")
+	}
+	if !slices.Equal(message.AutoAddedMemberIDs, []string{amActive2}) || message.MemberCount != 2 {
+		t.Fatalf("auto-add realtime metadata = ids=%v count=%d, want [%s] and 2", message.AutoAddedMemberIDs, message.MemberCount, amActive2)
 	}
 	if got := countDMParticipants(t, pool, ctx, amGroup); got != 2 {
 		t.Fatalf("successful message participants = %d, want sender plus mentioned target", got)

@@ -1,0 +1,127 @@
+.keyboard-shortcuts__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 430;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgba(22, 18, 31, 0.62);
+  backdrop-filter: blur(3px);
+}
+
+.keyboard-shortcuts {
+  width: min(500px, 100%);
+  padding: 24px;
+  border: 1px solid #ddd4ee;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 28px 72px rgba(22, 18, 31, 0.3);
+  color: #16121f;
+}
+
+.keyboard-shortcuts__header,
+.keyboard-shortcuts dl > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.keyboard-shortcuts__header h2,
+.keyboard-shortcuts p,
+.keyboard-shortcuts h3,
+.keyboard-shortcuts dl {
+  margin: 0;
+}
+.keyboard-shortcuts__header h2 {
+  margin-top: 3px;
+  font-size: 20px;
+  letter-spacing: -0.01em;
+}
+.keyboard-shortcuts__eyebrow {
+  color: #6d28d9;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.keyboard-shortcuts p {
+  margin-top: 10px;
+  color: #7c7390;
+  font-size: 14px;
+}
+.keyboard-shortcuts__groups {
+  display: grid;
+  gap: 16px;
+  margin-top: 22px;
+}
+.keyboard-shortcuts__group h3 {
+  color: #7c7390;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.keyboard-shortcuts__group dl {
+  margin-top: 6px;
+}
+.keyboard-shortcuts__group dl > div + div {
+  margin-top: 8px;
+}
+.keyboard-shortcuts dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.keyboard-shortcuts dl > div {
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid #eeeaf4;
+  border-radius: 10px;
+  background: #fcfbfe;
+}
+.keyboard-shortcuts dt,
+.keyboard-shortcuts__keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.keyboard-shortcuts kbd {
+  min-width: 24px;
+  padding: 4px 7px;
+  border: 1px solid #d8d1e4;
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: #f6f4fa;
+  color: #3f315d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+.keyboard-shortcuts__plus,
+.keyboard-shortcuts__alternative {
+  color: #958aa7;
+  font-size: 12px;
+}
+.keyboard-shortcuts__alternative {
+  margin: 0 6px;
+}
+.keyboard-shortcuts button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: #f6f4fa;
+  color: #55466f;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+}
+.keyboard-shortcuts button:hover {
+  background: #eee9f7;
+}
+.keyboard-shortcuts button:focus-visible {
+  outline: 2px solid #6d28d9;
+  outline-offset: 2px;
+}

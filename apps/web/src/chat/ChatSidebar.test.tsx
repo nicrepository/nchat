@@ -2043,7 +2043,7 @@ describe("ChatSidebar — footer", () => {
   // The footer's identity is the session's, so it does not depend on the
   // conversation lists: rendering the sidebar directly keeps each assertion
   // about the footer alone.
-  function renderFooter() {
+  function renderFooter(onOpenSearch = vi.fn()) {
     return render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatSidebar
@@ -2056,6 +2056,7 @@ describe("ChatSidebar — footer", () => {
             categories: [],
           }}
           retry={() => {}}
+          onOpenSearch={onOpenSearch}
         />
       </MemoryRouter>,
     );
@@ -2206,11 +2207,14 @@ describe("ChatSidebar — footer", () => {
     expect(userLink().contains(trigger)).toBe(false);
   });
 
-  it("links to the global search page (RF-15)", () => {
-    renderFooter();
+  it("uses the supplied global-search action", async () => {
+    const onOpenSearch = vi.fn();
+    const user = userEvent.setup();
+    renderFooter(onOpenSearch);
 
-    const search = screen.getByRole("link", { name: "Buscar" });
-    expect(search).toHaveAttribute("href", "/chat/search");
+    await user.click(screen.getByRole("button", { name: "Buscar" }));
+
+    expect(onOpenSearch).toHaveBeenCalledOnce();
   });
 
   it("keeps the profile link reachable", async () => {

@@ -64,6 +64,22 @@ describe("useChatEditor — initial state", () => {
   });
 });
 
+describe("useChatEditor — native undo", () => {
+  it("lets Ctrl+Z undo typing in the rich-text composer", async () => {
+    const { result } = renderHook(() => useChatEditor(defaults));
+    await waitForEditor(result);
+
+    act(() => {
+      result.current.editor!.commands.insertContent("Olá mundo teste");
+      result.current.editor!.view.dom.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(result.current.editor!.getText()).toBe("");
+  });
+});
+
 describe("useChatEditor — canSend guard", () => {
   it("handleSend does nothing when canSend=false (empty editor)", async () => {
     const { result } = renderHook(() => useChatEditor(defaults));

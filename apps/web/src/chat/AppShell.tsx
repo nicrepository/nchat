@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -18,6 +19,9 @@ import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
 import { onAuthChange } from "../lib/authSession";
 import { disposeNotificationSoundPlayer } from "../notifications/notificationSound";
+import { createCommandRegistry } from "../commands/commandRegistry";
+import KeyboardShortcutsDialog from "../commands/KeyboardShortcutsDialog";
+import { useShortcutManager } from "../commands/useShortcutManager";
 
 /**
  * Resolves a row menu's target to the details panel's own vocabulary.
@@ -185,6 +189,7 @@ export type AppShellOutletContext = ReturnType<typeof useChatSidebar> & {
 
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_DMS: DMConversation[] = [];
+const GLOBAL_SHORTCUT_SCOPE = ["global"] as const;
 
 /** "/profile" or "/profile/..." gets the settings label; everything else (today, only "/chat/...") gets the chat one. */
 function mainAriaLabel(pathname: string): string {
@@ -239,6 +244,14 @@ export default function AppShell() {
   // here rather than in ChatMessageArea because the target may be a
   // conversation other than the open one, and opening it must not navigate.
   const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [navigateSidebarRelative, setNavigateSidebarRelative] = useState<
+    (direction: -1 | 1) => void
+  >(() => () => {});
+  const setSidebarNavigation = useCallback((handler: (direction: -1 | 1) => void) => {
+    setNavigateSidebarRelative(() => handler);
+  }, []);
   // The route is part of the panel's identity, not something an effect syncs to
   // it: navigating away closes the panel because the value stored alongside it
   // stops matching, with no extra render pass. The panel is a peek at one
@@ -285,14 +298,27 @@ export default function AppShell() {
   const detailsOpenerRef = useRef<HTMLElement | null>(null);
   // Opening the alert is the one action it offers, and it is plain navigation:
   // the alert is a pointer at a conversation, not a place to read it.
-  const navigateFromAlert = useNavigate();
   const openInAppAlert = useCallback(
     (alert: InAppAlert) => {
       dismissInAppAlert();
-      navigateFromAlert(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
+      navigate(`/chat/${alert.targetKind}/${encodeURIComponent(alert.targetId)}`);
     },
-    [dismissInAppAlert, navigateFromAlert],
+    [dismissInAppAlert, navigate],
   );
+  const openSearch = useCallback(() => navigate("/chat/search"), [navigate]);
+  const commandRegistry = useMemo(
+    () =>
+      createCommandRegistry({
+        openSearch,
+        openShortcutHelp: () => setShortcutHelpOpen(true),
+        previousConversation: () => navigateSidebarRelative(-1),
+        nextConversation: () => navigateSidebarRelative(1),
+        historyBack: () => navigate(-1),
+        historyForward: () => navigate(1),
+      }),
+    [navigate, navigateSidebarRelative, openSearch],
+  );
+  useShortcutManager(commandRegistry, GLOBAL_SHORTCUT_SCOPE);
   const openSidebarDetails = useCallback(
     (kind: "channel" | "dm", targetId: string, opener: HTMLElement | null) => {
       const resolved = resolveDetailsTarget(kind, targetId, dms);
@@ -348,6 +374,8 @@ export default function AppShell() {
         setMuted={setMuted}
         leaveConversation={leaveConversation}
         onOpenDetails={openSidebarDetails}
+        onOpenSearch={() => commandRegistry.execute("search.open")}
+        onNavigateRelativeChange={setSidebarNavigation}
         draftSummaries={drafts.summaries}
       />
       {/* Pointer half of "the background is not interactive while the drawer is
@@ -385,6 +413,7 @@ export default function AppShell() {
           onDismiss={dismissInAppAlert}
         />
       )}
+      {shortcutHelpOpen && <KeyboardShortcutsDialog onClose={() => setShortcutHelpOpen(false)} />}
     </div>
   );
 }
