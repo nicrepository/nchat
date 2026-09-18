@@ -50,6 +50,27 @@ Falsos positivos devem ser tratados explicitamente:
 4. Registrar qualquer ignore com escopo minimo e motivo.
 5. Nunca ignorar silenciosamente.
 
+Os ignores vivem em arquivos versionados, um por scanner:
+
+- Trivy: `.trivyignore.yaml`.
+- govulncheck: `.govulncheckignore.yaml`.
+
+Os dois exigem o mesmo de cada entrada: um id exato, o motivo, a issue de
+acompanhamento e um `expired_at`. Nao existe wildcard e nao existe ignore por
+modulo — um advisory que nao esteja listado reprova o gate, e um advisory
+listado volta a reprovar assim que a data passa, para que a excecao seja
+revisitada em vez de herdada.
+
+Para Go a decisao de aprovacao pertence a `scripts/security/govulncheck_gate.py`,
+nao ao codigo de saida do govulncheck: o gate reprova qualquer vulnerabilidade
+_alcancada pelo nosso codigo_ que nao esteja aceita, e imprime quais aceitou.
+`scripts/security/test_govulncheck_gate.py` cobre justamente que aceitar um
+advisory nao carrega nenhum outro junto.
+
+Uma excecao mitiga o impacto alcancavel; ela nao faz a vulnerabilidade upstream
+desaparecer. O texto da entrada deve dizer o que foi mitigado e o que continua
+valendo.
+
 ## Modelo de confianca do Repository governance
 
 O workflow `Repository governance` usa o evento `pull_request`. Pull Requests
