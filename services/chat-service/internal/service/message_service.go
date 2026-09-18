@@ -52,6 +52,15 @@ type messageUpdatedPublisher interface {
 	PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message)
 }
 
+type conversationEventPublisher interface {
+	PublishConversationEvent(ctx context.Context, workspaceID, targetType, targetID, messageID string)
+}
+
+type membershipEventPublisher interface {
+	PublishMembersAdded(ctx context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int)
+	PublishConversationAvailable(ctx context.Context, workspaceID, targetType, targetID string, userIDs []string)
+}
+
 // acknowledgementUpdatedPublisher announces that one message's acknowledgement
 // changed (issue #824). Optional, like messageUpdatedPublisher: a publisher
 // that does not implement it simply announces nothing, and clients reconcile on
@@ -1596,8 +1605,24 @@ func (s *MessageService) publishMessageCreated(ctx context.Context, workspaceID,
 	if publisher == nil {
 		return
 	}
+	eventPublisher, canPublishConversationEvent := publisher.(conversationEventPublisher)
+	membershipPublisher, canPublishMembershipEvent := publisher.(membershipEventPublisher)
 	s.enqueuePublish(ctx, func(publishCtx context.Context) {
 		publisher.PublishMessageCreated(publishCtx, workspaceID, targetType, targetID, msg)
+		if canPublishMembershipEvent && len(msg.AutoAddedMemberIDs) > 0 {
+			membershipPublisher.PublishMembersAdded(
+				publishCtx, workspaceID, targetType, targetID, msg.SenderID,
+				len(msg.AutoAddedMemberIDs), msg.MemberCount,
+			)
+			membershipPublisher.PublishConversationAvailable(
+				publishCtx, workspaceID, targetType, targetID, msg.AutoAddedMemberIDs,
+			)
+		}
+		if canPublishConversationEvent && msg.CreatedConversationEventID != "" {
+			eventPublisher.PublishConversationEvent(
+				publishCtx, workspaceID, targetType, targetID, msg.CreatedConversationEventID,
+			)
+		}
 	})
 }
 
@@ -2200,12 +2225,12 @@ func normalizeAttachmentIDs(rawIDs []string, maxAttachments int) ([]string, erro
 func validateMentionRefs(userIDs, channelIDs []string, labels map[string]string) error {
 	for _, id := range userIDs {
 		if _, ok := labels["user:"+id]; !ok {
-			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+			return domain.ErrMentionNotEligible
 		}
 	}
 	for _, id := range channelIDs {
 		if _, ok := labels["channel:"+id]; !ok {
-			return fmt.Errorf("%w: invalid mention", domain.ErrInvalidInput)
+			return domain.ErrMentionNotEligible
 		}
 	}
 	return nil

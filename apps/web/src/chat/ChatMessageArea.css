@@ -2541,6 +2541,13 @@
   white-space: nowrap;
 }
 
+.mention-list__add-hint {
+  margin-left: auto;
+  color: var(--color-muted, #7c7390);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .mention-list__selected {
   margin-left: auto;
   font-size: 16px;

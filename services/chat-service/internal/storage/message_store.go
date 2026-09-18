@@ -952,6 +952,54 @@ var createMessageQuery = `
 			SELECT DISTINCT id::uuid AS channel_id
 			FROM unnest($12::text[]) AS ids(id)
 		),
+		existing_members AS MATERIALIZED (
+			SELECT member.user_id
+			FROM chat.channel_members member
+			WHERE member.channel_id = $2::uuid
+			UNION ALL
+			SELECT member.user_id
+			FROM chat.dm_members member
+			WHERE member.conversation_id = $3::uuid AND member.status = 'active'
+		),
+		authorized_user_mentions AS MATERIALIZED (
+			SELECT um.user_id
+			FROM user_mentions um
+			JOIN chat.channels c
+			  ON c.id = $2::uuid AND c.workspace_id = $1::uuid AND c.status = 'active'
+			JOIN chat.workspace_members target_wm
+			  ON target_wm.workspace_id = c.workspace_id
+			 AND target_wm.user_id = um.user_id AND target_wm.status = 'active'
+			JOIN auth.users target_user
+			  ON target_user.id = um.user_id
+			 AND target_user.status = 'active' AND target_user.deleted_at IS NULL
+			WHERE EXISTS (
+				SELECT 1 FROM chat.channel_members cm
+				WHERE cm.channel_id = c.id AND cm.user_id = um.user_id
+			) OR EXISTS (
+				SELECT 1 FROM chat.workspace_members actor
+				WHERE actor.workspace_id = c.workspace_id
+				  AND actor.user_id = $4::uuid AND actor.status = 'active'
+				  AND actor.role IN ('owner', 'admin', 'moderator')
+			)
+			UNION ALL
+			SELECT um.user_id
+			FROM user_mentions um
+			JOIN chat.dm_conversations dc
+			  ON dc.id = $3::uuid AND dc.workspace_id = $1::uuid
+			 AND dc.type = 'group' AND dc.status = 'active'
+			JOIN chat.dm_members actor_dm
+			  ON actor_dm.conversation_id = dc.id
+			 AND actor_dm.user_id = $4::uuid AND actor_dm.status = 'active'
+			JOIN chat.workspace_members actor_wm
+			  ON actor_wm.workspace_id = dc.workspace_id
+			 AND actor_wm.user_id = actor_dm.user_id AND actor_wm.status = 'active'
+			JOIN chat.workspace_members target_wm
+			  ON target_wm.workspace_id = dc.workspace_id
+			 AND target_wm.user_id = um.user_id AND target_wm.status = 'active'
+			JOIN auth.users target_user
+			  ON target_user.id = um.user_id
+			 AND target_user.status = 'active' AND target_user.deleted_at IS NULL
+		),
 			attachment_candidates AS (
 				SELECT id::uuid AS attachment_id, ord
 				FROM unnest($13::text[]) WITH ORDINALITY AS ids(id, ord)
@@ -1035,45 +1083,9 @@ var createMessageQuery = `
 		),
 		invalid_mentions AS (
 			SELECT 1
-			FROM user_mentions um
-			WHERE NOT EXISTS (
-				SELECT 1
-				FROM chat.channels source_channel
-				JOIN chat.channel_members cm
-				  ON cm.channel_id = source_channel.id AND cm.user_id = um.user_id
-				JOIN chat.workspace_members mentioned_member
-				  ON mentioned_member.workspace_id = source_channel.workspace_id
-				 AND mentioned_member.user_id = um.user_id
-				 AND mentioned_member.status = 'active'
-				JOIN auth.users mentioned_user
-				  ON mentioned_user.id = um.user_id
-				 AND mentioned_user.status = 'active'
-				 AND mentioned_user.deleted_at IS NULL
-				WHERE $2::uuid IS NOT NULL
-				  AND source_channel.id = $2::uuid
-				  AND source_channel.workspace_id = $1::uuid
-				  AND source_channel.status = 'active'
-				UNION ALL
-				SELECT 1
-				FROM chat.dm_conversations source_dm
-				JOIN chat.dm_members mentioned_dm
-				  ON mentioned_dm.conversation_id = source_dm.id
-				 AND mentioned_dm.user_id = um.user_id
-				 AND mentioned_dm.status = 'active'
-				JOIN chat.workspace_members mentioned_member
-				  ON mentioned_member.workspace_id = source_dm.workspace_id
-				 AND mentioned_member.user_id = um.user_id
-				 AND mentioned_member.status = 'active'
-				JOIN auth.users mentioned_user
-				  ON mentioned_user.id = um.user_id
-				 AND mentioned_user.status = 'active'
-				 AND mentioned_user.deleted_at IS NULL
-				WHERE $3::uuid IS NOT NULL
-				  AND source_dm.id = $3::uuid
-				  AND source_dm.workspace_id = $1::uuid
-				  AND source_dm.type = 'group'
-				  AND source_dm.status = 'active'
-			)
+			WHERE (SELECT count(*) FROM authorized_user_mentions) <>
+			      (SELECT count(*) FROM user_mentions)
+			   OR (SELECT count(*) FROM user_mentions) > ` + fmt.Sprint(domain.MaxAddMembersPerRequest) + `
 			UNION ALL
 			SELECT 1
 			FROM channel_mentions mentioned
@@ -1306,6 +1318,51 @@ var createMessageQuery = `
 			          -- through messageColumns, which names them (issue #527).
 			          event_type, event_payload,
 			          priority, acknowledgement_required, persistent_notifications
+		),
+		auto_added_channel_members AS (
+			INSERT INTO chat.channel_members (channel_id, user_id, role)
+			SELECT inserted.channel_id, authorized.user_id, 'member'
+			FROM inserted
+			JOIN authorized_user_mentions authorized ON inserted.channel_id IS NOT NULL
+			LEFT JOIN chat.channel_members existing
+			  ON existing.channel_id = inserted.channel_id AND existing.user_id = authorized.user_id
+			WHERE existing.user_id IS NULL
+			ON CONFLICT (channel_id, user_id) DO NOTHING
+			RETURNING user_id
+		),
+		auto_added_dm_members AS (
+			INSERT INTO chat.dm_members AS member (conversation_id, user_id, role, status, left_at)
+			SELECT inserted.dm_conversation_id, authorized.user_id, 'member', 'active', NULL
+			FROM inserted
+			JOIN authorized_user_mentions authorized ON inserted.dm_conversation_id IS NOT NULL
+			ON CONFLICT (conversation_id, user_id)
+			DO UPDATE SET role = 'member', status = 'active', left_at = NULL
+			WHERE member.status <> 'active'
+			RETURNING user_id
+		),
+		auto_added_members AS MATERIALIZED (
+			SELECT user_id FROM auto_added_channel_members
+			UNION ALL
+			SELECT user_id FROM auto_added_dm_members
+		),
+		membership_event AS (
+			INSERT INTO chat.messages
+				(workspace_id, channel_id, dm_conversation_id, sender_id, kind,
+				 body_text, event_type, event_payload)
+			SELECT inserted.workspace_id, inserted.channel_id, inserted.dm_conversation_id,
+			       inserted.sender_id, 'system', '', 'conversation_member_added',
+			       jsonb_build_object('target_users', (
+				       SELECT jsonb_agg(jsonb_build_object(
+					       'user_id', added.user_id::text,
+					       'display_name', COALESCE(NULLIF(BTRIM(u.full_name), ''),
+					                              NULLIF(BTRIM(u.display_name), ''), '')
+				       ) ORDER BY added.user_id)
+				       FROM auto_added_members added
+				       LEFT JOIN auth.users u ON u.id = added.user_id
+			       ))
+			FROM inserted
+			WHERE EXISTS (SELECT 1 FROM auto_added_members)
+			RETURNING id, event_payload
 		),
 		-- The per-recipient state of everything this message asks for
 		-- (issues #824, #825).
@@ -1587,7 +1644,7 @@ var createMessageQuery = `
 			ON CONFLICT DO NOTHING
 			RETURNING canonical_url
 		)
-		SELECT ` + listMessageWithQuoteColumns("m", "$4", "q") + `
+		SELECT ` + createMessageResultColumns() + `
 		FROM inserted m
 		LEFT JOIN auth.users u ON u.id = m.sender_id` + quotedMessageJoin("m", "q")
 
@@ -1598,7 +1655,28 @@ func (s *PGXMessageStore) CreateMessage(ctx context.Context, input CreateMessage
 	if err != nil {
 		return domain.Message{}, mapCreateMessageError(err)
 	}
+	msg.CreatedConversationEventID = msg.EventPayload.CreatedConversationEventID
+	msg.AutoAddedMemberIDs = msg.EventPayload.AutoAddedMemberIDs
+	msg.MemberCount = msg.EventPayload.MemberCount
+	msg.EventPayload = domain.ConversationEventPayload{}
 	return s.hydrateAttachments(ctx, msg, input.AttachmentIDs)
+}
+
+// createMessageResultColumns keeps the shared positional message projection
+// while borrowing the otherwise-empty user-message event payload to return the
+// system event created by this same statement. No extra result column means all
+// message scanners keep one contract; CreateMessage immediately transfers and
+// clears this internal metadata before the domain value can leave storage.
+func createMessageResultColumns() string {
+	columns := listMessageWithQuoteColumns("m", "$4", "q")
+	return strings.Replace(columns,
+		"COALESCE(m.event_payload, '{}'::jsonb)",
+		"jsonb_build_object("+
+			"'_created_conversation_event_id', COALESCE((SELECT id::text FROM membership_event), ''), "+
+			"'_auto_added_member_ids', COALESCE((SELECT jsonb_path_query_array(event_payload, '$.target_users[*].user_id') FROM membership_event), '[]'::jsonb), "+
+			"'_member_count', COALESCE((SELECT count(*) FROM existing_members), 0) + COALESCE((SELECT jsonb_array_length(event_payload->'target_users') FROM membership_event), 0))",
+		1,
+	)
 }
 
 // normalizeCreateMessageInput applies the server-owned defaults, so every value
@@ -2363,14 +2441,21 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		  ON source_channel.id = $2::uuid
 		 AND source_channel.workspace_id = $1::uuid
 		 AND source_channel.status = 'active'
-		JOIN chat.channel_members cm
-		  ON cm.channel_id = source_channel.id AND cm.user_id = ids.id::uuid
 		JOIN chat.workspace_members wm
 		  ON wm.workspace_id = source_channel.workspace_id
-		 AND wm.user_id = cm.user_id
+		 AND wm.user_id = ids.id::uuid
 		 AND wm.status = 'active'
 		JOIN auth.users u
-		  ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		WHERE EXISTS (
+			SELECT 1 FROM chat.channel_members cm
+			WHERE cm.channel_id = source_channel.id AND cm.user_id = wm.user_id
+		) OR EXISTS (
+			SELECT 1 FROM chat.workspace_members requester
+			WHERE requester.workspace_id = source_channel.workspace_id
+			  AND requester.user_id = $4::uuid AND requester.status = 'active'
+			  AND requester.role IN ('owner', 'admin', 'moderator')
+		)
 		UNION ALL
 		SELECT 'user', u.id::text, u.display_name
 		FROM unnest($5::text[]) AS ids(id)
@@ -2379,14 +2464,15 @@ func (s *PGXMessageStore) ResolveAuthorizedMentionLabels(ctx context.Context, wo
 		 AND source_dm.workspace_id = $1::uuid
 		 AND source_dm.type = 'group'
 		 AND source_dm.status = 'active'
-		JOIN chat.dm_members dm
-		  ON dm.conversation_id = source_dm.id AND dm.user_id = ids.id::uuid AND dm.status = 'active'
+		JOIN chat.dm_members requester_dm
+		  ON requester_dm.conversation_id = source_dm.id
+		 AND requester_dm.user_id = $4::uuid AND requester_dm.status = 'active'
 		JOIN chat.workspace_members wm
 		  ON wm.workspace_id = source_dm.workspace_id
-		 AND wm.user_id = dm.user_id
+		 AND wm.user_id = ids.id::uuid
 		 AND wm.status = 'active'
 		JOIN auth.users u
-		  ON u.id = dm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+		  ON u.id = wm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
 		UNION ALL
 		SELECT 'channel', c.id::text, c.display_name
 		FROM unnest($6::text[]) AS ids(id)

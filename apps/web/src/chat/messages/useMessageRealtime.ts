@@ -105,7 +105,7 @@ export function useMessageRealtime({
   listeners,
 }: Options): MessageRealtime {
   const { targetId, kind } = scope;
-  const { readCreatedMessage, readMessageSnapshot } = reads;
+  const { readCreatedMessage, readMessageSnapshot, readConversationEventSnapshot } = reads;
 
   /**
    * A new message.
@@ -337,9 +337,9 @@ export function useMessageRealtime({
   const reconcileConversationEvent = useCallback(
     (event: WSConversationEventMessage) => {
       if (!event.message_id) return;
-      readMessageSnapshot(event.message_id, true);
+      readConversationEventSnapshot(event.message_id);
     },
-    [readMessageSnapshot],
+    [readConversationEventSnapshot],
   );
   const handleConversationEvent = useForwardedTargetEvent(
     target,

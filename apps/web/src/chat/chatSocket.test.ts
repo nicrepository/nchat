@@ -225,6 +225,27 @@ describe("chatSocket connection", () => {
     expect(second).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the socket usable when one realtime event consumer throws", () => {
+    const rejectedEvent = vi.fn(() => {
+      throw new Error("unexpected members.added payload");
+    });
+    const receivedAfterFailure = vi.fn();
+    const report = vi.spyOn(console, "error").mockImplementation(() => {});
+    acquireChatSocket({ onMessage: rejectedEvent });
+    acquireChatSocket({ onMessage: receivedAfterFailure });
+    latest().open();
+
+    latest().emit({ type: "members.added", target_type: "dm", target_id: "group-1" });
+    latest().emit({ type: "message.created", target_type: "dm", target_id: "group-1" });
+
+    expect(report).toHaveBeenCalledTimes(2);
+    expect(receivedAfterFailure).toHaveBeenLastCalledWith(
+      { type: "message.created", target_type: "dm", target_id: "group-1" },
+      1,
+    );
+    expect(latest().readyState).toBe(FakeWebSocket.OPEN);
+  });
+
   it("drops malformed frames without reaching consumers", () => {
     const onMessage = vi.fn();
     acquireChatSocket({ onMessage });

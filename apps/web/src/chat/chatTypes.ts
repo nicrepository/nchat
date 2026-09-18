@@ -374,6 +374,8 @@ export interface MentionCandidate {
   mentionType: "user" | "channel" | "all";
   id: string;
   label: string;
+  /** The server has authorized adding this workspace member when the message is sent. */
+  willBeAdded?: boolean;
 }
 
 export interface MentionTarget {
@@ -427,6 +429,8 @@ export interface ConversationEventPayload {
 
 export interface Message {
   id: string;
+  /** Server-created side-effect event to reconcile after this message is posted. */
+  createdConversationEventId?: string;
   senderId: string;
   senderDisplayName: string;
   senderEmail: string;

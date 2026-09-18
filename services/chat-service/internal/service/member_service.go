@@ -225,6 +225,16 @@ type SearchChannelMemberCandidatesInput struct {
 func (s *MemberService) SearchChannelMemberCandidates(
 	ctx context.Context, input SearchChannelMemberCandidatesInput,
 ) ([]domain.DMCandidate, error) {
+	return s.searchChannelMemberCandidates(ctx, input, minDMCandidateQuery)
+}
+
+// searchChannelMemberCandidates keeps the authorization and eligibility path
+// shared while allowing the bounded mention popup to request its initial page
+// with an empty prefix. The public member-directory endpoint still requires
+// minDMCandidateQuery characters and therefore cannot be widened accidentally.
+func (s *MemberService) searchChannelMemberCandidates(
+	ctx context.Context, input SearchChannelMemberCandidatesInput, minQueryRunes int,
+) ([]domain.DMCandidate, error) {
 	member, err := requireActiveWorkspaceMember(ctx, s.workspaces, s.members, input.WorkspaceID, input.CallerID)
 	if err != nil {
 		return nil, err
@@ -233,7 +243,7 @@ func (s *MemberService) SearchChannelMemberCandidates(
 		return nil, domain.ErrForbidden
 	}
 
-	query, limit, err := normalizeCandidateSearch(input.Query, input.Limit)
+	query, limit, err := normalizeCandidateSearchWithMinimum(input.Query, input.Limit, minQueryRunes)
 	if err != nil {
 		return nil, err
 	}
@@ -258,9 +268,13 @@ func (s *MemberService) SearchChannelMemberCandidates(
 // normalizeCandidateSearch applies the same query bounds and limit clamping the
 // DM candidate search already uses, so the three searches cannot drift.
 func normalizeCandidateSearch(rawQuery string, rawLimit int) (string, int, error) {
+	return normalizeCandidateSearchWithMinimum(rawQuery, rawLimit, minDMCandidateQuery)
+}
+
+func normalizeCandidateSearchWithMinimum(rawQuery string, rawLimit, minQueryRunes int) (string, int, error) {
 	query := strings.TrimSpace(rawQuery)
 	queryRunes := utf8.RuneCountInString(query)
-	if queryRunes < minDMCandidateQuery || queryRunes > maxDMCandidateQuery {
+	if queryRunes < minQueryRunes || queryRunes > maxDMCandidateQuery {
 		return "", 0, fmt.Errorf("%w: invalid candidate search", domain.ErrInvalidInput)
 	}
 	if rawLimit < 0 {

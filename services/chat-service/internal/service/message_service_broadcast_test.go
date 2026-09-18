@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -15,9 +16,85 @@ import (
 // ── fakePublisher ─────────────────────────────────────────────────────────────
 
 type fakePublisher struct {
-	mu      sync.Mutex
-	calls   []publishCall
-	updates []publishCall
+	mu        sync.Mutex
+	calls     []publishCall
+	updates   []publishCall
+	events    []conversationEventCall
+	members   []membersAddedCall
+	available []conversationAvailableCall
+}
+
+type membersAddedCall struct {
+	workspaceID string
+	targetType  string
+	targetID    string
+	actorUserID string
+	addedCount  int
+	memberCount int
+}
+
+type conversationAvailableCall struct {
+	workspaceID string
+	targetType  string
+	targetID    string
+	userIDs     []string
+}
+
+type conversationEventCall struct {
+	workspaceID string
+	targetType  string
+	targetID    string
+	messageID   string
+}
+
+func (p *fakePublisher) PublishConversationEvent(_ context.Context, workspaceID, targetType, targetID, messageID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events = append(p.events, conversationEventCall{
+		workspaceID: workspaceID, targetType: targetType, targetID: targetID, messageID: messageID,
+	})
+}
+
+func (p *fakePublisher) eventSnapshot() []conversationEventCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]conversationEventCall(nil), p.events...)
+}
+
+func (p *fakePublisher) PublishMembersAdded(
+	_ context.Context, workspaceID, targetType, targetID, actorUserID string, addedCount, memberCount int,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.members = append(p.members, membersAddedCall{
+		workspaceID: workspaceID, targetType: targetType, targetID: targetID, actorUserID: actorUserID,
+		addedCount: addedCount, memberCount: memberCount,
+	})
+}
+
+func (p *fakePublisher) PublishConversationAvailable(
+	_ context.Context, workspaceID, targetType, targetID string, userIDs []string,
+) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.available = append(p.available, conversationAvailableCall{
+		workspaceID: workspaceID, targetType: targetType, targetID: targetID,
+		userIDs: append([]string(nil), userIDs...),
+	})
+}
+
+func waitForConversationEvents(t *testing.T, pub *fakePublisher, want int) []conversationEventCall {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		events := pub.eventSnapshot()
+		if len(events) >= want {
+			return events
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected %d conversation events, got %d", want, len(pub.eventSnapshot()))
+	return nil
 }
 
 func (p *fakePublisher) PublishMessageUpdated(ctx context.Context, workspaceID, targetType, targetID string, msg domain.Message) {
@@ -305,7 +382,8 @@ func TestMessageService_CreateChannelMessage_BroadcastsAfterPersist(t *testing.T
 	persistedMsg := domain.Message{
 		ID: "msg-broadcast", WorkspaceID: "ws-1", ChannelID: "ch-1",
 		SenderID: user1, Kind: domain.MessageKindUser,
-		Status: domain.MessageStatusActive,
+		Status: domain.MessageStatusActive, CreatedConversationEventID: "event-member-added",
+		AutoAddedMemberIDs: []string{"member-2"}, MemberCount: 2,
 	}
 	msgs := &fakeMessageStore{createdMessage: persistedMsg}
 	pub := &fakePublisher{}
@@ -323,6 +401,21 @@ func TestMessageService_CreateChannelMessage_BroadcastsAfterPersist(t *testing.T
 	got := calls[0]
 	if got.workspaceID != "ws-1" || got.targetType != "channel" || got.targetID != "ch-1" || got.msg.ID != "msg-broadcast" {
 		t.Errorf("unexpected publish call: %+v", got)
+	}
+	event := waitForConversationEvents(t, pub, 1)[0]
+	if event.workspaceID != "ws-1" || event.targetType != "channel" || event.targetID != "ch-1" || event.messageID != "event-member-added" {
+		t.Errorf("unexpected conversation event publish: %+v", event)
+	}
+	if len(pub.members) != 1 || pub.members[0] != (membersAddedCall{
+		workspaceID: "ws-1", targetType: "channel", targetID: "ch-1", actorUserID: user1,
+		addedCount: 1, memberCount: 2,
+	}) {
+		t.Errorf("unexpected members.added publish: %+v", pub.members)
+	}
+	if len(pub.available) != 1 || pub.available[0].workspaceID != "ws-1" ||
+		pub.available[0].targetType != "channel" || pub.available[0].targetID != "ch-1" ||
+		!slices.Equal(pub.available[0].userIDs, []string{"member-2"}) {
+		t.Errorf("unexpected conversation.available publish: %+v", pub.available)
 	}
 }
 

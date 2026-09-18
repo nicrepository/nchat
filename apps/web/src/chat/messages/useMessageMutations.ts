@@ -69,6 +69,8 @@ interface Options {
   bodyFormat: "v2" | "v3";
   /** Told when a delete this reader performed took a message out of the timeline. */
   notifyRemoved: () => void;
+  /** Reconciles an event created atomically with a successful message send. */
+  reconcileCreatedConversationEvent: (messageId: string) => void;
 }
 
 export function useMessageMutations({
@@ -77,6 +79,7 @@ export function useMessageMutations({
   dispatch,
   bodyFormat,
   notifyRemoved,
+  reconcileCreatedConversationEvent,
 }: Options): MessageMutations {
   /**
    * The idempotency key of the send currently being retried.
@@ -157,6 +160,9 @@ export function useMessageMutations({
         if (!scope.isCurrent(sendKey)) return stale;
         pendingSendIdentity.current = null;
         dispatch({ type: "sent", message: scope.sanitize(message) });
+        if (message.createdConversationEventId) {
+          reconcileCreatedConversationEvent(message.createdConversationEventId);
+        }
         return { status: "sent" };
       } catch (error: unknown) {
         // Stale failure: silently discard — do not update state for a previous target.
@@ -166,7 +172,7 @@ export function useMessageMutations({
         throw error;
       }
     },
-    [bodyFormat, dispatch, gateway, idempotencyKeyFor, scope],
+    [bodyFormat, dispatch, gateway, idempotencyKeyFor, reconcileCreatedConversationEvent, scope],
   );
 
   const editMessageLocal = useCallback(

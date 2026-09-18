@@ -513,7 +513,13 @@ function connect(): void {
     if (!data || typeof data !== "object") return;
     noteSubscriptionAcknowledgement(data as Record<string, unknown>);
     for (const listener of [...listeners]) {
-      listener.onMessage?.(data as Record<string, unknown>, currentGeneration);
+      try {
+        listener.onMessage?.(data as Record<string, unknown>, currentGeneration);
+      } catch (error) {
+        // A consumer can reject an unexpected server frame, but it must not
+        // prevent other views from receiving later events on this shared socket.
+        console.error("chat websocket event handler failed", error);
+      }
     }
   };
 

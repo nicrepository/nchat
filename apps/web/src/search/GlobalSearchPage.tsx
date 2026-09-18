@@ -7,6 +7,9 @@
  * loading/error/empty/pagination state per tab.
  */
 
+import { type KeyboardEvent } from "react";
+import { useNavigate } from "react-router";
+
 import "./GlobalSearchPage.css";
 
 import ChannelResultRow from "./ChannelResultRow";
@@ -24,9 +27,16 @@ const TABS: Array<{ id: SearchTab; label: string }> = [
 
 export default function GlobalSearchPage() {
   const { state, setQuery, setActiveTab, loadMore, retryTab } = useGlobalSearch();
+  const navigate = useNavigate();
+
+  function closeSearch(event: KeyboardEvent<HTMLElement>) {
+    if (event.key !== "Escape" || event.defaultPrevented) return;
+    event.preventDefault();
+    navigate(-1);
+  }
 
   return (
-    <div className="global-search" data-testid="global-search">
+    <main className="global-search" data-testid="global-search" onKeyDown={closeSearch}>
       <header className="global-search__header">
         <h1 className="global-search__title">Busca global</h1>
         <div className="global-search__field">
@@ -131,6 +141,6 @@ export default function GlobalSearchPage() {
           )}
         </div>
       )}
-    </div>
+    </main>
   );
 }

@@ -18,6 +18,10 @@ var (
 	ErrGeneralChannelMissing     = errors.New("workspace general channel not found")
 	ErrCannotLeaveGeneralChannel = errors.New("cannot leave general channel")
 	ErrInvalidMessageTarget      = errors.New("invalid message target")
+	// ErrMentionNotEligible is deliberately non-enumerating: it covers an
+	// unknown, cross-workspace, inactive, or unauthorized mention target without
+	// revealing which condition failed.
+	ErrMentionNotEligible = fmt.Errorf("%w: mention is not eligible for this conversation", ErrInvalidInput)
 	// ErrCallParticipantBusy reports that a direct or resource-call admission
 	// was refused because the affected user already holds an active/ringing
 	// direct call or a live resource-call participant lease. It wraps

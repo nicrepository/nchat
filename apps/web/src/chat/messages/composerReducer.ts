@@ -26,6 +26,7 @@ import type { Action, ActionOf, MessagesState } from "./types";
  * verdict the backend already made and enforced.
  */
 const sendErrorMessages: Record<string, string> = {
+  mention_not_eligible: "Essa pessoa não pode ser mencionada ou adicionada a esta conversa.",
   malicious_url: "Este link foi bloqueado por segurança.",
   link_check_unavailable:
     "Não foi possível verificar a segurança do link. Tente novamente em instantes.",

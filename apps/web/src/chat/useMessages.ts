@@ -240,7 +240,14 @@ export function useMessages({
   useReferenceRevalidation({ scope, gateway, dispatch, messages: state.messages });
 
   const { sendMessage, editMessageLocal, deleteMessageLocal, toggleFavorite } = useMessageMutations(
-    { scope, gateway, dispatch, bodyFormat, notifyRemoved },
+    {
+      scope,
+      gateway,
+      dispatch,
+      bodyFormat,
+      notifyRemoved,
+      reconcileCreatedConversationEvent: (messageId) => reads.readMessageSnapshot(messageId, true),
+    },
   );
 
   // Issue #824. Its own module and its own cache, because what it holds is a

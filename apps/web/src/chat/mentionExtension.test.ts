@@ -84,6 +84,22 @@ describe("mentionExtension", () => {
     ).toBe("@user-1");
   });
 
+  it("keeps the mention typography and adds an explanatory tooltip for auto-add targets", () => {
+    const rendered = options().renderHTML({
+      node: {
+        attrs: { label: "Juliane", id: "user-2", mentionType: "user", willBeAdded: true },
+      },
+      options: { HTMLAttributes: { class: "chat-mention" } },
+    });
+
+    expect(rendered[1]).toMatchObject({
+      class: "chat-mention",
+      title: "Será adicionada a esta conversa ao enviar.",
+      "data-will-be-added": "true",
+    });
+    expect(rendered[2]).toBe("@Juliane");
+  });
+
   it("repositions on update and handles keyboard lifecycle branches", () => {
     const lifecycle = options().suggestion.render();
     const firstRect = { left: 10, bottom: 20 } as DOMRect;

@@ -416,6 +416,17 @@ type Message struct {
 	// service layer — no HTTP response carries it — and exists so a reused key
 	// can be told from a genuine retry.
 	CreateFingerprint string
+
+	// CreatedConversationEventID is transient metadata returned only by the
+	// atomic create statement when that same statement also added mentioned
+	// members. The service uses it to announce the persisted system message
+	// after commit, and the create response exposes only this ID so the author
+	// can reconcile that same event when its own realtime echo is unavailable.
+	CreatedConversationEventID string
+	// AutoAddedMemberIDs and MemberCount are transient create metadata for the
+	// post-commit realtime publication. They never reach HTTP projections.
+	AutoAddedMemberIDs []string
+	MemberCount        int
 }
 
 // MaxMessageAttachments bounds how many attachments one message may be created

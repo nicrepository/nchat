@@ -709,10 +709,10 @@ func TestPGXMessageStore_CreateMessage_AllMentionFanoutDecisionStopsPastTheBound
 	checkExpectations(t, mock)
 }
 
-func TestPGXMessageStore_CreateMessage_GroupMentionUsesMembershipAndIdempotentOutbox(t *testing.T) {
+func TestPGXMessageStore_CreateMessage_GroupMentionAutoAddsBeforeIdempotentOutbox(t *testing.T) {
 	mock := newMock(t)
 	now := time.Now()
-	mock.ExpectQuery(`(?s)invalid_mentions.*chat\.dm_conversations source_dm.*source_dm\.type = 'group'.*chat\.notification_outbox.*ON CONFLICT`).
+	mock.ExpectQuery(`(?s)authorized_user_mentions AS MATERIALIZED.*chat\.dm_conversations dc.*dc\.type = 'group'.*inserted AS.*auto_added_dm_members AS.*chat\.notification_outbox.*ON CONFLICT`).
 		WithArgs(
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),
 			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(),

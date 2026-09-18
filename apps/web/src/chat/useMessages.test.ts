@@ -436,9 +436,18 @@ afterEach(() => {
 });
 
 describe("useMessages — DM body format", () => {
-  it("posts group messages as v3", async () => {
+  it("posts group messages as v3 and reconciles the membership event", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
-    mockPostDMMessage.mockResolvedValue(makeMessage({ id: "group-message", bodyFormat: "v3" }));
+    mockPostDMMessage.mockResolvedValue(
+      makeMessage({
+        id: "group-message",
+        bodyFormat: "v3",
+        createdConversationEventId: "event-member-added",
+      }),
+    );
+    mockFetchDMMessage.mockResolvedValue(
+      makeMessage({ id: "event-member-added", kind: "system", bodyText: "" }),
+    );
     const { result } = renderHook(() =>
       useMessages({
         kind: "dm",
@@ -456,6 +465,17 @@ describe("useMessages — DM body format", () => {
       "@[Ana](mention:user:user-1)",
       expect.objectContaining({ bodyFormat: "v3" }),
     );
+    await waitFor(() =>
+      expect(mockFetchDMMessage).toHaveBeenCalledWith(
+        "group-1",
+        "event-member-added",
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(result.current.state.messages.map((message) => message.id).sort()).toEqual([
+      "event-member-added",
+      "group-message",
+    ]);
   });
 
   it("keeps direct messages on v2 by default", async () => {
@@ -1659,6 +1679,31 @@ describe("useMessages — WS message.created integration", () => {
     );
     await waitFor(() => expect(result.current.state.messages).toHaveLength(1));
     expect(result.current.state.messages[0]).toEqual(evt);
+  });
+
+  it("retries the auto-add system event once without showing a realtime failure", async () => {
+    const evt = makeMessage({
+      id: "evt-auto-added-member",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(evt);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-auto-add", "evt-auto-added-member");
+    });
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toEqual([evt]));
+    expect(result.current.state.realtimeError).toBeNull();
   });
 
   it("ignores a conversation.event for a different conversation", async () => {
