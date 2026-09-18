@@ -221,7 +221,7 @@ func TestPreviewWorkerKeepsTheCardWhenTheImageIsRejected(t *testing.T) {
 	for name, fetcher := range map[string]*fakeFetcher{
 		"not an image":  {document: ogDocument, image: []byte("<html>")},
 		"fetch failed":  {document: ogDocument, imageErr: linkfetch.ErrURLNotAllowed},
-		"sensitive url": {document: `<html><head><meta property="og:title" content="T"><meta property="og:image" content="https://cdn.site.example/img?token=abc"></head></html>`},
+		"sensitive url": {document: `<html><head><meta property="og:title" content="T"><meta property="og:image" content="https://cdn.site.example/img?sig=abc"></head></html>`},
 		"internal host": {document: `<html><head><meta property="og:title" content="T"><meta property="og:image" content="https://cdn.internal/img.png"></head></html>`},
 	} {
 		t.Run(name, func(t *testing.T) {

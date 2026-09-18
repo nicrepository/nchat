@@ -48,7 +48,7 @@ func TestPolicyRefusesSensitiveAndInternalURLsWithoutTheProvider(t *testing.T) {
 		url    string
 		reason string
 	}{
-		"magic link":    {"https://app.example.com/magic-link?token=abc", storage.TerminalReasonSensitive},
+		"magic link":    {"https://app.example.com/magic-link?otp=123456", storage.TerminalReasonSensitive},
 		"signed url":    {"https://bucket.s3.amazonaws.com/f?X-Amz-Signature=x", storage.TerminalReasonSensitive},
 		"internal name": {"https://wiki.internal/page", storage.TerminalReasonInternal},
 	} {
