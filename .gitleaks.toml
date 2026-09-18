@@ -58,6 +58,16 @@ id = "generic-api-key"
   ]
 
   [[rules.allowlists]]
+  description = "Link Safety test fixtures (issue #807): a synthetic link-target identity, a literal 32-hex string, used only as the target_key/targetKey of a fake message link in two web unit tests. It is not an API key, is never read from the environment and grants access to nothing. The current tree uses a low-entropy fixture instead; this entry only covers the historical commit that the pull-request range scan still walks. Pinned to the field name, that exact value and the two files, so a real credential assigned to either field is still reported."
+  condition = "AND"
+  regexTarget = "line"
+  regexes = ['(target_key|targetKey): "a1b2c3d4e5f60718293a4b5c6d7e8f90"']
+  paths = [
+    '^apps/web/src/chat/messageLinks\.test\.ts$',
+    '^apps/web/src/chat/useChatWebSocket\.test\.ts$',
+  ]
+
+  [[rules.allowlists]]
   description = "Encrypted values in validated SealedSecret manifests"
   condition = "AND"
   paths = [

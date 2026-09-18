@@ -11,7 +11,36 @@
  */
 
 import type { Message } from "../chatTypes";
+import type { MessageLink } from "../messageLinks";
 import type { LinkSafetyChange, LinkSafetyCorrections } from "./types";
+
+/**
+ * Whether a message carries the per-link projection (issue #807): links[]
+ * naming each occurrence, and a body the server already redacted span by span
+ * (U+FFFC where a condemned URL stood). For such a message the aggregate
+ * marker is a compatibility projection and never an instruction: the body is
+ * kept exactly as the server projected it. A message without links[] is a
+ * legacy payload — a server that predates the entities, or a message the
+ * server described no links for — and there the aggregate `malicious` still
+ * means the body was withheld wholesale. The parsers fold an empty links array
+ * to undefined, so "no projection" has one spelling.
+ */
+export function hasLinkProjection(links: readonly MessageLink[] | undefined): boolean {
+  return links !== undefined && links.length > 0;
+}
+
+/**
+ * The body a message keeps once its aggregate marker is `state`: what the
+ * server projected when the per-link model is present; nothing when a legacy
+ * message is condemned. The one place this decision is made — the realtime
+ * correction, the retained correction and the reconnect snapshot all call it.
+ */
+export function bodyUnderAggregate(
+  message: Pick<Message, "bodyText" | "links">,
+  state: Message["linkSafetyState"] | undefined,
+): string {
+  return state === "malicious" && !hasLinkProjection(message.links) ? "" : message.bodyText;
+}
 
 export function isOlderSecurityVersion(candidate: string, current: string): boolean {
   const candidateMs = Date.parse(candidate);
@@ -34,7 +63,7 @@ export function applyLinkSafetyCorrection(
   return {
     ...message,
     linkSafetyState: correction.state,
-    bodyText: correction.state === "malicious" ? "" : message.bodyText,
+    bodyText: bodyUnderAggregate(message, correction.state),
     updatedAt: correction.updatedAt,
   };
 }

@@ -122,6 +122,7 @@ type LinkReconcileService struct {
 	queue     LinkReconcileQueue
 	provider  LinkVerdictReconciler
 	publisher LinkSafetyChangePublisher
+	announcer *LinkTargetAnnouncer
 	// metrics is nil until SetMetrics is called, and nil is a working value —
 	// every *PipelineMetrics method tolerates a nil receiver, so the call sites
 	// below are unguarded.
@@ -402,9 +403,20 @@ var ErrConvergenceStalled = errors.New("link reconcile: convergence made no prog
 // violated or the process is going away — a repeated batch, and context
 // cancellation — not for bounding ordinary work.
 func (s *LinkReconcileService) converge(ctx context.Context, scan storage.InconclusiveScan) {
+	if s.announcer != nil {
+		// Issue #807: the per-link convergence owns the aggregate drain too.
+		s.announcer.Announce(ctx, scan.CanonicalURL)
+		return
+	}
 	if err := drainMessageLinkSafety(ctx, s.queue, scan.CanonicalURL, s.publisher); err != nil {
 		s.logFailure(ctx, "converge message link safety", scan, err)
 	}
+}
+
+// SetAnnouncer attaches the per-link convergence (issue #807), which then
+// supersedes the aggregate-only drain.
+func (s *LinkReconcileService) SetAnnouncer(announcer *LinkTargetAnnouncer) {
+	s.announcer = announcer
 }
 
 type messageLinkSafetyRefresher interface {

@@ -950,32 +950,22 @@ export default function ChatComposer({
    *    result or a thrown error leaves it exactly where it was, so the same
    *    already-uploaded file can be sent again without re-uploading it.
    */
-  // Issue #769, "ACK ATRASADO": whether the text editor should actually
-  // clear once this send resolves. Decided the instant the send resolves —
-  // by comparing the draft's revision then against its revision when this
-  // send *started* — and deliberately before upload.resetAfterPublish()
-  // runs below, which bumps the revision itself (attachments consumed by
-  // this very send, not a new edit) and would otherwise read as "the reader
-  // moved on" every single time.
-  const shouldClearTextRef = useRef(true);
-  // -1 (never a real revision, which starts at 1 on a draft's first
-  // mutation) rather than null/undefined: with the no-op store every
-  // caller that does not opt into #769 gets — including most of this
-  // file's own tests — getDraft always reports undefined, and comparing
-  // two undefineds by strict equality is exactly as valid a "unchanged"
-  // signal as comparing two real revisions.
-  const noRevision = -1;
+  // Whether the editor should clear once this send resolves is the editor's
+  // own question, answered by useChatEditor against its document (issue
+  // #875) — not asked of the draft here, whose revision this very function
+  // goes on to bump by consuming the attachments the send published.
   const handleComposerSend = async (body: string): Promise<SendResult> => {
     if (uploading) return { status: "stale" };
-    const revisionAtSubmit = drafts.getDraft(draftKey ?? "")?.revision ?? noRevision;
+    const publishedAttachmentIds = pendingAttachments.map((attachment) => attachment.id);
     const result = await sendStatingPriority(
       body,
-      pendingAttachments.length ? pendingAttachments.map((attachment) => attachment.id) : undefined,
+      publishedAttachmentIds.length ? publishedAttachmentIds : undefined,
     );
     if (result.status === "sent") {
-      shouldClearTextRef.current =
-        (drafts.getDraft(draftKey ?? "")?.revision ?? noRevision) === revisionAtSubmit;
-      upload.resetAfterPublish();
+      // By identity, never wholesale: a file dropped while this request was
+      // still open belongs to the next message, not to this one (issue
+      // #875).
+      upload.resetAfterPublish(publishedAttachmentIds);
       setEmojiPickerOpen(false);
     }
     return result;
@@ -997,7 +987,6 @@ export default function ChatComposer({
     onSend: handleComposerSend,
     onActivity,
     onTextChange: draftKey ? (doc) => drafts.setText(draftKey, doc) : undefined,
-    shouldClearOnSent: () => shouldClearTextRef.current,
   });
 
   // Whether a new attachment may be taken at all right now. A voice

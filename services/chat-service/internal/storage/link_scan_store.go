@@ -195,8 +195,9 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 		SELECT canonical_url, status
 		FROM chat.link_scans
 		WHERE canonical_url = ANY($1::text[])
-		  AND status IN ('safe', 'malicious')
-		  AND decided_at > now() - ($2 * interval '1 second')`,
+		  AND ((status IN ('safe', 'malicious', 'unknown')
+		        AND decided_at > now() - ($2 * interval '1 second'))
+		       OR status = 'inconclusive')`,
 		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
 	)
 	if err != nil {
@@ -214,7 +215,7 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 		// anything else is treated as absent, so a corrupted or future status
 		// cannot clear a message.
 		if verdictIsLoadable(status) {
-			verdicts[url] = urlsafety.Verdict(status)
+			verdicts[url] = loadableVerdict(status)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -231,7 +232,20 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 // reach the policy layer at all.
 func verdictIsLoadable(status string) bool {
 	verdict := urlsafety.Verdict(status)
-	return verdict.IsFinal() || verdict == urlsafety.VerdictInconclusive
+	return verdict.IsFinal() || verdict == urlsafety.VerdictInconclusive || status == linkScanStatusUnknown
+}
+
+// linkScanStatusUnknown is the issue #807 terminal-without-clearance status:
+// the deadline passed, or the policy refused to ask. To the decision layer it is
+// the same fact as inconclusive — decided, and decided to say nothing.
+const linkScanStatusUnknown = "unknown"
+
+// loadableVerdict maps a stored status onto the decision layer's vocabulary.
+func loadableVerdict(status string) urlsafety.Verdict {
+	if status == linkScanStatusUnknown {
+		return urlsafety.VerdictInconclusive
+	}
+	return urlsafety.Verdict(status)
 }
 
 // EnsureLinkScans records that these canonical URLs need a verdict.
@@ -250,10 +264,10 @@ func (s *PGXMessageStore) EnsureLinkScans(ctx context.Context, canonicalURLs []s
 		return nil
 	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO chat.link_scans (canonical_url)
-		SELECT DISTINCT url FROM unnest($1::text[]) AS urls(url)
+		INSERT INTO chat.link_scans (canonical_url, deadline_at)
+		SELECT DISTINCT url, now() + ($2 * interval '1 second') FROM unnest($1::text[]) AS urls(url)
 		ON CONFLICT (canonical_url) DO NOTHING`,
-		canonicalURLs,
+		canonicalURLs, LinkScanPendingDeadline.Seconds(),
 	)
 	if err != nil {
 		return fmt.Errorf("ensure link scans: %w", err)
@@ -270,11 +284,12 @@ func (s *PGXMessageStore) EnsureLinkScans(ctx context.Context, canonicalURLs []s
 	_, err = s.pool.Exec(ctx, `
 		UPDATE chat.link_scans
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
-		       attempts = 0, next_attempt_at = NULL, updated_at = now()
+		       attempts = 0, next_attempt_at = NULL, terminal_reason = NULL,
+		       deadline_at = now() + ($3 * interval '1 second'), updated_at = now()
 		 WHERE canonical_url = ANY($1::text[])
-		   AND status IN ('safe', 'malicious')
+		   AND status IN ('safe', 'malicious', 'unknown')
 		   AND decided_at <= now() - ($2 * interval '1 second')`,
-		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
+		canonicalURLs, urlsafety.VerdictTTL.Seconds(), LinkScanPendingDeadline.Seconds(),
 	)
 	if err != nil {
 		return fmt.Errorf("reopen expired link scans: %w", err)
@@ -355,7 +370,8 @@ func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans ls
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
-		       attempts = 0, next_attempt_at = NULL, updated_at = now()
+		       attempts = 0, next_attempt_at = NULL, terminal_reason = NULL,
+		       deadline_at = now() + ($2 * interval '1 second'), updated_at = now()
 		 WHERE ls.status IN ('safe', 'malicious')
 		   AND ls.decided_at <= now() - ($1 * interval '1 second')
 		   AND EXISTS (
@@ -366,7 +382,7 @@ func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error
 		         AND mls.fingerprint = COALESCE(m.link_safety_fingerprint, '')
 		         AND m.status = 'pending_link_scan'
 		   )`,
-		urlsafety.VerdictTTL.Seconds(),
+		urlsafety.VerdictTTL.Seconds(), LinkScanPendingDeadline.Seconds(),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("reopen expired verdicts: %w", err)
@@ -514,11 +530,13 @@ func linkSafetyState(status string, malicious, inconclusive bool) (domain.LinkSa
 //
 // A NULL next_attempt_at counts as due, which is what makes a freshly inserted
 // row claimable on the next pass without a second write.
-const claimDueLinkScansQuery = `
+// A row past its deadline is never claimed, whatever the sweep has or has not
+// reached yet (pendingWithinDeadlineSQL).
+var claimDueLinkScansQuery = `
 	WITH due AS (
 		SELECT ls.canonical_url
 		FROM chat.link_scans ls
-		WHERE ls.status = 'pending'
+		WHERE ` + pendingWithinDeadlineSQL("ls") + `
 		  AND (ls.next_attempt_at IS NULL OR ls.next_attempt_at <= now())
 		ORDER BY ls.next_attempt_at NULLS FIRST, ls.created_at
 		LIMIT $1
@@ -580,20 +598,21 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(
 	ctx context.Context, canonicalURL, scanUUID string, generation int,
 ) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET scan_uuid = $2, submit_attempt_started_at = NULL, updated_at = now()
-		 WHERE canonical_url = $1 AND status = 'pending' AND scan_uuid IS NULL
-		   AND submit_generation = $3`,
+		 WHERE ls.canonical_url = $1 AND `+pendingWithinDeadlineSQL("ls")+` AND ls.scan_uuid IS NULL
+		   AND ls.submit_generation = $3`,
 		canonicalURL, scanUUID, generation,
 	)
 	if err != nil {
 		return fmt.Errorf("record link scan submission: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Somebody else already bound a scan to this URL, or it was decided while
-		// this submission was in flight. Either way this worker's scan id is not
-		// the one that counts, and saying so lets the caller record it as a lost
-		// race rather than retrying into a resubmission loop.
+		// Somebody else already bound a scan to this URL, it was decided while
+		// this submission was in flight, or its deadline passed. Either way this
+		// worker's scan id is not the one that counts, and saying so lets the
+		// caller record it as a lost race rather than retrying into a
+		// resubmission loop.
 		return ErrLinkScanConflict
 	}
 	return nil
@@ -615,7 +634,10 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(
 // carries a different scan id. Matching scan_uuid in the predicate is what stops
 // that stale answer from overwriting the current one; zero rows affected means
 // this worker lost the race, and ErrLinkScanConflict says so rather than
-// pretending the write succeeded.
+// pretending the write succeeded. An answer that arrives after the deadline
+// loses the same way: the row is the sweep's to end (unknown/deadline), and a
+// verdict — safe, malicious or inconclusive — is never written over a target
+// whose waiting has already ended.
 func (s *PGXMessageStore) RecordLinkVerdict(
 	ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict,
 ) error {
@@ -626,9 +648,9 @@ func (s *PGXMessageStore) RecordLinkVerdict(
 		return s.recordMaliciousLinkVerdict(ctx, canonicalURL, scanUUID, "pending")
 	}
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET status = $2, decided_at = now(), next_attempt_at = NULL, updated_at = now()
-		 WHERE canonical_url = $1 AND status = 'pending' AND scan_uuid = $3`,
+		 WHERE ls.canonical_url = $1 AND `+pendingWithinDeadlineSQL("ls")+` AND ls.scan_uuid = $3`,
 		canonicalURL, string(verdict), scanUUID,
 	)
 	if err != nil {
@@ -654,6 +676,9 @@ const recordMaliciousLinkVerdictQuery = `
 		   AND status = $2
 		   AND scan_uuid IS NOT NULL
 		   AND scan_uuid = $3
+		   -- A pending target is condemned only inside its deadline; an
+		   -- inconclusive one (reconciliation) has no deadline to honour.
+		   AND ($2 <> 'pending' OR deadline_at > now())
 		 RETURNING canonical_url
 	),
 	denied AS (
@@ -752,14 +777,14 @@ var resolvePendingMessagesQuery = `
 		       -- usable verdict stays that way until reconciliation deliberately
 		       -- changes it, and a message waiting on it must stop waiting rather
 		       -- than poll a terminal row forever.
-		       bool_or(ls.status = 'inconclusive') AS has_inconclusive,
+		       bool_or(ls.status IN ('inconclusive', 'unknown')) AS has_inconclusive,
 		       -- "No link of this message can still change to malicious." This is
 		       -- the gate that keeps a message with one inconclusive URL and one
 		       -- still-pending URL withheld.
 		       bool_and(
 		           (ls.status IN ('safe', 'malicious')
 		            AND ls.decided_at > now() - ($2 * interval '1 second'))
-		           OR ls.status = 'inconclusive'
+		           OR ls.status IN ('inconclusive', 'unknown')
 		       ) AS all_terminal
 		FROM chat.messages m
 		JOIN chat.message_link_scans mls

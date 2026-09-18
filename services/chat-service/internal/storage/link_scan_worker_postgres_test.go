@@ -27,6 +27,26 @@ func (p *ordinaryVerdictProvider) Poll(context.Context, string, string) (urlsafe
 	return p.verdict, nil
 }
 
+// Check is the provider-agnostic contract the worker speaks (issue #807), over
+// the two-step fake: no ref submits, a ref polls.
+func (p *ordinaryVerdictProvider) Check(ctx context.Context, canonicalURL, providerRef string) (urlsafety.ReputationResult, error) {
+	if providerRef == "" {
+		scanID, err := p.Submit(ctx, canonicalURL)
+		if err != nil {
+			return urlsafety.ReputationResult{}, err
+		}
+		return urlsafety.ReputationResult{ProviderRef: scanID}, urlsafety.ErrCheckInProgress
+	}
+	verdict, err := p.Poll(ctx, canonicalURL, providerRef)
+	if err != nil {
+		return urlsafety.ReputationResult{}, err
+	}
+	if !verdict.IsFinal() {
+		return urlsafety.ReputationResult{}, urlsafety.ErrUnavailable
+	}
+	return urlsafety.ReputationResult{ProviderRef: providerRef, Verdict: urlsafety.ReputationVerdict(verdict)}, nil
+}
+
 // The RF-21 worker lifecycle, against a real database.
 //
 // Everything here is a claim about SQL: a lease that another worker cannot take,
@@ -324,13 +344,14 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 			t.Fatalf("status = %q, want inconclusive", status)
 		}
 
-		// Never a usable verdict.
+		// Never a usable clearance: the decision layer receives it as
+		// inconclusive — decided, terminal, and never safe (issue #807).
 		verdicts, err := store.LoadLinkVerdicts(ctx, []string{goodURL})
 		if err != nil {
 			t.Fatalf("LoadLinkVerdicts: %v", err)
 		}
-		if len(verdicts) != 0 {
-			t.Fatalf("an inconclusive scan produced a loadable verdict: %v", verdicts)
+		if verdicts[goodURL] != urlsafety.VerdictInconclusive {
+			t.Fatalf("an inconclusive scan must load as inconclusive, got %v", verdicts)
 		}
 
 		// Never claimed again, even once the row would otherwise look due.

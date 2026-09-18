@@ -14,35 +14,44 @@ import (
 
 // The classification is the single fold both doors read. These assert the fold
 // itself, so a URL that is decided-but-silent can never be confused with a URL
-// nothing has decided — the distinction the edit path depends on.
+// nothing has decided, and — since issue #807 — so a condemned URL blocks its
+// own link and nothing else.
 func TestAggregateLinkDecisionClassifiesEveryVerdict(t *testing.T) {
 	const safeURL = "https://example.test/cleared"
 	const quietURL = "https://example.test/quiet"
 	const unknownURL = "https://example.test/unknown"
+	const badURL = "https://example.test/bad"
 
 	for _, test := range []struct {
 		name             string
 		urls             []string
 		verdicts         map[string]urlsafety.Verdict
+		wantSafe         []string
 		wantInconclusive []string
 		wantUndecided    []string
+		wantMalicious    []string
+		wantAggregate    domain.MessageLinkSafety
 	}{
 		{
-			name:     "a cleared URL holds nothing up",
-			urls:     []string{safeURL},
-			verdicts: map[string]urlsafety.Verdict{safeURL: urlsafety.VerdictSafe},
+			name:          "a cleared URL holds nothing up",
+			urls:          []string{safeURL},
+			verdicts:      map[string]urlsafety.Verdict{safeURL: urlsafety.VerdictSafe},
+			wantSafe:      []string{safeURL},
+			wantAggregate: domain.MessageLinkSafetySafe,
 		},
 		{
 			name:             "an inconclusive URL is decided, not pending",
 			urls:             []string{quietURL},
 			verdicts:         map[string]urlsafety.Verdict{quietURL: urlsafety.VerdictInconclusive},
 			wantInconclusive: []string{quietURL},
+			wantAggregate:    domain.MessageLinkSafetyInconclusive,
 		},
 		{
 			name:          "an absent verdict is undecided",
 			urls:          []string{unknownURL},
 			verdicts:      map[string]urlsafety.Verdict{},
 			wantUndecided: []string{unknownURL},
+			wantAggregate: domain.MessageLinkSafetyNone,
 		},
 		{
 			// The whole reason the default arm exists: a value this version does not
@@ -51,6 +60,20 @@ func TestAggregateLinkDecisionClassifiesEveryVerdict(t *testing.T) {
 			urls:          []string{unknownURL},
 			verdicts:      map[string]urlsafety.Verdict{unknownURL: urlsafety.Verdict("from-the-future")},
 			wantUndecided: []string{unknownURL},
+			wantAggregate: domain.MessageLinkSafetyNone,
+		},
+		{
+			// A condemned URL no longer refuses the message: it is one blocked link
+			// beside the others, each keeping its own state.
+			name: "a condemned URL blocks only itself",
+			urls: []string{badURL, safeURL, unknownURL},
+			verdicts: map[string]urlsafety.Verdict{
+				badURL: urlsafety.VerdictMalicious, safeURL: urlsafety.VerdictSafe,
+			},
+			wantMalicious: []string{badURL},
+			wantSafe:      []string{safeURL},
+			wantUndecided: []string{unknownURL},
+			wantAggregate: domain.MessageLinkSafetyMalicious,
 		},
 		{
 			name: "the groups are kept apart in one pass",
@@ -58,14 +81,16 @@ func TestAggregateLinkDecisionClassifiesEveryVerdict(t *testing.T) {
 			verdicts: map[string]urlsafety.Verdict{
 				safeURL: urlsafety.VerdictSafe, quietURL: urlsafety.VerdictInconclusive,
 			},
+			wantSafe:         []string{safeURL},
 			wantInconclusive: []string{quietURL},
 			wantUndecided:    []string{unknownURL},
+			wantAggregate:    domain.MessageLinkSafetyNone,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			decision, err := aggregateLinkDecision(test.urls, test.verdicts)
-			if err != nil {
-				t.Fatalf("aggregateLinkDecision returned %v", err)
+			decision := aggregateLinkDecision(test.urls, test.verdicts)
+			if !slices.Equal(decision.SafeURLs, test.wantSafe) {
+				t.Fatalf("safe = %q, want %q", decision.SafeURLs, test.wantSafe)
 			}
 			if !slices.Equal(decision.InconclusiveURLs, test.wantInconclusive) {
 				t.Fatalf("inconclusive = %q, want %q", decision.InconclusiveURLs, test.wantInconclusive)
@@ -73,83 +98,37 @@ func TestAggregateLinkDecisionClassifiesEveryVerdict(t *testing.T) {
 			if !slices.Equal(decision.UndecidedURLs, test.wantUndecided) {
 				t.Fatalf("undecided = %q, want %q", decision.UndecidedURLs, test.wantUndecided)
 			}
-		})
-	}
-}
-
-// One condemned URL refuses the message whatever else it carries, and refuses it
-// without classifying the rest.
-func TestAggregateLinkDecisionRefusesACondemnedURL(t *testing.T) {
-	const badURL = "https://example.test/bad"
-	const quietURL = "https://example.test/quiet"
-
-	decision, err := aggregateLinkDecision(
-		[]string{badURL, quietURL},
-		map[string]urlsafety.Verdict{
-			badURL: urlsafety.VerdictMalicious, quietURL: urlsafety.VerdictInconclusive,
-		},
-	)
-	if err != domain.ErrMaliciousURL {
-		t.Fatalf("err = %v, want ErrMaliciousURL", err)
-	}
-	if len(decision.URLs) != 0 || len(decision.InconclusiveURLs) != 0 {
-		t.Fatalf("a refused decision carried state: %+v", decision)
-	}
-}
-
-// editState is where inconclusive and undecided stop being interchangeable: an
-// edit publishes over the first and waits on the second.
-func TestEditStateSeparatesDecidedFromUndecided(t *testing.T) {
-	const someURL = "https://example.test/a"
-
-	for _, test := range []struct {
-		name      string
-		decision  linkDecision
-		wantState domain.MessageLinkSafety
-		wantOK    bool
-	}{
-		{
-			name:      "an undecided URL defers the edit",
-			decision:  linkDecision{URLs: []string{someURL}, UndecidedURLs: []string{someURL}},
-			wantState: domain.MessageLinkSafetyNone,
-		},
-		{
-			name:      "an inconclusive URL publishes with the marker",
-			decision:  linkDecision{URLs: []string{someURL}, InconclusiveURLs: []string{someURL}},
-			wantState: domain.MessageLinkSafetyInconclusive,
-			wantOK:    true,
-		},
-		{
-			name:      "a fully cleared body publishes safe",
-			decision:  linkDecision{URLs: []string{someURL}},
-			wantState: domain.MessageLinkSafetySafe,
-			wantOK:    true,
-		},
-		{
-			name:      "a body with no links has no opinion",
-			decision:  linkDecision{},
-			wantState: domain.MessageLinkSafetyNone,
-			wantOK:    true,
-		},
-		{
-			// Undecided wins over inconclusive: one URL nothing has decided is
-			// enough to hold the edit, whatever the others say.
-			name: "undecided outranks inconclusive",
-			decision: linkDecision{
-				URLs:             []string{someURL},
-				InconclusiveURLs: []string{someURL},
-				UndecidedURLs:    []string{someURL},
-			},
-			wantState: domain.MessageLinkSafetyNone,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			state, ok := test.decision.editState()
-			if state != test.wantState || ok != test.wantOK {
-				t.Fatalf("editState() = (%q, %t), want (%q, %t)",
-					state, ok, test.wantState, test.wantOK)
+			if !slices.Equal(decision.MaliciousURLs, test.wantMalicious) {
+				t.Fatalf("malicious = %q, want %q", decision.MaliciousURLs, test.wantMalicious)
+			}
+			if !slices.Equal(decision.URLs, test.urls) {
+				t.Fatalf("every URL must be recorded, got %q", decision.URLs)
+			}
+			if got := decision.aggregateState(); got != test.wantAggregate {
+				t.Fatalf("aggregateState() = %q, want %q", got, test.wantAggregate)
+			}
+			if decision.messageStatus() != "" {
+				t.Fatal("no link decision may withhold a message")
 			}
 		})
+	}
+}
+
+// A body with no links has no opinion, and admission asks only about the
+// undecided URLs.
+func TestLinkDecisionAdmitsOnlyUndecidedURLs(t *testing.T) {
+	if got := (linkDecision{}).aggregateState(); got != domain.MessageLinkSafetyNone {
+		t.Fatalf("empty decision aggregate = %q", got)
+	}
+	decision := linkDecision{
+		URLs: []string{"a", "b", "c"}, SafeURLs: []string{"a"},
+		InconclusiveURLs: []string{"b"}, UndecidedURLs: []string{"c"},
+	}
+	if !slices.Equal(decision.admissionURLs(), []string{"c"}) {
+		t.Fatalf("admission = %q", decision.admissionURLs())
+	}
+	if decision.fingerprint("body") == "" || (linkDecision{}).fingerprint("body") != "" {
+		t.Fatal("fingerprint must bind a body with links and nothing else")
 	}
 }
 

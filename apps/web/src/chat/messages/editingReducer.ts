@@ -7,10 +7,12 @@
  */
 
 import { normalizeBodyFormat, normalizeLinkSafety, type Message } from "../chatTypes";
+import { parseMessageLinks } from "../messageLinks";
 import type { WSMessageUpdatedEvent } from "../useChatWebSocket";
 import {
   applyLinkSafetyCorrection,
   applyLinkSafetyCorrections,
+  bodyUnderAggregate,
   isNotNewerSecurityVersion,
 } from "./linkSafetyCorrections";
 import type {
@@ -35,8 +37,10 @@ function applyEditOptimistic(
           editCount: message.editCount + 1,
           editedAt: action.editedAt,
           // The new body has not yet received the server's verdict. Keeping the
-          // old body's clearance here would briefly authorize different links.
+          // old body's clearance — or its link entities — here would briefly
+          // authorize different links.
           linkSafetyState: "unknown" as const,
+          links: undefined,
         }
       : message,
   );
@@ -59,6 +63,7 @@ function confirmEditOnMessage(
     editCount: confirmed.editCount,
     isEdited: confirmed.isEdited,
     linkSafetyState: confirmed.linkSafetyState,
+    links: confirmed.links,
   };
 }
 
@@ -126,15 +131,20 @@ function applyUpdatedBody(message: Message, update: MessageUpdate): Message {
     update.link_safety_state === undefined
       ? message.linkSafetyState
       : normalizeLinkSafety(update.link_safety_state);
+  // Issue #807: a server that describes the links has already redacted every
+  // condemned span from the body it sends, so the body is kept as sent. A
+  // legacy update without links withholds a condemned body wholesale.
+  const links = parseMessageLinks(update.links);
   return {
     ...message,
-    bodyText: linkSafetyState === "malicious" ? "" : update.body,
+    bodyText: bodyUnderAggregate({ bodyText: update.body, links }, linkSafetyState),
     bodyFormat: normalizeBodyFormat(update.body_format),
     editedAt: update.edited_at,
     updatedAt: update.updated_at ?? update.edited_at,
     editCount: update.edit_count,
     isEdited: update.is_edited,
     linkSafetyState,
+    links,
   };
 }
 

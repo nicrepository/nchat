@@ -6,6 +6,7 @@ import {
   OTHER_USER_ID,
   OTHER_USER_NAME,
   createScenario,
+  expectComposerConsumedTheSend,
   fillComposer,
   installMessagingMocks,
   makeMessage,
@@ -68,6 +69,9 @@ test.describe("mensagens diretas 1:1", () => {
     await expect(replyBubble.getByTestId("chat-message-quote")).toContainText(OTHER_USER_NAME);
     await expect(replyBubble.getByTestId("chat-message-quote")).toContainText(originalText);
 
+    // Issue #875: the reply is on the timeline, so it is no longer a draft.
+    await expectComposerConsumedTheSend(page);
+
     const channelLoad = page.waitForResponse(
       (response) =>
         response.url().includes("/api/chat/channels/e2e-channel-other/messages") &&
@@ -84,10 +88,13 @@ test.describe("mensagens diretas 1:1", () => {
 
     await page.goto(`/chat/dm/${targetId}`);
     await expect(messageBubble(page, reply!.id)).toContainText(replyText);
+    // Neither leaving and coming back nor a reload may resurrect it (#875).
+    await expectComposerConsumedTheSend(page);
     await page.reload();
     await expect(messageBubble(page, reply!.id).getByTestId("chat-message-quote")).toContainText(
       originalText,
     );
+    await expectComposerConsumedTheSend(page);
   });
 
   test("edita uma mensagem dentro da janela e mantém a alteração após reload", async ({

@@ -1929,7 +1929,9 @@ func (s *PGXMessageStore) ForwardChannelMessage(ctx context.Context, input Forwa
 }
 
 // EditMessage atomically snapshots the current body and replaces it after
-// server-side access, author, deletion, and edit-window validation.
+// server-side access, author, deletion, and edit-window validation. The
+// link-safety half of the edit runs in the same transaction as the body (issue
+// #135, CQ-001).
 func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInput) (domain.Message, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1937,11 +1939,35 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	databaseNow, err := lockEditableMessageTx(ctx, tx, input)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := snapshotEditHistoryTx(ctx, tx, input, databaseNow); err != nil {
+		return domain.Message{}, err
+	}
+	state, fingerprint, err := reconcileMessageLinksTx(ctx, tx, input)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	updated, err := updateMessageBodyTx(ctx, tx, input, databaseNow, state, fingerprint)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Message{}, fmt.Errorf("commit message edit: %w", err)
+	}
+	return updated, nil
+}
+
+// lockEditableMessageTx holds the message row FOR UPDATE and validates the
+// edit against the database's own clock and the workspace's edit window.
+func lockEditableMessageTx(ctx context.Context, tx pgx.Tx, input EditMessageInput) (time.Time, error) {
 	var current domain.Message
 	var deletedAt *time.Time
 	var editWindowSeconds *int
 	var databaseNow time.Time
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT m.sender_id::text, m.kind, m.status, m.deleted_at, m.created_at,
 		       w.edit_window_seconds, clock_timestamp()
 		FROM chat.messages m`+messageAccessJoins("$3")+`
@@ -1950,21 +1976,26 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		FOR UPDATE OF m`,
 		input.WorkspaceID, input.MessageID, input.EditorID,
 	).Scan(&current.SenderID, (*string)(&current.Kind), (*string)(&current.Status), &deletedAt, &current.CreatedAt, &editWindowSeconds, &databaseNow)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, domain.ErrNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Message{}, domain.ErrNotFound
-		}
-		return domain.Message{}, fmt.Errorf("lock editable message: %w", err)
+		return time.Time{}, fmt.Errorf("lock editable message: %w", err)
 	}
 	if deletedAt != nil {
 		current.DeletedAt = *deletedAt
 	}
 	if err := domain.ValidateMessageEdit(current, input.EditorID, editWindowSeconds, databaseNow); err != nil {
-		return domain.Message{}, err
+		return time.Time{}, err
 	}
+	return databaseNow, nil
+}
 
+// snapshotEditHistoryTx copies the current body and its link associations into
+// the edit history, so a prior version keeps its own redaction evidence.
+func snapshotEditHistoryTx(ctx context.Context, tx pgx.Tx, input EditMessageInput, versionedAt time.Time) error {
 	var historyID string
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		WITH snapshot AS (
 			INSERT INTO chat.message_edit_history
 				(message_id, body, body_format, editor_user_id, versioned_at, link_safety_fingerprint)
@@ -1982,59 +2013,63 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 			  ON mls.message_id = snapshot.message_id
 			 AND mls.fingerprint = snapshot.link_safety_fingerprint
 		)
-		SELECT id::text FROM snapshot`, input.MessageID, input.EditorID, databaseNow).Scan(&historyID)
+		SELECT id::text FROM snapshot`, input.MessageID, input.EditorID, versionedAt).Scan(&historyID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Message{}, domain.ErrNotFound
-		}
-		return domain.Message{}, fmt.Errorf("snapshot message edit: %w", err)
+		return fmt.Errorf("snapshot message edit: %w", err)
 	}
+	return nil
+}
 
-	// The link-safety half of the edit, in the same transaction as the body
-	// (issue #135, CQ-001).
-	//
-	// The invariant this establishes: once this transaction commits, the state and
-	// associations selected by the message's current fingerprint describe the new
-	// body and nothing else. Prior fingerprints remain only as edit-history
-	// redaction evidence and cannot decide the current row.
-	//
-	// Re-checked here rather than trusted from the caller. The service classified
-	// the new body before this transaction opened, and a reconciliation could have
-	// landed in between; the row is held FOR UPDATE, so checking now closes that
-	// window. A URL that has become malicious, or that has lost its terminal state,
-	// refuses the edit exactly as it would have refused it a moment earlier.
-	if err := assertEditableLinkStates(ctx, tx, input.LinkScanURLs); err != nil {
-		return domain.Message{}, err
+// reconcileMessageLinksTx replaces the message's link associations with the
+// new body's and returns the marker and fingerprint the update commits with.
+//
+// The invariant this establishes: once the transaction commits, the state and
+// associations selected by the message's current fingerprint describe the new
+// body and nothing else. Prior fingerprints remain only as edit-history
+// redaction evidence and cannot decide the current row. The target rows are
+// locked for the rest of the transaction so a verdict landing concurrently
+// orders after this edit — see lockLinkRowsForEdit — and a condemnation
+// already on one of them overrides the caller's marker.
+//
+// The fingerprint exists only to bind associations to the body version they
+// were extracted from, so a body with no URLs must not keep one. Derived here
+// rather than trusted from the caller: a leftover fingerprint with no rows to
+// match is precisely the stale link fact this transaction exists to prevent,
+// and the store is the last place that can still refuse it.
+func reconcileMessageLinksTx(ctx context.Context, tx pgx.Tx, input EditMessageInput) (domain.MessageLinkSafety, string, error) {
+	state, err := lockLinkRowsForEdit(ctx, tx, input.LinkScanURLs, input.LinkSafetyState)
+	if err != nil {
+		return "", "", err
 	}
-	// Prior URLs were copied to the edit-history association table above. The
-	// current table now describes only the new body.
-	// Every current-body reader joins on messages.link_safety_fingerprint, so an
-	// old association can redact its old version but cannot decide the new body.
-	// The fingerprint exists only to bind associations to the body version they
-	// were extracted from, so a body with no URLs must not keep one. Derived here
-	// rather than trusted from the caller: a leftover fingerprint with no rows to
-	// match is precisely the stale link fact this transaction exists to prevent,
-	// and the store is the last place that can still refuse it.
-	fingerprint := input.LinkSafetyFingerprint
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM chat.message_link_scans WHERE message_id = $1`, input.MessageID,
 	); err != nil {
-		return domain.Message{}, fmt.Errorf("replace message link scans: %w", err)
+		return "", "", fmt.Errorf("replace message link scans: %w", err)
 	}
 	if len(input.LinkScanURLs) == 0 {
-		fingerprint = ""
-	} else {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
-			SELECT $1::uuid, url, $2
-			FROM unnest($3::text[]) AS urls(url)
-			ON CONFLICT DO NOTHING`,
-			input.MessageID, fingerprint, input.LinkScanURLs,
-		); err != nil {
-			return domain.Message{}, fmt.Errorf("record message link scans: %w", err)
-		}
+		return state, "", nil
 	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO chat.message_link_scans (message_id, canonical_url, fingerprint)
+		SELECT $1::uuid, url, $2
+		FROM unnest($3::text[]) AS urls(url)
+		ON CONFLICT DO NOTHING`,
+		input.MessageID, input.LinkSafetyFingerprint, input.LinkScanURLs,
+	); err != nil {
+		return "", "", fmt.Errorf("record message link scans: %w", err)
+	}
+	return state, input.LinkSafetyFingerprint, nil
+}
 
+// updateMessageBodyTx writes the new body with its link projection and returns
+// the updated row as every reader sees it.
+func updateMessageBodyTx(
+	ctx context.Context, tx pgx.Tx, input EditMessageInput, editedAt time.Time,
+	state domain.MessageLinkSafety, fingerprint string,
+) (domain.Message, error) {
 	row := tx.QueryRow(ctx, `
 		WITH updated AS (
 			UPDATE chat.messages
@@ -2049,83 +2084,66 @@ func (s *PGXMessageStore) EditMessage(ctx context.Context, input EditMessageInpu
 		SELECT `+listMessageWithQuoteColumns("m", "$4", "q")+`
 		FROM updated m
 		LEFT JOIN auth.users u ON u.id = m.sender_id`+quotedMessageJoin("m", "q"),
-		input.MessageID, input.Body, string(input.BodyFormat), input.EditorID, databaseNow,
-		string(input.LinkSafetyState), fingerprint,
+		input.MessageID, input.Body, string(input.BodyFormat), input.EditorID, editedAt,
+		string(state), fingerprint,
 	)
 	updated, err := scanMessageWithSenderAndQuote(row)
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("update message body: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return domain.Message{}, fmt.Errorf("commit message edit: %w", err)
-	}
 	return updated, nil
 }
 
-// assertEditableLinkStates re-checks, inside the edit's transaction, that every
-// URL in the new body is still in a state an edit may publish.
+// lockLinkRowsForEdit takes the row locks on the targets the new body names, in
+// a stable order, for the rest of the edit transaction, and reports whether any
+// of them is already condemned.
 //
-// It exists to close a time-of-check window. The service classifies the new body
-// before opening this transaction, and a reconciliation running concurrently can
-// change a verdict in between — most importantly from inconclusive to malicious.
-// Without this the edit would publish a body carrying a URL that had just been
-// condemned.
+// Since issue #807 an edit is never refused for what is known about its links:
+// a pending URL is recorded pending and its link waits, a condemned one is
+// recorded and its link is withheld. What the lock still buys is ordering — a
+// verdict landing on one of these rows waits for this edit to commit, so the
+// aggregate marker written below and the associations it describes are computed
+// against the same state the worker will then refresh from. Two edits naming
+// overlapping URL sets lock in canonical order and cannot deadlock.
 //
-// The rule is the same one the classification applied, restated against the rows
-// as they are now:
+// The condemnation is re-read here rather than trusted from the caller, which
+// classified the body before this transaction opened: a verdict that landed in
+// between must decide the marker the edit commits with, or a quote of this
+// message would show a URL the row already knows is malicious.
 //
-//   - a fresh malicious verdict refuses the edit outright;
-//   - a URL with no terminal state means the edit must wait, because an edit
-//     cannot be withheld the way a new message can;
-//   - a fresh clearance and a terminal inconclusive both pass.
-//
-// The errors are the ones the caller already maps, so a race produces exactly the
-// answer the non-racing path would have produced a moment earlier.
-//
-// Lock order is message first, then scan rows by canonical_url. Reconciliation
-// commits its scan-row CAS before opening the message convergence transaction,
-// so it never holds a scan lock while waiting for a message lock and cannot form
-// the inverse scan -> message edge.
-func assertEditableLinkStates(ctx context.Context, tx pgx.Tx, canonicalURLs []string) error {
+// It returns the marker the edit commits with: the caller's own, or malicious
+// when any locked row already says so.
+func lockLinkRowsForEdit(
+	ctx context.Context, tx pgx.Tx, canonicalURLs []string, requested domain.MessageLinkSafety,
+) (domain.MessageLinkSafety, error) {
 	if len(canonicalURLs) == 0 {
-		return nil
+		return requested, nil
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT canonical_url, status
+		SELECT status = 'malicious'
 		FROM chat.link_scans
 		WHERE canonical_url = ANY($1::text[])
-		  AND ((status IN ('safe', 'malicious')
-		        AND decided_at > now() - ($2 * interval '1 second'))
-		       OR status = 'inconclusive')
 		ORDER BY canonical_url
-		FOR UPDATE`,
-		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
-	)
+		FOR UPDATE`, uniqueSortedURLs(canonicalURLs))
 	if err != nil {
-		return fmt.Errorf("read link states for edit: %w", err)
+		return "", fmt.Errorf("lock link rows for edit: %w", err)
 	}
 	defer rows.Close()
-
-	decided := make(map[string]struct{}, len(canonicalURLs))
+	condemned := false
 	for rows.Next() {
-		var url, status string
-		if err := rows.Scan(&url, &status); err != nil {
-			return fmt.Errorf("scan link state for edit: %w", err)
+		var malicious bool
+		if err := rows.Scan(&malicious); err != nil {
+			return "", fmt.Errorf("lock link rows for edit: %w", err)
 		}
-		if urlsafety.Verdict(status) == urlsafety.VerdictMalicious {
-			return domain.ErrMaliciousURL
-		}
-		decided[url] = struct{}{}
+		condemned = condemned || malicious
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read link states for edit: %w", err)
+		return "", fmt.Errorf("lock link rows for edit: %w", err)
 	}
-	for _, url := range canonicalURLs {
-		if _, ok := decided[url]; !ok {
-			return domain.ErrURLCheckPending
-		}
+	if condemned {
+		return domain.MessageLinkSafetyMalicious, nil
 	}
-	return nil
+	return requested, nil
 }
 
 // DeleteMessage atomically re-checks read access and authorship, then marks the

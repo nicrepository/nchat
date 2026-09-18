@@ -148,13 +148,16 @@ func (s *PGXMessageStore) AdmitLinkScans(
 // what stops two admissions naming overlapping URL sets from deadlocking.
 func chargeableURLs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) ([]string, error) {
 	wanted := uniqueSortedURLs(canonicalURLs)
+	// Pending joins existing work; inconclusive is terminal for its scan; a
+	// fresh terminal verdict is a reusable answer. Every existing row is locked,
+	// free or not, so the reservation below sees the same state.
 	rows, err := tx.Query(ctx, `
-		SELECT canonical_url, status,
-		       (status IN ('safe', 'malicious')
-		        AND decided_at > now() - ($2 * interval '1 second')) AS fresh
-		FROM chat.link_scans
-		WHERE canonical_url = ANY($1::text[])
-		ORDER BY canonical_url
+		SELECT ls.canonical_url,
+		       ls.status IN ('pending', 'inconclusive')
+		       OR (ls.status IN ('safe', 'malicious', 'unknown') AND `+freshVerdictSQL("ls", "$2")+`) AS free
+		FROM chat.link_scans ls
+		WHERE ls.canonical_url = ANY($1::text[])
+		ORDER BY ls.canonical_url
 		FOR UPDATE`,
 		wanted, urlsafety.VerdictTTL.Seconds(),
 	)
@@ -162,31 +165,32 @@ func chargeableURLs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) ([]s
 		return nil, fmt.Errorf("classify link scan cost: %w", err)
 	}
 	defer rows.Close()
-
 	free := make(map[string]struct{}, len(wanted))
 	for rows.Next() {
-		var url, status string
-		var fresh bool
-		if err := rows.Scan(&url, &status, &fresh); err != nil {
+		var url string
+		var isFree bool
+		if err := rows.Scan(&url, &isFree); err != nil {
 			return nil, fmt.Errorf("classify link scan cost: %w", err)
 		}
-		// Pending joins existing work; inconclusive is terminal for its scan; a
-		// fresh safe/malicious verdict is a reusable answer.
-		if status == "pending" || status == "inconclusive" || fresh {
+		if isFree {
 			free[url] = struct{}{}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("classify link scan cost: %w", err)
 	}
+	return withoutFree(wanted, free), nil
+}
 
+// withoutFree keeps the URLs that still cost a provider submission.
+func withoutFree(wanted []string, free map[string]struct{}) []string {
 	needed := make([]string, 0, len(wanted))
 	for _, url := range wanted {
 		if _, isFree := free[url]; !isFree {
 			needed = append(needed, url)
 		}
 	}
-	return needed, nil
+	return needed
 }
 
 // reserveCapacity applies the backlog cap and then the workspace budget.
@@ -226,22 +230,26 @@ func reserveCapacity(
 // "stale clearance" to "must be re-scanned" — never the other way, which would
 // be a way to unblock a malicious verdict by naming it.
 func ensureLinkScanJobs(ctx context.Context, tx pgx.Tx, canonicalURLs []string) error {
+	// Every pending row is born with a deadline (issue #807): the sweep turns it
+	// into unknown when nobody has answered by then, so no message waits on a
+	// target forever.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO chat.link_scans (canonical_url)
-		SELECT DISTINCT url FROM unnest($1::text[]) AS urls(url)
+		INSERT INTO chat.link_scans (canonical_url, deadline_at)
+		SELECT DISTINCT url, now() + ($2 * interval '1 second') FROM unnest($1::text[]) AS urls(url)
 		ON CONFLICT (canonical_url) DO NOTHING`,
-		canonicalURLs,
+		canonicalURLs, LinkScanPendingDeadline.Seconds(),
 	); err != nil {
 		return fmt.Errorf("create link scan jobs: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE chat.link_scans
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
-		       attempts = 0, next_attempt_at = NULL,
+		       attempts = 0, next_attempt_at = NULL, terminal_reason = NULL,
+		       deadline_at = now() + ($2 * interval '1 second'),
 		       submit_attempt_started_at = NULL, updated_at = now()
 		 WHERE canonical_url = ANY($1::text[])
-		   AND status IN ('safe', 'malicious')`,
-		canonicalURLs,
+		   AND status IN ('safe', 'malicious', 'unknown')`,
+		canonicalURLs, LinkScanPendingDeadline.Seconds(),
 	); err != nil {
 		return fmt.Errorf("reactivate link scan jobs: %w", err)
 	}
@@ -411,21 +419,21 @@ func (s *PGXMessageStore) BeginLinkScanSubmit(
 ) (int, error) {
 	var generation int
 	err := s.pool.QueryRow(ctx, `
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET submit_attempt_started_at = now(),
 		       submit_generation = submit_generation + 1,
 		       updated_at = now()
-		 WHERE canonical_url = $1
-		   AND status = 'pending'
-		   AND scan_uuid IS NULL
-		   AND submit_generation = $2
+		 WHERE ls.canonical_url = $1
+		   AND `+pendingWithinDeadlineSQL("ls")+`
+		   AND ls.scan_uuid IS NULL
+		   AND ls.submit_generation = $2
 		RETURNING submit_generation`,
 		canonicalURL, expectedGeneration,
 	).Scan(&generation)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		// Decided, submitted, or re-attempted by somebody else while this worker
-		// held the claim. Not this worker's to submit.
+		// Decided, submitted, re-attempted by somebody else while this worker
+		// held the claim, or past its deadline. Not this worker's to submit.
 		return 0, ErrLinkScanConflict
 	case err != nil:
 		return 0, fmt.Errorf("begin link scan submit: %w", err)
@@ -445,12 +453,12 @@ func (s *PGXMessageStore) AdoptScanUUID(
 	ctx context.Context, canonicalURL, scanUUID string, generation int,
 ) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET scan_uuid = $2, submit_attempt_started_at = NULL, updated_at = now()
-		 WHERE canonical_url = $1
-		   AND status = 'pending'
-		   AND scan_uuid IS NULL
-		   AND submit_generation = $3`,
+		 WHERE ls.canonical_url = $1
+		   AND `+pendingWithinDeadlineSQL("ls")+`
+		   AND ls.scan_uuid IS NULL
+		   AND ls.submit_generation = $3`,
 		canonicalURL, scanUUID, generation,
 	)
 	if err != nil {

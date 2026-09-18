@@ -42,7 +42,12 @@ export interface AttachmentUploadState {
   remove: (localId: string) => void;
   retry: (localId: string) => void;
   dismiss: () => void;
-  resetAfterPublish: () => void;
+  /**
+   * Consumes exactly the attachments a confirmed send published, by their
+   * server id (issue #875). Anything added while that send was still in
+   * flight belongs to the next message and is left in the queue.
+   */
+  resetAfterPublish: (publishedAttachmentIds: readonly string[]) => void;
 }
 
 const MAX_CONCURRENT = 2;
@@ -340,12 +345,25 @@ export function useAttachmentUpload(
     setNotice(null);
   }, [replaceItems]);
 
-  const resetAfterPublish = useCallback(() => {
-    controllersRef.current.clear();
-    startedRef.current.clear();
-    replaceItems(() => []);
-    setNotice(null);
-  }, [replaceItems]);
+  const resetAfterPublish = useCallback(
+    (publishedAttachmentIds: readonly string[]) => {
+      const published = new Set(publishedAttachmentIds);
+      const wasPublished = (item: AttachmentUploadItem) =>
+        item.attachment !== null && published.has(item.attachment.id);
+      // Only the consumed items' bookkeeping goes: clearing these maps
+      // wholesale would orphan the AbortController of an upload that is
+      // still running for a file added after the send started, and runItem
+      // checks its own controller is still the registered one before
+      // writing a result back.
+      for (const item of itemsRef.current.filter(wasPublished)) {
+        controllersRef.current.delete(item.localId);
+        startedRef.current.delete(item.localId);
+      }
+      replaceItems((current) => current.filter((item) => !wasPublished(item)));
+      setNotice(null);
+    },
+    [replaceItems],
+  );
 
   useEffect(() => {
     if (ownerRef.current !== targetKey) {

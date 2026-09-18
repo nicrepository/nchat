@@ -11,6 +11,7 @@
  */
 
 import { authenticatedFetch } from "../lib/authClient";
+import { parseMessageLinks } from "./messageLinks";
 import { ApiRequestError } from "../lib/api";
 import { onAuthChange } from "../lib/authSession";
 import {
@@ -926,6 +927,8 @@ interface MessageResponse {
   status: string;
   /** RF-21 link safety (issue #135). Absent on a pre-#135 server. */
   link_safety_state?: unknown;
+  /** Issue #807 per-link entities. Absent on a message without links. */
+  links?: unknown;
   deleted_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -998,6 +1001,7 @@ interface MessageSecuritySnapshotsEnvelope {
       status?: unknown;
       link_safety_state?: unknown;
       updated_at?: unknown;
+      links?: unknown;
       quoted?: {
         message_id?: unknown;
         status?: unknown;
@@ -1213,12 +1217,13 @@ function mapMessageTimestamps(
 function mapMessageBody(
   r: MessageResponse,
   isRemoved: boolean,
-): Pick<Message, "bodyText" | "bodyFormat" | "status" | "linkSafetyState"> {
+): Pick<Message, "bodyText" | "bodyFormat" | "status" | "linkSafetyState" | "links"> {
   return {
     bodyText: isRemoved ? "" : (r.body_text ?? ""),
     bodyFormat: normalizeBodyFormat(r.body_format),
     status: messageStatus(r.status, isRemoved),
     linkSafetyState: isRemoved ? "" : normalizeLinkSafety(r.link_safety_state),
+    links: isRemoved ? undefined : parseMessageLinks(r.links),
   };
 }
 
@@ -1333,6 +1338,22 @@ function mapReference(r: ReferenceResponse): NonNullable<Message["reference"]> {
     updatedAt: r.updated_at ?? r.created_at,
     linkSafetyState: normalizeLinkSafety(r.link_safety_state),
   };
+}
+
+/**
+ * Fetches a derived link-preview thumbnail (issue #807). Authenticated like
+ * every other asset and wrapped in a blob URL by the caller — there is no
+ * `<img src>` to a remote host anywhere in a card.
+ */
+export async function fetchLinkPreviewImage(
+  previewId: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return authenticatedFetch<Blob>(
+    `${CHAT_BASE}/link-previews/${encodeURIComponent(previewId)}/image`,
+    { method: "GET", signal },
+    (response) => response.blob(),
+  );
 }
 
 /** Returns the base path for the message collection of a channel or DM. */
@@ -1559,6 +1580,7 @@ async function fetchMessageSecuritySnapshots(
         linkSafetyState: normalizeLinkSafety(snapshot.link_safety_state),
         updatedAt: snapshot.updated_at,
         ...(quoted ? { quoted } : {}),
+        ...(snapshot.links !== undefined ? { links: parseMessageLinks(snapshot.links) } : {}),
       },
     ];
   });

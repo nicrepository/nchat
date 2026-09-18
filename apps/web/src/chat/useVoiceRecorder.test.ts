@@ -12,6 +12,8 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AttachmentUploadTarget } from "./useAttachmentUpload";
+import { useConversationDrafts } from "./useConversationDrafts";
+import type { ConversationDraftsApi } from "./useConversationDrafts";
 import { useVoiceRecorder } from "./useVoiceRecorder";
 
 const mockUploadAttachment = vi.hoisted(() => vi.fn());
@@ -254,6 +256,113 @@ describe("useVoiceRecorder", () => {
     act(() => result.current.send());
     await waitFor(() => expect(result.current.phase).toBe("reviewing"));
     expect(result.current.error).toBeTruthy();
+  });
+
+  /**
+   * Issue #875: a recording the server acknowledged is not a draft either.
+   * The hook's own phase going back to idle is not enough — what the sidebar
+   * badge and a conversation switch read is the draft, so that is what has
+   * to be empty.
+   */
+  describe("what a confirmed send leaves in the conversation's draft (issue #875)", () => {
+    const draftKey = "channel:ch-1";
+
+    function setupWithDraft(onUploaded: (id: string) => Promise<boolean>) {
+      let drafts!: ConversationDraftsApi;
+      const view = renderHook(() => {
+        drafts = useConversationDrafts("u1");
+        return useVoiceRecorder({
+          target,
+          maxUploadBytes: null,
+          onUploaded,
+          drafts,
+          draftKey,
+        });
+      });
+      return { result: view.result, getDrafts: () => drafts };
+    }
+
+    async function recordAndReview(result: { current: ReturnType<typeof useVoiceRecorder> }) {
+      act(() => result.current.start());
+      await waitFor(() => expect(result.current.phase).toBe("recording"));
+      act(() => result.current.stop());
+      expect(result.current.phase).toBe("reviewing");
+    }
+
+    it("consumes the recording it sent", async () => {
+      mockUploadAttachment.mockResolvedValue({ id: "att-1" });
+      const { result, getDrafts } = setupWithDraft(async () => true);
+      await recordAndReview(result);
+      await waitFor(() => expect(getDrafts().getDraft(draftKey)?.voiceMessage).toBeTruthy());
+
+      act(() => result.current.send());
+
+      await waitFor(() => expect(result.current.phase).toBe("idle"));
+      expect(getDrafts().getDraft(draftKey)).toBeUndefined();
+    });
+
+    /**
+     * Issue #875, I8: the acknowledgement of *this* recording may not take
+     * anything the reader started after submitting it.
+     *
+     * The reply is the state that can genuinely appear in this window. While
+     * a recording is uploading, `recording` is still true, so ChatComposer
+     * replaces the editor with the voice panel and refuses drops
+     * (`canAcceptAttachments = attachEnabled && !recording`) — but the
+     * message list is untouched, so "Responder" on a message is still one
+     * click away. The text is the other half: it predates the recording,
+     * which never cleared it, and must come through just as intact.
+     */
+    it("consumes only its own recording, never state created after the submit", async () => {
+      mockUploadAttachment.mockResolvedValue({ id: "att-1" });
+      // The acknowledgement, held open deliberately — no timers anywhere.
+      let confirmSend!: (consumed: boolean) => void;
+      const { result, getDrafts } = setupWithDraft(
+        () => new Promise<boolean>((resolve) => (confirmSend = resolve)),
+      );
+
+      const textBeforeRecording = {
+        type: "doc",
+        content: [{ type: "paragraph", content: [{ type: "text", text: "rascunho anterior" }] }],
+      };
+      act(() => getDrafts().setText(draftKey, textBeforeRecording));
+      await recordAndReview(result);
+      await waitFor(() => expect(getDrafts().getDraft(draftKey)?.voiceMessage).toBeTruthy());
+
+      act(() => result.current.send());
+      await waitFor(() => expect(result.current.phase).toBe("uploading"));
+
+      // After the submit, before the acknowledgement: the reader answers a
+      // message. This belongs to the *next* send, not to the one in flight.
+      act(() => getDrafts().setReply(draftKey, "msg-42"));
+      const inFlight = getDrafts().getDraft(draftKey);
+      expect(inFlight?.voiceMessage).toBeTruthy();
+      expect(inFlight?.replyToMessageId).toBe("msg-42");
+
+      act(() => confirmSend(true));
+
+      await waitFor(() => expect(result.current.phase).toBe("idle"));
+      const after = getDrafts().getDraft(draftKey);
+      // The recording it sent is gone...
+      expect(after?.voiceMessage).toBeNull();
+      // ...and nothing else is. A global clear would have taken the draft
+      // itself, and with it both of these.
+      expect(after?.replyToMessageId).toBe("msg-42");
+      expect(after?.text).toEqual(textBeforeRecording);
+    });
+
+    // The counterweight: without a confirmation there is nothing to consume,
+    // and the recording must still be there to retry.
+    it("keeps the recording in the draft when the send is not confirmed", async () => {
+      mockUploadAttachment.mockResolvedValue({ id: "att-1" });
+      const { result, getDrafts } = setupWithDraft(async () => false);
+      await recordAndReview(result);
+
+      act(() => result.current.send());
+
+      await waitFor(() => expect(result.current.phase).toBe("reviewing"));
+      expect(getDrafts().getDraft(draftKey)?.voiceMessage).toBeTruthy();
+    });
   });
 
   it("switching the destination discards any in-progress recording", async () => {

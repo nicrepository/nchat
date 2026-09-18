@@ -1024,6 +1024,107 @@ func (h *Hub) PublishMessageLinkSafetyChanged(
 	}
 }
 
+// PublishMessageLinkUpdated announces that one link of a published message
+// changed state (issue #807), to everyone who received the message.
+//
+// Routed like message.link_safety_changed, and like it the payload survives the
+// bus: a link entity is a canonical URL, closed-set states and remote text the
+// server already vetted as data, and the receiving side re-validates every
+// closed set before delivering it — see canonicalizeLinkUpdateEvent.
+func (h *Hub) PublishMessageLinkUpdated(
+	ctx context.Context, workspaceID string, targetType TargetType, targetID, messageID string, link LinkPayload,
+) {
+	if workspaceID == "" || targetID == "" || messageID == "" || !isKnownLinkPayload(link) {
+		return
+	}
+	evt := Event{
+		SchemaVersion: CurrentEventSchemaVersion, Type: EventTypeMessageLinkUpdated,
+		WorkspaceID: workspaceID, TargetType: targetType, TargetID: targetID,
+		MessageID:        messageID,
+		LinkUpdate:       &MessageLinkUpdatePayload{MessageID: messageID, Link: link},
+		EventID:          uuid.New().String(),
+		SourceInstanceID: h.presenceInstanceID, CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(evt)
+	if err != nil {
+		h.logger.ErrorContext(ctx, "ws: marshal message.link_updated event", "error", err)
+		return
+	}
+	select {
+	case h.bcast <- broadcastReq{event: evt, data: data}:
+	case <-ctx.Done():
+		return
+	case <-h.quit:
+		return
+	}
+	if err := h.bus.Publish(ctx, evt); err != nil {
+		// No message id, no URL and no state in the log line.
+		h.logger.WarnContext(ctx, "ws: message.link_updated bus publish failed",
+			"target_type", string(targetType), "error", err)
+	}
+}
+
+// isKnownLinkPayload validates a link entity against the closed sets this
+// version understands. An href on anything but a direct link, or any value
+// outside the sets, refuses the whole payload: a client must never be handed an
+// anchor this version did not mean to authorise.
+func isKnownLinkPayload(link LinkPayload) bool {
+	if !isLinkTargetKey(link.TargetKey) {
+		return false
+	}
+	switch domain.LinkSafety(link.Safety) {
+	case domain.LinkSafetyPending, domain.LinkSafetySafe, domain.LinkSafetyMalicious, domain.LinkSafetyUnknown:
+	default:
+		return false
+	}
+	switch domain.LinkClick(link.Click) {
+	case domain.LinkClickNone, domain.LinkClickDirect, domain.LinkClickInterstitial:
+	default:
+		return false
+	}
+	if link.Href != "" && link.Click != string(domain.LinkClickDirect) {
+		return false
+	}
+	return link.Preview == nil || isKnownPreviewState(link.Preview.State)
+}
+
+// isLinkTargetKey accepts the shape domain.LinkTargetKey produces: an update
+// without an identity could not be matched to any occurrence and is refused.
+func isLinkTargetKey(key string) bool {
+	if len(key) != domain.LinkTargetKeyLength {
+		return false
+	}
+	for _, r := range key {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func isKnownPreviewState(state string) bool {
+	switch domain.LinkPreviewState(state) {
+	case domain.LinkPreviewNone, domain.LinkPreviewQueued, domain.LinkPreviewFetching,
+		domain.LinkPreviewReady, domain.LinkPreviewUnsupported, domain.LinkPreviewFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// canonicalizeLinkUpdateEvent validates a link update arriving over the bus:
+// the block must be present, name the envelope's message, and carry only known
+// values. A failure drops the whole event.
+func canonicalizeLinkUpdateEvent(evt Event) (Event, bool) {
+	if evt.LinkUpdate == nil || evt.MessageID == "" || evt.LinkUpdate.MessageID != evt.MessageID {
+		return Event{}, false
+	}
+	if !isKnownLinkPayload(evt.LinkUpdate.Link) {
+		return Event{}, false
+	}
+	return evt, true
+}
+
 // isKnownLinkSafetyState reports whether a state is one of the three this version
 // announces.
 //
@@ -2557,84 +2658,77 @@ func (h *Hub) remoteRecipientMayAccess(evt Event) bool {
 // but not sufficient for untrusted Pub/Sub payloads. Canonicalization here
 // prevents spoofed workspace_id / target_id values from reaching the hub.
 func canonicalizeRemoteEvent(evt Event) (Event, bool) {
+	steps := []func(Event) (Event, bool){
+		canonicalizeRemoteEnvelope, canonicalizeEventIDs, canonicalizeTypedPayload, canonicalizeLinkEvents,
+	}
 	var ok bool
-	evt, ok = canonicalizeRemoteEnvelope(evt)
-	if !ok {
-		return Event{}, false
-	}
-	evt, ok = canonicalizeEventIDs(evt)
-	if !ok {
-		return Event{}, false
-	}
-	if evt.Type == EventTypeReactionUpdated {
-		evt, ok = canonicalizeReactionEvent(evt)
-		if !ok {
+	for _, step := range steps {
+		if evt, ok = step(evt); !ok {
 			return Event{}, false
 		}
 	}
-	if evt.Type == EventTypePinUpdated {
-		evt, ok = canonicalizePinEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if evt.Type == EventTypeMembersAdded {
-		evt, ok = canonicalizeMembersEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if evt.Type == EventTypeAttachmentStatus {
-		evt, ok = canonicalizeAttachmentEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if evt.Type == EventTypePresenceUpdated {
-		evt, ok = canonicalizePresenceEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if evt.Type == EventTypeMessageLinkSafetyChanged {
-		evt, ok = canonicalizeLinkSafetyEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if isCallEventType(evt.Type) {
-		evt, ok = canonicalizeCallEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
-	if evt.Type == EventTypeTypingUpdated {
-		evt, ok = canonicalizeTypingEvent(evt)
-		if !ok {
-			return Event{}, false
-		}
-	}
+	return stripUnrelatedBlocks(evt), true
+}
 
-	// Remote bus payloads may contain body_text or legacy sender_email. Strip
-	// them so remote nodes route by IDs only; clients fetch by ID if needed.
+// typedPayloadCanonicalizers validates the block one event family carries.
+// The link families are handled by canonicalizeLinkEvents, which also strips
+// the other family's block; the call family is matched by predicate.
+var typedPayloadCanonicalizers = map[EventType]func(Event) (Event, bool){
+	EventTypeReactionUpdated:  canonicalizeReactionEvent,
+	EventTypePinUpdated:       canonicalizePinEvent,
+	EventTypeMembersAdded:     canonicalizeMembersEvent,
+	EventTypeAttachmentStatus: canonicalizeAttachmentEvent,
+	EventTypePresenceUpdated:  canonicalizePresenceEvent,
+	EventTypeTypingUpdated:    canonicalizeTypingEvent,
+}
+
+func canonicalizeTypedPayload(evt Event) (Event, bool) {
+	if isCallEventType(evt.Type) {
+		return canonicalizeCallEvent(evt)
+	}
+	if step, ok := typedPayloadCanonicalizers[evt.Type]; ok {
+		return step(evt)
+	}
+	return evt, true
+}
+
+// stripUnrelatedBlocks drops what a remote node must route without. Bus
+// payloads may contain body_text or legacy sender_email: remote nodes route by
+// IDs only, and clients fetch by ID if needed. A presence/typing block belongs
+// to exactly one event type each; anything else carrying one is relaying a
+// state nobody asked it about, so it is dropped rather than forwarded.
+func stripUnrelatedBlocks(evt Event) Event {
 	evt.Payload = nil
 	evt.MessageUpdate = nil
-	// A presence/typing block belongs to exactly one event type each. Anything
-	// else carrying one is relaying a state nobody asked it about, so it is
-	// dropped here rather than forwarded alongside an unrelated event.
 	if evt.Type != EventTypePresenceUpdated {
 		evt.Presence = nil
-	}
-	// Same rule as the presence block: a link-safety correction belongs to exactly
-	// one event type, and anything else carrying one is relaying a security state
-	// nobody asked it about.
-	if evt.Type != EventTypeMessageLinkSafetyChanged {
-		evt.LinkSafety = nil
 	}
 	if evt.Type != EventTypeTypingUpdated {
 		evt.Typing = nil
 	}
+	return evt
+}
 
+// canonicalizeLinkEvents validates the two link-safety shapes — the aggregate
+// correction (RF-21) and the per-link update (issue #807) — and applies the
+// same rule as the presence block to both: each belongs to exactly one event
+// type, and anything else carrying one is relaying a security state nobody
+// asked it about, so it is dropped rather than forwarded.
+func canonicalizeLinkEvents(evt Event) (Event, bool) {
+	ok := true
+	switch evt.Type {
+	case EventTypeMessageLinkSafetyChanged:
+		evt, ok = canonicalizeLinkSafetyEvent(evt)
+		evt.LinkUpdate = nil
+	case EventTypeMessageLinkUpdated:
+		evt, ok = canonicalizeLinkUpdateEvent(evt)
+		evt.LinkSafety = nil
+	default:
+		evt.LinkSafety, evt.LinkUpdate = nil, nil
+	}
+	if !ok {
+		return Event{}, false
+	}
 	return evt, true
 }
 
@@ -2652,7 +2746,7 @@ func canonicalizeRemoteEnvelope(evt Event) (Event, bool) {
 
 	// Known event type required.
 	switch evt.Type {
-	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged,
+	case EventTypeMessageBlocked, EventTypeMessageLinkSafetyChanged, EventTypeMessageLinkUpdated,
 		EventTypeMessageCreated, EventTypeMessageUpdated, EventTypeReactionUpdated, EventTypePinUpdated,
 		EventTypeMembersAdded, EventTypeConversationAvailable, EventTypeConversationUpdated,
 		EventTypeConversationEvent, EventTypeAcknowledgementUpdated, EventTypeAttachmentStatus,

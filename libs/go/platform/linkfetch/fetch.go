@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"context"
@@ -15,15 +15,24 @@ import (
 )
 
 const (
-	// maxBodyBytes is the ceiling on the HTML actually read. Open Graph lives in
-	// <head>, so this is generous: parsing also stops at <body>, and whichever
-	// bound is reached first ends the read. It is applied to the *decoded*
-	// stream, so a compression bomb expands into this limit and no further.
-	maxBodyBytes = 512 << 10
+	// MaxDocumentBytes is the ceiling on the HTML actually read. Open Graph
+	// lives in <head>, so this is generous: parsing also stops at <body>, and
+	// whichever bound is reached first ends the read. It is applied to the
+	// *decoded* stream, so a compression bomb expands into this limit and no
+	// further.
+	MaxDocumentBytes = 512 << 10
 
-	// maxRedirects bounds a chain. Five covers the http→https→www→canonical
-	// shape real sites use and turns a redirect loop into a refusal.
-	maxRedirects = 5
+	// MaxImageBytes is the ceiling on an og:image download, decoded bytes again.
+	// A card thumbnail is a few hundred kilobytes at most; a page whose image is
+	// larger than this simply gets a card without one.
+	MaxImageBytes = 3 << 20
+
+	// MaxRedirects bounds a chain. Three covers the http→https→www→canonical
+	// shape real sites use and turns a redirect loop into a refusal. It is
+	// small on purpose: under issue #807 every hop is a new destination that
+	// needs its own clearance, so a longer chain is more waiting, not more
+	// reach.
+	MaxRedirects = 3
 
 	// maxResponseHeaderBytes bounds what a server may send before the body
 	// starts, so headers alone cannot exhaust memory.
@@ -36,43 +45,56 @@ const (
 	tlsHandshakeTimeout   = 3 * time.Second
 	responseHeaderTimeout = 4 * time.Second
 
-	// allowedMediaType is the whole allowlist. A preview is read out of an HTML
-	// document; nothing else is fetched and nothing else is interpreted as one.
-	allowedMediaType = "text/html"
+	// DefaultTimeout is the whole-exchange budget when a caller supplies none.
+	DefaultTimeout = 5 * time.Second
 
 	// userAgent identifies the fetch. It is a fixed string carrying no user,
 	// workspace or deployment identity.
 	userAgent = "nchat-linkpreview/1.0 (+https://github.com/nicrepository/nchat)"
 )
 
-// resolver looks a host up. It is a field so tests can drive the address policy
-// deterministically, without DNS and without a network.
-type resolver func(ctx context.Context, host string) ([]netip.Addr, error)
+// Resolver looks a host up. It is a parameter so tests can drive the address
+// policy deterministically, without DNS and without a network.
+type Resolver func(ctx context.Context, host string) ([]netip.Addr, error)
 
-// lookupAddrs is the production resolver.
-func lookupAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
+// LookupAddrs is the production resolver.
+func LookupAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
-// fetcher performs the one controlled request the feature is allowed to make.
-type fetcher struct {
+// Connector opens the connection once the destination has been accepted. It is
+// always given an address literal that AddrAllowed has just approved.
+type Connector func(ctx context.Context, network, address string) (net.Conn, error)
+
+// HopPolicy is the caller's veto over a redirect, asked after the address and
+// URL rules have already accepted the hop. Returning an error refuses the hop;
+// the whole fetch then fails with that error wrapped in ErrRedirectRefused, so
+// the caller can tell "the destination itself was fine and I said no" from
+// every other refusal. nil means SSRF policy only.
+type HopPolicy func(next *url.URL) error
+
+// Fetcher performs the controlled requests the features are allowed to make.
+type Fetcher struct {
 	client *http.Client
 }
 
-func newFetcher(timeout time.Duration, resolve resolver) *fetcher {
-	return newFetcherWith(timeout, resolve, (&net.Dialer{Timeout: dialTimeout}).DialContext)
+// NewFetcher builds the production fetcher. timeout bounds one whole exchange,
+// redirects included; <= 0 selects DefaultTimeout.
+func NewFetcher(timeout time.Duration) *Fetcher {
+	return NewFetcherWith(timeout, LookupAddrs, (&net.Dialer{Timeout: dialTimeout}).DialContext)
 }
 
-// newFetcherWith is newFetcher with the final connect step supplied.
+// NewFetcherWith is NewFetcher with the resolver and the final connect step
+// supplied.
 //
 // It exists so a test can exercise the real address policy — the resolver, the
 // checks, every rule — and still have the accepted connection land on a local
 // httptest server. Production always passes a plain net.Dialer, so there is no
 // path in which the policy is applied to one address and the connection made
 // to another.
-func newFetcherWith(timeout time.Duration, resolve resolver, connect connector) *fetcher {
+func NewFetcherWith(timeout time.Duration, resolve Resolver, connect Connector) *Fetcher {
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = DefaultTimeout
 	}
 	dialer := &safeDialer{resolve: resolve, connect: connect}
 	transport := &http.Transport{
@@ -96,11 +118,7 @@ func newFetcherWith(timeout time.Duration, resolve resolver, connect connector) 
 		// ServerName from the request, so SNI and verification stay correct
 		// without anything being skipped.
 	}
-	return &fetcher{client: &http.Client{
-		Transport:     transport,
-		Timeout:       timeout,
-		CheckRedirect: checkRedirect,
-	}}
+	return &Fetcher{client: &http.Client{Transport: transport, Timeout: timeout}}
 }
 
 // safeDialer is where the SSRF policy is enforced.
@@ -111,41 +129,34 @@ func newFetcherWith(timeout time.Duration, resolve resolver, connect connector) 
 // address that is used — which is what makes DNS rebinding and every other
 // time-of-check/time-of-use variant inapplicable rather than merely unlikely.
 type safeDialer struct {
-	resolve resolver
-	connect connector
+	resolve Resolver
+	connect Connector
 }
-
-// connector opens the connection once the destination has been accepted. It is
-// always given an address literal that addrAllowed has just approved.
-type connector func(ctx context.Context, network, address string) (net.Conn, error)
 
 // dial resolves, validates, and connects — in that order, with nothing between
 // the validation and the connection that could change the destination.
-//
-// The two halves are named but deliberately still adjacent: the security
-// property is the relationship between them, so they are read together. What
-// resolveAndValidate returns is a set of addresses, never a hostname, which is
-// what makes it impossible for the connect step to re-resolve anything.
 func (d *safeDialer) dial(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("%w: destination is not permitted", ErrURLNotAllowed)
 	}
-	addrs, err := d.resolveAndValidate(ctx, host)
+	addrs, err := ResolveAndValidate(ctx, d.resolve, host)
 	if err != nil {
 		return nil, err
 	}
 	return d.connectValidated(ctx, network, addrs, port)
 }
 
-// resolveAndValidate returns the addresses host resolves to, and only if every
+// ResolveAndValidate returns the addresses host resolves to, and only if every
 // one of them is a permitted destination.
 //
 // It fails closed across the whole answer: a name resolving to one public and
 // one private address is refused outright, because accepting it would let an
-// attacker win the race simply by being asked twice.
-func (d *safeDialer) resolveAndValidate(ctx context.Context, host string) ([]netip.Addr, error) {
-	addrs, err := d.resolve(ctx, host)
+// attacker win the race simply by being asked twice. Exported so the safety
+// worker can ask the same question of a hostname before handing it to a public
+// reputation provider.
+func ResolveAndValidate(ctx context.Context, resolve Resolver, host string) ([]netip.Addr, error) {
+	addrs, err := resolve(ctx, host)
 	if err != nil {
 		// A name that does not resolve is an upstream problem, not a policy
 		// one, and the resolver's message is not repeated.
@@ -155,7 +166,7 @@ func (d *safeDialer) resolveAndValidate(ctx context.Context, host string) ([]net
 		return nil, fmt.Errorf("%w: destination is not permitted", ErrURLNotAllowed)
 	}
 	for _, addr := range addrs {
-		if !addrAllowed(addr) {
+		if !AddrAllowed(addr) {
 			return nil, fmt.Errorf("%w: destination is not permitted", ErrURLNotAllowed)
 		}
 	}
@@ -182,41 +193,103 @@ func (d *safeDialer) connectValidated(
 	return nil, lastErr
 }
 
-// checkRedirect re-applies the URL rules at every hop.
+// checkRedirect re-applies the URL rules at every hop and then asks the caller.
 //
 // The address policy needs no help here — each hop to a new host is a new
 // dial through safeDialer, so a redirect into private space is refused by the
 // same check as the original request. What this adds is the part the dialer
-// cannot see: the scheme, the credentials, the port, and how many hops have
-// happened.
-func checkRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= maxRedirects {
-		return fmt.Errorf("%w: too many redirects", ErrUpstream)
+// cannot see: the scheme, the credentials, the port, how many hops have
+// happened, and whether the caller's own policy vouches for the destination.
+func checkRedirect(hop HopPolicy) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= MaxRedirects {
+			return fmt.Errorf("%w: too many redirects", ErrUpstream)
+		}
+		if err := CheckRequestURL(req.URL); err != nil {
+			return err
+		}
+		if hop == nil {
+			return nil
+		}
+		if err := hop(req.URL); err != nil {
+			return &hopRefusal{cause: err}
+		}
+		return nil
 	}
-	return checkRequestURL(req.URL)
 }
 
-// fetch performs the request and returns the final URL and the whole body.
-//
-// It is a sequence of four decisions — build, send, judge the response, read it
-// — each of which lives in its own function. The point of the split is that
+// hopRefusal carries the caller's own reason for vetoing a redirect through the
+// HTTP client, which would otherwise wrap it in a *url.Error naming the URL.
+// Its message names nothing; its chain matches both ErrRedirectRefused and the
+// caller's sentinel, so a caller can tell "wait for clearance" from "condemned".
+type hopRefusal struct{ cause error }
+
+func (r *hopRefusal) Error() string { return ErrRedirectRefused.Error() }
+
+func (r *hopRefusal) Unwrap() []error { return []error{ErrRedirectRefused, r.cause} }
+
+// fetchKind is what a request expects back: the media types it accepts and how
+// much of the decoded body it will read.
+type fetchKind struct {
+	accept   string
+	allowed  func(mediaType string) bool
+	maxBytes int64
+}
+
+var (
+	documentKind = fetchKind{
+		accept:   "text/html",
+		allowed:  func(mediaType string) bool { return mediaType == "text/html" },
+		maxBytes: MaxDocumentBytes,
+	}
+	imageKind = fetchKind{
+		accept:   "image/jpeg, image/png, image/gif",
+		allowed:  func(mediaType string) bool { return strings.HasPrefix(mediaType, "image/") },
+		maxBytes: MaxImageBytes,
+	}
+)
+
+// FetchDocument performs the one HTML request a preview makes and returns the
+// final URL and the whole body. hop may be nil.
+func (f *Fetcher) FetchDocument(ctx context.Context, target *url.URL, hop HopPolicy) (*url.URL, []byte, error) {
+	return f.fetch(ctx, target, hop, documentKind)
+}
+
+// FetchImage downloads an og:image under the image ceilings. The bytes are
+// remote and untrusted; DeriveThumbnail is what turns them into something a
+// browser may be shown. hop may be nil.
+func (f *Fetcher) FetchImage(ctx context.Context, target *url.URL, hop HopPolicy) ([]byte, error) {
+	_, body, err := f.fetch(ctx, target, hop, imageKind)
+	return body, err
+}
+
+// fetch is a sequence of four decisions — build, send, judge the response, read
+// it — each of which lives in its own function. The point of the split is that
 // "how much of a body may be read" is a rule with its own consequences, and it
 // should be readable and testable without a server in front of it.
-func (f *fetcher) fetch(ctx context.Context, target *url.URL) (*url.URL, []byte, error) {
-	request, err := newDocumentRequest(ctx, target)
+func (f *Fetcher) fetch(ctx context.Context, target *url.URL, hop HopPolicy, kind fetchKind) (*url.URL, []byte, error) {
+	if err := CheckRequestURL(target); err != nil {
+		return nil, nil, err
+	}
+	request, err := newRequest(ctx, target, kind.accept)
 	if err != nil {
 		return nil, nil, err
 	}
-	response, err := f.client.Do(request)
+	// A shallow copy per exchange so the hop policy is request-scoped while the
+	// transport — and its dialer — is shared. http.Client is a plain struct and
+	// documents that copying it is fine.
+	client := *f.client
+	client.CheckRedirect = checkRedirect(hop)
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, nil, classifyTransportError(err)
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	if err := checkResponse(response); err != nil {
+	if err := checkResponse(response, kind); err != nil {
 		return nil, nil, err
 	}
-	body, err := readBoundedBody(response.Body)
+	body, err := readBoundedBody(response.Body, kind.maxBytes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -227,18 +300,18 @@ func (f *fetcher) fetch(ctx context.Context, target *url.URL) (*url.URL, []byte,
 	return final, body, nil
 }
 
-// newDocumentRequest builds the one request this feature makes.
+// newRequest builds the one request a fetch makes.
 //
-// It carries only what a document fetch needs. No cookie, no credential and no
-// header derived from the caller's request: whatever is at the other end learns
+// It carries only what the fetch needs. No cookie, no credential and no header
+// derived from any caller's request: whatever is at the other end learns
 // nothing about who asked.
-func newDocumentRequest(ctx context.Context, target *url.URL) (*http.Request, error) {
+func newRequest(ctx context.Context, target *url.URL, accept string) (*http.Request, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: url is malformed", ErrInvalidURL)
 	}
 	request.Header.Set("User-Agent", userAgent)
-	request.Header.Set("Accept", "text/html")
+	request.Header.Set("Accept", accept)
 	return request, nil
 }
 
@@ -247,14 +320,14 @@ func newDocumentRequest(ctx context.Context, target *url.URL) (*http.Request, er
 // The declared length is a short-circuit and never the bound: it saves reading
 // a body that has already announced itself as too large, and a server that lies
 // about it or declares nothing is caught by readBoundedBody instead.
-func checkResponse(response *http.Response) error {
+func checkResponse(response *http.Response, kind fetchKind) error {
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("%w: unexpected upstream status", ErrUpstream)
 	}
-	if err := checkContentType(response.Header.Get("Content-Type")); err != nil {
+	if err := checkContentType(response.Header.Get("Content-Type"), kind.allowed); err != nil {
 		return err
 	}
-	if response.ContentLength > maxBodyBytes {
+	if response.ContentLength > kind.maxBytes {
 		return fmt.Errorf("%w: response is too large", ErrUpstream)
 	}
 	return nil
@@ -273,15 +346,12 @@ func checkResponse(response *http.Response) error {
 // The limit applies to the decoded stream. The transport decompresses before
 // this reader sees anything, so a compression bomb expands into the limit and
 // is refused on its real size rather than on its compressed one.
-func readBoundedBody(body io.Reader) ([]byte, error) {
-	// maxBodyBytes+1 is a constant expression evaluated at compile time, so a
-	// limit large enough to overflow the int64 io.LimitReader takes would fail
-	// the build rather than silently wrap into a small or negative bound.
-	data, err := io.ReadAll(io.LimitReader(body, maxBodyBytes+1))
+func readBoundedBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
 	if err != nil {
 		return nil, classifyTransportError(err)
 	}
-	if int64(len(data)) > maxBodyBytes {
+	if int64(len(data)) > maxBytes {
 		return nil, fmt.Errorf("%w: response is too large", ErrUpstream)
 	}
 	return data, nil
@@ -291,9 +361,9 @@ func readBoundedBody(body io.Reader) ([]byte, error) {
 //
 // Parameters are stripped rather than matched on, so "text/html; charset=utf-8"
 // is the same decision as "text/html", and the comparison is case-insensitive
-// because the header is. An absent or unparseable type is refused: this service
+// because the header is. An absent or unparseable type is refused: this package
 // never guesses that unlabelled bytes are a document.
-func checkContentType(header string) error {
+func checkContentType(header string, allowed func(string) bool) error {
 	if strings.TrimSpace(header) == "" {
 		return fmt.Errorf("%w: response declared no content type", ErrUnsupportedContentType)
 	}
@@ -301,8 +371,8 @@ func checkContentType(header string) error {
 	if err != nil {
 		return fmt.Errorf("%w: response content type is malformed", ErrUnsupportedContentType)
 	}
-	if !strings.EqualFold(strings.TrimSpace(mediaType), allowedMediaType) {
-		return fmt.Errorf("%w: response is not html", ErrUnsupportedContentType)
+	if !allowed(strings.ToLower(strings.TrimSpace(mediaType))) {
+		return fmt.Errorf("%w: response media type is not accepted", ErrUnsupportedContentType)
 	}
 	return nil
 }
@@ -311,6 +381,10 @@ func checkContentType(header string) error {
 // package's classes. The original message is dropped: it routinely names the
 // address that was dialled, which is the one thing a caller must not learn.
 func classifyTransportError(err error) error {
+	var refusal *hopRefusal
+	if errors.As(err, &refusal) {
+		return refusal
+	}
 	switch {
 	case errors.Is(err, ErrURLNotAllowed):
 		return fmt.Errorf("%w: destination is not permitted", ErrURLNotAllowed)

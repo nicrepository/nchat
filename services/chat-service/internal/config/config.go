@@ -124,6 +124,15 @@ type Config struct {
 	LinkSafetyCloudflareAccount string
 	LinkSafetyCloudflareToken   string
 
+	// LinkPreviewEnabled gates rich previews (issue #807): the server-side
+	// fetch of a cleared URL's Open Graph metadata and image. Off by default,
+	// because on it makes this service open outbound connections to hosts users
+	// named. Independent of LinkSafetyEnabled: safety decides what may be
+	// clicked and fetched; this decides only whether the fetch happens. Off, safe
+	// links stay clickable, no preview is queued, stored cards are not served
+	// and queued work drains as failed.
+	LinkPreviewEnabled bool
+
 	// What this deployment is willing to spend at the provider (RF-21 capacity).
 	//
 	// None of these have a "correct" value this code could pick, and that is why
@@ -183,12 +192,14 @@ type Config struct {
 	ConversationNotificationLevelsEnabled bool
 
 	linkSafetyEnabledInvalid                     bool
+	linkPreviewEnabledInvalid                    bool
 	conversationNotificationLevelsEnabledInvalid bool
 }
 
 func Load() Config {
 	wsDefaults := ws.DefaultHandlerConfig()
 	linkSafetyEnabled, linkSafetyEnabledInvalid := configuredBool("CHAT_LINK_SAFETY_ENABLED", false)
+	linkPreviewEnabled, linkPreviewEnabledInvalid := configuredBool("CHAT_LINK_PREVIEW_ENABLED", false)
 	notificationLevelsEnabled, notificationLevelsInvalid := configuredBool(
 		"CHAT_CONVERSATION_NOTIFICATION_LEVELS_ENABLED", false)
 	return Config{
@@ -227,6 +238,7 @@ func Load() Config {
 		WSInboundBurst:              getPositiveInt("WS_INBOUND_BURST", wsDefaults.InboundBurst),
 		WSMaxInvalidMessages:        getPositiveInt("WS_MAX_INVALID_MESSAGES", wsDefaults.MaxInvalidMessages),
 		LinkSafetyEnabled:           linkSafetyEnabled,
+		LinkPreviewEnabled:          linkPreviewEnabled,
 		LinkSafetyCloudflareAccount: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID", ""),
 		// Never logged, echoed in an error, or sent to a client.
 		LinkSafetyCloudflareToken: platformconfig.GetString("CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN", ""),
@@ -243,6 +255,7 @@ func Load() Config {
 		ConversationNotificationLevelsEnabled: notificationLevelsEnabled,
 
 		linkSafetyEnabledInvalid:                     linkSafetyEnabledInvalid,
+		linkPreviewEnabledInvalid:                    linkPreviewEnabledInvalid,
 		conversationNotificationLevelsEnabledInvalid: notificationLevelsInvalid,
 	}
 }
@@ -286,6 +299,9 @@ func (c Config) Validate() error {
 func (c Config) validateLinkSafety() error {
 	if c.linkSafetyEnabledInvalid {
 		return errors.New("CHAT_LINK_SAFETY_ENABLED must be a valid boolean")
+	}
+	if c.linkPreviewEnabledInvalid {
+		return errors.New("CHAT_LINK_PREVIEW_ENABLED must be a valid boolean")
 	}
 	// A typo in the rollout gate must not read as "off" *or* as "on": the first
 	// would hide a deliberate enablement, the second would open a writer nobody

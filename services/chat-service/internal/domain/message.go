@@ -341,7 +341,12 @@ type Message struct {
 	// MessageLinkSafety: it is what a client needs to decide whether to draw the
 	// "could not verify" notice, and what nothing in this service may read as
 	// permission to fetch a URL.
-	LinkSafety             MessageLinkSafety
+	LinkSafety MessageLinkSafety
+	// Links are the per-occurrence link entities the backend derived from the
+	// body (issue #807): what is a link, where it points, what is known about
+	// it and what the reader may do with it. Populated by the read paths that
+	// serve a message; nil for a message without links.
+	Links                  []MessageLink
 	ParentMessageID        string
 	ForwardedFromMessageID string
 	ReferencedMessageID    string

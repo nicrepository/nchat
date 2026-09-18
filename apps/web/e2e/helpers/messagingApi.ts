@@ -91,6 +91,30 @@ export interface RawMessageAttachment {
   duration_ms?: number;
 }
 
+/** One link entity as the server states it (issue #807). */
+export interface RawLink {
+  ordinal: number;
+  /** The target's stable identity; every occurrence and every update carries one. */
+  target_key: string;
+  text?: string;
+  url?: string;
+  hostname?: string;
+  safety: "pending" | "safe" | "malicious" | "unknown";
+  click: "none" | "direct" | "interstitial";
+  href?: string;
+  updated_at: string;
+  preview?: {
+    state: "none" | "queued" | "fetching" | "ready" | "unsupported" | "failed";
+    hostname: string;
+    site_name?: string;
+    title?: string;
+    description?: string;
+    image_id?: string;
+    image_width?: number;
+    image_height?: number;
+  };
+}
+
 interface RawMessage {
   id: string;
   sender_id: string;
@@ -101,6 +125,9 @@ interface RawMessage {
   body_format: "v1" | "v2" | "v3";
   status: "active" | "deleted";
   is_removed: boolean;
+  /** RF-21 aggregate marker and the issue #807 per-link entities. */
+  link_safety_state?: string;
+  links?: RawLink[];
   created_at: string;
   updated_at: string;
   edited_at?: string | null;
@@ -159,6 +186,11 @@ interface MessagingScenarioOptions {
   editWindowExpiredIds?: string[];
   /** People returned by GET /dm-candidates, used by "nova conversa" specs. */
   dmCandidates?: DMCandidateFixture[];
+  /**
+   * Issue #807: the link entities the mocked server attaches to a message the
+   * reader posts. Absent means the body has no links the server described.
+   */
+  postLinks?: (bodyText: string) => RawLink[] | undefined;
 }
 
 interface PatchRequest {
@@ -175,6 +207,7 @@ export interface MessagingScenario {
   targetId: string;
   targetName: string;
   messagesByTarget: Map<string, RawMessage[]>;
+  postLinks?: (bodyText: string) => RawLink[] | undefined;
   requests: {
     channelPosts: Array<{
       body_text?: string;
@@ -390,6 +423,8 @@ export function makeMessage(overrides: Partial<RawMessage> = {}): RawMessage {
     // carries them and neither does a fixture built without them.
     event_type: overrides.event_type,
     event_payload: overrides.event_payload,
+    link_safety_state: overrides.link_safety_state,
+    links: overrides.links,
   };
 }
 
@@ -483,6 +518,7 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     kind: options.kind,
     targetId: options.targetId,
     targetName: options.targetName,
+    postLinks: options.postLinks,
     messagesByTarget,
     requests: {
       channelPosts: [],
@@ -649,6 +685,8 @@ export async function emitMessageCreated(
       deleted_at: options.message.deleted_at,
       quoted: options.message.quoted,
       is_forwarded: options.message.is_forwarded,
+      link_safety_state: options.message.link_safety_state,
+      links: options.message.links,
     },
   };
   await page.waitForFunction(
@@ -667,6 +705,56 @@ export async function emitMessageCreated(
       }
     ).__e2eEmitMessageCreated(messageCreatedEvent);
   }, event);
+}
+
+/**
+ * Emits message.link_updated for one target of one message (issue #807), as the
+ * safety or preview worker would after a verdict or a card lands.
+ */
+export async function emitLinkUpdated(
+  page: Page,
+  options: {
+    kind: TargetKind;
+    targetId: string;
+    messageId: string;
+    link: RawLink;
+    eventId?: string;
+  },
+) {
+  await page.waitForFunction(
+    ({ kind, targetId }) =>
+      (
+        window as unknown as {
+          __e2eHasSubscription?: (kind: string, targetId: string) => boolean;
+        }
+      ).__e2eHasSubscription?.(kind, targetId) === true,
+    { kind: options.kind, targetId: options.targetId },
+  );
+  await page.evaluate(
+    ({ kind, targetId, messageId, link, eventId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "message.link_updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        message_id: messageId,
+        event_id: eventId,
+        link_update: { message_id: messageId, link },
+      });
+    },
+    {
+      kind: options.kind,
+      targetId: options.targetId,
+      messageId: options.messageId,
+      link: options.link,
+      eventId: options.eventId ?? `${options.messageId}-link-${options.link.url ?? "blocked"}`,
+    },
+  );
 }
 
 /** One presence entry as the server states it (RF-58). */
@@ -2500,6 +2588,7 @@ async function handleTargetMessagesRoute(
       body_format: body.body_format ?? (routeKind === "channel" ? "v3" : "v2"),
       created_at: "2026-07-15T12:03:00.000Z",
       updated_at: "2026-07-15T12:03:00.000Z",
+      links: scenario.postLinks?.(body.body_text ?? ""),
       quoted: parent ? quoteFrom(parent) : undefined,
       reference: source
         ? {
@@ -2710,6 +2799,16 @@ export async function fillComposer(page: Page, text: string) {
   await input.click();
   await page.keyboard.insertText(text);
   await expect(input).toContainText(text);
+}
+
+/**
+ * Issue #875: a message the server acknowledged is not a draft. Asserts the
+ * composer holds nothing of it — neither the text nor the quote of the
+ * message it answered.
+ */
+export async function expectComposerConsumedTheSend(page: Page) {
+  await expect(page.getByTestId("chat-composer-input")).toHaveText("");
+  await expect(page.getByTestId("chat-composer-quote")).toHaveCount(0);
 }
 
 export async function replaceEditorText(page: Page, editor: Locator, text: string) {

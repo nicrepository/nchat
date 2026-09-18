@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"net/url"
@@ -26,7 +26,7 @@ func TestExtractReadsOpenGraph(t *testing.T) {
 		<title>Ignored because og:title won</title>
 	</head><body><h1>page</h1></body></html>`
 
-	preview := extract(mustURL(t, "https://example.com/page"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/page"), []byte(document))
 
 	if preview.Title != "A title" {
 		t.Fatalf("title: %q", preview.Title)
@@ -48,7 +48,7 @@ func TestExtractFallsBackToHTMLTitleAndDescription(t *testing.T) {
 		<meta name="description" content="Plain description">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "The page title" {
 		t.Fatalf("expected the whitespace-normalised html title, got %q", preview.Title)
@@ -68,7 +68,7 @@ func TestExtractPrefersOpenGraphOverFallbacks(t *testing.T) {
 		<meta property="og:description" content="OG description">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "OG title" || preview.Description != "OG description" {
 		t.Fatalf("expected the Open Graph values to win, got %+v", preview)
@@ -85,7 +85,7 @@ func TestExtractKeepsTheFirstOfDuplicateTags(t *testing.T) {
 		<meta property="og:image" content="https://cdn.example.com/second.png">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "first" {
 		t.Fatalf("title: %q", preview.Title)
@@ -96,8 +96,8 @@ func TestExtractKeepsTheFirstOfDuplicateTags(t *testing.T) {
 }
 
 func TestExtractHandlesMissingMetadata(t *testing.T) {
-	preview := extract(mustURL(t, "https://example.com/"), []byte(`<html><head></head><body>hi</body></html>`))
-	if preview != (Preview{}) {
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(`<html><head></head><body>hi</body></html>`))
+	if preview != (Metadata{}) {
 		t.Fatalf("expected an empty preview, got %+v", preview)
 	}
 }
@@ -116,7 +116,7 @@ func TestExtractSurvivesMalformedHTML(t *testing.T) {
 		"duplicate html":    `<html><html><head><meta property="og:title" content="still read">`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+			preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 			if preview.Title != "still read" {
 				t.Fatalf("title: %q", preview.Title)
 			}
@@ -125,7 +125,7 @@ func TestExtractSurvivesMalformedHTML(t *testing.T) {
 }
 
 func TestExtractHandlesEmptyDocument(t *testing.T) {
-	if preview := extract(mustURL(t, "https://example.com/"), nil); preview != (Preview{}) {
+	if preview := Extract(mustURL(t, "https://example.com/"), nil); preview != (Metadata{}) {
 		t.Fatalf("expected an empty preview, got %+v", preview)
 	}
 }
@@ -140,7 +140,7 @@ func TestExtractDiscardsATagCutOffAtEOF(t *testing.T) {
 	document := `<html><head><meta property="og:title" content="complete">` +
 		`<meta property="og:description" content="cut in ha`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "complete" {
 		t.Fatalf("expected the complete tag to survive, got %q", preview.Title)
@@ -156,7 +156,7 @@ func TestExtractStopsAtBody(t *testing.T) {
 	document := `<html><head><meta property="og:title" content="head title"></head>
 		<body><meta property="og:description" content="should not be read"></body></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "head title" {
 		t.Fatalf("title: %q", preview.Title)
@@ -176,7 +176,7 @@ func TestExtractTreatsScriptPayloadsAsText(t *testing.T) {
 		<meta property="og:description" content="&lt;img src=x onerror=alert(1)&gt;">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Title != "<script>alert(1)</script>" {
 		t.Fatalf("title: %q", preview.Title)
@@ -193,7 +193,7 @@ func TestExtractCollapsesNewlines(t *testing.T) {
 	document := "<html><head><meta property=\"og:title\" content=\"line\r\nSet-Cookie: a=b\r\n\tmore\">" +
 		"</head></html>"
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if strings.ContainsAny(preview.Title, "\r\n\t") {
 		t.Fatalf("title kept a control character: %q", preview.Title)
@@ -211,7 +211,7 @@ func TestExtractTruncatesOversizedFields(t *testing.T) {
 		<meta property="og:site_name" content="` + huge + `">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if got := utf8.RuneCountInString(preview.Title); got != maxTitleRunes {
 		t.Fatalf("title kept %d runes, limit is %d", got, maxTitleRunes)
@@ -230,7 +230,7 @@ func TestExtractTruncatesOnRuneBoundaries(t *testing.T) {
 	document := `<html><head><meta property="og:title" content="` +
 		strings.Repeat("é", 10_000) + `"></head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if !utf8.ValidString(preview.Title) {
 		t.Fatal("truncation produced invalid UTF-8")
@@ -244,7 +244,7 @@ func TestExtractDropsInvalidUTF8(t *testing.T) {
 	document := []byte("<html><head><meta property=\"og:title\" content=\"ok\xff\xfe end\">" +
 		"</head></html>")
 
-	preview := extract(mustURL(t, "https://example.com/"), document)
+	preview := Extract(mustURL(t, "https://example.com/"), document)
 
 	if !utf8.ValidString(preview.Title) {
 		t.Fatalf("title is not valid UTF-8: %q", preview.Title)
@@ -296,7 +296,7 @@ func TestImageURLResolvesAndVets(t *testing.T) {
 func TestExtractAcceptsOgImageURLAlias(t *testing.T) {
 	document := `<html><head><meta property="og:image:url" content="/card.png"></head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/page"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/page"), []byte(document))
 
 	if preview.ImageURL != "https://example.com/card.png" {
 		t.Fatalf("image: %q", preview.ImageURL)
@@ -313,89 +313,89 @@ func TestExtractAcceptsOgImageURLAlias(t *testing.T) {
 func TestExtractIsIndependentOfAttributeOrder(t *testing.T) {
 	cases := map[string]struct {
 		tag  string
-		want Preview
+		want Metadata
 	}{
 		"property before name": {
 			`<meta property="og:title" name="description" content="OG title">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 		"name before property": {
 			`<meta name="description" property="og:title" content="OG title">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 		"content first, property last": {
 			`<meta content="OG title" name="description" property="og:title">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 
 		// The same pairing for description, so the precedence is not a rule
 		// that happens to hold only for the title.
 		"description property first": {
 			`<meta property="og:description" name="description" content="OG description">`,
-			Preview{Description: "OG description"},
+			Metadata{Description: "OG description"},
 		},
 		"description name first": {
 			`<meta name="description" property="og:description" content="OG description">`,
-			Preview{Description: "OG description"},
+			Metadata{Description: "OG description"},
 		},
 
 		// And for the image, whose value goes through URL resolution afterwards.
 		"image property first": {
 			`<meta property="og:image" name="thumbnail" content="/card.png">`,
-			Preview{ImageURL: "https://example.com/card.png"},
+			Metadata{ImageURL: "https://example.com/card.png"},
 		},
 		"image name first": {
 			`<meta name="thumbnail" property="og:image" content="/card.png">`,
-			Preview{ImageURL: "https://example.com/card.png"},
+			Metadata{ImageURL: "https://example.com/card.png"},
 		},
 
 		// property alone, and name alone for the fallback that depends on it.
 		"property only": {
 			`<meta property="og:site_name" content="Example">`,
-			Preview{SiteName: "Example"},
+			Metadata{SiteName: "Example"},
 		},
 		"name only falls back": {
 			`<meta name="description" content="Plain description">`,
-			Preview{Description: "Plain description"},
+			Metadata{Description: "Plain description"},
 		},
 
 		// Attributes this parser does not read must not disturb the ones it does.
 		"irrelevant attributes interleaved": {
 			`<meta charset="utf-8" property="og:title" data-x="1" content="OG title" lang="en">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 
 		// Identifying attributes are matched case-insensitively; a tag with no
 		// content declares nothing.
 		"uppercase property": {
 			`<meta property="OG:Title" content="OG title">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 		"padded property": {
 			`<meta property="  og:title  " content="OG title">`,
-			Preview{Title: "OG title"},
+			Metadata{Title: "OG title"},
 		},
 		"no content attribute": {
 			`<meta property="og:title">`,
-			Preview{},
+			Metadata{},
 		},
 		"empty content": {
 			`<meta property="og:title" content="">`,
-			Preview{},
+			Metadata{},
 		},
 		"unknown property ignored": {
 			`<meta property="og:audio" content="https://example.com/a.mp3">`,
-			Preview{},
+			Metadata{},
 		},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			document := "<html><head>" + testCase.tag + "</head></html>"
 
-			got := extract(mustURL(t, "https://example.com/page"), []byte(document))
+			got := Extract(mustURL(t, "https://example.com/page"), []byte(document))
 
 			if got != testCase.want {
-				t.Fatalf("extract(%s) = %+v, want %+v", testCase.tag, got, testCase.want)
+				t.Fatalf("Extract(%s) = %+v, want %+v", testCase.tag, got, testCase.want)
 			}
 		})
 	}
@@ -410,7 +410,7 @@ func TestExtractPrecedenceHoldsAcrossSeparateTags(t *testing.T) {
 		<meta property="og:description" content="open graph, declared second">
 	</head></html>`
 
-	preview := extract(mustURL(t, "https://example.com/"), []byte(document))
+	preview := Extract(mustURL(t, "https://example.com/"), []byte(document))
 
 	if preview.Description != "open graph, declared second" {
 		t.Fatalf("description: %q", preview.Description)

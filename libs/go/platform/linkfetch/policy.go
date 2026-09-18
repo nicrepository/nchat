@@ -1,4 +1,4 @@
-package linkpreview
+package linkfetch
 
 import (
 	"fmt"
@@ -33,15 +33,18 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("100::/64"),       // discard-only
 }
 
-// addrAllowed reports whether addr is a public destination this service may
+// AddrAllowed reports whether addr is a public destination this deployment may
 // connect to. It is the single decision the whole SSRF defence rests on, and it
 // is asked about the address the connection will actually use — never about a
 // hostname.
 //
+// Exported so the safety worker can classify a hostname that *resolves* into a
+// private network with the same rule the dialer enforces; two lists would drift.
+//
 // Cloud metadata services need no entry of their own: 169.254.169.254 is
 // link-local and fd00:ec2::254 is a unique local address, so both are already
 // refused, and so is any hostname or alias that resolves to them.
-func addrAllowed(addr netip.Addr) bool {
+func AddrAllowed(addr netip.Addr) bool {
 	// An IPv4 address written as ::ffff:127.0.0.1 has to be judged as
 	// 127.0.0.1, or every IPv4 rule below would silently not apply.
 	addr = addr.Unmap()
@@ -63,8 +66,8 @@ func addrAllowed(addr netip.Addr) bool {
 	return true
 }
 
-// canonicalURL validates a client-supplied URL and returns the form used both
-// for the request and as the cache key.
+// ParseURL validates a caller-supplied URL and returns the form used both for
+// the request and as a cache key.
 //
 // Everything it refuses is refused because allowing it would widen what the
 // endpoint can reach: a non-HTTP scheme, credentials the service would replay
@@ -75,7 +78,7 @@ func addrAllowed(addr netip.Addr) bool {
 //
 // It is a first line, not the defence: the destination is judged again, by
 // address, when the connection is made.
-func canonicalURL(raw string) (*url.URL, error) {
+func ParseURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	switch {
 	case raw == "":
@@ -87,7 +90,7 @@ func canonicalURL(raw string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: url is malformed", ErrInvalidURL)
 	}
-	if err := checkRequestURL(parsed); err != nil {
+	if err := CheckRequestURL(parsed); err != nil {
 		return nil, err
 	}
 	// The fragment never reaches the server, so keeping it would only split the
@@ -99,7 +102,7 @@ func canonicalURL(raw string) (*url.URL, error) {
 	return &canonical, nil
 }
 
-// checkRequestURL applies the rules every URL this service connects to must
+// CheckRequestURL applies the rules every URL this package connects to must
 // satisfy, including the target of each redirect.
 //
 // It is two questions asked in a fixed order — how this service would speak to
@@ -107,7 +110,7 @@ func canonicalURL(raw string) (*url.URL, error) {
 // each check's error class is what the caller maps to a status code, so a URL
 // that is wrong in two ways must keep reporting the same one it always did.
 // Both halves stay in this file so the whole policy is auditable in one place.
-func checkRequestURL(parsed *url.URL) error {
+func CheckRequestURL(parsed *url.URL) error {
 	scheme, err := checkRequestScheme(parsed)
 	if err != nil {
 		return err
@@ -147,7 +150,7 @@ func checkRequestAuthority(parsed *url.URL, scheme string) error {
 	if port := parsed.Port(); port != "" && port != defaultPort(scheme) {
 		return fmt.Errorf("%w: only the default port is supported", ErrURLNotAllowed)
 	}
-	if addr, err := netip.ParseAddr(host); err == nil && !addrAllowed(addr) {
+	if addr, err := netip.ParseAddr(host); err == nil && !AddrAllowed(addr) {
 		return fmt.Errorf("%w: destination is not permitted", ErrURLNotAllowed)
 	}
 	return nil
