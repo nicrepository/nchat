@@ -1,5 +1,19 @@
 name: CI
 
+# One gate, one owner, one execution (issue #931).
+#
+# Every mandatory validation of the repository is exactly one job here, named
+# after the failure it reports, with a local command that reproduces it. Jobs are
+# independent unless they consume something another job produced, so the only
+# `needs` in this file are the two that are technically real: SonarQube reads the
+# coverage reports the test jobs upload, and `CI / Required` reads the results of
+# the gates it consolidates.
+#
+# Security and Governance stay in workflows of their own -- the first because it
+# also runs on a weekly schedule, the second because its trust model is its own
+# -- and are called from here so their results reach the aggregation. They are
+# the repository's existing `workflow_call` pattern, the same one images.yml uses.
+
 on:
   pull_request:
     branches:
@@ -22,264 +36,655 @@ env:
   GO_VERSION: "1.25.13"
   NODE_VERSION: "24"
   PNPM_VERSION: "11.1.2"
+  KUBECTL_VERSION: "v1.32.3"
 
 jobs:
-  metadata:
-    name: Metadata
+  # ---------------------------------------------------------------- Static ---
+  static-web:
+    name: Static / Web
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Print run metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "branch=${GITHUB_REF_NAME}"
-          echo "sha=${GITHUB_SHA}"
-          echo "actor=${GITHUB_ACTOR}"
-          echo "event=${GITHUB_EVENT_NAME}"
-
-  quality:
-    name: Quality
-    runs-on: ubuntu-latest
-    needs: metadata
-    # `pnpm run ci` includes the Go coverage gate, which merges in the RF-21
-    # Link Safety profile when a database is offered. Ephemeral and local to
-    # this job; the *_test name is what the suites insist on.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: nchat
-          POSTGRES_PASSWORD: REPLACE_ME
-          POSTGRES_DB: nchat_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U nchat -d nchat_test"
-          --health-interval 10s --health-timeout 5s --health-retries 10
-    env:
-      # Read only by scripts/ci/go-coverage-check.sh, so `pnpm test` and the race
-      # step keep skipping every opt-in PostgreSQL suite.
-      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            services/*/go.mod
-            libs/go/*/go.mod
-
-      - name: Add Go bin to PATH
-        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Install golangci-lint
-        run: bash scripts/ci/install-golangci-lint.sh
-
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: ${{ env.PNPM_VERSION }}
-
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Activate pnpm
-        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: v1.32.3
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      # The RF-21 suites read the schema the real migrations produce, across both
-      # the chat and files domains, so the official runner applies them.
-      - name: Apply migrations to the coverage database
-        run: bash scripts/db/migrate.sh up
-        env:
-          MIGRATIONS_DATABASE_URL: ${{ env.LINK_SAFETY_TEST_DATABASE_URL }}
-
-      - name: Run aggregate CI
-        run: pnpm run ci
-
-  backend:
-    name: Backend
-    runs-on: ubuntu-latest
-    needs: metadata
-    # Same reason as the Quality job: the coverage gate merges in the RF-21 Link
-    # Safety profile, which only a real PostgreSQL can produce.
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: nchat
-          POSTGRES_PASSWORD: REPLACE_ME
-          POSTGRES_DB: nchat_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U nchat -d nchat_test"
-          --health-interval 10s --health-timeout 5s --health-retries 10
-    env:
-      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: |
-            services/*/go.mod
-            libs/go/*/go.mod
-
-      - name: Add Go bin to PATH
-        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Install golangci-lint
-        run: bash scripts/ci/install-golangci-lint.sh
-
-      - name: Check Go formatting
-        run: bash scripts/ci/go-fmt-check.sh
-
-      - name: Vet Go
-        run: bash scripts/ci/go-vet.sh
-
-      - name: Test Go
-        run: bash scripts/ci/go-test.sh
-
-      - name: Test channel membership contracts (PostgreSQL)
-        working-directory: services/chat-service
-        env:
-          CHAT_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/membership_contract_test?sslmode=disable
-          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
-        run: |
-          # This suite drops chat; keep it separate from the coverage database.
-          docker exec "$POSTGRES_CONTAINER" createdb -U nchat membership_contract_test
-          go test ./internal/storage -run '^TestChannelMembershipContractPostgreSQL_' -count=1 -v
-
-      - name: Run Go race tests
-        run: bash scripts/ci/go-test.sh -race
-
-      - name: Apply migrations to the coverage database
-        run: bash scripts/db/migrate.sh up
-        env:
-          MIGRATIONS_DATABASE_URL: ${{ env.LINK_SAFETY_TEST_DATABASE_URL }}
-
-      - name: Check Go coverage
-        run: bash scripts/ci/go-coverage-check.sh
-
-      - name: Lint Go
-        run: bash scripts/ci/go-lint.sh
-
-  frontend:
-    name: Frontend
-    runs-on: ubuntu-latest
-    needs: metadata
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Activate pnpm
-        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Check web formatting
+      - name: Check formatting
         run: pnpm format:check:web
-
-      - name: Lint web
+      - name: Lint
         run: pnpm lint:web
-
-      - name: Typecheck web
+      - name: Typecheck
         run: pnpm typecheck:web
 
-      - name: Test web coverage
-        run: pnpm test:coverage:web
-
-      - name: Build web
-        run: pnpm build:web
-
-  manifests:
-    name: Manifests
+  static-admin:
+    name: Static / Admin
     runs-on: ubuntu-latest
-    needs: metadata
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: ${{ env.PNPM_VERSION }}
-
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Activate pnpm
-        run: corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: v1.32.3
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Check formatting
+        run: pnpm format:check:admin-web
+      - name: Lint
+        run: pnpm lint:admin-web
+      - name: Typecheck
+        run: pnpm typecheck:admin-web
 
+  static-go:
+    name: Static / Go
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install golangci-lint
+        run: bash scripts/ci/install-golangci-lint.sh
+      - name: Check formatting
+        run: bash scripts/ci/go-fmt-check.sh
+      - name: Vet
+        run: bash scripts/ci/go-vet.sh
+      - name: Lint
+        run: bash scripts/ci/go-lint.sh
+
+  static-repository:
+    name: Static / Repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check documentation and YAML formatting
+        run: pnpm format:check:docs
+      - name: Check CI config
+        run: pnpm ci:config-check
+      - name: Test the CI architecture checker
+        run: pnpm ci:architecture-check-test
+      - name: Check the CI architecture
+        run: pnpm ci:architecture-check
+      - name: Test the required-gate aggregator
+        run: pnpm ci:required-gates-test
+      - name: Test the image module inputs checker
+        run: pnpm images:module-inputs-check-test
+      - name: Check image module inputs
+        run: pnpm images:module-inputs-check
+
+  # ----------------------------------------------------------------- Tests ---
+  # `vitest run --coverage` is the whole suite plus its thresholds, so the unit
+  # job is the coverage job: running `vitest run` as well would execute every
+  # test a second time for nothing.
+  tests-web-unit:
+    name: Tests / Web Unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test with coverage
+        run: pnpm test:coverage:web
+      - name: Upload coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-web
+          path: coverage/web
+          retention-days: 7
+          if-no-files-found: warn
+
+  tests-admin-unit:
+    name: Tests / Admin Unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test with coverage
+        run: pnpm test:coverage:admin-web
+      - name: Upload coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-admin-web
+          path: coverage/admin-web
+          retention-days: 7
+          if-no-files-found: warn
+
+  # No DSN is exported here, so every opt-in PostgreSQL suite skips: pure unit
+  # tests never wait for a database to come up.
+  tests-go-unit:
+    name: Tests / Go Unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+      - name: Test
+        run: bash scripts/ci/go-test.sh
+
+  tests-go-race:
+    name: Tests / Go Race
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+      - name: Test with the race detector
+        run: bash scripts/ci/go-test.sh -race
+
+  tests-go-integration:
+    name: Tests / Go Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nchat
+          POSTGRES_PASSWORD: REPLACE_ME
+          POSTGRES_DB: nchat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nchat -d nchat_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+      # One empty database per suite. Every one of them resets the schema it
+      # owns on setup, so sharing a database would make the result depend on
+      # execution order -- and none of them needs the migration runner first,
+      # because each applies the migration files it needs itself.
+      - name: Create the integration databases
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          for database in admin_test auth_test media_test; do
+            docker exec "$POSTGRES_CONTAINER" createdb -U nchat "$database"
+          done
+      - name: Test against PostgreSQL
+        env:
+          CHAT_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
+          ADMIN_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/admin_test?sslmode=disable
+          AUTH_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/auth_test?sslmode=disable
+          MEDIA_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/media_test?sslmode=disable
+        run: bash scripts/ci/go-integration-test.sh
+
+  # Kept separate from Tests / Go Unit because it is a different measurement, not
+  # a repeat: it drops the cmd/ entrypoints from the denominator and merges in the
+  # Link Safety, notification outbox and worker-claim profiles, which only a real
+  # PostgreSQL with the real migrations can produce.
+  tests-go-coverage:
+    name: Tests / Go Coverage
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nchat
+          POSTGRES_PASSWORD: REPLACE_ME
+          POSTGRES_DB: nchat_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nchat -d nchat_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      # Read only by scripts/ci/go-coverage-check.sh. Deliberately neither
+      # CHAT_TEST_DATABASE_URL nor FILE_TEST_DATABASE_URL, so a plain
+      # `go test ./...` keeps skipping every opt-in PostgreSQL suite.
+      LINK_SAFETY_TEST_DATABASE_URL: postgresql://nchat:REPLACE_ME@localhost:5432/nchat_test?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            services/*/go.mod
+            libs/go/*/go.mod
+      # The measured suites read the schema the real migrations produce, across
+      # both the chat and files domains, so the official runner applies them.
+      - name: Apply migrations to the coverage database
+        run: bash scripts/db/migrate.sh up
+        env:
+          MIGRATIONS_DATABASE_URL: ${{ env.LINK_SAFETY_TEST_DATABASE_URL }}
+      - name: Check coverage
+        run: bash scripts/ci/go-coverage-check.sh
+      # The merged profiles are what SonarQube reads, and the per-module summary
+      # is what makes a threshold failure readable without rerunning anything.
+      - name: Upload coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-go
+          path: |
+            coverage/go/*.threshold.out
+            coverage/go/*.threshold.txt
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------- E2E ---
+  e2e-web:
+    name: E2E / Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm --filter @nchat/web exec playwright install --with-deps chromium
+      - name: Test
+        run: pnpm test:e2e:web
+      # Only on failure: the HTML report and the traces Playwright writes on a
+      # retry are a diagnosis of a red run, and worth nothing for a green one.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report-web
+          path: |
+            apps/web/playwright-report
+            apps/web/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  e2e-admin:
+    name: E2E / Admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm --filter @nchat/admin-web exec playwright install --with-deps chromium
+      - name: Test
+        run: pnpm test:e2e:admin-web
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-report-admin-web
+          path: |
+            apps/admin-web/playwright-report
+            apps/admin-web/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ----------------------------------------------------------------- Build ---
+  build-web:
+    name: Build / Web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build:web
+
+  build-admin:
+    name: Build / Admin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build:admin-web
+
+  # ---------------------------------------------------------- Infrastructure ---
+  # Validation of versioned operational configuration. Homogeneous and cheap:
+  # no cluster or database (some validators use local Docker syntax checks).
+  infra-config:
+    name: Infra / Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
       - name: Check dev environment config
         run: pnpm dev:env:config-check
-
       - name: Check local gateway config
         run: pnpm gateway:config-check
-
       - name: Check web security headers
         run: pnpm web:security-headers-check
-
-      - name: Check web LiveKit CSP integration (Docker build + envsubst + nginx + HTTP)
-        run: pnpm web:livekit-integration-check
-
       - name: Check TLS config
         run: pnpm tls:config-check
+      - name: Check media config
+        run: pnpm media:config-check
+      - name: Check WebRTC office network config
+        run: pnpm webrtc-office-network:config-check
+      - name: Check observability config
+        run: pnpm observability:config-check
+      - name: Check Grafana dashboards
+        run: pnpm grafana:dashboard-check
+      - name: Check PoC config
+        run: pnpm poc:config-check
+      - name: Check health contract
+        run: pnpm health:contract-check
 
+  infra-kubernetes:
+    name: Infra / Kubernetes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@c0c8b32d33a5244f1e5947304550403b63930415 # v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check Kubernetes manifests
+        run: pnpm k8s:ci
       - name: Check Sealed Secrets policy
         run: pnpm sealed-secrets:policy-check
 
-      - name: Check Kubernetes manifests
-        run: pnpm k8s:ci
+  infra-migrations:
+    name: Infra / Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check migrations
+        run: pnpm migrations:check
+      - name: Test the Blue/Green migration gate
+        run: pnpm migrations:blue-green:test
+
+  infra-release-safety:
+    name: Infra / Release Safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@c0c8b32d33a5244f1e5947304550403b63930415 # v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Validate the release-safety gates
+        run: pnpm ci:infra:release-safety
+
+  # Its own owner rather than a step of Infra / Config: it builds the web image
+  # with Docker and exercises the running nginx over HTTP, which is a different
+  # dependency and a different cost from the offline validators above.
+  infra-web-image:
+    name: Infra / Web Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check the web LiveKit CSP integration
+        run: pnpm web:livekit-integration-check
+
+  # -------------------------------------------------- Security / Governance ---
+  # Called workflows rather than copies. Their checks are reported as
+  # `Security / <job>` and `Governance / <job>`, and their results reach the
+  # aggregation below, which a second workflow's jobs never could.
+  security:
+    name: Security
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml
+
+  governance:
+    name: Governance
+    permissions:
+      contents: read
+    uses: ./.github/workflows/governance.yml
+
+  # -------------------------------------------------------------- Advisory ---
+  # ADVISORY (issue #931). The analysis runs in full and the server computes the
+  # Quality Gate; what was removed is `sonar.qualitygate.wait`, the step that
+  # turned a failed Quality Gate into a blocking exit code. A scanner, token or
+  # upload failure still fails this job and stays visible -- it is not masked with
+  # continue-on-error -- it simply never reaches `CI / Required`.
+  #
+  # SonarQube Community Build analyses a single main branch and performs no pull
+  # request analysis, so only `develop` is submitted.
+  #
+  # `needs` here is a real data dependency, not serialisation: this job consumes
+  # the coverage reports those three produce instead of running the suites again.
+  quality-sonarqube:
+    name: Quality / SonarQube
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs:
+      - tests-web-unit
+      - tests-admin-unit
+      - tests-go-coverage
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # SonarQube uses the full history for SCM authorship and dates; a
+          # shallow clone would present the whole base as new code.
+          fetch-depth: 0
+      - name: Download web coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-web
+          path: coverage/web
+      - name: Download admin coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-admin-web
+          path: coverage/admin-web
+      - name: Download Go coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-go
+          path: coverage/go
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # ----------------------------------------------------------- Aggregation ---
+  # The single check branch protection is meant to require. It runs no test, no
+  # build and no scanner: it reads the result of every required gate and fails
+  # closed. `always()` is what lets it observe a failed, cancelled or skipped
+  # dependency at all -- without the explicit evaluation below, a job that merely
+  # ran would report success.
+  required:
+    name: CI / Required
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - static-web
+      - static-admin
+      - static-go
+      - static-repository
+      - tests-web-unit
+      - tests-admin-unit
+      - tests-go-unit
+      - tests-go-race
+      - tests-go-integration
+      - tests-go-coverage
+      - e2e-web
+      - e2e-admin
+      - build-web
+      - build-admin
+      - infra-config
+      - infra-kubernetes
+      - infra-migrations
+      - infra-release-safety
+      - infra-web-image
+      - security
+      - governance
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Consolidate the required gates
+        env:
+          REQUIRED_GATES: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/check_required_gates.py
