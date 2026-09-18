@@ -1364,7 +1364,7 @@ describe("useChatWebSocket", () => {
     );
     const link = {
       ordinal: 0,
-      target_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      target_key: "target-example-a",
       url: "https://example.test/a",
       hostname: "example.test",
       safety: "safe",

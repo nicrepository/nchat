@@ -16,7 +16,7 @@ import {
 
 const wire = (overrides: Record<string, unknown> = {}) => ({
   ordinal: 0,
-  target_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  target_key: "target-example-a",
   text: "https://Example.test/a",
   url: "https://example.test/a",
   hostname: "example.test",
@@ -30,7 +30,7 @@ const wire = (overrides: Record<string, unknown> = {}) => ({
 function entity(overrides: Partial<MessageLink> = {}): MessageLink {
   return {
     ordinal: 0,
-    targetKey: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    targetKey: "target-example-a",
     text: "https://Example.test/a",
     url: "https://example.test/a",
     hostname: "example.test",
@@ -90,7 +90,7 @@ describe("parseMessageLink", () => {
   it("tolerates a blocked entity with no text or url, which still carries its identity", () => {
     const blocked = parseMessageLink({
       ordinal: 1,
-      target_key: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      target_key: "target-example-a",
       safety: "malicious",
       click: "none",
       updated_at: "t",
