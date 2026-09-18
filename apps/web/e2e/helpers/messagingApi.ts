@@ -2801,6 +2801,16 @@ export async function fillComposer(page: Page, text: string) {
   await expect(input).toContainText(text);
 }
 
+/**
+ * Issue #875: a message the server acknowledged is not a draft. Asserts the
+ * composer holds nothing of it — neither the text nor the quote of the
+ * message it answered.
+ */
+export async function expectComposerConsumedTheSend(page: Page) {
+  await expect(page.getByTestId("chat-composer-input")).toHaveText("");
+  await expect(page.getByTestId("chat-composer-quote")).toHaveCount(0);
+}
+
 export async function replaceEditorText(page: Page, editor: Locator, text: string) {
   await expect(editor).toBeVisible();
   await editor.click();

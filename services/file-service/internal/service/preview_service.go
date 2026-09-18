@@ -451,7 +451,35 @@ func (s *PreviewService) finalizeExhausted(ctx context.Context, job PreviewJob, 
 // The content is opened exactly the way a download opens it — same key ring,
 // same binding, same verifying reader — so a tampered or truncated object fails
 // here too rather than being rendered into a preview of something else.
-func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, string, error) {
+//
+// # Why this function recovers
+//
+// Everything below this line parses a byte stream an uploader chose, through
+// third-party document libraries. A malformed file that makes one of them
+// panic rather than return an error would otherwise unwind through the preview
+// worker's goroutine, and an unrecovered panic in *any* goroutine takes the
+// whole process down — the worker is started as a bare `go func()` in app.go,
+// so neither the HTTP Recover middleware nor anything else is between it and
+// the runtime. That turns one hostile attachment into a file-service outage
+// for every tenant (GO-2026-6452 is exactly this shape: a panic on a negative
+// shared-string index in excelize, for which no fixed version exists).
+//
+// This is the narrowest boundary that fixes it. render's contract is already
+// "produce the pages, or return an error", and "the parser died on this file"
+// is that same answer: process below hands it to finishFailed like any other
+// render failure. Recovering higher — at the goroutine, or in process — would
+// also swallow defects in the storage and database paths, which are this
+// service's own code and must keep failing loudly.
+func (s *PreviewService) render(
+	ctx context.Context, job PreviewJob,
+) (pages [][]byte, contentType string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			pages, contentType = nil, ""
+			err = s.renderPanicked(ctx, job, recovered)
+		}
+	}()
+
 	content, err := openEncryptedObject(ctx, s.keys, s.objects, s.logger, encryptedObject{
 		objectID:        job.AttachmentID,
 		workspaceID:     job.WorkspaceID,
@@ -471,6 +499,33 @@ func (s *PreviewService) render(ctx context.Context, job PreviewJob) ([][]byte, 
 		return renderer.RenderDocument(ctx, job.DetectedMIME, job.OriginalFilename, content)
 	}
 	return s.renderer.Render(ctx, job.DetectedMIME, content)
+}
+
+// renderPanicked reports a recovered renderer panic and states it as the
+// permanent render failure the caller already knows how to finish.
+//
+// ErrRender specifically, never a bare error: previewFailureOutcome reads an
+// unclassified error as transient, which would leave the row pending and let
+// the same file be claimed again until its attempts ran out — the crash loop
+// this boundary exists to prevent, merely slowed down. A file whose bytes kill
+// the parser will do it again on every attempt, so the honest classification
+// is the permanent one.
+//
+// Only the panic's *type* is logged. The value can be anything the library
+// chose to put in it, and that library was handed attachment bytes; the type
+// ("runtime.boundsError" and friends) is what tells an operator whether they
+// are looking at a library defect or one of ours, and carries none of the
+// document. The stack is deliberately not captured either — see SECURITY.md on
+// what may reach logs.
+func (s *PreviewService) renderPanicked(ctx context.Context, job PreviewJob, recovered any) error {
+	s.logger.LogAttrs(ctx, slog.LevelError, "attachment preview renderer panicked",
+		slog.String("attachment_id", job.AttachmentID),
+		slog.String("format", previewFormat(job)),
+		slog.Int64("size_bytes", job.Size),
+		slog.Int("attempt", job.Attempts),
+		slog.String("panic_type", fmt.Sprintf("%T", recovered)),
+	)
+	return fmt.Errorf("%w: renderer panicked", preview.ErrRender)
 }
 
 // persistedPage is one encrypted-and-stored page, kept around only long
