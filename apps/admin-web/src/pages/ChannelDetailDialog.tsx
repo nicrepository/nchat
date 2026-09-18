@@ -29,8 +29,8 @@ type PendingRemoval = { member: ChannelMember };
  *
  * Adding requires an active channel: the shared eligibility rule in
  * libs/go/platform/channelmembership requires `c.status = 'active'`, so an
- * archived channel admits nobody. `#geral` *does* accept additions — guests are
- * not enrolled in it automatically, so adding one is a real operation.
+ * archived channel admits nobody. `#geral` accepts additions to repair missing
+ * membership; active workspace members, including guests, belong automatically.
  *
  * Both of these are UX. The API decides, and still would if these returned true
  * for everything.

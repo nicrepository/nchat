@@ -1340,8 +1340,8 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
   // The action is server-gated. `canManageMembers` is normalized to false unless
   // the server explicitly said true, so every state that is not "ready and
   // permitted" must leave the control absent.
-  it("offers the action when the server says the caller may manage members", () => {
-    renderPanel({ state: state({ details: readyChannel().details }) });
+  it.each(["Infra", "Geral", "Boas-vindas"])("offers server-authorized additions on %s", (name) => {
+    renderPanel({ state: state({ details: readyChannel({ name }).details }) });
 
     expect(screen.getByTestId("chat-details-add-members")).toBeEnabled();
     expect(screen.getByTestId("chat-details-add-members")).toHaveTextContent("Adicionar membros");
@@ -1364,10 +1364,10 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
     );
   });
 
-  it("hides the action when the caller may not manage members", () => {
+  it.each(["Infra", "Geral", "Boas-vindas"])("hides unauthorized additions on %s", (name) => {
     renderPanel({
       state: state({
-        details: { status: "ready", data: channelDetails({ canManageMembers: false }) },
+        details: { status: "ready", data: channelDetails({ name, canManageMembers: false }) },
       }),
     });
     expect(screen.queryByTestId("chat-details-add-members")).not.toBeInTheDocument();

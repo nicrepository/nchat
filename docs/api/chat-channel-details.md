@@ -218,7 +218,8 @@ permissao nao descobre pela resposta se um UUID de canal existe.
 O campo `can_manage_members` da resposta de `GET .../details` carrega a mesma
 decisao para o painel decidir se mostra a acao. E uma dica de renderizacao, nunca
 o controle: este endpoint reavalia a decisao a cada chamada. Ausente ou invalido
-e lido como `false` pelo cliente.
+e lido como `false` pelo cliente. Em `#geral`, o campo segue o mesmo gate
+owner/admin/moderator: `is_general` nao desabilita adicao/reparo (#882).
 
 ### Corpo
 
@@ -269,13 +270,25 @@ pessoa simultaneamente convergem em uma linha. Quem ja participava e contado em
 
 **Autorizacao reavaliada na transacao.** O ator autenticado e passado ate o
 store, que relê e bloqueia sua linha de `chat.workspace_members` exigindo
-`owner`/`admin` ativo **dentro da mesma transacao que insere**. A verificacao no
+`owner`/`admin`/`moderator` ativo **dentro da mesma transacao que insere**. A verificacao no
 service continua existindo apenas para recusar um chamador antes que a busca do
 canal revele se um ID existe; ela nao e o controle. Um papel rebaixado, uma
 membership suspensa ou removida entre as duas etapas resulta em `403`, sem
 persistir nenhuma membership e sem publicar evento.
 
-`#geral` e recusado: a participacao la e mantida pela sincronizacao de workspace.
+`#geral` aceita a mesma operacao (#882): membership existente retorna
+`already_members`, e uma linha elegivel ausente e reparada. RF-18 tambem
+materializa automaticamente owner/admin/moderator/member/guest ativos com conta
+ativa nao deletada. Suspended/left, outsider e papel invalido sao inelegiveis.
+Chat e Admin API compartilham `EligibleTargetsCTE`; a Admin API mantem seu gate
+separado `admin.channels.manage`. A transacao bloqueia canal antes das
+memberships e valida/bloqueia o estado dos alvos antes de escrever.
+
+A identidade especial e `channels.is_general`, nunca o nome "Geral". Renomear,
+arquivar, sair e remover continuam proibidos no canal estrutural; mute permanece
+uma preferencia pessoal. Guest continua sem acesso implicito a canais publicos
+comuns, e roster/count/candidates/painel/mentions/realtime nao sao redefinidos
+por #882.
 
 ### Resposta `200`
 

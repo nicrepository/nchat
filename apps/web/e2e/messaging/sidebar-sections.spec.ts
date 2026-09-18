@@ -694,10 +694,11 @@ test.describe("sidebar — silenciar notificações", () => {
     await expect.poll(() => scenario.requests.mutes.map((m) => m.targetType)).toEqual(["dm"]);
   });
 
-  test("não oferece silenciar no canal Geral", async ({ page }, testInfo) => {
+  test("canal estrutural renomeado nao oferece acoes proibidas", async ({ page }, testInfo) => {
     const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
     const channel = scenario.sidebarChannels[0];
     channel.is_general = true;
+    channel.display_name = "Boas-vindas";
     await page.reload();
 
     await rowMenu(page, `canal ${channel.display_name}`).click();
@@ -708,6 +709,19 @@ test.describe("sidebar — silenciar notificações", () => {
     // What the general channel does keep.
     await expect(page.getByRole("menuitem", { name: "Fixar no topo" })).toBeVisible();
     await expect(page.getByRole("menuitem", { name: "Detalhes do canal" })).toBeVisible();
+  });
+
+  test("canal comum chamado Geral conserva as acoes normais", async ({ page }, testInfo) => {
+    const { scenario } = await openChatWithAllThreeCategories(page, testInfo);
+    const channel = scenario.sidebarChannels[0];
+    channel.display_name = "Geral";
+    channel.is_general = false;
+    channel.can_rename = true;
+    await page.reload();
+
+    await rowMenu(page, "canal Geral").click();
+    await expect(page.getByRole("menuitem", { name: "Renomear canal" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: "Sair do canal" })).toBeVisible();
   });
 });
 

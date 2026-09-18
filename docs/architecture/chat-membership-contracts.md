@@ -1,24 +1,17 @@
 # Chat-service: contratos de membership (issue #881)
 
-Diagnostico das divergencias da issue #877 e definicao dos contratos semanticos
-autoritativos que as issues #882-#888 vao implementar.
+Diagnostico das divergencias da issue #877, iniciado em #881 e atualizado pela
+#882 para a politica estrutural de `#geral`.
 
-> **Esta pagina nao muda comportamento.** Ela nomeia as populacoes que o dominio
-> ja possui, prova onde o codigo atual as confunde, e atribui cada correcao a
-> sua issue filha. Nenhuma regra de autorizacao foi alterada pela #881; onde o
-> texto descreve a politica vigente, ele descreve o que o codigo faz hoje.
+**CURRENT** descreve o comportamento implementado. **TARGET** identifica trabalho
+ainda atribuido a #883-#889. A #882 consolida RF-18/RF-74: todo workspace member
+ativo elegivel, inclusive guest, recebe uma linha persistida no canal estrutural
+`channels.is_general=true`. Isso nao altera o alcance implicito de canais
+publicos comuns, nem decide as opcoes de roster da #883.
 
-**Como ler esta pagina.** Tudo aqui e **CURRENT** — o comportamento observado
-hoje — salvo onde o texto diz explicitamente **TARGET**, que e sempre uma
-decisao ainda nao tomada, sempre atribuida a uma issue filha e nunca
-implementada por esta issue. CURRENT nao significa correto: a secao 4 lista as
-divergencias comprovadas. As decisoes de TARGET ainda em aberto incluem
-as opcoes A/B de 1.4 (owner: #883) e a consolidacao RF-18 x RF-74 da secao 5
-(owner: #882); ambas ficam deliberadamente em aberto.
-
-Duas confusoes que esta pagina existe para desfazer, e que nao devem ser lidas
-de volta nela: **visibilidade/acesso nao e roster membership** (1.3 x 1.2), e
-**guest nao entra em `#geral` automaticamente** hoje (5, RF-74).
+**Visibilidade/acesso nao e roster membership** (1.3 x 1.2). Guest chega a
+`#geral` pela membership materializada, nao por uma ampliacao de
+`CanReachPublicChannels`.
 
 Documentos irmaos, que continuam sendo a autoridade sobre suas proprias rotas:
 [chat-channel-details.md](../api/chat-channel-details.md),
@@ -71,17 +64,17 @@ admin de workspace nao le um canal privado do qual nao participa.
 
 ### 1.4 Effective channel membership
 
-**TARGET (#883, com a politica especial de `#geral` em #882).**
+**TARGET (#883); politica estrutural de `#geral` ja consolidada na #882.**
 
 A populacao que as superficies de roster, contagem, mencao e elegibilidade
 **deveriam** descrever. Ela nao e "`chat.channel_members`" e nao e
 "`channel_visible_to_user`"; depende do tipo de canal:
 
-| Canal            | Effective channel membership                                                                   |
-| ---------------- | ---------------------------------------------------------------------------------------------- |
-| privado          | exatamente `chat.channel_members` (ativos no workspace, conta ativa)                           |
-| `#geral`         | todo workspace member ativo cujo papel esta em `generalMembershipRoles`, mais quem tiver linha |
-| publico (demais) | **indefinido hoje** — o codigo diz `chat.channel_members`, o acesso diz outra coisa            |
+| Canal            | Effective channel membership                                                                  |
+| ---------------- | --------------------------------------------------------------------------------------------- |
+| privado          | exatamente `chat.channel_members` (ativos no workspace, conta ativa)                          |
+| `#geral`         | owner/admin/moderator/member/guest ativos e com conta ativa nao deletada; rows materializadas |
+| publico (demais) | **indefinido hoje** — o codigo diz `chat.channel_members`, o acesso diz outra coisa           |
 
 A ultima linha e a causa raiz da #877 e a decisao de politica pertence a
 **#883**. As duas leituras possiveis sao:
@@ -167,7 +160,7 @@ Ordem das decisoes: `requireActiveWorkspaceMember` -> `GetVisibleChannelByID`
 (visibilidade, 404 uniforme) -> leitura de membros. Um chamador negado nunca
 alcanca roster nem snapshot de presenca.
 
-`CanManageMembers` = `!channel.IsGeneral && domain.CanManageChannelMembers(&member)`.
+`CanManageMembers` = `domain.CanManageChannelMembers(&member)`, inclusive em `#geral`.
 
 ### B. Group baseline — `GET /api/chat/dm/{conversationID}/details`
 
@@ -220,7 +213,7 @@ da lista nem perde vaga.
 | idempotencia       | PK `(channel_id, user_id)` + `ON CONFLICT DO NOTHING`; repeticao vira `already_members`                                                                                                       |
 | atomicidade        | `eligible != len(userIDs)` -> rollback total; nao existe sucesso parcial                                                                                                                      |
 | concorrencia       | `channelmembership.LockChannelSQL` (`FOR UPDATE` na linha do canal) como **primeira** sentenca                                                                                                |
-| `#geral`           | recusado no service com `ErrInvalidInput`                                                                                                                                                     |
+| `#geral`           | adicao idempotente e reparo de linha elegivel ausente (#882)                                                                                                                                  |
 | total retornado    | `member_count` lido **apos** o insert e **antes** do commit, dentro da mesma transacao                                                                                                        |
 | eventos pos-commit | `members.added` (assinantes) + `conversation.available` (so para `AddedUserIDs`) + `conversation.event` quando houve `EventMessageID`                                                         |
 
@@ -291,13 +284,13 @@ publico comum, privado e `#geral`. Nenhum tem `channel_members` no setup.
 
 ### 3.1 Acesso x membership persistida
 
-| Canal / momento                                 | Leitores na fixture                           | Linhas explicitas               |
-| ----------------------------------------------- | --------------------------------------------- | ------------------------------- |
-| Publico comum                                   | owner, admin, moderator, member; guest nao le | nenhuma                         |
-| Privado antes da adicao                         | nenhum papel                                  | nenhuma                         |
-| Privado apos `AddChannelMember` do caso privado | somente member                                | member                          |
-| `#geral` antes do sync                          | owner, admin, moderator, member; guest nao le | nenhuma                         |
-| `#geral` apos `SyncGeneralMemberships`          | owner, admin, moderator, member; guest nao le | owner, admin, moderator, member |
+| Canal / momento                                 | Leitores na fixture                           | Linhas explicitas                      |
+| ----------------------------------------------- | --------------------------------------------- | -------------------------------------- |
+| Publico comum                                   | owner, admin, moderator, member; guest nao le | nenhuma                                |
+| Privado antes da adicao                         | nenhum papel                                  | nenhuma                                |
+| Privado apos `AddChannelMember` do caso privado | somente member                                | member                                 |
+| `#geral` antes do sync                          | owner, admin, moderator, member; guest nao le | nenhuma                                |
+| `#geral` apos `SyncGeneralMemberships`          | owner, admin, moderator, member, guest        | owner, admin, moderator, member, guest |
 
 A fixture publica sem rows corresponde ao caminho de criacao:
 `ChannelService.CreateChannel` so define `EnsureCreatorMemberRole` para
@@ -311,24 +304,23 @@ A busca de candidates e feita pelo admin, que e excluido da propria lista.
 
 | Superficie                     | Publico comum sem rows                         | Privado apos adicao           | `#geral` apos sync                      | Owner do trabalho futuro                |
 | ------------------------------ | ---------------------------------------------- | ----------------------------- | --------------------------------------- | --------------------------------------- |
-| Acesso x membership persistida | quatro papeis leem implicitamente; nenhuma row | somente member le e tem row   | quatro papeis leem e tem row; guest nao | #883; especial de `#geral`: #882        |
-| `member_count`                 | 0                                              | 1                             | 4                                       | #883                                    |
-| `online_members`               | vazio mesmo fornecendo os leitores como online | member, fornecido como online | quatro membros fornecidos como online   | #886, consumindo roster de #883         |
-| `member-candidates`            | owner, moderator, member e guest               | owner, moderator e guest      | guest                                   | #885; adicao especial em `#geral`: #882 |
-| Mentions                       | vazio                                          | member                        | owner, admin, moderator e member        | #887                                    |
+| Acesso x membership persistida | quatro papeis leem implicitamente; nenhuma row | somente member le e tem row   | cinco papeis leem e tem row             | #883; especial de `#geral`: #882        |
+| `member_count`                 | 0                                              | 1                             | 5                                       | #883                                    |
+| `online_members`               | vazio mesmo fornecendo os leitores como online | member, fornecido como online | cinco membros fornecidos como online    | #886, consumindo roster de #883         |
+| `member-candidates`            | owner, moderator, member e guest               | owner, moderator e guest      | vazio                                   | #885; adicao especial em `#geral`: #882 |
+| Mentions                       | vazio                                          | member                        | owner, admin, moderator, member e guest | #887                                    |
 
 No publico, owner/moderator/member aparecem como candidates embora ja leiam
 implicitamente. **Guest aparece como candidato elegivel, mas nao le**: nao tem
 membership explicita. Admin le, mas nao aparece na sua propria busca.
-No privado, o membro atual e excluido dos candidates. Em `#geral`, a consulta
-oferece guest apos sync, mas `MemberService.AddChannelMembers` rejeita
-`is_general`; a diferenca com o caminho administrativo esta na secao 5.
+No privado, o membro atual e excluido dos candidates. Em `#geral`, os cinco
+papeis materializados apos sync sao excluidos; adicao/reparo segue a secao 5.
 
 ### 3.3 Limites da evidencia
 
 O teste publico nao adiciona guest: nao ha nesta suite um resultado observado
 de seis leitores ou uma segunda fixture com dois members. O caso de
-`#geral` comprova quatro inserts no primeiro sync e zero no segundo.
+`#geral` comprova cinco inserts no primeiro sync e zero no segundo.
 Antes do sync ha leitores implicitos sem rows; a concordancia de acesso,
 contagem e mentions e observada **apos o sync**, nos estados dessa fixture.
 
@@ -387,59 +379,43 @@ sem transformar `online_members` em roster.
 
 ---
 
-## 5. `#geral`: RF-18 x RF-74
+## 5. `#geral`: RF-18 x RF-74 — CURRENT (#882)
 
-| Aspecto                        | Estado                                                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| identidade estrutural          | `chat.channels.is_general`, nunca o nome. Migration 000002: `CHECK (NOT is_general OR (type = 'public' AND status = 'active'))` |
-| entrada automatica (1 usuario) | `PGXMemberStore.EnsureGeneralMembership` -> `ensureGeneralMembership` -> `addGeneralChannelMember`                              |
-| backfill / reparo              | `PGXMemberStore.SyncGeneralMemberships` (so insere, **nunca remove**)                                                           |
-| papeis admitidos               | `generalMembershipRoles = ('owner','admin','moderator','member')`                                                               |
-| guest                          | **excluido** do auto-join, por `generalMembershipRoles`                                                                         |
-| join explicito                 | `SelfJoinChannel` exige `CanReachPublicChannels`, excluindo guest; nao tem rota (R2)                                            |
-| reativacao                     | `ActivateWorkspaceMember` e `AddWorkspaceMember` chamam `ensureGeneralMembership` na mesma transacao                            |
-| leave                          | recusado: `domain.CanLeaveChannel` = `!IsGeneral`; `RemoveChannelMember` retorna `ErrCannotLeaveGeneralChannel`                 |
-| add-members                    | chat-service recusa `channel.IsGeneral`; admin-service admite alvos elegiveis (ver abaixo)                                      |
-| rename / mute                  | recusados pelo mesmo predicado estrutural (`ErrGeneralChannelImmutable`)                                                        |
+- **Identidade:** `chat.channels.is_general`, nunca nome/slug. Um canal comum
+  chamado "Geral" permanece comum. O CHECK existente exige canal publico ativo;
+  nao ha migration nem mudanca de schema.
+- **Entrada automatica:** `EnsureGeneralMembership`, join/reativacao e
+  `SyncGeneralMemberships` materializam owner/admin/moderator/member/guest com
+  workspace membership ativa e conta ativa nao deletada. Suspended/left,
+  outsider e papel invalido sao excluidos. Reparo so insere linhas faltantes;
+  nao remove linhas existentes nem altera mute.
+- **Acesso:** `CanReachPublicChannels` e `channel_visible_to_user` continuam
+  inalterados. Guest precisa da linha persistida, inclusive em `#geral`, e nao
+  ganha alcance implicito a canais publicos comuns. Privados continuam exigindo
+  membership explicita para todos.
+- **Add-members:** chat-service aceita `#geral` com o gate CURRENT
+  owner/admin/moderator; a Admin API mantem `admin.channels.manage`. Ambos usam
+  `channelmembership.EligibleTargetsCTE`, que usa o mesmo predicado-base de
+  workspace membership/conta que a materializacao automatica. Alvo ja membro retorna
+  `already_members`; alvo elegivel sem linha e reparado. Conta inativa/deletada,
+  membership suspensa/left, outsider e papel invalido sao recusados mesmo se
+  houver linha antiga. Nao existe sucesso parcial nem erro que identifique alvo.
+- **Concorrencia:** auto-sync usa `FOR SHARE` no canal antes de mudar workspace
+  membership; add-members usa `FOR UPDATE` no canal para serializar o count.
+  Ambos bloqueiam o canal antes dos alvos. O `ORDER BY` do sync so estabiliza
+  a ordem dos inserts entre syncs concorrentes; nao substitui a ordem de locks
+  canal-antes-de-alvo. O estado dos alvos e revalidado na transacao.
+- **Detalhes:** `CanManageMembers` usa a politica atual tambem em `#geral`;
+  a flag nao autoriza remocao e nao amplia atores para member/guest.
+- **Protecoes:** rename/archive/leave/remove continuam proibidos por identidade
+  estrutural. `SelfJoinChannel` continua usando `CanReachPublicChannels` e nao
+  possui rota; a inclusao automatica do guest nao depende dele.
 
-**A divergencia de requisito, registrada e nao decidida aqui:**
-
-- **RF-18** diz que **todos os usuarios** entram automaticamente em `#geral`.
-- **RF-74** define guest como "alcanca exatamente os canais aos quais foi
-  adicionado", e o codigo materializa isso excluindo guest de
-  `generalMembershipRoles`. O comentario de `ensureGeneralMembership` registra o
-  motivo: `#geral` e onde o trafego do workspace vive, e auto-join de guest la
-  devolveria o escopo workspace-wide que RF-74 remove.
-
-Distincao CURRENT entre row, predicado e fluxo suportado:
-
-1. **Row existente / predicado:** o sync nao remove rows legadas ou
-   administrativas. Uma membership explicita de guest em `#geral` satisfaz a
-   parte de membership de `channel_visible_to_user`, com workspace membership
-   ativa; os caminhos de acesso tambem exigem workspace e canal ativos. Ter
-   uma row nao significa que ela foi criada pelo auto-sync atual.
-2. **Fluxo do chat:** `ensureGeneralMembership` e `SyncGeneralMemberships`
-   excluem guest. `MemberService.AddChannelMembers` recusa `channel.IsGeneral`
-   antes de chamar o store. `SelfJoinChannel` tambem exclui guest por
-   `CanReachPublicChannels` e nao possui rota. O store
-   `PGXMemberStore.AddChannelMembers` nao repete a restricao de `is_general`;
-   invoca-lo diretamente nao equivale a uma API suportada do chat.
-3. **Fluxo administrativo existente:** a rota POST `RouteAdminChannelMembers`
-   exige `admin.channels.manage` e chama `ChannelAdminService.AddMembers` ->
-   `PGXChannelDirectoryStore.AddChannelMembers`. Esse store le `is_general`,
-   mas nao o usa para recusar a adicao (a remocao o recusa). A escrita usa
-   `channelmembership.EligibleTargetsCTE`, que admite guest ativo/elegivel e
-   nao exclui `is_general`. Portanto ha um caminho de API administrativo capaz
-   de criar essa row; nao e correto dizer que nenhuma rota do produto permite.
-   Esta conclusao vem do rastreamento do codigo, nao de um teste novo da Admin
-   API nesta suite. O comentario de `ensureGeneralMembership` que atribui essa
-   adicao a `CanManageChannelMembers` mistura os dois fluxos: o caminho do
-   chat com esse predicado a recusa. Consolidacao futura: #882.
-4. `domain.CanReachPublicChannels` (Go) e `generalMembershipRoles` (SQL) e a
-   lista de papeis dentro de `chat.channel_visible_to_user` (SQL, migration 000022) sao tres copias da mesma lista. A #881 adiciona um teste que falha
-   quando divergirem.
-
-**Owner da consolidacao: #882.** A #881 nao decide entre RF-18 e RF-74.
+O CHECK `workspace_members_role_check` fecha os cinco roles validos; nao ha uma
+segunda allowlist de todos eles no sync ou no add-members. A paridade entre o
+predicado Go e a funcao SQL de visibilidade continua obrigatoria. Roster/count (#883), atores
+(#884), candidates (#885), painel (#886), mentions (#887), realtime (#888) e E2E
+amplo (#889) continuam fora desta consolidacao.
 
 ---
 
@@ -451,29 +427,29 @@ Distincao CURRENT entre row, predicado e fluxo suportado:
 | Canal privado                        | Exige `chat.channel_members` para todo papel; `GetVisibleChannelByID` colapsa inexistente/arquivado/privado/outro tenant no mesmo `404`                                                                                                                           | nenhum         |
 | Enumeracao via `member-candidates`   | A rota revela quem **nao** esta num canal — fato sobre a composicao de canal privado. Por isso a autorizacao e verificada **antes** da busca do canal, e o `query` tem minimo de 2 chars e limite clampado no servidor                                            | nenhum         |
 | Enumeracao via erros de add-members  | `403` unico para "chamador sem permissao" e "alvo inelegivel"; nunca nomeia o alvo nem seu estado                                                                                                                                                                 | nenhum         |
-| Guest / `#geral`                     | Guest sem acesso implicito e fora do auto-sync; row explicita pode conceder alcance. Secao 5 distingue chat-service (recusa adicao) e Admin API (admite alvos elegiveis)                                                                                          | documentado    |
+| Guest / `#geral`                     | Guest sem acesso implicito; RF-18 materializa sua linha em `#geral`. Chat e Admin API admitem adicao/reparo com gates distintos (secao 5)                                                                                                                         | documentado    |
 | Acesso x membership                  | A divergencia e de **exibicao e elegibilidade**, nao de autorizacao: ninguem le um canal que `channel_visible_to_user` nega. O risco inverso e real — um `member_count` de 0 num canal com leitores implicitos pode levar um operador a tratar o canal como vazio | documentado    |
 | Realtime para assinantes autorizados | `members.added` reautoriza por assinante no fan-out; envelopes do barramento sao canonicalizados e nunca republicados; `source_instance_id` descarta eco. O payload nao nomeia ninguem                                                                            | nenhum         |
 | Logs / instrumentacao                | A #881 nao adiciona instrumentacao. Nenhum token, header, corpo de mensagem, e-mail, payload de busca ou lista de candidatos foi adicionado a log algum                                                                                                           | nenhum         |
 
-**Nenhuma regra de autorizacao foi ampliada ou restringida por esta issue.**
-As correcoes de documentacao abaixo alinham o texto ao codigo ja em producao
-(RF-74), nao antecipam as decisoes futuras das #882–#889.
+A #881 foi diagnostica. A #882 inclui guest no auto-sync estrutural e permite
+adicao/reparo em `#geral`, mantendo os gates de atores e a politica de acesso
+a canais comuns. As decisoes das #883–#889 continuam pendentes.
 
 ---
 
 ## 7. Pendencias atribuidas
 
-| Issue | Owner / trabalho TARGET                                                                                                                                             |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| #882  | Politica final de `#geral`, identidade estrutural, membership/add-members especial e rename/delete/archive especiais; consolidar RF-18/RF-74 e os fluxos da secao 5 |
-| #883  | Effective membership, roster autoritativo, `memberCount` consistente e separacao roster x `online_members` (R1, R2, R6)                                             |
-| #884  | Capability `CanAddChannelMembers`/equivalente, autorizacao de POST /members independente de remove/rename/delete, concorrencia e idempotencia do add                |
-| #885  | Backend `member-candidates`, exclusao de membros efetivos, picker/AddMembersDialog, busca/selecao/acessibilidade (R4)                                               |
-| #886  | Painel com roster/count reais, presence existente como enriquecimento e acao Add Members baseada em canAddMembers (R5)                                              |
-| #887  | SearchChannelMembers, autocomplete e mentions com membership autoritativa; rendering/identidade quando aplicavel (R3)                                               |
-| #888  | members.added, refetch/invalidation, convergencia roster/count/candidates/mentions, multi-client/reconnect sem reload                                               |
-| #889  | Integracao, Playwright, fluxo completo, BOLA/IDOR final, regressao de grupos e gate final da #877                                                                   |
+| Issue | Owner / trabalho TARGET                                                                                                                              |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #882  | **CURRENT, implementado:** politica estrutural, RF-18/RF-74 e adicao/reparo da secao 5                                                               |
+| #883  | Effective membership, roster autoritativo, `memberCount` consistente e separacao roster x `online_members` (R1, R2, R6)                              |
+| #884  | Capability `CanAddChannelMembers`/equivalente, autorizacao de POST /members independente de remove/rename/delete, concorrencia e idempotencia do add |
+| #885  | Backend `member-candidates`, exclusao de membros efetivos, picker/AddMembersDialog, busca/selecao/acessibilidade (R4)                                |
+| #886  | Painel com roster/count reais, presence existente como enriquecimento e acao Add Members baseada em canAddMembers (R5)                               |
+| #887  | SearchChannelMembers, autocomplete e mentions com membership autoritativa; rendering/identidade quando aplicavel (R3)                                |
+| #888  | members.added, refetch/invalidation, convergencia roster/count/candidates/mentions, multi-client/reconnect sem reload                                |
+| #889  | Integracao, Playwright, fluxo completo, BOLA/IDOR final, regressao de grupos e gate final da #877                                                    |
 
 ---
 
@@ -497,13 +473,12 @@ editar nenhuma das duas, e so a funcao instalada conhece a politica ativa.
 | `..._InstalledVisibilityMatchesTheDomainPredicate`          | **Invariante.** Sem rows, publico e `#geral` seguem `CanReachPublicChannels`; privado nega todos os papeis, independentemente dessa allowlist                                                |
 | `..._PublicChannelVisibilityDivergesFromExplicitMembership` | **CURRENT.** Leitores implicitos sem linha; `TotalCount = 0`; mencao vazia; candidates incluem os leitores exceto o chamador, e guest que nao le. Membership: **#883**; candidates: **#885** |
 | `..._PrivateChannelVisibilityMatchesExplicitMembership`     | **Baseline.** As quatro superficies ja concordam; nada aqui deve se mover                                                                                                                    |
-| `..._GeneralChannelMaterializesMembershipForNonGuestRoles`  | **CURRENT.** `SyncGeneralMemberships` materializa os papeis cobertos, e nenhum guest; guest nao tem linha **e** nao le. Owner do TARGET: **#882**                                            |
+| `..._GeneralChannelMaterializesMembershipForAllRoles`       | **CURRENT (#882).** `SyncGeneralMemberships` materializa os cinco papeis elegiveis, incluindo guest; retry nao insere duplicatas                                                             |
 
 Os nomes e comentarios dizem explicitamente que registram o estado atual
 diagnosticado pela #881, e nenhum chama o comportamento divergente de
-"desired"/"correct". Uma falha nesses testes depois que #882/#883 decidirem a
-politica e o efeito pretendido — a issue que mudar o contrato atualiza a
-caracterizacao junto.
+"desired"/"correct". A #882 atualiza a caracterizacao de `#geral`;
+a #883 devera atualizar a caracterizacao publica junto com sua decisao.
 
 Ja protegidas antes desta issue e deliberadamente nao duplicadas: a baseline de
 grupo (`group_details_service_test.go`, `group_details_handler_test.go` —

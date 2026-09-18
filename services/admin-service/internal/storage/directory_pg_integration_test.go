@@ -513,6 +513,83 @@ func TestPostgreSQL_AddChannelMembersAdmitsAGuest(t *testing.T) {
 	}
 }
 
+func TestPostgreSQL_GeneralChannelMembershipAndProtectionUseStructuralFlag(t *testing.T) {
+	pool := connectAdminTestDB(t)
+	fixture := seedDirectory(t, pool)
+	store := storage.NewPGXChannelDirectoryStore(pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE chat.channels SET display_name = CASE
+		WHEN is_general THEN 'Announcements' ELSE 'Geral' END
+		WHERE workspace_id = $1::uuid`, fixture.workspaceID); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		change, err := store.AddChannelMembers(ctx, fixture.generalID, []string{fixture.guest})
+		if err != nil || change.Added != 1-attempt || change.AlreadyMembers != attempt {
+			t.Fatalf("general guest add attempt %d: %+v, %v", attempt, change, err)
+		}
+	}
+	if _, err := store.UpdateChannelStatus(ctx, fixture.generalID, domain.ChannelStatusArchived); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("structural general archive: %v", err)
+	}
+	if _, err := store.RemoveChannelMember(ctx, fixture.generalID, fixture.guest); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("structural general removal: %v", err)
+	}
+	if ids := channelMemberIDs(t, pool, fixture.generalID); len(ids) != 1 || ids[0] != fixture.guest {
+		t.Fatalf("structural general membership changed: %v", ids)
+	}
+	channel, err := store.GetChannel(ctx, fixture.generalID)
+	if err != nil || channel.Status != domain.ChannelStatusActive {
+		t.Fatalf("structural general status changed: %+v, %v", channel, err)
+	}
+
+	archived, err := store.UpdateChannelStatus(ctx, fixture.channelID, domain.ChannelStatusArchived)
+	if err != nil || archived.Status != domain.ChannelStatusArchived {
+		t.Fatalf("ordinary channel named Geral archive: %+v, %v", archived, err)
+	}
+	removed, err := store.RemoveChannelMember(ctx, fixture.channelID, fixture.moderator)
+	if err != nil || !removed.Removed || removed.MemberCount != 0 {
+		t.Fatalf("ordinary channel named Geral removal: %+v, %v", removed, err)
+	}
+}
+
+func TestPostgreSQL_GeneralChannelAddRejectsInvalidBatch(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		query string
+	}{
+		{"missing workspace membership", `DELETE FROM chat.workspace_members WHERE user_id = $1::uuid`},
+		{"left workspace", `UPDATE chat.workspace_members SET status = 'left' WHERE user_id = $1::uuid`},
+		{"suspended account", `UPDATE auth.users SET status = 'suspended' WHERE id = $1::uuid`},
+		{"deleted account", `UPDATE auth.users SET deleted_at = now() WHERE id = $1::uuid`},
+		{"cross workspace", `UPDATE chat.workspace_members SET workspace_id = $2::uuid WHERE user_id = $1::uuid`},
+		{"missing account", `DELETE FROM auth.users WHERE id = $1::uuid`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool := connectAdminTestDB(t)
+			fixture := seedDirectory(t, pool)
+			ctx := context.Background()
+			args := []any{fixture.guest}
+			if test.name == "cross workspace" {
+				otherWorkspace, _ := insertWorkspace(t, pool, "other", "Other")
+				args = append(args, otherWorkspace)
+			}
+			if _, err := pool.Exec(ctx, test.query, args...); err != nil {
+				t.Fatal(err)
+			}
+			_, err := storage.NewPGXChannelDirectoryStore(pool).AddChannelMembers(ctx, fixture.generalID,
+				[]string{fixture.owner, fixture.guest})
+			if !errors.Is(err, domain.ErrConflict) {
+				t.Fatalf("invalid batch: %v", err)
+			}
+			if ids := channelMemberIDs(t, pool, fixture.generalID); len(ids) != 0 {
+				t.Fatalf("invalid batch partially added members: %v", ids)
+			}
+		})
+	}
+}
+
 // Somebody who is not a member of the channel's workspace cannot be admitted,
 // and the refusal takes the whole request with it.
 func TestPostgreSQL_AddChannelMembersRefusesAnOutsider(t *testing.T) {

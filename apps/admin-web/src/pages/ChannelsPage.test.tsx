@@ -147,11 +147,19 @@ describe("ChannelsPage", () => {
 
   // #geral is immutable in chat-service; the console does not offer a button
   // the API would refuse.
-  it("does not offer to archive the workspace's general channel", async () => {
-    stubPage([channel({ is_general: true, slug: "geral", display_name: "Geral" })], []);
+  it("offers archiving for an ordinary channel named Geral", async () => {
+    stubPage([channel({ is_general: false, slug: "geral", display_name: "Geral" })], []);
     renderWithSession(<ChannelsPage />, MANAGE);
 
     await screen.findByRole("rowheader", { name: /Geral/ });
+    expect(screen.getByRole("button", { name: "Arquivar" })).toBeInTheDocument();
+  });
+
+  it.each(["Geral", "Boas-vindas"])("does not archive structural %s", async (name) => {
+    stubPage([channel({ is_general: true, slug: "geral", display_name: name })], []);
+    renderWithSession(<ChannelsPage />, MANAGE);
+
+    await screen.findByRole("rowheader", { name: new RegExp(name) });
     expect(screen.queryByRole("button", { name: "Arquivar" })).not.toBeInTheDocument();
     expect(screen.getByText("canal geral")).toBeInTheDocument();
   });
@@ -1022,11 +1030,10 @@ describe("ChannelDetailDialog membership", () => {
     expect(await screen.findByTestId("admin-membership-feedback")).toHaveTextContent("removido");
   });
 
-  // #geral is the mirror image: the backend accepts additions (a guest is not
-  // enrolled automatically) and refuses removals with 403.
-  it("offers only the addition on the general channel", async () => {
+  // #geral accepts membership repair, including guests, but refuses removals.
+  it.each(["Geral", "Boas-vindas"])("offers only repair on structural %s", async (name) => {
     stubDetail({
-      detail: detailResponse({ is_general: true, slug: "geral", display_name: "Geral" }),
+      detail: detailResponse({ is_general: true, slug: "geral", display_name: name }),
     });
     renderWithSession(<ChannelsPage />, MANAGE);
     await screen.findByRole("rowheader", { name: /Engenharia/ });

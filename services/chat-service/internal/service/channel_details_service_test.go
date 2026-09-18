@@ -38,6 +38,33 @@ func detailsInput(onlineUserIDs []string, limit int) service.ChannelDetailsInput
 	}
 }
 
+func TestChannelDetailsGeneralMemberCapabilityUsesCurrentActorPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		role domain.WorkspaceRole
+		want bool
+	}{
+		{domain.WorkspaceRoleAdmin, true},
+		{domain.WorkspaceRoleModerator, true},
+		{domain.WorkspaceRoleMember, false},
+		{domain.WorkspaceRoleGuest, false},
+	} {
+		t.Run(string(tc.role), func(t *testing.T) {
+			members := detailsMemberStore()
+			m := members.workspaceMembers[wmKey("ws-1", "user-1")]
+			m.Role = tc.role
+			members.workspaceMembers[wmKey("ws-1", "user-1")] = m
+			channels := detailsChannelStore()
+			channels.visibleChannel.IsGeneral = true
+			channels.visibleChannel.DisplayName = "Comunicados"
+			got, err := service.NewChannelService(activeWorkspaceStore("ws-1"), channels, members).
+				GetChannelDetails(context.Background(), detailsInput(nil, 1))
+			if err != nil || got.CanManageMembers != tc.want {
+				t.Fatalf("details capability = %t, %v; want %t", got.CanManageMembers, err, tc.want)
+			}
+		})
+	}
+}
+
 // rosterOf builds a channel roster of size n whose display names sort in the
 // order they are generated, so "the first N alphabetically" is unambiguous.
 func rosterOf(n int) []domain.ChannelMemberProfile {

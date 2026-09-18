@@ -93,35 +93,40 @@ executam.
 
 ## Canais
 
-| Acao                              | Admin de Workspace       | Moderador          | Usuario            | Guest                 | Condicao                                                                                                                                                                          |
-| --------------------------------- | ------------------------ | ------------------ | ------------------ | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Listar canais                     | sim                      | sim                | sim                | **so os que integra** | `chat.channel_visible_to_user`                                                                                                                                                    |
-| Ler canal publico                 | sim                      | sim                | sim                | **so se incluido**    | idem                                                                                                                                                                              |
-| Ler canal privado                 | **so se incluido**       | **so se incluido** | **so se incluido** | **so se incluido**    | membership de canal, para todos os papeis; o Admin Master **lista** canais privados com `admin.channels.read` mas nao le nenhum                                                   |
-| Acesso direto por ID/slug         | mesma regra da listagem  | idem               | idem               | idem                  | `ErrNotFound` nao-enumerante                                                                                                                                                      |
-| Receber eventos por WebSocket     | mesma regra              | idem               | idem               | idem                  | `serviceAuthorizer` usa a mesma consulta                                                                                                                                          |
-| Publicar mensagem                 | segue leitura            | segue leitura      | segue leitura      | segue leitura         | `CanWriteChannel` = `CanReadChannel`                                                                                                                                              |
-| Encaminhar mensagem               | segue leitura no destino | idem               | idem               | idem                  | avaliado no proprio `INSERT`                                                                                                                                                      |
-| Reagir / favoritar                | segue leitura            | idem               | idem               | idem                  | mesma politica                                                                                                                                                                    |
-| **Pin/unpin (RF-05)**             | segue leitura            | segue leitura      | segue leitura      | **segue leitura**     | sem RBAC adicional; Guest incluido no canal pode fixar                                                                                                                            |
-| Criar canal                       | sim                      | sim                | sim                | **nao**               | `CanCreateChannel`; re-derivado no `INSERT`                                                                                                                                       |
-| Editar / arquivar canal           | sim                      | **nao**            | nao                | nao                   | `CanManageWorkspace`; `#geral` e imutavel. O Admin Master arquiva/desarquiva com `admin.channels.manage`, e `#geral` continua recusado                                            |
-| Entrar sozinho em canal publico   | sim                      | sim                | sim                | **nao**               | `CanReachPublicChannels`                                                                                                                                                          |
-| Adicionar membros a um canal      | sim                      | **sim**            | nao                | nao                   | `CanManageChannelMembers`; re-derivado na transacao; chat-service recusa `#geral`. Admin API com `admin.channels.manage` admite alvos elegiveis inclusive em `#geral`; ver abaixo |
-| Remover membro de um canal        | sim                      | **sim**            | nao                | nao                   | mesmo predicado da adicao; idem para o Admin Master, e `#geral` continua recusado                                                                                                 |
-| Buscar candidatos a membro        | sim                      | **sim**            | nao                | nao                   | mesmo predicado da escrita                                                                                                                                                        |
-| Sair de um canal                  | sim                      | sim                | sim                | sim                   | proprio; `#geral` recusado                                                                                                                                                        |
-| Membership automatica em `#geral` | sim                      | sim                | sim                | **nao**               | Guest excluido do sync; row explicita e fluxos de adicao descritos abaixo                                                                                                         |
+| Acao                              | Admin de Workspace       | Moderador          | Usuario            | Guest                 | Condicao                                                                                                                                                     |
+| --------------------------------- | ------------------------ | ------------------ | ------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Listar canais                     | sim                      | sim                | sim                | **so os que integra** | `chat.channel_visible_to_user`                                                                                                                               |
+| Ler canal publico                 | sim                      | sim                | sim                | **so se incluido**    | idem                                                                                                                                                         |
+| Ler canal privado                 | **so se incluido**       | **so se incluido** | **so se incluido** | **so se incluido**    | membership de canal, para todos os papeis; o Admin Master **lista** canais privados com `admin.channels.read` mas nao le nenhum                              |
+| Acesso direto por ID/slug         | mesma regra da listagem  | idem               | idem               | idem                  | `ErrNotFound` nao-enumerante                                                                                                                                 |
+| Receber eventos por WebSocket     | mesma regra              | idem               | idem               | idem                  | `serviceAuthorizer` usa a mesma consulta                                                                                                                     |
+| Publicar mensagem                 | segue leitura            | segue leitura      | segue leitura      | segue leitura         | `CanWriteChannel` = `CanReadChannel`                                                                                                                         |
+| Encaminhar mensagem               | segue leitura no destino | idem               | idem               | idem                  | avaliado no proprio `INSERT`                                                                                                                                 |
+| Reagir / favoritar                | segue leitura            | idem               | idem               | idem                  | mesma politica                                                                                                                                               |
+| **Pin/unpin (RF-05)**             | segue leitura            | segue leitura      | segue leitura      | **segue leitura**     | sem RBAC adicional; Guest incluido no canal pode fixar                                                                                                       |
+| Criar canal                       | sim                      | sim                | sim                | **nao**               | `CanCreateChannel`; re-derivado no `INSERT`                                                                                                                  |
+| Editar / arquivar canal           | sim                      | **nao**            | nao                | nao                   | `CanManageWorkspace`; `#geral` e imutavel. O Admin Master arquiva/desarquiva com `admin.channels.manage`, e `#geral` continua recusado                       |
+| Entrar sozinho em canal publico   | sim                      | sim                | sim                | **nao**               | `CanReachPublicChannels`                                                                                                                                     |
+| Adicionar membros a um canal      | sim                      | **sim**            | nao                | nao                   | `CanManageChannelMembers`; re-derivado na transacao; chat e Admin API admitem adicao idempotente/reparo em `#geral`; Admin API exige `admin.channels.manage` |
+| Remover membro de um canal        | sim                      | **sim**            | nao                | nao                   | mesmo predicado da adicao; idem para o Admin Master, e `#geral` continua recusado                                                                            |
+| Buscar candidatos a membro        | sim                      | **sim**            | nao                | nao                   | mesmo predicado da escrita                                                                                                                                   |
+| Sair de um canal                  | sim                      | sim                | sim                | sim                   | proprio; `#geral` recusado                                                                                                                                   |
+| Membership automatica em `#geral` | sim                      | sim                | sim                | **sim**               | RF-18: membership ativa e conta ativa nao deletada; ver abaixo                                                                                               |
 
-**CURRENT: guest e `#geral`.** Uma row explicita em `channel_members`, legada
-ou administrativa, pode satisfazer o predicate de visibilidade; as demais
-condicoes de acesso continuam obrigatorias. `ensureGeneralMembership` e
-`SyncGeneralMemberships` excluem guest do auto-sync e nao removem rows existentes.
-`MemberService.AddChannelMembers` recusa `is_general` no chat-service. A API do
-admin-service e um fluxo distinto: `ChannelAdminService.AddMembers` chama
-`PGXChannelDirectoryStore.AddChannelMembers`, que nao recusa `is_general` e usa
-`EligibleTargetsCTE`, permitindo guest elegivel sob `admin.channels.manage`.
-A consolidacao dessa diferenca pertence a #882; esta tabela nao define TARGET.
+**CURRENT (#882): guest e `#geral`.** RF-18 materializa `channel_members`
+para owner/admin/moderator/member/guest ativos no workspace e com conta ativa
+nao deletada. Suspended, left, outsider e papel invalido sao excluidos.
+`ensureGeneralMembership` e `SyncGeneralMemberships` reparam linhas faltantes
+sem remover rows existentes ou alterar mute. O canal e identificado por
+`channels.is_general`, nunca pelo nome.
+
+Chat-service e Admin API usam `EligibleTargetsCTE`: uma linha existente resulta
+em `already_members`; uma linha elegivel ausente e reparada. Os gates de ator
+continuam distintos: owner/admin/moderator no chat; `admin.channels.manage` no
+console. `can_manage_members` reflete o gate atual tambem em `#geral`.
+Renomear, arquivar, sair e remover continuam proibidos no canal estrutural.
+Guest continua sem acesso implicito a canais publicos comuns; o predicado de
+visibilidade exige sua linha persistida, inclusive em `#geral`.
 
 ## DMs
 

@@ -2,12 +2,16 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
@@ -40,8 +44,8 @@ import (
 // replaced it, so a future migration can replace it again without editing
 // either file, and only the installed function knows the active policy.
 
-// Fixture identifiers for the membership-contract suite. A distinct prefix from
-// every sibling fixture, so a leftover row can never satisfy an assertion here.
+// Stable fixture identifiers; membershipContractPostgres removes these users
+// after dropping the chat schema.
 const (
 	mcWorkspace = "d1000000-0000-4000-8000-000000000001"
 
@@ -54,6 +58,8 @@ const (
 	mcModerator = "d1000000-0000-4000-8000-00000000000c"
 	mcMember    = "d1000000-0000-4000-8000-00000000000d"
 	mcGuest     = "d1000000-0000-4000-8000-00000000000e"
+	mcNewGuest  = "d1000000-0000-4000-8000-0000000000af"
+	mcInactive  = "d1000000-0000-4000-8000-0000000000bf"
 )
 
 // mcSearchPrefix is shared by every display name below, so one prefix search
@@ -113,7 +119,20 @@ func membershipContractPostgres(t *testing.T) (*pgxpool.Pool, context.Context) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
 		t.Fatalf("reset chat schema: %v", err)
 	}
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS chat CASCADE`) })
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		if _, err := pool.Exec(cleanupCtx, `DROP SCHEMA IF EXISTS chat CASCADE`); err != nil {
+			t.Errorf("cleanup chat schema: %v", err)
+			return
+		}
+		userIDs := []string{mcNewGuest, mcInactive}
+		for _, user := range mcRoles {
+			userIDs = append(userIDs, user.userID)
+		}
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM auth.users WHERE id = ANY($1::uuid[])`, userIDs); err != nil {
+			t.Errorf("cleanup membership-contract users: %v", err)
+		}
+	})
 	if _, err := pool.Exec(ctx, `
 		CREATE SCHEMA IF NOT EXISTS auth;
 		CREATE TABLE IF NOT EXISTS auth.users (
@@ -293,9 +312,8 @@ func assertSameIDs(t *testing.T, what string, got, want []string) {
 // after every migration has run, so what is compared is what is installed.
 //
 // It is not a characterization of a divergence — the two agree today and must
-// keep agreeing. Issue #882 owns the guest policy for #geral; whatever it
-// decides, this test is what makes it move both statements together instead of
-// one of them.
+// keep agreeing for implicit public-channel reach. #882 gives guests a
+// materialized #geral row; it does not widen this predicate for public channels.
 func TestChannelMembershipContractPostgreSQL_InstalledVisibilityMatchesTheDomainPredicate(t *testing.T) {
 	pool, ctx := membershipContractPostgres(t)
 
@@ -484,23 +502,13 @@ func TestChannelMembershipContractPostgreSQL_PrivateChannelVisibilityMatchesExpl
 	})
 }
 
-// Baseline for #geral, and a characterization of the RF-74 guest boundary.
-//
-// #geral is the one public channel whose membership is materialized, by
-// SyncGeneralMemberships, so its four surfaces agree the way a private
-// channel's do — for the roles the sync covers. A guest is not one of them, and
-// a guest also does not reach a public channel implicitly, so the two exclusions
-// line up and #geral stays internally consistent.
-//
-// This records the policy as it is. Issue #882 owns consolidating RF-18's
-// "every user joins #geral automatically" against RF-74's guest exclusion, and
-// is expected to update this case. Nothing here decides that, auto-adds a
-// guest, or touches CanReachPublicChannels or generalMembershipRoles.
-func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershipForNonGuestRoles(t *testing.T) {
+// RF-18 (#882): every eligible active role receives a materialized row.
+// RF-74 still denies guest implicit access to ordinary public channels.
+func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershipForAllRoles(t *testing.T) {
 	pool, ctx := membershipContractPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
 
-	synced := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
+	synced := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember, mcGuest)
 
 	t.Run("before the sync nobody holds a row, yet the eligible roles already read it", func(t *testing.T) {
 		for _, user := range mcRoles {
@@ -510,14 +518,14 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershi
 		}
 		// The same divergence the public-channel case records, and the reason
 		// the sync exists: access does not wait for materialization.
-		for _, userID := range synced {
+		for _, userID := range sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember) {
 			if !channelVisibleToUser(t, pool, ctx, mcGeneral, userID) {
 				t.Fatalf("%s cannot read #geral before the sync", userID)
 			}
 		}
 	})
 
-	t.Run("the sync materializes every covered role and no guest", func(t *testing.T) {
+	t.Run("RF-18 materializes all five active workspace roles", func(t *testing.T) {
 		inserted, err := store.SyncGeneralMemberships(ctx, mcWorkspace)
 		if err != nil {
 			t.Fatalf("SyncGeneralMemberships: %v", err)
@@ -529,9 +537,6 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershi
 			if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, userID) {
 				t.Errorf("%s holds no #geral row after the sync", userID)
 			}
-		}
-		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("the sync gave a guest a #geral row; RF-74 excludes guests from it")
 		}
 	})
 
@@ -545,15 +550,12 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershi
 		}
 	})
 
-	t.Run("the guest neither holds a row nor reads the channel", func(t *testing.T) {
-		if channelVisibleToUser(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("installed visibility admits a guest to #geral with no membership row")
+	t.Run("guest reads general through its row but no ordinary public channel", func(t *testing.T) {
+		if !channelVisibleToUser(t, pool, ctx, mcGeneral, mcGuest) {
+			t.Error("guest cannot read its materialized general membership")
 		}
-		// The two exclusions agreeing is what keeps #geral consistent: the
-		// guest is absent from the roster and absent from the readership, so
-		// unlike an ordinary public channel there is no population mismatch.
-		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("the guest holds a #geral membership row")
+		if channelVisibleToUser(t, pool, ctx, mcPublic, mcGuest) {
+			t.Error("general membership must not grant implicit public access")
 		}
 	})
 
@@ -572,12 +574,145 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershi
 		assertSameIDs(t, "mention candidates", mentionUserIDs(t, store, ctx, mcGeneral), synced)
 	})
 
-	t.Run("only the guest remains as a candidate", func(t *testing.T) {
-		// Not a recommendation to add them: add-members refuses #geral in
-		// MemberService before the store is ever reached. It is what this
-		// query returns, and the gap between the two is itself part of what
-		// #882 has to settle.
+	t.Run("no synchronized member remains as a candidate", func(t *testing.T) {
 		got := addMemberCandidateIDs(t, store, ctx, mcGeneral, mcAdmin)
-		assertSameIDs(t, "add-member candidates", got, []string{mcGuest})
+		assertSameIDs(t, "add-member candidates", got, []string{})
 	})
+}
+
+func TestChannelMembershipContractPostgreSQL_ConcurrentGeneralSyncsConverge(t *testing.T) {
+	pool, _ := membershipContractPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var inserted [2]int64
+	var errs [2]error
+	wg.Add(2)
+	for i := range inserted {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			inserted[i], errs[i] = store.SyncGeneralMemberships(ctx, mcWorkspace)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatalf("concurrent sync errors = %v, %v", errs[0], errs[1])
+	}
+	if inserted[0]+inserted[1] != int64(len(mcRoles)) {
+		t.Fatalf("concurrent sync inserted %d + %d, want %d", inserted[0], inserted[1], len(mcRoles))
+	}
+	if again, err := store.SyncGeneralMemberships(t.Context(), mcWorkspace); err != nil || again != 0 {
+		t.Fatalf("repeat sync inserted %d, error %v", again, err)
+	}
+}
+
+func TestChannelMembershipContractPostgreSQL_GuestJoinActivationAndEnsure(t *testing.T) {
+	pool, ctx := membershipContractPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	const newcomer = mcNewGuest
+	if _, err := pool.Exec(ctx, `INSERT INTO auth.users (id, email, display_name, status)
+		VALUES ($1, 'new-guest@membership-contract.test', 'New Guest', 'active')
+		ON CONFLICT (id) DO UPDATE SET status = 'active', deleted_at = NULL`, newcomer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddWorkspaceMember(ctx, mcWorkspace, newcomer, domain.WorkspaceRoleGuest); err != nil {
+		t.Fatalf("guest join: %v", err)
+	}
+	if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, newcomer) {
+		t.Fatal("guest workspace join did not materialize #geral")
+	}
+	if channelVisibleToUser(t, pool, ctx, mcPublic, newcomer) {
+		t.Fatal("guest gained ordinary public channel access")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM chat.channel_members WHERE channel_id = $1 AND user_id = $2`, mcGeneral, newcomer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET status = 'left' WHERE workspace_id = $1 AND user_id = $2`, mcWorkspace, newcomer); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGeneralMembership(ctx, mcWorkspace, newcomer); !errors.Is(err, domain.ErrMemberInactive) {
+		t.Fatalf("ensure left guest: %v", err)
+	}
+	if _, err := store.ActivateWorkspaceMember(ctx, mcWorkspace, newcomer); err != nil {
+		t.Fatalf("guest reactivation: %v", err)
+	}
+	if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, newcomer) {
+		t.Fatal("reactivation failed to repair #geral")
+	}
+	if err := store.EnsureGeneralMembership(ctx, mcWorkspace, newcomer); err != nil {
+		t.Fatalf("idempotent ensure: %v", err)
+	}
+	const foreignWorkspace = "d2000000-0000-4000-8000-000000000001"
+	foreignTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = foreignTx.Rollback(context.Background()) }()
+	if _, err := foreignTx.Exec(ctx, `INSERT INTO chat.workspaces (id, slug, name, status)
+		VALUES ($1, 'foreign-contract', 'Foreign Contract', 'active')`, foreignWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignTx.Exec(ctx, `INSERT INTO chat.channels
+		(id, workspace_id, slug, display_name, type, is_general, status)
+		VALUES ('d2000000-0000-4000-8000-000000000020', $1, 'geral', 'Geral', 'public', true, 'active')`, foreignWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreignTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureGeneralMembership(ctx, foreignWorkspace, newcomer); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("foreign workspace error = %v, want ErrForbidden", err)
+	}
+}
+
+func TestChannelMembershipContractPostgreSQL_IneligibleUsersStayOutOfGeneral(t *testing.T) {
+	pool, ctx := membershipContractPostgres(t)
+	store := storage.NewPGXMemberStore(pool)
+	var roleConstraint *pgconn.PgError
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET role = 'unknown' WHERE workspace_id = $1 AND user_id = $2`, mcWorkspace, mcGuest); !errors.As(err, &roleConstraint) || roleConstraint.Code != "23514" {
+		t.Fatalf("unknown workspace role must violate the database CHECK: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET status = 'suspended' WHERE workspace_id = $1 AND user_id = $2`, mcWorkspace, mcMember); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE chat.workspace_members SET status = 'left' WHERE workspace_id = $1 AND user_id = $2`, mcWorkspace, mcGuest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE auth.users SET status = 'suspended' WHERE id = $1`, mcModerator); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := store.SyncGeneralMemberships(ctx, mcWorkspace)
+	if err != nil || inserted != 2 {
+		t.Fatalf("eligible-only sync = %d, %v; want owner/admin", inserted, err)
+	}
+	for _, userID := range []string{mcMember, mcGuest, mcModerator} {
+		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, userID) {
+			t.Fatalf("ineligible user %s got a #geral row", userID)
+		}
+	}
+	for _, userID := range []string{mcMember, mcGuest} {
+		if err := store.EnsureGeneralMembership(ctx, mcWorkspace, userID); !errors.Is(err, domain.ErrMemberInactive) {
+			t.Fatalf("ensure inactive membership %s: %v", userID, err)
+		}
+	}
+	if err := store.EnsureGeneralMembership(ctx, mcWorkspace, mcModerator); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("ensure inactive account: %v", err)
+	}
+	const inactiveNewcomer = mcInactive
+	if _, err := pool.Exec(ctx, `INSERT INTO auth.users (id, email, display_name, status)
+		VALUES ($1, 'inactive-guest@membership-contract.test', 'Inactive Guest', 'suspended')
+		ON CONFLICT (id) DO UPDATE SET status = 'suspended', deleted_at = NULL`, inactiveNewcomer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddWorkspaceMember(ctx, mcWorkspace, inactiveNewcomer, domain.WorkspaceRoleGuest); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("join inactive account: %v", err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM chat.workspace_members WHERE workspace_id = $1 AND user_id = $2`, mcWorkspace, inactiveNewcomer).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("failed guest join was not atomic: rows=%d err=%v", count, err)
+	}
 }

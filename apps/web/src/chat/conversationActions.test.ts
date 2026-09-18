@@ -132,26 +132,19 @@ describe("conversationActions — the product matrix", () => {
   const ids = (t: Partial<ConversationTarget>) =>
     conversationActions(target(t)).map((action) => action.id);
 
-  it("offers every applicable action on an ordinary channel", () => {
-    expect(ids({ kind: "channel", canRename: true, hasUnread: true })).toEqual([
-      "pin",
-      "mark-read",
-      "mute",
-      "rename",
-      "details",
-      "leave",
-    ]);
+  it.each(["Infra", "Geral"])("offers every applicable action on ordinary %s", (name) => {
+    expect(
+      ids({ kind: "channel", name, isGeneral: false, canRename: true, hasUnread: true }),
+    ).toEqual(["pin", "mark-read", "mute", "rename", "details", "leave"]);
   });
 
   // The general channel is structural: it is where everyone is reachable by
   // construction, so it cannot be renamed, silenced or left — by anybody. The
   // backend refuses all three in SQL; this is the UI not offering them.
-  it("offers only the structural-safe actions on the general channel", () => {
-    expect(ids({ kind: "channel", isGeneral: true, canRename: true, hasUnread: true })).toEqual([
-      "pin",
-      "mark-read",
-      "details",
-    ]);
+  it.each(["Geral", "Boas-vindas"])("protects the structural channel named %s", (name) => {
+    expect(
+      ids({ kind: "channel", name, isGeneral: true, canRename: true, hasUnread: true }),
+    ).toEqual(["pin", "mark-read", "details"]);
   });
 
   it("offers every applicable action on a group", () => {

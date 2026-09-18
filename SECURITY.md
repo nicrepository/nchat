@@ -165,7 +165,8 @@ Os cinco papeis do RF-74 e onde cada um vive:
   o workspace, nao altera settings e recebe `403` na API administrativa de
   usuarios.
 - **Usuario** — `member`.
-- **Guest** — `guest`. Membership de workspace **nao concede canal algum**.
+- **Guest** — `guest`. Sem acesso implicito a canais publicos comuns;
+  RF-18 materializa membership no canal estrutural `#geral` (#882).
 
 O `moderator` de `chat.channel_members` continua sendo um papel **por canal** e
 nunca e lido como autoridade de workspace. Nenhuma decisao de autorizacao
@@ -178,9 +179,11 @@ ja era para `owner` e `admin`.
 
 ## Escopo de canais do Guest (RF-74)
 
-Um Guest acessa **somente os canais em que foi explicitamente incluido**
-(`chat.channel_members`). Integrar o workspace nao lhe da nenhum canal publico,
-nem o `#geral`.
+Um Guest acessa **somente canais com membership persistida**
+(`chat.channel_members`). RF-18 materializa automaticamente essa linha no canal
+estrutural `is_general=true` para todo membro ativo elegivel, inclusive guest.
+Isso nao concede acesso implicito a canais publicos comuns: a allowlist de
+`CanReachPublicChannels` permanece inalterada.
 
 A regra tem uma unica definicao: a funcao SQL
 `chat.channel_visible_to_user(channel_id, user_id)` (migration 000022),
@@ -204,15 +207,17 @@ Consequencias deliberadas para o Guest:
   o isolamento seria contornavel em uma requisicao;
 - **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
   `INSERT`;
-- **nao** e adicionado automaticamente a `#geral`: `generalMembershipRoles`
-  exclui guest, tanto no sync individual quanto no backfill. Uma row explicita
-  existente (legada ou administrativa) pode satisfazer o predicate de
-  visibilidade, mantidas as demais condicoes de acesso; o sync nao a remove.
-  O fluxo de `MemberService.AddChannelMembers` no chat-service rejeita
-  `is_general`. Ha um caminho administrativo distinto: a API do admin-service,
-  com `admin.channels.manage`, chama `PGXChannelDirectoryStore.AddChannelMembers`,
-  que admite alvos elegiveis sem recusar `is_general`, inclusive guest.
-  Esta e a descricao CURRENT; a consolidacao futura pertence a #882.
+- **e** adicionado automaticamente ao canal estrutural `#geral` (RF-18,
+  issue #882), assim como owner/admin/moderator/member, com membership ativa e
+  conta ativa nao deletada. Suspensos, left, pessoas de outro workspace e
+  papeis invalidos sao excluidos. Sync individual e backfill so inserem linhas
+  faltantes; preservam rows existentes e mute.
+- `MemberService.AddChannelMembers` permite reparo de linha ausente e retorna
+  `already_members` quando a pessoa ja participa de `#geral`, sob o gate atual
+  owner/admin/moderator. A Admin API continua exigindo `admin.channels.manage`;
+  ambos reutilizam `EligibleTargetsCTE` para os alvos, sem ampliar os atores.
+- Renomear, arquivar, sair e remover participantes continuam proibidos no canal
+  estrutural. Um canal comum chamado "Geral" nao recebe essas propriedades.
 
 Canal privado continua exigindo membership de canal para **todos** os papeis:
 nem owner, nem admin, nem moderador leem um canal privado do qual nao
