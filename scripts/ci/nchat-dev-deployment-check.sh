@@ -852,14 +852,48 @@ validate_image_inventory() {
   done
   grep -Fq 'COPY libs/go ./libs/go' "$ROOT_DIR/Dockerfile.service" || fail "Docker build does not include all shared Go modules"
   ! grep -Eq '^COPY services([[:space:]]|/)[[:space:]]+\.?/services' "$ROOT_DIR/Dockerfile.service" || fail "Docker build copies every service source"
-  ! grep -Eq ':808[0-9]' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "smoke tests duplicate HTTP port numbers"
-  grep -Fq "services/http:\$service:http/proxy/healthz" "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" || fail "smoke tests do not use the named http port"
+  validate_smoke_named_port_contract
 
   cp "$NCHAT_DEV_IMAGE_INVENTORY" "$invalid_inventory"
   printf '%s\n' 'go auth-service auth-service' >>"$invalid_inventory"
   if (load_nchat_dev_image_inventory "$invalid_inventory") >/dev/null 2>&1; then
     fail "duplicate image inventory entry was accepted"
   fi
+}
+
+# The smoke reaches every Go service through the Service's *named* `http`
+# port, never through a port number (issue #941).
+#
+# Why the named port matters: the number is declared once, in each Service
+# manifest, and a second copy of it inside the smoke is a copy that goes
+# stale the day a service moves. The Service proxy accepts a name, so there
+# is no reason for the smoke to know a number at all -- and the check above
+# already proves every Service declares exactly one port named `http`.
+#
+# This lives in scripts/deploy/nchat-dev/smoke.sh. Until #933 it lived in
+# deploy.sh, and this function checked deploy.sh; when the smoke moved, the
+# assertions did not, which is exactly the regression #941 records. Two
+# consequences are worth keeping in mind when editing this:
+#
+#   - the file must be named explicitly here, because pointing a `grep -Fq`
+#     at a file that no longer contains the string fails the build, and
+#     pointing a `! grep -Eq` at one fails *nothing* -- a prohibition against
+#     a file with no ports to find is a check that cannot fire;
+#   - the URL is built with `$path`, not with `/healthz` baked in, so the
+#     proxy shape and the paths exercised are separate facts and are asserted
+#     separately below.
+validate_smoke_named_port_contract() {
+  local smoke="$ROOT_DIR/scripts/deploy/nchat-dev/smoke.sh"
+  [[ -f "$smoke" ]] || fail "the nchat-dev smoke script is missing"
+  # The smoke is its own script and must stay that way: a deploy that ends by
+  # smoking itself cannot report which of the two failed.
+  ! grep -Eq 'services/http:[^[:space:]]*/proxy' "$ROOT_DIR/scripts/deploy/nchat-dev/deploy.sh" ||
+    fail "deploy.sh probes Services; the smoke belongs in smoke.sh"
+  grep -Fq 'services/http:$service:http/proxy$path' "$smoke" ||
+    fail "smoke tests do not use the named http port"
+  ! grep -Eq ':808[0-9]' "$smoke" || fail "smoke tests duplicate HTTP port numbers"
+  grep -Fq 'check_service_endpoints /healthz' "$smoke" || fail "smoke tests do not probe /healthz"
+  grep -Fq 'check_service_endpoints /readyz' "$smoke" || fail "smoke tests do not probe /readyz"
 }
 
 # Fake `kubectl` that only understands `auth can-i` (answering "no" for the
