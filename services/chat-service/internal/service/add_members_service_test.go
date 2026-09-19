@@ -357,22 +357,19 @@ func TestAddChannelMembersRejectsUnreachableChannel(t *testing.T) {
 	}
 }
 
-// Automatic materialization stays the normal way into #geral. Add-members is
-// the repair for the row that should already be there: idempotent when the
-// membership exists, and bound by the same target eligibility every other
-// channel is bound by. It does not widen who may perform the operation — the
-// actor gate is still domain.CanManageChannelMembers.
-func TestAddChannelMembersRepairsGeneralChannel(t *testing.T) {
+// Membership in #geral is owned by the workspace sync. Adding to it here would
+// either be a no-op or a second writer for rows that path maintains.
+func TestAddChannelMembersRejectsGeneralChannel(t *testing.T) {
 	svc, members, channels := addMembersFixture(t, domain.WorkspaceRoleOwner)
 	channels.channel.IsGeneral = true
 	channels.channel.Type = domain.ChannelTypePublic
 
 	_, err := svc.AddChannelMembers(context.Background(), addInput(amTargetA))
-	if err != nil {
-		t.Fatalf("general repair: %v", err)
+	if !errors.Is(err, domain.ErrInvalidInput) {
+		t.Fatalf("err = %v, want ErrInvalidInput", err)
 	}
-	if len(members.addChannelMembersCalls) != 1 {
-		t.Fatal("general repair must use the same target policy as other channels")
+	if len(members.addChannelMembersCalls) != 0 {
+		t.Fatal("geral must not reach the store")
 	}
 }
 

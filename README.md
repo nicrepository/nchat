@@ -236,8 +236,24 @@ proprio PostgreSQL; nenhum outro job espera banco.
 
 ### CD
 
-Build de imagens e deploy permanecem fora da arvore de gates de PR
-(`images.yml`, `build-nchat-images.yml`, `deploy-nchat-dev.yml`, `deploy-nchat-prod.yml`).
+Build de imagens e deploy permanecem fora da arvore de gates de PR, e consomem
+`CI / Required` em vez de rodar em paralelo com ela (#933):
+
+| Workflow                    | Trigger                      | O que faz                                     |
+| --------------------------- | ---------------------------- | --------------------------------------------- |
+| `ci-eligibility.yml`        | `workflow_call`              | le `CI / Required` do SHA exato               |
+| `build-nchat-images.yml`    | `workflow_call`              | constroi as onze imagens, uma vez, por digest |
+| `images.yml`                | `workflow_call`              | build + release manifest selado               |
+| `cd-develop.yml`            | `workflow_run` (CI, develop) | deploy automatico do nchat-dev, single-slot   |
+| `deploy-nchat-dev.yml`      | `workflow_call`              | apply, smoke e summary do nchat-dev           |
+| `cd-prepare-production.yml` | `workflow_run` (CI, main)    | candidate Blue/Green automatico, sem cutover  |
+| `cutover-nchat-prod.yml`    | `workflow_dispatch`          | decisao humana: move o trafego                |
+| `rollback-nchat-prod.yml`   | `workflow_dispatch`          | decisao humana: volta o trafego, com motivo   |
+
+`Quality / SonarQube` permanece advisory: um Quality Gate reprovado nao bloqueia
+o CD, porque a elegibilidade e lida do job `CI / Required` e nao da conclusao do
+run. Detalhes operacionais em `docs/runbooks/production-blue-green-deployment.md`
+(secao 11b) e `docs/runbooks/nchat-dev-server.md`.
 
 Comandos locais agregados:
 

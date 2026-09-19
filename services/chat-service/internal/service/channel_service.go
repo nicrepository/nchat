@@ -164,8 +164,8 @@ type ChannelDetails struct {
 	// decision from the session on every call. A client that ignores it gets a
 	// 403, not a membership row.
 	//
-	// For #geral the same actor gate permits idempotent repair of a missing
-	// membership; the structural flag does not turn this capability off.
+	// It is false for #geral, matching the write path: membership there is owned
+	// by the workspace sync, not by this flow.
 	CanManageMembers bool
 }
 
@@ -202,7 +202,7 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		MemberCount:   page.TotalCount,
 		// The same predicate the write path checks, evaluated on the membership
 		// already loaded above — not a second, parallel rule that could drift.
-		CanManageMembers: domain.CanManageChannelMembers(&member),
+		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
 }
 

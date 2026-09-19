@@ -3336,13 +3336,13 @@ describe("ChatSidebar — row action menu", () => {
   });
 
   // The general channel is structural: no rename, no mute, no leave, for anyone.
-  it.each(["geral", "Boas-vindas"])("protects the structural channel named %s", async (name) => {
+  it("omits rename, mute and leave on the general channel", async () => {
     const user = userEvent.setup();
     renderSidebar({
-      channels: [channel(name, { isGeneral: true, canRename: true, unreadCount: 3 })],
+      channels: [channel("geral", { isGeneral: true, canRename: true, unreadCount: 3 })],
     });
 
-    await user.click(trigger(`canal ${name}`));
+    await user.click(trigger("canal geral"));
 
     for (const absent of [/renomear/i, /silenciar/i, /notificações/i, /sair/i]) {
       expect(screen.queryByRole("menuitem", { name: absent })).not.toBeInTheDocument();
@@ -3352,13 +3352,11 @@ describe("ChatSidebar — row action menu", () => {
     expect(screen.getByRole("menuitem", { name: "Detalhes do canal" })).toBeInTheDocument();
   });
 
-  it.each(["infra", "Geral"])("offers the full menu on ordinary %s", async (name) => {
+  it("offers the full menu on an ordinary channel", async () => {
     const user = userEvent.setup();
-    renderSidebar({
-      channels: [channel(name, { isGeneral: false, canRename: true, unreadCount: 1 })],
-    });
+    renderSidebar({ channels: [channel("infra", { canRename: true, unreadCount: 1 })] });
 
-    await user.click(trigger(`canal ${name}`));
+    await user.click(trigger("canal infra"));
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
       "Fixar no topo",

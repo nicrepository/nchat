@@ -1,0 +1,84 @@
+name: CD / Develop
+
+# Continuous delivery of develop to nchat-dev (issue #933).
+#
+#   an eligible develop commit
+#        -> build immutable images
+#        -> deploy, migrate, roll out
+#        -> smoke
+#        -> summary
+#
+# Automatic, single-slot, no Blue/Green and no approval. nchat-dev is one
+# environment with one copy of each workload; the two-slot machinery exists in
+# production because production cannot afford a rollback that is a redeploy,
+# and nchat-dev can.
+#
+# `workflow_run` rather than `push`, and that is the change #933 makes here.
+# Building on push meant building in parallel with the CI of the same commit
+# and deploying one CI then failed. Now the CI run finishes first and its
+# `CI / Required` verdict is read before anything is built.
+#
+# A `workflow_run` handler always runs the copy of its own YAML that is on the
+# default branch, which for this repository is develop -- the same branch it
+# deploys. There is nothing to reconcile: the file that orchestrates the
+# develop deploy and the commits it deploys are the same line of history.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# One delivery to nchat-dev at a time, and never cancelled. A run that is
+# applying migrations or waiting on a rollout is mid-mutation, and cancelling
+# it to pick up a newer commit would leave the namespace half-deployed with
+# nobody watching it. The newer commit gets its own run.
+#
+# cancel-in-progress must be the boolean false: the string "false" is truthy to
+# the expression evaluator.
+concurrency:
+  group: nchat-dev-delivery
+  cancel-in-progress: false
+
+jobs:
+  # `CI / Required` for this exact commit, or nothing happens. The branch and
+  # the triggering event are checked here rather than only inside, so a CI run
+  # of main or of a pull request does not even start a develop delivery.
+  eligibility:
+    if: >-
+      github.event.workflow_run.head_branch == 'develop' &&
+      github.event.workflow_run.event == 'push'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/ci-eligibility.yml
+    with:
+      branch: develop
+
+  # The same builder production uses, on the commit eligibility returned.
+  # `require_main` is false: this is a development build and develop is not
+  # reachable from main.
+  build:
+    needs: eligibility
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/images.yml
+    with:
+      sha: ${{ needs.eligibility.outputs.sha }}
+      require_main: false
+
+  # The deploy, the smoke and the summary, on the dev runner. The digests it
+  # pins come from this run's own artifacts, so the images it deploys are the
+  # ones this run built.
+  deploy:
+    needs: [eligibility, build]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/deploy-nchat-dev.yml
+    with:
+      sha: ${{ needs.eligibility.outputs.sha }}

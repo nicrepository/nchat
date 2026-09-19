@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# A kubectl stand-in for the nchat-dev smoke tests (issue #933).
+#
+# Small on purpose. The smoke asks the cluster four questions -- did the
+# rollouts finish, is anything in a restart back-off, did the migration Job
+# complete, do the Services answer -- and this answers each from a file, so a
+# test can make exactly one of them wrong and watch the smoke report it.
+#
+# State comes from FAKE_STATE_DIR:
+#   context              what `config current-context` answers
+#   rollout-fails        newline-separated deployment names whose rollout fails
+#   waiting-reasons      one container waiting reason per line, as the API
+#                        reports them; absent means nothing is waiting
+#   migration-condition  the status of the Job's Complete condition, or absent
+#                        for a Job that is not there at all
+#   probe-fails          newline-separated "<service><path>" that 404s
+set -Eeuo pipefail
+
+STATE="${FAKE_STATE_DIR:?FAKE_STATE_DIR is required}"
+
+read_state() { [[ -f "$STATE/$1" ]] && cat "$STATE/$1" || printf ''; }
+
+listed() { grep -Fxq "$1" <<<"$(read_state "$2")"; }
+
+if [[ "${1:-}" == "config" && "${2:-}" == "current-context" ]]; then
+  read_state context
+  exit 0
+fi
+
+# kubectl rollout status deployment/<name> -n nchat-dev --timeout=60s
+if [[ "${1:-}" == "rollout" ]]; then
+  workload="${3#deployment/}"
+  listed "$workload" rollout-fails && exit 1
+  echo "deployment \"$workload\" successfully rolled out"
+  exit 0
+fi
+
+# The waiting reason of every container, which is how a crash loop is visible
+# to something sampling the API rather than watching restarts.
+if [[ "${1:-}" == "get" && "${2:-}" == "pods" ]]; then
+  read_state waiting-reasons
+  exit 0
+fi
+
+# kubectl get job/nchat-migrations -o jsonpath={...Complete...}
+if [[ "${1:-}" == "get" && "${2:-}" == "job/nchat-migrations" ]]; then
+  [[ -f "$STATE/migration-condition" ]] || { echo "Error from server (NotFound)" >&2; exit 1; }
+  read_state migration-condition
+  exit 0
+fi
+
+# The Service proxy probes.
+if [[ "${1:-}" == "get" && "${2:-}" == "--request-timeout=10s" ]]; then
+  # Joined into a variable first: bash applies a pattern removal on `$*` to
+  # each positional parameter separately and then joins, so `${*##*/proxy}`
+  # would return the whole command line with nothing removed.
+  request="$*"
+  target="${request##*/proxy}"
+  service="${request#*services/http:}"
+  service="${service%%:http*}"
+  listed "$service$target" probe-fails && exit 1
+  echo '{}'
+  exit 0
+fi
+
+echo "fake kubectl: unhandled invocation: $*" >&2
+exit 64

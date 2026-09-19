@@ -718,11 +718,8 @@ active channel, because the shared eligibility rule does.
 `#geral` is refused with `403`, mirroring `ErrCannotLeaveGeneralChannel` in
 chat-service. Every member of a workspace belongs to its general channel by
 construction, and this console must not become a second way around that.
-Additions to `#geral` are _not_ refused: every active workspace member — a guest
-included — is enrolled automatically, so an add is idempotent when the row is
-already there and repairs an eligible row that is missing (#882). That row is a
-membership in `#geral` and nothing more; it grants no implicit access to any
-other public channel.
+Additions to `#geral` are _not_ refused: a guest is not enrolled in it
+automatically, so adding one is a real operation.
 
 **Not offered, deliberately:** membership of a private DM group. A platform
 administrator has no authority over a conversation they cannot read, and

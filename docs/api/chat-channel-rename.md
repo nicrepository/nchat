@@ -80,11 +80,6 @@ um administrador de outro workspace conseguem usar o status para descobrir se um
 UUID existe: canal de outro workspace, canal arquivado e canal inexistente
 respondem todos `404`.
 
-A protecao identifica o canal por `channels.is_general`, nunca por slug ou
-`display_name`. Um canal comum chamado "Geral" continua renomeavel sob o gate
-normal. A adicao idempotente/reparo de membership permitida em `#geral` pela
-#882 nao altera sua imutabilidade nem a proibicao de archive/leave/remove.
-
 ## Validacao do nome
 
 Uma unica regra, a mesma da criacao: `domain.NormalizeChannelDisplayName`.

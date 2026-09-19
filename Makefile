@@ -1,4 +1,4 @@
-.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-govulncheck-gate-test security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-release-manifest-test prod-deploy-workflow-test prod-runner-guard-test prod-capacity-evidence prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old prod-notification-levels migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci ci-static-web ci-static-admin-web ci-static-go ci-static-repository ci-architecture-check ci-infra-config ci-infra-kubernetes ci-infra-migrations ci-infra-release-safety test-integration-go
+.PHONY: help install dev-web dev-admin-web dev-env-up dev-env-down dev-env-reset dev-env-status dev-env-logs dev-env-validate dev-env-config-check dev-gateway-up dev-gateway-down dev-gateway-status dev-gateway-logs dev-gateway-validate dev-tls-generate dev-tls-status dev-tls-clean tls-config-check k8s-render k8s-validate k8s-render-staging k8s-validate-staging k8s-apply-dev k8s-delete-dev k8s-status-dev k8s-ci health-contract-check ci-config-check images-module-inputs-check images-module-inputs-check-test gateway-config-check web-security-headers-check web-livekit-integration-check sealed-secrets-validate sealed-secrets-policy-check sealed-secrets-install-controller sealed-secrets-fetch-cert build-web build-admin-web test-web test-admin-web lint-web lint-admin-web test-go vet-go fmt-go format format-check lint-go go-coverage go-coverage-check web-coverage coverage lint test build security security-secrets security-govulncheck security-govulncheck-gate-test security-trivy-fs security-trivy-config poc-seaweedfs poc-valkey poc-config-check observability-config-check grafana-dashboard-check migrations-check migrations-blue-green-test prod-blue-green-check prod-blue-green-check-test prod-stateful-check prod-stateful-check-test prod-stateful-preflight-test prod-stateful-apply prod-blue-green-test prod-blue-green-query-test prod-capacity-test prod-release-manifest-test cd-workflows-check cd-workflows-test prod-lifecycle-test prod-rollback-schema-test dev-smoke-test prod-runner-guard-test prod-capacity-evidence prod-blue-green-status prod-blue-green-bootstrap prod-blue-green-deploy prod-blue-green-smoke prod-blue-green-stable-smoke prod-blue-green-record-traffic-smoke prod-blue-green-rollback-schema-gate dev-smoke prod-blue-green-cutover prod-blue-green-rollback prod-blue-green-drain-old prod-notification-levels migrations-up migrations-down migrations-status migrations-reset migrations-smoke db-restore-test dev-observability-up dev-observability-down dev-observability-status dev-observability-logs dev-observability-validate dev-media-up dev-media-down dev-media-status dev-media-logs dev-media-validate media-config-check qa-webrtc-office-network webrtc-office-network-config-check ci ci-static-web ci-static-admin-web ci-static-go ci-static-repository ci-architecture-check ci-infra-config ci-infra-kubernetes ci-infra-migrations ci-infra-release-safety test-integration-go
 
 help:
 	@echo "NChat development commands"
@@ -81,7 +81,11 @@ help:
 	@echo "  make prod-blue-green-query-test Run manifest reader unit tests (CI-safe)"
 	@echo "  make prod-capacity-test      Run capacity preflight fixtures (CI-safe)"
 	@echo "  make prod-release-manifest-test Run release manifest tests (CI-safe)"
-	@echo "  make prod-deploy-workflow-test Run candidate-only deploy workflow tests (CI-safe)"
+	@echo "  make cd-workflows-check     Verify the five continuous delivery workflow contracts"
+	@echo "  make cd-workflows-test      Run the continuous delivery workflow contract tests (CI-safe)"
+	@echo "  make prod-lifecycle-test     Run the release lifecycle/drain tests (CI-safe)"
+	@echo "  make prod-rollback-schema-test Run the rollback schema compatibility gate tests (CI-safe)"
+	@echo "  make dev-smoke-test          Run the nchat-dev smoke tests (CI-safe)"
 	@echo "  make prod-runner-guard-test  Run production runner pre-job guard tests (CI-safe)"
 	@echo "  make prod-capacity-evidence  Collect cluster capacity evidence: ARGS=\"<output-dir>\""
 	@echo "  make prod-blue-green-status  Show the production release slots (requires cluster)"
@@ -412,8 +416,20 @@ prod-release-manifest-test:
 # input in it can move production traffic, and the stable Service selectors it
 # records before the deploy are proved unchanged after. Offline: parses the
 # workflow and drives the release binding, touches no cluster.
-prod-deploy-workflow-test:
-	pnpm prod:deploy-workflow:test
+cd-workflows-check:
+	pnpm cd:workflows:check
+
+cd-workflows-test:
+	pnpm cd:workflows:test
+
+prod-lifecycle-test:
+	pnpm prod:lifecycle:test
+
+prod-rollback-schema-test:
+	pnpm prod:rollback-schema:test
+
+dev-smoke-test:
+	pnpm dev:smoke:test
 
 # Proves the production runner's pre-job guard authorises exactly one context
 # and refuses every other repository, workflow, ref and event. Offline: runs
@@ -442,6 +458,24 @@ prod-blue-green-deploy:
 
 prod-blue-green-smoke:
 	pnpm prod:blue-green:smoke $(ARGS)
+
+# The post-traffic profile: run after a cutover or a rollback, never on a
+# candidate. smoke.sh is the candidate one and requires isolation, so the two
+# are separate commands rather than one with a flag.
+prod-blue-green-stable-smoke:
+	pnpm prod:blue-green:stable-smoke $(ARGS)
+
+# The same smoke, with its result recorded in the lifecycle record. This is
+# what the workflows run, and it is the operator's way to unblock a release
+# whose post-cutover smoke failed, was investigated and now passes.
+prod-blue-green-record-traffic-smoke:
+	pnpm prod:blue-green:record-traffic-smoke $(ARGS)
+
+prod-blue-green-rollback-schema-gate:
+	pnpm prod:blue-green:rollback-schema-gate $(ARGS)
+
+dev-smoke:
+	pnpm dev:smoke
 
 prod-blue-green-cutover:
 	pnpm prod:blue-green:cutover $(ARGS)

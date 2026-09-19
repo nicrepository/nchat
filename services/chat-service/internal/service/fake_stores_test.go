@@ -628,7 +628,12 @@ func (f *fakeMemberStore) SyncGeneralMemberships(_ context.Context, workspaceID 
 		if m.WorkspaceID != workspaceID {
 			continue
 		}
-		if m.Status != domain.MemberStatusActive {
+		// Same gate as the real backfill's `status = 'active' AND role IN (...)`:
+		// CanReachPublicChannels covers both, so a guest is skipped here exactly
+		// as it is skipped there. Note this only declines to *insert* — the loop
+		// never deletes, so a guest that was explicitly added to #geral keeps
+		// that membership across a sync.
+		if !domain.CanReachPublicChannels(&m) {
 			continue
 		}
 		key := cmKey(channelID, m.UserID)
@@ -650,9 +655,23 @@ func (f *fakeMemberStore) requireActiveWorkspace(workspaceID string) error {
 	return nil
 }
 
-// addGeneralMembership mirrors RF-18 for schema-valid workspace roles,
-// independently of implicit public access. PostgreSQL's role CHECK rejects
-// invalid values before they can reach a persisted membership.
+// addGeneralMembership models PGXMemberStore's automatic #geral join.
+//
+// It takes the whole membership rather than a user ID because the real
+// statement selects the role from the membership row and inserts only for the
+// roles in generalMembershipRoles. A guest is excluded there (RF-74), so it is
+// excluded here: a fake that joined a guest to #geral would let a regression in
+// the guest boundary pass every service test.
+//
+// The exclusion is domain.CanReachPublicChannels, not a `role != guest`
+// comparison, so the fake and the store stay tied to the same rule and an
+// unrecognised role is denied by both.
+//
+// Silently doing nothing, rather than erroring, is what the real INSERT ...
+// SELECT does when the role does not match: zero rows, no error. Only the
+// *automatic* join is gated — an explicit AddChannelMember into #geral is a
+// different path and stays available to a guest, which is how RF-74 says a
+// guest reaches any channel.
 func (f *fakeMemberStore) addGeneralMembership(m domain.WorkspaceMember) error {
 	channelID, ok := f.generalChannels[m.WorkspaceID]
 	if !ok {
@@ -661,8 +680,8 @@ func (f *fakeMemberStore) addGeneralMembership(m domain.WorkspaceMember) error {
 	if f.addCMErr != nil {
 		return f.addCMErr
 	}
-	if m.Status != domain.MemberStatusActive {
-		return domain.ErrForbidden
+	if !domain.CanReachPublicChannels(&m) {
+		return nil
 	}
 	key := cmKey(channelID, m.UserID)
 	if _, ok := f.channelMembers[key]; ok {

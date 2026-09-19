@@ -2,3 +2,8 @@ self-hosted-runner:
   labels:
     - nchat-dev-deploy
     - nchat-prod-deploy
+    # Issue #714/#933: the read-only capacity collector. A separate label
+    # because it is a separate identity -- the production deployer must stay
+    # namespaced, and the cluster-wide read that the capacity gate needs is
+    # collected by a runner that holds a read-only context of its own.
+    - nchat-prod-capacity

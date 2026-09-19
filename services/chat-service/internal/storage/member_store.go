@@ -16,19 +16,11 @@ import (
 
 // MemberStore is the persistence interface for workspace and channel membership.
 type MemberStore interface {
-	// AddWorkspaceMember atomically inserts an active workspace membership and
-	// materializes #geral. An existing active membership is repaired, committed,
-	// then reported as ErrAlreadyMember; an existing suspended/left membership
-	// returns ErrAlreadyMember without reactivation. An inactive/deleted account
-	// returns ErrForbidden and rolls back; absent #geral returns
-	// ErrGeneralChannelMissing before any membership write. Missing/inactive
-	// workspace returns ErrNotFound/ErrForbidden, respectively.
+	// AddWorkspaceMember inserts an active workspace membership and syncs #geral.
+	// ErrAlreadyMember may be returned after a successful commit; the call may
+	// have repaired missing #geral membership before returning it. Callers must
+	// not treat ErrAlreadyMember as proof that no side effects occurred.
 	AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error)
-	// ActivateWorkspaceMember atomically reactivates an existing membership and
-	// repairs #geral. Absent #geral returns ErrGeneralChannelMissing before UPDATE;
-	// otherwise missing membership returns ErrNotFound, and inactive/deleted
-	// account returns ErrForbidden with rollback. Missing/inactive workspace
-	// returns ErrNotFound/ErrForbidden, respectively.
 	ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
 	GetEligibleDMMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error)
@@ -81,11 +73,6 @@ type MemberStore interface {
 	// upon elsewhere — stays untouched. Returns ErrCannotLeaveGeneralChannel for
 	// #geral.
 	RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error)
-	// EnsureGeneralMembership is idempotent for an active eligible member.
-	// Suspended/left returns ErrMemberInactive; missing or foreign membership and
-	// inactive/deleted account return ErrForbidden. For an active membership,
-	// absent #geral returns ErrGeneralChannelMissing before account revalidation;
-	// missing/inactive workspace returns ErrNotFound/ErrForbidden, respectively.
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
 }
@@ -104,9 +91,11 @@ type memberQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-// AddWorkspaceMember follows the MemberStore contract above. The channel lock
-// precedes the workspace-member insert: moving it after the insert would invert
-// add-members' channel-then-target lock order for a concurrent #geral repair.
+// AddWorkspaceMember inserts an active workspace membership and atomically syncs
+// the user to that workspace's #geral channel. Existing active members are also
+// synced idempotently before ErrAlreadyMember is returned. ErrAlreadyMember may
+// be returned after a successful commit; callers must not assume it means
+// rollback or no side effects.
 func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, userID string, role domain.WorkspaceRole) (domain.WorkspaceMember, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -123,20 +112,14 @@ func (s *PGXMemberStore) AddWorkspaceMember(ctx context.Context, workspaceID, us
 		return domain.WorkspaceMember{}, err
 	}
 
-	// Match add-members' lock order before writing a workspace membership.
-	generalChannelID, err := getGeneralChannelID(ctx, tx, workspaceID)
-	if err != nil {
-		return domain.WorkspaceMember{}, err
-	}
 	m, inserted, err := addWorkspaceMember(ctx, tx, workspaceID, userID, role)
 	if err != nil {
 		return domain.WorkspaceMember{}, err
 	}
 	if m.Status == domain.MemberStatusActive {
-		err = addGeneralChannelMember(ctx, tx, generalChannelID, workspaceID, userID)
-	}
-	if err != nil {
-		return domain.WorkspaceMember{}, err
+		if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
+			return domain.WorkspaceMember{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.WorkspaceMember{}, fmt.Errorf("commit add workspace member: %w", err)
@@ -170,9 +153,8 @@ func addWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userI
 	return m, true, nil
 }
 
-// ActivateWorkspaceMember follows the MemberStore contract above. The channel
-// lock precedes UPDATE so add-members cannot hold that channel while waiting on
-// this target's workspace-membership row.
+// ActivateWorkspaceMember marks an existing workspace member active and
+// atomically syncs them to that workspace's #geral channel.
 func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceID, userID string) (domain.WorkspaceMember, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -189,10 +171,6 @@ func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceI
 		return domain.WorkspaceMember{}, err
 	}
 
-	generalChannelID, err := getGeneralChannelID(ctx, tx, workspaceID)
-	if err != nil {
-		return domain.WorkspaceMember{}, err
-	}
 	var m domain.WorkspaceMember
 	err = tx.QueryRow(ctx, `
 		UPDATE chat.workspace_members
@@ -207,7 +185,7 @@ func (s *PGXMemberStore) ActivateWorkspaceMember(ctx context.Context, workspaceI
 		}
 		return domain.WorkspaceMember{}, fmt.Errorf("activate workspace member: %w", err)
 	}
-	if err := addGeneralChannelMember(ctx, tx, generalChannelID, workspaceID, userID); err != nil {
+	if err := ensureGeneralMembership(ctx, tx, workspaceID, userID); err != nil {
 		return domain.WorkspaceMember{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -239,9 +217,9 @@ func getWorkspaceMember(ctx context.Context, q memberQuerier, workspaceID, userI
 	return m, nil
 }
 
-// EnsureGeneralMembership follows the MemberStore contract above. The initial
-// status read distinguishes ErrMemberInactive; the insert's shared eligibility
-// predicate rechecks and locks the target as the authority at write time.
+// EnsureGeneralMembership idempotently adds an active workspace member to that
+// workspace's #geral channel. Suspended and left members return
+// ErrMemberInactive and are not inserted.
 func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -278,8 +256,12 @@ func (s *PGXMemberStore) EnsureGeneralMembership(ctx context.Context, workspaceI
 }
 
 // SyncGeneralMemberships backfills missing #geral memberships for active
-// workspace members with active accounts, including guests (RF-18). It returns
-// the number of inserted rows and never removes existing memberships.
+// workspace members only, excluding guests (RF-74). It returns the number of
+// inserted channel_members rows.
+//
+// It never removes a row. A guest that already holds a #geral membership — one
+// written before RF-74, or one a manager added deliberately — keeps it; the
+// backfill only stops creating new ones.
 func (s *PGXMemberStore) SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -299,22 +281,15 @@ func (s *PGXMemberStore) SyncGeneralMemberships(ctx context.Context, workspaceID
 	if err != nil {
 		return 0, err
 	}
-	// Bind order: $1 workspace, $2 structural channel, $3 channel role.
-	// ORDER BY gives concurrent syncs a deterministic insert order; the channel
-	// lock, not this ordering, prevents the cycle with add-members.
 	tag, err := tx.Exec(ctx, `
-		WITH eligible AS (
-			SELECT wm.user_id
-			FROM chat.workspace_members wm
-			`+channelmembership.EligibleWorkspaceTargetJoinsSQL+`
-			WHERE `+channelmembership.EligibleWorkspaceTargetWhereSQL+`
-			ORDER BY wm.user_id
-			FOR SHARE OF wm, u
-		)
 		INSERT INTO chat.channel_members (channel_id, user_id, role)
-		SELECT $2, user_id, $3 FROM eligible
+		SELECT $1, wm.user_id, $3
+		FROM chat.workspace_members wm
+		WHERE wm.workspace_id = $2
+		  AND wm.status = 'active'
+		  AND wm.role IN `+generalMembershipRoles+`
 		ON CONFLICT (channel_id, user_id) DO NOTHING`,
-		workspaceID, generalChannelID, string(domain.ChannelRoleMember),
+		generalChannelID, workspaceID, string(domain.ChannelRoleMember),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("sync general memberships: %w", err)
@@ -347,22 +322,31 @@ func ensureWorkspaceActive(ctx context.Context, q memberQuerier, workspaceID str
 	return nil
 }
 
-// ensureGeneralMembership materializes RF-18's mandatory #geral row, a
-// structural exception that does not widen RF-74/CanReachPublicChannels.
-// addGeneralChannelMember decides target eligibility from the shared SQL
-// predicate; the caller's transaction holds the channel lock first and commits
-// the membership atomically with any workspace-membership change.
+// ensureGeneralMembership adds userID to the workspace's #geral channel, unless
+// userID is a guest.
+//
+// The exclusion is the RF-74 guest boundary applied to the one channel every
+// member is joined to automatically. #geral is where a workspace's traffic
+// lives; auto-joining a guest to it would mean "restricted to the channels it
+// was explicitly added to" started with the busiest channel in the workspace
+// already granted. A guest reaches #geral the same way it reaches any other
+// channel: somebody with domain.CanManageChannelMembers adds it.
+//
+// The role is not passed in and not read separately: the insert selects it from
+// the membership row inside the caller's transaction, so the decision cannot be
+// taken against a role that has since changed, and a membership row that is not
+// there writes nothing.
 func ensureGeneralMembership(ctx context.Context, q memberQuerier, workspaceID, userID string) error {
 	generalChannelID, err := getGeneralChannelID(ctx, q, workspaceID)
 	if err != nil {
 		return err
 	}
-	return addGeneralChannelMember(ctx, q, generalChannelID, workspaceID, userID)
+	if err := addGeneralChannelMember(ctx, q, generalChannelID, workspaceID, userID); err != nil {
+		return err
+	}
+	return nil
 }
 
-// FOR SHARE blocks changes to the channel's identity/status while allowing
-// independent joins to the same workspace to proceed concurrently. Add-members
-// takes the stronger FOR UPDATE lock for its count serialization protocol.
 func getGeneralChannelID(ctx context.Context, q memberQuerier, workspaceID string) (string, error) {
 	var channelID string
 	err := q.QueryRow(ctx, `
@@ -384,32 +368,25 @@ func getGeneralChannelID(ctx context.Context, q memberQuerier, workspaceID strin
 	return channelID, nil
 }
 
-// Bind order: $1 workspace, $2 target user, $3 structural channel, $4 role.
-// The shared predicate locks the eligible target until commit, so an account or
-// workspace membership cannot become inactive between validation and insert.
+// generalMembershipRoles is the role list that receives #geral automatically,
+// and the SQL statement of domain.CanReachPublicChannels: a guest is excluded,
+// and so is any role this list does not recognise. Shared by the single-user
+// path and the backfill so the two cannot disagree about who #geral belongs to.
+const generalMembershipRoles = `('owner', 'admin', 'moderator', 'member')`
+
 func addGeneralChannelMember(ctx context.Context, q memberQuerier, channelID, workspaceID, userID string) error {
-	var eligible bool
-	err := q.QueryRow(ctx, `
-		WITH eligible AS (
-			SELECT wm.user_id
-			FROM chat.workspace_members wm
-			`+channelmembership.EligibleWorkspaceTargetJoinsSQL+`
-			WHERE `+channelmembership.EligibleWorkspaceTargetWhereSQL+`
-			AND wm.user_id = $2::uuid
-			FOR SHARE OF wm, u
-		), inserted AS (
+	_, err := q.Exec(ctx, `
 		INSERT INTO chat.channel_members (channel_id, user_id, role)
-		SELECT $3, user_id, $4 FROM eligible
-		ON CONFLICT (channel_id, user_id) DO NOTHING
-		)
-		SELECT EXISTS (SELECT 1 FROM eligible)`,
-		workspaceID, userID, channelID, string(domain.ChannelRoleMember),
-	).Scan(&eligible)
+		SELECT $1, wm.user_id, $4
+		FROM chat.workspace_members wm
+		WHERE wm.workspace_id = $2
+		  AND wm.user_id = $3
+		  AND wm.role IN `+generalMembershipRoles+`
+		ON CONFLICT (channel_id, user_id) DO NOTHING`,
+		channelID, workspaceID, userID, string(domain.ChannelRoleMember),
+	)
 	if err != nil {
 		return fmt.Errorf("add general channel member: %w", err)
-	}
-	if !eligible {
-		return domain.ErrForbidden
 	}
 	return nil
 }

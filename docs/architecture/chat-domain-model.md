@@ -129,15 +129,15 @@ responses do not include it, and future HTTP responses must not expose it.
 | joined_at       | timestamptz |                                        |
 | left_at         | timestamptz | Nullable; set only when status is left |
 
-Under CURRENT RF-18 (#882), active workspace owners, admins, moderators,
-members and guests with active, undeleted accounts receive a persisted
-`channel_members` row in their workspace's structural `is_general=true` channel.
-Suspended/left memberships, outsiders and unknown roles are excluded. Workspace
-join/reactivation and insertion are atomic; repair/backfill is idempotent and
-preserves existing rows and mute. The channel is locked before workspace
-membership, consistently with add-members; target eligibility is validated and
-locked in the writing transaction. A missing general channel is an explicit
-error, never created by the membership path. No schema change is required.
+Under CURRENT RF-74, active workspace owners, admins, moderators and members
+are eligible for automatic sync into their workspace's mandatory `#geral`
+channel; guests are excluded by `generalMembershipRoles`. The future policy
+and RF-18/RF-74 consolidation belong to #882. The pgx member store performs workspace
+join/reactivation and `#geral` `channel_members` insertion in one transaction
+where the general channel is loaded by the same `workspace_id`. Duplicate rows
+are ignored with `ON CONFLICT DO NOTHING`; unexpected database errors propagate.
+If `#geral` is missing, membership sync returns an explicit error instead of
+creating the channel in this path.
 
 ### messages
 
@@ -229,10 +229,10 @@ Under the current RF-74 policy, active workspace owners, admins, moderators and
 members have implicit access to active public channels, including `#geral`,
 even before a repair sync inserts their `channel_members` row. Active guests
 require explicit `channel_members`; workspace membership alone does not grant
-them implicit access to public channels or `#geral`. RF-18 automatically
-materializes the guest row in structural `#geral`; ordinary public channels
-retain their existing policy. Private channels require explicit membership for
-every role. The domain/SQL visibility predicate remains unchanged.
+them access to public channels or `#geral`. Private channels require explicit
+channel membership for every role. The current domain/SQL visibility predicate
+remains authoritative; this describes existing behavior, not the future `#geral`
+decision owned by #882.
 
 The database enforces the general-channel invariant with a partial unique index,
 an active/public `CHECK`, and deferred constraint triggers. This permits creating
@@ -360,7 +360,7 @@ The listing distinguishes them explicitly: a persisted group carries
 always present, so the response shape never varies.
 
 The seeded `#geral` **channel** is a different object that happens to share the
-word: a structural channel with no category, which therefore appears inside this
+word: an ordinary channel with no category, which therefore appears inside this
 group.
 
 ### Ordering
@@ -686,7 +686,7 @@ group, and its `direct_pair_key` would then describe a conversation that is no
 longer a pair.
 
 Authorization differs between the two because the schema does. Channels use
-`domain.CanManageChannelMembers` (active workspace `owner`, `admin` or `moderator`), the same
+`domain.CanManageChannelMembers` (active workspace `owner` or `admin`), the same
 authority that already removes a channel member. Groups take active
 participation, because `chat.dm_members.role` is closed by CHECK to `'member'`
 and a group has no privileged participant to require. Both decisions and the
@@ -737,7 +737,7 @@ Both writes take the authenticated actor as an explicit argument and re-establis
 their authority in the same transaction that inserts, under a row lock:
 
 - channels re-read `chat.workspace_members` for the actor and require an active
-  `owner`/`admin`/`moderator` row -- the SQL statement of `domain.CanManageChannelMembers`;
+  `owner`/`admin` row -- the SQL statement of `domain.CanManageChannelMembers`;
 - groups re-read the actor's active `chat.dm_members` row, joined to an active
   workspace membership, because a participation row outlives the workspace
   membership that justified it.
@@ -750,9 +750,8 @@ from, and the whole thing rolls back with `ErrForbidden`. The service's
 verdict is deliberately not passed down as a boolean; a boolean computed a moment
 ago is exactly what the query exists to distrust.
 
-Lock order is conversation/channel -> actor membership -> target rows -> insert.
-General membership sync also locks the channel before workspace membership,
-avoiding the reverse order when add-members repairs a general-channel row.
+Lock order is conversation/channel -> actor membership -> target rows -> insert,
+the same order everywhere, so two of these cannot deadlock against each other.
 No lock is held across a WebSocket publish: events go out after commit.
 
 ### Candidate search is conversation-scoped, not workspace-wide
@@ -787,10 +786,11 @@ payload. Exceeding it is `ErrTooManyMembersRequested`, which wraps
 the conversation. Reading multiple successive requests as a way around a limit
 would be a category error: there is no limit to get around.
 
-The store opens a transaction and pins the authorization context while the
-write happens. Channel add-members serializes on the channel row with
-`FOR UPDATE`; membership/account locks protect actor and target eligibility.
-These locks do not impose a participant capacity.
+The store still opens a transaction and still locks, but only `FOR SHARE`, and
+only to pin the authorization context while the write happens — archiving the
+conversation or revoking the actor are UPDATEs that conflict with `FOR SHARE`.
+With no ceiling to serialise, two people adding different users to the same
+large conversation proceed in parallel instead of queueing.
 
 What the transaction does compute is which of the requested users _newly_ became
 participants. That is not a capacity check: it is what `AddedUserIDs` reports,

@@ -3,27 +3,17 @@
 **Branch:** feat/chat-channel-join-leave
 **Status:** Foundation — service/storage/tests only; no HTTP API
 
-> Historical foundation; CURRENT RF-18/RF-74 updates: structural `#geral`
-> (`channels.is_general`, never the display name) automatically materializes
-> active owner/admin/moderator/member/guest with active undeleted accounts.
-> Guest still cannot self-join ordinary public channels. Chat add-members permits
-> idempotent membership/repair in `#geral` under owner/admin/moderator; Admin API
-> uses its separate `admin.channels.manage` gate and the same target eligibility.
-> Rename/archive/leave/remove remain forbidden structurally; mute is preserved.
-> See [current contracts](../architecture/chat-membership-contracts.md) (#882).
-
 ## What this implements
 
 - `MemberService.SelfJoinChannel(ctx, workspaceID, channelID, userID)` — active
   workspace member self-joins a **public** active channel. Private channel self-join returns
   `ErrNotFound` (non-enumerating — private channel existence is not disclosed).
-  #geral explicit join is idempotent for owner/admin/moderator/member; guest
-  membership is materialized automatically and guest self-join remains forbidden.
+  #geral explicit join is idempotent (returns existing membership).
 - `MemberService.LeaveChannel(ctx, workspaceID, channelID, userID)` — removes the
   caller from a channel. Idempotent for non-members. #geral cannot be left.
   Archived channels return `ErrNotFound`.
 - `MemberService.RemoveMemberFromChannel(ctx, workspaceID, channelID, callerID, targetUserID)`
-  — workspace owner, admin or moderator removes any member from a non-#geral channel.
+  — workspace owner or admin removes any member from a non-#geral channel.
 - `MemberStore.RemoveChannelMember(ctx, workspaceID, channelID, userID)` — workspace-scoped
   DELETE with defensive `is_general` guard; idempotent when the row does not exist.
 - `domain.ErrCannotLeaveGeneralChannel` — new sentinel for explicit #geral leave/remove attempts.
@@ -37,15 +27,15 @@
 
 ## Join semantics
 
-| Caller state                        | Public channel | Private channel                   | #geral                        |
-| ----------------------------------- | -------------- | --------------------------------- | ----------------------------- |
-| Active owner/admin/moderator/member | Allowed        | **ErrNotFound** (non-enumerating) | Idempotent (returns existing) |
-| Suspended member                    | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
-| Left member                         | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
-| Non-workspace member                | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
-| Any — disabled workspace            | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
-| Any — archived channel              | ErrNotFound    | ErrNotFound                       | ErrNotFound                   |
-| Any — cross-workspace channel ID    | ErrNotFound    | ErrNotFound                       | ErrNotFound                   |
+| Caller state                     | Public channel | Private channel                   | #geral                        |
+| -------------------------------- | -------------- | --------------------------------- | ----------------------------- |
+| Active workspace member          | Allowed        | **ErrNotFound** (non-enumerating) | Idempotent (returns existing) |
+| Suspended member                 | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
+| Left member                      | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
+| Non-workspace member             | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
+| Any — disabled workspace         | ErrForbidden   | ErrNotFound                       | ErrForbidden                  |
+| Any — archived channel           | ErrNotFound    | ErrNotFound                       | ErrNotFound                   |
+| Any — cross-workspace channel ID | ErrNotFound    | ErrNotFound                       | ErrNotFound                   |
 
 - Channel role is always `ChannelRoleMember`; callers cannot set it.
 - Channel lookup uses `GetChannelByIDInWorkspace` — workspace-scoped, no IDOR possible.
@@ -77,8 +67,8 @@
 
 ## Manager remove
 
-`RemoveMemberFromChannel` currently requires active workspace owner, admin or
-moderator in the same workspace. Returns `ErrForbidden` for member/guest callers.
+`RemoveMemberFromChannel` requires the caller to be an active workspace owner or
+admin in the same workspace. Returns `ErrForbidden` for member/guest callers.
 Cannot be used on #geral (returns `ErrForbidden`). Idempotent for non-members.
 
 ## Private channel invitations / approval flow

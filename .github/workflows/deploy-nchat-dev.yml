@@ -1,5 +1,18 @@
 name: Deploy nchat-dev
 
+# The nchat-dev half of continuous delivery: apply, prove, report (issue #933).
+#
+# Called by cd-develop.yml with a commit `CI / Required` has already passed.
+# It holds no eligibility rule of its own -- the caller decided that -- and it
+# holds no Kubernetes logic of its own either: deploy.sh applies and rolls out,
+# smoke.sh proves the environment is serving the release, and this file wires
+# them together and publishes what happened.
+#
+# Deploy and smoke are two steps rather than one because they answer different
+# questions. A failed deploy means Kubernetes rejected the change; a failed
+# smoke means the change is bad. An operator reading the summary needs to know
+# which, and neither may be reported as success.
+
 on:
   workflow_call:
     inputs:
@@ -45,6 +58,7 @@ jobs:
           NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
         run: scripts/ci/nchat-dev-deployment-check.sh
       - name: Deploy data, migrations and application
+        id: apply
         env:
           ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
           DEPLOY_SHA: ${{ inputs.sha }}
@@ -53,3 +67,40 @@ jobs:
           NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
           NCHAT_DEV_TURN_EXTERNAL_IP: ${{ vars.NCHAT_DEV_TURN_EXTERNAL_IP }}
         run: scripts/deploy/nchat-dev/deploy.sh
+      # Rollout completion is not delivery. This is the step that asks whether
+      # the environment is actually serving the release: migrations complete,
+      # nothing in a restart back-off, the public host answering, the protected
+      # API and the WebSocket route refusing anonymous access rather than 404ing.
+      - name: Smoke the deployed environment
+        id: smoke
+        env:
+          NCHAT_DEV_HOST: ${{ vars.NCHAT_DEV_HOST }}
+        run: scripts/deploy/nchat-dev/smoke.sh
+      # Last, and it reports rather than decides: every step above keeps its
+      # own status, this one adds no `continue-on-error`, and a failed deploy
+      # or smoke has already failed the job by the time it runs.
+      #
+      # `!cancelled()` rather than `always()`: naming a status function at all
+      # stops Actions inserting the implicit `success()`, and a cancelled run
+      # has nothing to report.
+      - name: Publish the deployment summary
+        if: ${{ !cancelled() }}
+        env:
+          DEPLOY_SHA: ${{ inputs.sha }}
+          APPLY_RESULT: ${{ steps.apply.conclusion }}
+          SMOKE_RESULT: ${{ steps.smoke.conclusion }}
+          DIGEST_DIR: ${{ github.workspace }}/artifacts
+        run: |
+          set -euo pipefail
+          {
+            echo "## CD / Develop"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| SHA | \`$DEPLOY_SHA\` |"
+            echo "| Images | $(find "$DIGEST_DIR" -name 'digest-*.txt' -type f | wc -l) pinned by OCI digest |"
+            echo "| Migrations, rollout, readiness | ${APPLY_RESULT:-not reached} |"
+            echo "| Smoke | ${SMOKE_RESULT:-not reached} |"
+            echo
+            echo "Single-slot deployment; no Blue/Green and no traffic switch in this environment."
+          } >>"$GITHUB_STEP_SUMMARY"

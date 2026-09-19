@@ -1,0 +1,318 @@
+name: CD / Prepare Production
+
+# Everything that prepares and proves a production release, automatically
+# (issue #933).
+#
+#   an eligible main commit
+#        -> build once, seal the manifest
+#        -> collect cluster capacity evidence, read-only
+#        -> reserve the idle slot, retiring an expired rollback reservation
+#        -> capacity gate, migrations, candidate deploy, rollout
+#        -> candidate smoke
+#        -> prove the release identity
+#        -> prove the stable Services did not move
+#        -> CANDIDATE READY
+#
+# It ends there. Nothing in this file promotes: there is no step that reaches
+# cutover.sh, rollback.sh, switch_services_to_slot or a Service patch, and the
+# selector invariant it ends on fails the run if anything moved a Service while
+# it ran. Moving production traffic is a human decision, taken in
+# cutover-nchat-prod.yml.
+#
+# The operator types nothing. The commit comes from the CI run that woke this
+# workflow, the build is this run's own, the manifest and digests are this
+# run's artifacts, and the slot is read from the cluster -- the four values
+# #933 removes from the dispatch form.
+#
+# ON RUNNING FROM THE DEFAULT BRANCH. A `workflow_run` handler always executes
+# the copy of its own YAML on the default branch (develop), which is why the
+# runner's pre-job guard authorises exactly this workflow from exactly that
+# branch. What it orchestrates is not develop's: every script it runs comes
+# from the release commit it checks out, which is on main and has passed
+# `CI / Required`. And it moves no traffic, so the two workflows that do are
+# still `workflow_dispatch` from main and nothing else.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  eligibility:
+    if: >-
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/ci-eligibility.yml
+    with:
+      branch: main
+
+  # Build once. `require_main: true` refuses a commit main cannot reach before
+  # anything is pushed, and the manifest sealed here is the identity the
+  # candidate, the cutover and every later proof are compared against. Nothing
+  # downstream rebuilds.
+  build:
+    needs: eligibility
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/images.yml
+    with:
+      sha: ${{ needs.eligibility.outputs.sha }}
+      require_main: true
+
+  # Issue #714. The capacity calculation needs a cluster-wide view -- the node
+  # is shared with other namespaces, so nchat-prod's own requests do not
+  # describe what is left -- and the production deployer must never be given
+  # one. So the two are separated: this job collects under a read-only identity
+  # of its own, on its own runner label, and publishes the snapshot; the
+  # deployer consumes it and still cannot read a Node or another namespace's
+  # Pods.
+  #
+  # After the build, not beside it. The evidence is valid for fifteen minutes
+  # and eleven image builds take longer than that; collecting first would hand
+  # the candidate job a snapshot that load_capacity_evidence then refuses as
+  # stale, which is correct behaviour and a wasted release.
+  capacity:
+    needs: [eligibility, build]
+    name: Collect production capacity evidence
+    runs-on: [self-hosted, linux, x64, nchat-prod-capacity]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.eligibility.outputs.sha }}
+          persist-credentials: false
+      # Refuses to publish anything it could not collect in full: a kubectl
+      # that failed, or a resource that came back empty, ends the run with no
+      # metadata written, and the deployer treats a directory without valid
+      # metadata as absent. There is no path here that turns a failed
+      # collection into a snapshot.
+      - name: Collect the cluster-wide capacity snapshot
+        run: scripts/deploy/nchat-prod/capacity-evidence.sh "$RUNNER_TEMP/capacity-evidence"
+      # Node allocatable figures and pod names from other namespaces. Cluster
+      # topology, not secrets -- no kubeconfig, no token and no Secret value is
+      # read by the collector at all -- but it is retained for a day rather
+      # than ninety: its only consumer is the job immediately after it.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: capacity-evidence
+          path: ${{ runner.temp }}/capacity-evidence
+          retention-days: 1
+          if-no-files-found: error
+
+  # The candidate. It ends with a slot that is Ready, isolated from production
+  # traffic, smoked, proved to carry this run's release, and with the stable
+  # Services proved untouched. It patches no Service.
+  candidate:
+    needs: [eligibility, build, capacity]
+    name: Prepare the production candidate
+    # The shared production mutation lock, and it is declared here rather than
+    # on the workflow. Candidate preparation, cutover and rollback all take
+    # this one group, because all three mutate nchat-prod and no two of them
+    # may overlap: a candidate deployed underneath a cutover, or a rollback
+    # racing a drain, is a namespace nobody can reason about afterwards.
+    #
+    # On the job, because the jobs before it are eligibility, an image build
+    # and a read-only capacity collection -- twenty minutes of work that
+    # touches nchat-prod not at all. Holding the lock across them would mean an
+    # incident rollback waiting for an image build to finish, which is the one
+    # thing "rollback stays available" has to rule out.
+    #
+    # cancel-in-progress must be the boolean false. The string "false" is
+    # truthy to the expression evaluator, and cancelling a job that is applying
+    # migrations or waiting on a rollout leaves a half-built candidate with
+    # nobody watching it.
+    concurrency:
+      group: nchat-prod-release-mutation
+      cancel-in-progress: false
+    runs-on: [self-hosted, linux, x64, nchat-prod-deploy]
+    permissions:
+      # actions: read is what lets this job read the artifacts of its own run.
+      # It carries no write of any kind.
+      actions: read
+      contents: read
+    timeout-minutes: 45
+    steps:
+      - name: Validate the release SHA
+        env:
+          RELEASE_SHA: ${{ needs.eligibility.outputs.sha }}
+        run: '[[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      # Full history: the ancestry of main has to be walked, not assumed.
+      - name: Checkout the release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.eligibility.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Proved a second time, at the deploy identity. The builder proved it
+      # before pushing an image; this proves it before anything reaches the
+      # cluster, and the two are different moments.
+      - name: Require a SHA reachable from main
+        env:
+          RELEASE_SHA: ${{ needs.eligibility.outputs.sha }}
+        run: scripts/deploy/nchat-prod/require-main-sha.sh "$RELEASE_SHA"
+      # This run's own artifact, so no run-id and no token: the manifest can
+      # only be the one this run's build sealed.
+      - name: Download the sealed release manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-manifest
+          path: release-manifest
+      - name: Pin the release images from the manifest
+        env:
+          NCHAT_PROD_RELEASE_SHA: ${{ needs.eligibility.outputs.sha }}
+        run: scripts/deploy/nchat-prod/release-digests.sh release-manifest artifacts
+      # The identity of what is being deployed: the SHA-256 the manifest was
+      # sealed with. A rebuild of the same commit seals a different manifest,
+      # so this is the value that distinguishes two builds a commit cannot.
+      - name: Read the release identity
+        id: release
+        run: echo "release_id=$(cat artifacts/release-id.txt)" >>"$GITHUB_OUTPUT"
+      - name: Download the capacity evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: capacity-evidence
+          path: capacity-evidence
+      # One read of the cluster, used for everything that depends on it: the
+      # snapshot the selector invariant is proved against, the slot the deploy
+      # goes into, and the lifecycle decision about whether that slot may be
+      # reused at all. Taking them separately would leave windows in which they
+      # disagree, and the evidence would then describe a state no decision was
+      # ever made from.
+      #
+      # The candidate is opposite_slot(active), derived from the cluster.
+      # Nothing here reads a slot from an input, and neither blue nor green is
+      # written down: a mixed or unknown state fails instead of being guessed.
+      #
+      # The lifecycle gate is what #933 adds. The idle slot may be the rollback
+      # for the release currently in production, and this is where that is
+      # checked: a reservation whose retention window has not elapsed stops the
+      # release here, and one that has is retired through drain-old.sh under
+      # the full set of preconditions before the slot is reused.
+      - name: Reserve the candidate slot
+        id: slot
+        env:
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+          NCHAT_PROD_ROLLBACK_RETENTION_SECONDS: ${{ vars.NCHAT_PROD_ROLLBACK_RETENTION_SECONDS }}
+        run: scripts/deploy/nchat-prod/prepare-slot.sh "$SELECTORS_BEFORE" >>"$GITHUB_OUTPUT"
+      # Context, namespace, topology, capacity, migrations, apply and rollout,
+      # in that order and each fail-closed. It patches no stable Service.
+      #
+      # The capacity gate inside it reads the evidence collected above, and
+      # refuses the deploy if that evidence is missing, stale, truncated,
+      # checksum-mismatched, for another namespace, or a symlink. Absent
+      # evidence never becomes "enough capacity".
+      - name: Deploy the candidate slot
+        env:
+          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+          NCHAT_PROD_CAPACITY_EVIDENCE_DIR: ${{ github.workspace }}/capacity-evidence
+          # The slot resolved above, handed over rather than derived again.
+          # deploy.sh revalidates it against the cluster and refuses if the
+          # stable Services moved in between, so one decision drives the
+          # deploy, the smoke, the selector proof and the evidence.
+          NCHAT_PROD_CANDIDATE_SLOT: ${{ steps.slot.outputs.candidate }}
+          NCHAT_PROD_RELEASE_SHA: ${{ needs.eligibility.outputs.sha }}
+          NCHAT_PROD_TOPOLOGY_FILE: ${{ vars.NCHAT_PROD_TOPOLOGY_FILE }}
+          NCHAT_PROD_ASSUME_YES: "1"
+        run: scripts/deploy/nchat-prod/deploy.sh
+      # Fails the job on any automated check. It also proves the candidate is
+      # isolated from production traffic and carries one consistent release.
+      - name: Candidate smoke
+        env:
+          CANDIDATE_SLOT: ${{ steps.slot.outputs.candidate }}
+        run: scripts/deploy/nchat-prod/smoke.sh --target "$CANDIDATE_SLOT"
+      # The invariant, as evidence rather than as an argument: the same reader
+      # that produced the snapshot, run again against the cluster, compared
+      # exactly. A difference fails the run and is never repaired here -- this
+      # step exists to detect that something moved production, and repairing it
+      # would destroy the one record of that happening.
+      - name: Prove the stable Services did not move
+        env:
+          SELECTORS_BEFORE: ${{ runner.temp }}/stable-selectors-before.txt
+          SELECTORS_AFTER: ${{ runner.temp }}/stable-selectors-after.txt
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          collect_service_slots >"$SELECTORS_AFTER"
+          echo "stable Service selectors after the deploy:"
+          cat "$SELECTORS_AFTER"
+          diff -u "$SELECTORS_BEFORE" "$SELECTORS_AFTER"
+          echo "The stable Services select exactly what they selected before this run."
+      # The second invariant, and it is independent of the first. The selector
+      # proof says production traffic did not move; this says the candidate was
+      # not replaced underneath the run. A concurrent redeploy of the same slot
+      # leaves the selectors untouched and produces a slot that is equally
+      # Ready and equally CONSISTENT, so the smoke passes and only the identity
+      # tells the two releases apart.
+      - name: Verify the candidate carries the release this run built
+        env:
+          CANDIDATE_SLOT: ${{ steps.slot.outputs.candidate }}
+          EXPECTED_RELEASE: ${{ needs.eligibility.outputs.sha }}:${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          require_slot_release_identity "$CANDIDATE_SLOT" "$EXPECTED_RELEASE"
+          echo
+          echo "Slot $CANDIDATE_SLOT is running exactly $EXPECTED_RELEASE."
+      # Only now, after both invariants held. The record is what lets the
+      # cutover run hours later without an operator transcribing anything, and
+      # writing it before the proofs would mean recording a candidate that had
+      # not been proved.
+      #
+      # It is a claim, not an authorisation: the cutover re-reads the cluster
+      # and refuses if what it finds disagrees.
+      - name: Record the candidate as ready
+        env:
+          CANDIDATE_SLOT: ${{ steps.slot.outputs.candidate }}
+          EXPECTED_RELEASE: ${{ needs.eligibility.outputs.sha }}:${{ steps.release.outputs.release_id }}
+          PREPARE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/deploy/nchat-prod/lib.sh
+          source scripts/deploy/nchat-prod/lib.sh
+          # shellcheck source=scripts/deploy/nchat-prod/release-state.sh
+          source scripts/deploy/nchat-prod/release-state.sh
+          record_candidate_ready "$CANDIDATE_SLOT" "$EXPECTED_RELEASE" "$PREPARE_RUN_ID"
+      # Nothing above published a success, so every gate is proved before this
+      # run claims anything about the cluster.
+      - name: Publish the candidate summary
+        if: ${{ !cancelled() }}
+        env:
+          ACTIVE_SLOT: ${{ steps.slot.outputs.active }}
+          CANDIDATE_SLOT: ${{ steps.slot.outputs.candidate }}
+          EXPECTED_RELEASE: ${{ needs.eligibility.outputs.sha }}:${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production Candidate Ready"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Current active | \`${ACTIVE_SLOT:-unknown}\` |"
+            echo "| Candidate | \`${CANDIDATE_SLOT:-unknown}\` |"
+            echo "| Candidate release | \`$EXPECTED_RELEASE\` |"
+            echo
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Capacity | PASS |"
+            echo "| Migrations | PASS |"
+            echo "| Rollout | PASS |"
+            echo "| Candidate smoke | PASS |"
+            echo "| Release identity | PASS |"
+            echo "| Stable selectors | UNCHANGED |"
+            echo
+            echo "Production traffic remains on \`${ACTIVE_SLOT:-unknown}\`."
+            echo "Next action: **Actions -> Production / Cutover**."
+          } >>"$GITHUB_STEP_SUMMARY"

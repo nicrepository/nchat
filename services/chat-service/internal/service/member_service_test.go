@@ -853,7 +853,13 @@ func TestMemberService_SelfJoinChannel_NotFound_ExactErrorShape(t *testing.T) {
 	}
 }
 
-// The fake follows RF-18 for all five roles, including guest.
+// Regression for the test double itself: the fake member store used to join
+// every active member to #geral, guests included, while PGXMemberStore stopped
+// doing that for guests in RF-74. A fake that is more permissive than the store
+// makes the service suite agree with a state production cannot produce, so a
+// regression in the guest boundary would have gone unnoticed here.
+//
+// Both sides now gate on domain.CanReachPublicChannels.
 func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T) {
 	general := func(ms *fakeMemberStore) (string, bool) {
 		_, ok := ms.channelMembers[cmKey("ch-geral", "u")]
@@ -865,7 +871,7 @@ func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T)
 			role domain.WorkspaceRole
 			want bool
 		}{
-			{role: domain.WorkspaceRoleGuest, want: true},
+			{role: domain.WorkspaceRoleGuest, want: false},
 			{role: domain.WorkspaceRoleMember, want: true},
 			{role: domain.WorkspaceRoleModerator, want: true},
 			{role: domain.WorkspaceRoleAdmin, want: true},
@@ -889,7 +895,7 @@ func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T)
 			role domain.WorkspaceRole
 			want bool
 		}{
-			{role: domain.WorkspaceRoleGuest, want: true},
+			{role: domain.WorkspaceRoleGuest, want: false},
 			{role: domain.WorkspaceRoleMember, want: true},
 		} {
 			t.Run(string(tt.role), func(t *testing.T) {
@@ -908,7 +914,7 @@ func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T)
 		}
 	})
 
-	t.Run("SyncGeneralMemberships includes guests", func(t *testing.T) {
+	t.Run("SyncGeneralMemberships skips guests", func(t *testing.T) {
 		ms := newFakeMemberStore()
 		ms.generalChannels["ws-1"] = "ch-geral"
 		ms.workspaceMembers[wmKey("ws-1", "u")] = domain.WorkspaceMember{
@@ -920,15 +926,18 @@ func TestFakeMemberStore_GeneralMembershipMirrorsTheStoreForGuests(t *testing.T)
 		if err != nil {
 			t.Fatalf("SyncGeneralMemberships: %v", err)
 		}
-		if inserted != 2 {
-			t.Fatalf("inserted = %d, want 2", inserted)
+		if inserted != 1 {
+			t.Fatalf("inserted = %d, want 1 (the member only)", inserted)
 		}
-		if _, ok := general(ms); !ok {
-			t.Fatal("sync did not join guest to #geral")
+		if _, ok := general(ms); ok {
+			t.Fatal("sync joined a guest to #geral")
 		}
 	})
 
-	// Sync only inserts missing memberships.
+	// "A guest is not joined automatically" is not "a guest may never belong".
+	// RF-74 says a guest reaches the channels it was explicitly added to, and
+	// #geral is not special: an explicit membership must survive a sync, which
+	// only ever inserts.
 	t.Run("explicit guest membership survives sync", func(t *testing.T) {
 		ms := newFakeMemberStore()
 		ms.generalChannels["ws-1"] = "ch-geral"

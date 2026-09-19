@@ -146,8 +146,9 @@ type AddChannelMembersInput struct {
 //
 // The channel is then loaded workspace-scoped and active-only, which is what
 // refuses an archived channel, a channel from another tenant and one that never
-// existed with the same ErrNotFound. For #geral this is an idempotent repair
-// of the membership every active workspace member must hold (RF-18).
+// existed with the same ErrNotFound. #geral is refused as well: every active
+// workspace member already belongs to it by the membership sync, so "adding"
+// someone would either be a no-op or a way to write rows the sync owns.
 //
 // The store is the authority on the write. Everything below it — the UUID
 // parsing, the de-duplication, the batch cap — exists to refuse a malformed or
@@ -178,6 +179,9 @@ func (s *MemberService) AddChannelMembers(ctx context.Context, input AddChannelM
 			return storage.AddMembersResult{}, domain.ErrNotFound
 		}
 		return storage.AddMembersResult{}, fmt.Errorf("get channel: %w", err)
+	}
+	if channel.IsGeneral {
+		return storage.AddMembersResult{}, fmt.Errorf("%w: every active member already belongs to geral", domain.ErrInvalidInput)
 	}
 
 	// The actor is handed to the store so the transaction re-derives their

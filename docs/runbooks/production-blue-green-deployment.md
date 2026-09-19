@@ -943,6 +943,25 @@ Leaving `NCHAT_PROD_CAPACITY_EVIDENCE_DIR` unset keeps the previous behaviour,
 which is what a rehearsal cluster or an administrator running the deploy by hand
 should use.
 
+**In continuous delivery the collection is a job, not an operator step.**
+`CD / Prepare Production` runs `capacity-evidence.sh` in its own `capacity`
+job, on the `nchat-prod-capacity` runner with a read-only cluster-scoped
+context of its own, and uploads the directory as a run artifact. The
+`candidate` job downloads that artifact into its workspace and points
+`NCHAT_PROD_CAPACITY_EVIDENCE_DIR` at it. Neither identity gains the other's
+reach: the deployer still answers `no` to `get nodes` and to
+`get pods --all-namespaces`, and the collector cannot read the production
+kubeconfig.
+
+The collection runs **after** the build, not beside it. The evidence is valid
+for fifteen minutes and building eleven images takes longer than that, so
+collecting first would hand the candidate job a snapshot `load_capacity_evidence`
+then correctly refuses as stale — a fail-closed outcome, and a wasted release.
+That ordering is also the whole TOCTOU story: the window between collection and
+consumption is bounded by `NCHAT_PROD_CAPACITY_EVIDENCE_MAX_AGE_SECONDS`, the
+rollout is the second barrier for anything that moved inside it, and nothing
+here pretends to eliminate a race that only a scheduler reservation could.
+
 **What the evidence is trusted on.** The checksums detect a truncated or edited
 file. They are **not** authenticity — anything that can write the directory can
 write a matching `sha256sums.txt`. The evidence is believed because of where it
@@ -1140,135 +1159,452 @@ The old slot keeps running. It is the rollback.
 
 ---
 
-## 11b. The release from GitHub Actions
+## 11b. Continuous delivery from GitHub Actions
 
-`.github/workflows/deploy-nchat-prod.yml` runs sections 6, 7 and 9 in its
-`candidate` job, and section 11 in a separate `cutover` job that starts only
-after a reviewer approves the run in the `production` GitHub Environment.
-**The candidate job cannot promote**; the cutover job is the only automation in
-this repository that changes a stable Service selector, and it does it by
-calling the same `cutover.sh` section 11 does.
+Issue #933 split what used to be one dispatched workflow into three, because
+the release has three phases and only two of them are decisions:
 
 ```text
-workflow_dispatch (sha, run_id)
-    |
-    +-- candidate job          it cannot promote
-          validate sha and run id, refuse a dispatch from outside main
-          checkout the sha, prove it is reachable from main
-          download the sealed release manifest of run_id
-          pin the eleven digests the manifest seals
-          derive the release id from the manifest seal
-          snapshot every stable Service selector, resolve active,
-            take the candidate as its opposite
-          deploy.sh  -> the idle slot, no traffic, stamped sha + release id
-          smoke.sh   -> automated checks only
-                |
-                v
-          stable selector invariant
-            re-read the stable Services, diff against the snapshot
-                |
-                v
-          candidate release identity revalidation
-            read the slot's release from the cluster, require it to equal
-            the dispatched sha and the sealed release id
-                |
-                v
-          release evidence / workflow success
-    |
-    +== the candidate is Ready and carries no traffic. The run stops here
-    |   until a reviewer approves it.
-    |
-    +-- cutover job            environment: production, needs: candidate
-          [required reviewer approves the run]
-          checkout the sha, prove main can still reach it
-          download the sealed release manifest of run_id again
-          read every stable Service selector                 -> BEFORE
-            classify against the target: every Service must select
-            the target or its opposite, else FAIL before any patch
-            rollback target = opposite_slot(target)
-          revalidate: the candidate slot still carries exactly
-            <sha>:<release id>, read from the cluster
-          cutover.sh --target <candidate>   the one mutation
-          record every stable Service                        -> AFTER
-            read-only, and recorded whether the promotion passed or failed
-          [promotion failed] -> job FAILED, AFTER kept, nothing judged
-          require every Service to select the target
-          re-read the release the promoted slot is running
-                |
-                v
-          promotion evidence / workflow success
+CD / Prepare Production     automatic   builds and proves a candidate
+Production / Cutover        manual      moves production traffic
+Production / Rollback       manual      moves it back, during an incident
 ```
 
-Promotion is **not** disabled anywhere: there is no `if: false` to flip and no
-input that selects a promoting path, because a gate one edit away from being
-open is not a boundary. What holds it shut is the approval on the `production`
-environment, which is configured on the environment and not in this repository.
+**Automate everything that prepares and proves a release; keep manual only the
+decision to move traffic to it, and the decision to move it back.** Everything
+below follows from that sentence.
 
-**Approving the run is the authenticated smoke.** The workflow cannot perform
-section 10 — no shell against an in-cluster Service can sign in through
-Keycloak — and does not claim to. What the approval records is that a human
-performed and reviewed that checklist for the exact `candidate:release` the run
-reports, and authorised that candidate for promotion. Approving without having
-done it is the one failure nothing here can catch, which is why the run prints
-the release identity before the gate and the cutover job prints it again after.
+The operator no longer types anything. There is no SHA to paste, no build run
+id, no release id and no slot: all four are derived, and every one of them is
+proved against the cluster before a Service is patched.
 
-The cutover job re-reads the cluster before it patches anything, and that is
-not redundancy: an approval can arrive hours after the smoke, and a candidate
-redeployed, rebuilt or degraded in the meantime is exactly as Ready and as
-consistent as the one that was validated. Only the release identity separates
-them, so it is compared against `<sha>:<release id>` before the promotion and
-again after it. The evidence handed to `cutover.sh` is `<slot>:<sha>:<release
-id>` — which `cutover.sh` then recomputes from the cluster for itself, so a
-token this job assembled is checked rather than believed.
+### The eligibility boundary
 
-The preflight **classifies the selectors against the target** rather than
-resolving them into an active slot, and the difference matters. A namespace
-split between blue and green is the ordinary shape of a cutover to this same
-target that stopped part-way, and converging it is exactly what a retry with the
-same `--target` is for; refusing every mixed reading would close the one path
-that finishes it. So a blue/green split **continues**, to the same target. What
-fails, before anything is patched, is a reading this cannot describe: a Service
-selecting a value that is neither slot, one carrying no `nchat.io/release-slot`
-key, or one that is not there at all.
+Both automatic flows start from one question, asked by
+`.github/workflows/ci-eligibility.yml`:
 
-**The workflow's preflight does not replace the gate inside `cutover.sh`, and
-is not allowed to.** It runs before the approval, so what it proves is a fact
-about the namespace at that moment; the approval can arrive hours later.
-`cutover.sh` reads the cluster for itself and runs the same
-`require_promotable_selectors` against **that** reading — the one its own
-mutation is decided from — before it patches anything. Both checks are the same
-primitive and neither is decorative: the preflight is what fails a run early and
-before a reviewer is asked to approve it, and the check inside `cutover.sh` is
-what holds when the namespace changes after the preflight passed. That second
-one also holds for an operator running `cutover.sh` by hand per section 11,
-where no preflight ran at all.
+```text
+did `CI / Required` succeed for this exact commit?
+```
 
-**The target is never recalculated.** It is the slot the candidate job built and
-the reviewer approved, and a retry converges on it rather than inverting to the
+and from nothing else. `CI / Required` is the aggregation job of `ci.yml`
+(issue #931), so the verdict is read from **that job, by name**, through the
+run's `.../jobs` payload — never from the CI run's own `conclusion`.
+
+That distinction is the whole point. A run's conclusion is `failure` whenever
+any job in it failed, `Quality / SonarQube` included, so a handler that trusted
+it would turn the advisory Sonar Quality Gate back into a blocking one, through
+the CD pipeline, which is the one place #931 says it must not reach.
+
+```text
+Quality / SonarQube = FAILED
+CI / Required       = PASS
+        -> the commit is eligible; the release proceeds
+```
+
+A scanner, token or upload failure is different and stays visible: it fails
+`Quality / SonarQube` as its own red job, and it still does not reach this gate.
+Nothing here is wrapped in `continue-on-error`.
+
+The gate also binds the run to the commit. The run's workflow name, branch,
+event, **attempt number** and head SHA must all be what the delivery expects,
+so "a run passed" and "this commit is being deployed" cannot drift apart.
+
+The attempt matters because a CI run is not immutable. `/runs/{id}` and
+`/runs/{id}/jobs` answer for the _latest_ attempt, so a re-run started while an
+earlier attempt's handler is still in flight would have that handler read a
+verdict its own event never announced — deploying on a pass nobody's event
+reported, or refusing a commit that did pass because the newer attempt is still
+running. The eligibility job therefore reads the attempt-scoped endpoints,
+`/runs/{id}/attempts/{n}` and `/attempts/{n}/jobs`, and the attempt number in
+the payload is compared against the one the event carried. The checker runs from the
+**default branch's** copy of `scripts/ci/check_ci_eligibility.py`, never from
+the commit being judged: a commit may not supply the checker that decides
+whether it is eligible.
+
+### CD / Prepare Production
+
+Triggered by a `CI` run completing for `main`. It ends with a candidate that is
+Ready, carries no traffic, has been smoked, is proved to be running exactly the
+release this run built, and with the stable Services proved untouched.
+
+**It cannot promote.** There is no step in it that reaches `cutover.sh`,
+`rollback.sh`, `switch_services_to_slot` or a Service patch, and the selector
+invariant it ends on fails the run if anything moved a Service while it ran.
+
+```text
+CI run completed, head_branch = main, event = push
+    |
+    +-- eligibility            CI / Required for this exact SHA, or nothing happens
+    |
+    +-- build                  images.yml, require_main: true
+    |     eleven images, once, identified by OCI digest
+    |     release manifest sealed with a SHA-256 -> the release id
+    |
+    +-- capacity               runner: nchat-prod-capacity, read-only, cluster-wide
+    |     capacity-evidence.sh -> uploaded as a run artifact
+    |
+    +-- candidate              runner: nchat-prod-deploy, namespaced
+          validate the SHA, check it out, prove main reaches it
+          download this run's sealed manifest
+          pin the eleven digests the manifest seals
+          derive the release id from the manifest seal
+          download the capacity evidence
+                |
+                v
+          prepare-slot.sh   snapshot the selectors, resolve active,
+                            candidate = opposite(active), and then the
+                            lifecycle gate:
+                              reservation standing -> FAIL, release blocked
+                              reservation expired  -> drain-old.sh, prove 0
+                              no reservation       -> reuse directly
+                |
+                v
+          deploy.sh   capacity gate, migrations, apply, rollout
+          smoke.sh    candidate profile: isolation, one release, readiness
+                |
+                v
+          stable selector invariant      diff the two readings
+          candidate release identity     read from the cluster
+                |
+                v
+          record_candidate_ready         the lifecycle record
+          CANDIDATE READY                the step summary
+```
+
+Nothing is published as a success until both invariants have passed, and the
+lifecycle record is written only after them: recording a candidate that has not
+been proved is exactly the claim a later cutover must not be able to act on.
+
+### The lifecycle record
+
+Cutover can now happen hours after preparation, in a different workflow run, so
+three facts need somewhere to live that a job output cannot provide: which
+candidate was prepared and on what release, when the last cutover happened, and
+which build run sealed the manifest.
+
+They live in one ConfigMap, `nchat-release-state` in `nchat-prod`, written
+whole and read whole by `scripts/deploy/nchat-prod/release-state.sh`:
+
+| Key                      | What it records                                  |
+| ------------------------ | ------------------------------------------------ |
+| `schema`                 | `nchat-prod-release-state/v1`                    |
+| `candidate_slot`         | the slot the last preparation validated          |
+| `candidate_release`      | `<sha>:<release id>` it validated on that slot   |
+| `candidate_ready_at`     | when preparation finished, RFC3339 UTC           |
+| `prepare_run_id`         | the run whose artifact holds the sealed manifest |
+| `active_slot`            | the slot the last traffic move left serving      |
+| `cutover_at`             | when that move happened                          |
+| `rollback_reserved_slot` | the slot being kept alive as the rollback        |
+| `post_cutover_smoke`     | the release proved through the stable Services   |
+
+**It is a claim, and never an authorisation.** Every consumer re-reads the
+cluster and proves the claim against it — `require_slot_release_identity` for
+the release, `collect_service_slots` for the selectors, `slot_ready` for
+readiness — and a record that contradicts the cluster fails the operation
+instead of deciding it. The record can make a permitted operation _refused_ (a
+stale candidate, an unexpired retention window); it can never make a refused
+one permitted. Deleting it blocks the pipeline; it does not open it.
+
+`require_consistent_record` is where that stops being a slogan. Before any
+lifecycle decision is taken, the record must satisfy its own invariants: every
+key of the contract must be **present** (an empty value is a state, a missing
+key is a record nobody finished writing), no key outside the contract may
+appear, the schema must be the expected one, an `active_slot` it claims must be
+the slot the selectors actually select, a `rollback_reserved_slot` it claims
+must be the idle one, and the four candidate fields must be all set or all
+empty. A record that fails any of them blocks the release and asks for
+investigation — it is not quietly overridden by the cluster reading, because a
+record that wrong was written by something that is not this pipeline, or by
+something that died half-way, and neither is a state to reason forward from.
+
+**Absent, empty and unreadable are three different answers.** Only the first is
+a bootstrap:
+
+| The read found                     | Meaning                         | Outcome       |
+| ---------------------------------- | ------------------------------- | ------------- |
+| no ConfigMap                       | first release in this namespace | proceed       |
+| a ConfigMap, valid                 | the recorded state              | validate, use |
+| a ConfigMap with empty `data`      | something wrote a husk          | **refuse**    |
+| a ConfigMap missing a contract key | a write that did not finish     | **refuse**    |
+| a ConfigMap with an unexpected key | not written by this pipeline    | **refuse**    |
+| the read failed                    | nothing is known                | **refuse**    |
+
+The distinction is made with `kubectl get --ignore-not-found`, which exits 0
+and prints nothing for a missing object while keeping its non-zero exit for
+every other failure — no context, no credential, no API, no permission. It is
+not a match against the text of an error message. Because an existing
+ConfigMap with empty `data` renders identically to a missing one, a second
+`-o name` read separates those two, and a failure of _that_ read is a refusal
+as well rather than a vote for absence.
+
+This matters most in the one case it was getting wrong: a transient read error
+used to arrive as an empty record, which read as "no rollback is reserved" —
+and from there the next release would have drained the slot that was the way
+back.
+
+The cluster stays the source of truth for **where production is**. The active
+slot is always `resolve_active_slot(collect_service_slots())`, never
+`active_slot` from the record — which is why a rollback needs no special
+handling in the next release: the selectors say what is live, and the record's
+claim about it is only ever cross-checked.
+
+### Production / Cutover
+
+`workflow_dispatch`, no inputs. The operator clicks **Run workflow**.
+
+```text
+Run workflow (no inputs)
+    |
+    +-- refuse a dispatch from outside refs/heads/main
+    +-- checkout main at full depth
+    |
+    +-- cutover-preflight.sh
+    |     read the lifecycle record whole
+    |     require a complete candidate: slot, <sha>:<id>, run id, timestamp
+    |     require it to be recent  (NCHAT_PROD_CANDIDATE_MAX_AGE_SECONDS)
+    |     snapshot and classify the stable selectors against the target
+    |     require the slot Ready
+    |     require the cluster to be carrying exactly the recorded release
+    |     -> candidate, release_sha, release_id, prepare_run_id, rollback_target
+    |
+    +-- prove main still reaches the release SHA
+    +-- download the sealed manifest of prepare_run_id
+    |
+    +-- cutover.sh --target <candidate>        the one mutation
+    |
+    +-- record the selectors after      read-only, even on a failed promotion
+    +-- prove total convergence         all_services_on_slot
+    +-- prove the promoted release      require_slot_release_identity
+    +-- record_cutover                  reserve the demoted slot
+    +-- record-traffic-smoke.sh        post-traffic smoke, result recorded
+    +-- summary
+```
+
+**Every derived value is proved, not believed.** The record says which
+candidate; the cluster says what is actually on that slot, and they must agree
+before anything is patched. The `prepare_run_id` cannot point anywhere useful
+either: a manifest from another run seals a different release id, and
+`cutover.sh` recomputes that id from the seal and compares it against what the
+slot is running.
+
+**The target is explicit to the script and is never recalculated.** A retry
+after a partial cutover converges on the same slot rather than inverting to the
 opposite of whatever now looks active — the bug that would send production back
-to the release it had just left.
+to the release it had just left. `web -> green, auth -> green, chat -> blue`,
+re-run with target `green`, converges on green.
 
-**The rollback target is `opposite_slot(target)`**, derived from the authorised
-target and never read back from the selectors. Reading it back would name the
-target itself once the namespace has converged, which is the one slot a rollback
-can never go to. The job prints it and does nothing with it: `rollback.sh`,
-`drain-old.sh` and the observation window are outside this workflow, and no
-rollback is ever automatic.
+**The rollback slot is `opposite_slot(target)`**, resolved in the preflight from
+the authorised target and never read back from the selectors: once the namespace
+has converged they name the target itself, which is the one slot a rollback can
+never go to.
 
-**The after-state is recorded even when the promotion fails.** A cutover that
-stops part-way is the run whose after-state matters most and the run an
-asserting step would never reach, so recording and judging are two steps: the
-recording is read-only, repairs nothing, and runs when the promotion actually
-ran; the judgement is an ordinary step that stays skipped when the promotion
-failed, so no success is ever claimed for one. The job's status is the
-promotion's. Finishing a half-converged namespace from there is `cutover.sh
---target <the same slot>` run by an operator who has looked at that recording
-(section 12).
+**`record_cutover` runs before the post-cutover smoke.** The traffic has moved
+and the demoted slot is the rollback from that moment, whether or not the smoke
+passes — and a failing smoke is exactly when the reservation matters most.
 
-"When the promotion actually ran" is an allowlist of two conclusions, and it has
+**A failing post-cutover smoke fails the run and nothing else.** There is no
+automatic rollback: one failing probe is not a reason for a second unattended
+traffic move. The previous slot is still running, the evidence is in the
+summary, and `Production / Rollback` is one click away with a reason recorded.
+
+**The post-cutover smoke is a different command, not a flag.** `smoke.sh`
+validates a _candidate_ and its central assertion is that the slot carries no
+production traffic; that assertion is why it is trustworthy, and it is exactly
+false after a cutover. Adding `--isolated=false` to it would put the one gate
+that keeps a candidate smoke honest one argument away from being off. So
+`stable-smoke.sh` inverts the rule instead: it requires the target to be what
+every stable Service selects, and reaches the workloads the way production does
+— through the stable Service names, not `<service>-<slot>`.
+
+### Production / Rollback
+
+`workflow_dispatch`, two required inputs. Completes issue #801.
+
+```text
+target_slot   blue | green      required, and never derived
+reason        free text         required, recorded in the summary
+```
+
+Independent of the release pipeline by construction: it shares no job, no output
+and no artifact with the other two, so a broken release pipeline — very often
+why a rollback is needed — cannot take the rollback down with it.
+
+```text
+Run workflow (target_slot, reason)
+    |
+    +-- validate: ref is main, slot is blue|green, reason is one line of
+    |   at most 200 printable characters
+    +-- checkout main at full depth
+    |
+    +-- rollback-preflight.sh --target <slot>
+    |     classify the selectors against the target
+    |     require the target Ready and carrying one consistent release
+    |     read the release currently in front of it
+    |
+    +-- rollback-schema-gate.sh <target sha> <current sha>
+    |     every migration added between the two must be expand-only
+    |
+    +-- rollback.sh --target <slot> "<reason>"     the one mutation
+    |
+    +-- record the selectors after
+    +-- prove total convergence; mixed state FAILS
+    +-- record_rollback
+    +-- record-traffic-smoke.sh        post-rollback smoke, result recorded
+    +-- summary: from, to, reason, release, schema, selectors, smoke
+```
+
+**The target is the operator's and is never derived.** That is the one place
+this deliberately differs from the cutover, and it is not an oversight: a
+rollback runs under pressure and may be run twice, and a destination computed
+from the state it is about to change would send production, on the second run,
+back to the release it had just been rescued from. Named, a second run
+converges. A partial rollback is finished by running this again with the **same**
+target, never by choosing the other one.
+
+**No build, no migration, no `migrate down`.** Rolling back an application is a
+selector change; rolling back a database is not. The release contract —
+migrations stay compatible with the previous slot — is what makes the first
+possible without the second, and `rollback-schema-gate.sh` is where that
+contract is checked before traffic moves. See section 14.
+
+**Both inputs are untrusted.** `target_slot` is a `choice` input, but a choice
+is a form affordance and not an enforcement boundary — the API accepts any
+string for it — so it is matched against the allowlist in the workflow as well,
+and `require_target_slot` matches it again inside every script. `reason` is
+never executed, never interpolated into a command line, and never written into
+a GitHub command file: it reaches `rollback.sh` as a quoted argument, and it is
+constrained to one line of printable ASCII so that it cannot forge rows in the
+step summary an incident review reads.
+
+### The authenticated smoke, and who records it
+
+`cutover.sh` will not promote without `NCHAT_PROD_SMOKE_CONFIRMED`, and the
+workflow supplies it. That is not the workflow vouching for section 10: no
+shell against an in-cluster Service can sign in through Keycloak, watch a
+message arrive for a second account or upload a file past authorization, and
+nothing here claims to.
+
+**The human action is the record.** Running `Production / Cutover` — and
+approving it, where the environment requires an approval — is the statement
+that the authenticated checklist of section 10 was performed and reviewed for
+exactly the `candidate:release` the run prints. Starting the workflow without
+having done it is the one failure nothing in this repository can catch, which
+is why the preparation summary and the cutover preflight both print the
+release identity before anything moves.
+
+If the `production` environment has no required reviewers, the operator who
+presses **Run workflow** is making that statement alone. That is a governance
+setting, not a code one; decide it deliberately and write the decision down
+beside the environment.
+
+### One human action, or two
+
+The `production` GitHub Environment stays on the cutover job. If the
+organisation configures required reviewers on it, the operator performs two
+actions — **Run workflow**, then **Approve** — and the workflow supports either
+shape. Which is configured is an operational setting **on the environment**, by
+design: an approval rule written into this repository would be editable by the
+same change it gates, and nothing here tries to work around the policy.
+
+`Production / Rollback` deliberately declares **no** environment. An approval
+gate on an incident rollback is a delay measured in whoever is awake; the
+boundary there is the production runner's pre-job guard, the `refs/heads/main`
+check, and the repository write access that `workflow_dispatch` already
+requires. If the organisation wants an approval on rollback too, add the
+environment to that job — but record the trade in the incident procedure.
+
+### Concurrency
+
+All three workflows take one concurrency group,
+`nchat-prod-release-mutation`, with `cancel-in-progress: false`. Candidate
+preparation, cutover, rollback and the retirement that happens inside
+preparation therefore cannot overlap: a candidate deployed underneath a cutover,
+or a rollback racing a drain, is a namespace nobody can reason about afterwards.
+
+**Where the group is declared matters.** Cutover and rollback take it at the
+workflow root, because their one job _is_ the mutation. Preparation takes it on
+the `candidate` job only: the three jobs before it — eligibility, the image
+build and the read-only capacity collection — touch `nchat-prod` not at all and
+take twenty minutes between them. Holding the production mutation lock across
+them would queue an incident rollback behind an image build, which is precisely
+what "rollback stays available" has to rule out.
+
+`false` must be the boolean. The string `"false"` is truthy to the expression
+evaluator, and it would cancel exactly the run that is holding a half-finished
+mutation.
+
+A rollback waits for the lock like everything else. "Available during an
+incident" means the workflow is independent and always dispatchable, not that it
+may patch selectors while another run is patching them.
+
+`CD / Develop` uses a separate group, `nchat-dev-delivery`, and the nchat-dev
+deploy keeps its own `nchat-dev-deploy`. The two environments share no lock.
+
+### What the workflows prove, and how it is enforced
+
+`scripts/ci/check_cd_workflows.py` enforces all five structurally,
+and as a closed allowlist rather than a search for dangerous commands: every
+job, step, command, env binding and ordering each file may contain is written
+out there, and anything else is refused for not being in the contract.
+
+So a promotion added to `CD / Prepare Production` is refused for the same reason
+`echo hello` is, however it is spelled — `bash cutover.sh`, `env bash
+cutover.sh`, a wrapper, a hand-written `kubectl patch service`,
+`switch_services_to_slot` — and a fourth job is refused whatever it is called.
+
+The contract also holds the separations themselves: `cutover.sh` appears in
+exactly one step of one job of one workflow, `rollback.sh` in exactly one step
+of one job of another, and `drain-old.sh` in neither — retirement happens inside
+`prepare-slot.sh`, under the lifecycle preconditions, and never as a workflow
+step of its own. Only the cutover job may declare `environment:`. A migration, a
+build, a DNS call and a write permission are refused everywhere.
+
+`scripts/ci/test_check_cd_workflows.py` is the other half: it breaks
+one invariant at a time in the real files and requires a refusal, so a contract
+that passed because it was not looking is visible as a suite in which nothing
+was refused.
+
+| Evidence                     | Where it comes from                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| eligibility                  | `CI / Required` of the CI run, by job name                                            |
+| release SHA                  | that run's `head_sha`, re-proved reachable from `main`                                |
+| sealed release id            | the SHA-256 the release manifest was sealed with                                      |
+| capacity                     | a read-only collection, validated on schema, freshness, namespace, checksums and path |
+| lifecycle disposition        | `candidate_slot_disposition` of the record and the cluster                            |
+| retirement, when it happened | `drain-old.sh`, then `require_slot_scaled_to_zero`                                    |
+| stable selectors, before     | `collect_service_slots`, in the step that resolves the slot                           |
+| migrations, rollout          | `deploy.sh`, each fail-closed                                                         |
+| candidate smoke              | `smoke.sh` — isolation, one consistent release, readiness                             |
+| stable selectors, after      | `collect_service_slots` again; `diff` fails the run                                   |
+| candidate release identity   | `slot_release_state`, compared to `<sha>:<release id>`                                |
+| candidate ready evidence     | `record_candidate_ready`, written only after both invariants                          |
+| cutover preflight            | `cutover-preflight.sh`, against the cluster                                           |
+| the promotion                | `cutover.sh --target <candidate>`                                                     |
+| convergence                  | `all_services_on_slot` against the named target — total or FAIL                       |
+| promoted release             | `require_slot_release_identity`, once traffic has moved                               |
+| rollback reservation         | `record_cutover`, before the post-cutover smoke                                       |
+| post-cutover smoke           | `record-traffic-smoke.sh --after cutover`, recorded on pass                           |
+| schema compatibility         | `rollback-schema-gate.sh` between the two release commits                             |
+| the rollback                 | `rollback.sh --target <slot> "<reason>"`                                              |
+| post-rollback smoke          | `record-traffic-smoke.sh --after rollback`, recorded on pass                          |
+
+**A difference is never repaired.** The invariant steps exist to detect that
+something changed underneath a run; putting a selector back, or accepting
+whatever a slot happens to carry, would destroy the only record of it happening.
+Treat a failure at any of them as an incident, not as a deploy to retry.
+
+**The after-state is recorded even when a mutation fails**, in both manual
+workflows. A cutover or rollback that stops part-way is the run whose
+after-state matters most and the run an asserting step would never reach, so
+recording and judging are two steps: the recording is read-only and runs when
+the mutation actually ran; the judgement is an ordinary step that stays skipped
+when the mutation failed, so no success is ever claimed for one.
+
+"When the mutation actually ran" is an allowlist of two conclusions, and it has
 to be spelled as one:
 
-| The `promote` step ended            | after-state recorded |
+| The mutation step ended             | after-state recorded |
 | ----------------------------------- | -------------------- |
 | `success`                           | yes                  |
 | `failure`                           | yes                  |
@@ -1276,131 +1612,31 @@ to be spelled as one:
 | the run was cancelled               | no                   |
 
 Naming any status function in an `if:` stops Actions inserting the implicit
-`success()`, so anything looser runs the step on a run that promoted nothing.
-`steps.promote.conclusion != ''` is the specific trap: a skipped step reports
-`skipped`, which is not the empty string, so that spelling sends a run that
-never reached the promotion to query production anyway.
+`success()`, so anything looser runs the step on a run that mutated nothing.
+`steps.<id>.conclusion != ''` is the specific trap: a skipped step reports
+`skipped`, which is not the empty string.
 
-Dispatch it with the release SHA and the **run id of the "Build and push
-images" run that built it**. The manifest of that run is sealed with a SHA-256
-and names its own `source_sha`, so naming a run is not the same as trusting it:
-`release-digests.sh` verifies the seal, checks the contract, and refuses unless
-the manifest seals the commit being deployed. The digests the cluster then runs
-are exactly the ones that release was sealed with — not a rebuild that would
-produce different bytes under the same tag. It reads the manifest rather than
-the `digest-*.txt` artifacts because the manifest is kept for 90 days and they
-are kept for 7.
+### Variables and permissions
 
-The candidate slot is `opposite_slot(active)`, read from the cluster. Neither
-slot name appears in the workflow and no input names one, so a mixed or unknown
-selector state fails the run instead of being guessed past.
+The candidate job declares **no** environment: an approval there would gate a
+phase with nothing to approve, and would pull the production environment's
+secrets into a job that moves no traffic. Its variables must therefore be
+**repository or organisation** variables, never environment-scoped:
 
-The **candidate job** declares no environment, and the cutover job declares
-`production`. An approval on the candidate would gate the phase that has nothing
-to approve yet, and declaring an environment there would also pull that
-environment's secrets into an unprotected deploy. The candidate's two
-variables —
-`vars.NCHAT_PROD_TOPOLOGY_FILE` and, where the deploy identity cannot read
-Nodes, `vars.NCHAT_PROD_CAPACITY_EVIDENCE_DIR` — must therefore be **repository
-or organisation variables**, never environment-scoped. Both name paths on the
-runner; neither is a secret and neither is committed. An environment-only
-variable would arrive as an empty string, and the failure would not look like a
-configuration mistake: an empty `NCHAT_PROD_TOPOLOGY_FILE` means
-`prepare_prod_deploy_tree` skips installing the topology, and the deploy is
-refused later for carrying `REPLACE_ME_*` placeholders.
+| Variable                                | Used by            | Absent means                                                   |
+| --------------------------------------- | ------------------ | -------------------------------------------------------------- |
+| `NCHAT_PROD_TOPOLOGY_FILE`              | candidate          | the deploy is refused for carrying `REPLACE_ME_*` placeholders |
+| `NCHAT_PROD_ROLLBACK_RETENTION_SECONDS` | candidate, cutover | the documented default, 1800s                                  |
+| `NCHAT_PROD_CANDIDATE_MAX_AGE_SECONDS`  | cutover            | the documented default, 86400s                                 |
 
-Both jobs run on the production runner and hold the same two read permissions,
-`actions: read` (the sealed manifest of the named build run) and
-`contents: read`. Neither holds a write of any kind, and the cutover job
-downloads the manifest again into its own workspace rather than receiving an
-identity through a job output: a string that travelled through an output is a
-string a step could have edited, and the seal is what the promotion verifies.
+`NCHAT_PROD_CAPACITY_EVIDENCE_DIR` is no longer a variable in CD: the candidate
+job points it at the artifact the capacity job produced.
 
-The `refs/heads/main` check in the first step is defence in depth, not the
-boundary. A dispatch carries the workflow file of the ref it was started from,
-so a feature branch would run its own copy of that check; the runner's pre-job
-guard below is what actually confines this to `main`.
-
-### What the workflow proves, and how it is enforced
-
-`scripts/ci/check_deploy_prod_workflow.py` enforces the shape structurally, and
-as a closed allowlist rather than a search for dangerous commands: every job,
-step, command, env binding and ordering the file may contain is written out
-there, and anything else is refused for not being in the contract. So a
-promotion added to the `candidate` job is refused for the same reason
-`echo hello` is, however it is spelled — `bash cutover.sh`,
-`env bash cutover.sh`, a wrapper, a hand-written `kubectl patch service`,
-`switch_services_to_slot` — and a third job is refused whatever it is called.
-
-The contract also holds the separation itself, in both directions: only the
-`cutover` job may run `cutover.sh`, it may run it only at its one contracted
-position, only that job may declare `environment:` and `needs:`, and only the
-`production` environment satisfies it. `rollback.sh`, `drain-old.sh`, a
-migration and a DNS call are refused in either job for not being contracted
-steps. Neither job may declare `if:`, `continue-on-error:` on a gate, a write
-permission, or a runner other than the production one.
-
-The candidate job's last three steps are the evidence, produced on every run:
-
-| Evidence                   | Where it comes from                                           |
-| -------------------------- | ------------------------------------------------------------- |
-| stable selectors, before   | `collect_service_slots`, in the same step that picks the slot |
-| active slot                | `resolve_active_slot` of that same reading                    |
-| candidate slot             | `opposite_slot(active)`                                       |
-| migrations, rollout        | `deploy.sh`, each fail-closed                                 |
-| automated smoke            | `smoke.sh` — isolation, one consistent release, readiness     |
-| stable selectors, after    | `collect_service_slots` again                                 |
-| selector invariant result  | `diff` of the two readings; any difference fails the run      |
-| expected release SHA       | the dispatched `sha`, proved reachable from `main`            |
-| expected sealed release id | the SHA-256 the release manifest was sealed with              |
-| observed candidate release | `slot_release_state` of the candidate, read from the cluster  |
-| identity comparison result | observed must equal `CONSISTENT <sha>:<release id>`           |
-
-Both selector readings come from the same function, so that comparison is
-between two canonical forms and not two renderings. The snapshot is taken in the
-step that resolves the slot, from that one reading, so the evidence describes
-the state the deploy decision was actually made from.
-
-**A green smoke is not the end of the run.** Two gates follow it, and either can
-still fail:
-
-- the **selector invariant** fails if any stable Service selects something other
-  than what the snapshot recorded — something moved production traffic;
-- the **identity revalidation** fails if the candidate is not running the exact
-  release this run built — the slot was redeployed or rebuilt underneath the
-  run. A rebuild of the same commit seals a different manifest, so it is caught
-  here even though every SHA in the picture is unchanged.
-
-The two are independent: a concurrent redeploy of the candidate leaves the
-selectors untouched and produces a slot that is equally Ready and equally
-consistent, so only the identity separates the two releases.
-
-**A difference is never repaired.** These steps exist to detect that something
-changed underneath the run; putting a selector back, or accepting whatever the
-slot happens to carry, would destroy the only record of it happening. Treat a
-failure at either as an incident, not as a deploy that needs retrying.
-
-The cutover job produces its own evidence, on both sides of the one mutation:
-
-| Evidence                   | Where it comes from                                                                                              |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| approval                   | the required reviewer on the `production` environment                                                            |
-| stable selectors, before   | `collect_service_slots`, before anything is patched                                                              |
-| preflight result           | `require_promotable_selectors` against the target; unclassifiable fails here                                     |
-| decisive classification    | `require_promotable_selectors` again inside `cutover.sh`, on the reading its own mutation is decided from        |
-| rollback target            | `opposite_slot(target)`, from the authorised target                                                              |
-| approved release           | `<sha>:<release id>`, from the dispatch and the candidate job                                                    |
-| candidate still carries it | `require_slot_release_identity`, read from the cluster                                                           |
-| the promotion              | `cutover.sh --target <candidate>`, its own gates all fail-closed                                                 |
-| stable selectors, after    | `collect_service_slots` again, recorded on a failed promotion too, and not at all when the promotion was skipped |
-| convergence result         | `all_services_on_slot` against the named target — total or FAIL                                                  |
-| promoted release, after    | `require_slot_release_identity` again, once traffic has moved                                                    |
-
-Convergence and release identity are independent there too. A Service that is
-missing, carries no `nchat.io/release-slot` key, kept the previous slot or holds
-some other value all fail the convergence proof; and a slot that degraded or was
-redeployed during the patches would pass it and still fail the identity read
-that follows.
+Every job holds the minimum. `contents: read` everywhere; `actions: read` only
+where a run's artifacts are read; `packages: write` only in the build, which is
+the only job that pushes an image. No job holds `id-token: write` — nothing here
+federates to anything. Every third-party action is pinned by commit SHA, and
+every production checkout sets `persist-credentials: false`.
 
 ### The runner refuses everything else — the pre-job guard
 
@@ -1417,18 +1653,41 @@ The boundary is host-side and outside the repository's reach:
 and wired to `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner executes it before
 the first step of every job it accepts, and a non-zero exit ends the job there.
 
-It authorises one context, by exact comparison, and refuses everything else —
-including a variable the runner did not set:
+`GITHUB_REPOSITORY` must be `nicrepository/nchat`, and then the job's workflow
+must be one of exactly three authorised contexts, matched as a whole — the
+workflow file, the ref it was read from, and the event, together:
 
-| Variable              | Only accepted value                                                           |
-| --------------------- | ----------------------------------------------------------------------------- |
-| `GITHUB_REPOSITORY`   | `nicrepository/nchat`                                                         |
-| `GITHUB_WORKFLOW_REF` | `nicrepository/nchat/.github/workflows/deploy-nchat-prod.yml@refs/heads/main` |
-| `GITHUB_REF`          | `refs/heads/main`                                                             |
-| `GITHUB_EVENT_NAME`   | `workflow_dispatch`                                                           |
+| Workflow                    | `GITHUB_REF`         | `GITHUB_EVENT_NAME` |
+| --------------------------- | -------------------- | ------------------- |
+| `cd-prepare-production.yml` | `refs/heads/develop` | `workflow_run`      |
+| `cutover-nchat-prod.yml`    | `refs/heads/main`    | `workflow_dispatch` |
+| `rollback-nchat-prod.yml`   | `refs/heads/main`    | `workflow_dispatch` |
 
-So a pull request, a dispatch from `develop`, another workflow file, another
-event, a fork, and an empty environment are all the same outcome: no step runs.
+Matched as a whole, not as three independent allowlists: preparation is the
+only workflow that may run from `develop` and the only one that may run without
+a dispatch, so a cutover started by a `workflow_run`, or a rollback from
+`develop`, is refused even though every individual value appears somewhere in
+the table.
+
+So a pull request, another workflow file, another event, a fork, a crossed
+combination and an empty environment are all the same outcome: no step runs.
+
+**Why preparation is authorised from `develop`.** A `workflow_run` handler
+always executes the copy of its own YAML that is on the repository's default
+branch, which here is `develop`; GitHub offers no way to run it from `main`,
+and the alternative — an operator pasting a SHA into a dispatch — is exactly
+the manual step issue #933 removes. The concession is bounded: the scripts that
+workflow runs come from the release commit it checks out, which is on `main`
+and has passed `CI / Required`, and preparation moves no traffic at all. The
+two workflows that patch a stable Service selector are both
+`workflow_dispatch`, both from `main`, and nothing else is authorised to.
+
+**The capacity collector runs on a different runner.** `nchat-prod-capacity` is
+a separate label for a separate identity, and it needs its own copy of this
+hook authorising the preparation context and nothing else. It must **not** be
+able to read the production kubeconfig, and the production runner must not hold
+the collector's cluster-wide read-only context: the whole point of issue #714 is
+that neither identity has the other's reach.
 The refusal names the variable that disagreed and never its value, because the
 value is a string an untrusted workflow chose and the line is read out of a
 system log.
@@ -1527,12 +1786,14 @@ or Kubernetes RBAC are modified.
 
 #### Proving it refuses — negative evidence
 
-`deploy-nchat-prod.yml` already exists on `develop` and is `workflow_dispatch`,
-so the refusal can be observed without inventing a workflow for it.
+`cutover-nchat-prod.yml` exists on `develop` as well as on `main` and is
+`workflow_dispatch`, so the refusal can be observed without inventing a
+workflow for it.
 
-Dispatch **Deploy nchat-prod** from the `develop` ref with syntactically valid
-inputs — a real 40-hex SHA on `main` and a real "Build and push images" run id —
-so that nothing but the guard can be what refused it.
+Dispatch **Production / Cutover** from the `develop` ref. It takes no inputs,
+so nothing but the guard can be what refused it: the workflow's own
+`refs/heads/main` check is its first step, and a refused job never reaches a
+first step.
 
 PASS requires all three:
 
@@ -1544,7 +1805,7 @@ PASS requires all three:
   ```bash
   sudo journalctl -u actions.runner.nicrepository-nchat.srv-apps-01-nchat-prod.service \
     --since '-15 min' | grep 'runner job guard'
-  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not the authorised production deploy context.
+  # runner job guard: DENY, GITHUB_WORKFLOW_REF is not an authorised production release context.
   ```
 
 - `make prod-blue-green-status` is unchanged.
@@ -1639,10 +1900,58 @@ Re-running with the same target continues converging to that target.
 
 ---
 
-## 13. Observation window
+## 13. Observation window and the rollback reservation
 
-Keep the previous slot running and do not run `drain-old`. Minimum 30–60 minutes
-of active observation; several hours for the first general release. Watch:
+After a cutover the correct state is **not** "new slot active, old slot
+drained". It is:
+
+```text
+green = ACTIVE
+blue  = ROLLBACK RESERVED
+```
+
+and blue stays that way until the next release is prepared. That is what makes
+rollback a selector change for the whole period between two releases, which is
+the entire reason for running two slots.
+
+`Production / Cutover` records the reservation itself, in the lifecycle record,
+before it runs the post-cutover smoke — so the reservation exists even when
+that smoke fails, which is when it matters most. Nothing drains anything at
+cutover time, and there is no third manual button to press.
+
+### The retention window
+
+The next `CD / Prepare Production` is what retires the reservation, and only
+after a minimum period since the cutover:
+
+```text
+NCHAT_PROD_ROLLBACK_RETENTION_SECONDS    default 1800 (30 minutes)
+```
+
+Set it as a repository or organisation variable. The initial operational value
+recommended by issue #933 is **30 to 60 minutes**, to be tuned by the team
+against how quickly a regression actually surfaces in the signals below; the
+default is documented rather than hidden, and any value that is not a
+non-negative decimal integer of at most 18 digits is refused as a
+misconfiguration rather than silently replaced.
+
+If the next release arrives before the window has elapsed:
+
+```text
+CD / Prepare Production = FAILED
+  slot blue is reserved as the rollback for the release now on green
+  slot reserved for rollback 900s longer: the last cutover was 900s ago
+  and the retention window is 1800s
+```
+
+That is the intended outcome. Re-run the workflow once the window has passed.
+The reservation is never silently overwritten: overwriting it is how a
+Blue/Green namespace ends up with no way back from what is currently serving.
+
+### What is watched during the window
+
+Minimum 30–60 minutes of active observation; several hours for the first
+general release. Watch:
 
 - HTTP 5xx and latency at the edge, per slot;
 - login failures and OIDC callback errors;
@@ -1661,15 +1970,28 @@ kubectl get pods -n nchat-prod -l nchat.io/release-slot=green -o wide
 kubectl logs -n nchat-prod -l nchat.io/release-slot=green --all-containers --tail=200
 ```
 
+**No automatic rollback is wired to any of these.** A single metric is not a
+release verdict, and an unattended second traffic move during an incident is a
+worse outcome than a human looking at the picture. The summaries carry the SHA,
+the release id, the slot, the run and the cutover time so that a signal can be
+correlated with the release that caused it; acting on it is
+`Production / Rollback`, with a reason.
+
 ---
 
 ## 14. Rollback
+
+**The workflow.** Actions → **Production / Rollback** → Run workflow, with the
+target slot and a reason. This is the normal path; section 11b describes its
+gates.
+
+**By hand**, when GitHub Actions itself is unavailable:
 
 ```bash
 make prod-blue-green-rollback ARGS="--target blue 'reason recorded in the log'"
 ```
 
-No build, no image, no migration — the same nine selectors move back. The reason
+No build, no image, no migration — the same ten selectors move back. The reason
 is mandatory and is recorded.
 
 The target is named for the same reason as cutover, and here the cost of getting
@@ -1681,7 +2003,48 @@ If the named target is not Ready the command **stops**. It never picks a
 different slot: moving traffic onto a slot that cannot serve it turns one
 incident into two.
 
-The failed slot is left running for investigation.
+The failed slot is left running for investigation, and no new reservation is
+created on it — offering the slot that just caused an incident as a one-click
+rollback target would offer a path straight back into it.
+
+### Schema compatibility — checked before traffic moves
+
+`scripts/deploy/nchat-prod/rollback-schema-gate.sh <target sha> <current sha>`
+answers one narrow question: can the release on the target slot still serve
+against the schema as it now stands?
+
+It reuses `blue_green_incompatible_operation` from
+`scripts/ci/blue-green-migration-gate.sh` — there is one definition in this
+repository of "an operation that breaks the slot running the previous release",
+and two would be one nobody maintains — and applies it to every up migration
+added between the two release commits.
+
+One deliberate asymmetry with the forward gate: a migration that declares
+itself contract-phase,
+
+```sql
+-- nchat:blue-green contract-phase <why this is safe now>
+```
+
+is **accepted going forwards and refused going back**. The declaration means no
+slot depends on the old shape any more, which is a statement about the future;
+the slot a rollback targets is precisely one that does depend on it. The
+pre-policy exceptions list is not honoured here either.
+
+**What it cannot see.** It reads the repository, not the database. It proves
+what the releases _contained_; it cannot see a migration applied out of band, a
+schema edited by hand, or a backfill run from a console. It is a necessary
+condition for a safe application rollback and never a sufficient one.
+
+When it refuses:
+
+```text
+ROLLBACK BLOCKED: the schema has moved past the release on the target slot.
+```
+
+Nothing has been changed — the serving slot is untouched and the target is
+still running. **Do not run a down migration to make it pass.** Roll forward
+with a fix, or perform a deliberate database recovery with the DBA present.
 
 ---
 
@@ -1710,7 +2073,61 @@ observation window and compare against those.
 
 ## 16. Retiring the old slot
 
-Only after the observation window, and never automatically:
+**In continuous delivery this is not an operator action.** The next
+`CD / Prepare Production` retires the reservation, immediately before it
+reuses the slot, and only when every one of these holds:
+
+1. the lifecycle record does not contradict the cluster or itself;
+2. the retention window since `cutover_at` has elapsed;
+3. every stable Service has converged on the active slot;
+4. the active slot is fully Ready;
+5. the active slot carries one consistent release;
+6. **that exact release is recorded as having passed its post-traffic smoke**;
+7. no stable Service still selects the slot being retired;
+8. the slot being retired is not the active one.
+
+Any of them failing blocks the release rather than the retirement: retiring the
+old slot removes the fast way back from what is serving _now_, so an unhealthy,
+mixed or unproved active slot is exactly when it must not happen.
+
+**Condition 6 is the one that is easy to leave out.** Readiness and a
+consistent release say the slot is _running_ something coherent; they say
+nothing about whether it works. `record_cutover` writes the reservation before
+the post-cutover smoke — deliberately, because the demoted slot is the rollback
+from the moment traffic moves — so at that point nothing has been proved
+through the stable Services yet. Without condition 6 a cutover whose smoke
+failed would still have its rollback retired half an hour later, removing the
+way back from precisely the release that did not pass. The evidence names the
+release, not a slot, so an active slot redeployed after being smoked stops
+matching it.
+
+### When a post-traffic smoke failed
+
+The workflow failed and nothing was recorded, so the lifecycle is blocked: the
+next release refuses to retire the rollback and says so, naming the command
+below. That is the intended state — investigate it, do not route around it.
+
+Three ways out, in order of preference:
+
+1. **Roll back.** `Production / Rollback` clears the record's smoke evidence
+   and creates no reservation, so the lifecycle is no longer waiting on it.
+2. **Roll forward.** A new release cuts over and records its own smoke.
+3. **Fix in place**, when the fault was outside the release — a dependency, a
+   certificate, a configuration entry. Re-prove the slot and record it:
+
+   ```bash
+   make prod-blue-green-record-traffic-smoke ARGS="--target green --after cutover"
+   ```
+
+   It runs the same `stable-smoke.sh` and writes the record only if it passes.
+   It moves no traffic and retires nothing, and it cannot make a failing smoke
+   pass. Re-running it until it goes green is not a procedure; it is the thing
+   the gate exists to stop. The drain itself is
+   `drain-old.sh`, the same script an operator runs, and it is followed by
+   `require_slot_scaled_to_zero`, which reads `.spec.replicas` of all ten
+   Deployments back from the cluster rather than trusting the command's exit code.
+
+**By hand**, for a rehearsal or when the pipeline is unavailable:
 
 ```bash
 make prod-blue-green-drain-old ARGS="--target blue"
@@ -1745,7 +2162,28 @@ the lease to expire and be re-sent. When a backlog exists it claims the next row
 immediately rather than waiting for the next poll; when the queue is empty it
 waits. Delivery remains at-least-once — SMTP offers nothing stronger.
 
-After this, rollback needs a redeploy — it is no longer instant.
+**The Deployments remain**, at `replicas=0`, so the next candidate deploys into
+the slot without recreating anything. Nothing here deletes a Deployment, a
+Service or any other slot resource.
+
+After this, rollback to the retired slot needs a redeploy — it is no longer
+instant. That is the whole reason the retention window exists.
+
+### After a rollback, the lifecycle is recalculated
+
+```text
+blue active -> cutover to green -> rollback to blue
+```
+
+leaves `blue = ACTIVE` and `green` under investigation, with **no** reservation
+on green. The next preparation reads the stable Service selectors, finds blue
+active, takes green as the candidate, sees no reservation standing against it
+and reuses it directly.
+
+Nothing assumes "the last promoted slot is still active", and nothing reads the
+active slot out of the lifecycle record: `resolve_active_slot` of the current
+selectors is the only answer, and a record that contradicts it blocks the
+operation and asks for investigation rather than deciding it.
 
 ---
 
@@ -2010,3 +2448,89 @@ ReadWriteOnce and a single replica owns writes
 
 The fix is RWX or avatars in object storage — a data-model change, not part of
 issue #626.
+
+---
+
+## 20. Rehearsal — the two directions of Blue/Green
+
+Issue #933 requires the full lifecycle to be exercised before it is trusted.
+Two scenarios cover it. **Neither has been executed against a real cluster
+yet**, and nothing here may be ticked from reading it: an unexecuted rehearsal
+is a pending operational task, not a passed one.
+
+What _has_ been executed is the simulated half, against a fake kubectl with no
+cluster and no network:
+
+```bash
+make cd-workflows-check             # the five workflow contracts
+make cd-workflows-test              # and the mutations they must refuse
+make prod-lifecycle-test            # reservation, retention, drain, preflights
+make prod-rollback-schema-test      # the schema gate, both directions
+make prod-blue-green-test           # the canonical scripts
+make prod-capacity-test             # the capacity gate and its evidence
+make dev-smoke-test                 # the nchat-dev smoke
+```
+
+### Scenario A — cutover, then rollback
+
+Starting state: blue active, green idle and not reserved.
+
+| #   | Action                                                           | Expected                                                               |
+| --- | ---------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| 1   | merge to `main`; watch `CI`                                      | `CI / Required` green                                                  |
+| 2   | `CD / Prepare Production` starts on its own                      | no SHA typed anywhere                                                  |
+| 3   | the `capacity` job                                               | evidence uploaded, deployer reads no Node                              |
+| 4   | the `candidate` job                                              | candidate = green; summary says traffic remains on blue                |
+| 5   | `kubectl get cm nchat-release-state -n nchat-prod -o yaml`       | `candidate_slot: green`, `candidate_release`, `prepare_run_id`         |
+| 6   | `make prod-blue-green-status`                                    | blue ACTIVE, green CANDIDATE, both CONSISTENT                          |
+| 7   | Actions → **Production / Cutover** → Run workflow                | converges on green; post-cutover smoke PASS                            |
+| 8   | the record again                                                 | `active_slot: green`, `rollback_reserved_slot: blue`, `cutover_at` set |
+| 9   | `kubectl get deploy -n nchat-prod -l nchat.io/release-slot=blue` | blue still running, replicas unchanged                                 |
+| 10  | Actions → **Production / Rollback**, target `blue`, a reason     | schema gate PASS; converges on blue; post-rollback smoke PASS          |
+| 11  | the record again                                                 | `active_slot: blue`, `rollback_reserved_slot` **empty**                |
+| 12  | the rollback summary                                             | from, to, reason, release, schema, selectors, smoke                    |
+
+Also prove, in the same scenario:
+
+- **retry converges.** Before step 7, patch two stable Services to green by
+  hand to simulate a half-finished cutover, then run the cutover. It must
+  converge every Service on green and never invert to blue.
+- **stale candidate blocks.** Redeploy the candidate slot by hand between
+  preparation and cutover. The cutover must refuse at the identity check, with
+  production untouched.
+
+### Scenario B — cutover, retention, retirement, reuse
+
+Starting state: green active, blue reserved (the end of scenario A, step 8).
+
+| #   | Action                                                           | Expected                                                      |
+| --- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
+| 1   | merge to `main` **within** the retention window                  | `CD / Prepare Production` FAILS, naming the seconds remaining |
+| 2   | wait out `NCHAT_PROD_ROLLBACK_RETENTION_SECONDS`                 | —                                                             |
+| 3   | re-run the failed preparation                                    | retires blue: `drain-old.sh`, then `replicas=0` proved        |
+| 4   | `kubectl get deploy -n nchat-prod -l nchat.io/release-slot=blue` | Deployments present, `replicas: 0`                            |
+| 5   | the same run continues                                           | candidate = blue, deployed, smoked                            |
+| 6   | the record                                                       | `rollback_reserved_slot` empty, `candidate_slot: blue`        |
+| 7   | **Production / Cutover**                                         | converges on blue; green becomes the reservation              |
+| 8   | no rollback this time; observe                                   | green stays running for the whole window                      |
+
+Also prove, in the same scenario:
+
+- **an unhealthy active slot blocks the retirement.** Scale one workload of the
+  active slot to zero before step 3. Preparation must refuse, and blue must
+  still be running afterwards.
+- **a failed post-cutover smoke blocks the retirement.** Break the release so
+  the post-cutover smoke fails, wait out the retention window, then prepare the
+  next release. It must refuse with "no post-traffic smoke is recorded", the
+  rollback slot must still be running, and
+  `make prod-blue-green-record-traffic-smoke` must unblock it only once the
+  smoke genuinely passes.
+- **a schema-incompatible rollback blocks.** Ship a migration carrying
+  `-- nchat:blue-green contract-phase`, cut over, then attempt a rollback. It
+  must refuse before touching a selector and name the incident procedure.
+
+### Recording the result
+
+Record, per scenario and per row: the run URL, the release identity, the
+selectors before and after, and the contents of `nchat-release-state`. A row
+with no evidence counts as not executed.

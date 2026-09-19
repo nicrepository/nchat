@@ -239,16 +239,16 @@ func TestPGXMemberStore_AddWorkspaceMember_Success(t *testing.T) {
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
 			AddRow("ws-1", "user-1", "member", "active", now))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
@@ -276,9 +276,6 @@ func TestPGXMemberStore_AddWorkspaceMember_AlreadyMember(t *testing.T) {
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	// ON CONFLICT DO NOTHING returns 0 rows -> pgx.ErrNoRows on Scan.
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
@@ -287,9 +284,12 @@ func TestPGXMemberStore_AddWorkspaceMember_AlreadyMember(t *testing.T) {
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
 			AddRow("ws-1", "user-1", "member", "active", now))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
@@ -485,9 +485,6 @@ func TestPGXMemberStore_AddWorkspaceMember_DBError(t *testing.T) {
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
 		WillReturnError(want)
@@ -515,16 +512,16 @@ func TestPGXMemberStore_AddWorkspaceMember_AddsGeneralInTransaction(t *testing.T
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
 			AddRow("ws-1", "user-1", "member", "active", now))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
@@ -570,10 +567,15 @@ func TestPGXMemberStore_AddWorkspaceMember_MissingGeneralRollsBack(t *testing.T)
 	}
 	defer mock.Close()
 
+	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
+		WithArgs("ws-1", "user-1", "member").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
+			AddRow("ws-1", "user-1", "member", "active", now))
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}))
@@ -602,15 +604,15 @@ func TestPGXMemberStore_AddWorkspaceMember_GeneralInsertErrorRollsBack(t *testin
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
 			AddRow("ws-1", "user-1", "member", "active", now))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
 		WillReturnError(want)
 	mock.ExpectRollback()
 
@@ -636,9 +638,6 @@ func TestPGXMemberStore_AddWorkspaceMember_ExistingInactiveDoesNotSyncGeneral(t 
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`INSERT INTO chat\.workspace_members`).
 		WithArgs("ws-1", "user-1", "member").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}))
@@ -670,16 +669,16 @@ func TestPGXMemberStore_ActivateWorkspaceMember_AddsGeneralInTransaction(t *test
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
 		WithArgs("ws-1", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
 			AddRow("ws-1", "user-1", "member", "active", now))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
+		WithArgs("ws-1").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
@@ -706,9 +705,6 @@ func TestPGXMemberStore_ActivateWorkspaceMember_NotFoundRollsBack(t *testing.T) 
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
 		WithArgs("ws-1", "missing").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}))
@@ -754,10 +750,15 @@ func TestPGXMemberStore_ActivateWorkspaceMember_MissingGeneralRollsBack(t *testi
 	}
 	defer mock.Close()
 
+	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
+	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
+		WithArgs("ws-1", "user-1").
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}).
+			AddRow("ws-1", "user-1", "member", "active", now))
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}))
@@ -784,9 +785,6 @@ func TestPGXMemberStore_ActivateWorkspaceMember_UserIDScopedByWorkspace(t *testi
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-b").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-b").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
 		WithArgs("ws-b", "user-1").
 		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "user_id", "role", "status", "joined_at"}))
@@ -814,9 +812,6 @@ func TestPGXMemberStore_ActivateWorkspaceMember_UpdateErrorRollsBack(t *testing.
 	mock.ExpectQuery(`SELECT status\s+FROM chat\.workspaces`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("active"))
-	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
-		WithArgs("ws-1").
-		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
 	mock.ExpectQuery(`UPDATE chat\.workspace_members`).
 		WithArgs("ws-1", "user-1").
 		WillReturnError(want)
@@ -851,9 +846,9 @@ func TestPGXMemberStore_EnsureGeneralMembership_AddsActiveMember(t *testing.T) {
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit()
 
 	store := storage.NewPGXMemberStore(mock)
@@ -970,9 +965,9 @@ func TestPGXMemberStore_EnsureGeneralMembership_CommitErrorPropagates(t *testing
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectQuery(`(?s)WITH eligible AS.*JOIN auth\.users u.*wm\.status = 'active'.*FOR SHARE OF wm, u.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "user-1", "ch-geral", "member").
-		WillReturnRows(pgxmock.NewRows([]string{"eligible"}).AddRow(true))
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.role IN \('owner', 'admin', 'moderator', 'member'\)`).
+		WithArgs("ch-geral", "ws-1", "user-1", "member").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectCommit().WillReturnError(want)
 
 	store := storage.NewPGXMemberStore(mock)
@@ -999,8 +994,8 @@ func TestPGXMemberStore_SyncGeneralMemberships_ActiveMembersOnly(t *testing.T) {
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`(?s)WITH eligible AS.*FROM chat\.workspace_members wm.*wm\.workspace_id = \$1.*wm\.status = 'active'.*INSERT INTO chat\.channel_members.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).
-		WithArgs("ws-1", "ch-geral", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm.*wm\.workspace_id = \$2.*wm\.status = 'active'.*ON CONFLICT \(channel_id, user_id\) DO NOTHING`).
+		WithArgs("ch-geral", "ws-1", "member").
 		WillReturnResult(pgxmock.NewResult("INSERT", 2))
 	mock.ExpectCommit()
 
@@ -1081,8 +1076,8 @@ func TestPGXMemberStore_SyncGeneralMemberships_InsertErrorRollsBack(t *testing.T
 	mock.ExpectQuery(`SELECT id\s+FROM chat\.channels`).
 		WithArgs("ws-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("ch-geral"))
-	mock.ExpectExec(`(?s)WITH eligible AS.*FROM chat\.workspace_members wm.*INSERT INTO chat\.channel_members`).
-		WithArgs("ws-1", "ch-geral", "member").
+	mock.ExpectExec(`(?s)INSERT INTO chat\.channel_members.*FROM chat\.workspace_members wm`).
+		WithArgs("ch-geral", "ws-1", "member").
 		WillReturnError(want)
 	mock.ExpectRollback()
 

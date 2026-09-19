@@ -95,6 +95,58 @@ apenas para tentar resolver essa limitacao. Mudancas futuras que aumentem
 permissoes, adicionem secrets ou alterem este modelo de confianca exigem nova
 Security Review.
 
+## Modelo de confianca do CD de producao (issue #933)
+
+Tres workflows podem tocar `nchat-prod`, e apenas dois deles mudam trafego:
+
+| Workflow                    | Trigger             | Muda selector? |
+| --------------------------- | ------------------- | -------------- |
+| `cd-prepare-production.yml` | `workflow_run`      | nao            |
+| `cutover-nchat-prod.yml`    | `workflow_dispatch` | sim            |
+| `rollback-nchat-prod.yml`   | `workflow_dispatch` | sim            |
+
+O boundary e o pre-job guard host-side do runner de producao
+(`scripts/deploy/nchat-prod/runner-job-guard.sh`), instalado como copia
+root-owned fora do alcance do runner. Ele autoriza exatamente tres contextos,
+comparados como um todo — arquivo do workflow, ref e evento juntos — e recusa
+qualquer combinacao cruzada.
+
+**Preparacao roda a partir da default branch.** Um handler `workflow_run`
+sempre executa a copia do proprio YAML que esta na default branch (`develop`);
+o GitHub nao oferece forma de roda-lo a partir de `main`. A concessao e
+limitada: os scripts que aquele workflow executa vem do commit de release que
+ele faz checkout, que esta em `main` e passou por `CI / Required`, e a
+preparacao nao move trafego nenhum. Cutover e rollback continuam sendo
+`workflow_dispatch` a partir de `main`, e so.
+
+**Identidades separadas (issue #714).** O collector de capacidade roda em um
+runner proprio (`nchat-prod-capacity`) com um contexto read-only cluster-wide;
+o deployer de producao continua namespaced e continua respondendo `no` a
+`get nodes` e a `get pods --all-namespaces`. Nenhuma das duas identidades tem o
+alcance da outra, e o collector nao le kubeconfig de producao nem Secret algum.
+A evidencia trafega como artifact do run e e validada por schema, freshness,
+namespace, checksums e caminho antes de ser usada; ausencia ou inconsistencia
+reprova o deploy. O checksum detecta truncamento e edicao acidental — **nao** e
+autenticidade, e o documento de runbook diz isso explicitamente.
+
+**Estado do ciclo de vida.** O ConfigMap `nchat-release-state` em `nchat-prod`
+registra candidate, cutover e reserva de rollback. E uma **afirmacao**, nunca
+uma autorizacao: todo consumidor revalida contra o cluster e recusa quando os
+dois discordam. O registro pode tornar uma operacao permitida em recusada;
+nunca o contrario. Nao guarda segredo algum.
+
+**Inputs de `workflow_dispatch` sao nao confiaveis.** `target_slot` e validado
+contra allowlist no workflow e novamente em cada script; `reason` nunca e
+executado, nunca compoe linha de comando e e limitado a uma linha de ASCII
+imprimivel, para que nao possa forjar linhas no step summary lido em revisao de
+incidente.
+
+Nenhum job de CD declara `id-token: write`, nenhum imprime kubeconfig, token ou
+DSN, e nenhum publica artifact contendo credencial. Toda action de terceiro e
+pinada por commit SHA e todo checkout de producao usa
+`persist-credentials: false`. Mudancas que ampliem permissoes, adicionem
+secrets ou alterem este modelo de confianca exigem nova Security Review.
+
 ## TLS dev/staging
 
 - Endpoints publicos do MVP devem exigir TLS 1.3.
@@ -165,8 +217,7 @@ Os cinco papeis do RF-74 e onde cada um vive:
   o workspace, nao altera settings e recebe `403` na API administrativa de
   usuarios.
 - **Usuario** — `member`.
-- **Guest** — `guest`. Sem acesso implicito a canais publicos comuns;
-  RF-18 materializa membership no canal estrutural `#geral` (#882).
+- **Guest** — `guest`. Membership de workspace **nao concede canal algum**.
 
 O `moderator` de `chat.channel_members` continua sendo um papel **por canal** e
 nunca e lido como autoridade de workspace. Nenhuma decisao de autorizacao
@@ -179,11 +230,9 @@ ja era para `owner` e `admin`.
 
 ## Escopo de canais do Guest (RF-74)
 
-Um Guest acessa **somente canais com membership persistida**
-(`chat.channel_members`). RF-18 materializa automaticamente essa linha no canal
-estrutural `is_general=true` para todo membro ativo elegivel, inclusive guest.
-Isso nao concede acesso implicito a canais publicos comuns: a allowlist de
-`CanReachPublicChannels` permanece inalterada.
+Um Guest acessa **somente os canais em que foi explicitamente incluido**
+(`chat.channel_members`). Integrar o workspace nao lhe da nenhum canal publico,
+nem o `#geral`.
 
 A regra tem uma unica definicao: a funcao SQL
 `chat.channel_visible_to_user(channel_id, user_id)` (migration 000022),
@@ -207,17 +256,15 @@ Consequencias deliberadas para o Guest:
   o isolamento seria contornavel em uma requisicao;
 - **nao** cria canal (`domain.CanCreateChannel`), re-verificado no proprio
   `INSERT`;
-- **e** adicionado automaticamente ao canal estrutural `#geral` (RF-18,
-  issue #882), assim como owner/admin/moderator/member, com membership ativa e
-  conta ativa nao deletada. Suspensos, left, pessoas de outro workspace e
-  papeis invalidos sao excluidos. Sync individual e backfill so inserem linhas
-  faltantes; preservam rows existentes e mute.
-- `MemberService.AddChannelMembers` permite reparo de linha ausente e retorna
-  `already_members` quando a pessoa ja participa de `#geral`, sob o gate atual
-  owner/admin/moderator. A Admin API continua exigindo `admin.channels.manage`;
-  ambos reutilizam `EligibleTargetsCTE` para os alvos, sem ampliar os atores.
-- Renomear, arquivar, sair e remover participantes continuam proibidos no canal
-  estrutural. Um canal comum chamado "Geral" nao recebe essas propriedades.
+- **nao** e adicionado automaticamente a `#geral`: `generalMembershipRoles`
+  exclui guest, tanto no sync individual quanto no backfill. Uma row explicita
+  existente (legada ou administrativa) pode satisfazer o predicate de
+  visibilidade, mantidas as demais condicoes de acesso; o sync nao a remove.
+  O fluxo de `MemberService.AddChannelMembers` no chat-service rejeita
+  `is_general`. Ha um caminho administrativo distinto: a API do admin-service,
+  com `admin.channels.manage`, chama `PGXChannelDirectoryStore.AddChannelMembers`,
+  que admite alvos elegiveis sem recusar `is_general`, inclusive guest.
+  Esta e a descricao CURRENT; a consolidacao futura pertence a #882.
 
 Canal privado continua exigindo membership de canal para **todos** os papeis:
 nem owner, nem admin, nem moderador leem um canal privado do qual nao

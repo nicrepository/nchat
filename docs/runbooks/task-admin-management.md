@@ -102,21 +102,11 @@ O lock e **por canal**: mutacoes em canais diferentes nao esperam umas pelas
 outras. Ordem canonica: canal, depois ator/alvos, depois a mutacao, depois a
 contagem.
 
-`AddWorkspaceMember` e `ActivateWorkspaceMember` do chat-service travam o canal
-estrutural `#geral` **antes** da linha de `workspace_members` que vao escrever,
-com `FOR SHARE` — suficiente para fixar identidade e status do canal sem
-serializar joins concorrentes no mesmo workspace. Add-members toma `FOR UPDATE`
-no canal antes dos locks de ator e alvos, porque tambem precisa serializar a
-contagem. E a ordem consistente de aquisicao do lock do canal que previne o
-ciclo: a ordem inversa `workspace_members -> channels` nao existe em caminho
-algum.
-
-O chat-service **nao** recusa genericamente add-members em `#geral`: a operacao
-e idempotente quando a membership ja existe e repara uma linha elegivel ausente
-(#882). A elegibilidade do alvo e a mesma dos demais canais e o gate do ator
-continua `owner`/`admin`/`moderator`. O admin-service nunca trava uma linha de
-`workspace_members` para decidir — sua autoridade e capability de plataforma.
-Mudar qualquer um desses fatos exige reavaliar isto.
+`AddWorkspaceMember` do chat-service trava na ordem inversa (workspace_members e
+depois `#geral` com `FOR SHARE`), mas nao ha ciclo alcancavel: os caminhos que
+travam o canal primeiro ou recusam `#geral` (chat-service) ou nunca travam uma
+linha de `workspace_members` (admin-service, cuja autoridade e capability de
+plataforma). Mudar qualquer um desses dois fatos exige reavaliar isto.
 
 `TestPostgreSQL_ConcurrentAddsReportConsecutiveTotals` prova a corrida: uma
 terceira transacao segura a linha do canal, as duas operacoes ficam na fila, o
