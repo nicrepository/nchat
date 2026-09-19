@@ -210,12 +210,10 @@ test.describe("painel de detalhes do grupo", () => {
     await expect(panel.getByText("Nenhuma mensagem fixada neste grupo.")).toBeVisible();
     await expect(panel.getByText("Nenhum arquivo enviado neste grupo.")).toBeVisible();
     await expect(panel.getByText("Nenhum participante para exibir.")).toBeVisible();
-    // "Ver todos" continua visível e explicitamente indisponível: o botão segue
-    // alcançável por teclado para que o motivo descrito por aria-describedby
-    // possa ser anunciado.
-    const seeAll = panel.getByRole("button", { name: "Ver todos" }).first();
-    await expect(seeAll).toHaveAttribute("aria-disabled", "true");
-    expect(await seeAll.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+    // Nada a expandir em lugar nenhum: sem participantes, sem arquivos e sem
+    // pin, nenhuma seção oferece controle (issue #892).
+    await expect(panel.getByRole("button", { name: /Ver todos/ })).toHaveCount(0);
+    await expect(panel.getByText(/ainda não está disponível nesta versão/)).toHaveCount(0);
 
     // "Adicionar participantes" deixou de ser um placeholder (issue #398): virou
     // fluxo real, e esta fixture não concede a permissão, então a ação fica

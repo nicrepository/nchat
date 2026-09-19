@@ -187,16 +187,6 @@
 
 /* ── Members ────────────────────────────────────────────────────────────── */
 
-.chat-details__members,
-.chat-details__files {
-  list-style: none;
-  margin: 10px 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
 .chat-details__member {
   display: flex;
   align-items: center;

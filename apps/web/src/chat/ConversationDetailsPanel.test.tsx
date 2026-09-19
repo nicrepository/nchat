@@ -450,44 +450,205 @@ describe("ConversationDetailsPanel — canal: membros", () => {
   });
 });
 
-describe("ConversationDetailsPanel — canal: ações indisponíveis", () => {
-  it("offers the still-unimplemented actions as reachable controls that state their reason", async () => {
+// ── Seções expansíveis (issue #892) ──────────────────────────────────────────
+//
+// The panel's side of the shared primitive. Its own contracts — the compact
+// cap, ARIA, focus, keyboard, two independent instances — are covered in
+// ExpandableDetailsSection.test.tsx and are deliberately not repeated here.
+// What belongs here is that the panel wires real conversation data into it and
+// that each section still renders its own domain rows.
+
+/** Enough online members to exceed the compact cap. */
+function onlineRoster(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    userId: `user-${index}`,
+    displayName: `Pessoa ${index + 1}`,
+    role: "member" as const,
+  }));
+}
+
+describe("ConversationDetailsPanel — canal: seção de pessoas expansível", () => {
+  it("no longer offers an unavailable control or the sentence that explained it", () => {
     renderPanel();
 
-    // "Ver todos" is what remains unavailable; adding members is a real flow
-    // (issue #398) and is asserted separately below.
-    const seeAll = screen.getAllByRole("button", { name: "Ver todos" });
-    for (const button of seeAll) {
-      // aria-disabled, never the HTML attribute: `disabled` would drop the
-      // control out of the tab order and take the announced reason with it.
-      expect(button).not.toBeDisabled();
-      expect(button).toHaveAttribute("aria-disabled", "true");
-      expect(button).toHaveAccessibleDescription();
-    }
-    // Each "Ver todos" is described by its own section's reason, not a shared one.
-    expect(seeAll[0]).toHaveAccessibleDescription(
-      "A lista completa de membros do canal ainda não está disponível nesta versão.",
-    );
-    expect(seeAll[1]).toHaveAccessibleDescription(
-      "A central de arquivos do canal ainda não está disponível nesta versão.",
-    );
-
-    // Activating an unavailable control changes nothing and, above all, never
-    // reports a success that did not happen.
-    await userEvent.click(seeAll[0]);
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // The channel fixture has nobody online, so there is nothing to expand to
+    // and no control at all — not a visible one that reveals nothing.
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/ainda não está disponível nesta versão/)).not.toBeInTheDocument();
   });
 
-  it("keeps the unavailable actions in the keyboard tab order", async () => {
-    renderPanel();
+  it("shows five of seven online members and reveals the rest on demand", async () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+        },
+      }),
+    });
 
-    // The panel puts focus on its close button on open; from there the tab
-    // order must actually reach the unavailable actions.
+    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.getByRole("heading", { name: "Membros online (7)" })).toBeInTheDocument();
+    expect(screen.queryByText("Pessoa 7")).not.toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: /Ver todos Membros online/ });
+    // Reachable from the close button the panel focuses on open.
     expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
-    const seeAll = screen.getAllByRole("button", { name: "Ver todos" })[0];
-    await tabUntilFocused(seeAll);
+    await tabUntilFocused(toggle);
+    await userEvent.keyboard("{Enter}");
 
-    expect(seeAll).toHaveFocus();
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(7);
+    // Still the domain's own row, not something the primitive drew.
+    expect(within(list()).getAllByTestId("chat-details-member-avatar")).toHaveLength(7);
+    expect(screen.getByText("Pessoa 7")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Membros online/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+  });
+
+  it("reports a total larger than the preview without offering to list it", () => {
+    // The server caps the roster and reports the real total separately, so the
+    // two legitimately disagree. Three carried of forty online is the shape
+    // that discriminates: nothing local is hidden, and no flow exists to fetch
+    // the other thirty-seven, so a "Ver todos" here could only expand to the
+    // same three rows.
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ onlineMembers: onlineRoster(3), onlineCount: 40 }),
+        },
+      }),
+    });
+
+    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
+        "listitem",
+      ),
+    ).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+  });
+
+  it("expands a capped preview to its own rows and never promises the rest", async () => {
+    // The real backend limit: MaxChannelDetailsMembers rows carried, forty
+    // reported. The control exists — twenty-five loaded rows are hidden by the
+    // compact cap — and what it reveals is those, never the ten the server
+    // never sent.
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ onlineMembers: onlineRoster(30), onlineCount: 40 }),
+        },
+      }),
+    });
+
+    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
+    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+  });
+
+  it("offers no control when exactly five members are online", () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ onlineMembers: onlineRoster(5), onlineCount: 5 }),
+        },
+      }),
+    });
+
+    expect(
+      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
+        "listitem",
+      ),
+    ).toHaveLength(5);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+  });
+
+  it("collapses the roster again when the panel is pointed at another conversation", async () => {
+    const expanded = state({
+      details: {
+        status: "ready",
+        data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+      },
+    });
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={expanded}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    expect(
+      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
+        "listitem",
+      ),
+    ).toHaveLength(7);
+
+    // The panel is deliberately not remounted on a target switch; the section
+    // still must not carry one conversation's expansion into the next.
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-2", onlineMembers: onlineRoster(7), onlineCount: 7 }),
+          },
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(
+      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
+        "listitem",
+      ),
+    ).toHaveLength(5);
+    expect(screen.getByRole("button", { name: /Ver todos Membros online/ })).toBeInTheDocument();
+  });
+
+  it("keeps the two sections' expansions independent of each other", async () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+        },
+        files: {
+          status: "ready",
+          data: Array.from({ length: 6 }, (_, index) =>
+            attachment({ id: `a-${index}`, filename: `arquivo-${index}.pdf` }),
+          ),
+        },
+      }),
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+
+    expect(
+      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
+        "listitem",
+      ),
+    ).toHaveLength(7);
+    // The files section is the second consumer of the same primitive and is
+    // untouched by what the people section did.
+    expect(
+      within(screen.getByRole("list", { name: "Arquivos recentes" })).getAllByRole("listitem"),
+    ).toHaveLength(5);
+    expect(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ })).toBeInTheDocument();
   });
 });
 
@@ -573,7 +734,7 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
     expect(screen.queryAllByRole("link")).toHaveLength(0);
   });
 
-  it("picks the file icon from the detected type, never from the name", () => {
+  it("picks the file icon from the detected type, never from the name", async () => {
     renderPanel({
       state: state({
         files: {
@@ -592,6 +753,10 @@ describe("ConversationDetailsPanel — canal: arquivos recentes", () => {
       }),
     });
 
+    // Six files exceed the compact cap (issue #892), so the sixth icon is only
+    // reachable once the section is expanded — which is itself the files
+    // section proving it shares the primitive.
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ }));
     const rows = within(screen.getByRole("list", { name: "Arquivos recentes" })).getAllByRole(
       "listitem",
     );
@@ -812,18 +977,48 @@ describe("ConversationDetailsPanel — grupo", () => {
     );
   });
 
-  it("states the group reason for the action that is still unavailable", async () => {
-    renderGroupPanel(groupDetails());
-
-    const seeAll = screen.getAllByRole("button", { name: "Ver todos" })[0];
-    expect(seeAll).not.toBeDisabled();
-    expect(seeAll).toHaveAttribute("aria-disabled", "true");
-    expect(seeAll).toHaveAccessibleDescription(
-      "A lista completa de participantes do grupo ainda não está disponível nesta versão.",
+  it("reports a participant total larger than the preview without offering to list it", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 3 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 40,
+      }),
     );
 
-    await userEvent.click(seeAll);
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Participantes (40)" })).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+  });
+
+  it("expands the participant list in the group's own vocabulary", async () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 7 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 7,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.getByRole("heading", { name: "Participantes (7)" })).toBeInTheDocument();
+
+    const toggle = screen.getByRole("button", { name: /Ver todos Participantes/ });
+    expect(toggle).not.toBeDisabled();
+    // The control that used to state why it could do nothing now does the thing.
+    expect(toggle).not.toHaveAttribute("aria-disabled");
+    await userEvent.click(toggle);
+
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(7);
+    expect(screen.getByRole("button", { name: /Mostrar menos Participantes/ })).toBeInTheDocument();
+    expect(screen.queryByText(/ainda não está disponível nesta versão/)).not.toBeInTheDocument();
   });
 
   it("shows group wording while loading and on error", () => {

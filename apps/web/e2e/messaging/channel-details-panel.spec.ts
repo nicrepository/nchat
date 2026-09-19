@@ -104,12 +104,12 @@ test.describe("painel de detalhes do canal", () => {
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("relatorio-backup.pdf"),
     ).toBeVisible();
 
-    // "Ver todos" continua sem fluxo: visível, indisponível pela semântica, sem
-    // simular sucesso. O botão segue alcançável por teclado para que o motivo
-    // descrito por aria-describedby possa ser anunciado.
-    const seeAll = panel.getByRole("button", { name: "Ver todos" }).first();
-    await expect(seeAll).toHaveAttribute("aria-disabled", "true");
-    expect(await seeAll.evaluate((el) => (el as HTMLButtonElement).disabled)).toBe(false);
+    // Com dois membros online e um arquivo, nenhuma seção tem conteúdo além do
+    // compacto — então não existe controle algum (issue #892), em vez de um
+    // "Ver todos" visível que não revelaria nada. A frase que explicava essa
+    // indisponibilidade saiu junto.
+    await expect(panel.getByRole("button", { name: /Ver todos/ })).toHaveCount(0);
+    await expect(panel.getByText(/ainda não está disponível nesta versão/)).toHaveCount(0);
 
     // "Adicionar membros" deixou de ser um placeholder (issue #398): virou fluxo
     // real, e este cenário não concede a permissão, então a ação fica ausente —
@@ -365,5 +365,155 @@ test.describe("painel de detalhes do canal", () => {
     await expect(members.getByRole("listitem")).toHaveCount(1);
     await expect(panel.getByRole("heading", { name: "Membros online (1)" })).toBeVisible();
     await expect(panel.getByText(/Canal público · 31 membros/)).toBeVisible();
+  });
+});
+
+/**
+ * A roster longer than the compact cap, so the section really has something to
+ * reveal (issue #892). Thirty is the server's own ceiling for this preview.
+ */
+function onlineRoster(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    user_id: `e2e-online-${index}`,
+    display_name: `Pessoa Online ${String(index + 1).padStart(2, "0")}`,
+    role: "member" as const,
+    presence: "online" as const,
+  }));
+}
+
+test.describe("seção expansível de membros", () => {
+  test("mostra 5, expande com scroll interno e volta ao compacto sem mover a conversa", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-expand");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Infra Expansível",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, onlineRoster(12), 30));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const members = panel.getByRole("list", { name: "Membros online do canal" });
+    const messageArea = page.getByTestId("chat-message-area");
+
+    // ── 1. compacto ──────────────────────────────────────────────────────
+    await expect(members.getByRole("listitem")).toHaveCount(5);
+    await expect(panel.getByRole("heading", { name: "Membros online (12)" })).toBeVisible();
+    await expect(members.getByText("Pessoa Online 06")).toHaveCount(0);
+
+    // One locator for both states: the control is the same element throughout —
+    // only its label and its aria-expanded change — and a locator that matched
+    // just one of the two labels would be asserting that it is replaced.
+    const toggle = panel.getByRole("button", {
+      name: /(Ver todos|Mostrar menos) Membros online/,
+    });
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    // Alvo de toque utilizável: o controle é pequeno em texto, não em área.
+    const toggleBox = await toggle.boundingBox();
+    expect(toggleBox?.height ?? 0).toBeGreaterThanOrEqual(16);
+
+    const timelineBefore = await messageArea.boundingBox();
+
+    // ── 2. expandir pelo teclado ─────────────────────────────────────────
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+
+    await expect(members.getByRole("listitem")).toHaveCount(12);
+    await expect(members.getByText("Pessoa Online 12")).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+
+    // ── 3. o crescimento fica dentro da própria seção ─────────────────────
+    const scroll = await members.evaluate((list) => ({
+      clientHeight: list.clientHeight,
+      scrollHeight: list.scrollHeight,
+      overflowY: getComputedStyle(list).overflowY,
+      tabIndex: list.tabIndex,
+    }));
+    expect(scroll.overflowY).toBe("auto");
+    // Mais conteúdo do que altura: o scroll é interno, e não do painel inteiro.
+    expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
+    // Uma região rolável precisa ser alcançável por teclado.
+    expect(scroll.tabIndex).toBe(0);
+
+    // A conversa não se move nem muda de largura por causa da expansão. O
+    // contrato é geométrico, não bit-a-bit: o que não pode mudar é a coluna da
+    // timeline — onde ela começa e quanto ela ocupa. Comparar o boundingBox
+    // inteiro transformaria um arredondamento subpixel do navegador, ou uma
+    // mudança de altura que o contrato não proíbe, em falha de teste.
+    const timelineAfter = await messageArea.boundingBox();
+    expect(timelineAfter?.x).toBeCloseTo(timelineBefore?.x ?? NaN, 1);
+    expect(timelineAfter?.width).toBeCloseTo(timelineBefore?.width ?? NaN, 1);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+
+    // Nada de rolagem horizontal, nem no painel nem no documento.
+    const overflow = await page.evaluate(() => ({
+      document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      panel: (() => {
+        const aside = document.querySelector<HTMLElement>(
+          "[data-testid=chat-conversation-details]",
+        );
+        return aside ? aside.scrollWidth - aside.clientWidth : 0;
+      })(),
+    }));
+    expect(overflow.document).toBeLessThanOrEqual(0);
+    expect(overflow.panel).toBeLessThanOrEqual(0);
+
+    // ── 4. colapsar mantém o foco no mesmo controle ───────────────────────
+    await page.keyboard.press("Enter");
+    await expect(members.getByRole("listitem")).toHaveCount(5);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toBeFocused();
+  });
+
+  test("continua utilizável e sem overflow horizontal em viewport estreito", async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const targetId = uniqueId(testInfo, "channel-expand-phone");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Infra Estreita",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, onlineRoster(12), 30));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByTestId("chat-details-toggle").click();
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const toggle = panel.getByRole("button", {
+      name: /(Ver todos|Mostrar menos) Membros online/,
+    });
+    await toggle.click();
+
+    // O controle fica acima da lista, então expandir nunca o empurra para fora:
+    // "Mostrar menos" continua visível e clicável no mesmo lugar.
+    await expect(toggle).toBeVisible();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(
+      panel.getByRole("list", { name: "Membros online do canal" }).getByRole("listitem"),
+    ).toHaveCount(12);
+
+    const horizontal = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(horizontal).toBeLessThanOrEqual(0);
+
+    await toggle.click();
+    await expect(
+      panel.getByRole("list", { name: "Membros online do canal" }).getByRole("listitem"),
+    ).toHaveCount(5);
   });
 });

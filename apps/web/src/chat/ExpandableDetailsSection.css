@@ -1,0 +1,49 @@
+/*
+ * ExpandableDetailsSection (issue #892).
+ *
+ * The collection list of a details-panel section, in both states. It keeps the
+ * `chat-details__` prefix because it is part of that panel's scope and inherits
+ * its tokens — this is one shared element of an existing surface, not a new
+ * design system.
+ *
+ * The expanded height is bounded in `rem` rather than in viewport units: the
+ * panel is a column of the chat grid at one size and the whole screen at
+ * another, so a viewport-derived height would mean something different in each
+ * and would stop tracking the reader's own text size. `rem` grows with the root
+ * font, so a zoomed-in reader gets a taller region and the same number of rows.
+ */
+
+.chat-details__collection {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* A row's name and metadata already ellipsize; this keeps a long word inside
+     the section instead of widening the panel and, with it, the grid. */
+  min-width: 0;
+}
+
+/* Roughly six rows, which is more than the compact cap: expanding always
+   reveals rows before it reveals a scrollbar.
+
+   The height is capped rather than computed. Nothing here measures the DOM, so
+   there is no resize listener, no layout read and nothing to get out of step
+   with the panel's own scrolling — which continues to work, because this
+   region's overflow is contained and never propagates to it. */
+.chat-details__collection--expanded {
+  max-block-size: 18rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Room for a row's focus ring and for the scrollbar, so neither sits on top
+     of the content nor pushes it into a horizontal scroll. */
+  padding-inline-end: 4px;
+}
+
+/* The expanded region is focusable so it can be scrolled by keyboard; the ring
+   is stated rather than left to the UA default over a tinted background. */
+.chat-details__collection:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}

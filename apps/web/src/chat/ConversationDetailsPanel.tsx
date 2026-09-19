@@ -50,6 +50,10 @@ import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
+import ExpandableDetailsSection, {
+  SectionMessage,
+  type ExpandableSectionContent,
+} from "./ExpandableDetailsSection";
 import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
@@ -123,20 +127,6 @@ const attachmentStatusLabel: Record<ChannelAttachment["status"], string> = {
  * So the field is deliberately not read. Until the store has an answer this
  * panel says the same thing every other surface says, which is nothing.
  */
-
-interface SectionMessageProps {
-  children: React.ReactNode;
-  /** Loading rows announce themselves; empty and error states are static text. */
-  role?: "status" | "alert";
-}
-
-function SectionMessage({ children, role }: SectionMessageProps) {
-  return (
-    <p className="chat-details__note" role={role}>
-      {children}
-    </p>
-  );
-}
 
 /**
  * An action whose flow does not exist yet.
@@ -315,65 +305,74 @@ function GroupAboutSection({ details }: { details: GroupDetails }) {
   );
 }
 
-/** The channel's online-members list (issue #435): presence-filtered server-side. */
-function ChannelMembersSection({
-  details,
-  currentUserId,
-}: {
-  details: ChannelDetails;
-  currentUserId: string;
-}) {
-  if (details.onlineMembers.length === 0) {
+/**
+ * The channel's online-members rows (issue #435): presence-filtered server-side.
+ *
+ * `count` is `onlineCount`, not `onlineMembers.length`: the array is a preview
+ * the server caps at `MaxChannelDetailsMembers`, and the two disagree exactly
+ * when more people are online than the preview carries. Handing the section
+ * both is what lets it say how many there are without claiming it can show them
+ * all — the total is drawn beside the heading and never becomes an offer to
+ * list them.
+ *
+ * `hasMore` and a loader are deliberately absent, together. Nothing in this
+ * client can fetch the rest of a capped roster today, so "Membros online (40)"
+ * above thirty rows and no control is the honest shape. Expanding here only
+ * ever uncaps rows already in hand; when a future issue can retrieve the
+ * remainder, that is when this gains both a `hasMore` and the `onExpand` that
+ * honours it.
+ */
+function channelMembersContent(
+  details: ChannelDetails,
+  currentUserId: string,
+): ExpandableSectionContent {
+  return {
+    status: "ready",
+    count: details.onlineCount,
+    items: details.onlineMembers.map((member) => (
+      <MemberRow
+        key={member.userId}
+        member={member}
+        subtitle={member.role === "moderator" ? "Moderador" : "Membro"}
+        isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
+        conversationKey={presenceTargetKey("channel", details.id)}
+      />
+    )),
     // "ninguem online agora", never "este canal nao tem membros" — the
     // channel's size is reported separately and is unaffected.
-    return <SectionMessage>Nenhum membro online no momento.</SectionMessage>;
-  }
-  return (
-    <ul className="chat-details__members" aria-label="Membros online do canal">
-      {details.onlineMembers.map((member) => (
-        <MemberRow
-          key={member.userId}
-          member={member}
-          subtitle={member.role === "moderator" ? "Moderador" : "Membro"}
-          isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
-          conversationKey={presenceTargetKey("channel", details.id)}
-        />
-      ))}
-    </ul>
-  );
+    empty: <SectionMessage>Nenhum membro online no momento.</SectionMessage>,
+  };
 }
 
 /**
- * The group's participant list (issue #441).
+ * The group's participant rows (issue #441).
  *
  * Every active participant appears, online or not: presence is shown beside a
- * participant, never used to decide whether they are shown.
+ * participant, never used to decide whether they are shown. `participantCount`
+ * is the total, and it is presentation for the same reason `onlineCount` is
+ * above: the array is a capped preview, no loader exists for the remainder, and
+ * so no control claims one.
  */
-function GroupParticipantsSection({
-  details,
-  currentUserId,
-}: {
-  details: GroupDetails;
-  currentUserId: string;
-}) {
-  if (details.participants.length === 0) {
-    return <SectionMessage>Nenhum participante para exibir.</SectionMessage>;
-  }
-  return (
-    <ul className="chat-details__members" aria-label="Participantes do grupo">
-      {details.participants.map((participant) => (
-        <MemberRow
-          key={participant.userId}
-          member={participant}
-          subtitle="Participante"
-          isCurrentUser={Boolean(currentUserId) && participant.userId === currentUserId}
-          // A group is a dm conversation on the wire, so that is the target its
-          // presence is scoped by.
-          conversationKey={presenceTargetKey("dm", details.id)}
-        />
-      ))}
-    </ul>
-  );
+function groupParticipantsContent(
+  details: GroupDetails,
+  currentUserId: string,
+): ExpandableSectionContent {
+  return {
+    status: "ready",
+    count: details.participantCount,
+    items: details.participants.map((participant) => (
+      <MemberRow
+        key={participant.userId}
+        member={participant}
+        subtitle="Participante"
+        isCurrentUser={Boolean(currentUserId) && participant.userId === currentUserId}
+        // A group is a dm conversation on the wire, so that is the target its
+        // presence is scoped by.
+        conversationKey={presenceTargetKey("dm", details.id)}
+      />
+    )),
+    empty: <SectionMessage>Nenhum participante para exibir.</SectionMessage>,
+  };
 }
 
 // ── 1:1 profile (issue #443) ────────────────────────────────────────────────
@@ -538,37 +537,141 @@ const panelHeader = {
 /**
  * Per-conversation wording, in one table so a missing case is a type error.
  *
- * `peopleUnavailable` is now about the *full list* only. Adding people is a real
- * flow (issue #398), so the sentence that used to say member management was
- * unavailable would be false; what remains unavailable is "Ver todos", which is
- * the one control still pointing at this note as its reason.
+ * There is no longer a "still unavailable" sentence for the people or the files
+ * section (issue #892). Both controls used to be `UnavailableAction`s described
+ * by one, and both now expand for real when there is anything to expand to — a
+ * reason for an unavailability that no longer exists would be a false statement,
+ * and a control that reveals nothing is exactly what #892 removed.
  */
 const conversationCopy = {
   channel: {
     peopleHeading: "Membros online",
-    peopleUnavailable:
-      "A lista completa de membros do canal ainda não está disponível nesta versão.",
+    peopleLabel: "Membros online do canal",
     addAction: "Adicionar membros",
     addedNone: "Todas as pessoas selecionadas já participam deste canal.",
     addedOne: "1 pessoa adicionada ao canal.",
     addedMany: (count: number) => `${count} pessoas adicionadas ao canal.`,
     pinEmpty: "Nenhuma mensagem fixada neste canal.",
     filesEmpty: "Nenhum arquivo enviado neste canal.",
-    filesUnavailable: "A central de arquivos do canal ainda não está disponível nesta versão.",
   },
   group: {
     peopleHeading: "Participantes",
-    peopleUnavailable:
-      "A lista completa de participantes do grupo ainda não está disponível nesta versão.",
+    peopleLabel: "Participantes do grupo",
     addAction: "Adicionar participantes",
     addedNone: "Todas as pessoas selecionadas já participam deste grupo.",
     addedOne: "1 pessoa adicionada ao grupo.",
     addedMany: (count: number) => `${count} pessoas adicionadas ao grupo.`,
     pinEmpty: "Nenhuma mensagem fixada neste grupo.",
     filesEmpty: "Nenhum arquivo enviado neste grupo.",
-    filesUnavailable: "A central de arquivos do grupo ainda não está disponível nesta versão.",
   },
 } as const;
+
+/**
+ * One row of the recent-files list.
+ *
+ * Extracted so the files section hands the shared primitive a list of rows and
+ * nothing else: the scan badge, the thumbnail and the player are this row's
+ * concern and stay entirely inside it (RF-22, RF-31).
+ */
+function FileRow({ file }: { file: ChannelAttachment }) {
+  return (
+    <li className="chat-details__file">
+      {/* The thumbnail owns its own fetch and object URL; the icon stays exactly
+          as it was and is what shows whenever there is no preview to show. */}
+      <AttachmentThumbnail
+        attachment={file}
+        fallback={
+          <span className="chat-details__file-icon" aria-hidden="true">
+            <span className="material-symbols-outlined">{fileIconFor(file.contentType)}</span>
+          </span>
+        }
+      />
+      <span className="chat-details__file-text">
+        {/* A filename is text. It is never a URL and never markup. */}
+        <span className="chat-details__file-name">{file.filename}</span>
+        <span className="chat-details__file-meta">
+          {file.createdAt && `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
+          {formatFileSize(file.size)}
+          <span
+            className={`chat-details__file-status chat-details__file-status--${file.status}`}
+            data-testid={`chat-details-file-status-${file.id}`}
+          >
+            {attachmentStatusLabel[file.status]}
+          </span>
+        </span>
+      </span>
+      {/* The player is a sibling of the row's text rather than part of it, so it
+          wraps onto its own line and a file that is not a playable video renders
+          nothing at all — the row keeps its icon, its size and its status. */}
+      <AttachmentVideo attachment={file} />
+    </li>
+  );
+}
+
+/**
+ * The people section's content, in the vocabulary of whichever conversation is
+ * open (issue #892).
+ *
+ * Loading is the fallthrough rather than the first test: `ConversationBody` has
+ * already turned "ready, but tagged for the other aggregate" into loading, so
+ * the only way past the two ready cases is a load still in flight, and there is
+ * no fourth outcome to leave silently unrendered.
+ */
+function peopleContent(
+  kind: "channel" | "group",
+  details: ConversationDetailsState["details"],
+  currentUserId: string,
+): ExpandableSectionContent {
+  if (details.status === "error") {
+    return {
+      status: "error",
+      message:
+        kind === "channel"
+          ? "Não foi possível carregar os membros."
+          : "Não foi possível carregar os participantes.",
+    };
+  }
+  if (details.status === "ready" && details.data.kind === "channel") {
+    return channelMembersContent(details.data, currentUserId);
+  }
+  if (details.status === "ready" && details.data.kind === "group") {
+    return groupParticipantsContent(details.data, currentUserId);
+  }
+  return {
+    status: "loading",
+    message: kind === "channel" ? "Carregando membros…" : "Carregando participantes…",
+  };
+}
+
+/**
+ * The recent-files section's content (issue #892).
+ *
+ * No `count` and no `hasMore`: the list endpoint reports neither a total nor a
+ * cursor, and the panel asks it for exactly `channelFilesPreviewLimit` rows. So
+ * this section is structurally expandable and, with today's contract, never has
+ * anything to expand to — which is why it shows no control at all rather than
+ * one that would reveal nothing.
+ */
+function filesContent(
+  files: ConversationDetailsState["files"],
+  emptyText: string,
+): ExpandableSectionContent {
+  if (files.status === "loading") {
+    return { status: "loading", message: "Carregando arquivos…" };
+  }
+  if (files.status === "error") {
+    return { status: "error", message: "Não foi possível carregar os arquivos." };
+  }
+  return {
+    status: "ready",
+    items: files.data.map((file) => <FileRow key={file.id} file={file} />),
+    empty: (
+      <p className="chat-details__empty" data-testid="chat-details-files-empty">
+        {emptyText}
+      </p>
+    ),
+  };
+}
 
 /**
  * The body of a 1:1 panel: one profile, or the state of trying to load it.
@@ -593,6 +696,250 @@ function DirectBody({ details }: { details: ConversationDetailsState["details"] 
   return <DirectProfileSection details={details.data} />;
 }
 
+type ConversationCopy = (typeof conversationCopy)[keyof typeof conversationCopy];
+
+/** What one add-members call is reported as, in the conversation's vocabulary. */
+function addedText(copy: ConversationCopy, added: number): string {
+  if (added === 0) return copy.addedNone;
+  if (added === 1) return copy.addedOne;
+  return copy.addedMany(added);
+}
+
+/**
+ * The "Sobre" section: the metadata card, or the state of trying to load it.
+ *
+ * The three outcomes are exclusive, and the fourth — ready with a payload
+ * tagged for the other aggregate — cannot arrive: `ConversationBody` has
+ * already folded it into loading.
+ */
+function AboutSection({
+  kind,
+  details,
+}: {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+}) {
+  return (
+    <section className="chat-details__section" aria-labelledby="chat-details-about">
+      <h3 id="chat-details-about" className="chat-details__label">
+        Sobre
+      </h3>
+      {details.status === "loading" && (
+        <SectionMessage role="status">
+          {kind === "channel"
+            ? "Carregando informações do canal…"
+            : "Carregando informações do grupo…"}
+        </SectionMessage>
+      )}
+      {details.status === "error" && (
+        <SectionMessage role="alert">
+          {kind === "channel"
+            ? "Não foi possível carregar as informações do canal."
+            : "Não foi possível carregar as informações do grupo."}
+        </SectionMessage>
+      )}
+      {details.status === "ready" &&
+        (details.data.kind === "channel" ? (
+          <ChannelAboutSection details={details.data} />
+        ) : details.data.kind === "group" ? (
+          <GroupAboutSection details={details.data} />
+        ) : null)}
+    </section>
+  );
+}
+
+/** The one pinned message the panel and the bar above the conversation share. */
+function PinnedMessageSection({
+  latestPin,
+  emptyText,
+}: {
+  latestPin: PinnedItem | null;
+  emptyText: string;
+}) {
+  return (
+    <section className="chat-details__section" aria-labelledby="chat-details-pin">
+      <h3 id="chat-details-pin" className="chat-details__label">
+        Mensagem fixada
+      </h3>
+      {latestPin === null ? (
+        <p className="chat-details__empty" data-testid="chat-details-pin-empty">
+          {emptyText}
+        </p>
+      ) : (
+        <div className="chat-details__pin" data-testid="chat-details-pin">
+          <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
+            push_pin
+          </span>
+          <div className="chat-details__pin-text">
+            <div className="chat-details__pin-body">
+              {latestPin.message.isRemoved ? (
+                <em>Mensagem removida.</em>
+              ) : (
+                <RichTextRenderer
+                  text={latestPin.message.bodyText}
+                  bodyFormat={latestPin.message.bodyFormat}
+                />
+              )}
+            </div>
+            <div className="chat-details__pin-by">
+              {senderLabel(latestPin.message)}
+              {latestPin.pinnedAt &&
+                ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * The conversation currently described and what this caller may do to it.
+ *
+ * "" while loading, and "" for a direct payload — which cannot reach here, but
+ * the type permits it and an id borrowed from the wrong aggregate would be the
+ * worst possible default. `canManage` is the server's own answer, never
+ * inferred: a rendering hint only, since POST .../members re-derives it from
+ * the session on every call (issue #398).
+ */
+function manageableTarget(details: ConversationDetailsState["details"]): {
+  id: string;
+  canManage: boolean;
+} {
+  if (details.status !== "ready" || details.data.kind === "direct") {
+    return { id: "", canManage: false };
+  }
+  return { id: details.data.id, canManage: details.data.canManageMembers };
+}
+
+/**
+ * The people section: the roster, the add-members flow that acts on it, and
+ * nothing else (issues #398, #892).
+ *
+ * It owns the add flow's state rather than the panel, so `ConversationBody`
+ * stays an arrangement of sections instead of the state machine of each one.
+ * The roster itself is drawn by the shared primitive, which is handed rows and
+ * a status and knows neither what a member is nor who may add one.
+ */
+function PeopleSection({
+  kind,
+  details,
+  currentUserId,
+  copy,
+  reload,
+}: {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+  currentUserId: string;
+  copy: ConversationCopy;
+  reload: () => void;
+}) {
+  // Both the picker and the notice are keyed on the conversation rather than on
+  // a boolean, which is what makes confirming into the wrong conversation
+  // unrepresentable: the panel is deliberately not remounted on a target
+  // switch, so a boolean would survive one and let a dialog opened for A post
+  // its selection to B.
+  const { id: targetId, canManage } = manageableTarget(details);
+
+  const addMembersButtonRef = useRef<HTMLButtonElement>(null);
+  const [pickerFor, setPickerFor] = useState<string | null>(null);
+  const [addedNotice, setAddedNotice] = useState<{ targetId: string; text: string } | null>(null);
+
+  // Open only while the conversation it was opened for is still on screen. The
+  // comparison closes it during render — the dialog unmounts, its
+  // AbortController cancels any in-flight search or submit, and the selection
+  // goes with it. One structural mechanism, no effect.
+  const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
+
+  const closePicker = useCallback(() => {
+    setPickerFor(null);
+    // The button is only rendered while the caller may manage members, so the
+    // ref can be detached by the time this runs (a refetch that revoked the
+    // permission). Focusing a detached node would drop focus to <body>.
+    addMembersButtonRef.current?.focus();
+  }, []);
+
+  const handleAdded = useCallback(
+    (result: AddMembersResult) => {
+      closePicker();
+      // The server's own numbers, never a local increment: someone else may have
+      // added people between the search and this response.
+      setAddedNotice({ targetId, text: addedText(copy, result.added) });
+      // The single reconciliation path: the response is not merged into the
+      // rendered list, the panel refetches. So the roster and both counters come
+      // from one authority, and a concurrent members.added refetching too cannot
+      // double-count anything.
+      reload();
+    },
+    [closePicker, copy, reload, targetId],
+  );
+
+  return (
+    <>
+      {/*
+        Keyed by the conversation. The panel is deliberately not remounted on a
+        target switch, so without this the roster expanded for one conversation
+        would stay expanded under the next one's name — and that expansion is a
+        statement about a list that no longer exists. The remount React already
+        offers is the whole mechanism; there is no reset protocol to maintain.
+      */}
+      <ExpandableDetailsSection
+        key={`people-${targetId}`}
+        title={copy.peopleHeading}
+        listLabel={copy.peopleLabel}
+        content={peopleContent(kind, details, currentUserId)}
+      >
+        {/*
+          Rendered only once the server has answered and said this caller may
+          manage members. Loading, error and "not permitted" all leave it absent
+          — the safe default, since canManageMembers is false unless the server
+          sent exactly true. Hiding it is not the security boundary.
+        */}
+        {canManage && (
+          <button
+            ref={addMembersButtonRef}
+            type="button"
+            className="chat-details__wide-action"
+            onClick={() => setPickerFor(targetId)}
+            data-testid="chat-details-add-members"
+          >
+            <span className="material-symbols-outlined" aria-hidden="true">
+              person_add
+            </span>
+            {copy.addAction}
+          </button>
+        )}
+        {addedNotice?.targetId === targetId && (
+          // Announced rather than shown as a transient toast: the panel above
+          // has already been refetched, and this says what changed.
+          <p className="chat-details__note" role="status">
+            {addedNotice.text}
+          </p>
+        )}
+      </ExpandableDetailsSection>
+
+      {pickerOpen && (
+        <AddMembersDialog
+          target={
+            kind === "channel"
+              ? { kind: "channel", channelId: targetId }
+              : { kind: "group", conversationId: targetId }
+          }
+          /*
+            Only the viewer. Current members are excluded by the search endpoint
+            itself, in SQL — this list deliberately does not carry the rendered
+            roster, because both sections are capped previews and passing them
+            made members they could not show appear as selectable.
+          */
+          excludedUserIds={currentUserId ? [currentUserId] : []}
+          onClose={closePicker}
+          onAdded={handleAdded}
+        />
+      )}
+    </>
+  );
+}
+
 /**
  * The body of a channel or group panel: about, people, pin and files.
  *
@@ -600,6 +947,9 @@ function DirectBody({ details }: { details: ConversationDetailsState["details"] 
  * conditionals threaded through four sections. The conversation vocabulary and
  * the profile vocabulary now live in separate functions, and neither can grow a
  * branch for the other by accident.
+ *
+ * Each section decides its own content; this function decides only which
+ * sections exist and in what order.
  */
 function ConversationBody({
   kind,
@@ -630,287 +980,23 @@ function ConversationBody({
       ? { status: "loading" }
       : rawDetails;
 
-  // ── Add members (issue #398) ─────────────────────────────────────────────
-  //
-  // The conversation currently described, or "" while loading. Both the picker
-  // and the notice are keyed on it rather than on a boolean, which is what makes
-  // confirming into the wrong conversation unrepresentable: the panel is
-  // deliberately not remounted on a target switch, so a boolean would survive
-  // one and let a dialog opened for A post its selection to B.
-  const targetId =
-    details.status === "ready" && details.data.kind !== "direct" ? details.data.id : "";
-  const canManageMembers =
-    details.status === "ready" && details.data.kind !== "direct" && details.data.canManageMembers;
-
-  const addMembersButtonRef = useRef<HTMLButtonElement>(null);
-  const [pickerFor, setPickerFor] = useState<string | null>(null);
-  const [addedNotice, setAddedNotice] = useState<{ targetId: string; text: string } | null>(null);
-
-  // Open only while the conversation it was opened for is still on screen. The
-  // comparison closes it during render — the dialog unmounts, its
-  // AbortController cancels any in-flight search or submit, and the selection
-  // goes with it. One structural mechanism, no effect.
-  const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
-
-  const closePicker = useCallback(() => {
-    setPickerFor(null);
-    // The button is only rendered while the caller may manage members, so the
-    // ref can be detached by the time this runs (a refetch that revoked the
-    // permission). Focusing a detached node would drop focus to <body>.
-    addMembersButtonRef.current?.focus();
-  }, []);
-
-  const handleAdded = useCallback(
-    (result: AddMembersResult) => {
-      closePicker();
-      // The server's own numbers, never a local increment: someone else may have
-      // added people between the search and this response.
-      setAddedNotice({
-        targetId,
-        text:
-          result.added === 0
-            ? copy.addedNone
-            : result.added === 1
-              ? copy.addedOne
-              : copy.addedMany(result.added),
-      });
-      // The single reconciliation path: the response is not merged into the
-      // rendered list, the panel refetches. So the roster and both counters come
-      // from one authority, and a concurrent members.added refetching too cannot
-      // double-count anything.
-      reload();
-    },
-    [closePicker, copy, reload, targetId],
-  );
-
   return (
     <>
-      {/* ── Sobre ─────────────────────────────────────────────────────── */}
-      <section className="chat-details__section" aria-labelledby="chat-details-about">
-        <h3 id="chat-details-about" className="chat-details__label">
-          Sobre
-        </h3>
-        {details.status === "loading" && (
-          <SectionMessage role="status">
-            {kind === "channel"
-              ? "Carregando informações do canal…"
-              : "Carregando informações do grupo…"}
-          </SectionMessage>
-        )}
-        {details.status === "error" && (
-          <SectionMessage role="alert">
-            {kind === "channel"
-              ? "Não foi possível carregar as informações do canal."
-              : "Não foi possível carregar as informações do grupo."}
-          </SectionMessage>
-        )}
-        {details.status === "ready" &&
-          (details.data.kind === "channel" ? (
-            <ChannelAboutSection details={details.data} />
-          ) : details.data.kind === "group" ? (
-            <GroupAboutSection details={details.data} />
-          ) : null)}
-      </section>
-
-      {/* ── Pessoas (membros online / participantes) ──────────────────── */}
-      <section className="chat-details__section" aria-labelledby="chat-details-people">
-        <div className="chat-details__section-head">
-          {/*
-            The count is the server's total for this section, never the length
-            of the rendered list: both lists are capped previews. For a channel
-            that total is how many members are online; for a group it is how
-            many participants there are.
-          */}
-          <h3 id="chat-details-people" className="chat-details__label">
-            {copy.peopleHeading}
-            {details.status === "ready" &&
-              details.data.kind !== "direct" &&
-              ` (${
-                details.data.kind === "channel"
-                  ? details.data.onlineCount
-                  : details.data.participantCount
-              })`}
-          </h3>
-          <UnavailableAction
-            label="Ver todos"
-            reasonId="chat-details-people-unavailable"
-            className="chat-details__link-action"
-          />
-        </div>
-        {details.status === "loading" && (
-          <SectionMessage role="status">
-            {kind === "channel" ? "Carregando membros…" : "Carregando participantes…"}
-          </SectionMessage>
-        )}
-        {details.status === "error" && (
-          <SectionMessage role="alert">
-            {kind === "channel"
-              ? "Não foi possível carregar os membros."
-              : "Não foi possível carregar os participantes."}
-          </SectionMessage>
-        )}
-        {details.status === "ready" &&
-          (details.data.kind === "channel" ? (
-            <ChannelMembersSection details={details.data} currentUserId={currentUserId} />
-          ) : details.data.kind === "group" ? (
-            <GroupParticipantsSection details={details.data} currentUserId={currentUserId} />
-          ) : null)}
-        {/*
-          Rendered only once the server has answered and said this caller may
-          manage members (issue #398). Loading, error and "not permitted" all
-          leave it absent — the safe default, since canManageMembers is false
-          unless the server sent exactly true. Hiding it is not the security
-          boundary: POST .../members re-derives the decision from the session on
-          every call.
-        */}
-        {canManageMembers && (
-          <button
-            ref={addMembersButtonRef}
-            type="button"
-            className="chat-details__wide-action"
-            onClick={() => setPickerFor(targetId)}
-            data-testid="chat-details-add-members"
-          >
-            <span className="material-symbols-outlined" aria-hidden="true">
-              person_add
-            </span>
-            {copy.addAction}
-          </button>
-        )}
-        {addedNotice?.targetId === targetId && (
-          // Announced rather than shown as a transient toast: the panel above
-          // has already been refetched, and this says what changed.
-          <p className="chat-details__note" role="status">
-            {addedNotice.text}
-          </p>
-        )}
-        <p id="chat-details-people-unavailable" className="chat-details__note">
-          {copy.peopleUnavailable}
-        </p>
-      </section>
-
-      {pickerOpen && (
-        <AddMembersDialog
-          target={
-            kind === "channel"
-              ? { kind: "channel", channelId: targetId }
-              : { kind: "group", conversationId: targetId }
-          }
-          /*
-            Only the viewer. Current members are excluded by the search endpoint
-            itself, in SQL — this list deliberately does not carry the rendered
-            roster, because both sections are capped previews and passing them
-            made members they could not show appear as selectable.
-          */
-          excludedUserIds={currentUserId ? [currentUserId] : []}
-          onClose={closePicker}
-          onAdded={handleAdded}
-        />
-      )}
-
-      {/* ── Mensagem fixada ───────────────────────────────────────────── */}
-      <section className="chat-details__section" aria-labelledby="chat-details-pin">
-        <h3 id="chat-details-pin" className="chat-details__label">
-          Mensagem fixada
-        </h3>
-        {latestPin === null ? (
-          <p className="chat-details__empty" data-testid="chat-details-pin-empty">
-            {copy.pinEmpty}
-          </p>
-        ) : (
-          <div className="chat-details__pin" data-testid="chat-details-pin">
-            <span className="material-symbols-outlined chat-details__pin-icon" aria-hidden="true">
-              push_pin
-            </span>
-            <div className="chat-details__pin-text">
-              <div className="chat-details__pin-body">
-                {latestPin.message.isRemoved ? (
-                  <em>Mensagem removida.</em>
-                ) : (
-                  <RichTextRenderer
-                    text={latestPin.message.bodyText}
-                    bodyFormat={latestPin.message.bodyFormat}
-                  />
-                )}
-              </div>
-              <div className="chat-details__pin-by">
-                {senderLabel(latestPin.message)}
-                {latestPin.pinnedAt &&
-                  ` · ${formatDayLabel(latestPin.pinnedAt)}, ${formatTime(latestPin.pinnedAt)}`}
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* ── Arquivos recentes ─────────────────────────────────────────── */}
-      <section className="chat-details__section" aria-labelledby="chat-details-files">
-        <div className="chat-details__section-head">
-          <h3 id="chat-details-files" className="chat-details__label">
-            Arquivos recentes
-          </h3>
-          <UnavailableAction
-            label="Ver todos"
-            reasonId="chat-details-files-unavailable"
-            className="chat-details__link-action"
-          />
-        </div>
-        {files.status === "loading" && (
-          <SectionMessage role="status">Carregando arquivos…</SectionMessage>
-        )}
-        {files.status === "error" && (
-          <SectionMessage role="alert">Não foi possível carregar os arquivos.</SectionMessage>
-        )}
-        {files.status === "ready" &&
-          (files.data.length === 0 ? (
-            <p className="chat-details__empty" data-testid="chat-details-files-empty">
-              {copy.filesEmpty}
-            </p>
-          ) : (
-            <ul className="chat-details__files" aria-label="Arquivos recentes">
-              {files.data.map((file) => (
-                <li key={file.id} className="chat-details__file">
-                  {/* The thumbnail owns its own fetch and object URL; the icon
-                      stays exactly as it was and is what shows whenever there
-                      is no preview to show. */}
-                  <AttachmentThumbnail
-                    attachment={file}
-                    fallback={
-                      <span className="chat-details__file-icon" aria-hidden="true">
-                        <span className="material-symbols-outlined">
-                          {fileIconFor(file.contentType)}
-                        </span>
-                      </span>
-                    }
-                  />
-                  <span className="chat-details__file-text">
-                    {/* A filename is text. It is never a URL and never markup. */}
-                    <span className="chat-details__file-name">{file.filename}</span>
-                    <span className="chat-details__file-meta">
-                      {file.createdAt &&
-                        `${formatDayLabel(file.createdAt)}, ${formatTime(file.createdAt)} · `}
-                      {formatFileSize(file.size)}
-                      <span
-                        className={`chat-details__file-status chat-details__file-status--${file.status}`}
-                        data-testid={`chat-details-file-status-${file.id}`}
-                      >
-                        {attachmentStatusLabel[file.status]}
-                      </span>
-                    </span>
-                  </span>
-                  {/* The player is a sibling of the row rather than part of it,
-                      so it wraps onto its own line and a file that is not a
-                      playable video renders nothing at all — the row keeps its
-                      icon, its size and its status untouched. */}
-                  <AttachmentVideo attachment={file} />
-                </li>
-              ))}
-            </ul>
-          ))}
-        <p id="chat-details-files-unavailable" className="chat-details__note">
-          {copy.filesUnavailable}
-        </p>
-      </section>
+      <AboutSection kind={kind} details={details} />
+      <PeopleSection
+        kind={kind}
+        details={details}
+        currentUserId={currentUserId}
+        copy={copy}
+        reload={reload}
+      />
+      <PinnedMessageSection latestPin={latestPin} emptyText={copy.pinEmpty} />
+      <ExpandableDetailsSection
+        key={`files-${manageableTarget(details).id}`}
+        title="Arquivos recentes"
+        listLabel="Arquivos recentes"
+        content={filesContent(files, copy.filesEmpty)}
+      />
     </>
   );
 }
