@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,6 +47,8 @@ import type {
   PinnedItem,
 } from "./chatTypes";
 import { localTimeRefreshMs } from "./conversationDetailsDisplay";
+import { conversationNameMaxCodePoints } from "./conversationRename";
+import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
 
 const currentUserId = "user-me";
@@ -1996,5 +1998,613 @@ describe("ConversationDetailsPanel attachment previews (RF-31)", () => {
     expect(mockFetchAttachmentPreview).toHaveBeenCalledWith("a-ready", expect.any(AbortSignal));
 
     vi.unstubAllGlobals();
+  });
+});
+
+// ── Inline rename (issue #893) ──────────────────────────────────────────────
+//
+// The panel's own half of the feature: which affordance it draws, what the
+// editor does, and what it refuses to do to the rest of the UI. *Whether* a
+// given target may be renamed at all is conversationRename's decision and is
+// tested there — here the presence or absence of `onRename` stands for the
+// answer it already gave.
+
+function renderRenamePanel(
+  overrides: Partial<Parameters<typeof ConversationDetailsPanel>[0]> = {},
+) {
+  const onRename = vi.fn().mockResolvedValue(undefined);
+  const reload = vi.fn();
+  const rendered = render(
+    <ConversationDetailsPanel
+      kind="channel"
+      state={state({ reload })}
+      currentUserId={currentUserId}
+      latestPin={null}
+      onRename={onRename}
+      onClose={vi.fn()}
+      {...overrides}
+    />,
+  );
+  return { onRename, reload, ...rendered };
+}
+
+/** Opens the editor the way a user does, and hands back the field. */
+async function openEditor(user: ReturnType<typeof userEvent.setup>, label = "Renomear canal") {
+  await user.click(screen.getByRole("button", { name: label }));
+  return screen.getByRole("textbox", { name: "Nome do canal" });
+}
+
+describe("ConversationDetailsPanel — renomear inline: a ação", () => {
+  it("offers the rename control on a channel the caller may rename", () => {
+    renderRenamePanel();
+
+    expect(screen.getByRole("button", { name: "Renomear canal" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+  });
+
+  // The one absent value covers every reason there is: no capability, the
+  // general channel, and a host with no mutation wired.
+  it("shows the name without any control when the caller may not rename", () => {
+    renderRenamePanel({ onRename: undefined });
+
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+  });
+
+  it("offers the group vocabulary on a group", () => {
+    renderRenamePanel({
+      kind: "group",
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        reload: vi.fn(),
+      },
+    });
+
+    expect(screen.getByRole("button", { name: "Renomear grupo" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  // A 1:1 has no name of its own — its title is the counterpart's, resolved per
+  // viewer — so the profile panel has no name field to grow a rename from.
+  it("never renders a name field on a 1:1 profile", () => {
+    renderRenamePanel({
+      kind: "direct",
+      state: {
+        details: { status: "ready", data: directDetails() },
+        files: { status: "ready", data: [] },
+        reload: vi.fn(),
+      },
+    });
+
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-channel-name")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-group-name")).not.toBeInTheDocument();
+  });
+
+  it("shows no control while the details are still loading", () => {
+    renderRenamePanel({ state: state({ details: { status: "loading" } }) });
+
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: entrar e cancelar", () => {
+  it("opens an inline field seeded with the persisted name, focused, and asks nothing", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+
+    expect(field).toHaveValue("Infraestrutura");
+    expect(field).toHaveFocus();
+    // Inline, not the sidebar's modal.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
+  it("discards the draft on Escape and restores the persisted name", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    await user.keyboard("{Escape}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+  });
+
+  // Escape belongs to the editor while it is open; the panel must not close
+  // underneath it.
+  it("keeps the panel open when Escape cancels the editor", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    renderRenamePanel({ onClose });
+
+    const field = await openEditor(user);
+    await user.type(field, "x");
+    await user.keyboard("{Escape}");
+
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("cancels through the cancel control and returns focus to the rename control", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    await openEditor(user);
+    await user.click(screen.getByRole("button", { name: "Cancelar a renomeação do canal" }));
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Renomear canal" })).toHaveFocus();
+  });
+
+  it("reopens with the persisted name, not the abandoned draft, and without the old error", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    const reopened = await openEditor(user);
+
+    expect(reopened).toHaveValue("Infraestrutura");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: confirmar", () => {
+  it("confirms with Enter, trims, and never adopts the typed name itself", async () => {
+    const user = userEvent.setup();
+    const { onRename, reload } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "   Plataforma   {Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith("Plataforma"));
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+    // Still the persisted name: convergence is the canonical list moving and
+    // useReloadOnRename refetching it, never a write-back from the editor.
+    // The editor asks for no reload of its own (CQ-893-03).
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("confirms through the confirm control", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    await user.click(screen.getByRole("button", { name: "Salvar novo nome do canal" }));
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith("Plataforma"));
+  });
+
+  it("refuses a whitespace-only name locally and says so on the field", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "   {Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    const error = screen.getByRole("alert");
+    expect(error).toHaveTextContent("Escolha um nome para este canal.");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    expect(field).toHaveFocus();
+  });
+
+  // A write that would store the same string is a request with no change.
+  it("asks for nothing when the trimmed name is the persisted one", async () => {
+    const user = userEvent.setup();
+    const { onRename, reload } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "  Infraestrutura  {Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    // No request, so nothing moves the canonical list and nothing is
+    // refetched: a no-op rename costs exactly nothing (CQ-893-03).
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+  });
+
+  it("accepts an ASCII name at the channel cap", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const atCap = "a".repeat(conversationNameMaxCodePoints.channel);
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, atCap);
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+  });
+
+  // ── The cap is in code points, the field is not (CQ-893-01) ──────────────
+  //
+  // 100 emoji is 100 code points and 200 UTF-16 code units. The backend
+  // accepts it; a `maxLength={100}` field silently refused half of it, and
+  // `String.prototype.length` would have made the same mistake. These cases
+  // pin both sides of both boundaries.
+
+  it("accepts a channel name of exactly 100 emoji, whole and untruncated", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const atCap = "😀".repeat(100);
+    const field = await openEditor(user);
+    // Pasted rather than typed: 100 emoji through the keyboard is 200 events.
+    fireEvent.change(field, { target: { value: atCap } });
+    expect(field).toHaveValue(atCap);
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+    // Exactly what was typed reached the mutation — not 50 emoji, and nothing
+    // cut at 100 UTF-16 units.
+    expect((onRename.mock.calls[0][0] as string).length).toBe(200);
+  });
+
+  it("refuses a channel name of 101 emoji locally, keeping the draft", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const overCap = "😀".repeat(101);
+    const field = await openEditor(user);
+    fireEvent.change(field, { target: { value: overCap } });
+    await user.keyboard("{Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    const error = screen.getByRole("alert");
+    expect(error).toHaveTextContent("O nome do canal deve ter no máximo 100 caracteres.");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    // Nothing was cut to fit; the user shortens it themselves.
+    expect(field).toHaveValue(overCap);
+    expect(field).toHaveFocus();
+  });
+
+  it("accepts a group name of exactly 120 emoji and refuses 121", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockResolvedValue(undefined);
+    renderRenamePanel({
+      kind: "group",
+      onRename,
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        reload: vi.fn(),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Renomear grupo" }));
+    const field = screen.getByRole("textbox", { name: "Nome do grupo" });
+
+    const overCap = "😀".repeat(121);
+    fireEvent.change(field, { target: { value: overCap } });
+    await user.keyboard("{Enter}");
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "O nome do grupo deve ter no máximo 120 caracteres.",
+    );
+
+    const atCap = "😀".repeat(120);
+    fireEvent.change(field, { target: { value: atCap } });
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+  });
+
+  // The local check saves a round trip; it is not the authority. A name this
+  // client considers fine can still come back refused.
+  it("still renders the server's refusal for a name it let through", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(400, "bad_request", "nope"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Escolha um nome válido para esta conversa.",
+    );
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toHaveValue("Plataforma");
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit único", () => {
+  /** A rename whose resolution the test controls. */
+  function deferredRename() {
+    let settle: { resolve: () => void; reject: (error: unknown) => void } | undefined;
+    const onRename = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          settle = { resolve, reject: (error) => reject(error) };
+        }),
+    );
+    return { onRename, settle: () => settle };
+  }
+
+  it("keeps the wait inside the editor and leaves the rest of the panel usable", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    const confirm = screen.getByRole("button", { name: "Salvar novo nome do canal" });
+    await waitFor(() => expect(confirm).toBeDisabled());
+    expect(confirm).toHaveAttribute("aria-busy", "true");
+    expect(field).toHaveAttribute("readonly");
+    // The panel itself is untouched: its own controls still work.
+    expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toBeEnabled();
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  it("stays open with the typed name when the server refuses, and retries", async () => {
+    const user = userEvent.setup();
+    const onRename = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiRequestError(429, "rate_limited", "slow down"))
+      .mockResolvedValueOnce(undefined);
+    const { reload } = renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Muitas solicitações/);
+    const retained = screen.getByRole("textbox", { name: "Nome do canal" });
+    expect(retained).toHaveValue("Plataforma");
+    // The persisted name is still what the panel states elsewhere.
+    expect(screen.queryByText("Plataforma")).not.toBeInTheDocument();
+
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+    // Neither the failure nor the retry asks the panel to refetch: that is
+    // useReloadOnRename's job, on the canonical name moving (CQ-893-03).
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  // The server's own message is never rendered: it echoes caller-controlled
+  // text and may describe a resource the caller cannot see.
+  it("renders a refusal from its status alone, never the server's message", async () => {
+    const user = userEvent.setup();
+    const onRename = vi
+      .fn()
+      .mockRejectedValue(new ApiRequestError(404, "not_found", "channel 9f2 in workspace acme"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Este canal não está mais disponível.",
+    );
+    expect(screen.queryByText(/workspace acme/)).not.toBeInTheDocument();
+  });
+
+  it("uses the group's vocabulary for a group's refusal", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderRenamePanel({
+      kind: "group",
+      onRename,
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        reload: vi.fn(),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Renomear grupo" }));
+    const field = screen.getByRole("textbox", { name: "Nome do grupo" });
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Você não tem permissão para renomear este grupo.",
+    );
+  });
+
+  it("sends one request however many times confirm is clicked", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    const confirm = screen.getByRole("button", { name: "Salvar novo nome do canal" });
+    await user.click(confirm);
+    await user.click(confirm);
+    await user.click(confirm);
+
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  it("sends one request for a repeated Enter and for Enter plus a click", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    // A held key repeats; the repeat is not a second request.
+    await user.keyboard("{Enter>3/}");
+    await user.click(screen.getByRole("button", { name: "Salvar novo nome do canal" }));
+
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  // Enter is not always a confirmation: an IME sends one to commit a candidate
+  // while composing, and a held key repeats. Neither is a request.
+  it("ignores an Enter that is a composition commit or a key repeat", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+
+    fireEvent.keyDown(field, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(field, { key: "Enter", repeat: true });
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toBeInTheDocument();
+  });
+
+  // Cancelling mid-write would hide whether the request landed, so the editor
+  // holds until the answer arrives — and then closes on the user's next gesture.
+  it("refuses to close while a rename is still in flight", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "Cancelar a renomeação do canal" }));
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toBeInTheDocument();
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+  });
+
+  // Switching conversations unmounts the editor; the mutation for the previous
+  // target still resolves, and nothing it carries may reach the new one.
+  it("cannot leak a pending rename into the conversation opened after it", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    const reload = vi.fn();
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({ reload })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    // The reader moves to another channel. The panel is deliberately not
+    // remounted, so only the editor's own key unmounts it.
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-2", slug: "produto", name: "Produto" }),
+          },
+          reload,
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+
+    // B is in its own read state: no draft, no field, no error, its own name.
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Produto");
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Plataforma")).not.toBeInTheDocument();
+    // And the panel showing B was not refetched by A's resolution.
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not surface a rejection that lands after the conversation changed", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-2", slug: "produto", name: "Produto" }),
+          },
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      settle()?.reject(new ApiRequestError(403, "forbidden", "forbidden"));
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Produto");
   });
 });

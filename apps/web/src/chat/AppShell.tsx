@@ -14,6 +14,7 @@ import ChatSidebar, { chatNavigationId } from "./ChatSidebar";
 import InAppMessageAlert, { type InAppAlert } from "./InAppMessageAlert";
 import { useNavDrawer } from "./useNavDrawer";
 import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
+import { conversationRenameAction } from "./conversationRename";
 import type { Channel, DMConversation } from "./chatTypes";
 import { useChatSidebar } from "./useChatSidebar";
 import { useConversationDrafts, type ConversationDraftsApi } from "./useConversationDrafts";
@@ -58,6 +59,27 @@ function detailsTargetExists(
 ): boolean {
   const collection = target.kind === "channel" ? ready.channels : ready.dms;
   return collection.some((item) => item.id === target.id);
+}
+
+/**
+ * The canonical name of the conversation a details panel is open for
+ * (issue #893, CQ-893-02).
+ *
+ * Read from the same canonical collection as above, so it is the name the
+ * sidebar row itself renders and it moves whenever that list is refetched —
+ * after this actor's own rename, after conversation.updated, after a
+ * reconnect. The panel watches it to know its own projection went stale; it
+ * never displays it, so this cannot become a second source of truth for a
+ * name. "" for no target and for one the list no longer holds, which is inert:
+ * the panel is closed in both cases.
+ */
+function detailsTargetName(
+  target: SidebarDetailsTarget | null,
+  ready: { channels: Channel[]; dms: DMConversation[] },
+): string {
+  if (!target) return "";
+  const collection = target.kind === "channel" ? ready.channels : ready.dms;
+  return collection.find((item) => item.id === target.id)?.name ?? "";
 }
 
 /**
@@ -272,6 +294,25 @@ export default function AppShell() {
       ? sidebarDetails
       : null;
 
+  const detailsCanonicalName = detailsTargetName(openDetailsTarget, { channels, dms });
+
+  // The rename the row-menu panel may offer for *its own* target (issue #893),
+  // which is not necessarily the conversation that is open. Resolved from the
+  // canonical sidebar list, so the capability is the server's own — and
+  // undefined whenever this caller may not rename it, which is what leaves the
+  // panel with no affordance at all.
+  const renameDetailsTarget = useMemo(
+    () =>
+      conversationRenameAction({
+        kind: openDetailsTarget?.kind ?? null,
+        targetId: openDetailsTarget?.id ?? "",
+        channels,
+        renameChannel,
+        renameGroup,
+      }),
+    [openDetailsTarget, channels, renameChannel, renameGroup],
+  );
+
   // The navigation is a column on wide viewports and a drawer below them
   // (issue #467). Only the open/closed boolean lives here; which of the two it
   // is at a given width is decided in AppShell.css.
@@ -398,6 +439,8 @@ export default function AppShell() {
       <SidebarDetailsPanel
         target={openDetailsTarget}
         currentUserId={state.status === "ready" ? state.currentUserId : ""}
+        onRename={renameDetailsTarget}
+        canonicalName={detailsCanonicalName}
         onClose={closeSidebarDetails}
       />
       {/* The in-app channel of the delivery plan (issue #744). Whether it is

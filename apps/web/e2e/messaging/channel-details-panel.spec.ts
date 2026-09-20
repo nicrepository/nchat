@@ -4,12 +4,15 @@ import {
   CURRENT_USER_ID,
   CURRENT_USER_NAME,
   OTHER_CHANNEL_ID,
+  OTHER_CHANNEL_NAME,
   OTHER_USER_ID,
   OTHER_USER_NAME,
   channelDetailsFixture,
   createScenario,
+  emitConversationUpdated,
   installMessagingMocks,
   makeMessage,
+  setServerChannelName,
   uniqueId,
 } from "../helpers/messagingApi";
 
@@ -515,5 +518,269 @@ test.describe("seção expansível de membros", () => {
     await expect(
       panel.getByRole("list", { name: "Membros online do canal" }).getByRole("listitem"),
     ).toHaveCount(5);
+  });
+});
+
+/**
+ * Renomeação inline do nome no painel de detalhes (issue #893).
+ *
+ * Um describe próprio porque o assunto é outro: não a leitura do painel,
+ * mas a escrita que ele passa a oferecer — e a convergência das três
+ * superfícies a partir de uma única confirmação.
+ */
+test.describe("renomeação inline do canal no painel", () => {
+  // ── ISSUE #893: renomeação inline do canal no painel ────────────────────
+  //
+  // O que só o navegador responde: o nome persistido converge no painel, no
+  // cabeçalho e na sidebar a partir de uma única confirmação, sem recarregar a
+  // página — e sobrevive a um reload de verdade.
+  test("renomeia o canal pelo painel e converge painel, cabeçalho e sidebar sem recarregar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-rename-inline");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Infraestrutura E2E",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no canal" })],
+    });
+    // A capacidade é do servidor: a fixture a concede como o payload real faria.
+    for (const channel of scenario.sidebarChannels) {
+      channel.can_rename = channel.id === targetId;
+      scenario.channelDetails.set(
+        channel.id,
+        channelDetailsFixture(channel, [
+          {
+            user_id: CURRENT_USER_ID,
+            display_name: CURRENT_USER_NAME,
+            role: "moderator",
+            presence: "online",
+          },
+        ]),
+      );
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+
+    // Sentinela de "a página não recarregou": um reload apaga a propriedade.
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload = true;
+    });
+
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText("Infraestrutura E2E");
+
+    await panel.getByRole("button", { name: "Renomear canal" }).click();
+    const field = panel.getByRole("textbox", { name: "Nome do canal" });
+    await expect(field).toBeFocused();
+    await expect(field).toHaveValue("Infraestrutura E2E");
+    // Edição inline: nenhum modal se abriu.
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+
+    await field.fill("  Plataforma E2E  ");
+    await field.press("Enter");
+
+    // O painel volta ao estado de leitura já com o nome persistido, e o
+    // cabeçalho e a sidebar convergem pela mesma fonte canônica.
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText("Plataforma E2E");
+    await expect(panel.getByRole("textbox", { name: "Nome do canal" })).toHaveCount(0);
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Plataforma E2E");
+    await expect(page.getByRole("option", { name: /Plataforma E2E/ })).toBeVisible();
+    await expect(page.getByRole("option", { name: /Infraestrutura E2E/ })).toHaveCount(0);
+
+    // O servidor recebeu o nome já trimado, uma única vez.
+    expect(scenario.requests.channelRenames).toEqual([
+      { channelId: targetId, displayName: "Plataforma E2E" },
+    ]);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload === true,
+        ),
+      )
+      .toBe(true);
+
+    // ── persistência: reload real, painel reaberto ────────────────────────
+    await page.reload();
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Plataforma E2E");
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+    await expect(
+      page
+        .getByRole("complementary", { name: "Detalhes do canal" })
+        .getByTestId("chat-details-channel-name"),
+    ).toHaveText("Plataforma E2E");
+  });
+
+  test("Escape descarta o rascunho e nada é persistido", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-rename-escape");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Escape",
+      messages: [makeMessage({ id: `${targetId}-m1` })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      channel.can_rename = true;
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, []));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const editAction = panel.getByRole("button", { name: "Renomear canal" });
+    await editAction.click();
+    const field = panel.getByRole("textbox", { name: "Nome do canal" });
+    await field.fill("Nome abandonado");
+    await field.press("Escape");
+
+    // O editor fechou, o painel continua aberto e o nome autoritativo voltou.
+    await expect(panel.getByRole("textbox", { name: "Nome do canal" })).toHaveCount(0);
+    await expect(panel).toBeVisible();
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText("Canal Escape");
+    await expect(editAction).toBeFocused();
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Canal Escape");
+    expect(scenario.requests.channelRenames).toEqual([]);
+  });
+
+  // O canal geral do workspace é estrutural: a fixture o marca com is_general e
+  // ainda assim concede can_rename, para que a ausência da ação prove o flag
+  // estrutural e não a capacidade. O backend recusa o PATCH de qualquer forma
+  // (channel_rename_authorization_test.go).
+  test("o canal geral não oferece renomeação no painel", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-rename-general");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Anúncios",
+      messages: [makeMessage({ id: `${targetId}-m1` })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      channel.can_rename = true;
+      channel.is_general = channel.id === targetId;
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, []));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await page.getByRole("button", { name: "Detalhes do canal", exact: true }).click();
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText("Anúncios");
+    await expect(panel.getByRole("button", { name: "Renomear canal" })).toHaveCount(0);
+    expect(scenario.requests.channelRenames).toEqual([]);
+  });
+
+  test("renomeia inteiramente pelo teclado, sem mouse", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-rename-keyboard");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Teclado",
+      messages: [makeMessage({ id: `${targetId}-m1` })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      channel.can_rename = true;
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, []));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+
+    const toggle = page.getByRole("button", { name: "Detalhes do canal", exact: true });
+    await toggle.focus();
+    await page.keyboard.press("Enter");
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    const editAction = panel.getByRole("button", { name: "Renomear canal" });
+    await expect(editAction).toBeVisible();
+
+    // Tab a partir do foco que o painel deu (o botão fechar) até a ação.
+    for (
+      let stop = 0;
+      stop < 10 && !(await editAction.evaluate((el) => el === document.activeElement));
+      stop += 1
+    ) {
+      await page.keyboard.press("Tab");
+    }
+    await expect(editAction).toBeFocused();
+
+    await page.keyboard.press("Enter");
+    const field = panel.getByRole("textbox", { name: "Nome do canal" });
+    await expect(field).toBeFocused();
+    await page.keyboard.type("Canal Renomeado");
+    await page.keyboard.press("Enter");
+
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText("Canal Renomeado");
+    // O foco volta para a ação de renomear, previsivelmente.
+    await expect(editAction).toBeFocused();
+    expect(scenario.requests.channelRenames).toHaveLength(1);
+  });
+
+  // ── CQ-893-02: rename remoto com o painel aberto ─────────────────────────
+  //
+  // O painel guarda o próprio display_name de GET /details, então um rename
+  // feito por outra pessoa o deixava desatualizado até ser fechado e reaberto.
+  // Nada aqui empurra um nome para o cliente: o estado do mock server muda,
+  // o frame conversation.updated chega pelo socket real da aplicação, e o
+  // painel precisa perceber e reler a própria projeção.
+  //
+  // Vale para os dois hosts do painel — o do cabeçalho e o aberto pelo menu da
+  // linha —, e este exercita os dois de uma vez: o menu da linha é usado para
+  // um canal que NÃO é o aberto, que é exatamente o caso que só esse host tem.
+  test("o painel aberto pelo menu da linha converge quando outro cliente renomeia", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "channel-remote-rename");
+    const scenario = createScenario({
+      kind: "channel",
+      targetId,
+      targetName: "Canal Aberto",
+      messages: [makeMessage({ id: `${targetId}-m1` })],
+    });
+    for (const channel of scenario.sidebarChannels) {
+      scenario.channelDetails.set(channel.id, channelDetailsFixture(channel, []));
+    }
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/channel/${targetId}`);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload = true;
+    });
+
+    // Detalhes do OUTRO canal, pelo menu da linha: o painel deste host descreve
+    // uma conversa que não é a aberta.
+    await page
+      .getByRole("button", { name: `Mais opções para canal ${OTHER_CHANNEL_NAME}` })
+      .click();
+    await page.getByRole("menuitem", { name: "Detalhes do canal" }).click();
+
+    const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText(OTHER_CHANNEL_NAME);
+
+    // O servidor muda, e só então o frame chega — sem payload, como o real.
+    setServerChannelName(scenario, OTHER_CHANNEL_ID, "Canal Renomeado Remotamente");
+    await emitConversationUpdated(page, { kind: "channel", targetId: OTHER_CHANNEL_ID });
+
+    // A linha converge, como já convergia…
+    await expect(page.getByRole("option", { name: /Canal Renomeado Remotamente/ })).toBeVisible();
+    // …e agora o painel também, sem ser fechado e reaberto.
+    await expect(panel.getByTestId("chat-details-channel-name")).toHaveText(
+      "Canal Renomeado Remotamente",
+    );
+    await expect(panel).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload === true,
+        ),
+      )
+      .toBe(true);
   });
 });

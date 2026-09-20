@@ -15,7 +15,9 @@
  */
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import type { ConversationRenameAction } from "./conversationRename";
 import { useConversationDetails } from "./useConversationDetails";
+import { useReloadOnRename } from "./useReloadOnRename";
 
 export interface SidebarDetailsTarget {
   /** The panel's own vocabulary: a group and a 1:1 are both DM rows. */
@@ -26,18 +28,47 @@ export interface SidebarDetailsTarget {
 interface SidebarDetailsPanelProps {
   target: SidebarDetailsTarget | null;
   currentUserId: string;
+  /**
+   * Resolved by the shell for *this* target, which may not be the conversation
+   * that is open (issue #893). Absent whenever the target is not renameable by
+   * this caller, which is what leaves the panel with no rename affordance.
+   */
+  onRename?: ConversationRenameAction;
+  /**
+   * The canonical name of `target`, from the shell's sidebar payload — the
+   * same projection the row itself renders (issue #893, CQ-893-02).
+   *
+   * It is a *signal*, never content: nothing here displays it, and the panel
+   * keeps rendering its own display_name from GET /details. When it moves, the
+   * authoritative projection this panel holds is stale and the panel refetches
+   * it. That is what makes the row-menu panel converge on a rename by anyone —
+   * this actor, another client through conversation.updated, or a reconnect
+   * that simply refetches the list — with no realtime wiring of its own.
+   */
+  canonicalName: string;
   onClose: () => void;
 }
 
 export default function SidebarDetailsPanel({
   target,
   currentUserId,
+  onRename,
+  canonicalName,
   onClose,
 }: SidebarDetailsPanelProps) {
   // The hook accepts null and fetches nothing for it, so this is one hook call
   // whether or not a panel is open — no conditional hook, and no request for a
   // panel nobody asked for.
   const state = useConversationDetails(target ? { kind: target.kind, id: target.id } : null);
+  // Same primitive the header's host uses, above the early return so the hook
+  // order never depends on whether a panel is open. With no target the key is
+  // inert and the identity check alone stops it from ever firing.
+  useReloadOnRename(
+    target ? `${target.kind}:${target.id}` : "",
+    canonicalName,
+    target !== null,
+    state.reload,
+  );
   if (!target) return null;
   return (
     <ConversationDetailsPanel
@@ -46,6 +77,7 @@ export default function SidebarDetailsPanel({
       state={state}
       currentUserId={currentUserId}
       latestPin={null}
+      onRename={onRename}
       onClose={onClose}
     />
   );

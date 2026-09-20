@@ -337,6 +337,27 @@ describe("reaction exit", () => {
     expect(document.querySelector(".chat-msg-area__reaction-slot")).toBeNull();
   });
 
+  // A animação do emoji dentro do badge (chat-reaction-pop, 200ms) sobe até o
+  // slot. Se o slot ainda estivesse saindo quando ela termina, esse
+  // animationend alheio encerraria a saída e o badge sumiria sem animar — que
+  // é exatamente o "sumir entre dois frames" que este mecanismo existe para
+  // evitar. Só o animationend do próprio slot conta.
+  it("ignores an animationend that bubbled up from inside the badge", () => {
+    const { rerender } = render(<Reactions reactions={[cheer]} />);
+    rerender(<Reactions reactions={[]} />);
+
+    const slot = document.querySelector(".chat-msg-area__reaction-slot") as HTMLElement;
+    const emoji = slot.querySelector(".chat-msg-area__reaction-emoji") as HTMLElement;
+    fireEvent.animationEnd(emoji);
+
+    // Ainda saindo: a animação que importa não terminou.
+    expect(document.querySelector(".chat-msg-area__reaction-slot")).not.toBeNull();
+    expect(slot).toHaveAttribute("data-exiting", "true");
+
+    fireEvent.animationEnd(slot);
+    expect(document.querySelector(".chat-msg-area__reaction-slot")).toBeNull();
+  });
+
   it("leaves the other badges untouched while one is on its way out", () => {
     const { rerender } = render(<Reactions reactions={[cheer, rocket]} />);
 

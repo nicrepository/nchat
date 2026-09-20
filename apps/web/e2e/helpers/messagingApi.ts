@@ -1007,6 +1007,62 @@ export async function emitConversationAvailable(
   );
 }
 
+/**
+ * Emits the frame a rename broadcasts (issue #893, CQ-893-02).
+ *
+ * It carries no payload at all — not even the new name — exactly like the real
+ * one: it means "your view of this target is stale", and the client converges
+ * by refetching the canonical list, which the server re-authorises. So a spec
+ * moves the *mock server's* state first and then fires this; nothing here
+ * hands the application a name, touches the DOM or calls into React.
+ */
+export async function emitConversationUpdated(
+  page: Page,
+  target: { kind: TargetKind; targetId: string },
+) {
+  await page.waitForFunction(
+    () =>
+      typeof (window as unknown as { __e2eEmitWebSocketEvent?: unknown })
+        .__e2eEmitWebSocketEvent === "function",
+  );
+  await page.evaluate(
+    ({ kind, targetId }) => {
+      (
+        window as unknown as {
+          __e2eEmitWebSocketEvent: (event: Record<string, unknown>) => void;
+        }
+      ).__e2eEmitWebSocketEvent({
+        schema_version: 1,
+        type: "conversation.updated",
+        workspace_id: "e2e-workspace",
+        target_type: kind,
+        target_id: targetId,
+        event_id: `updated-${kind}-${targetId}-${Date.now()}`,
+      });
+    },
+    { kind: target.kind, targetId: target.targetId },
+  );
+}
+
+/**
+ * Moves the mock server's own record of a channel's name.
+ *
+ * Both projections the client can read — the sidebar list and GET /details —
+ * come from one row on the real server, so they move together here too. It
+ * changes server state and nothing else: no request is answered differently
+ * until the client makes one.
+ */
+export function setServerChannelName(
+  scenario: MessagingScenario,
+  channelId: string,
+  displayName: string,
+) {
+  const channel = scenario.sidebarChannels.find((candidate) => candidate.id === channelId);
+  if (channel) channel.display_name = displayName;
+  const details = scenario.channelDetails.get(channelId);
+  if (details) details.display_name = displayName;
+}
+
 /** Kills the tab's connection so the client takes its own reconnect path. */
 export async function dropWebSocket(page: Page) {
   await page.waitForFunction(
@@ -1978,6 +2034,11 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     scenario.requests.groupRenames.push({ conversationId: id, title });
     const previous = group.name;
     group.name = title;
+    // One row, one name: the details projection the panel reads is the same
+    // record the sidebar list is built from, so a rename moves both or the
+    // mock would let a panel look stale in a way the real service cannot.
+    const groupDetails = scenario.groupDetails.get(id);
+    if (groupDetails) groupDetails.name = title;
     // The real rename writes a system message in the same transaction; the mock
     // appends the same structured event so the timeline can render it.
     appendConversationEvent(
@@ -2036,6 +2097,9 @@ async function installSidebarMocks(page: Page, scenario: MessagingScenario) {
     scenario.requests.channelRenames.push({ channelId: id, displayName });
     const previousName = channel.display_name;
     channel.display_name = displayName;
+    // See the group rename above: the details projection is the same row.
+    const channelDetails = scenario.channelDetails.get(id);
+    if (channelDetails) channelDetails.display_name = displayName;
     appendConversationEvent(
       scenario,
       { kind: "channel", targetId: id },

@@ -152,10 +152,22 @@ export interface ChatOutletContext {
    * store).
    */
   drafts?: ConversationDraftsApi;
+  /**
+   * The sidebar's own rename mutations, forwarded unchanged (issue #893).
+   *
+   * The details panel's inline editor uses exactly the pair the sidebar's
+   * "Renomear" dialog already uses — request, then refetch the canonical list
+   * — so the two surfaces are one operation and neither surface owns a name.
+   * Optional like every other callback here, so a partial outlet context never
+   * has to fabricate one; absent simply means no rename affordance.
+   */
+  renameChannel?: (channelId: string, displayName: string) => Promise<void>;
+  renameGroup?: (conversationId: string, title: string) => Promise<void>;
 }
 
 export default function ChatShell() {
-  const { state, retry, markRead, drafts } = useOutletContext<AppShellOutletContext>();
+  const { state, retry, markRead, drafts, renameChannel, renameGroup } =
+    useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
     calls,
@@ -261,6 +273,8 @@ export default function ChatShell() {
     attachmentLimits: ready.attachmentLimits,
     markRead,
     drafts,
+    renameChannel,
+    renameGroup,
     refreshConversations: retry,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,

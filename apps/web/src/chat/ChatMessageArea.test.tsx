@@ -9640,3 +9640,195 @@ describe("ChatMessageArea — RF-21 link safety", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// ── Renomeação inline pelo painel (issue #893) ───────────────────────────────
+//
+// The integration half of the inline editor: the panel is handed a rename only
+// when the canonical channel list says this caller may, the mutation it calls
+// is the sidebar's own, and the three surfaces converge from the one refetch
+// that mutation triggers — never from the typed draft.
+
+/**
+ * Renders the message area over a canonical channel list the *mutation* moves.
+ *
+ * `renameChannel` mirrors useChatSidebar's: it awaits the write and then
+ * refreshes the canonical list, which is what the header reads and what makes
+ * the panel refetch. The details fixture is moved in the same step, exactly as
+ * the server's own row would be, so nothing in the test invents a name the
+ * "backend" never stored.
+ */
+function renderInlineRenameHost(channel: ChatOutletContext["channels"][number]) {
+  const names = new Map<string, string>([[channel.id, channel.name]]);
+  mockFetchChannelDetails.mockImplementation((channelId: string) =>
+    Promise.resolve({
+      ...channelDetailsFor(channelId),
+      name: names.get(channelId) ?? `Canal ${channelId}`,
+    }),
+  );
+  const renameChannel = vi.fn(async (channelId: string, displayName: string) => {
+    names.set(channelId, displayName);
+  });
+
+  function Host() {
+    const [channels, setChannels] = useState([channel]);
+    const rename = async (channelId: string, displayName: string) => {
+      await renameChannel(channelId, displayName);
+      // The refetch the real mutation performs: the canonical list, re-read.
+      setChannels((current) =>
+        current.map((row) => (row.id === channelId ? { ...row, name: displayName } : row)),
+      );
+    };
+    return (
+      <ParentWithContext
+        ctx={{ currentUserId: "me-123", channels, dms: [], renameChannel: rename }}
+      />
+    );
+  }
+
+  render(
+    <MemoryRouter initialEntries={[`/chat/channel/${channel.id}`]}>
+      <Routes>
+        <Route path="/chat" element={<Host />}>
+          <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+  return { renameChannel };
+}
+
+describe("ChatMessageArea — renomeação inline pelo painel (#893)", () => {
+  it("renames from the panel and converges the panel and the header without a reload", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    const { renameChannel } = renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "Plataforma{Enter}");
+
+    // The sidebar's own mutation, with the route's id — not a second endpoint.
+    await waitFor(() => expect(renameChannel).toHaveBeenCalledWith("geral", "Plataforma"));
+    // The header reads the canonical list; the panel refetched its own row.
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Plataforma"),
+    );
+    await waitFor(() =>
+      expect(within(panel).getByTestId("chat-details-channel-name")).toHaveTextContent(
+        "Plataforma",
+      ),
+    );
+    // The panel never unmounted and the editor closed: the edit happened in
+    // place, with no modal and no remount of the conversation.
+    expect(screen.getByTestId("chat-conversation-details")).toBe(panel);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+  });
+
+  // ── CQ-893-03: one rename, one reconciliation ───────────────────────────
+  //
+  // There used to be two reconciliation paths for the same fact. The editor
+  // asked the panel to reload on success, *and* the canonical name moving
+  // asked it again through useReloadOnRename — so one local rename issued two
+  // GET /details on top of the panel's opening read. useConversationDetails
+  // aborts the earlier of the two, which hides the cost without removing it.
+  //
+  // The opening read is counted separately from the reconciliation on purpose:
+  // what the fix is about is how many refetches the *rename* causes.
+  it("causes exactly one details refetch for one local rename", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost({ ...namedChannel("geral", "Geral"), canRename: true });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+    // The panel's opening read, and nothing else yet.
+    await waitFor(() => expect(detailsRequestsFor("geral")).toBe(1));
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, "Plataforma{Enter}");
+
+    await waitFor(() =>
+      expect(within(panel).getByTestId("chat-details-channel-name")).toHaveTextContent(
+        "Plataforma",
+      ),
+    );
+    // One reconciliation on top of the opening read. Two would be the bug.
+    expect(detailsRequestsFor("geral")).toBe(2);
+
+    // And it settles there: a reload replaces details.data.name, and if that
+    // were what the watcher observed it would ask for another reload, forever.
+    // It observes the canonical name instead, so there is no cycle.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(detailsRequestsFor("geral")).toBe(2);
+  });
+
+  // A confirmation that changes nothing sends nothing, so the canonical name
+  // never moves and there is nothing to reconcile.
+  it("refetches nothing when the confirmed name is the one already persisted", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    const { renameChannel } = renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    const persisted = within(panel).getByTestId("chat-details-channel-name").textContent ?? "";
+    await waitFor(() => expect(detailsRequestsFor("geral")).toBe(1));
+
+    await userEvent.click(within(panel).getByRole("button", { name: "Renomear canal" }));
+    const field = within(panel).getByRole("textbox", { name: "Nome do canal" });
+    await userEvent.clear(field);
+    await userEvent.type(field, `  ${persisted}  {Enter}`);
+
+    expect(renameChannel).not.toHaveBeenCalled();
+    expect(detailsRequestsFor("geral")).toBe(1);
+  });
+
+  // The capability is the server's, carried by the canonical list. Absent is
+  // read as "no", and the panel simply has no control.
+  it("offers no rename when the canonical list withholds the capability", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost(namedChannel("geral", "Geral"));
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    expect(within(panel).queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  // The workspace's general channel, by its structural flag alone. The backend
+  // refuses a rename of it regardless; the panel does not offer one.
+  it("offers no rename on the general channel even when the capability is set", async () => {
+    mockFetchChannelMessages.mockResolvedValue(messagePage([makeMessage({ id: "m1" })]));
+    renderInlineRenameHost({
+      ...namedChannel("geral", "Geral"),
+      canRename: true,
+      isGeneral: true,
+    });
+    await screen.findByTestId("chat-msg-bubble");
+
+    await userEvent.click(detailsToggle());
+    const panel = await screen.findByTestId("chat-conversation-details");
+    await within(panel).findByTestId("chat-details-channel-name");
+
+    expect(within(panel).queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+});

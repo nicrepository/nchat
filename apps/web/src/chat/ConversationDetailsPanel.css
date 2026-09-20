@@ -113,6 +113,103 @@
   flex: none;
 }
 
+/* ── Conversation name and its inline rename (issue #893) ───────────────── */
+
+/*
+ * One row for both states — name + pencil, and field + confirm/cancel — so the
+ * controls keep their place when the editor opens. It wraps rather than
+ * shrinking: in the narrow panel the viewport gives below the desktop
+ * threshold, the confirm and cancel buttons move under the field instead of
+ * squeezing it or leaving the panel.
+ */
+.chat-details__name-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-details__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--color-ink, #16121f);
+  /* A name is one unbroken token as often as not; it wraps rather than
+     pushing the pencil out of the panel. */
+  overflow-wrap: anywhere;
+}
+
+.chat-details__name-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-details__name-action:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-details__name-action--confirm {
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__name-action:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.chat-details__name-action .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-details__name-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-details__name-input {
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 14px;
+  color: inherit;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+}
+
+.chat-details__name-input:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 1px;
+}
+
+/* The invalid state is never colour alone: the message below is associated
+   with the field through aria-describedby and is what says what is wrong. */
+.chat-details__name-input[aria-invalid="true"] {
+  border-color: var(--color-danger-ink, #991b1b);
+}
+
+.chat-details__name-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-danger-ink, #991b1b);
+}
+
 .chat-details__empty,
 .chat-details__note {
   margin: 8px 0 0;

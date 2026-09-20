@@ -49,6 +49,7 @@ import { selectLatestPin } from "./selectLatestPin";
 import { useConversationDetailsPanel } from "./useConversationDetailsPanel";
 import { useResourceCallBar } from "./useResourceCallBar";
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
+import { conversationRenameAction } from "./conversationRename";
 import ChatComposer from "./ChatComposer";
 import { noopConversationDrafts } from "./useConversationDrafts";
 import { senderLabel } from "./messageDisplay";
@@ -153,6 +154,21 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     toggleRef: detailsToggleRef,
   });
   const reloadOpenDetails = details.reload;
+  // The rename the panel may offer for the conversation on screen (issue #893).
+  // The capability is the server's, read from the canonical sidebar payload,
+  // and the mutation is the very one the sidebar's own dialog calls — so both
+  // surfaces converge through one refetch and neither holds a name.
+  const renameConversation = useMemo(
+    () =>
+      conversationRenameAction({
+        kind: details.detailsKind,
+        targetId,
+        channels: ctx.channels,
+        renameChannel: ctx.renameChannel,
+        renameGroup: ctx.renameGroup,
+      }),
+    [details.detailsKind, targetId, ctx.channels, ctx.renameChannel, ctx.renameGroup],
+  );
 
   // Typing indicator: useTypingIndicator needs sendTyping, which useMessages
   // only produces once called, but useMessages needs an onTypingUpdated
@@ -599,6 +615,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           state={details.detailsState}
           currentUserId={ctx.currentUserId}
           latestPin={latestPin}
+          onRename={renameConversation}
           onClose={details.close}
         />
       )}

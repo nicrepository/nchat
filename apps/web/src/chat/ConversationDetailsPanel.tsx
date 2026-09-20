@@ -50,10 +50,12 @@ import "./ConversationDetailsPanel.css";
 import AddMembersDialog from "./AddMembersDialog";
 import AttachmentThumbnail from "./AttachmentThumbnail";
 import AttachmentVideo from "./AttachmentVideo";
+import ConversationNameField from "./ConversationNameField";
 import ExpandableDetailsSection, {
   SectionMessage,
   type ExpandableSectionContent,
 } from "./ExpandableDetailsSection";
+import type { ConversationRenameAction } from "./conversationRename";
 import RichTextRenderer from "./RichTextRenderer";
 import type {
   AddMembersResult,
@@ -273,18 +275,17 @@ function ChannelAboutSection({ details }: { details: ChannelDetails }) {
 }
 
 /**
- * The "Sobre" section of a group: name, creation date and participant total.
+ * The "Sobre" section of a group: creation date and participant total.
  *
  * Deliberately without visibility: a group is not public or private, it is a
  * closed conversation between the people in it, and rendering a channel's
- * vocabulary here would state something the domain never says.
+ * vocabulary here would state something the domain never says. The name moved
+ * up to AboutSection with issue #893 — a channel has one too, and both are now
+ * rendered by the same field so only one of them can grow a rename.
  */
 function GroupAboutSection({ details }: { details: GroupDetails }) {
   return (
     <>
-      <p className="chat-details__group-name" data-testid="chat-details-group-name">
-        {details.name || "Grupo sem nome"}
-      </p>
       <p className="chat-details__meta">
         <span className="material-symbols-outlined" aria-hidden="true">
           calendar_today
@@ -706,6 +707,40 @@ function addedText(copy: ConversationCopy, added: number): string {
 }
 
 /**
+ * The name of the conversation the panel is describing, and the inline rename
+ * it offers (issue #893).
+ *
+ * Rendered from the loaded payload rather than from a prop, so the name shown
+ * here is the same projection the rest of the section describes, and it
+ * converges the way every other field does — by refetching, which
+ * useReloadOnRename asks for when the canonical name of this target moves.
+ *
+ * Keyed by the target, because the panel is deliberately *not* remounted when
+ * the conversation changes under it. Without the key an editor opened for one
+ * conversation would stay open, with its draft and its error, under the next
+ * one's name. The remount React already offers is the whole mechanism.
+ */
+function ConversationName({
+  kind,
+  details,
+  onRename,
+}: {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+  onRename?: ConversationRenameAction;
+}) {
+  if (details.status !== "ready" || details.data.kind === "direct") return null;
+  return (
+    <ConversationNameField
+      key={`name-${details.data.id}`}
+      kind={kind}
+      name={details.data.name}
+      onRename={onRename}
+    />
+  );
+}
+
+/**
  * The "Sobre" section: the metadata card, or the state of trying to load it.
  *
  * The three outcomes are exclusive, and the fourth — ready with a payload
@@ -715,15 +750,18 @@ function addedText(copy: ConversationCopy, added: number): string {
 function AboutSection({
   kind,
   details,
+  onRename,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
+  onRename?: ConversationRenameAction;
 }) {
   return (
     <section className="chat-details__section" aria-labelledby="chat-details-about">
       <h3 id="chat-details-about" className="chat-details__label">
         Sobre
       </h3>
+      <ConversationName kind={kind} details={details} onRename={onRename} />
       {details.status === "loading" && (
         <SectionMessage role="status">
           {kind === "channel"
@@ -958,6 +996,7 @@ function ConversationBody({
   currentUserId,
   latestPin,
   reload,
+  onRename,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
@@ -965,6 +1004,7 @@ function ConversationBody({
   currentUserId: string;
   latestPin: PinnedItem | null;
   reload: () => void;
+  onRename?: ConversationRenameAction;
 }) {
   const copy = conversationCopy[kind];
   // `kind` is the conversation the user is looking at *now*; the loaded data
@@ -982,7 +1022,7 @@ function ConversationBody({
 
   return (
     <>
-      <AboutSection kind={kind} details={details} />
+      <AboutSection kind={kind} details={details} onRename={onRename} />
       <PeopleSection
         kind={kind}
         details={details}
@@ -1018,6 +1058,17 @@ interface ConversationDetailsPanelProps {
    * "the bar and the panel show the same message" structural.
    */
   latestPin: PinnedItem | null;
+  /**
+   * Renames the conversation this panel describes (issue #893).
+   *
+   * Absent means no rename affordance at all, which is how the caller states
+   * every case that has none: a 1:1, the workspace's general channel, a
+   * channel the server did not authorize, and a host with no mutation wired.
+   * It is presentation only — PATCH re-derives the caller's authority from the
+   * session — and the panel never decides it here, because the server's
+   * capability lives in the canonical sidebar payload the caller holds.
+   */
+  onRename?: ConversationRenameAction;
   onClose: () => void;
 }
 
@@ -1026,6 +1077,7 @@ export default function ConversationDetailsPanel({
   state,
   currentUserId,
   latestPin,
+  onRename,
   onClose,
 }: ConversationDetailsPanelProps) {
   const header = panelHeader[kind];
@@ -1096,6 +1148,7 @@ export default function ConversationDetailsPanel({
             currentUserId={currentUserId}
             latestPin={latestPin}
             reload={state.reload}
+            onRename={onRename}
           />
         )}
       </div>

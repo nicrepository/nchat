@@ -3863,6 +3863,37 @@ describe("ChatSidebar — renaming a channel", () => {
     expect(renameChannel).not.toHaveBeenCalled();
   });
 
+  // ── CQ-893-01: the cap is in code points, here too ──────────────────────
+  //
+  // The dialog and the details panel's inline editor share one rule
+  // (conversationRename), so the UTF-16 bug had to be fixed in one place and
+  // must stay fixed in both. 100 emoji is 100 code points and 200 UTF-16
+  // units: the old `maxLength={100}` field silently accepted only half of it.
+  it("accepts a channel name of 100 emoji whole, and refuses 101", async () => {
+    const user = userEvent.setup();
+    const renameChannel = vi.fn().mockResolvedValue(undefined);
+    renderWithRename(renameChannel);
+
+    await openDialog(user);
+    const field = screen.getByLabelText("Nome do canal");
+
+    const overCap = "😀".repeat(101);
+    fireEvent.change(field, { target: { value: overCap } });
+    await user.click(screen.getByRole("button", { name: "Salvar" }));
+    expect(renameChannel).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "O nome do canal deve ter no máximo 100 caracteres.",
+    );
+    // Refused, never trimmed to fit.
+    expect(field).toHaveValue(overCap);
+
+    const atCap = "😀".repeat(100);
+    fireEvent.change(field, { target: { value: atCap } });
+    await user.click(screen.getByRole("button", { name: "Salvar" }));
+    await waitFor(() => expect(renameChannel).toHaveBeenCalledWith("ch-1", atCap));
+    expect((renameChannel.mock.calls[0][1] as string).length).toBe(200);
+  });
+
   it("refuses an empty name locally and associates the message with the field", async () => {
     const user = userEvent.setup();
     const renameChannel = vi.fn().mockResolvedValue(undefined);

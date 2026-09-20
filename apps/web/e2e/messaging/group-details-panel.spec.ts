@@ -220,4 +220,89 @@ test.describe("painel de detalhes do grupo", () => {
     // ausente — o padrão seguro. O fluxo em si é coberto por add-members.spec.ts.
     await expect(panel.getByTestId("chat-details-add-members")).toHaveCount(0);
   });
+
+  // ── ISSUE #893: renomeação inline do grupo no painel ────────────────────
+  //
+  // A issue cobre canais E grupos, e um grupo não é um canal: endpoint
+  // próprio, autorização própria (participação) e vocabulário próprio. O que
+  // se prova aqui é a convergência real das três superfícies sem reload.
+  test("renomeia o grupo pelo painel e converge painel, cabeçalho e sidebar sem recarregar", async ({
+    page,
+  }, testInfo) => {
+    const targetId = uniqueId(testInfo, "grupo-rename-inline");
+    const scenario = createScenario({
+      kind: "dm",
+      conversationType: "group",
+      targetId,
+      targetName: "Time de Infra E2E",
+      messages: [makeMessage({ id: `${targetId}-m1`, body_text: "Mensagem no grupo" })],
+    });
+    scenario.groupDetails.set(
+      targetId,
+      groupDetailsFixture({ id: targetId, name: "Time de Infra E2E" }, [
+        { user_id: CURRENT_USER_ID, display_name: CURRENT_USER_NAME, presence: "online" },
+        { user_id: OTHER_USER_ID, display_name: OTHER_USER_NAME, presence: "offline" },
+      ]),
+    );
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+    await expect(page.getByTestId("chat-composer-input")).toBeVisible();
+
+    await page.evaluate(() => {
+      (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload = true;
+    });
+
+    await page.getByRole("button", { name: "Detalhes do grupo", exact: true }).click();
+    const panel = page.getByRole("complementary", { name: "Detalhes do grupo" });
+    await expect(panel.getByTestId("chat-details-group-name")).toHaveText("Time de Infra E2E");
+
+    await panel.getByRole("button", { name: "Renomear grupo" }).click();
+    const field = panel.getByRole("textbox", { name: "Nome do grupo" });
+    await expect(field).toBeFocused();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+
+    await field.fill("  Squad Plataforma  ");
+    await panel.getByRole("button", { name: "Salvar novo nome do grupo" }).click();
+
+    await expect(panel.getByTestId("chat-details-group-name")).toHaveText("Squad Plataforma");
+    await expect(panel.getByRole("textbox", { name: "Nome do grupo" })).toHaveCount(0);
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Squad Plataforma");
+    await expect(page.getByRole("option", { name: /Squad Plataforma/ })).toBeVisible();
+
+    expect(scenario.requests.groupRenames).toEqual([
+      { conversationId: targetId, title: "Squad Plataforma" },
+    ]);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (window as unknown as { __e2eNoReload?: boolean }).__e2eNoReload === true,
+        ),
+      )
+      .toBe(true);
+
+    // Persistido: um reload real reencontra o nome novo.
+    await page.reload();
+    await expect(page.getByTestId("chat-msg-header")).toContainText("Squad Plataforma");
+  });
+
+  // Uma conversa 1:1 não tem nome próprio — o título é o do interlocutor,
+  // resolvido por leitor —, então o perfil não ganha renomeação.
+  test("o perfil de uma conversa 1:1 não oferece renomeação", async ({ page }, testInfo) => {
+    const targetId = uniqueId(testInfo, "dm-sem-rename");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [makeMessage({ id: `${targetId}-m1` })],
+    });
+
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+
+    await page.getByRole("button", { name: `Abrir perfil de ${OTHER_USER_NAME}` }).click();
+    const panel = page.getByRole("complementary", { name: "Perfil" });
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("button", { name: /Renomear/ })).toHaveCount(0);
+  });
 });
