@@ -242,6 +242,7 @@ function channelDetails(): ChannelDetails {
     slug: "geral",
     name: "geral",
     type: "public",
+    description: "",
     createdAt: "2026-01-01T00:00:00Z",
     memberCount: 3,
     onlineCount: 1,

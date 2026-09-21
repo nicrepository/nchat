@@ -44,6 +44,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
 } from "react";
 
 import "./ConversationDetailsPanel.css";
@@ -239,69 +240,136 @@ function MemberRow({ member, subtitle, isCurrentUser, conversationKey }: MemberR
   );
 }
 
+/** One "Sobre" row: an icon that decorates, and the text that carries it. */
+function AboutRow({ icon, children }: { icon: string; children: ReactNode }) {
+  return (
+    <p className="chat-details__meta">
+      <span className="material-symbols-outlined" aria-hidden="true">
+        {icon}
+      </span>
+      {children}
+    </p>
+  );
+}
+
 /**
- * The "Sobre" section of a channel: description placeholder, creation date,
- * visibility and member total.
+ * The part of "Sobre" that a channel and a group answer identically
+ * (issue #894): what the conversation is for, when it was created and by whom.
+ *
+ * Shared because the questions are the same, not to save lines. Only the empty
+ * description differs by kind — a channel and a group say different words for
+ * the same absence — so that one string is the parameter and nothing else is.
+ * What follows these rows does differ (a channel has a visibility and counts
+ * members, a group counts participants), and stays with each caller rather than
+ * becoming a configurable slot here.
+ *
+ * Every value is rendered as a text node. `description` is server-side content
+ * and the only markup-shaped thing in the block: React escapes it, so a stored
+ * `<script>` is five words on screen and never a tag. Nothing here builds HTML,
+ * and the line breaks a description may contain are preserved by CSS rather
+ * than by interpreting anything.
+ *
+ * Both absences have a rendering of their own. An unusable creation date reads
+ * as unavailable instead of "Criado em " with nothing after it, and an
+ * unresolved creator reads as unidentified — never as an id, a slug or part of
+ * one, none of which the server even sends.
  */
-function ChannelAboutSection({ details }: { details: ChannelDetails }) {
+function AboutMetadata({
+  description,
+  emptyDescription,
+  createdAt,
+  creatorDisplayName,
+}: {
+  description: string;
+  emptyDescription: string;
+  createdAt: string;
+  creatorDisplayName?: string;
+}) {
+  // formatLongDate answers "" for anything that is not a usable date, which
+  // folds "the server sent nothing" and "the server sent something unusable"
+  // into the one state the panel can honestly render.
+  const createdOn = formatLongDate(createdAt);
   return (
     <>
-      {/*
-        chat.channels has no description column, so there is nothing to render
-        here yet. The empty state is the honest outcome, not a placeholder for
-        data the server withheld.
-      */}
-      <p className="chat-details__empty" data-testid="chat-details-description">
-        Este canal ainda não tem descrição.
-      </p>
-      <p className="chat-details__meta">
-        <span className="material-symbols-outlined" aria-hidden="true">
-          calendar_today
-        </span>
-        {details.createdAt
-          ? `Criado em ${formatLongDate(details.createdAt)}`
-          : "Data de criação indisponível"}
-      </p>
-      <p className="chat-details__meta">
-        <span className="material-symbols-outlined" aria-hidden="true">
-          {details.type === "private" ? "lock" : "public"}
-        </span>
-        {details.type === "private" ? "Canal privado" : "Canal público"}
-        {" · "}
-        {details.memberCount === 1 ? "1 membro" : `${details.memberCount} membros`}
-      </p>
+      <h4 className="chat-details__sublabel">Descrição</h4>
+      {description ? (
+        <p className="chat-details__description" data-testid="chat-details-description">
+          {description}
+        </p>
+      ) : (
+        <p className="chat-details__empty" data-testid="chat-details-description">
+          {emptyDescription}
+        </p>
+      )}
+      <AboutRow icon="calendar_today">
+        {createdOn ? `Criado em ${createdOn}` : "Data de criação indisponível"}
+      </AboutRow>
+      <AboutRow icon="person">
+        {creatorDisplayName ? `Criado por ${creatorDisplayName}` : "Criador não identificado"}
+      </AboutRow>
     </>
   );
 }
 
 /**
- * The "Sobre" section of a group: creation date and participant total.
+ * The "Sobre" section of a channel: the shared metadata, then the two facts
+ * only a channel has — its visibility and its size.
+ *
+ * The member total is `memberCount`, the server's own figure for every active
+ * member of the channel. It is never `onlineMembers.length` and never
+ * `onlineCount`: the preview is capped and presence-filtered, and a channel
+ * does not shrink when someone disconnects. The vocabulary stays "membro" here
+ * rather than "participante" because it is the word the rest of this surface
+ * already uses — the online-members heading, the add-members flow and the
+ * channel-details contract — and one block disagreeing with the panel around it
+ * would be the inconsistency, not the fix.
+ */
+function ChannelAboutSection({ details }: { details: ChannelDetails }) {
+  return (
+    <>
+      <AboutMetadata
+        description={details.description}
+        emptyDescription="Este canal ainda não tem descrição."
+        createdAt={details.createdAt}
+        creatorDisplayName={details.creatorDisplayName}
+      />
+      <AboutRow icon={details.type === "private" ? "lock" : "public"}>
+        {details.type === "private" ? "Canal privado" : "Canal público"}
+      </AboutRow>
+      <AboutRow icon="group">
+        {details.memberCount === 1 ? "1 membro" : `${details.memberCount} membros`}
+      </AboutRow>
+    </>
+  );
+}
+
+/**
+ * The "Sobre" section of a group: the shared metadata, then its participant
+ * total.
  *
  * Deliberately without visibility: a group is not public or private, it is a
  * closed conversation between the people in it, and rendering a channel's
  * vocabulary here would state something the domain never says. The name moved
  * up to AboutSection with issue #893 — a channel has one too, and both are now
  * rendered by the same field so only one of them can grow a rename.
+ *
+ * The total is `participantCount`, the figure the same query that produced the
+ * preview counted, and never `participants.length`.
  */
 function GroupAboutSection({ details }: { details: GroupDetails }) {
   return (
     <>
-      <p className="chat-details__meta">
-        <span className="material-symbols-outlined" aria-hidden="true">
-          calendar_today
-        </span>
-        {details.createdAt
-          ? `Criado em ${formatLongDate(details.createdAt)}`
-          : "Data de criação indisponível"}
-      </p>
-      <p className="chat-details__meta">
-        <span className="material-symbols-outlined" aria-hidden="true">
-          group
-        </span>
+      <AboutMetadata
+        description={details.description}
+        emptyDescription="Este grupo ainda não tem descrição."
+        createdAt={details.createdAt}
+        creatorDisplayName={details.creatorDisplayName}
+      />
+      <AboutRow icon="group">
         {details.participantCount === 1
           ? "1 participante"
           : `${details.participantCount} participantes`}
-      </p>
+      </AboutRow>
     </>
   );
 }

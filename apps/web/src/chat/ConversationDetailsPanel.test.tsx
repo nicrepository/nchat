@@ -47,6 +47,7 @@ import type {
   PinnedItem,
 } from "./chatTypes";
 import { localTimeRefreshMs } from "./conversationDetailsDisplay";
+import { formatLongDate } from "./messageDisplay";
 import { conversationNameMaxCodePoints } from "./conversationRename";
 import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
@@ -66,6 +67,9 @@ function channelDetails(
     slug: "infra",
     name: "Infraestrutura",
     type: "public",
+    // Absent by default (issue #894), so every case that says nothing about
+    // the description exercises the empty state the domain actually produces.
+    description: "",
     createdAt: "2024-01-12T09:30:00.000Z",
     memberCount: 12,
     onlineCount: 0,
@@ -228,7 +232,10 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
     });
 
     expect(screen.getByText(/Criado em 12 de janeiro de 2024/)).toBeInTheDocument();
-    expect(screen.getByText(/Canal privado · 12 membros/)).toBeInTheDocument();
+    // Visibility and size are two facts and now two rows (issue #894): the
+    // channel's type is not a qualifier on its member count.
+    expect(screen.getByText("Canal privado")).toBeInTheDocument();
+    expect(screen.getByText("12 membros")).toBeInTheDocument();
   });
 
   it("says public when the channel type says so, not the channel name", () => {
@@ -278,7 +285,7 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
     expect(screen.getByText("Data de criação indisponível")).toBeInTheDocument();
   });
 
-  it("shows an explicit empty state while the domain has no description", () => {
+  it("shows an explicit empty state when the channel has no description", () => {
     renderPanel();
 
     expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
@@ -820,6 +827,7 @@ function groupDetails(overrides: Partial<GroupDetails> = {}): { kind: "group" } 
     kind: "group" as const,
     id: "conv-1",
     name: "Time de Infra",
+    description: "",
     createdAt: "2024-03-04T15:00:00.000Z",
     participantCount: 4,
     participants: [],
@@ -868,13 +876,17 @@ describe("ConversationDetailsPanel — grupo", () => {
     expect(screen.getByText(/12 participantes/)).toBeInTheDocument();
   });
 
-  it("never shows a channel's visibility or description", () => {
+  it("never shows a channel's visibility or a channel's empty description", () => {
     renderGroupPanel(groupDetails());
 
-    // A group is neither public nor private, and has no description column.
+    // A group is neither public nor private. It does have a description
+    // (issue #894), but the absence is worded for a group — a panel that said
+    // "canal" here would name the wrong aggregate.
     expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Canal privado/)).not.toBeInTheDocument();
-    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este grupo ainda não tem descrição.",
+    );
     // Nor the channel's people vocabulary.
     expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
   });
@@ -2606,5 +2618,298 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
 
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Produto");
+  });
+});
+
+// ── Bloco "Sobre": descrição, criação e criador (issue #894) ─────────────────
+//
+// The block states four facts about a conversation, and each of them has an
+// absence that has to read as an absence. What it must never do is fill a gap
+// with something technical: an identifier, part of one, or a value derived from
+// somewhere else in the payload.
+
+describe("ConversationDetailsPanel — Sobre: descrição", () => {
+  it.each([
+    [
+      "canal",
+      () =>
+        renderPanel({
+          state: state({
+            details: {
+              status: "ready",
+              data: channelDetails({ description: "Infraestrutura e operações." }),
+            },
+          }),
+        }),
+    ],
+    ["grupo", () => renderGroupPanel(groupDetails({ description: "Infraestrutura e operações." }))],
+  ])("renders the persisted description of a %s under its own label", (_kind, renderIt) => {
+    renderIt();
+
+    expect(screen.getByRole("heading", { name: "Descrição" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Infraestrutura e operações.",
+    );
+  });
+
+  it("words the empty state for the aggregate it is describing", () => {
+    const { unmount } = renderPanel();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este canal ainda não tem descrição.",
+    );
+    unmount();
+
+    renderGroupPanel(groupDetails());
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este grupo ainda não tem descrição.",
+    );
+  });
+
+  // The description is server-side content and the only markup-shaped value in
+  // the block, so the invariant is asserted payload-independently rather than
+  // per-payload: the element holds the string verbatim and contains no element
+  // children at all. That is only true of a React text node, and it holds for
+  // any markup — including shapes no test enumerated.
+  it.each([
+    ["script tag", "<script>window.__pwned = true</script>"],
+    ["img onerror", '<img src=x onerror="window.__pwned = true">'],
+    ["svg onload", '<svg onload="window.__pwned = true"></svg>'],
+    ["javascript: anchor", '<a href="javascript:window.__pwned = true">click</a>'],
+    ["attribute breakout", "\"'><script>window.__pwned = true</script>"],
+    ["template expression", "{{constructor.constructor('window.__pwned = true')()}}"],
+    ["bare entities", "& < > \" ' `"],
+  ])("renders a %s description as inert text", (_label, hostile) => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ description: hostile }) },
+      }),
+    });
+
+    const description = screen.getByTestId("chat-details-description");
+    // Verbatim, character for character — not escaped-and-unescaped, not
+    // stripped, not normalized.
+    expect(description.textContent).toBe(hostile);
+    // Nothing was parsed out of it. Checking for zero element children rather
+    // than for a <script> or an <img> is what makes this hold for payloads the
+    // list does not name.
+    expect(description.querySelectorAll("*")).toHaveLength(0);
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+  });
+
+  // The creator's name is `auth.users.full_name`/`display_name`, which a person
+  // sets on themselves through PATCH /auth/me. Issue #894 renders it in a place
+  // it was never rendered before, so the content behind this row is
+  // attacker-controlled and the same inertness has to hold for it.
+  //
+  // This is also the guard for the navigable creator the issue anticipates: the
+  // day the name becomes a link, an href built from it would fail here rather
+  // than ship.
+  it("renders a hostile creator name as inert text, in channel and in group", () => {
+    const hostile = '<img src=x onerror="window.__pwned = true">';
+
+    // The row carries one decorative icon of its own, so "the name contributed
+    // no elements" is the assertion — not "the row has no elements".
+    const contributedElements = (row: HTMLElement) =>
+      [...row.querySelectorAll("*")].filter((el) => el.getAttribute("aria-hidden") !== "true");
+
+    const { unmount } = renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ creatorDisplayName: hostile }),
+        },
+      }),
+    });
+    const channelRow = screen.getByText(`Criado por ${hostile}`);
+    expect(channelRow.textContent).toContain(hostile);
+    expect(contributedElements(channelRow)).toHaveLength(0);
+    unmount();
+
+    renderGroupPanel(groupDetails({ creatorDisplayName: hostile }));
+    const groupRow = screen.getByText(`Criado por ${hostile}`);
+    expect(groupRow.textContent).toContain(hostile);
+    expect(contributedElements(groupRow)).toHaveLength(0);
+
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+  });
+
+  it("keeps accents, emoji and line breaks in a description", () => {
+    const description = "Operações — ç, ã, ü 🚀\nSegunda linha";
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ description }) },
+      }),
+    });
+
+    // textContent keeps the newline; the break itself is CSS (white-space:
+    // pre-wrap), never an interpreted <br>.
+    expect(screen.getByTestId("chat-details-description").textContent).toBe(description);
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: criador", () => {
+  it("names the creator by display name for a channel and for a group", () => {
+    const { unmount } = renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ creatorDisplayName: "Álvaro Neto" }),
+        },
+      }),
+    });
+    expect(screen.getByText("Criado por Álvaro Neto")).toBeInTheDocument();
+    unmount();
+
+    renderGroupPanel(groupDetails({ creatorDisplayName: "Juliane Lino" }));
+    expect(screen.getByText("Criado por Juliane Lino")).toBeInTheDocument();
+  });
+
+  it("falls back to a neutral state when the creator is unresolved", () => {
+    const { unmount } = renderPanel();
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+    expect(screen.queryByText(/Criado por/)).not.toBeInTheDocument();
+    unmount();
+
+    renderGroupPanel(groupDetails());
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+  });
+
+  it("never shows an identifier where the creator's name would go", () => {
+    // The panel is handed a details object that still carries the conversation's
+    // own id and every id in its preview, and no creator name. None of them may
+    // become the creator.
+    const creatorId = "11111111-2222-4333-8444-555555555555";
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            id: creatorId,
+            onlineCount: 1,
+            onlineMembers: [
+              { userId: creatorId, displayName: "Álvaro", role: "member", presence: "online" },
+            ],
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+    // Not the id, and not a prefix of it either: a truncated UUID is still a
+    // UUID on screen.
+    expect(screen.queryByText(new RegExp(creatorId.slice(0, 8)))).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: data de criação", () => {
+  it("formats the aggregate's own timestamp with the shared long-date format", () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ createdAt: "2026-08-31T12:00:00.000Z" }),
+        },
+      }),
+    });
+
+    expect(
+      screen.getByText(`Criado em ${formatLongDate("2026-08-31T12:00:00.000Z")}`),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["absent", ""],
+    ["unparseable", "ontem de manhã"],
+  ])(
+    "reads as unavailable when the date is %s, never as a half-written sentence",
+    (_case, value) => {
+      renderPanel({
+        state: state({
+          details: { status: "ready", data: channelDetails({ createdAt: value }) },
+        }),
+      });
+
+      expect(screen.getByText("Data de criação indisponível")).toBeInTheDocument();
+      expect(screen.queryByText(/^Criado em\s*$/)).not.toBeInTheDocument();
+    },
+  );
+});
+
+describe("ConversationDetailsPanel — Sobre: contagem", () => {
+  it.each([
+    [1, "1 membro"],
+    [6, "6 membros"],
+  ])("a channel of %d reads %s", (memberCount, expected) => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ memberCount }) },
+      }),
+    });
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it.each([
+    [1, "1 participante"],
+    [6, "6 participantes"],
+  ])("a group of %d reads %s", (participantCount, expected) => {
+    renderGroupPanel(groupDetails({ participantCount }));
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it("counts the server's total, never the preview it was given", () => {
+    // Three independent numbers, deliberately all different: the size of the
+    // conversation, how many are online, and how many rows the preview holds.
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            memberCount: 40,
+            onlineCount: 6,
+            onlineMembers: [
+              { userId: "u-1", displayName: "Ana", role: "member", presence: "online" },
+            ],
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByText("40 membros")).toBeInTheDocument();
+    expect(screen.queryByText("1 membro")).not.toBeInTheDocument();
+    expect(screen.queryByText("6 membros")).not.toBeInTheDocument();
+  });
+
+  it("counts a group's total, never its capped participant preview", () => {
+    renderGroupPanel(
+      groupDetails({
+        participantCount: 31,
+        participants: [
+          { userId: "u-1", displayName: "Ana" },
+          { userId: "u-2", displayName: "Bruno" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("31 participantes")).toBeInTheDocument();
+    expect(screen.queryByText("2 participantes")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: a DM 1:1 não ganhou nada", () => {
+  it("shows no conversation description, creator or count on a 1:1 profile", () => {
+    // A direct conversation is a person, not a described conversation: issue
+    // #894 added a block to the channel and group panels and nothing at all
+    // here, and the profile must not have inherited any of it.
+    renderProfilePanel(directDetails({ displayName: "Juliane Lino" }));
+
+    expect(screen.queryByRole("heading", { name: "Descrição" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    expect(screen.queryByText(/ainda não tem descrição/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Criado por/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Criador não identificado")).not.toBeInTheDocument();
+    expect(screen.queryByText(/participantes?$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/membros?$/)).not.toBeInTheDocument();
   });
 });

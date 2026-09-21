@@ -121,6 +121,12 @@ populacao coincide com os leitores no privado apos adicao e em `#geral` apos
 sync; nao no publico sem rows nem em `#geral` antes do sync.
 **TARGET (#883):** alinhar a contagem a membership efetiva/roster de 1.4.
 
+O bloco `SOBRE` do painel (issue #894) **consome** esta contagem e nao define
+outra: nao ha contador local, nada e derivado de `online_members.length` nem da
+previa de participantes, e a convergencia apos uma mudanca de membership
+continua sendo o refetch existente. Quando #883 mudar a fonte, o painel muda com
+ela sem alteracao propria.
+
 ### 1.8 Candidate eligibility
 
 **TARGET (#885, dependente de #883):** candidatos elegiveis com exclusao dos
@@ -149,19 +155,23 @@ desatualizada ate o proximo refetch, nunca uma membership.
 
 ### A. Channel details — `GET /api/chat/channels/{channelID}/details`
 
-| Camada   | Arquivo / simbolo                                                                                     |
-| -------- | ----------------------------------------------------------------------------------------------------- |
-| rota     | `internal/http/routes.go` `RouteChannelDetails`; `router.go:430` (orcamento de leitura)               |
-| handler  | `internal/http/channel_handler.go` `(*ChannelHandler).Details`, `onlineUserIDs`, `channelDetailsBody` |
-| service  | `internal/service/channel_service.go` `(*ChannelService).GetChannelDetails`                           |
-| store    | `internal/storage/member_store.go` `(*PGXMemberStore).ListOnlineChannelMemberProfiles`                |
-| SQL      | CTE `active_members` -> CTE `online_members` -> `page` (`ORDER BY` + `LIMIT`)                         |
-| JSON     | `member_count`, `online_member_count`, `online_members[]`, `can_manage_members`                       |
-| chatApi  | `apps/web/src/chat/chatApi.ts` `fetchChannelDetails`                                                  |
-| tipos    | `apps/web/src/chat/chatTypes.ts` `ChannelDetails`                                                     |
-| hook     | `apps/web/src/chat/useConversationDetails.ts`                                                         |
-| UI       | `apps/web/src/chat/ConversationDetailsPanel.tsx` `ChannelAboutSection`, `ChannelMembersSection`       |
-| contrato | `docs/api/chat-channel-details.md`                                                                    |
+| Camada   | Arquivo / simbolo                                                                                                      |
+| -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| rota     | `internal/http/routes.go` `RouteChannelDetails`; `router.go:430` (orcamento de leitura)                                |
+| handler  | `internal/http/channel_handler.go` `(*ChannelHandler).Details`, `onlineUserIDs`, `channelDetailsBody`                  |
+| service  | `internal/service/channel_service.go` `(*ChannelService).GetChannelDetails`                                            |
+| store    | `internal/storage/member_store.go` `(*PGXMemberStore).ListOnlineChannelMemberProfiles`                                 |
+| SQL      | CTE `active_members` -> CTE `online_members` -> `page` (`ORDER BY` + `LIMIT`)                                          |
+| JSON     | `member_count`, `online_member_count`, `online_members[]`, `can_manage_members`, `description`, `creator_display_name` |
+| chatApi  | `apps/web/src/chat/chatApi.ts` `fetchChannelDetails`                                                                   |
+| tipos    | `apps/web/src/chat/chatTypes.ts` `ChannelDetails`                                                                      |
+| hook     | `apps/web/src/chat/useConversationDetails.ts`                                                                          |
+| UI       | `apps/web/src/chat/ConversationDetailsPanel.tsx` `AboutMetadata`, `ChannelAboutSection`, `ChannelMembersSection`       |
+| contrato | `docs/api/chat-channel-details.md`                                                                                     |
+
+`description` e `creator_display_name` sao metadata do bloco `SOBRE`
+(issue #894), lidos por `storage.(*PGXChannelStore).GetChannelAbout` depois do
+gate. Nao pertencem a membership e nao participam de nenhuma contagem.
 
 Ordem das decisoes: `requireActiveWorkspaceMember` -> `GetVisibleChannelByID`
 (visibilidade, 404 uniforme) -> leitura de membros. Um chamador negado nunca

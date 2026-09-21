@@ -131,6 +131,10 @@ type routeChannelStore struct {
 	events [][3]string
 }
 
+func (s *routeChannelStore) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
+}
+
 func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {
 	channel, ok := s.visible[channelID]
 	if !ok || channel.WorkspaceID != workspaceID {

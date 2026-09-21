@@ -304,14 +304,21 @@ export interface GroupParticipantFixture {
 }
 
 /**
- * A group's details. Deliberately without visibility, slug or description: a
- * chat.dm_conversations row has none of them, and the panel must never show a
+ * A group's details. Deliberately without visibility or slug: a
+ * chat.dm_conversations row has neither, and the panel must never show a
  * channel's vocabulary for a group.
+ *
+ * description and creator_display_name are optional here for the same reason
+ * the server omits them (issue #894): absence is the contract for "there is
+ * none", so a spec that says nothing about them exercises the empty and
+ * neutral states rather than a value the backend would have had to invent.
  */
 export interface GroupDetailsFixture {
   id: string;
   type: "group";
   name: string;
+  description?: string;
+  creator_display_name?: string;
   created_at: string;
   /** Every active participant; may exceed participants.length. */
   participant_count: number;
@@ -360,6 +367,16 @@ export interface ChannelDetailsFixture {
   slug: string;
   display_name: string;
   type: "public" | "private";
+  /**
+   * Optional exactly as the server's own field is (issue #894): absent means
+   * the conversation has no description and the panel says so.
+   */
+  description?: string;
+  /**
+   * Absent when the server could resolve no trustworthy creator identity. It is
+   * a name and never an id — the real payload carries no creator id at all.
+   */
+  creator_display_name?: string;
   created_at: string;
   /** Every active member of the channel, online or not. */
   member_count: number;

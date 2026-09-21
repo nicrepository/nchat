@@ -71,6 +71,9 @@ type fakeChannelStore struct {
 	listCalls              int
 	listVisibleCalls       int
 	getVisibleByIDCalls    int
+	about                  storage.ConversationAbout
+	aboutErr               error
+	aboutCalls             []aboutCall
 	getVisibleBySlugCalls  int
 	creatorMembershipSeeds int
 	archiveCalls           int
@@ -141,6 +144,22 @@ func (f *fakeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID,
 	}
 	return ch, nil
 }
+
+// aboutCall records the arguments of one About read, so a test can assert the
+// workspace it was scoped to rather than only the value it returned.
+type aboutCall struct {
+	workspaceID string
+	targetID    string
+}
+
+func (f *fakeChannelStore) GetChannelAbout(_ context.Context, workspaceID, channelID string) (storage.ConversationAbout, error) {
+	f.aboutCalls = append(f.aboutCalls, aboutCall{workspaceID: workspaceID, targetID: channelID})
+	if f.aboutErr != nil {
+		return storage.ConversationAbout{}, f.aboutErr
+	}
+	return f.about, nil
+}
+
 func (f *fakeChannelStore) GetVisibleChannelBySlug(_ context.Context, workspaceID, slug, _ string) (domain.Channel, error) {
 	f.getVisibleBySlugCalls++
 	if f.getVisibleBySlugErr != nil {

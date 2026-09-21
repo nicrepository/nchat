@@ -2090,6 +2090,8 @@ interface ChannelDetailsEnvelope {
     slug?: unknown;
     display_name?: unknown;
     type?: unknown;
+    description?: unknown;
+    creator_display_name?: unknown;
     created_at?: unknown;
     member_count?: unknown;
     online_member_count?: unknown;
@@ -2124,6 +2126,40 @@ function nonNegativeCount(raw: unknown): number {
 }
 
 /**
+ * A conversation's description (issue #894), or "" when the server sent none.
+ *
+ * Only a string is a description. A number, an object or a null is not coerced
+ * into one — `String(value)` here would put "[object Object]" or "null" in the
+ * panel under the conversation's name — and a server that predates the field
+ * omits it, which is the same outcome as a conversation nobody has described.
+ *
+ * Nothing is stripped or unescaped: the value reaches the DOM as a React text
+ * node, so markup inside it is text and this is not the layer that has to make
+ * it safe. Whitespace-only values are absent, but meaningful leading, trailing
+ * and line-break whitespace remains part of the stored description.
+ */
+function conversationDescription(raw: unknown): string {
+  return typeof raw === "string" && raw.trim() !== "" ? raw : "";
+}
+
+/**
+ * The creator's display name (issue #894), or undefined when there is none to
+ * show.
+ *
+ * Absent means absent, and it has exactly one rendering: the panel's neutral
+ * state. A blank string is treated as absent for the same reason — a name made
+ * of spaces names nobody — and nothing else in the payload is ever promoted
+ * into this field. In particular there is no creator id to fall back to,
+ * because the server does not send one: a UUID is not a name and must never be
+ * shown as one.
+ */
+function creatorDisplayName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const name = raw.trim();
+  return name === "" ? undefined : name;
+}
+
+/**
  * Fetches the channel-details payload for the panel.
  *
  * The server is the authority on visibility: a channel the caller cannot read
@@ -2155,6 +2191,8 @@ export async function fetchChannelDetails(
     slug: typeof data.slug === "string" ? data.slug : "",
     name: typeof data.display_name === "string" ? data.display_name : "",
     type: data.type === "private" ? "private" : "public",
+    description: conversationDescription(data.description),
+    creatorDisplayName: creatorDisplayName(data.creator_display_name),
     createdAt: typeof data.created_at === "string" ? data.created_at : "",
     // Both totals are the server's. Deriving either from onlineMembers.length
     // would under-report: that array is a capped preview, and the channel's size
@@ -2261,6 +2299,8 @@ interface GroupDetailsEnvelope {
     id?: unknown;
     type?: unknown;
     name?: unknown;
+    description?: unknown;
+    creator_display_name?: unknown;
     created_at?: unknown;
     participant_count?: unknown;
     participants?: unknown;
@@ -2314,6 +2354,8 @@ export async function fetchGroupDetails(
   return {
     id: typeof data.id === "string" ? data.id : conversationId,
     name: typeof data.name === "string" ? data.name : "",
+    description: conversationDescription(data.description),
+    creatorDisplayName: creatorDisplayName(data.creator_display_name),
     createdAt: typeof data.created_at === "string" ? data.created_at : "",
     // The server's total. Deriving it from the preview would under-report a
     // group with more participants than the cap allows.

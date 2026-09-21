@@ -194,6 +194,27 @@ type Channel struct {
 // utf8.RuneCountInString and PostgreSQL char_length.
 const MaxChannelDisplayNameCodePoints = 100
 
+// MaxConversationDescriptionCodePoints bounds a conversation's description
+// (issue #894) — the same number the CHECK constraints migration 000053 adds to
+// chat.channels and chat.dm_conversations enforce.
+//
+// One constant for both aggregates because it is one product concept: "what
+// this conversation is for". A channel and a group would have no reason to
+// disagree about how long that may be, and two numbers would only be a chance
+// to drift.
+//
+// 500 sits where the existing text caps put it: above a title (120) and a
+// display name (MaxChannelDisplayNameCodePoints, 100), because this is prose
+// rather than a label, and well below a scraped link-preview description
+// (1000), because a person types this one.
+//
+// Counted in Unicode code points, matching utf8.RuneCountInString and
+// PostgreSQL char_length, so the service and the database agree on what 500
+// means for non-ASCII text. There is no write path in this release; the
+// constant exists so the database constraint has a named counterpart rather
+// than a literal repeated in SQL and Go.
+const MaxConversationDescriptionCodePoints = 500
+
 // NormalizeChannelDisplayName trims a channel name and enforces the cap.
 //
 // The single rule behind every path that persists chat.channels.display_name —

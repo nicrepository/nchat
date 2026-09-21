@@ -47,6 +47,10 @@ test.describe("painel de detalhes do grupo", () => {
         9,
       ),
     );
+    // Metadados "Sobre" próprios do grupo (issue #894): descrição e criador
+    // diferentes dos do canal, para que a troca de conversa tenha o que trocar.
+    scenario.groupDetails.get(targetId)!.description = "O grupo que cuida da malha.";
+    scenario.groupDetails.get(targetId)!.creator_display_name = OTHER_USER_NAME;
     // Quando o alvo do cenário já é um grupo, a sidebar padrão traz só ele; o
     // segundo grupo é adicionado para a troca do passo 7.
     scenario.sidebarDMs.push({
@@ -106,8 +110,16 @@ test.describe("painel de detalhes do grupo", () => {
     // ── 3. seções do grupo, com dados reais ──────────────────────────────
     await expect(panel.getByRole("heading", { name: "Detalhes do grupo" })).toBeVisible();
     await expect(panel.getByTestId("chat-details-group-name")).toHaveText("Time de Infra E2E");
+    await expect(panel.getByRole("heading", { name: "Descrição" })).toBeVisible();
+    await expect(panel.getByTestId("chat-details-description")).toHaveText(
+      "O grupo que cuida da malha.",
+    );
     await expect(panel.getByText(/Criado em 4 de março de 2024/)).toBeVisible();
-    await expect(panel.getByText(/9 participantes/)).toBeVisible();
+    await expect(panel.getByText(`Criado por ${OTHER_USER_NAME}`)).toBeVisible();
+    await expect(panel.getByText("9 participantes")).toBeVisible();
+    // Nenhum identificador técnico no bloco, nem um pedaço de um.
+    await expect(panel.getByText(OTHER_USER_ID)).toHaveCount(0);
+    await expect(panel.getByText(OTHER_USER_ID.slice(0, 8))).toHaveCount(0);
     await expect(panel.getByRole("heading", { name: "Participantes (9)" })).toBeVisible();
 
     const participants = panel.getByRole("list", { name: "Participantes do grupo" });
@@ -120,7 +132,8 @@ test.describe("painel de detalhes do grupo", () => {
     await expect(panel.getByText(/Canal público/)).toHaveCount(0);
     await expect(panel.getByText(/Canal privado/)).toHaveCount(0);
     await expect(panel.getByRole("heading", { name: /Membros online/ })).toHaveCount(0);
-    await expect(panel.getByTestId("chat-details-description")).toHaveCount(0);
+    // Um grupo tem descrição (issue #894), mas nunca a contagem de um canal.
+    await expect(panel.getByText(/membros/)).toHaveCount(0);
 
     // ── 5. arquivos do grupo ─────────────────────────────────────────────
     await expect(
@@ -140,6 +153,14 @@ test.describe("painel de detalhes do grupo", () => {
     await page.getByRole("option", { name: new RegExp(GROUP_DM_NAME) }).click();
     await expect(panel).toBeVisible();
     await expect(panel.getByTestId("chat-details-group-name")).toHaveText(GROUP_DM_NAME);
+    // O outro grupo não tem descrição nem criador resolvido: os dois estados de
+    // ausência aparecem, e nenhum metadado do grupo anterior sobrevive.
+    await expect(panel.getByTestId("chat-details-description")).toHaveText(
+      "Este grupo ainda não tem descrição.",
+    );
+    await expect(panel.getByText("Criador não identificado")).toBeVisible();
+    await expect(panel.getByText(`Criado por ${OTHER_USER_NAME}`)).toHaveCount(0);
+    await expect(panel.getByText("O grupo que cuida da malha.")).toHaveCount(0);
     await expect(
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("checklist.png"),
     ).toBeVisible();

@@ -795,15 +795,27 @@ export interface ChannelMemberProfile {
  *    *before* the limit is applied, so an offline member never takes a slot
  *    from an online one.
  *
- * `description` is deliberately not a field: chat.channels has no description
- * column, so the panel renders its empty state rather than a value nothing can
- * produce.
+ * `description` and `creatorDisplayName` are the "Sobre" block's metadata
+ * (issue #894) and both can genuinely be absent:
+ *  - `description` is "" for a conversation nobody has described, including
+ *    every one created before the column existed. The panel renders its empty
+ *    state, which is the truth rather than a placeholder;
+ *  - `creatorDisplayName` is absent when the server could not resolve a
+ *    historically trustworthy identity — no recorded creator, or an account
+ *    that is deleted or no longer in this workspace. The panel renders a
+ *    neutral state.
+ *
+ * There is deliberately no creator id. The server does not send one, nothing
+ * here navigates to the creator, and a field holding a UUID is how a UUID ends
+ * up on screen as a fallback for the name that was missing.
  */
 export interface ChannelDetails {
   id: string;
   slug: string;
   name: string;
   type: ChannelType;
+  description: string;
+  creatorDisplayName?: string;
   createdAt: string; // ISO 8601
   memberCount: number;
   onlineCount: number;
@@ -858,8 +870,12 @@ export interface GroupParticipantProfile {
  * The group-details payload.
  *
  * A group is a `chat.dm_conversations` row of type 'group', not a channel, so
- * this carries no visibility, slug, category or description — the domain has
- * none of them for conversations and none is invented here.
+ * this carries no visibility, slug or category — the domain has none of them
+ * for conversations and none is invented here.
+ *
+ * `description` and `creatorDisplayName` mean exactly what ChannelDetails'
+ * do, including how each is absent: a conversation is a conversation, and the
+ * "Sobre" block asks it the same questions whichever aggregate it lives in.
  *
  * `participantCount` is every active participant and is never
  * `participants.length`: that array is a capped preview.
@@ -867,6 +883,8 @@ export interface GroupParticipantProfile {
 export interface GroupDetails {
   id: string;
   name: string;
+  description: string;
+  creatorDisplayName?: string;
   createdAt: string; // ISO 8601
   participantCount: number;
   participants: GroupParticipantProfile[];

@@ -29,6 +29,8 @@ usuario), porque o painel refaz a consulta a cada troca de canal.
     "slug": "infraestrutura",
     "display_name": "Infraestrutura",
     "type": "private",
+    "description": "Infraestrutura, processos internos e operacoes.",
+    "creator_display_name": "Alvaro Neto",
     "created_at": "2024-01-12T09:30:00Z",
     "member_count": 12,
     "online_member_count": 5,
@@ -49,7 +51,18 @@ Campos:
 
 - `type` e o valor de dominio `chat.channels.type` (`public` | `private`). O
   cliente nunca deve inferir visibilidade pelo nome do canal.
-- `created_at` e RFC3339 em UTC.
+- `description` e `chat.channels.description` (issue #894). **Omitido** quando a
+  coluna e NULL ou vazia -- ausencia e o contrato para "nao ha descricao", e um
+  canal criado antes da migration 000053 nunca tem uma. Texto simples: nao existe
+  formato rich-text para metadado de conversa neste dominio, o valor e
+  serializado como esta armazenado e o cliente o renderiza como text node.
+- `creator_display_name` e o nome de apresentacao de `chat.channels.created_by`,
+  resolvido no servidor (issue #894). **Omitido** quando nao ha identidade
+  historicamente confiavel: `created_by` NULL, conta apagada ou desativada, ou
+  quem criou o canal nao e mais membro ativo deste workspace. O cliente mostra um
+  estado neutro nesse caso.
+- `created_at` e RFC3339 em UTC, e vem do agregado -- nunca da primeira mensagem,
+  da membership ou do relogio do cliente.
 
 As tres grandezas de membros respondem perguntas diferentes e **nenhuma deriva
 da outra**:
@@ -95,13 +108,42 @@ Campos de cada entrada:
   construcao. O campo e enviado assim mesmo para que o cliente possa **verificar**
   a afirmacao em vez de deduzi-la do nome da lista.
 
-Nao existe campo `description`: `chat.channels` nao tem coluna de descricao.
-Quando o dominio ganhar uma, ela entra aqui e o estado vazio do painel deixa de
-ser o unico resultado possivel.
-
 Campos deliberadamente ausentes de `members[]`: e-mail, papel no workspace, data
 de entrada, `auth_source` e qualquer outro atributo de perfil. Um painel de
 detalhes nao e uma exportacao de diretorio.
+
+### Descricao e criador (issue #894)
+
+`chat.channels.description` existe desde a migration 000053: coluna `TEXT`
+nullable, sem backfill, com CHECK de
+`domain.MaxConversationDescriptionCodePoints` (500) code points, validado em 000054. Ausencia historica continua valida e e o estado normal de todo canal
+criado antes dela.
+
+**Nao existe rota de escrita de descricao nesta entrega.** A issue #894
+implementa persistencia, leitura e apresentacao; a mutation de edicao pertence a
+uma issue propria. Nao ha, portanto, autorizacao nova a documentar: a leitura
+destes dois campos usa exatamente a autorizacao do `GET .../details` descrita
+acima, e um chamador que recebe `404` nao aprende nem que o canal existe, nem que
+ele tem descricao.
+
+O criador e resolvido **na mesma consulta** que le a descricao, por LEFT JOIN em
+`chat.workspace_members` + `auth.users`, com o mesmo
+`COALESCE(full_name, display_name)` que o resto do dominio usa para nome visivel.
+Nao existe rota `/creator`, nao ha busca de perfil depois do details e nao ha
+consulta por campo: o painel continua fazendo **uma** requisicao HTTP, e o
+handler passou de duas para tres consultas SQL, todas de custo constante e
+nenhuma por membro.
+
+**O UUID do criador nao e serializado.** Nada neste painel navega para ele, e um
+campo que so existe para ser enviado e como um UUID acaba na tela no lugar do
+nome que faltou. `creator_display_name` ausente significa ausente, e o cliente
+renderiza estado neutro -- nunca um id, nunca um prefixo de id, nunca e-mail ou
+slug.
+
+`member_count` continua sendo a unica fonte da contagem exibida no bloco
+`SOBRE`, com a mesma definicao (e a mesma divergencia conhecida) descrita acima:
+a #894 **consome** a autoridade de membership, nao a redefine. O fix pertence a
+issue #883.
 
 ### Presenca
 
@@ -151,13 +193,16 @@ lista de participantes.
 
 ## Consultas
 
-Duas, nesta ordem:
+Tres, nesta ordem:
 
 1. `GetVisibleChannelByID` -- o mesmo predicado de visibilidade usado pelo resto
    da superficie de canais (workspace ativo, participacao ativa no workspace,
    canal ativo, publico ou com `channel_members`).
 2. `ListOnlineChannelMemberProfiles` -- as duas contagens + a previa limitada, em
    uma unica consulta.
+3. `GetChannelAbout` -- descricao + nome do criador, em uma unica consulta,
+   depois do gate. O filtro `workspace_id` ali e isolamento em profundidade, nao
+   a permissao: quem decide o acesso e a etapa 1.
 
 A ordem dentro dessa consulta e o ponto do contrato:
 
@@ -182,9 +227,11 @@ ver o aviso sobre `member_count` acima. O filtro
 aqui, e o `user_id = ANY(...)` e uma **intersecao**: uma entrada de presenca de
 quem nao e membro deste canal nao seleciona nada.
 
-Sem N+1: uma consulta por requisicao, uma leitura de presenca por requisicao,
-ordenacao deterministica (`lower(display_name)` com `user_id` como desempate) e
-limite constante do servidor. O `LEFT JOIN LATERAL` sobre uma linha unica
+Sem N+1: uma consulta de membros por requisicao, uma leitura de presenca por
+requisicao, ordenacao deterministica (`lower(display_name)` com `user_id` como
+desempate) e limite constante do servidor. A consulta de descricao/criador
+(issue #894) e igualmente uma so por requisicao e de custo constante -- resolve
+um criador, nunca um por membro. O `LEFT JOIN LATERAL` sobre uma linha unica
 garante que as contagens voltem mesmo quando ninguem esta online.
 
 ## Adicionar membros (issue #398)

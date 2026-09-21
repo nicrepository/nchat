@@ -52,6 +52,14 @@ test.describe("painel de detalhes do canal", () => {
         ),
       );
     }
+    // Distinct About metadata per channel (issue #894), so switching channels
+    // with the panel open has something to actually change. The details for the
+    // channel the user starts in name a creator; the other one deliberately
+    // does not, which is the historical case the panel must not fill in.
+    scenario.channelDetails.get(targetId)!.description =
+      "Infraestrutura, processos internos e operações.";
+    scenario.channelDetails.get(targetId)!.creator_display_name = OTHER_USER_NAME;
+    scenario.channelDetails.get(OTHER_CHANNEL_ID)!.description = "Outro canal, outra descrição.";
     scenario.channelAttachments.set(targetId, [
       {
         id: `${targetId}-file`,
@@ -95,8 +103,18 @@ test.describe("painel de detalhes do canal", () => {
 
     // ── 2. seções principais com dados reais do canal ────────────────────
     await expect(panel.getByRole("heading", { name: "Detalhes do canal" })).toBeVisible();
+    await expect(panel.getByRole("heading", { name: "Descrição" })).toBeVisible();
+    await expect(panel.getByTestId("chat-details-description")).toHaveText(
+      "Infraestrutura, processos internos e operações.",
+    );
     await expect(panel.getByText(/Criado em 12 de janeiro de 2024/)).toBeVisible();
-    await expect(panel.getByText(/Canal público · 12 membros/)).toBeVisible();
+    await expect(panel.getByText(`Criado por ${OTHER_USER_NAME}`)).toBeVisible();
+    await expect(panel.getByText("Canal público")).toBeVisible();
+    await expect(panel.getByText("12 membros")).toBeVisible();
+    // Nothing technical reached the block: no identifier, and no truncation of
+    // one standing in for the creator's name.
+    await expect(panel.getByText(OTHER_USER_ID)).toHaveCount(0);
+    await expect(panel.getByText(OTHER_USER_ID.slice(0, 8))).toHaveCount(0);
     await expect(panel.getByRole("heading", { name: "Membros online (2)" })).toBeVisible();
     const members = panel.getByRole("list", { name: "Membros online do canal" });
     await expect(members.getByText(CURRENT_USER_NAME)).toBeVisible();
@@ -130,6 +148,13 @@ test.describe("painel de detalhes do canal", () => {
     // ── 4. trocar de canal com o painel aberto ───────────────────────────
     await page.getByRole("option", { name: /Canal E2E/ }).click();
     await expect(panel).toBeVisible();
+    // The whole About block moved to the other channel: its own description,
+    // and its own neutral creator state. Neither field is one channel behind.
+    await expect(panel.getByTestId("chat-details-description")).toHaveText(
+      "Outro canal, outra descrição.",
+    );
+    await expect(panel.getByText("Criador não identificado")).toBeVisible();
+    await expect(panel.getByText(`Criado por ${OTHER_USER_NAME}`)).toHaveCount(0);
     await expect(
       panel.getByRole("list", { name: "Arquivos recentes" }).getByText("topologia-rede.png"),
     ).toBeVisible();
@@ -320,7 +345,8 @@ test.describe("painel de detalhes do canal", () => {
     const panel = page.getByRole("complementary", { name: "Detalhes do canal" });
     await expect(panel.getByText("Nenhum membro online no momento.")).toBeVisible();
     // O tamanho do canal continua reportado e não vira zero.
-    await expect(panel.getByText(/Canal público · 31 membros/)).toBeVisible();
+    await expect(panel.getByText("Canal público")).toBeVisible();
+    await expect(panel.getByText("31 membros")).toBeVisible();
     await expect(panel.getByRole("heading", { name: "Membros online (0)" })).toBeVisible();
     await expect(panel.getByText("Nenhuma mensagem fixada neste canal.")).toBeVisible();
     await expect(panel.getByText("Nenhum arquivo enviado neste canal.")).toBeVisible();
@@ -367,7 +393,8 @@ test.describe("painel de detalhes do canal", () => {
     await expect(members.getByText("Zulmira Última")).toBeVisible();
     await expect(members.getByRole("listitem")).toHaveCount(1);
     await expect(panel.getByRole("heading", { name: "Membros online (1)" })).toBeVisible();
-    await expect(panel.getByText(/Canal público · 31 membros/)).toBeVisible();
+    await expect(panel.getByText("Canal público")).toBeVisible();
+    await expect(panel.getByText("31 membros")).toBeVisible();
   });
 });
 

@@ -338,6 +338,12 @@ type GroupDetails struct {
 	Conversation     domain.DMConversation
 	Participants     []domain.DMParticipantProfile
 	ParticipantCount int
+	// About is the group's own description and its creator's resolved display
+	// name (issue #894), read from the aggregate rather than derived from
+	// anything the panel already has. Either field being empty means absent, and
+	// absent renders as an empty or neutral state — never as a placeholder and
+	// never as an identifier.
+	About storage.ConversationAbout
 	// CanManageMembers is the server's answer to "may this caller add
 	// participants" (issue #398).
 	//
@@ -383,10 +389,18 @@ func (s *DMService) GetGroupDetails(ctx context.Context, input GroupDetailsInput
 	if err != nil {
 		return GroupDetails{}, fmt.Errorf("list dm participant profiles: %w", err)
 	}
+	// After the gate, like the participant page: this read carries the workspace
+	// for isolation in depth but is not what decides the caller may see the
+	// conversation.
+	about, err := s.dms.GetConversationAbout(ctx, workspaceID, conversation.ID)
+	if err != nil {
+		return GroupDetails{}, err
+	}
 	return GroupDetails{
 		Conversation:     conversation,
 		Participants:     page.Participants,
 		ParticipantCount: page.TotalCount,
+		About:            about,
 		CanManageMembers: true,
 	}, nil
 }

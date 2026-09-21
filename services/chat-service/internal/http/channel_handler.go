@@ -281,18 +281,29 @@ type channelDetailsMemberJSON struct {
 // limit is applied, so an offline member never occupies one of its slots and an
 // online member never loses a slot to one.
 //
-// There is no description field: chat.channels has no description column, so
-// there is nothing truthful to send. When the domain grows one, it is added
-// here and the panel's existing empty state stops being the only outcome.
+// description and creator_display_name are the About block's metadata
+// (issue #894), and both are omitted rather than sent empty. Absence is the
+// contract for "there is none": a channel created before migration 000053 has
+// no description, and a creator who is gone from this workspace has no name to
+// show. A client reads an absent field as the empty state, which is what a
+// client predating these fields already does — so the addition is compatible in
+// both directions.
+//
+// creator_display_name carries a name and never an identifier. The creator's
+// UUID is not serialised at all: nothing in this panel navigates to them, so
+// sending the ID would only create the opportunity to render it when the name
+// is missing.
 type channelDetailsResponse struct {
-	ID                string                     `json:"id"`
-	Slug              string                     `json:"slug"`
-	DisplayName       string                     `json:"display_name"`
-	Type              string                     `json:"type"`
-	CreatedAt         string                     `json:"created_at"`
-	MemberCount       int                        `json:"member_count"`
-	OnlineMemberCount int                        `json:"online_member_count"`
-	OnlineMembers     []channelDetailsMemberJSON `json:"online_members"`
+	ID                 string                     `json:"id"`
+	Slug               string                     `json:"slug"`
+	DisplayName        string                     `json:"display_name"`
+	Type               string                     `json:"type"`
+	Description        string                     `json:"description,omitempty"`
+	CreatorDisplayName string                     `json:"creator_display_name,omitempty"`
+	CreatedAt          string                     `json:"created_at"`
+	MemberCount        int                        `json:"member_count"`
+	OnlineMemberCount  int                        `json:"online_member_count"`
+	OnlineMembers      []channelDetailsMemberJSON `json:"online_members"`
 	// CanManageMembers lets the panel disable an action the server would refuse
 	// (issue #398). It is a hint for the UI and never a control: the add-members
 	// route re-derives the same decision from the session on every call. It is
@@ -380,15 +391,17 @@ func channelDetailsBody(details service.ChannelDetails) channelDetailsResponse {
 		})
 	}
 	return channelDetailsResponse{
-		ID:                details.Channel.ID,
-		Slug:              details.Channel.Slug,
-		DisplayName:       details.Channel.DisplayName,
-		Type:              string(details.Channel.Type),
-		CreatedAt:         details.Channel.CreatedAt.UTC().Format(time.RFC3339),
-		MemberCount:       details.MemberCount,
-		OnlineMemberCount: details.OnlineCount,
-		OnlineMembers:     members,
-		CanManageMembers:  details.CanManageMembers,
+		ID:                 details.Channel.ID,
+		Slug:               details.Channel.Slug,
+		DisplayName:        details.Channel.DisplayName,
+		Type:               string(details.Channel.Type),
+		Description:        details.About.Description,
+		CreatorDisplayName: details.About.CreatorDisplayName,
+		CreatedAt:          details.Channel.CreatedAt.UTC().Format(time.RFC3339),
+		MemberCount:        details.MemberCount,
+		OnlineMemberCount:  details.OnlineCount,
+		OnlineMembers:      members,
+		CanManageMembers:   details.CanManageMembers,
 	}
 }
 

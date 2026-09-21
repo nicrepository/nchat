@@ -58,6 +58,9 @@ function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
     slug: "infra",
     name: "Infraestrutura",
     type: "public",
+    // Absent by default (issue #894): the empty state is what a conversation
+    // nobody has described produces, so cases that say nothing exercise it.
+    description: "",
     createdAt: "2024-01-12T09:30:00Z",
     memberCount: 3,
     onlineCount: 0,
@@ -212,6 +215,7 @@ function group(overrides: Partial<GroupDetails> = {}): GroupDetails {
   return {
     id: "conv-1",
     name: "Time de Infra",
+    description: "",
     createdAt: "2024-03-04T15:00:00Z",
     participantCount: 4,
     participants: [],
@@ -1308,5 +1312,143 @@ describe("useConversationDetails — preview reconciliation", () => {
     await advancePastInterval();
 
     expect(mockFetchChannelAttachments).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── Metadados do bloco "Sobre" na troca de conversa (issue #894) ─────────────
+//
+// The About block gained three more fields that describe a specific
+// conversation, so "a late answer for A must not land on B" now has three more
+// ways to go wrong. These cover the metadata specifically: the existing
+// staleness tests assert the identity and the roster, and a field that arrived
+// later is exactly the kind of thing a guard written for other fields misses.
+
+describe("useConversationDetails — metadata não vaza entre conversas", () => {
+  it("drops a channel's late About metadata after the user moved to another channel", async () => {
+    const slowFirst = details({
+      id: "ch-1",
+      name: "Primeiro",
+      description: "Descrição do primeiro",
+      creatorDisplayName: "Álvaro Neto",
+      createdAt: "2024-01-12T09:30:00Z",
+      memberCount: 12,
+    });
+    const second = details({
+      id: "ch-2",
+      name: "Segundo",
+      description: "Descrição do segundo",
+      creatorDisplayName: "Juliane Lino",
+      createdAt: "2026-08-31T12:00:00Z",
+      memberCount: 6,
+    });
+
+    let resolveFirst: (value: ChannelDetails) => void = () => {};
+    mockFetchChannelDetails.mockImplementationOnce(
+      () =>
+        new Promise<ChannelDetails>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+    mockFetchChannelAttachments.mockResolvedValue([]);
+
+    const { result, rerender } = renderHook(
+      ({ id }) => useConversationDetails({ kind: "channel", id }),
+      { initialProps: { id: "ch-1" } },
+    );
+
+    mockFetchChannelDetails.mockResolvedValueOnce(second);
+    rerender({ id: "ch-2" });
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    // The first channel answers long after the switch.
+    await act(async () => {
+      resolveFirst(slowFirst);
+    });
+
+    const section = result.current.details;
+    expect(section.status === "ready" && section.data.kind === "channel").toBe(true);
+    // Every About field is the second channel's — they move together with
+    // `details`, so none of them can be one conversation behind the others.
+    expect(section).toEqual({
+      status: "ready",
+      data: { kind: "channel", ...second },
+    });
+  });
+
+  it("replaces every About field when a channel becomes a group", async () => {
+    mockFetchChannelDetails.mockResolvedValue(
+      details({
+        id: "ch-1",
+        description: "Descrição do canal",
+        creatorDisplayName: "Álvaro Neto",
+        createdAt: "2024-01-12T09:30:00Z",
+        memberCount: 12,
+      }),
+    );
+    mockFetchGroupDetails.mockResolvedValue(
+      group({
+        id: "conv-1",
+        description: "Descrição do grupo",
+        creatorDisplayName: "Juliane Lino",
+        createdAt: "2024-03-04T15:00:00Z",
+        participantCount: 6,
+      }),
+    );
+    mockFetchChannelAttachments.mockResolvedValue([]);
+
+    const { result, rerender } = renderHook(
+      ({ target }: { target: ConversationDetailsTarget }) => useConversationDetails(target),
+      { initialProps: { target: { kind: "channel", id: "ch-1" } as ConversationDetailsTarget } },
+    );
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    rerender({ target: { kind: "group", id: "conv-1" } });
+    await waitFor(() =>
+      expect(result.current.details).toEqual({
+        status: "ready",
+        data: {
+          kind: "group",
+          ...group({
+            id: "conv-1",
+            description: "Descrição do grupo",
+            creatorDisplayName: "Juliane Lino",
+            createdAt: "2024-03-04T15:00:00Z",
+            participantCount: 6,
+          }),
+        },
+      }),
+    );
+
+    // Nothing of the channel survived the switch — not the description, not the
+    // creator, and not the shape that would let the panel word an empty state
+    // for the wrong aggregate.
+    const section = result.current.details;
+    expect(section.status === "ready" && section.data.kind).toBe("group");
+    expect(JSON.stringify(section)).not.toContain("Descrição do canal");
+    expect(JSON.stringify(section)).not.toContain("Álvaro Neto");
+  });
+
+  it("converges the count on the persisted answer when membership changes", async () => {
+    // The membership signal — the add's own response, or members.added from
+    // someone else — is a "your view is stale" trigger, not a number. Both call
+    // reload, and the count that lands is whatever the server persisted.
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 6 }));
+    mockFetchChannelAttachments.mockResolvedValue([]);
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+
+    // Two members added concurrently, but the server committed three: a client
+    // that had incremented locally would now read 8.
+    mockFetchChannelDetails.mockResolvedValue(details({ memberCount: 9 }));
+    await act(async () => {
+      result.current.reload();
+    });
+
+    await waitFor(() => {
+      const section = result.current.details;
+      expect(
+        section.status === "ready" && section.data.kind === "channel" && section.data.memberCount,
+      ).toBe(9);
+    });
   });
 });

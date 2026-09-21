@@ -112,6 +112,11 @@ case "$MODULE" in
       TestNotificationOutboxPromotesDirectConversationPostgreSQL
       TestNotificationOutboxPromotionSkipsRecipientWhoLeftTheConversationPostgreSQL
       TestNotificationOutboxMigrationRoundTripPostgreSQL
+      # Issue #894. Conversation description and creator resolution: an additive
+      # column that leaves historical rows valid, two CHECK constraints counting
+      # code points, and a LEFT JOIN that has to answer "nobody to name" without
+      # losing the row. None of the three can be held by a fake.
+      TestConversationAboutPostgreSQL
       TestNotificationOutboxMigrationDownRefusesUnrepresentableStatePostgreSQL
       # Issue #136. The first three read the migrated schema and the fixture the
       # outbox suite above already seeds; the fourth creates and drops a database

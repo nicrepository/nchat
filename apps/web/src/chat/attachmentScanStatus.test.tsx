@@ -65,6 +65,7 @@ function channelDetails(): { kind: "channel" } & ChannelDetails {
     slug: "infra",
     name: "Infraestrutura",
     type: "public",
+    description: "",
     createdAt: "2026-07-01T09:00:00.000Z",
     memberCount: 2,
     onlineCount: 0,

@@ -30,6 +30,8 @@ orcamento de leitura (`msgListRateLimit`, 30/min por usuario).
     "id": "44444444-4444-4444-8444-444444444444",
     "type": "group",
     "name": "Time de Infra",
+    "description": "O grupo que cuida da malha.",
+    "creator_display_name": "Alvaro Neto",
     "created_at": "2024-03-04T15:00:00Z",
     "participant_count": 12,
     "participants": [
@@ -48,7 +50,17 @@ Campos:
 
 - `name` e `chat.dm_conversations.title`. Pode vir vazio -- um grupo ad-hoc nao
   exige titulo -- e o cliente mostra um rotulo neutro nesse caso.
-- `created_at` e RFC3339 em UTC.
+- `description` e `chat.dm_conversations.description` (issue #894). **Omitido**
+  quando a coluna e NULL ou vazia -- ausencia e o contrato para "nao ha
+  descricao", e um grupo criado antes da migration 000053 nunca tem uma. Texto
+  simples, renderizado pelo cliente como text node.
+- `creator_display_name` e o nome de apresentacao de
+  `chat.dm_conversations.created_by`, resolvido no servidor (issue #894).
+  **Omitido** quando nao ha identidade historicamente confiavel: conta apagada ou
+  desativada, ou quem criou o grupo nao e mais membro ativo do workspace. O
+  cliente mostra um estado neutro nesse caso, nunca um identificador.
+- `created_at` e RFC3339 em UTC, e vem do agregado -- nunca da primeira mensagem
+  nem da membership.
 - `participant_count` e o total de participantes ativos, via `COUNT(*) OVER ()`
   na mesma consulta da pagina. **Nunca** use `participants.length` como total:
   `participants` e uma previa limitada a `domain.MaxDMDetailsParticipants` (30),
@@ -61,8 +73,10 @@ Campos:
 - `participants[].avatar_url` e omitido quando ausente.
 
 Deliberadamente **ausentes**, porque um grupo nao e um canal: visibilidade
-(`public`/`private`), `slug`, categoria e descricao. O dominio nao tem nenhum
-deles para conversas e nenhum e inventado aqui.
+(`public`/`private`), `slug` e categoria. O dominio nao tem nenhum deles para
+conversas e nenhum e inventado aqui. Descricao, por outro lado, existe desde a
+issue #894 e pertence a conversa -- a mesma coluna, a mesma semantica de
+ausencia e o mesmo limite do lado dos canais.
 
 Tambem ausente: `role`. `chat.dm_members.role` e fechado por CHECK ao unico
 valor `'member'`, entao um grupo nao tem papel a exibir. E-mail, papel no
@@ -86,9 +100,34 @@ DM 1:1 esta **fora do escopo** da issue #441 e e recusada mesmo quando o
 chamador participa dela: o tipo e verificado contra a linha que o banco
 devolveu, nunca contra algo que o cliente afirmou.
 
+## Descricao e criador (issue #894)
+
+`chat.dm_conversations.description` existe desde a migration 000053: coluna
+`TEXT` nullable, sem backfill, com CHECK de
+`domain.MaxConversationDescriptionCodePoints` (500) code points, validado em 000054. Uma linha `direct` herda a coluna porque e a mesma tabela; nada a le para
+uma DM 1:1, cujo painel e o perfil da outra pessoa.
+
+**Nao existe rota de escrita de descricao nesta entrega.** A issue #894 implementa
+persistencia, leitura e apresentacao; a mutation de edicao pertence a uma issue
+propria. A leitura destes dois campos usa exatamente a autorizacao do
+`GET .../details` descrita acima -- um chamador que recebe `404` nao aprende nem
+que a conversa existe, nem que ela tem descricao, e uma conversa `direct` e
+recusada antes de a descricao ser lida.
+
+O criador e resolvido na mesma consulta que le a descricao, por LEFT JOIN em
+`chat.workspace_members` + `auth.users`, com o mesmo
+`COALESCE(full_name, display_name)` do resto do dominio. Nao ha rota `/creator`,
+nem busca de perfil depois do details, nem consulta por campo: o painel faz
+**uma** requisicao HTTP e o handler passou de duas para tres consultas SQL, todas
+de custo constante. O UUID do criador nao e serializado.
+
+`participant_count` permanece a unica fonte da contagem exibida no bloco
+`SOBRE`, derivada da mesma consulta autoritativa dos participantes -- nunca de
+`participants.length` e nunca de um contador mantido no cliente.
+
 ## Consultas
 
-Duas, nesta ordem:
+Tres, nesta ordem:
 
 1. `GetVisibleConversationByID` -- o mesmo predicado de acesso usado pelo resto
    da superficie de DM (workspace ativo, participacao ativa no workspace,
@@ -97,6 +136,9 @@ Duas, nesta ordem:
    com `dm.status = 'active'` (quem saiu do grupo desaparece), `dc.workspace_id`
    (isolamento de tenant), `dm.conversation_id` (isolamento entre grupos) e o
    join em `auth.users` ativo/nao deletado.
+3. `GetConversationAbout` -- descricao + nome do criador, em uma unica consulta,
+   depois do gate. O filtro `workspace_id` ali e isolamento em profundidade, nao
+   a permissao: quem decide o acesso e a etapa 1.
 
 A presenca e lida **uma vez por requisicao**, em lote (`OnlineUserIDs`), e so
 anota as linhas que a consulta ja selecionou -- nunca uma consulta por

@@ -157,6 +157,12 @@ type ChannelDetails struct {
 	OnlineMembers []domain.ChannelMemberProfile
 	OnlineCount   int
 	MemberCount   int
+	// About is the channel's own description and its creator's resolved display
+	// name (issue #894), read from the aggregate rather than derived from
+	// anything the panel already has. Either field being empty means absent, and
+	// absent renders as an empty or neutral state — never as a placeholder and
+	// never as an identifier.
+	About storage.ConversationAbout
 	// CanManageMembers is the server's own answer to "may this caller add
 	// participants" (issue #398), derived from the membership this method already
 	// had to load. It exists so the panel can disable an action the server would
@@ -195,11 +201,18 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 	if err != nil {
 		return ChannelDetails{}, fmt.Errorf("list online channel member profiles: %w", err)
 	}
+	// After the gate, like the member page: this read carries the workspace for
+	// isolation in depth but is not what decides the caller may see the channel.
+	about, err := s.channels.GetChannelAbout(ctx, input.WorkspaceID, channel.ID)
+	if err != nil {
+		return ChannelDetails{}, err
+	}
 	return ChannelDetails{
 		Channel:       channel,
 		OnlineMembers: page.Online,
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
+		About:         about,
 		// The same predicate the write path checks, evaluated on the membership
 		// already loaded above — not a second, parallel rule that could drift.
 		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),

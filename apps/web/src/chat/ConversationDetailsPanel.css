@@ -635,3 +635,37 @@
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
 }
+
+/* ── "Sobre": description label and value (issue #894) ───────────────────── */
+
+/*
+ * A real heading rather than a styled paragraph: it names the value under it,
+ * and h4 is the level below the section's own h3, so a screen reader can reach
+ * the description the same way it reaches every other part of the panel. It
+ * borrows the section label's typography without borrowing its spacing, which
+ * belongs above a section rather than inside one.
+ */
+.chat-details__sublabel {
+  margin: 12px 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted, #7c7390);
+}
+
+/*
+ * The description's own text. pre-wrap is the whole reason this rule exists:
+ * a stored description may contain line breaks, and the panel has to keep them
+ * without interpreting anything — the value is a React text node, never markup.
+ * overflow-wrap keeps a long unbroken token (a URL, a path) inside the narrow
+ * panel instead of widening it.
+ */
+.chat-details__description {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-2, #3d3550);
+}

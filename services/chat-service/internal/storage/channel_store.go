@@ -99,6 +99,11 @@ type ChannelStore interface {
 	// Returns ErrNotFound when the channel does not exist or belongs to a different workspace.
 	GetChannelByIDInWorkspace(ctx context.Context, workspaceID, id string) (domain.Channel, error)
 	GetVisibleChannelByID(ctx context.Context, workspaceID, channelID, userID string) (domain.Channel, error)
+	// GetChannelAbout returns the channel's description and its creator's
+	// resolved display name (issue #894), in one query. The caller's read access
+	// to the channel must already have been settled — this is isolation in
+	// depth, not the permission.
+	GetChannelAbout(ctx context.Context, workspaceID, channelID string) (ConversationAbout, error)
 	GetVisibleChannelBySlug(ctx context.Context, workspaceID, slug, userID string) (domain.Channel, error)
 	ListChannelsByWorkspace(ctx context.Context, workspaceID string) ([]domain.Channel, error)
 	// ListVisibleChannelsByUser returns active channels in workspaceID visible to userID.
