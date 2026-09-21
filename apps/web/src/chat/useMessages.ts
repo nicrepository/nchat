@@ -246,7 +246,7 @@ export function useMessages({
       dispatch,
       bodyFormat,
       notifyRemoved,
-      reconcileCreatedConversationEvent: (messageId) => reads.readMessageSnapshot(messageId, true),
+      reconcileCreatedConversationEvent: reads.readConversationEventSnapshot,
     },
   );
 

@@ -277,6 +277,30 @@ describe("useChatWebSocket", () => {
     expect(FakeWebSocket.instances[0].readyState).toBe(FakeWebSocket.OPEN);
   });
 
+  it("ignores a subscribe error for another conversation", () => {
+    const onSubscriptionError = vi.fn();
+    renderHook(() =>
+      useChatWebSocket({
+        kind: "channel",
+        targetId: "ch-1",
+        onMessageCreated: vi.fn(),
+        onSubscriptionError,
+      }),
+    );
+
+    act(() =>
+      FakeWebSocket.instances[0].simulateMessage({
+        type: "error",
+        operation: "subscribe",
+        code: "room_subscription_unavailable",
+        target_type: "channel",
+        target_id: "ch-other",
+      }),
+    );
+
+    expect(onSubscriptionError).not.toHaveBeenCalled();
+  });
+
   it("recovers a temporary subscribe failure on the current open socket", () => {
     vi.useFakeTimers();
     const onReactionError = vi.fn();

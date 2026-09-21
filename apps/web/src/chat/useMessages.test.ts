@@ -478,6 +478,32 @@ describe("useMessages — DM body format", () => {
     ]);
   });
 
+  it("retries the auto-add event announced by the send response without flashing a realtime error", async () => {
+    const event = makeMessage({
+      id: "event-member-added",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockResolvedValue(
+      makeMessage({ id: "message-with-auto-add", createdConversationEventId: event.id }),
+    );
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(event);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.sendMessage("@[Pessoa nova](mention:user:user-new)"));
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toContainEqual(event));
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
   it("keeps direct messages on v2 by default", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     mockPostDMMessage.mockResolvedValue(makeMessage({ id: "direct-message", bodyFormat: "v2" }));

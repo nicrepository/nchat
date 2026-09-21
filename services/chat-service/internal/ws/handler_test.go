@@ -680,6 +680,9 @@ func TestServeWS_RepeatedSubscribeAuthorizationErrorFailsClosed(t *testing.T) {
 		if response.Type != "error" || response.Operation != "subscribe" || response.Code != "room_subscription_unavailable" {
 			t.Fatalf("attempt %d returned %+v", attempt, response)
 		}
+		if response.TargetType != TargetTypeDM || response.TargetID != dmID {
+			t.Fatalf("attempt %d target = %q/%q, want dm/%q", attempt, response.TargetType, response.TargetID, dmID)
+		}
 		if strings.Contains(string(data), "database unavailable") {
 			t.Fatalf("technical details leaked in subscribe response: %s", data)
 		}
