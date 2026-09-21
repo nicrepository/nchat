@@ -291,6 +291,66 @@
   min-width: 0;
 }
 
+/*
+ * The row's identity region (issue #895): avatar, name and status, as one
+ * block. It is a <button> when activating it opens a conversation and a plain
+ * <span> when it does not — the viewer's own row — so the two never differ in
+ * layout and a row can never look activatable while doing nothing.
+ *
+ * It is the row's flex child rather than the row itself, which is what lets a
+ * secondary action (issue #469's removal control) sit beside it as a sibling
+ * instead of nesting one interactive element inside another.
+ *
+ * min-height is the touch target, stated on the region both variants share so
+ * an activatable row and a static one are the same height in one list.
+ *
+ * The region is deliberately flush with the row rather than bled outwards with
+ * a negative margin: the expanded list is a scroll container, and `overflow-y:
+ * auto` makes its horizontal overflow `auto` too, so anything reaching past the
+ * row's box would buy a hover surface at the price of a horizontal scrollbar.
+ */
+.chat-details__member-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: start;
+}
+
+.chat-details__member-main--action {
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-details__member-main--action:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-details__member-main--action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* Being resolved. Not `disabled`: taking the control out of the tab order mid
+   interaction moves focus out from under whoever just pressed it, and a repeat
+   press is harmless — the open-DM flow deduplicates by recipient. */
+.chat-details__member-main--action[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat-details__member-main--action {
+    transition: background-color 120ms ease-out;
+  }
+}
+
 .chat-details__avatar {
   position: relative;
   flex: none;

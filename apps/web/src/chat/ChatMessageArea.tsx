@@ -62,7 +62,7 @@ import ConversationDialogs from "./message-area/dialogs/ConversationDialogs";
 import ConversationTimeline from "./message-area/timeline/ConversationTimeline";
 import { quickReactionEmojis } from "./message-area/conversationText";
 import { directCallBar } from "./message-area/directCallBar";
-import { useAuthorDM } from "./message-area/hooks/useAuthorDM";
+import { inertDirectMessage, useDirectMessageAccess } from "./directMessage";
 import { useMessageDialogs } from "./message-area/hooks/useMessageDialogs";
 import { useTypingIndicatorLabel } from "./message-area/hooks/useTypingIndicatorLabel";
 import { useViewportAnchors } from "./message-area/hooks/useViewportAnchors";
@@ -111,13 +111,30 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   } = useEmojiUsage(ctx.currentUserId);
 
   const dialogs = useMessageDialogs({ kind, targetId, navigate });
-  const authorDM = useAuthorDM({
-    currentUserId: ctx.currentUserId,
-    kind,
-    targetId,
-    refreshConversations: ctx.refreshConversations,
-    navigate,
-  });
+  /*
+    The shell's coordinator, never one of this component's own (issue #895): the
+    in-flight registry inside it is what makes a second request for a recipient
+    already being resolved impossible, and the details panel beside this
+    timeline can address the same person. Two registries meant two POSTs. Falls
+    back to an inert one for the same reason drafts does — a ChatOutletContext
+    fixture that predates the field, never production.
+
+    The lifetime on top of it is this conversation's, stated as the domain
+    discriminant the rest of this component already keys everything by. So a
+    switch from one conversation to another releases what this surface was
+    waiting for, and a reply that arrives afterwards navigates nowhere — while
+    leaving untouched anything the details panel is still waiting for.
+  */
+  const directMessage = useDirectMessageAccess(
+    ctx.directMessage ?? inertDirectMessage,
+    `${kind}:${targetId}`,
+  );
+  const openAuthorDM = useCallback(
+    (message: Message) => {
+      if (message.senderId) directMessage.coordinator.open(message.senderId, directMessage.origin);
+    },
+    [directMessage],
+  );
   const anchors = useViewportAnchors({
     kind,
     targetId,
@@ -444,9 +461,9 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
   const handleMentionClick = useCallback(
     (mentionType: MentionType, id: string) => {
       if (mentionType !== "user" || !id || id === ctx.currentUserId) return;
-      authorDM.openMentionDM(id);
+      directMessage.coordinator.open(id, directMessage.origin);
     },
-    [ctx.currentUserId, authorDM],
+    [ctx.currentUserId, directMessage],
   );
 
   // One object rather than a dozen props: the timeline hands every one of these
@@ -457,7 +474,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     onReferenceMessage: dialogs.openReference,
     onForwardMessage: dialogs.openForward,
     onReferenceJump: jumpToReference,
-    onOpenAuthorDM: authorDMAction(ctx.currentUserId, kind, activeDM, authorDM.openAuthorDM),
+    onOpenAuthorDM: authorDMAction(ctx.currentUserId, kind, activeDM, openAuthorDM),
     onMentionClick: handleMentionClick,
     onToggleFavorite: toggleFavorite,
     onReconcileLinkSafety: reconcileLinkSafety,
@@ -531,7 +548,7 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           onRetry={retry}
           editDisabledIds={editDisabledIds}
           pinnedIds={pinnedIds}
-          openingAuthorDMIds={authorDM.openingAuthorDMIds}
+          directMessage={directMessage}
           acknowledgements={acknowledgements}
           acknowledgingId={acknowledgingId}
           recentReactionEmojis={recentReactionEmojis}
@@ -549,7 +566,6 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           sendError={state.sendError}
           realtimeError={state.realtimeError}
           actionError={state.actionError}
-          openDMError={authorDM.openDMError}
           pinError={pinError}
           acknowledgeError={acknowledgeError}
           typingLabel={typingIndicatorLabel}
@@ -616,6 +632,10 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
           currentUserId={ctx.currentUserId}
           latestPin={latestPin}
           onRename={renameConversation}
+          // The very flow a mention and a message author already use, and the
+          // very same instance, so the roster cannot acquire a second way — or a
+          // second in-flight map — for the same endpoint.
+          openDM={directMessage}
           onClose={details.close}
         />
       )}

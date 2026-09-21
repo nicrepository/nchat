@@ -16,6 +16,7 @@
 
 import ConversationDetailsPanel from "./ConversationDetailsPanel";
 import type { ConversationRenameAction } from "./conversationRename";
+import { useDirectMessageAccess, type DirectMessageCoordinator } from "./directMessage";
 import { useConversationDetails } from "./useConversationDetails";
 import { useReloadOnRename } from "./useReloadOnRename";
 
@@ -46,6 +47,18 @@ interface SidebarDetailsPanelProps {
    * that simply refetches the list — with no realtime wiring of its own.
    */
   canonicalName: string;
+  /**
+   * The session's open-DM coordinator (issue #895), handed down rather than
+   * built here. This panel and the conversation's own details panel can be open
+   * at once and can address the same person; one registry is what makes the
+   * second activation join the request in flight instead of sending another.
+   *
+   * What this panel *does* own is its lifetime, declared below. The shell has
+   * none to lend it: closing this panel, or pointing it at a different
+   * conversation, changes nothing about the route, and a reply for the person
+   * it used to describe must not navigate once it no longer describes them.
+   */
+  coordinator: DirectMessageCoordinator;
   onClose: () => void;
 }
 
@@ -54,6 +67,7 @@ export default function SidebarDetailsPanel({
   currentUserId,
   onRename,
   canonicalName,
+  coordinator,
   onClose,
 }: SidebarDetailsPanelProps) {
   // The hook accepts null and fetches nothing for it, so this is one hook call
@@ -69,6 +83,20 @@ export default function SidebarDetailsPanel({
     target !== null,
     state.reload,
   );
+  /*
+    This panel's own lifetime, as the coordinator sees it (issue #895).
+
+    The key is what the panel is currently describing, so all three ways this
+    surface can stop being entitled to a reply — closing, switching to another
+    conversation, unmounting — are the same event: a new token, and the old
+    one released. "closed" is a lifetime like any other; nothing is opened
+    under it, and registering it unconditionally keeps the hook order
+    independent of whether a panel is on screen.
+  */
+  const access = useDirectMessageAccess(
+    coordinator,
+    target ? `${target.kind}:${target.id}` : "closed",
+  );
   if (!target) return null;
   return (
     <ConversationDetailsPanel
@@ -78,6 +106,7 @@ export default function SidebarDetailsPanel({
       currentUserId={currentUserId}
       latestPin={null}
       onRename={onRename}
+      openDM={access}
       onClose={onClose}
     />
   );

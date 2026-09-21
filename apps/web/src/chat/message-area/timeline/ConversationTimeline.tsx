@@ -8,6 +8,7 @@
  */
 
 import { useMemo } from "react";
+import type { DirectMessageAccess } from "../../directMessage";
 
 import type { CallParticipantProfile } from "../../chatApi";
 import {
@@ -39,7 +40,8 @@ export interface ConversationTimelineProps {
   onRetry: () => void;
   editDisabledIds: Set<string>;
   pinnedIds: Set<string>;
-  openingAuthorDMIds?: Set<string>;
+  /** The shared open-DM operation and this conversation's claim on it. */
+  directMessage?: DirectMessageAccess;
   /** Issue #824: the server's acknowledgement summary per message, if any. */
   acknowledgements?: Record<string, MessageAcknowledgement>;
   /** Issue #824: the message whose confirmation is in flight, if any. */
@@ -105,7 +107,7 @@ export default function ConversationTimeline(props: ConversationTimelineProps) {
       mentionTarget={props.mentionTarget}
       presenceTarget={targetId ? presenceTargetKey(kind, targetId) : undefined}
       pinnedIds={props.pinnedIds}
-      openingAuthorDMIds={props.openingAuthorDMIds}
+      directMessage={props.directMessage}
       acknowledgements={props.acknowledgements}
       acknowledgingId={props.acknowledgingId}
       resolveRecipientIdentities={resolveRecipientIdentities}

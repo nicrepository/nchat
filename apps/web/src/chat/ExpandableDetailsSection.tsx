@@ -186,6 +186,22 @@ export interface ExpandableDetailsSectionProps {
   /** Defaults to {@link defaultCollapsedLimit}. */
   collapsedLimit?: number;
   /**
+   * The words on the control, when "Ver todos" would overstate what expanding
+   * does (issue #895).
+   *
+   * A section whose `items` are a server-capped preview can reveal the rows it
+   * holds and no more, so offering "all" of them is a promise it cannot keep.
+   * The caller decides, because only the caller knows whether its collection is
+   * complete — this component is handed rows and a count and has no way to tell
+   * a whole collection from a page of one. It stays ignorant of what the rows
+   * are: these are two strings, not a mode, and nothing here inspects them.
+   *
+   * Both default to the existing wording, so every section that says nothing
+   * keeps reading "Ver todos" / "Mostrar menos".
+   */
+  expandLabel?: string;
+  collapseLabel?: string;
+  /**
    * Loads the rows `content.hasMore` promises. Supplying it is what turns that
    * promise into an offer the section is allowed to make; without it `hasMore`
    * is inert and no control appears.
@@ -209,6 +225,8 @@ export default function ExpandableDetailsSection({
   listLabel,
   content,
   collapsedLimit = defaultCollapsedLimit,
+  expandLabel = "Ver todos",
+  collapseLabel = "Mostrar menos",
   onExpand,
   children,
 }: ExpandableDetailsSectionProps) {
@@ -248,7 +266,7 @@ export default function ExpandableDetailsSection({
             aria-expanded={expanded}
             aria-controls={listId}
             /*
-              "Ver todos" on its own says nothing about what of, and every
+              The label on its own says nothing about what of, and every
               section's control would share one name. Pointing at the visible
               label *and* the heading names it in context — "Ver todos Membros
               online (3)" — without the caller restating the section in a second
@@ -258,7 +276,7 @@ export default function ExpandableDetailsSection({
             aria-labelledby={`${toggleTextId} ${headingId}`}
             onClick={toggle}
           >
-            <span id={toggleTextId}>{expanded ? "Mostrar menos" : "Ver todos"}</span>
+            <span id={toggleTextId}>{expanded ? collapseLabel : expandLabel}</span>
           </button>
         )}
       </div>

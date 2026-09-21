@@ -10,6 +10,13 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { MemoryRouter, Outlet, Route, Routes, useLocation, useNavigate } from "react-router";
 
+import SidebarDetailsPanel, { type SidebarDetailsTarget } from "./SidebarDetailsPanel";
+import {
+  useDirectMessageCoordinator,
+  useDirectMessageError,
+  type DirectMessageCoordinator,
+} from "./directMessage";
+
 import { ApiRequestError } from "../lib/api";
 
 import type {
@@ -5508,13 +5515,390 @@ describe("ChatMessageArea — route decoding", () => {
 
 // ── Outlet context helper ─────────────────────────────────────────────────────
 
-function ParentWithContext({ ctx }: { ctx: ChatOutletContext }) {
+/**
+ * The shell, as far as these tests need one.
+ *
+ * Faithful to AppShell in the three things that matter for the open-DM flow
+ * (issue #895): it owns one coordinator, it hands that coordinator to the
+ * conversation *and* to a real SidebarDetailsPanel, and it is the single place
+ * a refusal is drawn. ChatMessageArea owns none of those any more, so a parent
+ * that did not provide them would be testing a component wired to nothing.
+ *
+ * The sidebar's target is state here rather than a prop, because that is the
+ * point of several tests below: a panel closing, or turning to a different
+ * conversation, changes nothing about the route.
+ */
+function ParentWithContext({
+  ctx,
+  sidebarTargets,
+  onRender,
+  onNavigate,
+}: {
+  ctx: ChatOutletContext;
+  /** Renders a real sidebar details panel, switchable between these targets. */
+  sidebarTargets?: SidebarDetailsTarget[];
+  /** Counts this component's renders — the shell's, and so the whole tree's. */
+  onRender?: () => void;
+  onNavigate?: (path: string) => void;
+}) {
+  const routerNavigate = useNavigate();
+  onRender?.();
+  const navigate = (path: string) => {
+    onNavigate?.(path);
+    routerNavigate(path);
+  };
+  const coordinator = useDirectMessageCoordinator({
+    currentUserId: ctx.currentUserId,
+    refreshConversations: ctx.refreshConversations,
+    navigate,
+  });
+  const [sidebarTarget, setSidebarTarget] = useState<SidebarDetailsTarget | null>(null);
   return (
     <div>
-      <Outlet context={ctx} />
+      <Outlet context={{ ...ctx, directMessage: coordinator }} />
+      {sidebarTargets?.map((target) => (
+        <button
+          key={target.id}
+          type="button"
+          onClick={() => setSidebarTarget(target)}
+          data-testid={`harness-open-${target.id}`}
+        >
+          abrir painel {target.id}
+        </button>
+      ))}
+      {sidebarTargets && (
+        <button
+          type="button"
+          onClick={() => setSidebarTarget(null)}
+          data-testid="harness-close-sidebar"
+        >
+          fechar painel
+        </button>
+      )}
+      {sidebarTargets && (
+        <SidebarDetailsPanel
+          target={sidebarTarget}
+          currentUserId={ctx.currentUserId}
+          canonicalName=""
+          coordinator={coordinator}
+          onClose={() => setSidebarTarget(null)}
+        />
+      )}
+      <HarnessDirectMessageError coordinator={coordinator} />
     </div>
   );
 }
+
+/** AppShell's single error renderer, in the harness's own words. */
+function HarnessDirectMessageError({ coordinator }: { coordinator: DirectMessageCoordinator }) {
+  const error = useDirectMessageError(coordinator);
+  if (!error) return null;
+  return <p role="alert">{error}</p>;
+}
+
+/**
+ * Two real surfaces of the shell, one open-DM flow (issue #895).
+ *
+ * The timeline and a details panel opened from the sidebar are on screen
+ * together and both can address the same person. Two things went wrong in turn:
+ * a registry per surface meant two POSTs for one person, and then a single
+ * shared *snapshot* meant every pending change re-rendered the whole tree. So
+ * this mounts both real surfaces under one real coordinator and asserts the
+ * consequences — one request, one navigation, one alert, and a shell that does
+ * not re-render because somebody became pending.
+ *
+ * The sidebar panel is the real component, not a stand-in: its lifetime is the
+ * conversation it is describing, and only the real one has that.
+ */
+describe("ChatMessageArea — one open-DM flow across real surfaces (issue #895)", () => {
+  const recipientId = "other-456";
+  const groupA: SidebarDetailsTarget = { kind: "group", id: "conv-a" };
+  const groupB: SidebarDetailsTarget = { kind: "group", id: "conv-b" };
+
+  function groupDetailsFor(id: string) {
+    return {
+      kind: "group" as const,
+      id,
+      name: `Grupo ${id}`,
+      description: "",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      participantCount: 3,
+      participants: [
+        { userId: "me-123", displayName: "Eu" },
+        { userId: recipientId, displayName: "Fernanda" },
+        { userId: "other-789", displayName: "Marina" },
+      ],
+      canManageMembers: false,
+    };
+  }
+
+  function renderShell(
+    options: { onRender?: () => void; onNavigate?: (path: string) => void } = {},
+  ) {
+    return render(
+      <MemoryRouter initialEntries={["/chat/channel/geral"]}>
+        <Routes>
+          <Route
+            path="/chat"
+            element={
+              <ParentWithContext
+                ctx={{ currentUserId: "me-123", channels: [], dms: [] }}
+                sidebarTargets={[groupA, groupB]}
+                onRender={options.onRender}
+                onNavigate={options.onNavigate}
+              />
+            }
+          >
+            <Route path="channel/:id" element={<ChatMessageArea kind="channel" />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  /** The roster row for a person inside the sidebar's panel. */
+  function rosterRow(displayName: string) {
+    return screen.getByRole("button", {
+      name: new RegExp(`^Abrir conversa com ${displayName}\\.`),
+    });
+  }
+
+  /** The timeline's author action for the message Fernanda sent. */
+  function timelineAuthorAction() {
+    return screen.findByRole("button", { name: "Abrir conversa com Fernanda" });
+  }
+
+  async function openSidebar(target: SidebarDetailsTarget, participantName: string) {
+    fireEvent.click(screen.getByTestId(`harness-open-${target.id}`));
+    return waitFor(() => rosterRow(participantName));
+  }
+
+  let resolveOpen!: (value: { conversationId: string; created: boolean }) => void;
+  let rejectOpen!: (cause: unknown) => void;
+
+  beforeEach(() => {
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((resolve, reject) => {
+        resolveOpen = resolve as typeof resolveOpen;
+        rejectOpen = reject;
+      }),
+    );
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([makeMessage({ senderId: recipientId, senderDisplayName: "Fernanda" })]),
+    );
+    mockFetchGroupDetails.mockImplementation((conversationId: string) =>
+      Promise.resolve(groupDetailsFor(conversationId)),
+    );
+  });
+
+  it("sends one request when the timeline starts and the sidebar joins", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await timelineAuthorAction());
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    const row = await openSidebar(groupA, "Fernanda");
+    fireEvent.click(row);
+    fireEvent.click(row);
+
+    // One registry: the panel found the recipient already being resolved and
+    // joined the request in flight rather than sending another.
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+    expect(row).toHaveAttribute("aria-busy", "true");
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+    // One result, one navigation — not one per waiting origin.
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("sends one request when the sidebar starts and the timeline joins", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(await timelineAuthorAction());
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("does not navigate for a panel that closed, with the route never moving", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // Closing is this panel's whole lifetime ending. The route is untouched,
+    // which is exactly why it could never have expressed this.
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    expect(navigations).toEqual([]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not navigate for a panel that turned to another conversation", async () => {
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // Same panel, different conversation, same route: a new lifetime, and the
+    // previous one released.
+    fireEvent.click(screen.getByTestId(`harness-open-${groupB.id}`));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    expect(navigations).toEqual([]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    // And the panel still works under its new lifetime.
+    mockGetOrCreateDirectDM.mockReturnValue(new Promise(() => {}));
+    fireEvent.click(await waitFor(() => rosterRow("Marina")));
+    expect(mockGetOrCreateDirectDM).toHaveBeenLastCalledWith("other-789", expect.any(AbortSignal));
+  });
+
+  it("keeps an operation the timeline still wants when the panel that started it closes", async () => {
+    // The timeline joins through a mention rather than the author action: the
+    // author button disables itself while its recipient is pending, so it
+    // cannot express a second interest, and a mention stays activatable.
+    const mentionId = "11111111-1111-1111-1111-111111111111";
+    mockFetchChannelMessages.mockResolvedValue(
+      messagePage([
+        makeMessage({ bodyText: `Oi @[Fernanda](mention:user:${mentionId})`, bodyFormat: "v3" }),
+      ]),
+    );
+    mockFetchGroupDetails.mockImplementation((conversationId: string) =>
+      Promise.resolve({
+        ...groupDetailsFor(conversationId),
+        participants: [
+          { userId: "me-123", displayName: "Eu" },
+          { userId: mentionId, displayName: "Fernanda" },
+        ],
+      }),
+    );
+    const navigations: string[] = [];
+    renderShell({ onNavigate: (path) => navigations.push(path) });
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    // The timeline joins the very same operation.
+    fireEvent.click(await screen.findByRole("button", { name: "Abrir conversa com Fernanda" }));
+    expect(mockGetOrCreateDirectDM).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+
+    // Releasing one origin must not cancel what another is still waiting for,
+    // and the surviving origin still gets exactly one navigation.
+    expect(navigations).toEqual(["/chat/dm/dm-456"]);
+  });
+
+  it("keeps different recipients independent when their origin goes away", async () => {
+    const started: string[] = [];
+    mockGetOrCreateDirectDM.mockImplementation((userId: string) => {
+      started.push(userId);
+      return new Promise(() => {});
+    });
+    renderShell();
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    fireEvent.click(rosterRow("Marina"));
+
+    // Two people, two operations: deduplication is per recipient and never
+    // collapses different ones.
+    expect(started).toEqual([recipientId, "other-789"]);
+    expect(rosterRow("Fernanda")).toHaveAttribute("aria-busy", "true");
+    expect(rosterRow("Marina")).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    expect(started).toEqual([recipientId, "other-789"]);
+  });
+
+  it("announces one failure once, and nothing at all for a panel that closed", async () => {
+    renderShell();
+
+    fireEvent.click(await openSidebar(groupA, "Fernanda"));
+    await act(async () => {
+      rejectOpen(new ApiRequestError(404, "not_found", "user not available"));
+    });
+
+    const message = "Esta pessoa não está mais disponível para conversa direta.";
+    expect(
+      screen.getAllByRole("alert").filter((alert) => alert.textContent === message),
+    ).toHaveLength(1);
+
+    // A second attempt whose origin is gone before it fails publishes nothing,
+    // so no refusal outlives the surface that asked for it.
+    mockGetOrCreateDirectDM.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectOpen = reject;
+      }),
+    );
+    fireEvent.click(rosterRow("Marina"));
+    fireEvent.click(screen.getByTestId("harness-close-sidebar"));
+    await act(async () => {
+      rejectOpen(new ApiRequestError(500, "internal", "boom"));
+    });
+
+    expect(screen.queryByText("Não foi possível abrir a conversa. Tente novamente.")).toBeNull();
+  });
+
+  it("does not re-render the shell — and so the conversation — for a sidebar pending change", async () => {
+    let renders = 0;
+    renderShell({ onRender: () => (renders += 1) });
+    const row = await openSidebar(groupA, "Fernanda");
+    const rendersBeforeOpening = renders;
+
+    fireEvent.click(row);
+
+    // The row learned it is pending and the shell did not. Everything the
+    // conversation is — ChatShell, ChatMessageArea, the timeline, every message
+    // row — is below this component, so a shell that does not re-render is a
+    // tree that does not re-render. Before the coordinator, the capability
+    // itself changed identity here on every pending change and invalidated all
+    // of it.
+    expect(row).toHaveAttribute("aria-busy", "true");
+    expect(renders).toBe(rendersBeforeOpening);
+
+    await act(async () => {
+      resolveOpen({ conversationId: "dm-456", created: true });
+    });
+  });
+
+  it("does not re-render the shell for a failure either", async () => {
+    let renders = 0;
+    renderShell({ onRender: () => (renders += 1) });
+    const row = await openSidebar(groupA, "Fernanda");
+    const rendersBeforeOpening = renders;
+
+    fireEvent.click(row);
+    await act(async () => {
+      rejectOpen(new ApiRequestError(500, "internal", "boom"));
+    });
+
+    // Drawn by the one component that subscribes to the error, and by nothing
+    // above it.
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(renders).toBe(rendersBeforeOpening);
+  });
+});
 
 function CurrentPath() {
   return <span data-testid="current-path">{useLocation().pathname}</span>;

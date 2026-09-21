@@ -51,6 +51,7 @@ import { formatLongDate } from "./messageDisplay";
 import { conversationNameMaxCodePoints } from "./conversationRename";
 import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
+import type { DirectMessageAccess } from "./directMessage";
 
 const currentUserId = "user-me";
 
@@ -544,7 +545,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     // The real backend limit: MaxChannelDetailsMembers rows carried, forty
     // reported. The control exists — twenty-five loaded rows are hidden by the
     // compact cap — and what it reveals is those, never the ten the server
-    // never sent.
+    // never sent. So it does not say "Ver todos": expanding shows more, not all.
     renderPanel({
       state: state({
         details: {
@@ -556,11 +557,21 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
 
     const list = () => screen.getByRole("list", { name: "Membros online do canal" });
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    // And the shortfall is named rather than left for the reader to infer from
+    // a heading that says forty above a list that stops at thirty.
+    expect(screen.getByTestId("chat-details-roster-shortfall")).toHaveTextContent(
+      "30 de 40 membros online carregados.",
+    );
 
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Membros online/ }));
 
     expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
     expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    // The way back is unchanged: only the promise of "all" was wrong.
+    expect(
+      screen.getByRole("button", { name: /Mostrar menos Membros online/ }),
+    ).toBeInTheDocument();
   });
 
   it("offers no control when exactly five members are online", () => {
@@ -840,6 +851,8 @@ function renderGroupPanel(
   details: { kind: "group" } & GroupDetails,
   viewerId = currentUserId,
   reload: () => void = vi.fn(),
+  openDM?: DirectMessageAccess,
+  files: ChannelAttachment[] = [],
 ) {
   const onClose = vi.fn();
   const rendered = render(
@@ -847,15 +860,50 @@ function renderGroupPanel(
       kind="group"
       state={{
         details: { status: "ready", data: details },
-        files: { status: "ready", data: [] },
+        files: { status: "ready", data: files },
         reload,
       }}
       currentUserId={viewerId}
       latestPin={null}
+      openDM={openDM}
       onClose={onClose}
     />,
   );
   return { onClose, reload, ...rendered };
+}
+
+/**
+ * The open-DM capability as a double: the flow's own semantics live in
+ * useAuthorDM and are tested there, so what a panel test needs is the shape of
+ * what it is handed and a record of what it asked for.
+ */
+function fakeOpenDM(
+  options: { pending?: ReadonlySet<string> } = {},
+): DirectMessageAccess & { open: ReturnType<typeof vi.fn> } {
+  const open = vi.fn();
+  const pending = options.pending ?? new Set<string>();
+  return {
+    coordinator: {
+      open,
+      releaseOrigin: () => {},
+      isPending: (recipientId: string) => pending.has(recipientId),
+      subscribePending: () => () => {},
+      error: () => null,
+      subscribeError: () => () => {},
+      setDeps: () => {},
+      dispose: () => {},
+    },
+    origin: testOrigin,
+    open,
+  };
+}
+
+/** The origin every row in these tests opens on behalf of. */
+const testOrigin = "panel-test-origin";
+
+/** The roster row for a person, found by the action it offers. */
+function participantAction(displayName: string) {
+  return screen.getByRole("button", { name: new RegExp(`^Abrir conversa com ${displayName}\\.`) });
 }
 
 describe("ConversationDetailsPanel — grupo", () => {
@@ -942,8 +990,15 @@ describe("ConversationDetailsPanel — grupo", () => {
     const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
       "listitem",
     );
-    expect(within(rows[0]).getByText("Você")).toBeInTheDocument();
-    expect(within(rows[1]).queryByText("Você")).not.toBeInTheDocument();
+    // Asserted by identity rather than by position: two people with the same
+    // name are separated by their ids (issue #895), so which of them the
+    // deterministic tiebreak puts first is not what this test is about. Exactly
+    // one of the two is the viewer, and it is the one whose id matches.
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => within(row).queryByText("Você") !== null)).toHaveLength(1);
+    expect(
+      within(rows.find((row) => within(row).queryByText("Você") !== null)!).queryByRole("button"),
+    ).toBeNull();
   });
 
   it("does not mark anyone when the viewer's id is unknown", () => {
@@ -1111,6 +1166,449 @@ function metaRow(label: string): string {
   expect(row, `no metadata row labelled ${label}`).toBeTruthy();
   return row?.lastElementChild?.textContent ?? "";
 }
+
+/**
+ * The roster's navigation (issue #895).
+ *
+ * The open-DM flow itself — the self guard, the per-recipient dedupe, the abort
+ * and generation bookkeeping, the 404 copy — belongs to useAuthorDM and is
+ * proved by its own tests. What is proved here is the panel's half of the
+ * contract: who gets an activatable row, what activating one asks for, and that
+ * nothing else in the section is disturbed by a failure.
+ */
+describe("ConversationDetailsPanel — roster: abrir conversa", () => {
+  const people = [
+    { userId: "user-ana", displayName: "Ana Lima" },
+    { userId: currentUserId, displayName: "Álvaro Neto" },
+    { userId: "user-bruno", displayName: "Bruno Sá" },
+  ];
+
+  it("asks the shared flow for the participant that was activated, by id", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    await userEvent.click(participantAction("Bruno Sá"));
+
+    expect(openDM.open).toHaveBeenCalledTimes(1);
+    // The id, never the name and never a route assembled here: the destination
+    // is the conversation the server answers with. The second argument is this
+    // host's claim on the operation — the row never handles one itself.
+    expect(openDM.open).toHaveBeenCalledWith("user-bruno", testOrigin);
+  });
+
+  it("names the action, and carries the status the row shows", () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    // With the store silent there is no status to carry, so the name is the
+    // action and the person's role — never a raw id.
+    const action = participantAction("Ana Lima");
+    expect(action).toHaveAccessibleName("Abrir conversa com Ana Lima. Participante");
+    expect(action.getAttribute("aria-label")).not.toContain("user-ana");
+  });
+
+  it("activates from the avatar and the name alike, because they are one control", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Ana Lima");
+    await userEvent.click(within(action).getByTestId("chat-details-member-avatar"));
+    await userEvent.click(within(action).getByText("Ana Lima"));
+
+    expect(openDM.open).toHaveBeenCalledTimes(2);
+    expect(openDM.open).toHaveBeenNthCalledWith(2, "user-ana", testOrigin);
+  });
+
+  it("is reachable and activatable by keyboard, with Enter and with Space", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Ana Lima");
+    await tabUntilFocused(action);
+    expect(action).toHaveFocus();
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard(" ");
+
+    // A <button> is what gives both keys for free; that is the reason the row is
+    // one rather than an <li> with an onClick.
+    expect(openDM.open).toHaveBeenCalledTimes(2);
+    expect(openDM.open).toHaveBeenNthCalledWith(1, "user-ana", testOrigin);
+    expect(openDM.open).toHaveBeenNthCalledWith(2, "user-ana", testOrigin);
+  });
+
+  it("offers no action on the viewer's own row", () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: /Abrir conversa com Álvaro Neto/ }),
+    ).not.toBeInTheDocument();
+    // The row is still there, still says who it is, and still says it is you.
+    const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
+      "listitem",
+    );
+    const own = rows.find((row) => within(row).queryByText("Você") !== null)!;
+    expect(within(own).getByText("Álvaro Neto")).toBeInTheDocument();
+    expect(within(own).queryByRole("button")).toBeNull();
+  });
+
+  it("shows no action at all when the host has not wired the flow", () => {
+    renderGroupPanel(groupDetails({ participants: people, participantCount: 3 }));
+
+    expect(screen.queryByRole("button", { name: /Abrir conversa com/ })).not.toBeInTheDocument();
+    // Honest rather than broken: three rows, none of them pretending.
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(3);
+  });
+
+  it("marks a recipient being resolved as busy, without leaving the tab order", async () => {
+    const openDM = fakeOpenDM({ pending: new Set(["user-ana"]) });
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const pending = participantAction("Ana Lima");
+    expect(pending).toHaveAttribute("aria-busy", "true");
+    // Never `disabled`: that would move focus out from under whoever just
+    // pressed it, and repeating the request is refused by the flow anyway.
+    expect(pending).toBeEnabled();
+    await tabUntilFocused(pending);
+    expect(pending).toHaveFocus();
+
+    expect(participantAction("Bruno Sá")).toHaveAttribute("aria-busy", "false");
+  });
+
+  it("keeps handing the same id to the flow on rapid repeated activation", async () => {
+    // Deduplication lives in the flow, which refuses a recipient it is already
+    // resolving. The panel's part is to keep addressing the same person rather
+    // than, say, resolving a row index that reordering could move.
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Bruno Sá");
+    await userEvent.click(action);
+    await userEvent.click(action);
+    await userEvent.click(action);
+
+    expect(openDM.open.mock.calls).toEqual([
+      ["user-bruno", testOrigin],
+      ["user-bruno", testOrigin],
+      ["user-bruno", testOrigin],
+    ]);
+  });
+
+  it("leaves a refusal to the shell, and keeps the roster it was raised from", () => {
+    // The flow has one owner and one place that reports a refusal (issue #895):
+    // this panel and the conversation behind it are both on screen, and drawing
+    // the sentence here as well announced one failure twice. What the panel
+    // must do is survive the failure, which is asserted here; that exactly one
+    // alert exists is asserted where both surfaces are mounted together, in
+    // ChatMessageArea.test.tsx.
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // The rows the reader was looking at are exactly where they were.
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(3);
+    expect(screen.getByRole("heading", { name: "Participantes (3)" })).toBeInTheDocument();
+    // And still activatable: a refusal is not a dead section.
+    expect(participantAction("Bruno Sá")).toBeEnabled();
+  });
+
+  it("gives a channel member the same navigable row", async () => {
+    // The channel roster is still blocked on issue #877's membership contract,
+    // but a member the server already vouched for is someone this user may open a
+    // conversation with — navigation depends on no roster contract at all.
+    const openDM = fakeOpenDM();
+    renderPanel({
+      openDM,
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            onlineMembers: [
+              { userId: "user-ana", displayName: "Ana Lima", role: "member", presence: "online" },
+            ],
+            onlineCount: 1,
+            memberCount: 9,
+          }),
+        },
+      }),
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Abrir conversa com Ana Lima. Membro" }),
+    );
+
+    expect(openDM.open).toHaveBeenCalledWith("user-ana", testOrigin);
+  });
+});
+
+/**
+ * What the roster shows about a person, and what it refuses to show.
+ */
+describe("ConversationDetailsPanel — roster: identidade e ordem", () => {
+  it("orders by the documented fallback when the presence store is silent", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-zoe", displayName: "Zoe" },
+          { userId: "u-alv", displayName: "Álvaro" },
+          { userId: "u-bea", displayName: "Beatriz" },
+        ],
+        participantCount: 3,
+      }),
+    );
+
+    const names = within(screen.getByRole("list", { name: "Participantes do grupo" }))
+      .getAllByRole("listitem")
+      .map((row) => within(row).getByText(/^(Zoe|Álvaro|Beatriz)$/).textContent);
+    // Accent-folded, so the accented name is not exiled past Z.
+    expect(names).toEqual(["Álvaro", "Beatriz", "Zoe"]);
+  });
+
+  it("keeps only five rows compact and restores five on collapse", async () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 8 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 8,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+  });
+
+  it("gives an offline participant one of the five compact slots", () => {
+    // The roster is membership, not presence: the group's own contract lists
+    // every active participant and this list does not thin it out.
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-1", displayName: "Ana", presence: "offline" },
+          { userId: "u-2", displayName: "Bruno", presence: "offline" },
+        ],
+        participantCount: 2,
+      }),
+    );
+
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(2);
+    expect(screen.getByRole("heading", { name: "Participantes (2)" })).toBeInTheDocument();
+  });
+
+  it("never falls back to a user id when the name is missing", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [{ userId: "7c9e6679-7425-40de-944b-e07fc1f90ae7", displayName: "" }],
+        participantCount: 1,
+      }),
+    );
+
+    const row = within(screen.getByRole("list", { name: "Participantes do grupo" })).getByRole(
+      "listitem",
+    );
+    expect(row).not.toHaveTextContent("7c9e6679");
+    // The row still exists and still says what the domain calls this person.
+    expect(within(row).getByText("Participante")).toBeInTheDocument();
+  });
+
+  it("offers Ver todos only when the preview really is the whole group", async () => {
+    // CASE A: the client holds everybody, so expanding shows everybody and the
+    // control may say so.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 8 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 8,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByTestId("chat-details-roster-shortfall")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+    expect(screen.getByRole("button", { name: /Mostrar menos Participantes/ })).toBeInTheDocument();
+  });
+
+  it("says Mostrar mais, and how much it holds, when the group is larger than the preview", async () => {
+    // CASE B: the server's own cap. There is no route that lists the other ten
+    // (GET /dm/{id}/details is the only participant source and it is capped),
+    // so the control may not offer them and the section says what it has.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 30 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${String(index + 1).padStart(2, "0")}`,
+        })),
+        participantCount: 40,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Participantes (40)" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-roster-shortfall")).toHaveTextContent(
+      "30 de 40 participantes carregados.",
+    );
+
+    // The thirty it does hold stay reachable — the honest label is not a reason
+    // to hide rows 6..30.
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
+
+    // Nothing is invented about the missing ten: not offline, not unavailable.
+    const section = screen.getByRole("heading", { name: "Participantes (40)" }).closest("section")!;
+    expect(section).not.toHaveTextContent(/indisponí/i);
+    expect(section).not.toHaveTextContent(/Offline/);
+  });
+
+  it("offers no control at all when the whole group fits in the compact state", () => {
+    // CASE C: five or fewer, all held. Nothing is hidden, so nothing expands.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 4 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 4,
+      }),
+    );
+
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(4);
+    expect(
+      screen.queryByRole("button", { name: /Ver todos|Mostrar mais/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-roster-shortfall")).not.toBeInTheDocument();
+  });
+
+  it("leaves the other sections of the panel on the default wording", () => {
+    // CASE D: the label override is the roster's, not the primitive's. The files
+    // section shares the same component and is untouched by it.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 30 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${String(index + 1).padStart(2, "0")}`,
+        })),
+        participantCount: 40,
+      }),
+      currentUserId,
+      vi.fn(),
+      undefined,
+      Array.from({ length: 7 }, (_, index) =>
+        attachment({ id: `file-${index}`, filename: `arquivo-${index}.pdf` }),
+      ),
+    );
+
+    expect(screen.getByRole("button", { name: /Mostrar mais Participantes/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ })).toBeInTheDocument();
+  });
+
+  it("renders the avatar the server vouched for, and initials when there is none", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-1", displayName: "Ana Lima", avatarUrl: "/media/avatars/ana.png" },
+          { userId: "u-2", displayName: "Bruno Sá" },
+        ],
+        participantCount: 2,
+      }),
+    );
+
+    const [withPhoto, withInitials] = within(
+      screen.getByRole("list", { name: "Participantes do grupo" }),
+    ).getAllByTestId("chat-details-member-avatar");
+
+    // chatApi already rejected anything that is not a safe same-origin target,
+    // so the only URL that reaches here is one the client vouched for. The
+    // empty alt is what makes it `presentation` rather than an image with a
+    // name: the person's name beside it is the accessible text, and a second
+    // one inside the avatar would be announced twice.
+    const image = within(withPhoto).getByRole("presentation", { hidden: true });
+    expect(image).toHaveAttribute("src", "/media/avatars/ana.png");
+    expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+
+    // No URL, so initials — never the user id, and never a broken image.
+    expect(withInitials).toHaveTextContent("B");
+    expect(within(withInitials).queryByRole("presentation", { hidden: true })).toBeNull();
+    expect(withInitials).not.toHaveTextContent("u-2");
+  });
+
+  it("shows nothing about presence while the store has said nothing", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [{ userId: "u-1", displayName: "Ana", presence: "online" }],
+        participantCount: 1,
+      }),
+    );
+
+    // The HTTP payload claims "online" and is deliberately not read (RF-58):
+    // no dot, and no word after the role.
+    expect(screen.queryByTestId("presence-dot")).not.toBeInTheDocument();
+    expect(screen.getByText("Participante")).toBeInTheDocument();
+    expect(screen.queryByText(/Participante · /)).not.toBeInTheDocument();
+  });
+});
 
 describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () => {
   it("is titled Perfil, not the conversation vocabulary", () => {

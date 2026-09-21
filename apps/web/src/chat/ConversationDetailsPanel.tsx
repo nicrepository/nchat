@@ -62,12 +62,18 @@ import type {
   AddMembersResult,
   ChannelAttachment,
   ChannelDetails,
-  ChannelMemberProfile,
   DirectDetails,
   GroupDetails,
-  GroupParticipantProfile,
   PinnedItem,
 } from "./chatTypes";
+import ParticipantRow from "./ParticipantRow";
+import {
+  orderRoster,
+  rosterPresenceStates,
+  type RosterContext,
+  type RosterParticipant,
+} from "./participantRosterOrder";
+import type { DirectMessageAccess } from "./directMessage";
 import {
   avatarColorFor,
   formatDayLabel,
@@ -77,7 +83,7 @@ import {
   senderLabel,
 } from "./messageDisplay";
 import PresenceDot from "./PresenceDot";
-import { presenceLabel, presenceTargetKey, usePresence } from "./presence";
+import { presenceLabel, presenceTargetKey, usePresence, usePresenceTarget } from "./presence";
 import type { ConversationDetailsState } from "./useConversationDetails";
 import {
   conversationDetailsPanelId,
@@ -187,63 +193,24 @@ function UnavailableAction({
   );
 }
 
-/**
- * A person row, shared by the channel's members and the group's participants.
- *
- * `subtitle` is what the two surfaces disagree about — a channel shows the
- * channel role, a group has no role to show — so it is passed in rather than
- * derived here from a union.
- */
-interface MemberRowProps {
-  member: ChannelMemberProfile | GroupParticipantProfile;
-  subtitle: string;
-  isCurrentUser: boolean;
-  /** The conversation this roster belongs to; presence is resolved within it. */
-  conversationKey: string;
-}
-
-function MemberRow({ member, subtitle, isCurrentUser, conversationKey }: MemberRowProps) {
-  const color = avatarColorFor(member.userId);
-  const presence = usePresence(member.userId, conversationKey);
-  return (
-    <li className="chat-details__member">
-      <span
-        className={`chat-details__avatar chat-details__avatar--${color}`}
-        aria-hidden="true"
-        data-testid="chat-details-member-avatar"
-      >
-        {member.avatarUrl ? (
-          <img
-            className="chat-details__avatar-img"
-            src={member.avatarUrl}
-            alt=""
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          initialsFrom(member.displayName)
-        )}
-        <PresenceDot state={presence} size="md" />
-      </span>
-      <span className="chat-details__member-text">
-        <span className="chat-details__member-name">
-          {member.displayName}
-          {isCurrentUser && <span className="chat-details__badge">Você</span>}
-        </span>
-        {/* The state as a word, beside the dot rather than instead of it: the
-            row survives greyscale, a screen reader and a colour-blind reader. */}
-        <span className="chat-details__member-role">
-          {subtitle}
-          {presence !== "unknown" && ` · ${presenceLabel(presence)}`}
-        </span>
-      </span>
-    </li>
-  );
-}
-
 /** One "Sobre" row: an icon that decorates, and the text that carries it. */
-function AboutRow({ icon, children }: { icon: string; children: ReactNode }) {
+function AboutRow({
+  icon,
+  children,
+  testId,
+}: {
+  icon: string;
+  children: ReactNode;
+  /**
+   * Names the row for a test that would otherwise have to match its words. The
+   * size row's words are a substring of the roster's "N de M ... carregados."
+   * note (issue #895), and two ways of saying the same number are not two
+   * elements a test should have to tell apart by text.
+   */
+  testId?: string;
+}) {
   return (
-    <p className="chat-details__meta">
+    <p className="chat-details__meta" data-testid={testId}>
       <span className="material-symbols-outlined" aria-hidden="true">
         {icon}
       </span>
@@ -336,7 +303,7 @@ function ChannelAboutSection({ details }: { details: ChannelDetails }) {
       <AboutRow icon={details.type === "private" ? "lock" : "public"}>
         {details.type === "private" ? "Canal privado" : "Canal público"}
       </AboutRow>
-      <AboutRow icon="group">
+      <AboutRow icon="group" testId="chat-details-people-count">
         {details.memberCount === 1 ? "1 membro" : `${details.memberCount} membros`}
       </AboutRow>
     </>
@@ -365,7 +332,7 @@ function GroupAboutSection({ details }: { details: GroupDetails }) {
         createdAt={details.createdAt}
         creatorDisplayName={details.creatorDisplayName}
       />
-      <AboutRow icon="group">
+      <AboutRow icon="group" testId="chat-details-people-count">
         {details.participantCount === 1
           ? "1 participante"
           : `${details.participantCount} participantes`}
@@ -375,7 +342,93 @@ function GroupAboutSection({ details }: { details: GroupDetails }) {
 }
 
 /**
+ * What a section may honestly say about a collection it only partly holds
+ * (issue #895).
+ *
+ * Both rosters are server-capped previews whose authoritative total arrives
+ * beside them, and the two disagree exactly when the conversation is larger than
+ * the cap. Expanding then reveals every row the client has and still not every
+ * row there is, so a control reading "Ver todos" states something no client
+ * work can make true — and this client has no paginated listing to make it true
+ * with: the group's participants come from `GET /dm/{id}/details`, capped at
+ * `MaxDMDetailsParticipants`, and no route lists the rest (issue #895 §5.1).
+ *
+ * So the words change and the shortfall is named. "Mostrar mais" promises only
+ * what expanding does. The note says how much is in hand, in the caller's own
+ * noun, and nothing else: it does not guess where the missing people are, does
+ * not call them offline, and does not call them unavailable — it does not know,
+ * and neither does anything else on this screen.
+ *
+ * `loaded === 0` carries no note: the section is showing its empty state, and a
+ * sentence counting rows nobody can see would describe a list that is not there.
+ */
+function previewShortfall(
+  total: number,
+  loaded: number,
+  noun: string,
+): { expandLabel?: string; note: string | null } {
+  if (total <= loaded) return { note: null };
+  return {
+    expandLabel: "Mostrar mais",
+    note: loaded === 0 ? null : `${loaded} de ${total} ${noun} carregados.`,
+  };
+}
+
+/**
+ * The roster's rows, ordered and keyed, ready for the expansion primitive.
+ *
+ * Presence is read once per person from the one snapshot `PeopleSection`
+ * subscribed to — never by a hook inside each row — so thirty rows are one
+ * subscription and the values the sort used are the values the rows draw.
+ *
+ * Deliberately a function and not a component: the primitive takes a list of
+ * rendered rows, and a component here would have to hand one back through a
+ * prop instead of returning it.
+ */
+function rosterItems(
+  participants: readonly RosterParticipant[],
+  context: RosterContext,
+): ReactNode[] {
+  const access = context.openDM;
+  // Bound once to this host's claim, so the row never handles an origin and
+  // never sees the coordinator's write side.
+  const openDM = access
+    ? (userId: string) => access.coordinator.open(userId, access.origin)
+    : undefined;
+  const states = rosterPresenceStates(participants, context.presence);
+  const presenceOf = (userId: string) => states.get(userId) ?? "unknown";
+  return orderRoster(participants, presenceOf).map((participant) => {
+    const isCurrentUser =
+      context.currentUserId !== "" && participant.userId === context.currentUserId;
+    return (
+      <ParticipantRow
+        key={participant.userId}
+        participant={participant}
+        presence={presenceOf(participant.userId)}
+        isCurrentUser={isCurrentUser}
+        // The viewer's own row activates nothing: there is no conversation to
+        // open with yourself, and the flow refuses it anyway.
+        onOpenDM={isCurrentUser ? undefined : openDM}
+        // The row subscribes for its own participant; nothing about who is
+        // pending is computed here, so a request starting for one person does
+        // not rebuild the list.
+        pendingSource={context.openDM?.coordinator}
+      />
+    );
+  });
+}
+
+/**
  * The channel's online-members rows (issue #435): presence-filtered server-side.
+ *
+ * This is *not* the participant roster issue #895 describes, and the heading it
+ * is drawn under still says so. A channel has no roster contract: the details
+ * endpoint's `online_members` is filtered by presence inside the query itself —
+ * the CTE selects the online subset *before* ORDER BY and LIMIT run — so what
+ * arrives is "who is here now", and no amount of client work turns that into
+ * "who belongs". Issue #877 owns the authoritative channel membership; until it
+ * lands, calling this section "Participantes (N)" would name a list after
+ * something it is not.
  *
  * `count` is `onlineCount`, not `onlineMembers.length`: the array is a preview
  * the server caps at `MaxChannelDetailsMembers`, and the two disagree exactly
@@ -384,29 +437,27 @@ function GroupAboutSection({ details }: { details: GroupDetails }) {
  * all — the total is drawn beside the heading and never becomes an offer to
  * list them.
  *
- * `hasMore` and a loader are deliberately absent, together. Nothing in this
- * client can fetch the rest of a capped roster today, so "Membros online (40)"
- * above thirty rows and no control is the honest shape. Expanding here only
- * ever uncaps rows already in hand; when a future issue can retrieve the
- * remainder, that is when this gains both a `hasMore` and the `onExpand` that
- * honours it.
+ * What issue #895 does deliver here is the row itself: the ordering helper and
+ * the navigable identity are presentation, they depend on no membership
+ * contract, and a member the server already vouched for is someone this user
+ * may open a conversation with. So the rows behave exactly like a group's.
  */
 function channelMembersContent(
   details: ChannelDetails,
-  currentUserId: string,
+  context: RosterContext,
 ): ExpandableSectionContent {
   return {
     status: "ready",
     count: details.onlineCount,
-    items: details.onlineMembers.map((member) => (
-      <MemberRow
-        key={member.userId}
-        member={member}
-        subtitle={member.role === "moderator" ? "Moderador" : "Membro"}
-        isCurrentUser={Boolean(currentUserId) && member.userId === currentUserId}
-        conversationKey={presenceTargetKey("channel", details.id)}
-      />
-    )),
+    items: rosterItems(
+      details.onlineMembers.map((member) => ({
+        userId: member.userId,
+        displayName: member.displayName,
+        avatarUrl: member.avatarUrl,
+        subtitle: member.role === "moderator" ? "Moderador" : "Membro",
+      })),
+      context,
+    ),
     // "ninguem online agora", never "este canal nao tem membros" — the
     // channel's size is reported separately and is unaffected.
     empty: <SectionMessage>Nenhum membro online no momento.</SectionMessage>,
@@ -414,32 +465,38 @@ function channelMembersContent(
 }
 
 /**
- * The group's participant rows (issue #441).
+ * The group's participant rows (issue #441), which issue #895 turns into the
+ * roster the panel was specified to have.
  *
- * Every active participant appears, online or not: presence is shown beside a
- * participant, never used to decide whether they are shown. `participantCount`
- * is the total, and it is presentation for the same reason `onlineCount` is
- * above: the array is a capped preview, no loader exists for the remainder, and
- * so no control claims one.
+ * Every active participant appears, online or not: the server's own query
+ * applies no presence predicate, so presence is shown beside a participant and
+ * used to order them, never to decide whether they are shown. That is the whole
+ * difference from the channel section above, and it is a difference of
+ * contract, not of rendering — which is why both sections share the row and the
+ * ordering and nothing else.
+ *
+ * `participantCount` is the total, and it is presentation for the same reason
+ * `onlineCount` is above: the array is a capped preview, no loader exists for
+ * the remainder, and so no control claims one. It is the same query's own
+ * `COUNT(*) OVER ()`, so the heading's number and the rows below it cannot
+ * describe different sets of people.
  */
 function groupParticipantsContent(
   details: GroupDetails,
-  currentUserId: string,
+  context: RosterContext,
 ): ExpandableSectionContent {
   return {
     status: "ready",
     count: details.participantCount,
-    items: details.participants.map((participant) => (
-      <MemberRow
-        key={participant.userId}
-        member={participant}
-        subtitle="Participante"
-        isCurrentUser={Boolean(currentUserId) && participant.userId === currentUserId}
-        // A group is a dm conversation on the wire, so that is the target its
-        // presence is scoped by.
-        conversationKey={presenceTargetKey("dm", details.id)}
-      />
-    )),
+    items: rosterItems(
+      details.participants.map((participant) => ({
+        userId: participant.userId,
+        displayName: participant.displayName,
+        avatarUrl: participant.avatarUrl,
+        subtitle: "Participante",
+      })),
+      context,
+    ),
     empty: <SectionMessage>Nenhum participante para exibir.</SectionMessage>,
   };
 }
@@ -689,7 +746,7 @@ function FileRow({ file }: { file: ChannelAttachment }) {
 function peopleContent(
   kind: "channel" | "group",
   details: ConversationDetailsState["details"],
-  currentUserId: string,
+  context: RosterContext,
 ): ExpandableSectionContent {
   if (details.status === "error") {
     return {
@@ -701,10 +758,10 @@ function peopleContent(
     };
   }
   if (details.status === "ready" && details.data.kind === "channel") {
-    return channelMembersContent(details.data, currentUserId);
+    return channelMembersContent(details.data, context);
   }
   if (details.status === "ready" && details.data.kind === "group") {
-    return groupParticipantsContent(details.data, currentUserId);
+    return groupParticipantsContent(details.data, context);
   }
   return {
     status: "loading",
@@ -919,6 +976,70 @@ function manageableTarget(details: ConversationDetailsState["details"]): {
 }
 
 /**
+ * The sentence naming how much of a roster the client holds, or nothing.
+ *
+ * Its own unit because it is its own statement: the heading says how many
+ * people the conversation has, the list shows the ones in hand, and this is the
+ * only place the difference between those two is put into words.
+ */
+function RosterShortfallNote({ note }: { note: string | null }) {
+  if (!note) return null;
+  return (
+    <p className="chat-details__note" data-testid="chat-details-roster-shortfall">
+      {note}
+    </p>
+  );
+}
+
+/**
+ * The conversation presence is resolved within.
+ *
+ * A group is a `chat.dm_conversations` row on the wire, so its presence is
+ * scoped by the dm target even though this panel calls it a group; a channel is
+ * its own kind. One place, because the roster and anything else that asks has to
+ * ask about the same conversation.
+ */
+function rosterPresenceKey(kind: "channel" | "group", targetId: string): string {
+  return presenceTargetKey(kind === "channel" ? "channel" : "dm", targetId);
+}
+
+/**
+ * How much of this conversation's roster the client is actually holding, in the
+ * vocabulary of whichever aggregate is loaded (issue #895).
+ *
+ * Both totals are the server's own figure for the whole collection and both
+ * arrays are its capped preview, so the same comparison answers for a channel
+ * and for a group — but the noun is not the same, and neither is which pair of
+ * fields to read. That is the only thing this decides; the words and the rule
+ * live in `previewShortfall`.
+ *
+ * Nothing is claimed before the payload has arrived: while loading or on a
+ * failure the section says nothing about what it is missing, because it does
+ * not yet know what it has.
+ */
+function rosterShortfall(details: ConversationDetailsState["details"]): {
+  expandLabel?: string;
+  note: string | null;
+} {
+  if (details.status !== "ready") return { note: null };
+  if (details.data.kind === "channel") {
+    return previewShortfall(
+      details.data.onlineCount,
+      details.data.onlineMembers.length,
+      "membros online",
+    );
+  }
+  if (details.data.kind === "group") {
+    return previewShortfall(
+      details.data.participantCount,
+      details.data.participants.length,
+      "participantes",
+    );
+  }
+  return { note: null };
+}
+
+/**
  * The people section: the roster, the add-members flow that acts on it, and
  * nothing else (issues #398, #892).
  *
@@ -933,12 +1054,14 @@ function PeopleSection({
   currentUserId,
   copy,
   reload,
+  openDM,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
   currentUserId: string;
   copy: ConversationCopy;
   reload: () => void;
+  openDM?: DirectMessageAccess;
 }) {
   // Both the picker and the notice are keyed on the conversation rather than on
   // a boolean, which is what makes confirming into the wrong conversation
@@ -946,6 +1069,22 @@ function PeopleSection({
   // switch, so a boolean would survive one and let a dialog opened for A post
   // its selection to B.
   const { id: targetId, canManage } = manageableTarget(details);
+
+  /*
+    One subscription for the whole roster, scoped to this conversation, read
+    here rather than by each row.
+
+    Two properties at once. A list that *orders itself* by presence has to read
+    everybody's state in one consistent pass — thirty rows each subscribing on
+    their own would each re-render alone, and the sort would be over values
+    sampled at thirty different moments. And the subscription is per
+    conversation, so a presence frame about a conversation this panel is not
+    describing returns the identical snapshot and React bails out: neither the
+    sort nor a single row runs again. The rows below receive their presence
+    already resolved — see rosterItems.
+  */
+  const presence = usePresenceTarget(rosterPresenceKey(kind, targetId));
+  const shortfall = rosterShortfall(details);
 
   const addMembersButtonRef = useRef<HTMLButtonElement>(null);
   const [pickerFor, setPickerFor] = useState<string | null>(null);
@@ -993,8 +1132,20 @@ function PeopleSection({
         key={`people-${targetId}`}
         title={copy.peopleHeading}
         listLabel={copy.peopleLabel}
-        content={peopleContent(kind, details, currentUserId)}
+        /*
+          Left undefined whenever the preview is the whole collection, which is
+          what keeps "Ver todos" as the default wording for every section that
+          can genuinely show everything.
+        */
+        expandLabel={shortfall.expandLabel}
+        content={peopleContent(kind, details, { presence, currentUserId, openDM })}
       >
+        {/*
+          Named before the actions, directly under the list it is about: how many
+          of the conversation's people this client is holding. The heading above
+          already says how many there are.
+        */}
+        <RosterShortfallNote note={shortfall.note} />
         {/*
           Rendered only once the server has answered and said this caller may
           manage members. Loading, error and "not permitted" all leave it absent
@@ -1065,6 +1216,7 @@ function ConversationBody({
   latestPin,
   reload,
   onRename,
+  openDM,
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
@@ -1073,6 +1225,7 @@ function ConversationBody({
   latestPin: PinnedItem | null;
   reload: () => void;
   onRename?: ConversationRenameAction;
+  openDM?: DirectMessageAccess;
 }) {
   const copy = conversationCopy[kind];
   // `kind` is the conversation the user is looking at *now*; the loaded data
@@ -1097,6 +1250,7 @@ function ConversationBody({
         currentUserId={currentUserId}
         copy={copy}
         reload={reload}
+        openDM={openDM}
       />
       <PinnedMessageSection latestPin={latestPin} emptyText={copy.pinEmpty} />
       <ExpandableDetailsSection
@@ -1137,6 +1291,29 @@ interface ConversationDetailsPanelProps {
    * capability lives in the canonical sidebar payload the caller holds.
    */
   onRename?: ConversationRenameAction;
+  /**
+   * Opens a direct conversation with a roster participant (issue #895).
+   *
+   * The capability, never the request: resolving or creating a DM is one
+   * operation with rules this panel does not own — self is refused, a recipient
+   * already being resolved is not resolved twice, and a reply that outlives the
+   * conversation it was asked from navigates nowhere. The panel's hosts already
+   * run that flow for mentions and message authors, so they hand it down rather
+   * than letting a second copy of it grow here.
+   *
+   * Absent means the host has not wired it, and the roster then shows people
+   * without offering to open conversations with them — which is honest, rather
+   * than rows that look activatable and do nothing.
+   *
+   * No error is carried on it at all. The flow has one owner and one place that
+   * reports a refusal — the shell — because this panel and the conversation
+   * behind it are both on screen and both used to draw the same sentence, which
+   * is one failure announced twice.
+   *
+   * Its identity is stable: a request starting, finishing or failing does not
+   * replace it, so nothing in this panel is rebuilt by one.
+   */
+  openDM?: DirectMessageAccess;
   onClose: () => void;
 }
 
@@ -1146,6 +1323,7 @@ export default function ConversationDetailsPanel({
   currentUserId,
   latestPin,
   onRename,
+  openDM,
   onClose,
 }: ConversationDetailsPanelProps) {
   const header = panelHeader[kind];
@@ -1217,6 +1395,7 @@ export default function ConversationDetailsPanel({
             latestPin={latestPin}
             reload={state.reload}
             onRename={onRename}
+            openDM={openDM}
           />
         )}
       </div>

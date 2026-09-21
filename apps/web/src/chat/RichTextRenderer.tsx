@@ -21,6 +21,7 @@ import {
 } from "./richTextMarkers";
 import type { InlineMarkerType, ListType, MentionType } from "./richTextMarkers";
 import { findAutolinks } from "./autolink";
+import { useDirectMessagePending, type DirectMessagePendingSource } from "./directMessage";
 import type { MessageBodyFormat } from "./chatTypes";
 import { LINK_BLOCKED_MARKER, linkForText, type MessageLink } from "./messageLinks";
 import MessageLinkSpan, { BlockedLinkChip } from "./MessageLinkSpan";
@@ -237,8 +238,56 @@ export interface MentionInteraction {
    */
   currentUserId: string;
   onMentionClick: (mentionType: MentionType, id: string) => void;
-  /** Mentions whose DM is currently being resolved, for a discreet busy state. */
-  openingIds?: Set<string>;
+  /**
+   * Answers whether *one* person's DM is being resolved, for a discreet busy
+   * state (issue #895).
+   *
+   * A read-only port rather than the set of everyone pending: this renderer
+   * draws text, and handing it the set made every message holding a mention
+   * re-render whenever anybody anywhere was being resolved. A mention names one
+   * person and watches that one. It is also all the authority this file gets —
+   * there is no way to start or cancel an operation from here.
+   */
+  pendingSource?: DirectMessagePendingSource;
+}
+
+/**
+ * A clickable `@user` mention.
+ *
+ * A component rather than a branch inside `renderMentionToken`, for one reason:
+ * the busy state has to be *reactive* per mention, and only a component can
+ * subscribe. An inert mention stays a plain span and subscribes to nothing.
+ */
+function MentionButton({
+  token,
+  mention,
+}: {
+  token: Extract<InlineToken, { type: "mention" }>;
+  mention: MentionInteraction;
+}) {
+  const pending = useDirectMessagePending(mention.pendingSource, token.id);
+  const activate = () => mention.onMentionClick(token.mentionType, token.id);
+  return (
+    <span
+      className="rtr-mention"
+      data-mention-type={token.mentionType}
+      data-mention-id={token.id}
+      data-mention-clickable="true"
+      role="button"
+      tabIndex={0}
+      aria-label={`Abrir conversa com ${token.text}`}
+      aria-busy={pending || undefined}
+      onClick={activate}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          activate();
+        }
+      }}
+    >
+      @{token.text}
+    </span>
+  );
 }
 
 /**
@@ -266,29 +315,7 @@ function renderMentionToken(
       </span>
     );
   }
-  const activate = () => mention.onMentionClick(token.mentionType, token.id);
-  return (
-    <span
-      key={key}
-      className="rtr-mention"
-      data-mention-type={token.mentionType}
-      data-mention-id={token.id}
-      data-mention-clickable="true"
-      role="button"
-      tabIndex={0}
-      aria-label={`Abrir conversa com ${token.text}`}
-      aria-busy={mention.openingIds?.has(token.id) || undefined}
-      onClick={activate}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          activate();
-        }
-      }}
-    >
-      @{token.text}
-    </span>
-  );
+  return <MentionButton key={key} token={token} mention={mention} />;
 }
 
 function renderTokens(

@@ -2,6 +2,7 @@ import { useCallback, useEffect } from "react";
 import { Outlet, useOutletContext } from "react-router";
 
 import { useCallSession } from "../calls/CallSessionProvider";
+import type { DirectMessageCoordinator } from "./directMessage";
 import type { ParticipantMedia } from "./useCallMedia";
 import type { AppShellOutletContext } from "./AppShell";
 import type { ResourceCallKind } from "./callApi";
@@ -116,6 +117,19 @@ export interface ChatOutletContext {
    */
   markRead?: (target: { kind: "channel" | "dm"; targetId: string }) => void;
   refreshConversations?: () => void;
+  /**
+   * The session's one open-DM coordinator (issue #895), owned by AppShell.
+   *
+   * Stable for the life of the session, so putting it in this context costs
+   * nothing: it does not change when a request starts, finishes or fails, and
+   * therefore never invalidates the conversation below.
+   *
+   * Optional for the same reason `drafts` is: ChatOutletContext fixtures that
+   * predate it keep typechecking, and ChatMessageArea falls back to an inert
+   * one — never reached in production, where AppShell always provides the real
+   * instance.
+   */
+  directMessage?: DirectMessageCoordinator;
   startCall?: (targetUserId: string, callType: CallType) => boolean;
   /**
    * Discovery only (issue #622 round 2): whether a channel/group-DM has an
@@ -166,7 +180,7 @@ export interface ChatOutletContext {
 }
 
 export default function ChatShell() {
-  const { state, retry, markRead, drafts, renameChannel, renameGroup } =
+  const { state, retry, markRead, drafts, renameChannel, renameGroup, directMessage } =
     useOutletContext<AppShellOutletContext>();
   const ready = readySidebar(state);
   const {
@@ -276,6 +290,10 @@ export default function ChatShell() {
     renameChannel,
     renameGroup,
     refreshConversations: retry,
+    // Forwarded, never rebuilt: the shell above owns the one instance whose
+    // in-flight map makes a second request for the same recipient impossible
+    // (issue #895).
+    directMessage,
     startCall: resourceCall.active ? undefined : calls.start,
     getResourceCall,
     isParticipatingIn,

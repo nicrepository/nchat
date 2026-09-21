@@ -386,6 +386,41 @@ function parseInstant(value: unknown): PresenceInstant {
 }
 
 /**
+ * One conversation's presence, as a single value.
+ *
+ * The two halves have to travel together because neither answers the question
+ * alone: the entries say what the server has asserted about the people it named,
+ * and `covered` says whether the server's answer for this conversation was
+ * *complete*. Only the pair distinguishes "not mentioned in a full list" —
+ * offline — from "not mentioned in a list that was cut short" — unknown.
+ *
+ * It exists as a type, rather than as two arguments, so a subscriber can hold
+ * one identity for one conversation. See {@link usePresenceTarget}.
+ */
+export interface TargetPresence {
+  entries: TargetEntries;
+  /** Whether the server has fully described this conversation. */
+  covered: boolean;
+}
+
+/** A conversation the store has been told nothing about. */
+export const emptyTargetPresence: TargetPresence = { entries: emptyTarget, covered: false };
+
+/**
+ * Resolves what to show for one user, inside one conversation.
+ *
+ * The rule, in one place: what the server said, or — when it described this
+ * conversation completely and did not mention this person — offline. Anything
+ * else is unknown, because nothing established an absence.
+ */
+export function selectTargetPresence(target: TargetPresence, userId: string): PresenceState {
+  if (!userId) return "unknown";
+  const entry = target.entries.get(userId);
+  if (entry) return entry.state;
+  return target.covered ? "offline" : "unknown";
+}
+
+/**
  * Resolves what to show for one user.
  *
  * `targetKey` is the conversation the caller is rendering this person in, and it
@@ -406,11 +441,7 @@ export function selectPresence(
   targetKey?: string,
 ): PresenceState {
   if (!userId) return "unknown";
-  if (targetKey) {
-    const entry = state.entries.get(targetKey)?.get(userId);
-    if (entry) return entry.state;
-    return state.covered.has(targetKey) ? "offline" : "unknown";
-  }
+  if (targetKey) return selectTargetPresence(targetPresenceOf(state, targetKey), userId);
   let best: PresenceEntry | undefined;
   for (const target of state.entries.values()) {
     const entry = target.get(userId);
@@ -567,8 +598,76 @@ export function usePresence(userId: string | undefined, targetKey?: string): Pre
 /** Test-only: drop every listener and reset the state. */
 export function _resetPresenceStore(): void {
   listeners.clear();
+  targetViews.clear();
   detach();
   lastGeneration = -1;
   sessionScope = getSessionGeneration();
   state = emptyPresenceState;
+}
+
+/**
+ * One conversation's view of the store, cached so its identity only moves when
+ * that conversation's own evidence does (issue #895).
+ *
+ * `withTarget` already replaces the outer map while keeping every *untouched*
+ * conversation's inner map identical, and `covered` is a boolean, so both halves
+ * are stable across a frame about somebody else. What is not stable is the pair:
+ * building `{ entries, covered }` fresh on every read would hand
+ * `useSyncExternalStore` a new object each time, which is both an invalid
+ * snapshot and exactly the churn this is here to avoid.
+ *
+ * So one view is kept per conversation and re-derived from the *current* state
+ * on every read. The identity check is the two halves, not a version counter,
+ * which is what makes the cache impossible to leave stale: a view is reused only
+ * when the state it was built from is still the state being read.
+ *
+ * A conversation the server has said nothing about gets the shared empty view
+ * rather than one of its own, so rendering a roster before any frame arrives —
+ * or for a conversation presence never reports on — stores nothing at all. What
+ * remains is one small object per conversation the server *has* described,
+ * which is the bound the store's own `entries` already has: the cache holds no
+ * memory the store was not already holding.
+ */
+const targetViews = new Map<string, TargetPresence>();
+
+function targetPresenceOf(source: PresenceSnapshotState, targetKey: string): TargetPresence {
+  const entries = source.entries.get(targetKey);
+  const covered = source.covered.has(targetKey);
+  if (entries === undefined && !covered) return emptyTargetPresence;
+  const known = entries ?? emptyTarget;
+  const cached = targetViews.get(targetKey);
+  if (cached && cached.entries === known && cached.covered === covered) return cached;
+  const view: TargetPresence = { entries: known, covered };
+  targetViews.set(targetKey, view);
+  return view;
+}
+
+/**
+ * One conversation's presence, for a caller that has to answer the same
+ * question about many people at once (issue #895).
+ *
+ * `usePresence` is one subscription per person, which is right for a screen of
+ * independent avatars: each one re-renders only when *its* value moves. A roster
+ * is the other shape — it *orders* itself by presence, so one person changing
+ * state is a fact about the list rather than about a row, and the answer has to
+ * be read for everybody in a single consistent pass. Thirty rows asking thirty
+ * times, each able to re-render alone, is how a list ends up sorted by values
+ * that were read at thirty different moments.
+ *
+ * Scoped to one conversation rather than handing back the whole store, because
+ * the roster on screen is about one conversation and a frame about a different
+ * one is not news to it. The snapshot returned is `===` across any number of
+ * frames for other conversations, so React bails out and neither the sort nor
+ * the rows run again. That is the granularity: not a filter applied after being
+ * woken, but a snapshot that does not move.
+ *
+ * The server snapshot is the empty view, so a server-rendered roster is ordered
+ * by the deterministic fallback rather than by a presence nobody has reported.
+ */
+export function usePresenceTarget(targetKey: string): TargetPresence {
+  return useSyncExternalStore(
+    subscribe,
+    () => targetPresenceOf(state, targetKey),
+    () => emptyTargetPresence,
+  );
 }
