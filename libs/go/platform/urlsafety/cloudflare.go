@@ -183,7 +183,19 @@ type resultResponse struct {
 		// exist, and the caller has a conservative fallback when both are absent.
 		Time    string `json:"time"`
 		TimeEnd string `json:"timeEnd"`
+		// Errors is the second place a refusal has been observed. Both are read
+		// because neither is documented as the one, and reading a field that
+		// never arrives costs nothing.
+		Errors []cloudflareMessage `json:"errors"`
 	} `json:"task"`
+	// Message and Errors are where the provider states *why* it produced a
+	// report with no verdict. They are read for one purpose only — telling a
+	// hostname refusal apart from an ordinary empty scan, for the operator — and
+	// they can never change a verdict: every branch of verdictFromReport is
+	// decided before any of this text is looked at, and nothing derived from it
+	// can promote, demote or create one.
+	Message  string              `json:"message"`
+	Errors   []cloudflareMessage `json:"errors"`
 	Verdicts struct {
 		Overall *struct {
 			// HasVerdicts is a pointer for the same reason Malicious is: "the
@@ -225,8 +237,14 @@ func (c *CloudflareScanner) SubmitScan(ctx context.Context, canonicalURL string)
 	// wrong, and 429, which means the quota is spent — is a failure and never a
 	// scan id. A misconfigured token that produced a usable answer is the exact
 	// silent failure this package exists to prevent.
+	//
+	// The refusal is categorised on the way out (issue #928): every one of these
+	// is the same fail-closed outcome, but "the hostname was scanned too
+	// recently" is the one an operator must be able to see without reading it as
+	// a verdict, and the one that motivated putting a list lookup in front of
+	// this scanner in the first place.
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusCreated {
-		return "", ErrUnavailable
+		return "", unavailable(c.submitRefusalReason(response))
 	}
 	var decoded submitResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
@@ -236,6 +254,38 @@ func (c *CloudflareScanner) SubmitScan(ctx context.Context, canonicalURL string)
 		return "", ErrUnavailable
 	}
 	return decoded.UUID, nil
+}
+
+// submitRefusalReason categorises a rejected submission, from the status code
+// and — only when the status alone does not say — the provider's error
+// envelope.
+//
+// It reads the body it was given and returns a constant from reason.go. The
+// provider's text never leaves this function, and nothing downstream branches
+// on the result: every value it can return is the same refusal to the pipeline.
+func (c *CloudflareScanner) submitRefusalReason(response *http.Response) string {
+	switch response.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return ReasonAuthError
+	case http.StatusTooManyRequests:
+		return ReasonRateLimited
+	}
+	var envelope struct {
+		Message string              `json:"message"`
+		Errors  []cloudflareMessage `json:"errors"`
+	}
+	if err := decodeExactlyOne(response.Body, &envelope); err != nil {
+		return ReasonUnavailable
+	}
+	messages := make([]string, 0, len(envelope.Errors)+1)
+	messages = append(messages, envelope.Message)
+	for _, entry := range envelope.Errors {
+		messages = append(messages, entry.Message)
+	}
+	if reason := classifyRefusal(messages); reason != "" {
+		return reason
+	}
+	return ReasonUnavailable
 }
 
 // GetScanResult reads a submitted scan.
@@ -270,36 +320,107 @@ func (c *CloudflareScanner) GetScanResult(ctx context.Context, scanID string) (V
 func (c *CloudflareScanner) GetScanReport(
 	ctx context.Context, scanID string,
 ) (Verdict, time.Time, error) {
+	verdict, evidence, _, err := c.scanReport(ctx, scanID)
+	return verdict, evidence, err
+}
+
+// scanReport is GetScanReport with the refusal category it normalised.
+//
+// The third return is one of the closed constants in reason.go, or "" when the
+// report said nothing that distinguishes it. It is separate from the public
+// method for two reasons: the signature GetScanReport already has is the one
+// file-service, Reconcile and the polling path all depend on, and the category
+// is strictly additive diagnostics that none of them read.
+//
+// The category is derived *after* the verdict, from a report the verdict rules
+// have already finished with, which is what makes it impossible for the
+// provider's own words to influence what this deployment decides.
+func (c *CloudflareScanner) scanReport(
+	ctx context.Context, scanID string,
+) (Verdict, time.Time, string, error) {
 	if strings.TrimSpace(scanID) == "" {
-		return VerdictUnknown, time.Time{}, ErrUnavailable
+		return VerdictUnknown, time.Time{}, "", ErrUnavailable
 	}
 	endpoint := c.accountPath("/urlscanner/v2/result/" + url.PathEscape(scanID))
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return VerdictUnknown, time.Time{}, ErrUnavailable
+		return VerdictUnknown, time.Time{}, "", ErrUnavailable
 	}
 	c.authorize(request)
 
 	response, err := c.do(ctx, request)
 	if err != nil {
-		return VerdictUnknown, time.Time{}, err
+		return VerdictUnknown, time.Time{}, "", err
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	// The documented progress signal is the status code: 404 while the scan is
 	// in progress, 200 once it is finished.
 	if response.StatusCode == http.StatusNotFound {
-		return VerdictUnknown, time.Time{}, ErrScanPending
+		return VerdictUnknown, time.Time{}, "", ErrScanPending
 	}
 	if response.StatusCode != http.StatusOK {
-		return VerdictUnknown, time.Time{}, ErrUnavailable
+		return VerdictUnknown, time.Time{}, "", ErrUnavailable
 	}
 	var decoded resultResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
-		return VerdictUnknown, time.Time{}, ErrUnavailable
+		return VerdictUnknown, time.Time{}, "", ErrUnavailable
 	}
 	verdict, err := verdictFromReport(decoded, scanID)
-	return verdict, reportEvidenceTime(decoded), err
+	return verdict, reportEvidenceTime(decoded), reportRefusalReason(decoded), err
+}
+
+// cloudflareMessage is one entry of the provider's error list. Only the text is
+// read, and only to be thrown away in favour of a constant.
+type cloudflareMessage struct {
+	Message string `json:"message"`
+}
+
+// hostnameLimitMarkers are the fragments of Cloudflare's refusal that identify
+// it as a rate limit on the *hostname* rather than a finding about the URL:
+//
+//	"Refusing to scan: hostname was recently scanned or too many scans to
+//	 hostname in the last days."
+//
+// Matched as fragments rather than as the whole sentence, lower-cased, because
+// the exact wording is the provider's to change and the two clauses are what
+// actually name the condition. Either one is enough.
+//
+// This is the only string comparison against a provider's prose anywhere in the
+// package, and it is confined to what it can affect: a label. The verdict for
+// this report is already decided — a finished scan with no verdicts is
+// inconclusive whether or not any of this matches — so the worst a wording
+// change can do is lose a distinction in a dashboard, and the worst a *hostile*
+// match can do is nothing at all, because there is no branch anywhere that
+// treats ReasonHostnameLimit as permission for something.
+var hostnameLimitMarkers = []string{"recently scanned", "too many scans"}
+
+// reportRefusalReason names why a report carries no verdict, when the provider
+// said. It returns a constant from reason.go or "", never the provider's text.
+func reportRefusalReason(report resultResponse) string {
+	messages := make([]string, 0, len(report.Errors)+len(report.Task.Errors)+1)
+	messages = append(messages, report.Message)
+	for _, entry := range report.Errors {
+		messages = append(messages, entry.Message)
+	}
+	for _, entry := range report.Task.Errors {
+		messages = append(messages, entry.Message)
+	}
+	return classifyRefusal(messages)
+}
+
+// classifyRefusal folds provider prose into the closed vocabulary. Nothing it
+// is given escapes it.
+func classifyRefusal(messages []string) string {
+	for _, message := range messages {
+		lowered := strings.ToLower(message)
+		for _, marker := range hostnameLimitMarkers {
+			if strings.Contains(lowered, marker) {
+				return ReasonHostnameLimit
+			}
+		}
+	}
+	return ""
 }
 
 // reportEvidenceTime reads when the provider says the scan concluded.

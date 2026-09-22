@@ -207,6 +207,29 @@ func NewReputationService(provider URLReputationProvider, metrics *Metrics) *Ser
 	return service
 }
 
+// NewFallbackService is the composition issue #928 adopted: a synchronous
+// primary reputation source, with the Cloudflare scanner behind it.
+//
+// The two roles are separate and both are kept, which is the whole reason this
+// is a constructor rather than a setter:
+//
+//   - provider becomes the composition, so Check asks the primary first and
+//     falls back only when the primary has no answer to act on;
+//   - scanner stays the Cloudflare client itself, because the submit-then-poll
+//     half of this package is not part of the reputation contract and must not
+//     be routed through a composition. Reconcile, FindRecentScan and
+//     GetScanReport all recover a scan *this deployment created at Cloudflare*,
+//     and there is no such thing at the primary — a lookup leaves nothing to
+//     find. Pointing them at the composition would have silently disabled the
+//     recovery path that issue #135 exists for.
+func NewFallbackService(
+	primary URLReputationProvider, secondary *CloudflareScanner, metrics *Metrics,
+) *Service {
+	service := newService(secondary, metrics, time.Now)
+	service.provider = NewPrimaryFallbackProvider(primary, secondary, metrics)
+	return service
+}
+
 // SetBreaker replaces the circuit breaker, so a deployment can tune the
 // threshold and cooldown. nil restores the default.
 func (s *Service) SetBreaker(breaker *Breaker) {

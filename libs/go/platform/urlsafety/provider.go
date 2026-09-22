@@ -60,6 +60,21 @@ type ReputationResult struct {
 	// ThreatCategories is provider-specific detail about a condemnation. It is
 	// never shown to a user and never a label.
 	ThreatCategories []string
+	// Reason narrows a non-answer to one of the closed categories in reason.go,
+	// when the provider said enough to tell them apart.
+	//
+	// It exists for one distinction issue #928 made operationally load-bearing:
+	// Cloudflare answering ReputationUnknown because it scanned and found
+	// nothing, versus answering it because it refused to scan the hostname at
+	// all. Both are fail-closed and both are terminal, so neither changes what
+	// the pipeline does — but only one of them is a reason to look at the
+	// provider, and an operator who cannot separate them reads the fallback as
+	// broken.
+	//
+	// Empty is the normal case. It is never the provider's own words: an adapter
+	// normalises to a constant from reason.go before anything leaves it, which
+	// is what keeps an attacker-influenceable string out of a metric label.
+	Reason string
 }
 
 // ErrCheckInProgress is returned by an asynchronous provider whose answer is not
@@ -113,12 +128,13 @@ func (c *CloudflareScanner) Check(
 		return result, ErrCheckInProgress
 	}
 	result.ProviderRef = providerRef
-	verdict, evidence, err := c.GetScanReport(ctx, providerRef)
+	verdict, evidence, refusal, err := c.scanReport(ctx, providerRef)
 	switch {
 	case errors.Is(err, ErrScanPending):
 		return result, ErrCheckInProgress
 	case errors.Is(err, ErrScanInconclusive):
 		result.Verdict, result.CheckedAt = ReputationUnknown, evidence
+		result.Reason = refusal
 		return result, nil
 	case err != nil:
 		return result, err
