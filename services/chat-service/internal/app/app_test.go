@@ -1022,6 +1022,7 @@ func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
 	svc := &service.MessageService{}
 	cfg := config.Config{
 		LinkSafetyEnabled:           true,
+		LinkSafetyGoogleWebRiskKey:  "key-xyz",
 		LinkSafetyCloudflareAccount: "acct-123",
 		LinkSafetyCloudflareToken:   "token-abc",
 	}
@@ -1051,8 +1052,24 @@ func TestWireLinkSafetyInstallsGateWhenEnabled(t *testing.T) {
 func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 	for name, cfg := range map[string]config.Config{
 		"no credentials": {LinkSafetyEnabled: true},
-		"no token":       {LinkSafetyEnabled: true, LinkSafetyCloudflareAccount: "acct-123"},
-		"no account":     {LinkSafetyEnabled: true, LinkSafetyCloudflareToken: "token-abc"},
+		// The primary is a way the checker cannot be built too, and since issue
+		// #928 it is the first one: falling through to Cloudflare alone would be
+		// the configuration this issue replaced, reached by omission.
+		"no web risk key": {
+			LinkSafetyEnabled:           true,
+			LinkSafetyCloudflareAccount: "acct-123",
+			LinkSafetyCloudflareToken:   "token-abc",
+		},
+		"no token": {
+			LinkSafetyEnabled:           true,
+			LinkSafetyGoogleWebRiskKey:  "key-xyz",
+			LinkSafetyCloudflareAccount: "acct-123",
+		},
+		"no account": {
+			LinkSafetyEnabled:          true,
+			LinkSafetyGoogleWebRiskKey: "key-xyz",
+			LinkSafetyCloudflareToken:  "token-abc",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc := &service.MessageService{}
@@ -1062,8 +1079,10 @@ func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 			if err == nil {
 				t.Fatal("the bootstrap continued with the flag on and no gate")
 			}
-			if strings.Contains(err.Error(), "acct-123") || strings.Contains(err.Error(), "token-abc") {
-				t.Fatalf("the error carries a configuration value: %v", err)
+			for _, secret := range []string{"acct-123", "token-abc", "key-xyz"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("the error carries a configuration value: %v", err)
+				}
 			}
 		})
 	}
@@ -1075,6 +1094,7 @@ func TestWireLinkSafetyFailsWhenTheCheckerCannotBeBuilt(t *testing.T) {
 func TestWireLinkSafetyFailsWithoutAMessageService(t *testing.T) {
 	cfg := config.Config{
 		LinkSafetyEnabled:           true,
+		LinkSafetyGoogleWebRiskKey:  "key-xyz",
 		LinkSafetyCloudflareAccount: "acct-123",
 		LinkSafetyCloudflareToken:   "token-abc",
 	}

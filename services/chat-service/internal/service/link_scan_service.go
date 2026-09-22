@@ -97,7 +97,13 @@ type hostResolver = linkfetch.Resolver
 // directProviderRef is the ref persisted for a provider that answered on the
 // first call: there is no remote id, and the verdict compare-and-set still
 // binds the write to this attempt.
-const directProviderRef = "direct"
+//
+// It is the shared constant rather than a local copy because since issue #928
+// the provider is a composition that routes on this value: a row carrying it
+// has no check outstanding at the asynchronous half, so resuming it means
+// asking the synchronous primary again. Two spellings of it would send such a
+// row to the scanner with a word that is not a scan id.
+const directProviderRef = urlsafety.DirectProviderRef
 
 // LinkScanSearcher is the recovery half, and is deliberately optional.
 //
