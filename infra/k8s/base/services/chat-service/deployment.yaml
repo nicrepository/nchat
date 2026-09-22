@@ -53,12 +53,18 @@ spec:
             - secretRef:
                 name: nchat-secrets
                 optional: true
-            # RF-21: the Cloudflare URL Scanner credentials, kept out of the
-            # shared nchat-secrets so no service that never calls Cloudflare
-            # receives the token through its own envFrom. Optional because an
-            # overlay with CHAT_LINK_SAFETY_ENABLED=false needs no credentials;
-            # with the flag on, an absent value stops start-up in
-            # Config.Validate rather than silently disabling the check.
+            # RF-21: the Safe Browsing credentials, kept out of the shared
+            # nchat-secrets so no service that never calls a reputation provider
+            # receives them through its own envFrom. Since issue #928 the Secret
+            # holds three keys this service reads — the Google Web Risk API key
+            # for the primary provider and the Cloudflare pair for the fallback —
+            # and mounting it wholesale is correct here because every CHAT_ key
+            # in it belongs to this service.
+            #
+            # Optional because an overlay with CHAT_LINK_SAFETY_ENABLED=false
+            # needs no credentials; with the flag on, an absent value stops
+            # start-up in Config.Validate rather than silently disabling the
+            # check.
             - secretRef:
                 name: nchat-link-safety
                 optional: true

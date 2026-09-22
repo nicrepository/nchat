@@ -906,8 +906,14 @@ validate_nchat_dev() {
   # The flags themselves are asserted for every supported overlay by
   # validate_link_safety. What is specific here is the shape of the wiring: this
   # overlay names each secret key explicitly rather than mounting the Secret
-  # wholesale, so it is four references — an account id and a token for each of
+  # wholesale, so it is five references — the Google Web Risk key for
+  # chat-service alone (issue #928), plus an account id and a token for each of
   # the two services.
+  #
+  # The count is the assertion that matters, in both directions. Too few means a
+  # credential stopped being wired and a service would refuse to start; too many
+  # means a key reached a workload that has no call site for it — which is
+  # exactly what the Web Risk key must not do to file-service.
   # Count only SecretKeySelector references. The rendered application may also
   # contain the SealedSecret itself, whose metadata and template legitimately
   # repeat the same Secret name and must not be mistaken for workload readers.
@@ -929,8 +935,15 @@ validate_nchat_dev() {
       }
       END { print count + 0 }
     ' "$application"
-  )" -ne 4 ]]; then
-    echo "error: only chat-service and file-service may read nchat-link-safety, two keys each" >&2
+  )" -ne 5 ]]; then
+    echo "error: nchat-link-safety must be read as three keys by chat-service and two by file-service" >&2
+    return 1
+  fi
+  # And the Web Risk key specifically: chat-service, once, and nowhere else.
+  # file-service has no Google call site, so a second reference would be a
+  # credential mounted where it can only ever leak.
+  if [[ "$(grep -Fc 'key: CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY' "$application")" -ne 1 ]]; then
+    echo "error: CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY must be referenced exactly once" >&2
     return 1
   fi
   # And the egress that makes the lookup possible: without it the fail-closed
@@ -1100,7 +1113,7 @@ validate_link_safety() {
   # The credentials the flags require reach only the two services that call
   # Cloudflare. In a ConfigMap they would be readable by every pod that mounts
   # it, and in nchat-secrets by every service that mounts that.
-  if grep -Eq '^  (CHAT|FILE)_LINK_SAFETY_CLOUDFLARE_' "$rendered"; then
+  if grep -Eq '^  (CHAT|FILE)_LINK_SAFETY_(CLOUDFLARE_|GOOGLE_WEBRISK_)' "$rendered"; then
     echo "error: Safe Browsing credentials must not appear in a ConfigMap ($name)" >&2
     return 1
   fi
