@@ -192,16 +192,121 @@ type URLReputationProvider interface {
 
 Respostas: `ReputationSafe`, `ReputationMalicious`, `ReputationUnknown`
 (terminal sem verdict) ou erro (`ErrUnavailable`, retentavel; `ErrCheckInProgress`
-com `ProviderRef` para providers assincronos). O Cloudflare URL Scanner e o
-unico adapter implementado (`CloudflareScanner.Check` = submit/poll por tras
-do contrato); ele **so** devolve SAFE com `hasVerdicts=true && malicious=false`.
-`finished` sem verdict e UNKNOWN. O contrato foi validado apenas contra as
-fixtures reais sanitizadas ja existentes em `cloudflare_test.go`; nenhuma
-validacao online foi feita nesta entrega (sem secret disponivel).
+com `ProviderRef` para providers assincronos).
 
-Pipeline por target, nesta ordem: policy local (sensivel/interna: nunca vai ao
-provider) -> cache/verdict fresco (`VerdictTTL`) -> fast deny
-(`files.link_fetch_denylist`, so nega, nunca libera) -> provider -> deadline.
+Pipeline por target, nesta ordem: policy local (sensivel/interna: nunca vai a
+provider nenhum) -> cache/verdict fresco (`VerdictTTL`) -> fast deny
+(`files.link_fetch_denylist`, so nega, nunca libera) -> provider primario ->
+provider secundario -> deadline.
+
+### Primario e fallback (issue #928)
+
+Desde a #928 o chat-service consulta **dois** adapters, compostos por
+`urlsafety.PrimaryFallbackProvider`:
+
+| Papel      | Adapter                                           | Forma       |
+| ---------- | ------------------------------------------------- | ----------- |
+| Primario   | Google Web Risk (`google_webrisk`)                | sincrono    |
+| Secundario | Cloudflare URL Scanner (`cloudflare_url_scanner`) | submit/poll |
+
+**Por que a troca.** O Cloudflare URL Scanner e um _scanner_, nao uma lista: ele
+busca a pagina e forma uma opiniao, e tem o direito de recusar. Em producao isso
+apareceu de duas formas, ambas honestamente inconclusivas:
+
+```
+https://www.youtube.com/@YouTube   HTTP 200, task.success=false,
+                                   hasVerdicts=false,
+                                   "Refusing to scan: hostname was recently
+                                    scanned or too many scans to hostname in
+                                    the last days."
+https://example.com/               HTTP 200, task.success=true,
+                                   hasVerdicts=false
+```
+
+Nenhuma das duas foi promovida a SAFE — e essa regra **nao mudou**. O que mudou
+foi perguntar a uma fonte que responde a pergunta que o RF-21 de fato faz.
+
+**Precedencia**, exatamente:
+
+```
+primario MALICIOUS    -> MALICIOUS; o secundario nao e consultado
+primario SAFE         -> SAFE; devolvido na hora, sem esperar o scanner
+primario UNKNOWN      -> consulta o secundario
+primario indisponivel -> consulta o secundario
+secundario SAFE       -> SAFE
+secundario MALICIOUS  -> MALICIOUS
+secundario UNKNOWN    -> UNKNOWN (interstitial)
+ambos indisponiveis   -> unavailable; nada e gravado, converge pelo deadline
+```
+
+Um `hasVerdicts=false` do Cloudflare — com ou sem a recusa por hostname — nao
+consegue rebaixar um SAFE do Google, e isso nao e uma regra aplicada: e um
+estado que a composicao nao consegue representar, porque SAFE e MALICIOUS do
+primario retornam antes de qualquer requisicao ao secundario.
+
+**Roteamento de um check retomado.** So um provider assincrono emite
+`ProviderRef`, e dos dois so o secundario e assincrono. Logo um ref nao vazio e,
+por construcao, um scan pendente no Cloudflare e vai direto para la. Nada e
+parseado do ref e nenhum prefixo e imposto: a reconciliacao adota UUIDs crus do
+provider na mesma coluna. `urlsafety.DirectProviderRef` (`"direct"`), que o
+pipeline grava para uma resposta sincrona, nao nomeia scan nenhum e volta ao
+primario.
+
+**Um SAFE do Google nao bloqueia a request esperando o Cloudflare.** Nao ha
+double-check assincrono novo: o mecanismo de recheck que ja existia continua
+podendo mover `safe -> malicious` e revogar href e preview em tempo real
+(`message.link_safety_changed`). Isso e uma limitacao consciente — um SAFE do
+primario nao e confirmado por um scan — e nao uma arquitetura paralela
+especulativa.
+
+### Contrato do Google Web Risk
+
+```
+GET https://webrisk.googleapis.com/v1/uris:search
+    ?uri={canonical}&threatTypes=MALWARE&threatTypes=SOCIAL_ENGINEERING
+X-Goog-Api-Key: {key}
+```
+
+Uma unica request carrega todos os threat types configurados, entao nao existe
+"consulta parcial": ou a pergunta inteira foi feita e respondida, ou nada foi.
+
+| Resposta                                        | Resultado                         |
+| ----------------------------------------------- | --------------------------------- |
+| 200 + `{}`                                      | `ReputationSafe`                  |
+| 200 + `threat.threatTypes` com tipo configurado | `ReputationMalicious`             |
+| 200 + `threat` sem tipo reconhecido             | `ErrUnavailable` (`malformed`)    |
+| 200 + JSON invalido / dado extra                | `ErrUnavailable` (`malformed`)    |
+| 401, 403                                        | `ErrUnavailable` (`auth_error`)   |
+| 429                                             | `ErrUnavailable` (`rate_limited`) |
+| 400, 5xx, qualquer outro status                 | `ErrUnavailable` (`unavailable`)  |
+| timeout                                         | `ErrUnavailable` (`timeout`)      |
+| context cancelado                               | `ctx.Err()`, nao contabilizado    |
+
+Corpo vazio **nunca** e SAFE se o HTTP nao foi 200, se o parsing falhou, se
+sobrou dado no corpo ou se o contexto expirou. Nenhum erro externo vira SAFE.
+
+**O que "safe" significa aqui, exatamente:** "nao identificado como ameaca nas
+listas consultadas naquele instante". Nao e garantia de que o destino seja
+inofensivo, e nada no produto pode apresenta-lo como tal. E uma afirmacao mais
+fraca que a clearance de um scanner e muito mais disponivel — essa e a troca.
+
+**A chave viaja no header `X-Goog-Api-Key`, nunca na query string.** Uma chave
+na URL chega a toda mensagem de erro de transporte, a todo log de proxy e a todo
+stack trace que nomeie a request.
+
+`expireTime` e lido e deliberadamente **nao** encurta uma condenacao: o cache
+deste pacote guarda um verdict malicious por `VerdictTTL` (15 min), bem dentro
+de qualquer expiracao que o Web Risk emita, e encurtar uma _recusa_ concede
+permissao em vez de retira-la.
+
+### Privacidade da Lookup API
+
+A Lookup API recebe a **URL completa**, com path e query. Por isso
+`ClassifyURL` roda **antes** de qualquer chamada externa: URLs `sensitive` e
+`internal` nunca chegam ao Google nem ao Cloudflare, terminam como
+`unknown/sensitive` ou `unknown/internal` e nunca geram preview. Isso e testado
+com os dois providers observados ao mesmo tempo, e nao so com um fake
+(`link_scan_fallback_test.go`).
 
 ### Circuit breaker
 
@@ -210,6 +315,14 @@ provider) -> cache/verdict fresco (`VerdictTTL`) -> fast deny
 devolve `ErrCircuitOpen` (que `errors.Is` `ErrUnavailable`) sem tocar o
 provider; os targets convergem pelo deadline. Gauge
 `nchat_link_safety_circuit_state{state}`.
+
+Sao **dois** breakers, do mesmo tipo, e a razao e a composicao: o do `Service`
+fica na frente da composicao inteira e so abre quando ela falha — o que, durante
+uma queda do Web Risk coberta pelo Cloudflare, nao acontece. Sem um breaker
+proprio, o primario ficaria invisivel para o circuito e toda URL gastaria uma
+request condenada nele. O `PrimaryFallbackProvider` tem o seu, so na frente do
+primario; o secundario continua coberto pelo do `Service`. Um 429 do Google
+alimenta o breaker em vez de ser respondido com mais requests.
 
 ### Classificacao antes do provider (`urlsafety.ClassifyURL`)
 
@@ -223,12 +336,21 @@ provider; os targets convergem pelo deadline. Gauge
 
 ### Flags
 
-| Variavel                    | Efeito                                                                                                                |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `CHAT_LINK_SAFETY_ENABLED`  | provider consultado. Off: sweeper continua; pending -> `unknown/disabled`                                             |
-| `CHAT_LINK_PREVIEW_ENABLED` | fetch OG + imagem derivada. Off: cards nao servidos, fila drenada (`failed/disabled`), links safe continuam clicaveis |
+| Variavel                                                | Efeito                                                                                                                |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `CHAT_LINK_SAFETY_ENABLED`                              | providers consultados. Off: sweeper continua; pending -> `unknown/disabled`                                           |
+| `CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY`               | segredo. Chave do provider primario. Obrigatoria com a flag on                                                        |
+| `CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID` / `_API_TOKEN` | segredos. Provider secundario. Tambem obrigatorios com a flag on                                                      |
+| `CHAT_LINK_PREVIEW_ENABLED`                             | fetch OG + imagem derivada. Off: cards nao servidos, fila drenada (`failed/disabled`), links safe continuam clicaveis |
 
 ### Metricas novas (labels de conjunto fechado)
+
+`nchat_url_safety_provider_checks_total{provider,result}` (issue #928):
+`provider` e `google_webrisk` ou `cloudflare_url_scanner`; `result` e
+`safe|malicious|unknown|pending|unavailable|timeout|rate_limited|auth_error|malformed|circuit_open|hostname_limit`.
+Ambos os conjuntos sao fechados e definidos no pacote compartilhado — URL,
+hostname, UUID de scan e credencial nunca sao label, e a prosa do provider e
+normalizada para uma dessas constantes dentro do adapter antes de sair dele.
 
 `nchat_link_scan_attempts_total{operation="resolve",result="deadline"}`,
 `{operation="submit",result="policy"}`, `nchat_link_safety_circuit_state{state}`,
@@ -1666,17 +1788,29 @@ Buscar primeiro e perguntar depois seria renderizar a pagina de phishing.
 
 ## Configuracao
 
-Tres variaveis por servico, todas em `.env.example`:
+Todas em `.env.example`. O chat-service tem dois providers desde a #928; o
+file-service continua com um so.
 
-| file-service                             | chat-service                             |
-| ---------------------------------------- | ---------------------------------------- |
-| `FILE_LINK_SAFETY_ENABLED`               | `CHAT_LINK_SAFETY_ENABLED`               |
-| `FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID` | `CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID` |
-| `FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN`  | `CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN`  |
+| file-service                             | chat-service                              |
+| ---------------------------------------- | ----------------------------------------- |
+| `FILE_LINK_SAFETY_ENABLED`               | `CHAT_LINK_SAFETY_ENABLED`                |
+| —                                        | `CHAT_LINK_SAFETY_GOOGLE_WEBRISK_API_KEY` |
+| `FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID` | `CHAT_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID`  |
+| `FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN`  | `CHAT_LINK_SAFETY_CLOUDFLARE_API_TOKEN`   |
 
-Desligado por default nos dois. O token e exclusivamente server-side: nunca vai
-ao frontend, nunca aparece em log, erro ou resposta, e nunca entra na query
-string (vai no header `Authorization`).
+Desligado por default nos dois. As credenciais sao exclusivamente server-side:
+nunca vao ao frontend, nunca aparecem em log, erro ou resposta, e nunca entram
+na query string — o token Cloudflare vai no header `Authorization`, a chave do
+Web Risk em `X-Goog-Api-Key`.
+
+**No chat-service as tres credenciais sao obrigatorias com a flag ligada**, e o
+secundario nao e opcional de proposito. Um start-up valido com primario e sem
+fallback teria dois significados para o mesmo estado — "escolhemos so o Web
+Risk" e "o secret do Cloudflare nao montou" — e nada os distinguiria em runtime
+a nao ser links que param de resolver sempre que o Web Risk cai. Recusar subir
+nomeia o segundo na hora. O file-service nao recebe a chave do Google: nao tem
+call site para ela, e o Deployment dele nomeia as duas chaves que usa em vez de
+montar o Secret inteiro com `envFrom`.
 
 Flag ligada e credencial ausente **falha no start-up nos dois servicos**. So
 existem tres estados:

@@ -544,11 +544,14 @@ As rotas de anexo do file-service (RF-30/RF-32/RF-33) ficam atras de
 Contrato, autorizacao, limites, estados de scan e envelope encryption:
 [docs/api/file-attachments.md](docs/api/file-attachments.md).
 
-Links em mensagens (RF-21, issue #807): o chat-service e a autoridade sobre
-cada URL — estado por link, clique autorizado por policy e rich preview so
-depois de `safe`. `CHAT_LINK_SAFETY_ENABLED` liga a consulta ao provider de
-reputacao e `CHAT_LINK_PREVIEW_ENABLED` (default `false`) liga o fetch server-side
-de Open Graph com imagem derivada servida pelo NChat. Contratos:
+Links em mensagens (RF-21, issues #807 e #928): o chat-service e a autoridade
+sobre cada URL — estado por link, clique autorizado por policy e rich preview so
+depois de `safe`. `CHAT_LINK_SAFETY_ENABLED` liga a consulta de reputacao, que
+usa **Google Web Risk como provider primario e Cloudflare URL Scanner como
+fallback**; `CHAT_LINK_PREVIEW_ENABLED` (default `false`) liga o fetch
+server-side de Open Graph com imagem derivada servida pelo NChat. Nenhum erro de
+provider vira `safe`, e URLs sensiveis ou internas nunca saem do NChat.
+Contratos:
 [docs/api/link-safety.md](docs/api/link-safety.md) e
 [docs/api/link-preview.md](docs/api/link-preview.md).
 
