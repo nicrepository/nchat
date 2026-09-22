@@ -263,3 +263,45 @@ func TestDMService_GetGroupDetails_DeniedCallerNeverReadsAbout(t *testing.T) {
 		t.Fatalf("about reads = %d, want none for a denied caller", len(dms.aboutCalls))
 	}
 }
+
+// The removal capability is creatorship, and nothing else (issue #469).
+//
+// A group has no role column — chat.dm_members.role is closed by CHECK to
+// 'member' — so the creator is the only authority narrower than "any
+// participant". can_manage_members is true for every participant here, which
+// is exactly why the removal control cannot be derived from it: the store
+// would refuse every one of those callers.
+func TestDMService_GetGroupDetails_ReportsRemovalCapabilityAsCreatorshipAlone(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		createdBy string
+		caller    string
+		want      bool
+	}{
+		{name: "the creator", createdBy: "user-1", caller: "user-1", want: true},
+		{name: "another participant", createdBy: "user-9", caller: "user-1", want: false},
+		{name: "no recorded creator", createdBy: "", caller: "user-1", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conversation := groupConversation()
+			conversation.CreatedBy = test.createdBy
+			dms := &fakeDMStore{
+				visibleConversation: conversation,
+				participants:        storage.DMParticipantPage{Participants: participantsOf(2), TotalCount: 2},
+			}
+			input := groupDetailsInput(domain.MaxDMDetailsParticipants)
+			input.CallerID = test.caller
+
+			got, err := service.NewDMService(dms, newFakeMemberStore()).GetGroupDetails(context.Background(), input)
+			if err != nil {
+				t.Fatalf("GetGroupDetails: %v", err)
+			}
+			if got.CanRemoveMembers != test.want {
+				t.Fatalf("CanRemoveMembers = %v, want %v", got.CanRemoveMembers, test.want)
+			}
+			if !got.CanManageMembers {
+				t.Fatal("adding stays open to every participant; only removal is creator-only")
+			}
+		})
+	}
+}

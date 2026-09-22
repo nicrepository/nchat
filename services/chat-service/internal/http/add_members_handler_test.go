@@ -551,6 +551,31 @@ func TestChannelDetails_ReportsCanManageMembers(t *testing.T) {
 	}
 }
 
+// The removal control reads its own field (issue #469). It is serialized
+// beside can_manage_members and independently of it, so a client can never be
+// in the position of inferring one from the other.
+func TestChannelDetails_ReportsCanRemoveMembersIndependently(t *testing.T) {
+	provider := &fakeChannelProvider{details: service.ChannelDetails{
+		Channel:          detailsChannel(),
+		CanManageMembers: true,
+		CanRemoveMembers: false,
+	}}
+
+	rec := serveDetails(t, channelTestHandler(provider), testChannelID)
+
+	data := detailsData(t, rec)
+	got, ok := data["can_remove_members"].(bool)
+	if !ok {
+		t.Fatalf("can_remove_members missing from the payload: %v", data)
+	}
+	if got {
+		t.Fatalf("can_remove_members = %v, want the service's own false", got)
+	}
+	if data["can_manage_members"] != true {
+		t.Fatalf("the add capability must be unaffected: %v", data)
+	}
+}
+
 // ── Contextual candidate search (issue #398) ────────────────────────────────
 
 func candidatesRequest(query string) *http.Request {

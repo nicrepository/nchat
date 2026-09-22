@@ -234,6 +234,15 @@ export default function ChatMessageArea({ kind }: ChatMessageAreaProps) {
     // Passed directly: useMessages holds this callback in a ref, so a new
     // identity each render does not restart the socket or its subscriptions.
     onMembersAdded: reloadOpenDetails,
+    // A member was *removed*, renamed, or any other conversation event landed
+    // (issue #469). The server publishes conversation.event and nothing else
+    // for a removal — there is no members.removed — and the frame names only
+    // the message, so the panel does what it does for every other
+    // invalidation: it refetches, and the server decides what this reader now
+    // sees. An addition publishes both signals and therefore refetches twice;
+    // that is two idempotent reads of a panel that is already open, and
+    // deduplicating them would mean holding state about events instead.
+    onConversationEvent: reloadOpenDetails,
     // An attachment's malware verdict landed (RF-22). The same treatment as
     // members.added and for the same reason: the event says which row changed,
     // not what the list should now look like, so the panel refetches and the

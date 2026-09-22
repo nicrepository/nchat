@@ -78,6 +78,9 @@ function channelDetails(
     // Off unless a case turns it on: the add action is absent by default, which
     // is what the server's own strict `=== true` normalization produces.
     canManageMembers: false,
+    // Same default and the same reason (issue #469): no capability, no
+    // removal control, and no roster request behind it.
+    canRemoveMembers: false,
     ...overrides,
   };
 }
@@ -86,6 +89,9 @@ function state(overrides: Partial<ConversationDetailsState> = {}): ConversationD
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: [] },
+    // The roster is only ever requested for a caller who may administer the
+    // channel, so "still loading" is what every other case sees.
+    roster: { status: "loading" },
     reload: vi.fn(),
     ...overrides,
   };
@@ -843,6 +849,8 @@ function groupDetails(overrides: Partial<GroupDetails> = {}): { kind: "group" } 
     participantCount: 4,
     participants: [],
     canManageMembers: false,
+    // Creator-only for a group (issue #469), so off unless a case says so.
+    canRemoveMembers: false,
     ...overrides,
   };
 }
@@ -861,6 +869,7 @@ function renderGroupPanel(
       state={{
         details: { status: "ready", data: details },
         files: { status: "ready", data: files },
+        roster: { status: "loading" },
         reload,
       }}
       currentUserId={viewerId}
@@ -1094,7 +1103,12 @@ describe("ConversationDetailsPanel — grupo", () => {
     const { unmount } = render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "loading" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1107,7 +1121,12 @@ describe("ConversationDetailsPanel — grupo", () => {
     render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "error" }, files: { status: "error" }, reload: vi.fn() }}
+        state={{
+          details: { status: "error" },
+          files: { status: "error" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1142,6 +1161,7 @@ function renderProfilePanel(details: { kind: "direct" } & DirectDetails = direct
       state={{
         details: { status: "ready", data: details },
         files: { status: "loading" },
+        roster: { status: "loading" },
         reload: vi.fn(),
       }}
       currentUserId={currentUserId}
@@ -1925,7 +1945,12 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "loading" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1942,7 +1967,12 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "error" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "error" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1962,6 +1992,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
         state={{
           details: { status: "ready", data: groupDetails() },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -1988,6 +2019,7 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
         state={{
           details: { status: "ready", data: channelDetails() },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -2016,6 +2048,7 @@ function readyChannel(overrides: Partial<ChannelDetails> = {}, reload = vi.fn())
       data: channelDetails({ canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
+    roster: { status: "loading" as const },
     reload,
   };
 }
@@ -2027,6 +2060,7 @@ function readyGroup(overrides: Partial<GroupDetails> = {}, reload = vi.fn()) {
       data: groupDetails({ canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
+    roster: { status: "loading" as const },
     reload,
   };
 }
@@ -2113,6 +2147,7 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
             },
           },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -2567,6 +2602,7 @@ describe("ConversationDetailsPanel — renomear inline: a ação", () => {
       state: {
         details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
         files: { status: "ready", data: [] },
+        roster: { status: "loading" },
         reload: vi.fn(),
       },
     });
@@ -2583,6 +2619,7 @@ describe("ConversationDetailsPanel — renomear inline: a ação", () => {
       state: {
         details: { status: "ready", data: directDetails() },
         files: { status: "ready", data: [] },
+        roster: { status: "loading" },
         reload: vi.fn(),
       },
     });
@@ -2800,6 +2837,7 @@ describe("ConversationDetailsPanel — renomear inline: confirmar", () => {
       state: {
         details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
         files: { status: "ready", data: [] },
+        roster: { status: "loading" },
         reload: vi.fn(),
       },
     });
@@ -2929,6 +2967,7 @@ describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit 
       state: {
         details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
         files: { status: "ready", data: [] },
+        roster: { status: "loading" },
         reload: vi.fn(),
       },
     });

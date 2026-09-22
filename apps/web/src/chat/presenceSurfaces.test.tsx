@@ -256,6 +256,7 @@ function channelDetails(): ChannelDetails {
       },
     ],
     canManageMembers: false,
+    canRemoveMembers: false,
   };
 }
 
@@ -269,6 +270,7 @@ function detailsStateFor(userId: string): ConversationDetailsState {
   return {
     details: { status: "ready", data: { kind: "channel", ...data } },
     files: { status: "ready", data: [] },
+    roster: { status: "loading" },
     reload: () => {},
   };
 }
@@ -370,9 +372,11 @@ describe("group participant roster follows presence", () => {
                   { userId: "user-carla", displayName: "Carla" },
                 ],
                 canManageMembers: false,
+                canRemoveMembers: false,
               },
             },
             files: { status: "ready", data: [] },
+            roster: { status: "loading" },
             reload: () => {},
           }}
           currentUserId="user-self"

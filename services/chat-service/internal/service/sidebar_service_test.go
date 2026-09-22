@@ -69,6 +69,9 @@ func (f *sidebarFakeMemberStore) SearchDMConversationMembers(_ context.Context, 
 func (f *sidebarFakeMemberStore) ListOnlineChannelMemberProfiles(_ context.Context, _, _ string, _ []string, _ int) (storage.ChannelMemberPage, error) {
 	return storage.ChannelMemberPage{}, nil
 }
+func (f *sidebarFakeMemberStore) ListChannelMemberRoster(_ context.Context, _, _ string, _ int) (storage.ChannelRosterPage, error) {
+	return storage.ChannelRosterPage{}, nil
+}
 func (f *sidebarFakeMemberStore) ListChannelMemberProfilesByIDs(_ context.Context, _, _ string, _ []string) ([]domain.CallParticipantProfile, error) {
 	return nil, nil
 }

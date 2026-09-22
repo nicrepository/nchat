@@ -44,6 +44,13 @@ type MemberStore interface {
 	ListOnlineChannelMemberProfiles(
 		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
 	) (ChannelMemberPage, error)
+	// ListChannelMemberRoster returns the channel's explicit members —
+	// chat.channel_members, the population the admin removal deletes from —
+	// as a capped, ordered page plus the full total (issue #469). Unlike
+	// ListOnlineChannelMemberProfiles it applies no presence predicate, so an
+	// offline member stays administrable instead of disappearing. The caller's
+	// authority to administer the channel must already have been settled.
+	ListChannelMemberRoster(ctx context.Context, workspaceID, channelID string, limit int) (ChannelRosterPage, error)
 	// ListChannelMemberProfilesByIDs resolves the subset of userIDs that are
 	// active members of channelID, for the call-participant avatar/name
 	// lookup (issue #612). Unlike ListOnlineChannelMemberProfiles this is not
@@ -880,6 +887,103 @@ func (s *PGXMemberStore) ListOnlineChannelMemberProfiles(
 	}
 	if err := rows.Err(); err != nil {
 		return ChannelMemberPage{}, fmt.Errorf("iterate channel member profiles: %w", err)
+	}
+	return page, nil
+}
+
+// ChannelRosterPage is the channel's administrable membership (issue #469): a
+// capped, ordered page of chat.channel_members and the total behind it.
+//
+// Deliberately not ChannelMemberPage. That type answers "who is here now" and
+// carries an online total; this one answers "who belongs", has no presence
+// dimension at all, and a wrong presence snapshot cannot subtract from it. Two
+// questions, two types, so a caller cannot read one as the other.
+type ChannelRosterPage struct {
+	Members    []domain.ChannelMemberProfile
+	TotalCount int
+}
+
+// ListChannelMemberRoster returns a capped page of a channel's explicit
+// members and the full total, in a single query (issue #469).
+//
+// The predicate is the one active_members already encodes in
+// ListOnlineChannelMemberProfiles — active channel in this workspace, active
+// workspace membership, active non-deleted account — and nothing else: no
+// presence, no visibility. That matters twice over. chat.channel_members is
+// exactly the population RemoveChannelMemberByAdmin deletes from, so every
+// roster row is something the removal can act on; and a member who is offline,
+// or connected to another replica, stays administrable instead of disappearing
+// from the panel.
+//
+// What this deliberately does not do is widen membership. A public channel is
+// readable through chat.channel_visible_to_user without a row here, and those
+// readers are not members and do not appear — offering to remove a row that
+// does not exist would be a lie in the shape of a button. Which population a
+// public channel's roster *should* be is issue #883's to settle; this answer
+// tracks whatever it decides, because it reads the same table member_count
+// already counts.
+//
+// COUNT(*) OVER () is evaluated before LIMIT, so the total describes the whole
+// membership and not the page — the same single-query shape
+// ListParticipantProfiles uses for a group, and for the same reason: a second
+// COUNT statement is a second chance to drift from this one's predicate.
+func (s *PGXMemberStore) ListChannelMemberRoster(
+	ctx context.Context, workspaceID, channelID string, limit int,
+) (ChannelRosterPage, error) {
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH active_members AS (
+			SELECT cm.user_id,
+			       cm.role::text AS role,
+			       COALESCE(
+			           NULLIF(BTRIM(u.full_name), ''),
+			           NULLIF(BTRIM(u.display_name), ''),
+			           ''
+			       ) AS display_name,
+			       COALESCE(u.avatar_url, '') AS avatar_url
+			FROM chat.channel_members cm
+			JOIN chat.channels c
+			  ON c.id = cm.channel_id
+			 AND c.workspace_id = $1::uuid
+			 AND c.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = c.workspace_id
+			 AND wm.user_id = cm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+			WHERE cm.channel_id = $2::uuid
+		)
+		SELECT user_id::text,
+		       display_name,
+		       avatar_url,
+		       role,
+		       COUNT(*) OVER () AS total_count
+		FROM active_members
+		ORDER BY lower(display_name), user_id
+		LIMIT $3`, workspaceID, channelID, limit)
+	if err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("list channel member roster: %w", err)
+	}
+	defer rows.Close()
+
+	page := ChannelRosterPage{Members: make([]domain.ChannelMemberProfile, 0, limit)}
+	for rows.Next() {
+		var (
+			profile domain.ChannelMemberProfile
+			role    string
+			total   int
+		)
+		if err := rows.Scan(&profile.UserID, &profile.DisplayName, &profile.AvatarURL, &role, &total); err != nil {
+			return ChannelRosterPage{}, fmt.Errorf("scan channel roster member: %w", err)
+		}
+		profile.Role = domain.ChannelRole(role)
+		page.TotalCount = total
+		page.Members = append(page.Members, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("iterate channel roster members: %w", err)
 	}
 	return page, nil
 }

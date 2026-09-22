@@ -173,6 +173,15 @@ type ChannelDetails struct {
 	// It is false for #geral, matching the write path: membership there is owned
 	// by the workspace sync, not by this flow.
 	CanManageMembers bool
+	// CanRemoveMembers is the server's own answer to "may this caller remove
+	// another member" (issue #469). It is a separate field from
+	// CanManageMembers although both evaluate the same predicate today: adding
+	// and removing are different questions, the panel asks them separately, and
+	// the day one policy moves the other must not follow it silently. Like its
+	// neighbour it is a rendering hint — DELETE .../members/{userID} re-derives
+	// the decision from the session — and it is false for #geral, matching the
+	// write path.
+	CanRemoveMembers bool
 }
 
 // GetChannelDetails returns the channel-details payload for a channel the
@@ -216,7 +225,74 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 		// The same predicate the write path checks, evaluated on the membership
 		// already loaded above — not a second, parallel rule that could drift.
 		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
+		// MemberService.RemoveMemberFromChannel's own two refusals, in the order
+		// it applies them: #geral is never administrable here, and everyone else
+		// needs the same management authority the add path needs.
+		CanRemoveMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
+}
+
+// ChannelRosterInput asks for the channel's administrable membership
+// (issue #469). Same shape as ChannelDetailsInput minus the presence snapshot,
+// which this surface has no use for: the workspace and the caller come from the
+// session, and the client names only the channel.
+type ChannelRosterInput struct {
+	WorkspaceID string
+	CallerID    string
+	ChannelID   string
+	// MemberLimit caps the page. Values outside
+	// (0, domain.MaxChannelDetailsMembers] are clamped by the store.
+	MemberLimit int
+}
+
+// ChannelRoster is the administrable membership of one channel: who belongs to
+// it, and how many belong in total.
+//
+// It carries no capability flag. The caller's authority is the gate on the read
+// itself — a roster is answered only to someone who may administer it — so a
+// second boolean restating what the 403 already decided would be a copy of the
+// same fact.
+type ChannelRoster struct {
+	Members     []domain.ChannelMemberProfile
+	MemberCount int
+}
+
+// ListChannelMembers returns the channel's explicit membership for a caller who
+// may administer it (issue #469).
+//
+// The gate is the removal policy itself — !IsGeneral && CanManageChannelMembers
+// — and not read access, deliberately. This is the administration surface: it
+// exists so a manager can see who to remove, and answering it to a reader who
+// could not remove anybody would publish a membership list to the whole
+// workspace for no purpose. #geral is refused for the same reason the write
+// path refuses it: its membership is owned by the workspace sync, so there is
+// nothing here to administer.
+//
+// Order of decisions mirrors MemberCandidates: authority first, then the
+// channel lookup, so a caller who may not administer channels cannot use this
+// route to learn whether a channel UUID exists. A caller who may administer but
+// cannot see the channel still gets the uniform ErrNotFound the visibility
+// predicate produces.
+func (s *ChannelService) ListChannelMembers(ctx context.Context, input ChannelRosterInput) (ChannelRoster, error) {
+	member, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID)
+	if err != nil {
+		return ChannelRoster{}, err
+	}
+	if !domain.CanManageChannelMembers(&member) {
+		return ChannelRoster{}, domain.ErrForbidden
+	}
+	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
+	if err != nil {
+		return ChannelRoster{}, err
+	}
+	if channel.IsGeneral {
+		return ChannelRoster{}, domain.ErrForbidden
+	}
+	page, err := s.members.ListChannelMemberRoster(ctx, input.WorkspaceID, channel.ID, input.MemberLimit)
+	if err != nil {
+		return ChannelRoster{}, fmt.Errorf("list channel member roster: %w", err)
+	}
+	return ChannelRoster{Members: page.Members, MemberCount: page.TotalCount}, nil
 }
 
 // ChannelCallParticipantProfilesInput asks for presentation identities of a

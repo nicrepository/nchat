@@ -71,6 +71,7 @@ function channelDetails(): { kind: "channel" } & ChannelDetails {
     onlineCount: 0,
     onlineMembers: [],
     canManageMembers: false,
+    canRemoveMembers: false,
   };
 }
 
@@ -92,6 +93,7 @@ function panelState(files: ChannelAttachment[]): ConversationDetailsState {
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: files },
+    roster: { status: "loading" },
     reload: vi.fn(),
   };
 }

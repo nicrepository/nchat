@@ -82,6 +82,68 @@ function openDMLabel(participant: RosterParticipant, presence: PresenceState): s
 }
 
 /**
+ * The removal control's own contract (issue #469).
+ *
+ * `noun` is the conversation's word ("canal", "grupo") and exists so the
+ * accessible name states *where* someone is being removed from — "Remover
+ * Fernanda Nicácio do canal" — rather than a bare "Remover" repeated down the
+ * list. `onRemove` is what opens the confirmation; nothing is removed by this
+ * button, and the row never calls an API.
+ *
+ * It is handed the button element as well as the person, because cancelling
+ * the confirmation has to put focus back on the control that opened it and
+ * this row is the only place that knows which one that was.
+ *
+ * The prop is optional and absent is the honest default: a viewer without the
+ * capability, the viewer's own row, and any host that has not wired the flow
+ * all render a row with no control at all. Hiding it is presentation — the
+ * DELETE re-derives the decision — but offering an action the server would
+ * refuse is a worse lie than not offering it.
+ */
+export interface ParticipantRemoval {
+  noun: string;
+  onRemove: (participant: RosterParticipant, trigger: HTMLElement) => void;
+}
+
+/**
+ * The destructive secondary action, a sibling of the identity region rather
+ * than a child of it.
+ *
+ * That is what keeps the row free of nested interactive elements: the identity
+ * opens a conversation, this opens a confirmation, and each is reachable on
+ * its own by keyboard. `stopPropagation` is not needed and not used — there is
+ * no outer handler to escape from, by construction.
+ *
+ * The glyph is decorative and hidden from the accessibility tree; the button's
+ * name is the sentence below it. `title` gives the pointer tooltip the issue
+ * asks for, and the accessible name gives the same information to anyone who
+ * reaches the control by keyboard or screen reader — neither depends on the
+ * other, and neither depends on colour.
+ */
+function ParticipantRemoveButton({
+  participant,
+  removal,
+}: {
+  participant: RosterParticipant;
+  removal: ParticipantRemoval;
+}) {
+  return (
+    <button
+      type="button"
+      className="chat-details__member-remove"
+      title="Remover membro"
+      aria-label={`Remover ${participant.displayName} do ${removal.noun}`}
+      onClick={(event) => removal.onRemove(participant, event.currentTarget)}
+      data-testid="chat-details-participant-remove"
+    >
+      <span className="material-symbols-outlined" aria-hidden="true">
+        do_not_disturb_on
+      </span>
+    </button>
+  );
+}
+
+/**
  * One roster row.
  *
  * The row is an `<li>` and the navigable region is a `<button>` inside it,
@@ -114,12 +176,15 @@ export default function ParticipantRow({
   isCurrentUser,
   onOpenDM,
   pendingSource,
+  removal,
 }: {
   participant: RosterParticipant;
   presence: PresenceState;
   isCurrentUser: boolean;
   onOpenDM?: (userId: string) => void;
   pendingSource?: DirectMessagePendingSource;
+  /** The removal action for *this* person, or nothing (issue #469). */
+  removal?: ParticipantRemoval;
 }) {
   const pending = useDirectMessagePending(pendingSource, participant.userId);
   const identity = (
@@ -129,10 +194,17 @@ export default function ParticipantRow({
       isCurrentUser={isCurrentUser}
     />
   );
+  // Rendered after the identity region in both variants, so the control is
+  // last in the row's tab order and its position does not depend on whether
+  // the identity happens to be activatable.
+  const removeButton = removal ? (
+    <ParticipantRemoveButton participant={participant} removal={removal} />
+  ) : null;
   if (!onOpenDM) {
     return (
       <li className="chat-details__member">
         <span className="chat-details__member-main">{identity}</span>
+        {removeButton}
       </li>
     );
   }
@@ -148,6 +220,7 @@ export default function ParticipantRow({
       >
         {identity}
       </button>
+      {removeButton}
     </li>
   );
 }

@@ -347,19 +347,61 @@ func (s *MemberService) LeaveChannel(ctx context.Context, workspaceID, channelID
 	return nil
 }
 
+// requireChannelMemberManager is the removal path's authorization gate: an
+// active workspace and a caller domain.CanManageChannelMembers admits.
+//
+// Extracted rather than inlined so RemoveMemberFromChannel stays one sequence
+// of decisions after issue #469 added the self-removal refusal to it. It is
+// deliberately *not* requireActiveWorkspaceMember: that helper also requires
+// the caller's membership to be active, and adopting it here would change who
+// this route accepts — a separate question, and not this issue's to answer.
+func (s *MemberService) requireChannelMemberManager(ctx context.Context, workspaceID, callerID string) error {
+	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return domain.ErrForbidden
+		}
+		return fmt.Errorf("get workspace: %w", err)
+	}
+	if workspace.Status != domain.WorkspaceStatusActive {
+		return domain.ErrForbidden
+	}
+
+	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
+	if errors.Is(err, domain.ErrNotFound) {
+		return domain.ErrForbidden
+	}
+	if err != nil {
+		return fmt.Errorf("get caller workspace member: %w", err)
+	}
+	if !domain.CanManageChannelMembers(&caller) {
+		return domain.ErrForbidden
+	}
+	return nil
+}
+
 // RemoveMemberFromChannel removes targetUserID from channelID in workspaceID.
 //
 // Authorization is domain.CanManageChannelMembers — the same predicate the add
 // path uses, rather than a second inline role list that could drift from it.
 // Adding and removing the same row are the same authority, so RF-74 widening
 // the add to the workspace moderator widens the removal with it.
-// Returns ErrForbidden when removing from #geral or when caller lacks permission.
+// Returns ErrForbidden when removing from #geral or when caller lacks
+// permission, and ErrInvalidInput when the caller names themselves.
 //
 // The returned domain.Message is the conversation_member_removed event the
 // same transaction wrote, zero-valued when targetUserID was not a member —
 // the same "publish only when there is one" convention UpdateChannel's Event
 // uses, so a caller that asks to remove a non-member broadcasts nothing.
 func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID, channelID, callerID, targetUserID string) (domain.Message, error) {
+	// The one shape the store cannot tell apart from a real removal, refused
+	// here exactly as DMService.RemoveGroupParticipant refuses it: a manager
+	// naming themselves is leaving, and Leave is where that happens. Without
+	// this, self-removal through the admin route would delete the same row and
+	// write "removeu" into the timeline about the person who left.
+	if callerID != "" && callerID == targetUserID {
+		return domain.Message{}, fmt.Errorf("%w: use leave to remove yourself", domain.ErrInvalidInput)
+	}
 	channel, err := s.channels.GetChannelByIDInWorkspace(ctx, workspaceID, channelID)
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("get channel: %w", err)
@@ -368,26 +410,8 @@ func (s *MemberService) RemoveMemberFromChannel(ctx context.Context, workspaceID
 		return domain.Message{}, domain.ErrForbidden
 	}
 
-	workspace, err := s.workspaces.GetWorkspaceByID(ctx, workspaceID)
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return domain.Message{}, domain.ErrForbidden
-		}
-		return domain.Message{}, fmt.Errorf("get workspace: %w", err)
-	}
-	if workspace.Status != domain.WorkspaceStatusActive {
-		return domain.Message{}, domain.ErrForbidden
-	}
-
-	caller, err := s.members.GetWorkspaceMember(ctx, workspaceID, callerID)
-	if errors.Is(err, domain.ErrNotFound) {
-		return domain.Message{}, domain.ErrForbidden
-	}
-	if err != nil {
-		return domain.Message{}, fmt.Errorf("get caller workspace member: %w", err)
-	}
-	if !domain.CanManageChannelMembers(&caller) {
-		return domain.Message{}, domain.ErrForbidden
+	if err := s.requireChannelMemberManager(ctx, workspaceID, callerID); err != nil {
+		return domain.Message{}, err
 	}
 
 	event, err := s.members.RemoveChannelMemberByAdmin(ctx, workspaceID, channelID, callerID, targetUserID)

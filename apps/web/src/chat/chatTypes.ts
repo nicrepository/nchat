@@ -830,6 +830,53 @@ export interface ChannelDetails {
    * predates this field hides the action rather than enabling it.
    */
   canManageMembers: boolean;
+  /**
+   * Whether the server would let this caller remove another member
+   * (issue #469).
+   *
+   * A second field rather than a reading of `canManageMembers`, even though a
+   * channel evaluates both from the same predicate today. They answer
+   * different questions, the panel asks them separately, and a group already
+   * answers them differently — inferring one from the other is how a control
+   * ends up offered where the write path refuses it. Normalized with the same
+   * strict `=== true`, and the DELETE re-derives the real decision regardless.
+   */
+  canRemoveMembers: boolean;
+}
+
+/**
+ * One row of a channel's administrable membership (issue #469).
+ *
+ * Deliberately without `presence`: this list says who belongs, and whether
+ * they are connected is the realtime store's answer — the same store every
+ * other surface reads. A presence field here would be a second, staler one.
+ */
+export interface ChannelRosterMember {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  role: ChannelMemberRole;
+}
+
+/**
+ * A channel's administrable membership: `chat.channel_members`, which is the
+ * population the removal acts on (issue #469).
+ *
+ * It is not `ChannelDetails.onlineMembers` and cannot be derived from it: that
+ * array is filtered by presence inside the query, so it never contains an
+ * offline member and would hide exactly the people an administrator most needs
+ * to act on. `memberCount` is the whole membership and `members` the capped
+ * page of it, the same relationship every other paged surface here has.
+ *
+ * One page, and the route offers no cursor: in a channel larger than the cap
+ * the removal reaches the rows in hand, and the section says how many those
+ * are. Navigating the whole collection is issue #895's, which owns the
+ * roster's presentation and consumes this payload.
+ */
+export interface ChannelRoster {
+  memberCount: number;
+  members: ChannelRosterMember[];
 }
 
 // ── Add members (issue #398) ─────────────────────────────────────────────────
@@ -890,6 +937,17 @@ export interface GroupDetails {
   participants: GroupParticipantProfile[];
   /** Same meaning and the same strict normalization as ChannelDetails' (issue #398). */
   canManageMembers: boolean;
+  /**
+   * Whether the server would let this caller remove another participant
+   * (issue #469).
+   *
+   * In a group this is genuinely not `canManageMembers`: adding is open to
+   * every participant, while removing is the creator's alone — a group has no
+   * role to consult, since chat.dm_members.role is closed to 'member'. Reading
+   * the add capability as the removal one would put a control in front of
+   * every participant that the server refuses for all but one caller.
+   */
+  canRemoveMembers: boolean;
 }
 
 /**

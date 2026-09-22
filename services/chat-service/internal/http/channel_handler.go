@@ -17,6 +17,10 @@ import (
 type channelProvider interface {
 	CreateChannel(ctx context.Context, input service.CreateChannelInput) (domain.Channel, error)
 	GetChannelDetails(ctx context.Context, input service.ChannelDetailsInput) (service.ChannelDetails, error)
+	// ListChannelMembers is the administrable membership behind the removal
+	// control (issue #469) — chat.channel_members, not the presence preview
+	// GetChannelDetails returns.
+	ListChannelMembers(ctx context.Context, input service.ChannelRosterInput) (service.ChannelRoster, error)
 	// GetCallParticipantProfiles resolves presentation identities for a set
 	// of call-participant user IDs, scoped to this channel (issue #612).
 	GetCallParticipantProfiles(ctx context.Context, input service.ChannelCallParticipantProfilesInput) ([]domain.CallParticipantProfile, error)
@@ -310,6 +314,12 @@ type channelDetailsResponse struct {
 	// always sent, so a client that predates it reads absent-as-false and hides
 	// the action — the safe direction — rather than enabling it by default.
 	CanManageMembers bool `json:"can_manage_members"`
+	// CanRemoveMembers is the same kind of hint for the removal control
+	// (issue #469). Sent beside can_manage_members rather than folded into it:
+	// the two answer different questions, and a client must not infer one from
+	// the other even while the channel policy makes them agree. Absent reads as
+	// false, so an older server hides the control.
+	CanRemoveMembers bool `json:"can_remove_members"`
 }
 
 // Presence values serialised by the details endpoints. presenceOnline is the
@@ -402,7 +412,107 @@ func channelDetailsBody(details service.ChannelDetails) channelDetailsResponse {
 		OnlineMemberCount:  details.OnlineCount,
 		OnlineMembers:      members,
 		CanManageMembers:   details.CanManageMembers,
+		CanRemoveMembers:   details.CanRemoveMembers,
 	}
+}
+
+// ── Channel roster (issue #469) ──────────────────────────────────────────────
+
+// channelRosterMemberJSON is one administrable member.
+//
+// Same four fields as an online_members entry minus the presence one, and the
+// omission is the point: this list is membership, and a member's connection
+// state is neither why they are here nor something this query asks. The panel
+// annotates presence from the realtime store it already subscribes to.
+type channelRosterMemberJSON struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url,omitempty"`
+	Role        string `json:"role"`
+}
+
+// channelRosterResponse is the administrable membership of one channel.
+//
+// `members` is the capped page and `member_count` the whole membership, in the
+// same relationship every other paged surface here uses — the array is never
+// the count. It is deliberately a different route from /details rather than a
+// second array inside it: /details answers every reader, this answers only a
+// manager, and folding the two would either hand a roster to readers who may
+// not administer it or make one payload mean different things per caller.
+type channelRosterResponse struct {
+	MemberCount int                       `json:"member_count"`
+	Members     []channelRosterMemberJSON `json:"members"`
+}
+
+// Members handles GET /api/chat/channels/{channelID}/members (issue #469).
+//
+// The administration counterpart of /details: who belongs to this channel, so
+// a manager can act on them. Authorization is the service's — the same
+// predicate the removal itself applies — and it runs before any row is read,
+// so this route can neither confirm a channel UUID to someone who may not
+// administer channels nor list a membership to someone who may not change it.
+//
+// It shares the read budget rather than a write one: the panel issues it when
+// it opens and after a membership change, exactly like /details.
+func (h *ChannelHandler) Members(w http.ResponseWriter, r *http.Request) {
+	if h.workspaces == nil || h.channels == nil {
+		httputil.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "channels not available")
+		return
+	}
+	channelID := r.PathValue("channelID")
+	if !validateTargetID(w, channelID, "channel_id") {
+		return
+	}
+	callerID := GetContextUserID(r)
+	if callerID == "" {
+		writeUnauthorized(w)
+		return
+	}
+	workspaceID, ok := h.resolveDefaultWorkspaceID(w, r)
+	if !ok {
+		return
+	}
+
+	roster, err := h.channels.ListChannelMembers(r.Context(), service.ChannelRosterInput{
+		WorkspaceID: workspaceID,
+		CallerID:    callerID,
+		ChannelID:   channelID,
+		MemberLimit: domain.MaxChannelDetailsMembers,
+	})
+	if err != nil {
+		writeChannelRosterError(w, err)
+		return
+	}
+	httputil.WriteJSON(w, http.StatusOK, channelRosterBody(roster))
+}
+
+// writeChannelRosterError keeps the two denials distinguishable in the way the
+// rest of the member surface already does: a caller who cannot administer
+// channels is refused (403, like member-candidates), while a channel they
+// cannot see — or #geral, whose membership this route does not administer — is
+// indistinguishable from one that does not exist.
+func writeChannelRosterError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrForbidden):
+		httputil.WriteError(w, http.StatusForbidden, httputil.ErrCodeForbidden, "forbidden")
+	case errors.Is(err, domain.ErrNotFound):
+		httputil.WriteError(w, http.StatusNotFound, httputil.ErrCodeNotFound, "channel not found")
+	default:
+		httputil.WriteError(w, http.StatusInternalServerError, httputil.ErrCodeInternal, "internal error")
+	}
+}
+
+func channelRosterBody(roster service.ChannelRoster) channelRosterResponse {
+	members := make([]channelRosterMemberJSON, 0, len(roster.Members))
+	for _, member := range roster.Members {
+		members = append(members, channelRosterMemberJSON{
+			UserID:      member.UserID,
+			DisplayName: member.DisplayName,
+			AvatarURL:   member.AvatarURL,
+			Role:        string(member.Role),
+		})
+	}
+	return channelRosterResponse{MemberCount: roster.MemberCount, Members: members}
 }
 
 // ── Call-participant profiles (issue #612) ───────────────────────────────────

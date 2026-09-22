@@ -39,7 +39,6 @@
  */
 
 import {
-  useCallback,
   useEffect,
   useRef,
   useState,
@@ -62,11 +61,14 @@ import type {
   AddMembersResult,
   ChannelAttachment,
   ChannelDetails,
+  ChannelRoster,
   DirectDetails,
   GroupDetails,
   PinnedItem,
 } from "./chatTypes";
-import ParticipantRow from "./ParticipantRow";
+import ParticipantRow, { type ParticipantRemoval } from "./ParticipantRow";
+import RemoveMemberDialog from "./RemoveMemberDialog";
+import { useMemberRemoval, type MemberRemovalFlow } from "./useMemberRemoval";
 import {
   orderRoster,
   rosterPresenceStates,
@@ -388,6 +390,7 @@ function previewShortfall(
 function rosterItems(
   participants: readonly RosterParticipant[],
   context: RosterContext,
+  removal?: ParticipantRemoval,
 ): ReactNode[] {
   const access = context.openDM;
   // Bound once to this host's claim, so the row never handles an origin and
@@ -413,6 +416,10 @@ function rosterItems(
         // pending is computed here, so a request starting for one person does
         // not rebuild the list.
         pendingSource={context.openDM?.coordinator}
+        // Never on the viewer's own row (issue #469). Leaving yourself is
+        // "Sair da conversa", the server refuses this route for the caller,
+        // and a control that can only fail is not an affordance.
+        removal={isCurrentUser ? undefined : removal}
       />
     );
   });
@@ -445,6 +452,7 @@ function rosterItems(
 function channelMembersContent(
   details: ChannelDetails,
   context: RosterContext,
+  removal?: ParticipantRemoval,
 ): ExpandableSectionContent {
   return {
     status: "ready",
@@ -457,10 +465,59 @@ function channelMembersContent(
         subtitle: member.role === "moderator" ? "Moderador" : "Membro",
       })),
       context,
+      // Everyone here is a chat.channel_members row — the presence filter
+      // narrows that population, it does not come from another one — so the
+      // removal is as valid on a preview row as on a roster row. It matters
+      // while the roster request is in flight, and if it failed.
+      removal,
     ),
     // "ninguem online agora", never "este canal nao tem membros" — the
     // channel's size is reported separately and is unaffected.
     empty: <SectionMessage>Nenhum membro online no momento.</SectionMessage>,
+  };
+}
+
+/**
+ * The channel's administrable membership (issue #469), when the server has
+ * answered one.
+ *
+ * This is the section a manager sees instead of the online preview, and the
+ * difference is the whole reason the roster route exists: `online_members` is
+ * intersected with presence inside the query, so an offline member has no row
+ * — and no row means no way to remove them. Everyone else keeps the preview,
+ * unchanged, because nothing about #469 decides what a reader should see.
+ *
+ * `count` is the roster's own total, from the same statement that produced the
+ * rows, so the heading and the list cannot describe different sets — and when
+ * the channel is larger than the page, `RosterShortfallNote` says so in words
+ * rather than letting the heading imply the list is complete. Turning that
+ * shortfall into navigation (five compact rows, "Ver todos", the paginated
+ * collection) is issue #895's, which owns how this roster is presented.
+ *
+ * The empty state is about membership and says so. A public channel really can
+ * have no explicit members while people read it — that divergence is issue
+ * #883's — and the honest sentence is that there is nobody to administer, not
+ * that the channel is deserted.
+ */
+function channelRosterContent(
+  roster: ChannelRoster,
+  context: RosterContext,
+  removal: ParticipantRemoval,
+): ExpandableSectionContent {
+  return {
+    status: "ready",
+    count: roster.memberCount,
+    items: rosterItems(
+      roster.members.map((member) => ({
+        userId: member.userId,
+        displayName: member.displayName,
+        avatarUrl: member.avatarUrl,
+        subtitle: member.role === "moderator" ? "Moderador" : "Membro",
+      })),
+      context,
+      removal,
+    ),
+    empty: <SectionMessage>Nenhum membro para administrar neste canal.</SectionMessage>,
   };
 }
 
@@ -484,6 +541,7 @@ function channelMembersContent(
 function groupParticipantsContent(
   details: GroupDetails,
   context: RosterContext,
+  removal?: ParticipantRemoval,
 ): ExpandableSectionContent {
   return {
     status: "ready",
@@ -496,6 +554,7 @@ function groupParticipantsContent(
         subtitle: "Participante",
       })),
       context,
+      removal,
     ),
     empty: <SectionMessage>Nenhum participante para exibir.</SectionMessage>,
   };
@@ -673,6 +732,10 @@ const conversationCopy = {
   channel: {
     peopleHeading: "Membros online",
     peopleLabel: "Membros online do canal",
+    // What the same section is called once it shows the administrable
+    // membership instead of the presence preview (issue #469).
+    membersHeading: "Membros",
+    membersLabel: "Membros do canal",
     addAction: "Adicionar membros",
     addedNone: "Todas as pessoas selecionadas já participam deste canal.",
     addedOne: "1 pessoa adicionada ao canal.",
@@ -683,6 +746,10 @@ const conversationCopy = {
   group: {
     peopleHeading: "Participantes",
     peopleLabel: "Participantes do grupo",
+    // A group's participants already are its membership, so administering it
+    // changes nothing about what the section is called.
+    membersHeading: "Participantes",
+    membersLabel: "Participantes do grupo",
     addAction: "Adicionar participantes",
     addedNone: "Todas as pessoas selecionadas já participam deste grupo.",
     addedOne: "1 pessoa adicionada ao grupo.",
@@ -735,38 +802,64 @@ function FileRow({ file }: { file: ChannelAttachment }) {
 }
 
 /**
- * The people section's content, in the vocabulary of whichever conversation is
- * open (issue #892).
+ * Everything the people section needs to decide what to draw.
  *
- * Loading is the fallthrough rather than the first test: `ConversationBody` has
- * already turned "ready, but tagged for the other aggregate" into loading, so
- * the only way past the two ready cases is a load still in flight, and there is
- * no fourth outcome to leave silently unrendered.
+ * One value instead of five positional arguments, because the five are not
+ * independent: `roster` is only ever non-null when `removal` is present, and
+ * both only ever apply to the aggregate `details` already identifies. Passing
+ * them together is what lets the reader see that.
  */
-function peopleContent(
-  kind: "channel" | "group",
-  details: ConversationDetailsState["details"],
-  context: RosterContext,
-): ExpandableSectionContent {
-  if (details.status === "error") {
-    return {
-      status: "error",
-      message:
-        kind === "channel"
-          ? "Não foi possível carregar os membros."
-          : "Não foi possível carregar os participantes.",
-    };
+interface PeopleView {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+  /**
+   * The channel's administrable membership, or null (issue #469).
+   *
+   * Null covers every case in which the preview stays: a group, a caller
+   * without the capability, and the moment before the roster request answers.
+   * A failed roster request is also null — the preview is still correct, just
+   * narrower, and blanking the section would be the worse outcome.
+   */
+  roster: ChannelRoster | null;
+  context: RosterContext;
+  removal?: ParticipantRemoval;
+}
+
+/** The words each aggregate uses while its people are loading or failed. */
+const peopleSectionMessages = {
+  channel: { loading: "Carregando membros…", error: "Não foi possível carregar os membros." },
+  group: {
+    loading: "Carregando participantes…",
+    error: "Não foi possível carregar os participantes.",
+  },
+} as const;
+
+/**
+ * The people section's content, in the vocabulary of whichever conversation is
+ * loaded (issues #435, #441, #469).
+ *
+ * The payload's three states, in that order, and then the one decision that is
+ * left (issue #469): for a channel, the administrable membership replaces the
+ * presence preview — but only for a caller who may act on it, and only once
+ * the roster is actually in hand.
+ *
+ * The direct variant cannot arrive here: `ConversationBody` has already turned
+ * "ready, but tagged for the other aggregate" into loading. It is still named,
+ * because that is what narrows `details.data` to a channel for the line below
+ * — a cast would assert the same thing without the type system checking it.
+ */
+function peopleContent(view: PeopleView): ExpandableSectionContent {
+  const { kind, details, roster, context, removal } = view;
+  const words = peopleSectionMessages[kind];
+  if (details.status === "error") return { status: "error", message: words.error };
+  if (details.status !== "ready") return { status: "loading", message: words.loading };
+  if (details.data.kind === "group") {
+    return groupParticipantsContent(details.data, context, removal);
   }
-  if (details.status === "ready" && details.data.kind === "channel") {
-    return channelMembersContent(details.data, context);
-  }
-  if (details.status === "ready" && details.data.kind === "group") {
-    return groupParticipantsContent(details.data, context);
-  }
-  return {
-    status: "loading",
-    message: kind === "channel" ? "Carregando membros…" : "Carregando participantes…",
-  };
+  if (details.data.kind === "direct") return { status: "loading", message: words.loading };
+  return roster && removal
+    ? channelRosterContent(roster, context, removal)
+    : channelMembersContent(details.data, context, removal);
 }
 
 /**
@@ -967,12 +1060,24 @@ function PinnedMessageSection({
  */
 function manageableTarget(details: ConversationDetailsState["details"]): {
   id: string;
+  name: string;
   canManage: boolean;
+  canRemove: boolean;
 } {
   if (details.status !== "ready" || details.data.kind === "direct") {
-    return { id: "", canManage: false };
+    return { id: "", name: "", canManage: false, canRemove: false };
   }
-  return { id: details.data.id, canManage: details.data.canManageMembers };
+  return {
+    id: details.data.id,
+    // The server's own name for the conversation, which the removal
+    // confirmation states so it cannot be about the wrong one.
+    name: details.data.name,
+    canManage: details.data.canManageMembers,
+    // The server's separate answer for removal (issue #469). Read, never
+    // derived: in a group the two differ, and in a channel they are two
+    // questions that happen to share a predicate today.
+    canRemove: details.data.canRemoveMembers,
+  };
 }
 
 /**
@@ -1017,10 +1122,16 @@ function rosterPresenceKey(kind: "channel" | "group", targetId: string): string 
  * failure the section says nothing about what it is missing, because it does
  * not yet know what it has.
  */
-function rosterShortfall(details: ConversationDetailsState["details"]): {
+function rosterShortfall(
+  details: ConversationDetailsState["details"],
+  roster: ChannelRoster | null,
+): {
   expandLabel?: string;
   note: string | null;
 } {
+  // The administrable membership, when it is what the section is showing: its
+  // own total, its own noun, and the same capped-page rule (issue #469).
+  if (roster) return previewShortfall(roster.memberCount, roster.members.length, "membros");
   if (details.status !== "ready") return { note: null };
   if (details.data.kind === "channel") {
     return previewShortfall(
@@ -1040,6 +1151,92 @@ function rosterShortfall(details: ConversationDetailsState["details"]): {
 }
 
 /**
+ * What this section is called, which depends on what it is showing.
+ *
+ * A manager of a channel is shown its membership, and calling that "Membros
+ * online" would name the list after a filter it no longer has (issue #469).
+ * Everything else keeps the wording it already had.
+ */
+function peopleSectionWords(
+  copy: ConversationCopy,
+  roster: ChannelRoster | null,
+): { heading: string; label: string } {
+  if (roster) return { heading: copy.membersHeading, label: copy.membersLabel };
+  return { heading: copy.peopleHeading, label: copy.peopleLabel };
+}
+
+/**
+ * The administrable membership this section should draw, or null (issue #469).
+ *
+ * Null is every case in which the presence preview stays: a group, whose
+ * participants already are its membership; a caller the server did not grant
+ * the capability to, who never requested a roster; and the moment before the
+ * request answers — or after it failed, where the preview is still correct,
+ * only narrower.
+ */
+function administrableRoster(
+  kind: "channel" | "group",
+  canRemove: boolean,
+  roster: ConversationDetailsState["roster"],
+): ChannelRoster | null {
+  if (kind !== "channel" || !canRemove || roster.status !== "ready") return null;
+  return roster.data;
+}
+
+/**
+ * The removal action every row in this conversation gets, or nothing.
+ *
+ * The noun is the conversation's own word, because the control's accessible
+ * name says where the person is being removed from. Which rows actually get it
+ * is decided further down — the viewer's own never does.
+ */
+function rowRemovalFor(
+  kind: "channel" | "group",
+  canRemove: boolean,
+  request: MemberRemovalFlow["request"],
+): ParticipantRemoval | undefined {
+  if (!canRemove) return undefined;
+  return { noun: kind === "channel" ? "canal" : "grupo", onRemove: request };
+}
+
+/**
+ * The confirmation, mounted only while a member is under it (issue #469).
+ *
+ * Its own component so the section that renders a list does not also decide
+ * what a removal costs: the one fact it has to look up — whether this is a
+ * private channel, the only conversation where losing the membership really
+ * does revoke reading — is read from the loaded payload here, and nowhere
+ * else.
+ */
+function MemberRemovalDialog({
+  kind,
+  details,
+  conversationName,
+  removal,
+}: {
+  kind: "channel" | "group";
+  details: ConversationDetailsState["details"];
+  conversationName: string;
+  removal: MemberRemovalFlow;
+}) {
+  if (!removal.member) return null;
+  const isPrivateChannel =
+    details.status === "ready" &&
+    details.data.kind === "channel" &&
+    details.data.type === "private";
+  return (
+    <RemoveMemberDialog
+      kind={kind}
+      isPrivateChannel={isPrivateChannel}
+      conversationName={conversationName}
+      member={removal.member}
+      onClose={removal.cancel}
+      onConfirm={removal.confirm}
+    />
+  );
+}
+
+/**
  * The people section: the roster, the add-members flow that acts on it, and
  * nothing else (issues #398, #892).
  *
@@ -1051,6 +1248,7 @@ function rosterShortfall(details: ConversationDetailsState["details"]): {
 function PeopleSection({
   kind,
   details,
+  roster,
   currentUserId,
   copy,
   reload,
@@ -1058,6 +1256,8 @@ function PeopleSection({
 }: {
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
+  /** The channel's administrable membership section (issue #469). */
+  roster: ConversationDetailsState["roster"];
   currentUserId: string;
   copy: ConversationCopy;
   reload: () => void;
@@ -1068,7 +1268,7 @@ function PeopleSection({
   // unrepresentable: the panel is deliberately not remounted on a target
   // switch, so a boolean would survive one and let a dialog opened for A post
   // its selection to B.
-  const { id: targetId, canManage } = manageableTarget(details);
+  const { id: targetId, name: conversationName, canManage, canRemove } = manageableTarget(details);
 
   /*
     One subscription for the whole roster, scoped to this conversation, read
@@ -1084,11 +1284,24 @@ function PeopleSection({
     already resolved — see rosterItems.
   */
   const presence = usePresenceTarget(rosterPresenceKey(kind, targetId));
-  const shortfall = rosterShortfall(details);
 
   const addMembersButtonRef = useRef<HTMLButtonElement>(null);
   const [pickerFor, setPickerFor] = useState<string | null>(null);
   const [addedNotice, setAddedNotice] = useState<{ targetId: string; text: string } | null>(null);
+
+  // The removal flow, with focus landing on the add-members control once a
+  // removed row is gone: it is the one control in this section that outlives
+  // the list it acts on (issue #469).
+  const removal = useMemberRemoval({
+    kind,
+    targetId,
+    reload,
+    fallbackFocusRef: addMembersButtonRef,
+  });
+  const channelRoster = administrableRoster(kind, canRemove, roster);
+  const rowRemoval = rowRemovalFor(kind, canRemove, removal.request);
+  const shortfall = rosterShortfall(details, channelRoster);
+  const sectionWords = peopleSectionWords(copy, channelRoster);
 
   // Open only while the conversation it was opened for is still on screen. The
   // comparison closes it during render — the dialog unmounts, its
@@ -1096,28 +1309,30 @@ function PeopleSection({
   // goes with it. One structural mechanism, no effect.
   const pickerOpen = pickerFor !== null && pickerFor === targetId && targetId !== "";
 
-  const closePicker = useCallback(() => {
+  // Plain functions rather than useCallback: AddMembersDialog only calls them
+  // — it keeps neither in an effect's dependencies and is not memoized — so
+  // their identity buys nothing, and after issue #469 added a second flow to
+  // this section the compiler reports it can no longer preserve the
+  // memoization anyway.
+  function closePicker() {
     setPickerFor(null);
     // The button is only rendered while the caller may manage members, so the
     // ref can be detached by the time this runs (a refetch that revoked the
     // permission). Focusing a detached node would drop focus to <body>.
     addMembersButtonRef.current?.focus();
-  }, []);
+  }
 
-  const handleAdded = useCallback(
-    (result: AddMembersResult) => {
-      closePicker();
-      // The server's own numbers, never a local increment: someone else may have
-      // added people between the search and this response.
-      setAddedNotice({ targetId, text: addedText(copy, result.added) });
-      // The single reconciliation path: the response is not merged into the
-      // rendered list, the panel refetches. So the roster and both counters come
-      // from one authority, and a concurrent members.added refetching too cannot
-      // double-count anything.
-      reload();
-    },
-    [closePicker, copy, reload, targetId],
-  );
+  function handleAdded(result: AddMembersResult) {
+    closePicker();
+    // The server's own numbers, never a local increment: someone else may have
+    // added people between the search and this response.
+    setAddedNotice({ targetId, text: addedText(copy, result.added) });
+    // The single reconciliation path: the response is not merged into the
+    // rendered list, the panel refetches. So the roster and both counters come
+    // from one authority, and a concurrent members.added refetching too cannot
+    // double-count anything.
+    reload();
+  }
 
   return (
     <>
@@ -1130,15 +1345,21 @@ function PeopleSection({
       */}
       <ExpandableDetailsSection
         key={`people-${targetId}`}
-        title={copy.peopleHeading}
-        listLabel={copy.peopleLabel}
+        title={sectionWords.heading}
+        listLabel={sectionWords.label}
         /*
           Left undefined whenever the preview is the whole collection, which is
           what keeps "Ver todos" as the default wording for every section that
           can genuinely show everything.
         */
         expandLabel={shortfall.expandLabel}
-        content={peopleContent(kind, details, { presence, currentUserId, openDM })}
+        content={peopleContent({
+          kind,
+          details,
+          roster: channelRoster,
+          context: { presence, currentUserId, openDM },
+          removal: rowRemoval,
+        })}
       >
         {/*
           Named before the actions, directly under the list it is about: how many
@@ -1173,7 +1394,25 @@ function PeopleSection({
             {addedNotice.text}
           </p>
         )}
+        {removal.notice !== "" && (
+          /*
+            A removal is announced rather than only seen (issue #469): the row
+            it happened to is gone from the list, and focus has moved to the
+            control above — neither of which says anything to someone who is
+            not looking at the panel.
+          */
+          <p className="chat-details__note" role="status">
+            {removal.notice}
+          </p>
+        )}
       </ExpandableDetailsSection>
+
+      <MemberRemovalDialog
+        kind={kind}
+        details={details}
+        conversationName={conversationName}
+        removal={removal}
+      />
 
       {pickerOpen && (
         <AddMembersDialog
@@ -1212,6 +1451,7 @@ function ConversationBody({
   kind,
   details: rawDetails,
   files,
+  roster,
   currentUserId,
   latestPin,
   reload,
@@ -1221,6 +1461,8 @@ function ConversationBody({
   kind: "channel" | "group";
   details: ConversationDetailsState["details"];
   files: ConversationDetailsState["files"];
+  /** The channel's administrable membership (issue #469). */
+  roster: ConversationDetailsState["roster"];
   currentUserId: string;
   latestPin: PinnedItem | null;
   reload: () => void;
@@ -1247,6 +1489,7 @@ function ConversationBody({
       <PeopleSection
         kind={kind}
         details={details}
+        roster={roster}
         currentUserId={currentUserId}
         copy={copy}
         reload={reload}
@@ -1339,6 +1582,7 @@ export default function ConversationDetailsPanel({
 
   const details = state.details;
   const files = state.files;
+  const roster = state.roster;
 
   // Escape closes the panel (issue #467). It matters most where the panel covers
   // the conversation instead of sitting beside it, but the gesture is the same in
@@ -1391,6 +1635,7 @@ export default function ConversationDetailsPanel({
             kind={kind}
             details={details}
             files={files}
+            roster={roster}
             currentUserId={currentUserId}
             latestPin={latestPin}
             reload={state.reload}

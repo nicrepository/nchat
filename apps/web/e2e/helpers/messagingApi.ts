@@ -287,6 +287,15 @@ export interface MessagingScenario {
   // IDs were sent.
   addMembersRequests: Array<{ channelId: string; userIds: string[] }>;
   addMembersStatus: number;
+  // The administrable roster per channel id (issue #469). Absent means the
+  // server refuses the route, which is what a caller without the capability
+  // gets.
+  channelRosters: Map<string, ChannelRosterFixture>;
+  // Removals the app performed, and the status the mock should answer with
+  // (issue #469). Recording each one is what lets a spec assert that a double
+  // click sent exactly one request.
+  removeMemberRequests: Array<{ kind: TargetKind; targetId: string; userId: string }>;
+  removeMemberStatus: number;
   // Channel attachments per channel id, newest first, as the server returns them.
   channelAttachments: Map<string, AttachmentFixture[]>;
   // Group-details payload per conversation id (issue #441).
@@ -329,6 +338,13 @@ export interface GroupDetailsFixture {
    * reads as false and the action stays hidden.
    */
   can_manage_members: boolean;
+  /**
+   * Whether the server would let this caller remove another participant
+   * (issue #469). A different answer from the one above for a group — adding
+   * is open to every participant, removing is the creator's alone — so a
+   * spec has to set it deliberately.
+   */
+  can_remove_members?: boolean;
 }
 
 /**
@@ -390,6 +406,27 @@ export interface ChannelDetailsFixture {
    * reads as false and the action stays hidden.
    */
   can_manage_members: boolean;
+  /** Whether this caller may remove a member (issue #469). */
+  can_remove_members?: boolean;
+}
+
+/**
+ * One row of a channel's administrable membership (issue #469).
+ *
+ * No presence field: this list is membership, and who is connected is the
+ * realtime store's answer. That is the difference from ChannelMemberFixture
+ * above, which is the presence preview.
+ */
+export interface ChannelRosterMemberFixture {
+  user_id: string;
+  display_name: string;
+  role: "member" | "moderator";
+}
+
+/** GET /api/chat/channels/{id}/members (issue #469). */
+export interface ChannelRosterFixture {
+  member_count: number;
+  members: ChannelRosterMemberFixture[];
 }
 
 export interface AttachmentFixture {
@@ -568,6 +605,9 @@ export function createScenario(options: MessagingScenarioOptions): MessagingScen
     channelAttachments: new Map(),
     addMembersRequests: [],
     addMembersStatus: 200,
+    channelRosters: new Map(),
+    removeMemberRequests: [],
+    removeMemberStatus: 204,
     directProfiles: new Map(),
     conversationAttachments: new Map(),
   };
@@ -588,6 +628,7 @@ export function groupDetailsFixture(
   participants: GroupParticipantFixture[],
   participantCount = participants.length,
   canManageMembers = false,
+  canRemoveMembers = false,
 ): GroupDetailsFixture {
   return {
     id: conversation.id,
@@ -597,7 +638,22 @@ export function groupDetailsFixture(
     participant_count: participantCount,
     participants,
     can_manage_members: canManageMembers,
+    can_remove_members: canRemoveMembers,
   };
+}
+
+/**
+ * Default administrable roster for a channel (issue #469).
+ *
+ * memberCount defaults to the page's length and is overridable for the same
+ * reason every other total here is: the page is capped and the membership is
+ * not.
+ */
+export function channelRosterFixture(
+  members: ChannelRosterMemberFixture[],
+  memberCount = members.length,
+): ChannelRosterFixture {
+  return { member_count: memberCount, members };
 }
 
 /**
@@ -631,6 +687,7 @@ export function channelDetailsFixture(
   onlineMembers: ChannelMemberFixture[],
   memberCount = onlineMembers.length,
   canManageMembers = false,
+  canRemoveMembers = false,
 ): ChannelDetailsFixture {
   return {
     id: channel.id,
@@ -642,7 +699,52 @@ export function channelDetailsFixture(
     online_member_count: onlineMembers.length,
     online_members: onlineMembers,
     can_manage_members: canManageMembers,
+    can_remove_members: canRemoveMembers,
   };
+}
+
+/**
+ * Applies a committed channel removal to the fixture (issue #469): the roster
+ * row, the roster's total, the membership set and the details count all move
+ * together, because on the server they are one population.
+ */
+function removeChannelMemberFromFixture(
+  scenario: MessagingScenario,
+  channelId: string,
+  userId: string,
+): void {
+  const roster = scenario.channelRosters.get(channelId);
+  if (roster) {
+    const before = roster.members.length;
+    roster.members = roster.members.filter((member) => member.user_id !== userId);
+    if (roster.members.length !== before) roster.member_count -= 1;
+  }
+  scenario.channelMemberships.get(channelId)?.delete(userId);
+  const details = scenario.channelDetails.get(channelId);
+  if (details) {
+    const before = details.online_members.length;
+    details.online_members = details.online_members.filter((member) => member.user_id !== userId);
+    if (details.online_members.length !== before) details.online_member_count -= 1;
+    details.member_count = Math.max(0, details.member_count - 1);
+  }
+}
+
+/** The group counterpart of the helper above. */
+function removeGroupParticipantFromFixture(
+  scenario: MessagingScenario,
+  conversationId: string,
+  userId: string,
+): void {
+  scenario.groupMemberships.get(conversationId)?.delete(userId);
+  const details = scenario.groupDetails.get(conversationId);
+  if (!details) return;
+  const before = details.participants.length;
+  details.participants = details.participants.filter(
+    (participant) => participant.user_id !== userId,
+  );
+  if (details.participants.length !== before) {
+    details.participant_count = Math.max(0, details.participant_count - 1);
+  }
 }
 
 export function messagesFor(
@@ -1275,6 +1377,96 @@ async function installChannelDetailsMocks(
         },
       }),
     });
+  });
+
+  // GET /api/chat/channels/{id}/members (issue #469) — the administrable
+  // membership, which is a different population from the details panel's
+  // presence preview. No roster in the fixture means the server refused the
+  // route, which is exactly what a caller without the capability gets.
+  //
+  // Registered before the POST handler below because Playwright runs the most
+  // recently added matching route first; both fall back for a method they do
+  // not serve, so order only decides who looks first.
+  await page.route("**/api/chat/channels/*/members", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    if (!channelId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    const roster = scenario.channelRosters.get(channelId);
+    if (!roster) {
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "forbidden", message: "forbidden" } }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: roster }),
+    });
+  });
+
+  // DELETE /api/chat/channels/{id}/members/{userId} (issue #469).
+  //
+  // On success it mutates the scenario's own fixtures — the roster, its total
+  // and the details count — so the panel's refetch observes the removal the
+  // way it would against the real service. A mock that answered 204 without
+  // changing anything would let a broken reconciliation pass.
+  await page.route("**/api/chat/channels/*/members/*", async (route) => {
+    if (route.request().method() !== "DELETE") {
+      await route.fallback();
+      return;
+    }
+    const channelId = pathSegmentAfter(route.request().url(), "channels");
+    const userId = pathSegmentAfter(route.request().url(), "members");
+    if (!channelId || !userId || !assertConversationAccess(channelId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.removeMemberRequests.push({ kind: "channel", targetId: channelId, userId });
+    if (scenario.removeMemberStatus !== 204) {
+      await route.fulfill({
+        status: scenario.removeMemberStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+    removeChannelMemberFromFixture(scenario, channelId, userId);
+    await route.fulfill({ status: 204, body: "" });
+  });
+
+  // DELETE /api/chat/dm/{id}/participants/{userId} (issue #469), the group
+  // counterpart. Same fixture mutation, against the participant list.
+  await page.route("**/api/chat/dm/*/participants/*", async (route) => {
+    if (route.request().method() !== "DELETE") {
+      await route.fallback();
+      return;
+    }
+    const conversationId = pathSegmentAfter(route.request().url(), "dm");
+    const userId = pathSegmentAfter(route.request().url(), "participants");
+    if (!conversationId || !userId || !assertConversationAccess(conversationId)) {
+      await route.fulfill({ status: 404 });
+      return;
+    }
+    scenario.removeMemberRequests.push({ kind: "dm", targetId: conversationId, userId });
+    if (scenario.removeMemberStatus !== 204) {
+      await route.fulfill({
+        status: scenario.removeMemberStatus,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "denied", message: "denied" } }),
+      });
+      return;
+    }
+    removeGroupParticipantFromFixture(scenario, conversationId, userId);
+    await route.fulfill({ status: 204, body: "" });
   });
 
   // POST /api/chat/channels/{id}/members (issue #398).

@@ -351,6 +351,68 @@
   }
 }
 
+/*
+ * The row's destructive secondary action (issue #469).
+ *
+ * `flex: none` beside the identity region's `flex: 1` is what keeps it from
+ * displacing the avatar, the name or the status line: the identity keeps the
+ * whole remaining width and shrinks its own text, so a very long name
+ * ellipsises instead of pushing this button out of the panel. The panel is
+ * narrow at every breakpoint and narrower still on a phone, which is exactly
+ * where a shrinking control would become unusable.
+ *
+ * 36px is the drawn box and the 44px row height is the touch target around it,
+ * matching the identity region's own min-height so an administrable row is the
+ * same height as any other.
+ *
+ * Risk is not carried by colour alone. The icon is a "minus in a circle", the
+ * tooltip says "Remover membro", the accessible name names the person and the
+ * conversation, and the confirmation dialog states the consequence before
+ * anything happens — the red is the fourth signal, not the only one.
+ */
+.chat-details__member-remove {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--color-danger, #b42318);
+  cursor: pointer;
+}
+
+.chat-details__member-remove .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-details__member-remove:hover:not(:disabled) {
+  background: var(--color-danger-tint, #fdeceb);
+}
+
+.chat-details__member-remove:active:not(:disabled) {
+  background: var(--color-danger-tint-strong, #fbd9d6);
+}
+
+.chat-details__member-remove:focus-visible {
+  outline: 2px solid var(--color-danger, #b42318);
+  outline-offset: 2px;
+}
+
+.chat-details__member-remove:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat-details__member-remove {
+    transition: background-color 120ms ease-out;
+  }
+}
+
 .chat-details__avatar {
   position: relative;
   flex: none;

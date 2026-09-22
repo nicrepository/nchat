@@ -17,10 +17,12 @@ import type { ChannelAttachment, ChannelDetails, DirectDetails, GroupDetails } f
 
 const {
   mockFetchChannelDetails,
+  mockFetchChannelMembers,
   mockFetchGroupDetails,
   mockFetchDirectProfile,
   mockFetchChannelAttachments,
 } = vi.hoisted(() => ({
+  mockFetchChannelMembers: vi.fn(),
   mockFetchChannelDetails:
     vi.fn<(channelId: string, signal?: AbortSignal) => Promise<ChannelDetails>>(),
   mockFetchGroupDetails: vi.fn<(id: string, signal?: AbortSignal) => Promise<GroupDetails>>(),
@@ -38,6 +40,8 @@ const {
 vi.mock("./chatApi", () => ({
   fetchChannelDetails: (channelId: string, signal?: AbortSignal) =>
     mockFetchChannelDetails(channelId, signal),
+  fetchChannelMembers: (channelId: string, signal?: AbortSignal) =>
+    mockFetchChannelMembers(channelId, signal),
   fetchGroupDetails: (conversationId: string, signal?: AbortSignal) =>
     mockFetchGroupDetails(conversationId, signal),
   fetchDirectProfile: (conversationId: string, signal?: AbortSignal) =>
@@ -65,6 +69,7 @@ function details(overrides: Partial<ChannelDetails> = {}): ChannelDetails {
     memberCount: 3,
     onlineCount: 0,
     canManageMembers: false,
+    canRemoveMembers: false,
     onlineMembers: [],
     ...overrides,
   };
@@ -85,6 +90,7 @@ function attachment(id: string): ChannelAttachment {
 beforeEach(() => {
   mockFetchChannelDetails.mockResolvedValue(details());
   mockFetchChannelAttachments.mockResolvedValue([]);
+  mockFetchChannelMembers.mockResolvedValue({ memberCount: 0, members: [] });
 });
 
 afterEach(() => {
@@ -220,6 +226,7 @@ function group(overrides: Partial<GroupDetails> = {}): GroupDetails {
     participantCount: 4,
     participants: [],
     canManageMembers: false,
+    canRemoveMembers: false,
     ...overrides,
   };
 }
@@ -1450,5 +1457,83 @@ describe("useConversationDetails — metadata não vaza entre conversas", () => 
         section.status === "ready" && section.data.kind === "channel" && section.data.memberCount,
       ).toBe(9);
     });
+  });
+});
+
+// ── The administrable channel roster (issue #469) ───────────────────────────
+//
+// It is a third section of the same load, and the capability in the details
+// payload is what decides whether it is requested at all: a reader who cannot
+// remove anybody would otherwise spend a guaranteed 403 on every channel they
+// open.
+describe("useConversationDetails channel roster", () => {
+  it("does not ask for a roster the caller may not have", async () => {
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+    expect(mockFetchChannelMembers).not.toHaveBeenCalled();
+    expect(result.current.roster.status).toBe("loading");
+  });
+
+  it("loads the roster for a caller the server says may remove members", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details({ canRemoveMembers: true }));
+    mockFetchChannelMembers.mockResolvedValue({
+      memberCount: 2,
+      members: [{ userId: "u-1", displayName: "Ana", role: "member" }],
+    });
+
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+
+    await waitFor(() => expect(result.current.roster.status).toBe("ready"));
+    expect(mockFetchChannelMembers).toHaveBeenCalledWith("ch-1", expect.any(AbortSignal));
+    expect(result.current.roster).toEqual({
+      status: "ready",
+      data: { memberCount: 2, members: [{ userId: "u-1", displayName: "Ana", role: "member" }] },
+    });
+  });
+
+  // A refused or broken roster is its own failure. The details section is
+  // unaffected, so the panel still describes the channel and still shows the
+  // presence preview it already had.
+  it("keeps the details when the roster fails", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details({ canRemoveMembers: true }));
+    mockFetchChannelMembers.mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+
+    await waitFor(() => expect(result.current.roster.status).toBe("error"));
+    expect(result.current.details.status).toBe("ready");
+  });
+
+  it("never asks for a roster for a group or a direct conversation", async () => {
+    mockFetchGroupDetails.mockResolvedValue({
+      id: "conv-1",
+      name: "Time",
+      description: "",
+      createdAt: "2024-03-04T15:00:00Z",
+      participantCount: 2,
+      participants: [],
+      canManageMembers: true,
+      canRemoveMembers: true,
+    });
+
+    const { result } = renderHook(() => useConversationDetails({ kind: "group", id: "conv-1" }));
+
+    await waitFor(() => expect(result.current.details.status).toBe("ready"));
+    expect(mockFetchChannelMembers).not.toHaveBeenCalled();
+  });
+
+  // One reload refetches the whole panel: the roster and the counters beside
+  // it can never come from two different moments.
+  it("refetches the roster with the rest of the panel", async () => {
+    mockFetchChannelDetails.mockResolvedValue(details({ canRemoveMembers: true }));
+
+    const { result } = renderHook(() => useConversationDetails({ kind: "channel", id: "ch-1" }));
+
+    await waitFor(() => expect(result.current.roster.status).toBe("ready"));
+    act(() => result.current.reload());
+
+    await waitFor(() => expect(mockFetchChannelMembers).toHaveBeenCalledTimes(2));
+    expect(mockFetchChannelDetails).toHaveBeenCalledTimes(2);
   });
 });

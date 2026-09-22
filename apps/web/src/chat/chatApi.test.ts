@@ -22,6 +22,7 @@ import {
   forwardChannelMessage,
   ERR_INVALID_RESPONSE,
   fetchChannelDetails,
+  fetchChannelMembers,
   fetchDirectProfile,
   fetchGroupDetails,
   fetchChannelMessage,
@@ -54,6 +55,8 @@ import {
   searchChannelMemberCandidates,
   searchDMCandidates,
   searchGroupParticipantCandidates,
+  removeChannelMember,
+  removeGroupParticipant,
   renameChannel,
   setConversationMuted,
   setConversationNotificationMode,
@@ -2923,8 +2926,10 @@ describe("fetchChannelDetails", () => {
         },
       ],
       // Absent from this payload, so it must be false: an add-members action is
-      // never enabled by a field the server did not send (issue #398).
+      // never enabled by a field the server did not send (issue #398). The
+      // removal capability reads the same way (issue #469).
       canManageMembers: false,
+      canRemoveMembers: false,
     });
   });
 
@@ -3237,8 +3242,10 @@ describe("fetchGroupDetails (issue #441)", () => {
           presence: "online",
         },
       ],
-      // Absent in this payload, so the add action stays hidden (issue #398).
+      // Absent in this payload, so neither action is offered (issues #398,
+      // #469).
       canManageMembers: false,
+      canRemoveMembers: false,
     });
   });
 
@@ -4013,5 +4020,158 @@ describe("sidebar notification-level capability (issue #136)", () => {
     for (const capability of ["absent", false, null, "true", 1, {}]) {
       expect(await capabilityFor(capability)).toBe(false);
     }
+  });
+});
+
+// ── Channel roster and member removal (issue #469) ──────────────────────────
+
+describe("fetchChannelMembers", () => {
+  it("reads the administrable membership and encodes the channel in the path", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        member_count: 12,
+        members: [
+          { user_id: "u-1", display_name: "Álvaro", avatar_url: "/media/a.png", role: "moderator" },
+          { user_id: "u-2", display_name: "Juliane", role: "member" },
+        ],
+      },
+    });
+
+    const roster = await fetchChannelMembers("ch 1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(roster).toEqual({
+      // The server's own total, larger than the page it came with.
+      memberCount: 12,
+      members: [
+        { userId: "u-1", displayName: "Álvaro", avatarUrl: "/media/a.png", role: "moderator" },
+        { userId: "u-2", displayName: "Juliane", avatarUrl: undefined, role: "member" },
+      ],
+    });
+  });
+
+  // A roster row is membership, and nothing in it is trusted blindly: an
+  // unknown role reads as the least privileged one, an off-origin avatar is
+  // dropped, and a row without an id is not a person.
+  it("normalizes rows and drops the ones that are not identities", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        member_count: -3,
+        members: [
+          { user_id: "u-1", display_name: "Ana", role: "owner", avatar_url: "https://evil.test/a" },
+          { user_id: "", display_name: "Sem id", role: "member" },
+          null,
+        ],
+      },
+    });
+
+    const roster = await fetchChannelMembers("ch-1");
+
+    expect(roster.memberCount).toBe(0);
+    expect(roster.members).toEqual([
+      { userId: "u-1", displayName: "Ana", avatarUrl: undefined, role: "member" },
+    ]);
+  });
+
+  it("answers an empty roster for a payload without members", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: {} });
+
+    await expect(fetchChannelMembers("ch-1")).resolves.toEqual({ memberCount: 0, members: [] });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { member_count: 0, members: [] } });
+    const controller = new AbortController();
+
+    await fetchChannelMembers("ch-1", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // The route is refused for a caller who may not administer the channel, and
+  // that must reach the caller as a failure — never as "this channel has no
+  // members".
+  it("rejects when the server refuses the roster", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(fetchChannelMembers("ch-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("removeChannelMember", () => {
+  it("DELETEs the membership and encodes both identifiers", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeChannelMember("ch 1", "u/2");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members/u%2F2", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  // The request must carry nothing else. A workspace, an actor or a role in a
+  // body would mean this client believes it has authority it does not.
+  it("sends no body at all", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeChannelMember("ch-1", "u-2");
+
+    expect(mockAuthFetch.mock.calls[0][1]).toEqual({ method: "DELETE", signal: undefined });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    const controller = new AbortController();
+
+    await removeChannelMember("ch-1", "u-2", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("rejects with the API error so the dialog can say what happened", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(removeChannelMember("ch-1", "u-2")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("removeGroupParticipant", () => {
+  it("DELETEs the participation under the DM prefix", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeGroupParticipant("conv 1", "u 2");
+
+    // A group is a conversation: never /channels/.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/participants/u%202", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("sends no body at all", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeGroupParticipant("conv-1", "u-2");
+
+    expect(mockAuthFetch.mock.calls[0][1]).toEqual({ method: "DELETE", signal: undefined });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    const controller = new AbortController();
+
+    await removeGroupParticipant("conv-1", "u-2", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("rejects with the API error", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(removeGroupParticipant("conv-1", "u-2")).rejects.toBeInstanceOf(ApiRequestError);
   });
 });

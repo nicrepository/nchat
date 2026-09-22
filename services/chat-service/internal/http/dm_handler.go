@@ -175,6 +175,11 @@ type groupDetailsResponse struct {
 	// a rendering hint: POST .../members re-derives the decision in its own
 	// transaction.
 	CanManageMembers bool `json:"can_manage_members"`
+	// CanRemoveMembers (issue #469) is sent for the same reason and read the
+	// same way, and it is a genuinely different answer: adding is open to every
+	// participant, removing is the creator's alone. A client that folded the
+	// two would offer an action the store refuses.
+	CanRemoveMembers bool `json:"can_remove_members"`
 }
 
 // GroupDetails handles GET /api/chat/dm/{conversationID}/details.
@@ -251,6 +256,7 @@ func (h *DMHandler) groupDetailsBody(workspaceID string, details service.GroupDe
 		ParticipantCount:   details.ParticipantCount,
 		Participants:       participants,
 		CanManageMembers:   details.CanManageMembers,
+		CanRemoveMembers:   details.CanRemoveMembers,
 	}
 }
 

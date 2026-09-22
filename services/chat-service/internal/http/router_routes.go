@@ -153,6 +153,11 @@ func (r *routeSet) registerChannelRoutes(channels *ChannelHandler) {
 	// Channel details (issue #435) is a read, so it shares the listing budget
 	// rather than the write one: the panel refetches on every channel switch.
 	r.handle("GET "+RouteChannelDetails, r.list, channels.Details)
+	// The administrable roster (issue #469), on the same path add-members POSTs
+	// to because it is the same collection seen the other way round. Also a
+	// read, so also on the listing budget; the service refuses a caller who may
+	// not administer the channel before any row is read.
+	r.handle("GET "+RouteChannelMembers, r.list, channels.Members)
 	// Call-participant identity resolution (issue #612) carries its own budget
 	// inside the handler, like add-members.
 	r.handle("POST "+RouteChannelCallParticipants, nil, channels.CallParticipants)

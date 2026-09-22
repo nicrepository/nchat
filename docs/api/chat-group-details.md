@@ -151,3 +151,51 @@ Ficam em file-service, na rota de anexos da conversa
 (`GET /api/files/dm/{conversationID}/attachments`), documentada em
 [file-attachments.md](./file-attachments.md). A autorizacao e a mesma do upload
 em DM; um `channelID` nunca resolve na rota de conversa e vice-versa.
+
+## Remover um participante (issue #469, backend #685)
+
+| Metodo | Rota publica                                          | Descricao              |
+| ------ | ----------------------------------------------------- | ---------------------- |
+| DELETE | `/api/chat/dm/{conversationID}/participants/{userID}` | remove um participante |
+
+Prefixo proprio, e nao `/members/{userID}`, para deixar claro que a rota nomeia
+um alvo: `DELETE /api/chat/dm/{conversationID}/membership` continua sendo a
+saida do proprio chamador.
+
+**A autoridade e a criacao do grupo, nao a participacao.** Um grupo nao tem
+papel a consultar -- `chat.dm_members.role` e fechado por CHECK ao valor
+`'member'` --, entao o criador (`chat.dm_conversations.created_by`) e a unica
+autoridade mais estreita que "qualquer participante". Isto **difere** da adicao,
+que qualquer participante ativo pode fazer
+([chat-group-members.md](./chat-group-members.md)): as duas capacidades nao
+podem ser deduzidas uma da outra. A creatorship e re-derivada dentro da
+transacao, sobre a linha da conversa travada (`FOR SHARE`).
+
+- **Sem corpo.** Workspace e ator vem da sessao; a rota carrega apenas a
+  conversa e o alvo.
+- **Auto-remocao e recusada** com `400`: sair e `DELETE .../membership`.
+- **Idempotente:** um alvo que ja nao participa responde `204` e nao publica
+  evento algum.
+- **Transacional:** o `UPDATE chat.dm_members SET status = 'left'` e o evento
+  `conversation_member_removed` sao a mesma transacao, e o `conversation.event`
+  so e publicado apos o commit. Ordem de locks: conversa, participacao e
+  membership do ator, participacao do alvo.
+- **Resposta:** `204` sem corpo; o cliente reconcilia pelo refetch de
+  `GET .../details`.
+
+| Status | Codigo                | Quando                                                     |
+| ------ | --------------------- | ---------------------------------------------------------- |
+| 204    | --                    | removido, ou o alvo ja nao participava                     |
+| 400    | `bad_request`         | ID invalido, ou o alvo e o proprio chamador                |
+| 401    | `unauthorized`        | token ausente/invalido ou sessao inativa                   |
+| 403    | `forbidden`           | chamador nao e o criador, ou nao participa mais            |
+| 404    | `not_found`           | conversa inexistente, arquivada, de outro workspace ou 1:1 |
+| 429    | `rate_limited`        | orcamento de administracao de grupo excedido               |
+| 503    | `service_unavailable` | handler nao conectado                                      |
+
+### `can_remove_members` em `GET .../details`
+
+Campo booleano, sempre enviado: `true` somente para o criador do grupo. E o
+unico jeito de o painel saber que a acao existe sem reconstruir a regra, e e
+deliberadamente diferente de `can_manage_members` -- que num grupo e `true` para
+todo participante. Dica de renderizacao apenas: o DELETE reavalia a decisao.

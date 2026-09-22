@@ -141,6 +141,32 @@ func TestDMHandler_GroupDetails_SerializesTheAddParticipantsPermission(t *testin
 	}
 }
 
+// can_remove_members (issue #469) is a different answer from its neighbour and
+// is serialized separately: in a group, adding is open to every participant
+// while removing is the creator's alone.
+func TestDMHandler_GroupDetails_SerializesTheRemoveParticipantsPermission(t *testing.T) {
+	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
+		Conversation:     groupConversation(),
+		ParticipantCount: 1,
+		CanManageMembers: true,
+		CanRemoveMembers: false,
+	}}
+
+	rec := serveGroupDetails(t, groupDetailsHandler(provider), testConversationID)
+
+	data := detailsData(t, rec)
+	got, present := data["can_remove_members"].(bool)
+	if !present {
+		t.Fatalf("can_remove_members absent from the payload: %v", data)
+	}
+	if got {
+		t.Fatalf("can_remove_members = %v, want the service's own false", got)
+	}
+	if data["can_manage_members"] != true {
+		t.Fatalf("the add capability must be unaffected: %v", data)
+	}
+}
+
 func TestDMHandler_GroupDetails_OmitsPresenceWhenNotTracked(t *testing.T) {
 	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
 		Conversation:     groupConversation(),

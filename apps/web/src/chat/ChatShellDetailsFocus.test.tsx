@@ -147,6 +147,7 @@ function setServerChannelName(name: string) {
     onlineCount: 0,
     onlineMembers: [],
     canManageMembers: false,
+    canRemoveMembers: false,
   });
 }
 
@@ -182,6 +183,7 @@ beforeEach(() => {
     onlineCount: 0,
     onlineMembers: [],
     canManageMembers: false,
+    canRemoveMembers: false,
   });
   vi.mocked(fetchConversationAttachments).mockResolvedValue([]);
 });
