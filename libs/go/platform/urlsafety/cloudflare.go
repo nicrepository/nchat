@@ -164,7 +164,15 @@ type submitResponse struct {
 // those two the same value.
 type resultResponse struct {
 	Task struct {
-		UUID    string `json:"uuid"`
+		UUID string `json:"uuid"`
+		// URL is the address the provider says it scanned.
+		//
+		// Read only by the evidence-reuse path (issue #928), and there it is
+		// load-bearing: reuse adopts a scan found by a search, so the report has
+		// to prove for itself that it describes the URL being asked about. The
+		// polling path does not need it — it is reading back a scan id this
+		// deployment created for a known URL — and does not consult it.
+		URL     string `json:"url"`
 		Success *bool  `json:"success"`
 		// Status is the provider's own lifecycle label for the scan (observed
 		// value: "finished"). It is what distinguishes a terminal report with no
@@ -338,36 +346,53 @@ func (c *CloudflareScanner) GetScanReport(
 func (c *CloudflareScanner) scanReport(
 	ctx context.Context, scanID string,
 ) (Verdict, time.Time, string, error) {
+	decoded, err := c.fetchScanReport(ctx, scanID)
+	if err != nil {
+		return VerdictUnknown, time.Time{}, "", err
+	}
+	verdict, err := verdictFromReport(decoded, scanID)
+	return verdict, reportEvidenceTime(decoded), reportRefusalReason(decoded), err
+}
+
+// fetchScanReport reads one scan's report off the wire and decodes it.
+//
+// It is the transport half only: it decides nothing about the scan, and the two
+// callers — ordinary polling and evidence reuse — apply their own checks to what
+// it returns. Splitting it out is what keeps the strict verdict rules in one
+// place while letting reuse add the extra identity check it needs, rather than
+// growing a second HTTP path that could drift from this one's status handling.
+func (c *CloudflareScanner) fetchScanReport(
+	ctx context.Context, scanID string,
+) (resultResponse, error) {
 	if strings.TrimSpace(scanID) == "" {
-		return VerdictUnknown, time.Time{}, "", ErrUnavailable
+		return resultResponse{}, ErrUnavailable
 	}
 	endpoint := c.accountPath("/urlscanner/v2/result/" + url.PathEscape(scanID))
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return VerdictUnknown, time.Time{}, "", ErrUnavailable
+		return resultResponse{}, ErrUnavailable
 	}
 	c.authorize(request)
 
 	response, err := c.do(ctx, request)
 	if err != nil {
-		return VerdictUnknown, time.Time{}, "", err
+		return resultResponse{}, err
 	}
 	defer func() { _ = response.Body.Close() }()
 
 	// The documented progress signal is the status code: 404 while the scan is
 	// in progress, 200 once it is finished.
 	if response.StatusCode == http.StatusNotFound {
-		return VerdictUnknown, time.Time{}, "", ErrScanPending
+		return resultResponse{}, ErrScanPending
 	}
 	if response.StatusCode != http.StatusOK {
-		return VerdictUnknown, time.Time{}, "", ErrUnavailable
+		return resultResponse{}, ErrUnavailable
 	}
 	var decoded resultResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
-		return VerdictUnknown, time.Time{}, "", ErrUnavailable
+		return resultResponse{}, ErrUnavailable
 	}
-	verdict, err := verdictFromReport(decoded, scanID)
-	return verdict, reportEvidenceTime(decoded), reportRefusalReason(decoded), err
+	return decoded, nil
 }
 
 // cloudflareMessage is one entry of the provider's error list. Only the text is

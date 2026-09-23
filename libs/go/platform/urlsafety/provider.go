@@ -60,6 +60,21 @@ type ReputationResult struct {
 	// ThreatCategories is provider-specific detail about a condemnation. It is
 	// never shown to a user and never a label.
 	ThreatCategories []string
+	// ExpiresAt is when the provider says this evidence stops being current.
+	// Zero means the provider did not state a limit.
+	//
+	// It is a *ceiling*, never an extension (issue #928). A verdict is evidence
+	// with a lifetime, and the lifetime is the shorter of what the provider
+	// grants and what this deployment is willing to reuse — so a stated expiry
+	// can only ever make a verdict expire sooner than VerdictTTL, and a zero
+	// value leaves VerdictTTL in charge. Nothing anywhere multiplies the two or
+	// takes the longer one.
+	//
+	// It does not decide which way an expired verdict resolves. Expiry means the
+	// evidence is gone, not that the URL became safe: the pipeline reopens the
+	// target and asks again. See Service.settleCheck and
+	// PGXMessageStore.ReopenExpiredVerdicts.
+	ExpiresAt time.Time
 	// Reason narrows a non-answer to one of the closed categories in reason.go,
 	// when the provider said enough to tell them apart.
 	//
@@ -120,12 +135,7 @@ func (c *CloudflareScanner) Check(
 ) (ReputationResult, error) {
 	result := ReputationResult{Provider: c.Name()}
 	if strings.TrimSpace(providerRef) == "" {
-		scanID, err := c.SubmitScan(ctx, canonicalURL)
-		if err != nil {
-			return result, err
-		}
-		result.ProviderRef = scanID
-		return result, ErrCheckInProgress
+		return c.startCheck(ctx, canonicalURL, result)
 	}
 	result.ProviderRef = providerRef
 	verdict, evidence, refusal, err := c.scanReport(ctx, providerRef)
@@ -142,6 +152,52 @@ func (c *CloudflareScanner) Check(
 	result.CheckedAt = evidence
 	result.Verdict, err = reputationFromVerdict(verdict)
 	return result, err
+}
+
+// startCheck is the first attempt at a URL: reuse before submit (issue #928).
+//
+// The order is the whole point. A POST creates a billed scan and is the thing
+// the provider's hostname budget refuses, so asking whether the answer already
+// exists costs one cheap search and, in the case that motivated this issue —
+// the hostname was scanned recently *because this URL was* — produces a verdict
+// where a submission would produce only a refusal.
+//
+// A failed search is not a reason to stop. It leaves the same uncertainty the
+// caller had before asking, and no submission is outstanding yet, so the
+// ordinary path continues; the pipeline's own intent record is what keeps a
+// submission from being made twice. That is the opposite of reconciliation's
+// rule, and deliberately: there, a throttled search mistaken for absence buys a
+// duplicate scan, because a submission *is* outstanding.
+//
+// Nothing here can produce a clearance the polling path would not. The verdict
+// comes from a full report through verdictFromReport, the same function, and
+// evidence older than VerdictTTL is refused before it is ever returned.
+func (c *CloudflareScanner) startCheck(
+	ctx context.Context, canonicalURL string, result ReputationResult,
+) (ReputationResult, error) {
+	switch evidence, err := c.FindReusableEvidence(ctx, canonicalURL, VerdictTTL); {
+	case err == nil:
+		result.ProviderRef = evidence.UUID
+		result.CheckedAt = evidence.ObservedAt
+		result.Verdict, err = reputationFromVerdict(evidence.Verdict)
+		return result, err
+	case ctx.Err() != nil:
+		// The caller went away. Not a fact about the URL, and not a reason to
+		// spend a submission on its behalf.
+		return result, ctx.Err()
+	}
+	scanID, err := c.SubmitScan(ctx, canonicalURL)
+	if err != nil {
+		// Including a hostname-limit refusal. The search above already asked
+		// whether reusable evidence existed and it did not, so asking again now
+		// would be the duplicate lookup with none of the new information. The
+		// exchange fails, the pipeline retries on its own schedule, and the
+		// target converges to UNKNOWN at its deadline — bounded, and never a
+		// clearance.
+		return result, err
+	}
+	result.ProviderRef = scanID
+	return result, ErrCheckInProgress
 }
 
 // reputationFromVerdict maps the scanner's Verdict onto the provider contract.
