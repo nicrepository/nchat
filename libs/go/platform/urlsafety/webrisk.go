@@ -132,12 +132,14 @@ func (w *WebRiskProvider) Name() string { return ProviderGoogleWebRisk }
 type webRiskResponse struct {
 	Threat *struct {
 		ThreatTypes []string `json:"threatTypes"`
-		// ExpireTime is when Google says the match stops being current. It is
-		// read so the shape is understood rather than silently ignored, and it is
-		// deliberately not used to shorten a condemnation: this package caches a
-		// malicious verdict for VerdictTTL, fifteen minutes, which is already far
-		// inside any expiry Web Risk issues, and shortening a *refusal* grants
-		// permission rather than withdrawing it.
+		// ExpireTime is when Google says the match stops being current, RFC3339.
+		//
+		// It bounds the condemnation it arrives with: a threat match may only
+		// found a MALICIOUS verdict while the evidence is still current, so the
+		// verdict's lifetime is the shorter of this and VerdictTTL. See
+		// webRiskEvidenceExpiry for what an absent, unparseable or already-past
+		// value means, and why none of those can turn a condemnation into a
+		// clearance.
 		ExpireTime string `json:"expireTime"`
 	} `json:"threat"`
 }
@@ -185,7 +187,7 @@ func (w *WebRiskProvider) Check(
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
 		return result, unavailable(reasonMalformed)
 	}
-	result.Verdict, result.ThreatCategories, err = webRiskVerdict(decoded)
+	result.Verdict, result.ThreatCategories, result.ExpiresAt, err = webRiskVerdict(decoded, time.Now())
 	return result, err
 }
 
@@ -233,7 +235,8 @@ func webRiskStatusReason(status int) string {
 	}
 }
 
-// webRiskVerdict turns a decoded lookup into a verdict.
+// webRiskVerdict turns a decoded lookup into a verdict and the evidence
+// lifetime that comes with it.
 //
 // Absent threat is the clearance, and it is the *only* clearance: it is reached
 // solely from a 200 whose body parsed as exactly one document, which is what
@@ -241,20 +244,74 @@ func webRiskStatusReason(status int) string {
 // names no recognised type is refused rather than read in either direction — it
 // is neither the "no match" shape nor the "match" shape, so it is a response
 // this client does not understand.
-func webRiskVerdict(decoded webRiskResponse) (ReputationVerdict, []string, error) {
+//
+// A clearance carries no provider-stated expiry: Web Risk says when a *match*
+// stops being current, not how long an absence of one lasts, and inventing a
+// lifetime for the second from the first would be a clearance this deployment
+// granted itself. VerdictTTL governs it, as it always has.
+func webRiskVerdict(
+	decoded webRiskResponse, now time.Time,
+) (ReputationVerdict, []string, time.Time, error) {
 	if decoded.Threat == nil {
-		return ReputationSafe, nil, nil
+		return ReputationSafe, nil, time.Time{}, nil
 	}
+	matched := matchedThreatTypes(decoded.Threat.ThreatTypes)
+	if len(matched) == 0 {
+		return ReputationUnknown, nil, time.Time{}, unavailable(reasonMalformed)
+	}
+	expiresAt, err := webRiskEvidenceExpiry(decoded.Threat.ExpireTime, now)
+	if err != nil {
+		return ReputationUnknown, nil, time.Time{}, err
+	}
+	return ReputationMalicious, matched, expiresAt, nil
+}
+
+// matchedThreatTypes reports which of the types this deployment asked about the
+// provider actually named. A type nobody asked about is ignored rather than
+// acted on: the question decides the answer's meaning.
+func matchedThreatTypes(reported []string) []string {
 	matched := make([]string, 0, len(webRiskThreatTypes))
-	for _, threatType := range decoded.Threat.ThreatTypes {
+	for _, threatType := range reported {
 		for _, configured := range webRiskThreatTypes {
 			if strings.EqualFold(strings.TrimSpace(threatType), configured) {
 				matched = append(matched, configured)
 			}
 		}
 	}
-	if len(matched) == 0 {
-		return ReputationUnknown, nil, unavailable(reasonMalformed)
+	return matched
+}
+
+// webRiskEvidenceExpiry reads how long a threat match stays current.
+//
+// Three cases, and the reasoning for each is about what the *pipeline* does
+// with the answer, not about which one feels stricter in isolation:
+//
+//   - absent: the provider stated no limit, so VerdictTTL alone governs. Zero
+//     is returned rather than a guess. This is not a relaxation: fifteen
+//     minutes is far inside any expiry Web Risk actually issues, so the
+//     fallback is the more conservative of the two either way;
+//   - unparseable: refused as malformed, exactly like a threat naming no type
+//     and exactly like trailing data in the body. A field this client cannot
+//     read is a response it does not understand, and it has one rule for those.
+//     Refusing does not lose the block — a refused exchange is retried, and a
+//     provider that keeps answering unreadably opens the breaker and the target
+//     converges to UNKNOWN at its deadline. UNKNOWN is an interstitial: no
+//     href, no preview. There is no path from here to a clearance;
+//   - already past: the match describes a threat the provider itself says is no
+//     longer current, so it cannot found a condemnation now. Refused for the
+//     same reason and with the same consequence — the next lookup asks again
+//     and gets whatever is true then.
+func webRiskEvidenceExpiry(raw string, now time.Time) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, nil
 	}
-	return ReputationMalicious, matched, nil
+	expiresAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, unavailable(reasonMalformed)
+	}
+	if !expiresAt.After(now) {
+		return time.Time{}, unavailable(reasonMalformed)
+	}
+	return expiresAt, nil
 }

@@ -291,7 +291,7 @@ func (s *Service) settleCheck(canonicalURL string, result ReputationResult, err 
 	}
 	switch result.Verdict {
 	case ReputationSafe, ReputationMalicious:
-		s.cache.set(canonicalURL, result.Verdict.LegacyVerdict(), VerdictTTL)
+		s.cache.set(canonicalURL, result.Verdict.LegacyVerdict(), s.evidenceLifetime(result))
 		s.observe(string(result.Verdict))
 		return result, nil
 	case ReputationUnknown:
@@ -304,6 +304,79 @@ func (s *Service) settleCheck(canonicalURL string, result ReputationResult, err 
 		s.observe(resultError)
 		return ReputationResult{}, ErrUnavailable
 	}
+}
+
+// evidenceLifetime is how long one provider answer may be reused: VerdictTTL,
+// or less when the provider stated a shorter limit (issue #928).
+//
+// The shorter of the two, always, and never the longer. VerdictTTL is what this
+// deployment is willing to reuse; ExpiresAt is what the provider is willing to
+// stand behind. Exceeding either would be reusing evidence somebody has already
+// said is finished.
+//
+// A non-positive result is a caller's answer that is already expired, and
+// cache.set refuses it — an entry that cannot be served is not written.
+func (s *Service) evidenceLifetime(result ReputationResult) time.Duration {
+	if result.ExpiresAt.IsZero() {
+		return VerdictTTL
+	}
+	stated := result.ExpiresAt.Sub(s.cache.now())
+	if stated < VerdictTTL {
+		return stated
+	}
+	return VerdictTTL
+}
+
+// ErrSecondaryUnsupported reports a provider with no second source to ask. It
+// is a working deployment: there is simply no background verification to run.
+var ErrSecondaryUnsupported = errors.New("url safety: provider has no secondary source")
+
+// secondaryChecker is the optional half a composed provider exposes.
+type secondaryChecker interface {
+	CheckSecondary(ctx context.Context, canonicalURL, providerRef string) (ReputationResult, error)
+}
+
+// CheckSecondary asks the secondary source about a URL the primary already
+// decided (issue #928).
+//
+// The cache rule here is the whole reason this is not Check, and it is
+// deliberately asymmetric:
+//
+//   - a condemnation is written to the cache, because it must displace the
+//     clearance that is sitting there. Without it, Lookup would keep answering
+//     "safe" for the rest of VerdictTTL about a URL this deployment has just
+//     decided is malicious;
+//   - a clearance, a terminal non-answer and every failure write nothing. The
+//     primary's answer is already cached, it is still the verdict of record, and
+//     a second opinion that agreed, abstained or could not be obtained has
+//     changed nothing about it. In particular a failure must not cache
+//     VerdictUnknown the way a failed Check does — that would erase a live
+//     clearance because a background double-check timed out.
+func (s *Service) CheckSecondary(
+	ctx context.Context, canonicalURL, providerRef string,
+) (ReputationResult, error) {
+	verifier, ok := s.provider.(secondaryChecker)
+	if !ok {
+		return ReputationResult{}, ErrSecondaryUnsupported
+	}
+	if !s.breaker.Allow() {
+		s.observe(resultCircuitOpen)
+		return ReputationResult{}, ErrCircuitOpen
+	}
+	result, err := verifier.CheckSecondary(ctx, canonicalURL, providerRef)
+	s.breaker.Complete(breakerOutcome(ctx, err))
+	if ctx.Err() != nil {
+		return ReputationResult{}, ctx.Err()
+	}
+	if err != nil {
+		s.observe(resultError)
+		return ReputationResult{}, err
+	}
+	if result.Verdict == ReputationMalicious {
+		s.cache.set(canonicalURL, VerdictMalicious, s.evidenceLifetime(result))
+	}
+	s.observe(string(result.Verdict))
+	return result, nil
 }
 
 // Lookup answers from memory only, and never blocks.
