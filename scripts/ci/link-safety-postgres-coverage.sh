@@ -40,6 +40,10 @@ case "$MODULE" in
   services/chat-service)
     dsn_var="CHAT_TEST_DATABASE_URL"
     package="./internal/storage"
+    # Every PostgreSQL test declared in these files must be named above. See the
+    # guard below for why the check is scoped to a glob rather than to the
+    # package.
+    required_glob="internal/storage/link_*_postgres_test.go"
     tests=(
       TestLinkScanAdmissionPostgreSQL
       TestPendingMessageVisibilityPostgreSQL
@@ -55,6 +59,9 @@ case "$MODULE" in
       TestLinkReconcileEvidenceAgePostgreSQL
       TestLinkEvidenceExpiryPostgreSQL
       TestLinkSecondaryVerificationPostgreSQL
+      TestExpiredProviderEvidenceIsNeverActedOnPostgreSQL
+      TestSecondaryLaneWritesBelongToTheirAttemptPostgreSQL
+      TestSecondaryCondemnationRequiresALiveClearancePostgreSQL
       TestLinkSafetyCheckValidationDoesNotBlockWritersPostgreSQL
       TestCrossServiceReconcileLeasePostgreSQL
       TestCrossServiceTwoURLLeaseOrderPostgreSQL
@@ -384,6 +391,39 @@ case "$MODULE" in
     exit 1
     ;;
 esac
+
+# The list catches a renamed test; it cannot catch one that was never added.
+#
+# That is the hole the second Code Quality review found: the two regressions
+# proving the first review's blockers passed when run by hand and were in no
+# CI profile at all, because nothing compared the list against the tests that
+# exist.
+#
+# The guard is a glob and not the whole package on purpose. Discovering every
+# *_postgres_test.go would drag in the suites this file exists to keep apart —
+# chat-service's own older suites drop and recreate the `chat` schema, and
+# file-service's upload-admission suite takes advisory locks and does not
+# finish. The link-safety files are one coherent suite that already runs
+# together, so "everything in them is measured" is both true and worth
+# asserting.
+if [ -n "${required_glob:-}" ]; then
+  declared="$(
+    cd "$ROOT_DIR/$MODULE"
+    # shellcheck disable=SC2086 # required_glob is a package constant, expanded on purpose.
+    grep -hoE '^func (Test[A-Za-z0-9_]*PostgreSQL)' $required_glob |
+      sed 's/^func //' | LC_ALL=C sort -u
+  )"
+  missing=""
+  while IFS= read -r test_name; do
+    [ -n "$test_name" ] || continue
+    printf '%s\n' "${tests[@]}" | grep -Fxq -- "$test_name" || missing="$missing $test_name"
+  done <<<"$declared"
+  if [ -n "$missing" ]; then
+    echo "PostgreSQL tests in $required_glob are not measured by $MODULE:$missing" >&2
+    echo "Add them to the list in $(basename "${BASH_SOURCE[0]}"), or this coverage is a lie." >&2
+    exit 1
+  fi
+fi
 
 # `go test -run` succeeds when a named test was renamed or removed. Refuse that
 # silent coverage hole by checking every exact name before running the suite.
