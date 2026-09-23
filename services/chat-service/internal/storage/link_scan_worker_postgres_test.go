@@ -224,7 +224,7 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 			t.Fatalf("a scan still running produced %v", verdicts)
 		}
 
-		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-good", urlsafety.VerdictSafe); err != nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: goodURL, ScanUUID: "scan-good", Verdict: urlsafety.VerdictSafe}); err != nil {
 			t.Fatalf("RecordLinkVerdict: %v", err)
 		}
 		verdicts, err = store.LoadLinkVerdicts(ctx, []string{goodURL})
@@ -332,7 +332,7 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		if err := store.RecordLinkScanSubmission(ctx, goodURL, "scan-inconclusive", generation); err != nil {
 			t.Fatalf("RecordLinkScanSubmission: %v", err)
 		}
-		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-inconclusive", urlsafety.VerdictInconclusive); err != nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: goodURL, ScanUUID: "scan-inconclusive", Verdict: urlsafety.VerdictInconclusive}); err != nil {
 			t.Fatalf("RecordLinkVerdict(inconclusive): %v", err)
 		}
 		var status string
@@ -547,7 +547,7 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 				t.Fatal("the shared url was claimed a second time before it was decided")
 			}
 		}
-		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-shared", urlsafety.VerdictInconclusive); err != nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: goodURL, ScanUUID: "scan-shared", Verdict: urlsafety.VerdictInconclusive}); err != nil {
 			t.Fatalf("RecordLinkVerdict(inconclusive): %v", err)
 		}
 
@@ -621,7 +621,7 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		}
 		// A verdict is bound to the scan it came from, so an answer about a scan
 		// this row no longer carries decides nothing.
-		if err := store.RecordLinkVerdict(ctx, goodURL, "scan-stale", urlsafety.VerdictSafe); !errors.Is(err, storage.ErrLinkScanConflict) {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: goodURL, ScanUUID: "scan-stale", Verdict: urlsafety.VerdictSafe}); !errors.Is(err, storage.ErrLinkScanConflict) {
 			t.Fatalf("RecordLinkVerdict for a superseded scan: %v, want ErrLinkScanConflict", err)
 		}
 		// And a second submission finds the id already bound.
@@ -637,7 +637,7 @@ func TestLinkScanWorkerLifecyclePostgreSQL(t *testing.T) {
 		if err := store.EnsureLinkScans(ctx, []string{goodURL}); err != nil {
 			t.Fatalf("EnsureLinkScans: %v", err)
 		}
-		err := store.RecordLinkVerdict(ctx, goodURL, "scan-any", urlsafety.VerdictUnknown)
+		err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: goodURL, ScanUUID: "scan-any", Verdict: urlsafety.VerdictUnknown})
 		if !errors.Is(err, domain.ErrInvalidInput) {
 			t.Fatalf("RecordLinkVerdict(unknown) = %v, want ErrInvalidInput", err)
 		}

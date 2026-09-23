@@ -62,13 +62,6 @@ spec:
             - secretRef:
                 name: nchat-file-encryption
                 optional: true
-            # RF-21: the Cloudflare URL Scanner credentials for link previews.
-            # Shared with chat-service, scoped to the two services that call
-            # Cloudflare, and optional for the same reason as above — the flag
-            # decides, and an enabled flag with no credentials stops start-up.
-            - secretRef:
-                name: nchat-link-safety
-                optional: true
           env:
             - name: PORT
               value: "8083"
@@ -76,6 +69,31 @@ spec:
               value: file-service
             - name: DOCUMENT_CONVERTER_URL
               value: http://document-converter:8089
+            # RF-21: the Cloudflare URL Scanner credentials for link previews.
+            #
+            # Named key by key rather than mounted with envFrom, which is the
+            # change issue #928 required. The Secret is shared with chat-service,
+            # and it now also holds that service's Google Web Risk key —
+            # file-service has no Web Risk call site, so mounting the Secret
+            # wholesale would hand it a credential it can only ever leak. These
+            # are the two keys this service actually reads.
+            #
+            # Optional for the same reason the shared mounts above are: with
+            # FILE_LINK_SAFETY_ENABLED=false no credential is needed, and with
+            # the flag on an absent value stops start-up in Config.Validate
+            # rather than silently disabling the check.
+            - name: FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: FILE_LINK_SAFETY_CLOUDFLARE_ACCOUNT_ID
+                  optional: true
+            - name: FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nchat-link-safety
+                  key: FILE_LINK_SAFETY_CLOUDFLARE_API_TOKEN
+                  optional: true
           ports:
             - name: http
               containerPort: 8083

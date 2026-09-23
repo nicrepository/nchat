@@ -323,7 +323,7 @@ func TestRecordLinkVerdictMaliciousInvalidationPostgreSQL(t *testing.T) {
 
 	t.Run("malicious poll atomically revokes old and new readers", func(t *testing.T) {
 		reset(t, "pending", "chat-poll")
-		if err := store.RecordLinkVerdict(ctx, url, "chat-poll", urlsafety.VerdictMalicious); err != nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: url, ScanUUID: "chat-poll", Verdict: urlsafety.VerdictMalicious}); err != nil {
 			t.Fatalf("RecordLinkVerdict: %v", err)
 		}
 		status, denied, legacySafe, currentSafe := readAuthority(t)
@@ -334,7 +334,7 @@ func TestRecordLinkVerdictMaliciousInvalidationPostgreSQL(t *testing.T) {
 
 	t.Run("failed scan uuid CAS creates no denial", func(t *testing.T) {
 		reset(t, "pending", "chat-current")
-		if err := store.RecordLinkVerdict(ctx, url, "chat-stale", urlsafety.VerdictMalicious); err == nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: url, ScanUUID: "chat-stale", Verdict: urlsafety.VerdictMalicious}); err == nil {
 			t.Fatal("stale scan uuid unexpectedly recorded a verdict")
 		}
 		status, denied, legacySafe, currentSafe := readAuthority(t)
@@ -345,7 +345,7 @@ func TestRecordLinkVerdictMaliciousInvalidationPostgreSQL(t *testing.T) {
 
 	t.Run("failed status CAS creates no denial", func(t *testing.T) {
 		reset(t, "safe", "chat-poll")
-		if err := store.RecordLinkVerdict(ctx, url, "chat-poll", urlsafety.VerdictMalicious); err == nil {
+		if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: url, ScanUUID: "chat-poll", Verdict: urlsafety.VerdictMalicious}); err == nil {
 			t.Fatal("a decided row unexpectedly accepted another verdict")
 		}
 		status, denied, legacySafe, currentSafe := readAuthority(t)
@@ -357,7 +357,10 @@ func TestRecordLinkVerdictMaliciousInvalidationPostgreSQL(t *testing.T) {
 	for _, verdict := range []urlsafety.Verdict{urlsafety.VerdictSafe, urlsafety.VerdictInconclusive} {
 		t.Run(string(verdict)+" does not touch the denylist", func(t *testing.T) {
 			reset(t, "pending", "chat-poll")
-			if err := store.RecordLinkVerdict(ctx, url, "chat-poll", verdict); err != nil {
+			write := storage.LinkVerdictWrite{
+				CanonicalURL: url, ScanUUID: "chat-poll", Verdict: verdict,
+			}
+			if err := store.RecordLinkVerdict(ctx, write); err != nil {
 				t.Fatalf("RecordLinkVerdict: %v", err)
 			}
 			status, denied, legacySafe, currentSafe := readAuthority(t)

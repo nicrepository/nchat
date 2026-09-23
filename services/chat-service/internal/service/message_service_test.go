@@ -245,7 +245,7 @@ func (f *fakeMessageStore) ReserveProviderSubmit(_ context.Context, _ int, _ tim
 
 func (f *fakeMessageStore) PruneLinkScanBudget(_ context.Context, _ time.Duration) error { return nil }
 
-func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+func (f *fakeMessageStore) RecordLinkVerdict(_ context.Context, _ storage.LinkVerdictWrite) error {
 	return nil
 }
 

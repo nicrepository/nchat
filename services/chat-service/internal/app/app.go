@@ -280,24 +280,36 @@ func wireLinkSafety(
 // wireReputationProvider builds the provider behind the abstraction, or nil
 // with the flag off. Config.Validate already refuses missing credentials; this
 // is the second lock on the same door.
+//
+// Since issue #928 the provider is a composition: Google Web Risk answers first
+// and Cloudflare URL Scanner answers when it cannot. Both clients are built
+// before either is used, so a deployment with a bad credential fails at
+// start-up rather than at the first link somebody sends — the same rule the
+// single-provider wiring had, applied to both halves.
 func wireReputationProvider(cfg config.Config, metrics *observability.Metrics) (*urlsafety.Service, error) {
 	if !cfg.LinkSafetyEnabled {
 		return nil, nil
+	}
+	// Every constructor error below is flattened into one fixed value. Their own
+	// messages name no credential, but a message that varies with which
+	// credential was missing is itself a fact about the secrets, so nothing
+	// about them can reach a log through this return.
+	primary, err := urlsafety.NewWebRiskProvider(cfg.LinkSafetyGoogleWebRiskKey)
+	if err != nil {
+		return nil, errLinkSafetyUnwired
 	}
 	scanner, err := urlsafety.NewCloudflareScanner(
 		cfg.LinkSafetyCloudflareAccount, cfg.LinkSafetyCloudflareToken,
 	)
 	if err != nil {
-		// The constructor's message names no value, but it is not repeated
-		// either: this returns a fixed error so nothing about the credentials
-		// can reach a log through it.
 		return nil, errLinkSafetyUnwired
 	}
-	// The shared counter, registered on this service's own registry so
-	// chat-service reports verdict outcomes exactly as file-service does. Its
-	// labels are the closed set the shared package defines; no URL, host, user or
-	// message id is ever one. The circuit breaker lives inside this service.
-	return urlsafety.NewService(scanner, urlsafety.NewMetrics(metrics)), nil
+	// The shared counters, registered on this service's own registry so
+	// chat-service reports verdict outcomes exactly as file-service does. Their
+	// labels are the closed sets the shared package defines; no URL, host, user,
+	// message id or credential is ever one. The circuit breakers live inside this
+	// service: one in front of the composition, one in front of the primary.
+	return urlsafety.NewFallbackService(primary, scanner, urlsafety.NewMetrics(metrics)), nil
 }
 
 // wireScanWorkers builds the scan worker — always, so the deadline sweep runs —

@@ -264,6 +264,59 @@ test.describe("links por alvo e previews (issue #807)", () => {
     await expect(anchorFor(page, messageId, OTHER_URL)).toBeVisible();
   });
 
+  test("queda total dos dois providers: pendente vira interstitial, não fica verificando para sempre", async ({
+    page,
+  }, testInfo) => {
+    // The journey issue #928 made worth asserting on its own. With a primary
+    // and a fallback, "nobody could answer" is the state both being down
+    // produces — and the backend converges it at the target's deadline rather
+    // than leaving it pending. From the reader's side that is one transition:
+    // the "checking" status becomes an interstitial, and the spinner is gone.
+    //
+    // Neither provider is reachable from this spec, and neither is mocked
+    // either: the server is the authority for link state, so what the client
+    // receives is the terminal `unknown` it would receive from a deadline
+    // sweep. Which provider failed is not observable here by construction.
+    const targetId = uniqueId(testInfo, "dm");
+    const scenario = createScenario({
+      kind: "dm",
+      targetId,
+      targetName: OTHER_USER_NAME,
+      messages: [],
+      postLinks: (body) => (body.includes(UNKNOWN_URL) ? [pendingLink(UNKNOWN_URL)] : undefined),
+    });
+    await installMessagingMocks(page, scenario);
+    await page.goto(`/chat/dm/${targetId}`);
+
+    await fillComposer(page, `veja ${UNKNOWN_URL}`);
+    await page.getByRole("button", { name: "Enviar mensagem" }).click();
+
+    const bubble = page.locator("[data-testid='chat-msg-bubble']").filter({ hasText: UNKNOWN_URL });
+    await expect(bubble).toBeVisible();
+    await expect(bubble.getByRole("status")).toHaveText(/Verificando segurança do link…/);
+    expect(await bubble.locator("a").count()).toBe(0);
+
+    // The deadline elapses server-side with no verdict from either provider.
+    const messageId = `${targetId}-reply-1`;
+    await emitLinkUpdated(page, {
+      kind: "dm",
+      targetId,
+      messageId,
+      link: unknownLink(UNKNOWN_URL),
+    });
+
+    // The reader is out of the waiting state and gets a decision to make, with
+    // the real host shown. Never an automatic anchor: an outage is not a
+    // clearance.
+    const button = bubble.getByRole("button", {
+      name: `${UNKNOWN_URL} — Link não verificado`,
+    });
+    await expect(button).toBeVisible();
+    await expect(bubble.getByRole("status")).toHaveCount(0);
+    expect(await bubble.locator("a.rtr-link").count()).toBe(0);
+    await expect(bubble.getByTestId("chat-link-card")).toHaveCount(0);
+  });
+
   test("preview indisponível não quebra o link", async ({ page }, testInfo) => {
     const targetId = uniqueId(testInfo, "dm");
     const message = makeMessage({

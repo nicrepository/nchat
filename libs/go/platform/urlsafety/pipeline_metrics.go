@@ -46,6 +46,12 @@ const (
 	OperationPoll    = "poll"
 	OperationResolve = "resolve"
 	OperationPublish = "publish"
+	// OperationVerify is the background second opinion (issue #928): asking the
+	// secondary provider about a URL the primary already cleared. Its own
+	// operation rather than another "poll" because it answers a different
+	// question about the pipeline — nothing is waiting on it, so its backlog and
+	// its failures mean something different to an operator.
+	OperationVerify = "verify"
 
 	// Attempt outcomes.
 	AttemptSuccess   = "success"

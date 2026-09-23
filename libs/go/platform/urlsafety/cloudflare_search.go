@@ -119,9 +119,26 @@ type searchResponse struct {
 func (c *CloudflareScanner) FindRecentScan(
 	ctx context.Context, canonicalURL string, since time.Time,
 ) (ScanRecord, int, error) {
-	query, err := scanSearchQuery(canonicalURL)
+	decoded, err := c.searchScans(ctx, canonicalURL)
 	if err != nil {
 		return ScanRecord{}, 0, err
+	}
+	return selectReconcilableScan(decoded, canonicalURL, since)
+}
+
+// searchScans runs the account-scoped search for one exact canonical URL.
+//
+// Transport and nothing else: it decides no identity and adopts no scan. Both
+// callers — reconciliation of an uncertain submission, and evidence reuse
+// (issue #928) — apply their own filters to what comes back, which is what lets
+// them have different eligibility rules without having two search paths that
+// could disagree about escaping, page size or status handling.
+func (c *CloudflareScanner) searchScans(
+	ctx context.Context, canonicalURL string,
+) (searchResponse, error) {
+	query, err := scanSearchQuery(canonicalURL)
+	if err != nil {
+		return searchResponse{}, err
 	}
 	endpoint := c.accountPath("/urlscanner/v2/search") + "?" + url.Values{
 		"q":    []string{query},
@@ -130,13 +147,13 @@ func (c *CloudflareScanner) FindRecentScan(
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return ScanRecord{}, 0, ErrUnavailable
+		return searchResponse{}, ErrUnavailable
 	}
 	c.authorize(request)
 
 	response, err := c.do(ctx, request)
 	if err != nil {
-		return ScanRecord{}, 0, err
+		return searchResponse{}, err
 	}
 	defer func() { _ = response.Body.Close() }()
 
@@ -144,13 +161,13 @@ func (c *CloudflareScanner) FindRecentScan(
 	// or a 5xx says the provider could not answer; treating that as absence is
 	// exactly how a throttled search would cause a duplicate submission.
 	if response.StatusCode != http.StatusOK {
-		return ScanRecord{}, 0, ErrUnavailable
+		return searchResponse{}, ErrUnavailable
 	}
 	var decoded searchResponse
 	if err := decodeExactlyOne(response.Body, &decoded); err != nil {
-		return ScanRecord{}, 0, ErrUnavailable
+		return searchResponse{}, ErrUnavailable
 	}
-	return selectReconcilableScan(decoded, canonicalURL, since)
+	return decoded, nil
 }
 
 // selectReconcilableScan applies the identity filters and picks the newest

@@ -59,7 +59,7 @@ type LinkScanQueue interface {
 	AdoptScanUUID(ctx context.Context, canonicalURL, scanUUID string, generation int) error
 	ReserveProviderSubmit(ctx context.Context, limit int, window time.Duration) (bool, error)
 	PruneLinkScanBudget(ctx context.Context, olderThan time.Duration) error
-	RecordLinkVerdict(ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error
+	RecordLinkVerdict(ctx context.Context, write storage.LinkVerdictWrite) error
 	RefreshMessageLinkSafety(ctx context.Context, canonicalURL string) ([]storage.MessageLinkSafetyChange, error)
 	ResolveDecidedMessages(ctx context.Context) (storage.ResolveSummary, error)
 	ReopenExpiredVerdicts(ctx context.Context) (int, error)
@@ -97,7 +97,13 @@ type hostResolver = linkfetch.Resolver
 // directProviderRef is the ref persisted for a provider that answered on the
 // first call: there is no remote id, and the verdict compare-and-set still
 // binds the write to this attempt.
-const directProviderRef = "direct"
+//
+// It is the shared constant rather than a local copy because since issue #928
+// the provider is a composition that routes on this value: a row carrying it
+// has no check outstanding at the asynchronous half, so resuming it means
+// asking the synchronous primary again. Two spellings of it would send such a
+// row to the scanner with a word that is not a scan id.
+const directProviderRef = urlsafety.DirectProviderRef
 
 // LinkScanSearcher is the recovery half, and is deliberately optional.
 //
@@ -122,6 +128,7 @@ const (
 	operationPoll    = urlsafety.OperationPoll
 	operationResolve = urlsafety.OperationResolve
 	operationPublish = urlsafety.OperationPublish
+	operationVerify  = urlsafety.OperationVerify
 
 	attemptResultSuccess      = urlsafety.AttemptSuccess
 	attemptResultPending      = urlsafety.AttemptPending
@@ -371,6 +378,10 @@ func (s *LinkScanService) ProcessDue(ctx context.Context) (int, error) {
 		s.advance(ctx, job)
 		moved++
 	}
+	// The background second opinion (issue #928), last because nothing is
+	// waiting on it: every URL in that lane is already clickable, so it yields
+	// to every step above that somebody's message is blocked on.
+	s.verifySecondary(ctx)
 	// Always run, even when nothing was claimed: a verdict written by another
 	// replica leaves messages here that nothing else would release.
 	s.releaseDecided(ctx)
@@ -551,7 +562,7 @@ func (s *LinkScanService) submitClaim(ctx context.Context, job storage.LinkScanJ
 			job.ScanUUID = result.ProviderRef
 		}
 		if s.persistScanID(ctx, job, generation, job.ScanUUID) {
-			s.recordVerdict(ctx, job, result.Verdict.LegacyVerdict())
+			s.recordVerdict(ctx, job, result)
 		}
 	}
 }
@@ -781,7 +792,7 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job storage.LinkScanJob
 	// usable verdict — the production incident this branch exists for. It is
 	// terminal and fail-closed: recorded once as inconclusive, never polled
 	// again, and there is no path from here into resubmission.
-	s.recordVerdict(ctx, job, verdict)
+	s.recordVerdict(ctx, job, result)
 }
 
 // recordVerdict writes a terminal poll outcome — safe, malicious, or
@@ -789,12 +800,23 @@ func (s *LinkScanService) pollClaim(ctx context.Context, job storage.LinkScanJob
 // success path and its ErrScanInconclusive branch, because both are "this scan
 // id is decided, write it down and stop polling"; only the outcome label
 // differs.
-func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkScanJob, verdict urlsafety.Verdict) {
-	result := attemptResultSuccess
+func (s *LinkScanService) recordVerdict(
+	ctx context.Context, job storage.LinkScanJob, answer urlsafety.ReputationResult,
+) {
+	verdict := answer.Verdict.LegacyVerdict()
+	outcome := attemptResultSuccess
 	if verdict == urlsafety.VerdictInconclusive {
-		result = attemptResultInconclusive
+		outcome = attemptResultInconclusive
 	}
-	switch err := s.queue.RecordLinkVerdict(ctx, job.CanonicalURL, job.ScanUUID, verdict); {
+	write := storage.LinkVerdictWrite{
+		CanonicalURL:      job.CanonicalURL,
+		ScanUUID:          job.ScanUUID,
+		Verdict:           verdict,
+		EvidenceExpiresAt: answer.ExpiresAt,
+		VerifySecondary:   s.wantsSecondOpinion(answer),
+	}
+	result := outcome
+	switch err := s.queue.RecordLinkVerdict(ctx, write); {
 	case err == nil:
 		s.observeAttempt(operationPoll, result)
 		s.converge(ctx, job.CanonicalURL)
@@ -806,6 +828,32 @@ func (s *LinkScanService) recordVerdict(ctx context.Context, job storage.LinkSca
 		s.observeAttempt(operationPoll, attemptResultError)
 		s.logFailure(ctx, "record link verdict", job, err)
 	}
+}
+
+// wantsSecondOpinion reports whether a clearance should be verified in the
+// background by the secondary provider (issue #928).
+//
+// Two conditions, and both are necessary:
+//
+//   - the answer is a clearance. There is nothing to double-check about a
+//     condemnation — it is already the strictest outcome — and nothing to
+//     double-check about a non-answer, which decided nothing;
+//   - it did not come from the secondary itself. When the primary was
+//     unavailable and Cloudflare produced the clearance, asking Cloudflare again
+//     is not a second opinion, it is the same one.
+//
+// A deployment whose provider cannot verify simply never opens the lane: the
+// worker checks for the capability before claiming, so the column stays NULL
+// and nothing is scheduled that nothing would drain.
+func (s *LinkScanService) wantsSecondOpinion(answer urlsafety.ReputationResult) bool {
+	if answer.Verdict != urlsafety.ReputationSafe {
+		return false
+	}
+	if answer.Provider == urlsafety.ProviderCloudflareURLScanner {
+		return false
+	}
+	_, canVerify := s.provider.(LinkSecondaryVerifier)
+	return canVerify
 }
 
 // converge propagates a decided target into its messages: the per-link

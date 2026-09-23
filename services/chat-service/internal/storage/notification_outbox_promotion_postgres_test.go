@@ -145,7 +145,7 @@ func clearTheScan(t *testing.T, store *storage.PGXMessageStore) {
 	if err := store.RecordLinkScanSubmission(ctx, notifyScannedURL, "scan-notify-741", generation); err != nil {
 		t.Fatalf("RecordLinkScanSubmission: %v", err)
 	}
-	if err := store.RecordLinkVerdict(ctx, notifyScannedURL, "scan-notify-741", urlsafety.VerdictSafe); err != nil {
+	if err := store.RecordLinkVerdict(ctx, storage.LinkVerdictWrite{CanonicalURL: notifyScannedURL, ScanUUID: "scan-notify-741", Verdict: urlsafety.VerdictSafe}); err != nil {
 		t.Fatalf("RecordLinkVerdict: %v", err)
 	}
 }

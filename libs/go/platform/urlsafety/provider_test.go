@@ -15,15 +15,26 @@ import (
 
 // --- Cloudflare adapter -----------------------------------------------------
 
+// A first Check now searches before it submits (issue #928): a POST creates a
+// billed scan and is what the provider's hostname budget refuses, so the cheap
+// question comes first. With nothing to reuse, the submission happens exactly as
+// it always did.
 func TestCloudflareCheckSubmitsThenReportsInProgressWithRef(t *testing.T) {
+	var methods []string
 	scanner, _ := scannerAgainst(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("first Check must submit, got %s", r.Method)
+		methods = append(methods, r.Method)
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"results":[]}`))
+			return
 		}
 		_, _ = w.Write([]byte(`{"uuid":"scan-1"}`))
 	})
 
 	result, err := scanner.Check(context.Background(), "https://example.com/", "")
+
+	if len(methods) != 2 || methods[0] != http.MethodGet || methods[1] != http.MethodPost {
+		t.Fatalf("exchanges = %v, want a search then a submit", methods)
+	}
 
 	if !errors.Is(err, ErrCheckInProgress) {
 		t.Fatalf("want ErrCheckInProgress, got %v", err)
