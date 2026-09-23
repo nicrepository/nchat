@@ -66,6 +66,29 @@ func freshVerdictSQL(alias, ttlParam string) string {
 		" AND (" + alias + ".evidence_expires_at IS NULL OR " + alias + ".evidence_expires_at > now())"
 }
 
+// staleVerdictSQL is the exact complement of freshVerdictSQL, for the statements
+// that reopen a decided row rather than read one.
+//
+// It is written here, beside its opposite, because the two have to stay exact
+// negations of each other. A row that is neither fresh nor stale is a row that
+// no reader will act on and no sweep will reopen — permanently undecided, with
+// a message possibly waiting on it. Keeping the pair apart is how that gap gets
+// introduced silently, which is what issue #928's review found: freshness had
+// grown the provider-expiry clause and the reopen predicates had not.
+//
+// `decided_at IS NOT NULL` is not restated: every caller already scopes itself
+// to terminal statuses, and the schema's link_scans_decided_check makes a
+// terminal row without decided_at unrepresentable.
+//
+// The boundary is deliberate and matches freshVerdictSQL's: an expiry of
+// exactly now() is expired. Fresh requires `> now()`, stale accepts
+// `<= now()`, so every instant belongs to exactly one of them.
+func staleVerdictSQL(alias, ttlParam string) string {
+	return "(" + alias + ".decided_at <= now() - (" + ttlParam + " * interval '1 second')" +
+		" OR (" + alias + ".evidence_expires_at IS NOT NULL" +
+		" AND " + alias + ".evidence_expires_at <= now()))"
+}
+
 // safeFreshVerdictSQL is the only clearance a preview may be fetched or served
 // on: explicitly safe, and still inside its TTL.
 func safeFreshVerdictSQL(alias, ttlParam string) string {

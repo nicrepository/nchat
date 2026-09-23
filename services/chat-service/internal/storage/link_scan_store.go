@@ -192,12 +192,12 @@ func (s *PGXMessageStore) LoadLinkVerdicts(
 		return map[string]urlsafety.Verdict{}, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT canonical_url, status
-		FROM chat.link_scans
-		WHERE canonical_url = ANY($1::text[])
-		  AND ((status IN ('safe', 'malicious', 'unknown')
-		        AND decided_at > now() - ($2 * interval '1 second'))
-		       OR status = 'inconclusive')`,
+		SELECT ls.canonical_url, ls.status
+		FROM chat.link_scans ls
+		WHERE ls.canonical_url = ANY($1::text[])
+		  AND ((ls.status IN ('safe', 'malicious', 'unknown')
+		        AND `+freshVerdictSQL("ls", "$2")+`)
+		       OR ls.status = 'inconclusive')`,
 		canonicalURLs, urlsafety.VerdictTTL.Seconds(),
 	)
 	if err != nil {
@@ -282,13 +282,15 @@ func (s *PGXMessageStore) EnsureLinkScans(ctx context.Context, canonicalURLs []s
 	// introduce — an inconclusive row stays inconclusive until something
 	// deliberate changes it, not until VerdictTTL happens to elapse.
 	_, err = s.pool.Exec(ctx, `
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
 		       attempts = 0, next_attempt_at = NULL, terminal_reason = NULL,
+		       evidence_expires_at = NULL,
+		       secondary_due_at = NULL, secondary_scan_uuid = NULL,
 		       deadline_at = now() + ($3 * interval '1 second'), updated_at = now()
-		 WHERE canonical_url = ANY($1::text[])
-		   AND status IN ('safe', 'malicious', 'unknown')
-		   AND decided_at <= now() - ($2 * interval '1 second')`,
+		 WHERE ls.canonical_url = ANY($1::text[])
+		   AND ls.status IN ('safe', 'malicious', 'unknown')
+		   AND `+staleVerdictSQL("ls", "$2"),
 		canonicalURLs, urlsafety.VerdictTTL.Seconds(), LinkScanPendingDeadline.Seconds(),
 	)
 	if err != nil {
@@ -389,8 +391,7 @@ func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error
 		   -- evidence_expires_at on the way back to pending is what stops the
 		   -- previous answer's ceiling from bounding the next one, which
 		   -- describes a different observation entirely.
-		   AND (ls.decided_at <= now() - ($1 * interval '1 second')
-		        OR (ls.evidence_expires_at IS NOT NULL AND ls.evidence_expires_at <= now()))
+		   AND `+staleVerdictSQL("ls", "$1")+`
 		   AND EXISTS (
 		       SELECT 1
 		       FROM chat.message_link_scans mls
@@ -702,6 +703,12 @@ func (s *PGXMessageStore) RecordLinkVerdict(ctx context.Context, write LinkVerdi
 		       evidence_expires_at = $4,
 		       secondary_due_at = CASE WHEN $5 THEN now() ELSE NULL END,
 		       secondary_scan_uuid = NULL,
+		       -- Opening a lane mints a new attempt identity even though no
+		       -- worker holds it yet. Without this a lane settled at generation
+		       -- N and reopened later would be writable by the worker abandoned
+		       -- by the *first* generation N: "lane open" and "generation N"
+		       -- would both be true again. The counter only ever moves forward.
+		       secondary_generation = ls.secondary_generation + 1,
 		       updated_at = now()
 		 WHERE ls.canonical_url = $1 AND `+pendingWithinDeadlineSQL("ls")+` AND ls.scan_uuid = $3`,
 		write.CanonicalURL, string(write.Verdict), write.ScanUUID,
@@ -738,7 +745,7 @@ func nullableTime(value time.Time) any {
 // scan id it polled, the secondary lane compares the one it polled, and
 // everything else about the statement, including the global denial and the
 // file-service invalidation, is shared.
-func recordMaliciousLinkVerdictQuery(refColumn string) string {
+func recordMaliciousLinkVerdictQuery(refColumn, attemptPredicate string) string {
 	return `
 	WITH updated AS (
 		UPDATE chat.link_scans
@@ -749,6 +756,7 @@ func recordMaliciousLinkVerdictQuery(refColumn string) string {
 		   AND status = $2
 		   AND ` + refColumn + ` IS NOT NULL
 		   AND ` + refColumn + ` = $3
+		   ` + attemptPredicate + `
 		   -- A pending target is condemned only inside its deadline; an
 		   -- inconclusive one (reconciliation) has no deadline to honour.
 		   AND ($2 <> 'pending' OR deadline_at > now())
@@ -778,11 +786,20 @@ func recordMaliciousLinkVerdictQuery(refColumn string) string {
 	SELECT EXISTS (SELECT 1 FROM updated)`
 }
 
-// Which column a condemnation's compare-and-set is bound to. Package constants,
-// never caller input — see recordMaliciousLinkVerdictQuery.
+// Which column a condemnation's compare-and-set is bound to, and the extra
+// precondition each lane needs. Package constants, never caller input — see
+// recordMaliciousLinkVerdictQuery.
+//
+// The secondary lane adds two clauses the primary path has no equivalent of:
+// the lane must still be open, and this attempt must still own it. $6 is bound
+// only by the secondary variant, which is why the predicate travels with the
+// column rather than being spelled inline at one of two call sites.
 const (
 	refColumnPrimary   = "scan_uuid"
 	refColumnSecondary = "secondary_scan_uuid"
+
+	attemptPredicateNone      = ""
+	attemptPredicateSecondary = "AND secondary_due_at IS NOT NULL AND secondary_generation = $6"
 )
 
 func (s *PGXMessageStore) recordMaliciousLinkVerdict(
@@ -790,12 +807,34 @@ func (s *PGXMessageStore) recordMaliciousLinkVerdict(
 	evidenceExpiresAt time.Time,
 ) error {
 	var updated bool
-	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery(refColumn),
+	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery(refColumn, attemptPredicateNone),
 		canonicalURL, expectedStatus, scanUUID, urlsafety.URLDigest(canonicalURL),
 		nullableTime(evidenceExpiresAt),
 	).Scan(&updated)
 	if err != nil {
 		return fmt.Errorf("record malicious link verdict: %w", err)
+	}
+	if !updated {
+		return ErrLinkScanConflict
+	}
+	return nil
+}
+
+// recordSecondaryMaliciousVerdict is the background lane's condemnation: the
+// same statement, the same global fetch denial and the same file-service
+// invalidation, with the attempt's identity added to the compare-and-set.
+func (s *PGXMessageStore) recordSecondaryMaliciousVerdict(
+	ctx context.Context, canonicalURL string, generation int,
+	secondaryRef string, evidenceExpiresAt time.Time,
+) error {
+	var updated bool
+	err := s.pool.QueryRow(ctx,
+		recordMaliciousLinkVerdictQuery(refColumnSecondary, attemptPredicateSecondary),
+		canonicalURL, "safe", secondaryRef, urlsafety.URLDigest(canonicalURL),
+		nullableTime(evidenceExpiresAt), generation,
+	).Scan(&updated)
+	if err != nil {
+		return fmt.Errorf("record secondary malicious verdict: %w", err)
 	}
 	if !updated {
 		return ErrLinkScanConflict
@@ -854,7 +893,7 @@ var resolvePendingMessagesQuery = `
 		SELECT m.id,
 		       m.link_safety_fingerprint AS fingerprint,
 		       bool_or(ls.status = 'malicious'
-		               AND ls.decided_at > now() - ($2 * interval '1 second')) AS blocked,
+		               AND ` + freshVerdictSQL("ls", "$2") + `) AS blocked,
 		       -- Inconclusive has no freshness window — see ReopenExpiredVerdicts —
 		       -- so it is checked without one: a scan that finished without a
 		       -- usable verdict stays that way until reconciliation deliberately
@@ -866,7 +905,7 @@ var resolvePendingMessagesQuery = `
 		       -- still-pending URL withheld.
 		       bool_and(
 		           (ls.status IN ('safe', 'malicious')
-		            AND ls.decided_at > now() - ($2 * interval '1 second'))
+		            AND ` + freshVerdictSQL("ls", "$2") + `)
 		           OR ls.status IN ('inconclusive', 'unknown')
 		       ) AS all_terminal
 		FROM chat.messages m
