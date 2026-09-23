@@ -81,7 +81,9 @@ function applySent(state: MessagesState, action: ActionOf<"sent">): MessagesStat
     sendError: null,
     lastMutation: alreadyPresent ? "none" : "append",
     realtimeError: null,
-    replyTo: null,
+    // The reply this message answered is consumed; one chosen since the
+    // submit is the next message's and survives the acknowledgement (#929).
+    replyTo: state.replyTo?.id === action.parentMessageId ? null : state.replyTo,
     linkSafetyCorrections,
   };
 }

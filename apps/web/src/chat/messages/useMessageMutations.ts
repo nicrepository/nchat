@@ -157,11 +157,17 @@ export function useMessageMutations({
 
         const message = await gateway.post(body, options);
 
-        if (!scope.isCurrent(sendKey)) return stale;
         pendingSendIdentity.current = null;
-        dispatch({ type: "sent", message: scope.sanitize(message) });
-        if (message.createdConversationEventId) {
-          reconcileCreatedConversationEvent(message.createdConversationEventId);
+        // The timeline is the conversation on screen's; the acknowledgement
+        // is the origin conversation's (issue #929). A reader who switched
+        // away mid-request still gets their draft reconciled — by the
+        // caller, against the key it captured at submit — while this state,
+        // which now belongs to another conversation, is left alone.
+        if (scope.isCurrent(sendKey)) {
+          dispatch({ type: "sent", message: scope.sanitize(message), parentMessageId });
+          if (message.createdConversationEventId) {
+            reconcileCreatedConversationEvent(message.createdConversationEventId);
+          }
         }
         return { status: "sent" };
       } catch (error: unknown) {

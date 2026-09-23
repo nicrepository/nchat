@@ -81,9 +81,14 @@ export interface MessagesState {
 /**
  * Explicit result returned by sendMessage.
  *
- * "sent"  — POST succeeded and state was updated for the current target.
- * "stale" — target changed before POST resolved/rejected; caller must not
- *            treat this as success or failure for the current target.
+ * "sent"  — the server accepted the message. Authoritative for the draft the
+ *            send was issued from, whether or not that conversation is still
+ *            the one on screen (issue #929): the timeline is updated only
+ *            while it is, but a caller reconciling a draft keys on the
+ *            conversation it captured at submit, never on the current one.
+ * "stale" — no acknowledgement to act on: nothing was sent, or the request
+ *            failed after the target changed; caller must not treat this as
+ *            success or failure for the current target.
  *
  * Current-target failures throw instead of returning a result, preserving
  * the existing draft-retention contract in callers.
@@ -104,7 +109,12 @@ export type Action =
    */
   | { type: "denied" }
   | { type: "sending" }
-  | { type: "sent"; message: Message }
+  /**
+   * `parentMessageId` is the reply the send actually carried, so the reducer
+   * consumes `replyTo` by identity (issue #929): a reply the reader picked
+   * while this send was in flight belongs to the next message and stays.
+   */
+  | { type: "sent"; message: Message; parentMessageId?: string }
   | { type: "send_error"; error: string }
   /**
    * RF-21: a message this client is showing as pending has reached a terminal
