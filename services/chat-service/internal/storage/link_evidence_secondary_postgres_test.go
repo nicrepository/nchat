@@ -783,3 +783,124 @@ func TestSecondaryLaneWritesBelongToTheirAttemptPostgreSQL(t *testing.T) {
 		}
 	})
 }
+
+// The window the second Code Quality review found: a lane is claimed while its
+// clearance is fresh, the worker then spends a Cloudflare exchange, and the
+// clearance lapses before the answer comes back.
+//
+// The claim's freshness check cannot cover that — a claim is not a write. The
+// condemnation itself has to revalidate, in the same statement, or a target
+// gets condemned on the authority of evidence that no longer exists.
+func TestSecondaryCondemnationRequiresALiveClearancePostgreSQL(t *testing.T) {
+	f := newLinkTargetFixture(t)
+
+	// denylistRows counts the global fetch denial for this URL, which is the
+	// side effect that must not appear when the compare-and-set loses.
+	denylistRows := func(t *testing.T) int {
+		t.Helper()
+		var count int
+		if err := f.pool.QueryRow(f.ctx,
+			`SELECT count(*) FROM files.link_fetch_denylist WHERE url_digest = $1`,
+			urlsafety.URLDigest(secondaryURL)).Scan(&count); err != nil {
+			t.Fatalf("read denylist: %v", err)
+		}
+		return count
+	}
+
+	// claimWithRef opens a lane, claims it, binds a scan id, and returns the
+	// attempt — the state a worker holds when it calls Cloudflare.
+	claimWithRef := func(t *testing.T, expiresAt time.Time) storage.LinkSecondaryJob {
+		t.Helper()
+		decide(t, f, secondaryURL, urlsafety.VerdictSafe, expiresAt, true)
+		job := claimOneSecondary(t, f)
+		if err := f.store.RecordSecondaryRef(
+			f.ctx, secondaryURL, job.Generation, "cf-scan-1"); err != nil {
+			t.Fatalf("RecordSecondaryRef: %v", err)
+		}
+		return job
+	}
+
+	// Both ways a clearance can lapse between the claim and the answer. The
+	// provider's own ceiling, and the local window — the shared predicate has to
+	// cover both, and a caller must not be able to satisfy one and skip the other.
+	for name, lapse := range map[string]func(t *testing.T){
+		"the provider ceiling passed": func(t *testing.T) {
+			shiftEvidenceExpiry(t, f, secondaryURL, -time.Second)
+		},
+		"the local window passed": func(t *testing.T) {
+			if _, err := f.pool.Exec(f.ctx, `
+				UPDATE chat.link_scans SET decided_at = now() - ($2 * interval '1 second')
+				 WHERE canonical_url = $1`,
+				secondaryURL, urlsafety.VerdictTTL.Seconds()+60); err != nil {
+				t.Fatalf("age the clearance: %v", err)
+			}
+		},
+	} {
+		t.Run("a condemnation is refused after "+name, func(t *testing.T) {
+			f.reset(t)
+			// A ceiling far in the future, so only the lapse under test ends it.
+			job := claimWithRef(t, time.Now().Add(time.Hour))
+			before := denylistRows(t)
+
+			lapse(t)
+
+			err := f.store.RecordSecondaryMalicious(
+				f.ctx, secondaryURL, job.Generation, "cf-scan-1", time.Time{})
+
+			if !errors.Is(err, storage.ErrLinkScanConflict) {
+				t.Fatalf("err = %v, want ErrLinkScanConflict", err)
+			}
+			// The verdict did not flip. The target is stale, which the ordinary
+			// reopen path resolves by asking again — not by taking this answer.
+			var status string
+			if err := f.pool.QueryRow(f.ctx,
+				`SELECT status FROM chat.link_scans WHERE canonical_url = $1`,
+				secondaryURL).Scan(&status); err != nil {
+				t.Fatalf("read status: %v", err)
+			}
+			if status != "safe" {
+				t.Fatalf("status = %q, want the stale clearance left for the reopen path", status)
+			}
+			// And none of the condemnation's side effects happened. The CTEs all
+			// select from the UPDATE that won, so zero rows updated must mean zero
+			// rows anywhere else.
+			if after := denylistRows(t); after != before {
+				t.Fatalf("denylist rows %d -> %d; a refused condemnation published a denial",
+					before, after)
+			}
+			var laneOpen bool
+			if err := f.pool.QueryRow(f.ctx,
+				`SELECT secondary_due_at IS NOT NULL FROM chat.link_scans WHERE canonical_url = $1`,
+				secondaryURL).Scan(&laneOpen); err != nil {
+				t.Fatalf("read lane: %v", err)
+			}
+			if !laneOpen {
+				t.Fatal("a refused condemnation closed the lane it could not conclude")
+			}
+		})
+	}
+
+	// The legitimate path, so the fix is not just "refuse everything": a live
+	// clearance still gets condemned, with every side effect intact.
+	t.Run("a condemnation on a live clearance still goes through", func(t *testing.T) {
+		f.reset(t)
+		job := claimWithRef(t, time.Time{})
+
+		if err := f.store.RecordSecondaryMalicious(
+			f.ctx, secondaryURL, job.Generation, "cf-scan-1", time.Time{}); err != nil {
+			t.Fatalf("RecordSecondaryMalicious: %v", err)
+		}
+
+		status, fresh := freshness(t, f, secondaryURL)
+		if status != "malicious" || !fresh {
+			t.Fatalf("status = %q fresh=%v, want a fresh condemnation", status, fresh)
+		}
+		if denylistRows(t) != 1 {
+			t.Fatal("the condemnation did not publish the global fetch denial")
+		}
+		_, _, open := secondaryLaneState(t, f, secondaryURL)
+		if open {
+			t.Fatal("the lane survived the condemnation it produced")
+		}
+	})
+}

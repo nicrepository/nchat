@@ -748,19 +748,19 @@ func nullableTime(value time.Time) any {
 func recordMaliciousLinkVerdictQuery(refColumn, attemptPredicate string) string {
 	return `
 	WITH updated AS (
-		UPDATE chat.link_scans
+		UPDATE chat.link_scans ls
 		   SET status = 'malicious', decided_at = now(), next_attempt_at = NULL,
 		       next_reconcile_at = NULL, evidence_expires_at = $5,
 		       secondary_due_at = NULL, secondary_scan_uuid = NULL, updated_at = now()
-		 WHERE canonical_url = $1
-		   AND status = $2
-		   AND ` + refColumn + ` IS NOT NULL
-		   AND ` + refColumn + ` = $3
+		 WHERE ls.canonical_url = $1
+		   AND ls.status = $2
+		   AND ls.` + refColumn + ` IS NOT NULL
+		   AND ls.` + refColumn + ` = $3
 		   ` + attemptPredicate + `
 		   -- A pending target is condemned only inside its deadline; an
 		   -- inconclusive one (reconciliation) has no deadline to honour.
-		   AND ($2 <> 'pending' OR deadline_at > now())
-		 RETURNING canonical_url
+		   AND ($2 <> 'pending' OR ls.deadline_at > now())
+		 RETURNING ls.canonical_url
 	),
 	denied AS (
 		INSERT INTO files.link_fetch_denylist (url_digest, canonical_url, source)
@@ -790,17 +790,42 @@ func recordMaliciousLinkVerdictQuery(refColumn, attemptPredicate string) string 
 // precondition each lane needs. Package constants, never caller input — see
 // recordMaliciousLinkVerdictQuery.
 //
-// The secondary lane adds two clauses the primary path has no equivalent of:
-// the lane must still be open, and this attempt must still own it. $6 is bound
-// only by the secondary variant, which is why the predicate travels with the
-// column rather than being spelled inline at one of two call sites.
+// The secondary lane adds three clauses the primary path has no equivalent of.
+// $6 and $7 are bound only by the secondary variant, which is why the predicate
+// travels with the column rather than being spelled inline at one of two call
+// sites.
+//
+// The lane must still be open and this attempt must still own it — that much
+// the generation already did. What it did not do, and what the second Code
+// Quality review found, is revalidate the clearance the lane exists to
+// question.
+//
+// A secondary verification has authority only while the SAFE that opened it is
+// still valid. The claim checked that, but a claim is not a write: the worker
+// then spends a Cloudflare exchange, and the clearance can lapse while it
+// waits. Letting the late answer land would condemn a target on the authority
+// of evidence that no longer exists — jumping the state machine, which should
+// instead reopen the target and ask again from the top.
+//
+// So freshness is revalidated here, in the same UPDATE, through the same
+// freshVerdictSQL every other reader uses. Checking it in a separate SELECT
+// first would be a TOCTOU window of exactly the shape this closes.
+//
+// `status = $2` is the status check the review asks for: this path binds $2 to
+// the literal 'safe' in recordSecondaryMaliciousVerdict, never from a caller.
 const (
 	refColumnPrimary   = "scan_uuid"
 	refColumnSecondary = "secondary_scan_uuid"
 
-	attemptPredicateNone      = ""
-	attemptPredicateSecondary = "AND secondary_due_at IS NOT NULL AND secondary_generation = $6"
+	attemptPredicateNone = ""
 )
+
+// attemptPredicateSecondary is built from the shared freshness definition
+// rather than restating it, so the lane cannot drift from the rest of the
+// system the way the reopen predicates once did.
+var attemptPredicateSecondary = "AND ls.secondary_due_at IS NOT NULL" +
+	" AND ls.secondary_generation = $6" +
+	" AND " + freshVerdictSQL("ls", "$7")
 
 func (s *PGXMessageStore) recordMaliciousLinkVerdict(
 	ctx context.Context, canonicalURL, scanUUID, expectedStatus, refColumn string,
@@ -831,7 +856,7 @@ func (s *PGXMessageStore) recordSecondaryMaliciousVerdict(
 	err := s.pool.QueryRow(ctx,
 		recordMaliciousLinkVerdictQuery(refColumnSecondary, attemptPredicateSecondary),
 		canonicalURL, "safe", secondaryRef, urlsafety.URLDigest(canonicalURL),
-		nullableTime(evidenceExpiresAt), generation,
+		nullableTime(evidenceExpiresAt), generation, urlsafety.VerdictTTL.Seconds(),
 	).Scan(&updated)
 	if err != nil {
 		return fmt.Errorf("record secondary malicious verdict: %w", err)
