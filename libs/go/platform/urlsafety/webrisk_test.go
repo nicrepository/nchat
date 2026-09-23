@@ -205,24 +205,42 @@ func TestWebRiskTimeoutIsUnavailable(t *testing.T) {
 // not about the URL, and conflating the two is how a cancelled request would be
 // counted against the provider.
 func TestWebRiskContextCancellationIsNotAVerdict(t *testing.T) {
+	// Synchronised on the request actually arriving, not on a clock. The
+	// handler announces that the exchange is in flight, the test cancels only
+	// then, and the handler stays parked until its own request context ends —
+	// so the cancellation under test is provably the one that ended the call,
+	// and the test cannot pass by racing a sleep on a slow machine.
+	arrived := make(chan struct{})
 	blocked := make(chan struct{})
 	t.Cleanup(func() { close(blocked) })
 	provider, _ := webRiskServer(t, func(w http.ResponseWriter, r *http.Request) {
+		close(arrived)
 		select {
 		case <-blocked:
 		case <-r.Context().Done():
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-	result, err := provider.Check(ctx, "https://example.test/a", "")
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+	t.Cleanup(cancel)
+
+	type outcome struct {
+		result ReputationResult
+		err    error
 	}
-	if result.Verdict == ReputationSafe {
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := provider.Check(ctx, "https://example.test/a", "")
+		done <- outcome{result, err}
+	}()
+
+	<-arrived
+	cancel()
+	got := <-done
+
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", got.err)
+	}
+	if got.result.Verdict == ReputationSafe {
 		t.Fatal("a cancelled check must never report a clearance")
 	}
 }
