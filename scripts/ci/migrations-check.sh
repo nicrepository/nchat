@@ -3,7 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-MIGRATIONS_DIR="$ROOT_DIR/migrations"
+# Overridable so the gate's own tests can point it at a synthetic tree; CI and
+# every human run take the default.
+MIGRATIONS_DIR="${MIGRATIONS_DIR_OVERRIDE:-$ROOT_DIR/migrations}"
 
 ERRORS=0
 
@@ -139,34 +141,101 @@ echo
 # Scoped per domain, because each domain carries its own sequence.
 echo "--- one migration per ordinal ---"
 ORDINAL_EXCEPTIONS_FILE="${ORDINAL_EXCEPTIONS_FILE:-$ROOT_DIR/scripts/ci/migration-ordinal-exceptions.txt}"
-declare -A ORDINAL_EXCEPTED=()
-if [[ -f "$ORDINAL_EXCEPTIONS_FILE" ]]; then
-  while IFS= read -r entry || [[ -n "$entry" ]]; do
-    entry="${entry%%#*}"
-    entry="${entry//[[:space:]]/}"
-    [[ -n "$entry" ]] && ORDINAL_EXCEPTED[$entry]=1
+
+# sorted_words prints its arguments one per line, sorted, so two sets can be
+# compared as strings regardless of the order they were discovered in.
+sorted_words() {
+  printf '%s\n' "$@" | LC_ALL=C sort
+}
+
+# load_ordinal_exceptions fills ORDINAL_EXPECTED with the exact basenames each
+# historical collision is allowed to contain.
+#
+# Keyed on domain/ordinal, valued with the whole expected set: an exception
+# closes over *which* migrations may share the number, not merely over the fact
+# that some do. A third file appearing at a grandfathered ordinal is a new
+# collision and fails like any other, which is the whole point of the list being
+# closed.
+#
+# Format: <domain>/<ordinal>|<basename>|<basename>...
+load_ordinal_exceptions() {
+  declare -gA ORDINAL_EXPECTED=()
+  [[ -f "$ORDINAL_EXCEPTIONS_FILE" ]] || return 0
+  local line key members
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] || continue
+    key="${line%%|*}"
+    members="${line#*|}"
+    if [[ "$key" == "$line" || -z "$members" ]]; then
+      fail "malformed ordinal exception (want <domain>/<ordinal>|<basename>|...): $line"
+      continue
+    fi
+    ORDINAL_EXPECTED[$key]="${members//|/ }"
   done < "$ORDINAL_EXCEPTIONS_FILE"
-fi
-declare -A ORDINAL_OWNER=()
-ordinal_collisions=0
+}
+
+# check_ordinal_group decides one domain/ordinal that holds more than one
+# migration.
+#
+# Accepted only when the set found is exactly the set recorded. Not a superset,
+# not a subset, not a prefix, no wildcard: a migration removed, renamed or added
+# at a grandfathered ordinal all read as a change to something the exception was
+# written about, and a change to that is a review decision rather than
+# something a gate should wave through.
+check_ordinal_group() {
+  local key="$1"
+  shift
+  local found expected
+  found="$(sorted_words "$@")"
+  if [[ -z "${ORDINAL_EXPECTED[$key]+set}" ]]; then
+    fail "duplicate migration number $key: $(printf '%s ' "$@")"
+    return 1
+  fi
+  # shellcheck disable=SC2086 # the recorded members are a deliberate word list.
+  expected="$(sorted_words ${ORDINAL_EXPECTED[$key]})"
+  if [[ "$found" != "$expected" ]]; then
+    fail "ordinal exception $key no longer matches the migrations it was written for"
+    echo "         expected: $(tr '\n' ' ' <<<"$expected")" >&2
+    echo "         found:    $(tr '\n' ' ' <<<"$found")" >&2
+    return 1
+  fi
+  ok "$key is a recorded pre-existing duplicate, unchanged"
+  return 0
+}
+
+load_ordinal_exceptions
+declare -A ORDINAL_MEMBERS=()
 for up in "${UP_FILES[@]}"; do
   up_domain="$(basename "$(dirname "$up")")"
   up_base="$(basename "$up" .up.sql)"
-  ordinal="${up_base%%_*}"
-  key="$up_domain/$ordinal"
-  if [[ -n "${ORDINAL_OWNER[$key]:-}" ]]; then
-    if [[ -n "${ORDINAL_EXCEPTED[$key]:-}" ]]; then
-      ok "$key is a recorded pre-existing duplicate"
-      continue
-    fi
-    fail "duplicate migration number $key: ${ORDINAL_OWNER[$key]} and $up_base"
+  key="$up_domain/${up_base%%_*}"
+  ORDINAL_MEMBERS[$key]="${ORDINAL_MEMBERS[$key]:-} $up_base"
+done
+
+ordinal_collisions=0
+for key in "${!ORDINAL_MEMBERS[@]}"; do
+  # shellcheck disable=SC2086 # the collected basenames are a deliberate word list.
+  set -- ${ORDINAL_MEMBERS[$key]}
+  [ "$#" -gt 1 ] || continue
+  check_ordinal_group "$key" "$@" || ordinal_collisions=$((ordinal_collisions + 1))
+done
+
+# An exception that no longer describes a collision at all is stale: the
+# migrations were renumbered, or the list outlived them. Left in place it would
+# silently pre-authorise the next collision at that ordinal.
+for key in "${!ORDINAL_EXPECTED[@]}"; do
+  # shellcheck disable=SC2086
+  set -- ${ORDINAL_MEMBERS[$key]:-}
+  if [ "$#" -le 1 ]; then
+    fail "ordinal exception $key no longer describes a duplicate; remove it"
     ordinal_collisions=$((ordinal_collisions + 1))
-  else
-    ORDINAL_OWNER[$key]="$up_base"
   fi
 done
+
 if [ "$ordinal_collisions" -eq 0 ]; then
-  ok "every migration number is used once per domain (${#ORDINAL_OWNER[@]} checked)"
+  ok "every migration number is used once per domain (${#ORDINAL_MEMBERS[@]} checked)"
 fi
 echo
 
