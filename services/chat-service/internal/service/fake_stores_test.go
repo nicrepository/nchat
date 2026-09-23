@@ -71,6 +71,9 @@ type fakeChannelStore struct {
 	listCalls              int
 	listVisibleCalls       int
 	getVisibleByIDCalls    int
+	about                  storage.ConversationAbout
+	aboutErr               error
+	aboutCalls             []aboutCall
 	getVisibleBySlugCalls  int
 	creatorMembershipSeeds int
 	archiveCalls           int
@@ -141,6 +144,22 @@ func (f *fakeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID,
 	}
 	return ch, nil
 }
+
+// aboutCall records the arguments of one About read, so a test can assert the
+// workspace it was scoped to rather than only the value it returned.
+type aboutCall struct {
+	workspaceID string
+	targetID    string
+}
+
+func (f *fakeChannelStore) GetChannelAbout(_ context.Context, workspaceID, channelID string) (storage.ConversationAbout, error) {
+	f.aboutCalls = append(f.aboutCalls, aboutCall{workspaceID: workspaceID, targetID: channelID})
+	if f.aboutErr != nil {
+		return storage.ConversationAbout{}, f.aboutErr
+	}
+	return f.about, nil
+}
+
 func (f *fakeChannelStore) GetVisibleChannelBySlug(_ context.Context, workspaceID, slug, _ string) (domain.Channel, error) {
 	f.getVisibleBySlugCalls++
 	if f.getVisibleBySlugErr != nil {
@@ -249,6 +268,10 @@ type fakeMemberStore struct {
 	memberProfilesErr  error
 	memberProfileCalls []memberProfileCall
 
+	roster      storage.ChannelRosterPage
+	rosterErr   error
+	rosterCalls []rosterCall
+
 	candidateErr           error
 	candidateCalls         []candidateSearchCall
 	addCMsErr              error
@@ -347,6 +370,36 @@ func (f *fakeMemberStore) ListOnlineChannelMemberProfiles(
 		matched = matched[:limit]
 	}
 	page.Online = matched
+	return page, nil
+}
+
+// rosterCall records what the service handed the roster query (issue #469), so
+// a test can assert the workspace and the server-resolved channel reached SQL.
+type rosterCall struct {
+	workspaceID string
+	channelID   string
+	limit       int
+}
+
+// ListChannelMemberRoster models the roster query (issue #469): the same
+// membership the online preview is drawn from, with no presence predicate, so
+// a test can tell the two populations apart.
+func (f *fakeMemberStore) ListChannelMemberRoster(
+	_ context.Context, workspaceID, channelID, _ string, limit int,
+) (storage.ChannelRosterPage, error) {
+	f.rosterCalls = append(f.rosterCalls, rosterCall{workspaceID: workspaceID, channelID: channelID, limit: limit})
+	if f.rosterErr != nil {
+		return storage.ChannelRosterPage{}, f.rosterErr
+	}
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	members := append([]domain.ChannelMemberProfile(nil), f.roster.Members...)
+	page := storage.ChannelRosterPage{TotalCount: f.roster.TotalCount}
+	if len(members) > limit {
+		members = members[:limit]
+	}
+	page.Members = members
 	return page, nil
 }
 

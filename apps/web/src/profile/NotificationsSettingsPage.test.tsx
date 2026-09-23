@@ -9,6 +9,7 @@ import type { AppShellOutletContext } from "../chat/AppShell";
 import type { SidebarState } from "../chat/useChatSidebar";
 import type { Channel, DMConversation } from "../chat/chatTypes";
 import { noopConversationDrafts } from "../chat/useConversationDrafts";
+import { inertDirectMessage } from "../chat/directMessage";
 import { requestBrowserNotificationPermission } from "../chat/browserNotification";
 import type { WebPushAvailableSnapshot, WebPushSnapshot } from "../notifications/webPushReconciler";
 
@@ -131,6 +132,7 @@ function makeContext(
     inAppAlert: null,
     dismissInAppAlert: vi.fn(),
     drafts: noopConversationDrafts,
+    directMessage: inertDirectMessage,
   };
 }
 

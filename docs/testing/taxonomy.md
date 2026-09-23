@@ -31,7 +31,7 @@ helper do pacote) e da `t.Skip` quando ele nao existe, ou exige uma build tag.
 | --------------------------------------------------------------- | ----------------------------------------------- | ------------------------ | -----: |
 | `admin-service/internal/storage`                                | `ADMIN_TEST_DATABASE_URL`                       | `Tests / Go Integration` |     47 |
 | `auth-service/internal/storage`                                 | `AUTH_TEST_DATABASE_URL`                        | `Tests / Go Integration` |     31 |
-| `chat-service` contrato de membership (#881)                    | `CHAT_TEST_DATABASE_URL` + `-run`               | `Tests / Go Integration` |      4 |
+| `chat-service` contrato de membership (#881, #469)              | `CHAT_TEST_DATABASE_URL` + `-run`               | `Tests / Go Integration` |      8 |
 | `media-service/internal/storage`                                | `MEDIA_TEST_DATABASE_URL` + `-tags integration` | `Tests / Go Integration` |      1 |
 | `chat-service` Link Safety, outbox, prioridade, ack, lembrete   | `CHAT_TEST_DATABASE_URL`, 127 testes nomeados   | `Tests / Go Coverage`    |    127 |
 | `notification-service/internal/storage`                         | `NOTIFICATION_TEST_DATABASE_URL`, nomeados      | `Tests / Go Coverage`    |    113 |

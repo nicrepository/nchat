@@ -39,9 +39,9 @@ test.beforeEach(async ({ page }) => {
       message.location().url.includes("/api/chat/sidebar");
     // Pre-existing warning (verified via `git stash` bisection against
     // unmodified upstream/develop): the *pre-existing* "abrir conversa com o
-    // autor" flow (issue #707), which useAuthorDM.ts's resolveRecipientDM
-    // shares unchanged with this issue's mention flow, already logs this on
-    // fast refreshConversations()-then-navigate sequences. Not introduced by
+    // autor" flow (issue #707), which shares the open-DM coordinator
+    // (directMessage.ts) unchanged with this issue's mention flow, already logs
+    // this on fast refreshConversations()-then-navigate sequences. Not from
     // #795 and out of scope to fix here — allowlisted so this suite tests
     // #795's own behavior rather than re-reporting a known, unrelated issue.
     const knownPreExistingDMOpenWarning = message

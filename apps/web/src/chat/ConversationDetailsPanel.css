@@ -113,6 +113,103 @@
   flex: none;
 }
 
+/* ── Conversation name and its inline rename (issue #893) ───────────────── */
+
+/*
+ * One row for both states — name + pencil, and field + confirm/cancel — so the
+ * controls keep their place when the editor opens. It wraps rather than
+ * shrinking: in the narrow panel the viewport gives below the desktop
+ * threshold, the confirm and cancel buttons move under the field instead of
+ * squeezing it or leaving the panel.
+ */
+.chat-details__name-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chat-details__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--color-ink, #16121f);
+  /* A name is one unbroken token as often as not; it wraps rather than
+     pushing the pencil out of the panel. */
+  overflow-wrap: anywhere;
+}
+
+.chat-details__name-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  color: var(--color-muted, #7c7390);
+  cursor: pointer;
+}
+
+.chat-details__name-action:hover:not(:disabled) {
+  background: var(--color-surface-2, #faf8fd);
+  color: var(--color-ink-2, #3d3550);
+}
+
+.chat-details__name-action--confirm {
+  color: var(--color-primary, #6d28d9);
+}
+
+.chat-details__name-action:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.chat-details__name-action .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.chat-details__name-action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+.chat-details__name-input {
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 14px;
+  color: inherit;
+  border: 1px solid var(--color-border-strong, #d4cde3);
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface, #fff);
+}
+
+.chat-details__name-input:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 1px;
+}
+
+/* The invalid state is never colour alone: the message below is associated
+   with the field through aria-describedby and is what says what is wrong. */
+.chat-details__name-input[aria-invalid="true"] {
+  border-color: var(--color-danger-ink, #991b1b);
+}
+
+.chat-details__name-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-danger-ink, #991b1b);
+}
+
 .chat-details__empty,
 .chat-details__note {
   margin: 8px 0 0;
@@ -192,6 +289,128 @@
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+/*
+ * The row's identity region (issue #895): avatar, name and status, as one
+ * block. It is a <button> when activating it opens a conversation and a plain
+ * <span> when it does not — the viewer's own row — so the two never differ in
+ * layout and a row can never look activatable while doing nothing.
+ *
+ * It is the row's flex child rather than the row itself, which is what lets a
+ * secondary action (issue #469's removal control) sit beside it as a sibling
+ * instead of nesting one interactive element inside another.
+ *
+ * min-height is the touch target, stated on the region both variants share so
+ * an activatable row and a static one are the same height in one list.
+ *
+ * The region is deliberately flush with the row rather than bled outwards with
+ * a negative margin: the expanded list is a scroll container, and `overflow-y:
+ * auto` makes its horizontal overflow `auto` too, so anything reaching past the
+ * row's box would buy a hover surface at the price of a horizontal scrollbar.
+ */
+.chat-details__member-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: start;
+}
+
+.chat-details__member-main--action {
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-details__member-main--action:hover {
+  background: var(--color-surface-2, #faf8fd);
+}
+
+.chat-details__member-main--action:focus-visible {
+  outline: 2px solid var(--color-primary, #6d28d9);
+  outline-offset: 2px;
+}
+
+/* Being resolved. Not `disabled`: taking the control out of the tab order mid
+   interaction moves focus out from under whoever just pressed it, and a repeat
+   press is harmless — the open-DM flow deduplicates by recipient. */
+.chat-details__member-main--action[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat-details__member-main--action {
+    transition: background-color 120ms ease-out;
+  }
+}
+
+/*
+ * The row's destructive secondary action (issue #469).
+ *
+ * `flex: none` beside the identity region's `flex: 1` is what keeps it from
+ * displacing the avatar, the name or the status line: the identity keeps the
+ * whole remaining width and shrinks its own text, so a very long name
+ * ellipsises instead of pushing this button out of the panel. The panel is
+ * narrow at every breakpoint and narrower still on a phone, which is exactly
+ * where a shrinking control would become unusable.
+ *
+ * 36px is the drawn box and the 44px row height is the touch target around it,
+ * matching the identity region's own min-height so an administrable row is the
+ * same height as any other.
+ *
+ * Risk is not carried by colour alone. The icon is a "minus in a circle", the
+ * tooltip says "Remover membro", the accessible name names the person and the
+ * conversation, and the confirmation dialog states the consequence before
+ * anything happens — the red is the fourth signal, not the only one.
+ */
+.chat-details__member-remove {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--color-danger, #b42318);
+  cursor: pointer;
+}
+
+.chat-details__member-remove .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.chat-details__member-remove:hover:not(:disabled) {
+  background: var(--color-danger-tint, #fdeceb);
+}
+
+.chat-details__member-remove:active:not(:disabled) {
+  background: var(--color-danger-tint-strong, #fbd9d6);
+}
+
+.chat-details__member-remove:focus-visible {
+  outline: 2px solid var(--color-danger, #b42318);
+  outline-offset: 2px;
+}
+
+.chat-details__member-remove:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat-details__member-remove {
+    transition: background-color 120ms ease-out;
+  }
 }
 
 .chat-details__avatar {
@@ -537,4 +756,38 @@
 .chat-details__file-status--rejected {
   background: var(--color-danger-tint, #fee2e2);
   color: var(--color-danger-ink, #991b1b);
+}
+
+/* ── "Sobre": description label and value (issue #894) ───────────────────── */
+
+/*
+ * A real heading rather than a styled paragraph: it names the value under it,
+ * and h4 is the level below the section's own h3, so a screen reader can reach
+ * the description the same way it reaches every other part of the panel. It
+ * borrows the section label's typography without borrowing its spacing, which
+ * belongs above a section rather than inside one.
+ */
+.chat-details__sublabel {
+  margin: 12px 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted, #7c7390);
+}
+
+/*
+ * The description's own text. pre-wrap is the whole reason this rule exists:
+ * a stored description may contain line breaks, and the panel has to keep them
+ * without interpreting anything — the value is a React text node, never markup.
+ * overflow-wrap keeps a long unbroken token (a URL, a path) inside the narrow
+ * panel instead of widening it.
+ */
+.chat-details__description {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-2, #3d3550);
 }

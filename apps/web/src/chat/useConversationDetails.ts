@@ -31,10 +31,15 @@
 
 import { useCallback, useEffect, useReducer, useRef } from "react";
 
-import { fetchChannelDetails, fetchDirectProfile, fetchGroupDetails } from "./chatApi";
+import {
+  fetchChannelDetails,
+  fetchChannelMembers,
+  fetchDirectProfile,
+  fetchGroupDetails,
+} from "./chatApi";
 import { fetchConversationAttachments } from "./filesApi";
 import { canShowPreview, isPreviewWorkPending } from "./useAttachmentPreview";
-import type { ChannelAttachment, ConversationDetails } from "./chatTypes";
+import type { ChannelAttachment, ChannelRoster, ConversationDetails } from "./chatTypes";
 
 /**
  * What the panel is being opened for.
@@ -136,6 +141,22 @@ export interface ConversationDetailsState {
   details: AsyncSection<ConversationDetails>;
   files: AsyncSection<ChannelAttachment[]>;
   /**
+   * A channel's administrable membership (issue #469), loaded only for a
+   * caller the server says may change it.
+   *
+   * It is a third section rather than a hook of its own because it has to
+   * reconcile with the details it belongs to: one `reload` refetches both, so
+   * the roster and the counter beside it can never come from two different
+   * moments. It stays "loading" for a group — whose participants already are
+   * the roster — for a 1:1, and for any caller without the capability; the
+   * panel reads it only where it asked for it.
+   *
+   * The request is chained after the details response because the capability
+   * that authorizes it arrives in that response: issuing it blindly would mean
+   * a guaranteed 403 every time any reader opens any channel.
+   */
+  roster: AsyncSection<ChannelRoster>;
+  /**
    * Refetches the panel for the target it is currently showing (issue #398).
    *
    * The single reconciliation path after a membership change. Both triggers —
@@ -157,10 +178,12 @@ type Action =
   | { type: "details_ready"; details: ConversationDetails }
   | { type: "details_error" }
   | { type: "files_ready"; files: ChannelAttachment[] }
-  | { type: "files_error" };
+  | { type: "files_error" }
+  | { type: "roster_ready"; roster: ChannelRoster }
+  | { type: "roster_error" };
 
 /**
- * The reducer owns the two sections only; `reload` is attached by the hook.
+ * The reducer owns the sections only; `reload` is attached by the hook.
  *
  * Keeping the callback out of reducer state is what stops a dispatch from ever
  * replacing it with a stale identity.
@@ -170,6 +193,7 @@ type Sections = Omit<ConversationDetailsState, "reload">;
 const initialState: Sections = {
   details: { status: "loading" },
   files: { status: "loading" },
+  roster: { status: "loading" },
 };
 
 function reducer(state: Sections, action: Action): Sections {
@@ -184,6 +208,10 @@ function reducer(state: Sections, action: Action): Sections {
       return { ...state, files: { status: "ready", data: action.files } };
     case "files_error":
       return { ...state, files: { status: "error" } };
+    case "roster_ready":
+      return { ...state, roster: { status: "ready", data: action.roster } };
+    case "roster_error":
+      return { ...state, roster: { status: "error" } };
   }
 }
 
@@ -254,6 +282,34 @@ function reconcileReducer(state: ReconcileWindow, action: ReconcileAction): Reco
 }
 
 /**
+ * Issues the authoritative roster request for every visible channel. The
+ * server applies the same visibility check as channel details, while action
+ * capabilities only decide which controls each row receives.
+ *
+ * It shares the details request's AbortController, so a target switch or an
+ * unmount cancels an in-flight roster exactly like everything else here, and a
+ * reply that lands after the switch is dropped rather than shown under the new
+ * conversation's name.
+ */
+function loadChannelRoster(
+  details: ConversationDetails,
+  controller: AbortController,
+  dispatch: (action: Action) => void,
+) {
+  if (details.kind !== "channel") return;
+  fetchChannelMembers(details.id, controller.signal).then(
+    (roster) => {
+      if (controller.signal.aborted) return;
+      dispatch({ type: "roster_ready", roster });
+    },
+    (error: unknown) => {
+      if (controller.signal.aborted || isAbort(error)) return;
+      dispatch({ type: "roster_error" });
+    },
+  );
+}
+
+/**
  * Loads the panel's data for `target`. Pass null (panel closed, or an unknown
  * target) and the hook stays idle and issues no request.
  */
@@ -316,6 +372,7 @@ export function useConversationDetails(
       (resolved) => {
         if (controller.signal.aborted) return;
         dispatch({ type: "details_ready", details: resolved });
+        loadChannelRoster(resolved, controller, dispatch);
       },
       (error: unknown) => {
         if (controller.signal.aborted || isAbort(error)) return;

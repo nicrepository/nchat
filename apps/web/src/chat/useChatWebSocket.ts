@@ -804,13 +804,23 @@ export function useChatWebSocket({
       return true;
     }
 
-    function routeClientError(d: Record<string, unknown>, generation: number): boolean {
+    function routeClientError(
+      control: SubscriptionControl,
+      d: Record<string, unknown>,
+      generation: number,
+      incoming: IncomingTarget,
+    ): boolean {
       if (d["type"] !== "error" || typeof d["code"] !== "string") return false;
       const clientError = d as unknown as WSClientErrorEvent;
       if (d["operation"] !== "subscribe") {
         onReactionErrorRef.current?.(clientError);
         return true;
       }
+      // Older servers did not identify a failed subscription, so retain their
+      // conservative handling. Newer frames are target-scoped: an additional
+      // sidebar subscription must not make the currently open conversation
+      // appear disconnected.
+      if (incoming.type && !control.expected.has(incoming.key)) return true;
       onSubscriptionErrorRef.current?.(clientError);
       if (d["code"] === "room_subscription_unavailable" && handle?.isOpen()) {
         scheduleSubscriptionRecovery(generation);
@@ -1008,7 +1018,7 @@ export function useChatWebSocket({
         if (!control) return;
         const incoming = incomingTarget(d);
         if (routeSubscriptionAck(control, d, incoming)) return;
-        if (routeClientError(d, generation)) return;
+        if (routeClientError(control, d, generation, incoming)) return;
         if (routeUnscopedEvent(d, incoming)) return;
         if (!control.expected.has(incoming.key)) return;
         if (routeSubscribedTargetEvent(d, incoming)) return;

@@ -22,6 +22,7 @@ import {
   forwardChannelMessage,
   ERR_INVALID_RESPONSE,
   fetchChannelDetails,
+  fetchChannelMembers,
   fetchDirectProfile,
   fetchGroupDetails,
   fetchChannelMessage,
@@ -54,6 +55,8 @@ import {
   searchChannelMemberCandidates,
   searchDMCandidates,
   searchGroupParticipantCandidates,
+  removeChannelMember,
+  removeGroupParticipant,
   renameChannel,
   setConversationMuted,
   setConversationNotificationMode,
@@ -2906,6 +2909,10 @@ describe("fetchChannelDetails", () => {
       slug: "infra",
       name: "Infraestrutura",
       type: "private",
+      // Legacy payload: neither About field is present, so both read as absent
+      // rather than as an empty-looking value (issue #894).
+      description: "",
+      creatorDisplayName: undefined,
       createdAt: "2024-01-12T09:30:00Z",
       memberCount: 12,
       onlineCount: 3,
@@ -2919,8 +2926,10 @@ describe("fetchChannelDetails", () => {
         },
       ],
       // Absent from this payload, so it must be false: an add-members action is
-      // never enabled by a field the server did not send (issue #398).
+      // never enabled by a field the server did not send (issue #398). The
+      // removal capability reads the same way (issue #469).
       canManageMembers: false,
+      canRemoveMembers: false,
     });
   });
 
@@ -3221,6 +3230,8 @@ describe("fetchGroupDetails (issue #441)", () => {
     expect(details).toEqual({
       id: "conv 1",
       name: "Time de Infra",
+      description: "",
+      creatorDisplayName: undefined,
       createdAt: "2024-03-04T15:00:00Z",
       participantCount: 12,
       participants: [
@@ -3231,8 +3242,10 @@ describe("fetchGroupDetails (issue #441)", () => {
           presence: "online",
         },
       ],
-      // Absent in this payload, so the add action stays hidden (issue #398).
+      // Absent in this payload, so neither action is offered (issues #398,
+      // #469).
       canManageMembers: false,
+      canRemoveMembers: false,
     });
   });
 
@@ -3333,6 +3346,113 @@ describe("fetchGroupDetails (issue #441)", () => {
     });
 
     expect((await fetchGroupDetails("conv-1")).canManageMembers).toBe(false);
+  });
+});
+
+// ── About metadata: description and creator (issue #894) ─────────────────────
+//
+// The parser's whole job here is to refuse to invent. A description that is not
+// a string is not a description, a creator name that is not a usable string is
+// not a creator, and nothing in the payload may be promoted into either — least
+// of all an identifier.
+
+describe.each([
+  ["fetchChannelDetails", fetchChannelDetails, "ch-1"],
+  ["fetchGroupDetails", fetchGroupDetails, "conv-1"],
+] as const)("%s — About metadata (issue #894)", (_label, fetchDetails, targetId) => {
+  it("maps a description and a resolved creator", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: targetId,
+        description: "Infraestrutura, processos internos e operações.",
+        creator_display_name: "Álvaro Neto",
+      },
+    });
+
+    const details = await fetchDetails(targetId);
+
+    expect(details.description).toBe("Infraestrutura, processos internos e operações.");
+    expect(details.creatorDisplayName).toBe("Álvaro Neto");
+  });
+
+  it("reads a legacy payload without either field as absent, not as an error", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: targetId } });
+
+    const details = await fetchDetails(targetId);
+
+    expect(details.description).toBe("");
+    expect(details.creatorDisplayName).toBeUndefined();
+  });
+
+  it("keeps markup in a description as the text it is", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: targetId, description: "<script>alert(1)</script> & <b>bold</b>" },
+    });
+
+    // Not unescaped, not stripped, not parsed: the value survives verbatim and
+    // the DOM never sees it as anything but a text node.
+    expect((await fetchDetails(targetId)).description).toBe(
+      "<script>alert(1)</script> & <b>bold</b>",
+    );
+  });
+
+  it.each([
+    ["a number", 42],
+    ["an object", { text: "oi" }],
+    ["an array", ["oi"]],
+    ["null", null],
+    ["true", true],
+  ])("refuses %s as a description instead of coercing it", async (_case, value) => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: targetId, description: value } });
+
+    // String(value) here would put "42", "[object Object]" or "null" under the
+    // conversation's name as if someone had written it.
+    expect((await fetchDetails(targetId)).description).toBe("");
+  });
+
+  it("treats a blank description as no description", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: targetId, description: "   \n  " } });
+
+    expect((await fetchDetails(targetId)).description).toBe("");
+  });
+
+  it("preserves meaningful boundary whitespace in a description", async () => {
+    const description = "\n  Infraestrutura e operações.\n";
+    mockAuthFetch.mockResolvedValueOnce({ data: { id: targetId, description } });
+
+    expect((await fetchDetails(targetId)).description).toBe(description);
+  });
+
+  it.each([
+    ["a number", 7],
+    ["an object", { display_name: "Álvaro" }],
+    ["null", null],
+    ["a blank string", "   "],
+  ])("leaves the creator unresolved when the name is %s", async (_case, value) => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: { id: targetId, creator_display_name: value },
+    });
+
+    expect((await fetchDetails(targetId)).creatorDisplayName).toBeUndefined();
+  });
+
+  it("never turns an identifier in the payload into the creator's name", async () => {
+    const creatorId = "11111111-2222-4333-8444-555555555555";
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        id: targetId,
+        // A server that grew a creator id would still not be naming anyone. The
+        // parser reads the name field and only the name field.
+        created_by: creatorId,
+        creator_id: creatorId,
+        creator: { user_id: creatorId },
+      },
+    });
+
+    const details = await fetchDetails(targetId);
+
+    expect(details.creatorDisplayName).toBeUndefined();
+    expect(JSON.stringify(details)).not.toContain(creatorId);
   });
 });
 
@@ -3900,5 +4020,158 @@ describe("sidebar notification-level capability (issue #136)", () => {
     for (const capability of ["absent", false, null, "true", 1, {}]) {
       expect(await capabilityFor(capability)).toBe(false);
     }
+  });
+});
+
+// ── Channel roster and member removal (issue #469) ──────────────────────────
+
+describe("fetchChannelMembers", () => {
+  it("reads the administrable membership and encodes the channel in the path", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        total: 12,
+        members: [
+          { user_id: "u-1", display_name: "Álvaro", avatar_url: "/media/a.png", role: "moderator" },
+          { user_id: "u-2", display_name: "Juliane", role: "member" },
+        ],
+      },
+    });
+
+    const roster = await fetchChannelMembers("ch 1");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members", {
+      method: "GET",
+      signal: undefined,
+    });
+    expect(roster).toEqual({
+      // The server's own total, larger than the page it came with.
+      memberCount: 12,
+      members: [
+        { userId: "u-1", displayName: "Álvaro", avatarUrl: "/media/a.png", role: "moderator" },
+        { userId: "u-2", displayName: "Juliane", avatarUrl: undefined, role: "member" },
+      ],
+    });
+  });
+
+  // A roster row is membership, and nothing in it is trusted blindly: an
+  // unknown role reads as the least privileged one, an off-origin avatar is
+  // dropped, and a row without an id is not a person.
+  it("normalizes rows and drops the ones that are not identities", async () => {
+    mockAuthFetch.mockResolvedValueOnce({
+      data: {
+        member_count: -3,
+        members: [
+          { user_id: "u-1", display_name: "Ana", role: "owner", avatar_url: "https://evil.test/a" },
+          { user_id: "", display_name: "Sem id", role: "member" },
+          null,
+        ],
+      },
+    });
+
+    const roster = await fetchChannelMembers("ch-1");
+
+    expect(roster.memberCount).toBe(0);
+    expect(roster.members).toEqual([
+      { userId: "u-1", displayName: "Ana", avatarUrl: undefined, role: "member" },
+    ]);
+  });
+
+  it("answers an empty roster for a payload without members", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: {} });
+
+    await expect(fetchChannelMembers("ch-1")).resolves.toEqual({ memberCount: 0, members: [] });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce({ data: { member_count: 0, members: [] } });
+    const controller = new AbortController();
+
+    await fetchChannelMembers("ch-1", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  // The route is refused for a caller who may not administer the channel, and
+  // that must reach the caller as a failure — never as "this channel has no
+  // members".
+  it("rejects when the server refuses the roster", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(fetchChannelMembers("ch-1")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("removeChannelMember", () => {
+  it("DELETEs the membership and encodes both identifiers", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeChannelMember("ch 1", "u/2");
+
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/channels/ch%201/members/u%2F2", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  // The request must carry nothing else. A workspace, an actor or a role in a
+  // body would mean this client believes it has authority it does not.
+  it("sends no body at all", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeChannelMember("ch-1", "u-2");
+
+    expect(mockAuthFetch.mock.calls[0][1]).toEqual({ method: "DELETE", signal: undefined });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    const controller = new AbortController();
+
+    await removeChannelMember("ch-1", "u-2", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("rejects with the API error so the dialog can say what happened", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(403, "forbidden", "forbidden"));
+
+    await expect(removeChannelMember("ch-1", "u-2")).rejects.toBeInstanceOf(ApiRequestError);
+  });
+});
+
+describe("removeGroupParticipant", () => {
+  it("DELETEs the participation under the DM prefix", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeGroupParticipant("conv 1", "u 2");
+
+    // A group is a conversation: never /channels/.
+    expect(mockAuthFetch).toHaveBeenCalledWith("/api/chat/dm/conv%201/participants/u%202", {
+      method: "DELETE",
+      signal: undefined,
+    });
+  });
+
+  it("sends no body at all", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+
+    await removeGroupParticipant("conv-1", "u-2");
+
+    expect(mockAuthFetch.mock.calls[0][1]).toEqual({ method: "DELETE", signal: undefined });
+  });
+
+  it("passes the abort signal through", async () => {
+    mockAuthFetch.mockResolvedValueOnce(undefined);
+    const controller = new AbortController();
+
+    await removeGroupParticipant("conv-1", "u-2", controller.signal);
+
+    expect(mockAuthFetch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
+  it("rejects with the API error", async () => {
+    mockAuthFetch.mockRejectedValueOnce(new ApiRequestError(404, "not_found", "not found"));
+
+    await expect(removeGroupParticipant("conv-1", "u-2")).rejects.toBeInstanceOf(ApiRequestError);
   });
 });

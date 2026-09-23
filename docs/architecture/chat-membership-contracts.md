@@ -121,6 +121,12 @@ populacao coincide com os leitores no privado apos adicao e em `#geral` apos
 sync; nao no publico sem rows nem em `#geral` antes do sync.
 **TARGET (#883):** alinhar a contagem a membership efetiva/roster de 1.4.
 
+O bloco `SOBRE` do painel (issue #894) **consome** esta contagem e nao define
+outra: nao ha contador local, nada e derivado de `online_members.length` nem da
+previa de participantes, e a convergencia apos uma mudanca de membership
+continua sendo o refetch existente. Quando #883 mudar a fonte, o painel muda com
+ela sem alteracao propria.
+
 ### 1.8 Candidate eligibility
 
 **TARGET (#885, dependente de #883):** candidatos elegiveis com exclusao dos
@@ -149,19 +155,23 @@ desatualizada ate o proximo refetch, nunca uma membership.
 
 ### A. Channel details — `GET /api/chat/channels/{channelID}/details`
 
-| Camada   | Arquivo / simbolo                                                                                     |
-| -------- | ----------------------------------------------------------------------------------------------------- |
-| rota     | `internal/http/routes.go` `RouteChannelDetails`; `router.go:430` (orcamento de leitura)               |
-| handler  | `internal/http/channel_handler.go` `(*ChannelHandler).Details`, `onlineUserIDs`, `channelDetailsBody` |
-| service  | `internal/service/channel_service.go` `(*ChannelService).GetChannelDetails`                           |
-| store    | `internal/storage/member_store.go` `(*PGXMemberStore).ListOnlineChannelMemberProfiles`                |
-| SQL      | CTE `active_members` -> CTE `online_members` -> `page` (`ORDER BY` + `LIMIT`)                         |
-| JSON     | `member_count`, `online_member_count`, `online_members[]`, `can_manage_members`                       |
-| chatApi  | `apps/web/src/chat/chatApi.ts` `fetchChannelDetails`                                                  |
-| tipos    | `apps/web/src/chat/chatTypes.ts` `ChannelDetails`                                                     |
-| hook     | `apps/web/src/chat/useConversationDetails.ts`                                                         |
-| UI       | `apps/web/src/chat/ConversationDetailsPanel.tsx` `ChannelAboutSection`, `ChannelMembersSection`       |
-| contrato | `docs/api/chat-channel-details.md`                                                                    |
+| Camada   | Arquivo / simbolo                                                                                                      |
+| -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| rota     | `internal/http/routes.go` `RouteChannelDetails`; `router.go:430` (orcamento de leitura)                                |
+| handler  | `internal/http/channel_handler.go` `(*ChannelHandler).Details`, `onlineUserIDs`, `channelDetailsBody`                  |
+| service  | `internal/service/channel_service.go` `(*ChannelService).GetChannelDetails`                                            |
+| store    | `internal/storage/member_store.go` `(*PGXMemberStore).ListOnlineChannelMemberProfiles`                                 |
+| SQL      | CTE `active_members` -> CTE `online_members` -> `page` (`ORDER BY` + `LIMIT`)                                          |
+| JSON     | `member_count`, `online_member_count`, `online_members[]`, `can_manage_members`, `description`, `creator_display_name` |
+| chatApi  | `apps/web/src/chat/chatApi.ts` `fetchChannelDetails`                                                                   |
+| tipos    | `apps/web/src/chat/chatTypes.ts` `ChannelDetails`                                                                      |
+| hook     | `apps/web/src/chat/useConversationDetails.ts`                                                                          |
+| UI       | `apps/web/src/chat/ConversationDetailsPanel.tsx` `AboutMetadata`, `ChannelAboutSection`, `ChannelMembersSection`       |
+| contrato | `docs/api/chat-channel-details.md`                                                                                     |
+
+`description` e `creator_display_name` sao metadata do bloco `SOBRE`
+(issue #894), lidos por `storage.(*PGXChannelStore).GetChannelAbout` depois do
+gate. Nao pertencem a membership e nao participam de nenhuma contagem.
 
 Ordem das decisoes: `requireActiveWorkspaceMember` -> `GetVisibleChannelByID`
 (visibilidade, 404 uniforme) -> leitura de membros. Um chamador negado nunca
@@ -188,6 +198,37 @@ candidatos de mencao. Uma unica populacao, um unico predicado. Presenca e
 anotada **depois** da selecao (`groupDetailsBody` consulta
 `OnlineUserIDs` e marca cada linha), portanto um participante offline nunca sai
 da lista nem perde vaga.
+
+### B2. Channel roster — `GET /api/chat/channels/{channelID}/members` (issue #469)
+
+| Camada   | Arquivo / simbolo                                                                   |
+| -------- | ----------------------------------------------------------------------------------- |
+| rota     | `internal/http/routes.go` `RouteChannelMembers` (GET); orcamento de leitura         |
+| handler  | `internal/http/channel_handler.go` `(*ChannelHandler).Members`, `channelRosterBody` |
+| service  | `internal/service/channel_service.go` `(*ChannelService).ListChannelMembers`        |
+| store    | `internal/storage/member_store.go` `(*PGXMemberStore).ListChannelMemberRoster`      |
+| SQL      | CTE `active_members` (a mesma de B) -> `COUNT(*) OVER ()` + `ORDER BY` + `LIMIT`    |
+| JSON     | `member_count`, `members[]` (`user_id`, `display_name`, `avatar_url`, `role`)       |
+| UI       | `ConversationDetailsPanel.tsx` `channelRosterContent`, via `useConversationDetails` |
+| contrato | `docs/api/chat-channel-details.md`                                                  |
+
+**Populacao: 1.2, explicit channel membership** — exatamente a que
+`RemoveChannelMemberByAdmin` apaga, e exatamente a que `member_count` (1.7)
+conta. Nao ha predicado de presenca: e o mesmo `active_members` de B sem o
+recorte de 1.6, porque uma remocao precisa alcancar quem esta offline.
+
+Uma unica pagina de 30 por chamada, sem cursor, com o total real ao lado. A
+navegacao da colecao inteira (compacto de cinco, `Ver todos`, lista
+completa/paginada) pertence a **#895**, que consome esta rota; a #469 usa a
+primeira pagina e diz na tela quanto dela tem.
+
+Nao substitui `online_members` e nao altera a rota de detalhes: B continua
+respondendo a todo leitor com a previa de presenca, e esta rota responde
+**apenas** a quem pode mudar a membership — o gate e a propria politica de
+remocao (`!IsGeneral && domain.CanManageChannelMembers`), verificada antes da
+busca do canal, como em C. Um canal publico sem linhas explicitas responde
+roster vazio: e a divergencia de 1.4, nao uma decisao desta rota, e o dia em que
+#883 definir a membership efetiva esta rota a segue sem mudar de forma.
 
 ### C. Member candidates — `GET /api/chat/channels/{channelID}/member-candidates`
 
@@ -263,6 +304,21 @@ A sidebar reflete **acesso/visibilidade** e por construcao nao e roster. Ela
 nao deve ser usada como fonte para candidates nem para mentions — e a linha
 `LEFT JOIN chat.channel_members cm` que ela carrega existe para o papel do
 proprio leitor, nao para compor uma lista de membros.
+
+### G2. Remocao administrativa — `DELETE .../members/{userID}` e `DELETE /dm/{id}/participants/{userID}`
+
+Issue #685 para as duas escritas, issue #469 para as superficies que as chamam.
+Populacao afetada: 1.2 no canal (`DELETE FROM chat.channel_members`) e
+`chat.dm_members` no grupo (`status = 'left'`). Autorizacao: canal por
+`domain.CanManageChannelMembers` — o mesmo predicado da adicao, mais a recusa de
+`#geral` — e grupo por creatorship, que **nao** e a politica da adicao (qualquer
+participante). Por isso os detalhes de cada agregado carregam
+`can_remove_members` separado de `can_manage_members`.
+
+O ator nunca e alvo: as duas rotas recusam `callerID == targetUserID` com
+`ErrInvalidInput`, porque sair da conversa e a rota de `membership`. Ambas sao
+idempotentes, escrevem `conversation_member_removed` na mesma transacao e
+publicam `conversation.event` apos o commit. Nenhum evento novo foi criado.
 
 ### H. Realtime — `members.added`
 

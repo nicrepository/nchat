@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { DMConversation } from "./chatTypes";
 import { useConversationDetails, type ConversationDetailsState } from "./useConversationDetails";
+import { useReloadOnRename } from "./useReloadOnRename";
 
 export type ConversationDetailsKind = "channel" | "group" | "direct";
 
@@ -83,33 +84,6 @@ function toggleLabelFor(
     return detailsKind === "channel" ? "Detalhes do canal" : "Detalhes do grupo";
   const counterpart = activeDM?.counterpart?.displayName;
   return counterpart ? `Abrir perfil de ${counterpart}` : "Abrir perfil da conversa";
-}
-
-/**
- * Reloads an open panel when the conversation is renamed under it.
- *
- * A rename lands in the sidebar payload first — through this actor's own
- * refetch, or through channel.updated for everybody else — and the header reads
- * its name straight from there. The panel does not: it holds its own
- * display_name from GET /details, so without this it would keep showing the old
- * one until it was closed and reopened (issue #527).
- *
- * The name is watched *together with the target's identity*, and that pairing is
- * the point. Switching conversations also changes the name, but there
- * useConversationDetails is already loading the new target from its own effect —
- * reloading here too would abort that request and issue a second one for the
- * same panel. So a changed identity is left alone, and only a name that moved
- * under the same conversation triggers a refetch.
- */
-function useReloadOnRename(key: string, name: string, open: boolean, reload: () => void): void {
-  const last = useRef({ key, name });
-  useEffect(() => {
-    const previous = last.current;
-    last.current = { key, name };
-    if (previous.key !== key) return;
-    if (previous.name === name) return;
-    if (open) reload();
-  }, [key, name, open, reload]);
 }
 
 /**

@@ -27,6 +27,8 @@ import {
   type ChannelCategory,
   type ChannelDetails,
   type ChannelMemberProfile,
+  type ChannelRoster,
+  type ChannelRosterMember,
   type ConversationNotificationLevel,
   type ConversationNotificationMode,
   type GroupDetails,
@@ -2090,11 +2092,14 @@ interface ChannelDetailsEnvelope {
     slug?: unknown;
     display_name?: unknown;
     type?: unknown;
+    description?: unknown;
+    creator_display_name?: unknown;
     created_at?: unknown;
     member_count?: unknown;
     online_member_count?: unknown;
     online_members?: unknown;
     can_manage_members?: unknown;
+    can_remove_members?: unknown;
   };
 }
 
@@ -2121,6 +2126,40 @@ function mapChannelMember(raw: unknown): ChannelMemberProfile | undefined {
 
 function nonNegativeCount(raw: unknown): number {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : 0;
+}
+
+/**
+ * A conversation's description (issue #894), or "" when the server sent none.
+ *
+ * Only a string is a description. A number, an object or a null is not coerced
+ * into one — `String(value)` here would put "[object Object]" or "null" in the
+ * panel under the conversation's name — and a server that predates the field
+ * omits it, which is the same outcome as a conversation nobody has described.
+ *
+ * Nothing is stripped or unescaped: the value reaches the DOM as a React text
+ * node, so markup inside it is text and this is not the layer that has to make
+ * it safe. Whitespace-only values are absent, but meaningful leading, trailing
+ * and line-break whitespace remains part of the stored description.
+ */
+function conversationDescription(raw: unknown): string {
+  return typeof raw === "string" && raw.trim() !== "" ? raw : "";
+}
+
+/**
+ * The creator's display name (issue #894), or undefined when there is none to
+ * show.
+ *
+ * Absent means absent, and it has exactly one rendering: the panel's neutral
+ * state. A blank string is treated as absent for the same reason — a name made
+ * of spaces names nobody — and nothing else in the payload is ever promoted
+ * into this field. In particular there is no creator id to fall back to,
+ * because the server does not send one: a UUID is not a name and must never be
+ * shown as one.
+ */
+function creatorDisplayName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const name = raw.trim();
+  return name === "" ? undefined : name;
 }
 
 /**
@@ -2155,6 +2194,8 @@ export async function fetchChannelDetails(
     slug: typeof data.slug === "string" ? data.slug : "",
     name: typeof data.display_name === "string" ? data.display_name : "",
     type: data.type === "private" ? "private" : "public",
+    description: conversationDescription(data.description),
+    creatorDisplayName: creatorDisplayName(data.creator_display_name),
     createdAt: typeof data.created_at === "string" ? data.created_at : "",
     // Both totals are the server's. Deriving either from onlineMembers.length
     // would under-report: that array is a capped preview, and the channel's size
@@ -2167,6 +2208,10 @@ export async function fetchChannelDetails(
     // therefore leaves the action hidden, which is the safe direction, and the
     // POST re-checks the real decision regardless of what this says.
     canManageMembers: data.can_manage_members === true,
+    // Its own field, read with the same strict `=== true` (issue #469). Never
+    // inferred from can_manage_members: the two are different questions, and
+    // the DELETE re-derives the real answer on every call.
+    canRemoveMembers: data.can_remove_members === true,
   };
 }
 
@@ -2261,10 +2306,13 @@ interface GroupDetailsEnvelope {
     id?: unknown;
     type?: unknown;
     name?: unknown;
+    description?: unknown;
+    creator_display_name?: unknown;
     created_at?: unknown;
     participant_count?: unknown;
     participants?: unknown;
     can_manage_members?: unknown;
+    can_remove_members?: unknown;
   };
 }
 
@@ -2314,6 +2362,8 @@ export async function fetchGroupDetails(
   return {
     id: typeof data.id === "string" ? data.id : conversationId,
     name: typeof data.name === "string" ? data.name : "",
+    description: conversationDescription(data.description),
+    creatorDisplayName: creatorDisplayName(data.creator_display_name),
     createdAt: typeof data.created_at === "string" ? data.created_at : "",
     // The server's total. Deriving it from the preview would under-report a
     // group with more participants than the cap allows.
@@ -2323,7 +2373,120 @@ export async function fetchGroupDetails(
     // add action hidden, so a server that predates it does not enable a flow it
     // cannot authorize.
     canManageMembers: data.can_manage_members === true,
+    // Genuinely a different answer for a group (issue #469): every participant
+    // may add, only the creator may remove.
+    canRemoveMembers: data.can_remove_members === true,
   };
+}
+
+// ── Channel roster and member removal (issue #469) ───────────────────────────
+
+interface ChannelRosterMemberResponse {
+  user_id?: unknown;
+  display_name?: unknown;
+  avatar_url?: unknown;
+  role?: unknown;
+}
+
+interface ChannelRosterEnvelope {
+  data: {
+    total?: unknown;
+    next_cursor?: unknown;
+    members?: unknown;
+  };
+}
+
+function mapChannelRosterMember(raw: unknown): ChannelRosterMember | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const member = raw as ChannelRosterMemberResponse;
+  if (typeof member.user_id !== "string" || member.user_id === "") return undefined;
+  return {
+    userId: member.user_id,
+    displayName: typeof member.display_name === "string" ? member.display_name : "",
+    avatarUrl: safeAvatarUrl(member.avatar_url),
+    role: member.role === "moderator" ? "moderator" : "member",
+  };
+}
+
+/**
+ * Fetches a channel's administrable membership (issue #469).
+ *
+ * The server answers only a caller who may change that membership — 403
+ * otherwise — so this rejects rather than returning an empty roster, and the
+ * panel keeps showing the presence preview it already had instead of claiming
+ * the channel has nobody in it.
+ *
+ * `memberCount` is the server's own total and is never `members.length`: the
+ * page is capped, and the note under the list is what says so.
+ */
+export async function fetchChannelMembers(
+  channelId: string,
+  signal?: AbortSignal,
+  cursor?: string,
+): Promise<ChannelRoster> {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  const res = await authenticatedFetch<ChannelRosterEnvelope>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/members${query}`,
+    { method: "GET", signal },
+  );
+  const data = res.data;
+  const members = Array.isArray(data.members)
+    ? data.members
+        .map(mapChannelRosterMember)
+        .filter((member): member is ChannelRosterMember => member !== undefined)
+    : [];
+  const nextCursor =
+    typeof data.next_cursor === "string" && data.next_cursor ? data.next_cursor : undefined;
+  return {
+    memberCount: nonNegativeCount(data.total),
+    members,
+    ...(nextCursor ? { nextCursor } : {}),
+  };
+}
+
+/**
+ * Removes one member from a channel (issue #469, backend issue #685).
+ *
+ * The request carries the two identifiers the route names and nothing else:
+ * no workspace, no actor, no role, no permission flag. All four are derived
+ * from the session server-side, which is what makes the authorization
+ * un-spoofable from here — this function could not assert them if it wanted
+ * to, because the shape has nowhere to put them.
+ *
+ * The server answers 204 with no body, so there is nothing to parse and
+ * nothing to believe: the caller reconciles by refetching, never from a
+ * response. A target who is not a member is the same 204 — the removal is
+ * idempotent in the database, not in this client.
+ */
+export async function removeChannelMember(
+  channelId: string,
+  userId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(
+    `${CHAT_BASE}/channels/${encodeURIComponent(channelId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE", signal },
+  );
+}
+
+/**
+ * Removes one participant from a group conversation (issue #469, backend
+ * issue #685).
+ *
+ * A separate route from the channel one because a group is a DM conversation,
+ * and a separate *authority*: only the group's creator may call it, which the
+ * store re-derives inside the transaction. Same empty request and same 204 as
+ * the channel removal above.
+ */
+export async function removeGroupParticipant(
+  conversationId: string,
+  userId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await authenticatedFetch<void>(
+    `${CHAT_BASE}/dm/${encodeURIComponent(conversationId)}/participants/${encodeURIComponent(userId)}`,
+    { method: "DELETE", signal },
+  );
 }
 
 // ── Call-participant profiles (issue #612) ───────────────────────────────────

@@ -56,6 +56,7 @@ type routeMemberStore struct {
 
 	memberPages       map[string]storage.ChannelMemberPage
 	memberLimit       int
+	rosterLimit       int
 	lastOnlineUserIDs []string
 }
 
@@ -64,6 +65,24 @@ func (s *routeMemberStore) GetWorkspaceMember(_ context.Context, workspaceID, us
 		return domain.WorkspaceMember{}, domain.ErrNotFound
 	}
 	return s.member, nil
+}
+
+// ListChannelMemberRoster models the roster query (issue #469): the same
+// membership, with no presence predicate and no reordering by connection
+// state, so a route test can tell a roster response from a presence preview.
+func (s *routeMemberStore) ListChannelMemberRoster(
+	_ context.Context, _, channelID, _ string, limit int,
+) (storage.ChannelRosterPage, error) {
+	s.rosterLimit = limit
+	roster := s.memberPages[channelID]
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	members := append([]domain.ChannelMemberProfile(nil), roster.Online...)
+	if len(members) > limit {
+		members = members[:limit]
+	}
+	return storage.ChannelRosterPage{Members: members, TotalCount: roster.TotalCount}, nil
 }
 
 // ListOnlineChannelMemberProfiles models the store faithfully for route tests:
@@ -129,6 +148,10 @@ type routeChannelStore struct {
 	// (actor, old, new) — so a route test can assert the event exists exactly
 	// when the rename did (issue #527).
 	events [][3]string
+}
+
+func (s *routeChannelStore) GetChannelAbout(_ context.Context, _, _ string) (storage.ConversationAbout, error) {
+	return storage.ConversationAbout{}, nil
 }
 
 func (s *routeChannelStore) GetVisibleChannelByID(_ context.Context, workspaceID, channelID, _ string) (domain.Channel, error) {

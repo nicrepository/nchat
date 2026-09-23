@@ -56,8 +56,9 @@ func NewChannelService(workspaces storage.WorkspaceStore, channels storage.Chann
 	return &ChannelService{workspaces: workspaces, channels: channels, members: members}
 }
 
-// CreateChannel creates a public or private channel in an active workspace.
-// Private channels add the creator as a channel member in the storage transaction.
+// CreateChannel creates a channel in an active workspace. Public channels add
+// every eligible workspace member; private channels add their creator, in the
+// same storage transaction as the channel itself.
 //
 // Creating a channel takes no management role (BUG #393): a plain member and an
 // owner take the same path. The one role it excludes is guest, via
@@ -97,18 +98,18 @@ func (s *ChannelService) CreateChannel(ctx context.Context, input CreateChannelI
 	}
 
 	createInput := storage.CreateChannelInput{
-		WorkspaceID: input.WorkspaceID,
-		CategoryID:  categoryID,
-		Slug:        slug,
-		DisplayName: displayName,
-		Type:        input.Type,
-		IsGeneral:   false,
-		Position:    input.Position,
-		CreatedBy:   input.CallerID,
+		WorkspaceID:                  input.WorkspaceID,
+		CategoryID:                   categoryID,
+		Slug:                         slug,
+		DisplayName:                  displayName,
+		Type:                         input.Type,
+		IsGeneral:                    false,
+		Position:                     input.Position,
+		CreatedBy:                    input.CallerID,
+		EnsurePublicWorkspaceMembers: input.Type == domain.ChannelTypePublic,
 	}
-	// A private channel nobody belongs to is invisible to its own creator, so
-	// the membership is part of the same transaction rather than a follow-up
-	// write that could fail on its own.
+	// A private channel starts with its creator. Public channels take the whole
+	// eligible workspace population above, which necessarily includes them.
 	if input.Type == domain.ChannelTypePrivate {
 		createInput.EnsureCreatorMemberRole = domain.ChannelRoleMember
 	}
@@ -157,6 +158,12 @@ type ChannelDetails struct {
 	OnlineMembers []domain.ChannelMemberProfile
 	OnlineCount   int
 	MemberCount   int
+	// About is the channel's own description and its creator's resolved display
+	// name (issue #894), read from the aggregate rather than derived from
+	// anything the panel already has. Either field being empty means absent, and
+	// absent renders as an empty or neutral state — never as a placeholder and
+	// never as an identifier.
+	About storage.ConversationAbout
 	// CanManageMembers is the server's own answer to "may this caller add
 	// participants" (issue #398), derived from the membership this method already
 	// had to load. It exists so the panel can disable an action the server would
@@ -167,6 +174,15 @@ type ChannelDetails struct {
 	// It is false for #geral, matching the write path: membership there is owned
 	// by the workspace sync, not by this flow.
 	CanManageMembers bool
+	// CanRemoveMembers is the server's own answer to "may this caller remove
+	// another member" (issue #469). It is a separate field from
+	// CanManageMembers although both evaluate the same predicate today: adding
+	// and removing are different questions, the panel asks them separately, and
+	// the day one policy moves the other must not follow it silently. Like its
+	// neighbour it is a rendering hint — DELETE .../members/{userID} re-derives
+	// the decision from the session — and it is false for #geral, matching the
+	// write path.
+	CanRemoveMembers bool
 }
 
 // GetChannelDetails returns the channel-details payload for a channel the
@@ -195,15 +211,84 @@ func (s *ChannelService) GetChannelDetails(ctx context.Context, input ChannelDet
 	if err != nil {
 		return ChannelDetails{}, fmt.Errorf("list online channel member profiles: %w", err)
 	}
+	// After the gate, like the member page: this read carries the workspace for
+	// isolation in depth but is not what decides the caller may see the channel.
+	about, err := s.channels.GetChannelAbout(ctx, input.WorkspaceID, channel.ID)
+	if err != nil {
+		return ChannelDetails{}, err
+	}
 	return ChannelDetails{
 		Channel:       channel,
 		OnlineMembers: page.Online,
 		OnlineCount:   page.OnlineCount,
 		MemberCount:   page.TotalCount,
+		About:         about,
 		// The same predicate the write path checks, evaluated on the membership
 		// already loaded above — not a second, parallel rule that could drift.
 		CanManageMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
+		// MemberService.RemoveMemberFromChannel's own two refusals, in the order
+		// it applies them: #geral is never administrable here, and everyone else
+		// needs the same management authority the add path needs.
+		CanRemoveMembers: !channel.IsGeneral && domain.CanManageChannelMembers(&member),
 	}, nil
+}
+
+// ChannelRosterInput asks for the channel's administrable membership
+// (issue #469). Same shape as ChannelDetailsInput minus the presence snapshot,
+// which this surface has no use for: the workspace and the caller come from the
+// session, and the client names only the channel.
+type ChannelRosterInput struct {
+	WorkspaceID string
+	CallerID    string
+	ChannelID   string
+	Cursor      string
+	// MemberLimit caps the page. Values outside
+	// (0, domain.MaxChannelDetailsMembers] are clamped by the store.
+	MemberLimit int
+}
+
+// ChannelRoster is the administrable membership of one channel: who belongs to
+// it, and how many belong in total.
+//
+// It carries no capability flag. The caller's authority is the gate on the read
+// itself — a roster is answered only to someone who may administer it — so a
+// second boolean restating what the 403 already decided would be a copy of the
+// same fact.
+type ChannelRoster struct {
+	Members     []domain.ChannelMemberProfile
+	MemberCount int
+	NextCursor  string
+}
+
+// ListChannelMembers returns the channel's explicit membership for a caller who
+// may administer it (issue #469).
+//
+// The gate is the removal policy itself — !IsGeneral && CanManageChannelMembers
+// — and not read access, deliberately. This is the administration surface: it
+// exists so a manager can see who to remove, and answering it to a reader who
+// could not remove anybody would publish a membership list to the whole
+// workspace for no purpose. #geral is refused for the same reason the write
+// path refuses it: its membership is owned by the workspace sync, so there is
+// nothing here to administer.
+//
+// Order of decisions mirrors MemberCandidates: authority first, then the
+// channel lookup, so a caller who may not administer channels cannot use this
+// route to learn whether a channel UUID exists. A caller who may administer but
+// cannot see the channel still gets the uniform ErrNotFound the visibility
+// predicate produces.
+func (s *ChannelService) ListChannelMembers(ctx context.Context, input ChannelRosterInput) (ChannelRoster, error) {
+	if _, err := s.requireActiveWorkspaceMember(ctx, input.WorkspaceID, input.CallerID); err != nil {
+		return ChannelRoster{}, err
+	}
+	channel, err := s.channels.GetVisibleChannelByID(ctx, input.WorkspaceID, input.ChannelID, input.CallerID)
+	if err != nil {
+		return ChannelRoster{}, err
+	}
+	page, err := s.members.ListChannelMemberRoster(ctx, input.WorkspaceID, channel.ID, input.Cursor, input.MemberLimit)
+	if err != nil {
+		return ChannelRoster{}, fmt.Errorf("list channel member roster: %w", err)
+	}
+	return ChannelRoster{Members: page.Members, MemberCount: page.TotalCount, NextCursor: page.NextCursor}, nil
 }
 
 // ChannelCallParticipantProfilesInput asks for presentation identities of a

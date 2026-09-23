@@ -50,6 +50,7 @@ import { useAcknowledgements } from "./messages/useAcknowledgements";
 import { useSecurityReconciliation } from "./messages/useSecurityReconciliation";
 import type {
   WSAttachmentStatusEvent,
+  WSConversationEventMessage,
   WSMembersAddedEvent,
   WSPinUpdatedEvent,
   WSTypingUpdatedEvent,
@@ -80,6 +81,15 @@ interface UseMessagesOptions {
    * membership would double the WebSocket count per conversation.
    */
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  /**
+   * Issue #469: called on a conversation.event for the active target.
+   *
+   * Routed through this hook for the same reason members.added is — the
+   * connection and its subscriptions already live here. A member *removed*
+   * publishes only this signal, so a caller that reconciles on members.added
+   * alone would converge after an addition and not after a removal.
+   */
+  onConversationEvent?: (event: WSConversationEventMessage) => void;
   /**
    * RF-22: called on an attachment.status event for the active target.
    *
@@ -174,6 +184,7 @@ export function useMessages({
   onOwnReactionConfirmed,
   onPinUpdated,
   onMembersAdded,
+  onConversationEvent,
   onAttachmentStatus,
   onTypingUpdated,
   onMessageRemoved,
@@ -246,7 +257,7 @@ export function useMessages({
       dispatch,
       bodyFormat,
       notifyRemoved,
-      reconcileCreatedConversationEvent: (messageId) => reads.readMessageSnapshot(messageId, true),
+      reconcileCreatedConversationEvent: reads.readConversationEventSnapshot,
     },
   );
 
@@ -271,7 +282,13 @@ export function useMessages({
     reconcileAcknowledgements: acknowledgements.reconcile,
     reconcileAcknowledgement: acknowledgements.reconcileOne,
     notifyRemoved,
-    listeners: { onPinUpdated, onMembersAdded, onAttachmentStatus, onTypingUpdated },
+    listeners: {
+      onPinUpdated,
+      onMembersAdded,
+      onConversationEvent,
+      onAttachmentStatus,
+      onTypingUpdated,
+    },
   });
 
   usePreviewReconciliation({ target, messages: state.messages, dispatch });

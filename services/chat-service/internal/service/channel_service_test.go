@@ -39,8 +39,11 @@ func TestChannelService_CreatePublicChannel_ManagerSucceeds(t *testing.T) {
 	if got.ID != "ch-public" || got.CreatedBy != "owner-1" {
 		t.Fatalf("unexpected channel: %+v", got)
 	}
+	if !channels.lastCreateInput.EnsurePublicWorkspaceMembers {
+		t.Fatal("public channel must add every eligible workspace member")
+	}
 	if channels.creatorMembershipSeeds != 0 {
-		t.Fatal("public channel creation must not fan out channel_members")
+		t.Fatal("public channel membership must be populated as one workspace set")
 	}
 	if channels.lastCreateInput.CreatedBy != "owner-1" || channels.lastCreateInput.IsGeneral {
 		t.Fatalf("service must own created_by/is_general, input=%+v", channels.lastCreateInput)

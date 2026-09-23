@@ -39,6 +39,7 @@ const { mockFetchChannelDetails, mockFetchConversationAttachments, mockFetchAtta
 
 vi.mock("./chatApi", () => ({
   fetchChannelDetails: (id: string, signal?: AbortSignal) => mockFetchChannelDetails(id, signal),
+  fetchChannelMembers: vi.fn(() => Promise.resolve({ memberCount: 0, members: [] })),
   fetchGroupDetails: vi.fn(),
   fetchDirectProfile: vi.fn(),
 }));
@@ -65,11 +66,13 @@ function channelDetails(): { kind: "channel" } & ChannelDetails {
     slug: "infra",
     name: "Infraestrutura",
     type: "public",
+    description: "",
     createdAt: "2026-07-01T09:00:00.000Z",
     memberCount: 2,
     onlineCount: 0,
     onlineMembers: [],
     canManageMembers: false,
+    canRemoveMembers: false,
   };
 }
 
@@ -91,6 +94,7 @@ function panelState(files: ChannelAttachment[]): ConversationDetailsState {
   return {
     details: { status: "ready", data: channelDetails() },
     files: { status: "ready", data: files },
+    roster: { status: "loading" },
     reload: vi.fn(),
   };
 }

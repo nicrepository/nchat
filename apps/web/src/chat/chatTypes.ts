@@ -795,15 +795,27 @@ export interface ChannelMemberProfile {
  *    *before* the limit is applied, so an offline member never takes a slot
  *    from an online one.
  *
- * `description` is deliberately not a field: chat.channels has no description
- * column, so the panel renders its empty state rather than a value nothing can
- * produce.
+ * `description` and `creatorDisplayName` are the "Sobre" block's metadata
+ * (issue #894) and both can genuinely be absent:
+ *  - `description` is "" for a conversation nobody has described, including
+ *    every one created before the column existed. The panel renders its empty
+ *    state, which is the truth rather than a placeholder;
+ *  - `creatorDisplayName` is absent when the server could not resolve a
+ *    historically trustworthy identity — no recorded creator, or an account
+ *    that is deleted or no longer in this workspace. The panel renders a
+ *    neutral state.
+ *
+ * There is deliberately no creator id. The server does not send one, nothing
+ * here navigates to the creator, and a field holding a UUID is how a UUID ends
+ * up on screen as a fallback for the name that was missing.
  */
 export interface ChannelDetails {
   id: string;
   slug: string;
   name: string;
   type: ChannelType;
+  description: string;
+  creatorDisplayName?: string;
   createdAt: string; // ISO 8601
   memberCount: number;
   onlineCount: number;
@@ -818,6 +830,52 @@ export interface ChannelDetails {
    * predates this field hides the action rather than enabling it.
    */
   canManageMembers: boolean;
+  /**
+   * Whether the server would let this caller remove another member
+   * (issue #469).
+   *
+   * A second field rather than a reading of `canManageMembers`, even though a
+   * channel evaluates both from the same predicate today. They answer
+   * different questions, the panel asks them separately, and a group already
+   * answers them differently — inferring one from the other is how a control
+   * ends up offered where the write path refuses it. Normalized with the same
+   * strict `=== true`, and the DELETE re-derives the real decision regardless.
+   */
+  canRemoveMembers: boolean;
+}
+
+/**
+ * One row of a channel's administrable membership (issue #469).
+ *
+ * Deliberately without `presence`: this list says who belongs, and whether
+ * they are connected is the realtime store's answer — the same store every
+ * other surface reads. A presence field here would be a second, staler one.
+ */
+export interface ChannelRosterMember {
+  userId: string;
+  displayName: string;
+  /** Absent when unset or when the stored URL is not a safe same-origin target. */
+  avatarUrl?: string;
+  role: ChannelMemberRole;
+}
+
+/**
+ * A channel's authoritative membership: `chat.channel_members`, which is both
+ * the population shown to readers and the population member actions act on.
+ *
+ * It is not `ChannelDetails.onlineMembers` and cannot be derived from it: that
+ * array is filtered by presence inside the query, so it never contains an
+ * offline member and would hide exactly the people an administrator most needs
+ * to act on. `memberCount` is the whole membership and `members` the capped
+ * page of it, the same relationship every other paged surface here has.
+ *
+ * `nextCursor` continues the stable name/user-id ordering without deriving the
+ * total from the current page.
+ */
+export interface ChannelRoster {
+  memberCount: number;
+  members: ChannelRosterMember[];
+  nextCursor?: string;
 }
 
 // ── Add members (issue #398) ─────────────────────────────────────────────────
@@ -858,8 +916,12 @@ export interface GroupParticipantProfile {
  * The group-details payload.
  *
  * A group is a `chat.dm_conversations` row of type 'group', not a channel, so
- * this carries no visibility, slug, category or description — the domain has
- * none of them for conversations and none is invented here.
+ * this carries no visibility, slug or category — the domain has none of them
+ * for conversations and none is invented here.
+ *
+ * `description` and `creatorDisplayName` mean exactly what ChannelDetails'
+ * do, including how each is absent: a conversation is a conversation, and the
+ * "Sobre" block asks it the same questions whichever aggregate it lives in.
  *
  * `participantCount` is every active participant and is never
  * `participants.length`: that array is a capped preview.
@@ -867,11 +929,24 @@ export interface GroupParticipantProfile {
 export interface GroupDetails {
   id: string;
   name: string;
+  description: string;
+  creatorDisplayName?: string;
   createdAt: string; // ISO 8601
   participantCount: number;
   participants: GroupParticipantProfile[];
   /** Same meaning and the same strict normalization as ChannelDetails' (issue #398). */
   canManageMembers: boolean;
+  /**
+   * Whether the server would let this caller remove another participant
+   * (issue #469).
+   *
+   * In a group this is genuinely not `canManageMembers`: adding is open to
+   * every participant, while removing is the creator's alone — a group has no
+   * role to consult, since chat.dm_members.role is closed to 'member'. Reading
+   * the add capability as the removal one would put a control in front of
+   * every participant that the server refuses for all but one caller.
+   */
+  canRemoveMembers: boolean;
 }
 
 /**

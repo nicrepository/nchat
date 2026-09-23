@@ -2145,7 +2145,7 @@ func (h *Hub) mayStillRead(c *Client, targetType TargetType, targetID, key strin
 	h.logger.DebugContext(context.Background(), "ws: access revoked before presence snapshot",
 		"target_type", string(targetType),
 	)
-	handleSubscribeClientError(c, ErrSubscribeForbidden)
+	handleSubscribeClientError(c, ErrSubscribeForbidden, targetType, targetID)
 	return false
 }
 

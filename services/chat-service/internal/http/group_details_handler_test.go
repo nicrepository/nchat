@@ -3,12 +3,14 @@ package httpapi_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/nicrepository/nchat/services/chat-service/internal/domain"
 	httpapi "github.com/nicrepository/nchat/services/chat-service/internal/http"
 	"github.com/nicrepository/nchat/services/chat-service/internal/service"
+	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
 func groupConversation() domain.DMConversation {
@@ -139,6 +141,32 @@ func TestDMHandler_GroupDetails_SerializesTheAddParticipantsPermission(t *testin
 	}
 }
 
+// can_remove_members (issue #469) is a different answer from its neighbour and
+// is serialized separately: in a group, adding is open to every participant
+// while removing is the creator's alone.
+func TestDMHandler_GroupDetails_SerializesTheRemoveParticipantsPermission(t *testing.T) {
+	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
+		Conversation:     groupConversation(),
+		ParticipantCount: 1,
+		CanManageMembers: true,
+		CanRemoveMembers: false,
+	}}
+
+	rec := serveGroupDetails(t, groupDetailsHandler(provider), testConversationID)
+
+	data := detailsData(t, rec)
+	got, present := data["can_remove_members"].(bool)
+	if !present {
+		t.Fatalf("can_remove_members absent from the payload: %v", data)
+	}
+	if got {
+		t.Fatalf("can_remove_members = %v, want the service's own false", got)
+	}
+	if data["can_manage_members"] != true {
+		t.Fatalf("the add capability must be unaffected: %v", data)
+	}
+}
+
 func TestDMHandler_GroupDetails_OmitsPresenceWhenNotTracked(t *testing.T) {
 	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
 		Conversation:     groupConversation(),
@@ -203,5 +231,60 @@ func TestDMHandler_GroupDetails_IsUnavailableWithoutWiring(t *testing.T) {
 	rec := serveGroupDetails(t, httpapi.NewDMHandler(nil, nil, nil), testConversationID)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", rec.Code)
+	}
+}
+
+// ── About metadata (issue #894) ──────────────────────────────────────────────
+
+// A group serialises the same two About fields as a channel, under the same
+// names, and likewise without the creator's identifier.
+func TestDMHandler_GroupDetails_SerialisesAboutMetadata(t *testing.T) {
+	conversation := groupConversation()
+	conversation.CreatedBy = "11111111-2222-4333-8444-555555555555"
+	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
+		Conversation:     conversation,
+		ParticipantCount: 6,
+		About: storage.ConversationAbout{
+			Description:        "O grupo que cuida da malha.",
+			CreatorDisplayName: "Álvaro Neto",
+		},
+	}}
+
+	rec := serveGroupDetails(t, groupDetailsHandler(provider), testConversationID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	data := detailsData(t, rec)
+	if data["description"] != "O grupo que cuida da malha." {
+		t.Fatalf("description = %v", data["description"])
+	}
+	if data["creator_display_name"] != "Álvaro Neto" {
+		t.Fatalf("creator_display_name = %v", data["creator_display_name"])
+	}
+	if data["participant_count"] != float64(6) {
+		t.Fatalf("participant_count = %v", data["participant_count"])
+	}
+	if raw := rec.Body.String(); strings.Contains(raw, conversation.CreatedBy) {
+		t.Fatalf("response carries the creator's identifier: %s", raw)
+	}
+}
+
+// Absent stays absent for a group too, and the payload is otherwise whole.
+func TestDMHandler_GroupDetails_OmitsAbsentAboutMetadata(t *testing.T) {
+	provider := &fakeDMProvider{groupDetails: service.GroupDetails{
+		Conversation:     groupConversation(),
+		ParticipantCount: 6,
+	}}
+
+	rec := serveGroupDetails(t, groupDetailsHandler(provider), testConversationID)
+	data := detailsData(t, rec)
+	if _, present := data["description"]; present {
+		t.Fatalf("description must be omitted when there is none, got %v", data["description"])
+	}
+	if _, present := data["creator_display_name"]; present {
+		t.Fatalf("creator_display_name must be omitted when unresolved, got %v", data["creator_display_name"])
+	}
+	if data["created_at"] != "2024-03-04T15:00:00Z" || data["participant_count"] != float64(6) {
+		t.Fatalf("unexpected payload: %v", data)
 	}
 }

@@ -14,25 +14,17 @@ import (
 	"github.com/nicrepository/nchat/services/chat-service/internal/storage"
 )
 
-// Characterization suite for issue #881.
+// Membership-contract suite for issues #881 and #883.
 //
 // It records, against a real PostgreSQL with every current chat migration
 // applied, what "member of a channel" means today on each of the four surfaces
 // the issue #877 family touches: visibility, explicit membership, the details
 // count, mention autocomplete and candidate search.
 //
-// It deliberately records a divergence rather than a desired end state. In a
-// public channel, "may read" and "has a chat.channel_members row" are different
-// populations, and the last three surfaces all read the second one. Issue #883
-// owns the decision about what effective channel membership should be for a
-// public channel, and is expected to update these expectations when that
-// contract changes — a failure here after #883 lands is the point, not a
-// regression.
-//
-// What the suite must never become is a statement that the current behaviour is
-// correct. Nothing below is named "desired", "correct" or "expected behaviour";
-// the assertions say "today this is what happens", and the comments say which
-// issue owns changing it.
+// Issue #883 closes the former public-channel divergence by materializing each
+// eligible active workspace member in chat.channel_members. These assertions
+// keep visibility, roster/count, mention autocomplete and candidate search on
+// that shared population while preserving the explicit-invite rule for guests.
 //
 // Every visibility assertion executes chat.channel_visible_to_user as it is
 // actually installed after all migrations run. The predicate is never restated
@@ -84,12 +76,10 @@ var mcRoles = []struct {
 // refusal to run against a database whose name does not end in _test. No new
 // bypass is introduced.
 //
-// The public channel is seeded with **no** chat.channel_members rows at all,
-// including for a creator. That is not a shortcut for the test: it is what
-// ChannelService.CreateChannel actually produces, because it sets
-// EnsureCreatorMemberRole only for a private channel. #geral is seeded the same
-// way, so the materialization case below can observe the sync do its work
-// rather than inherit rows the fixture wrote.
+// The channels are inserted before workspace membership. The installed trigger
+// therefore materializes eligible users into both public channels as each
+// workspace membership becomes active, while leaving the private channel and
+// guest memberships untouched.
 func membershipContractPostgres(t *testing.T) (*pgxpool.Pool, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("CHAT_TEST_DATABASE_URL")
@@ -329,30 +319,17 @@ func TestChannelMembershipContractPostgreSQL_InstalledVisibilityMatchesTheDomain
 	}
 }
 
-// Characterization for #881. This intentionally records the current divergence.
-// #883 owns the future effective-membership decision and is expected to update
-// this characterization when that contract changes.
-//
-// In an ordinary public channel the four surfaces disagree about who is in it:
-//
-//   - chat.channel_visible_to_user admits every role CanReachPublicChannels
-//     names, with no chat.channel_members row;
-//   - ListOnlineChannelMemberProfiles counts chat.channel_members, so
-//     member_count is 0 while those readers are reading;
-//   - SearchChannelMembers offers nobody for mention autocomplete;
-//   - SearchChannelMemberCandidates offers those same readers as people who
-//     could still be added.
-//
-// None of that is asserted here as a good outcome. It is asserted so that #883
-// cannot change it silently.
-func TestChannelMembershipContractPostgreSQL_PublicChannelVisibilityDivergesFromExplicitMembership(t *testing.T) {
+// Issue #883 closes the old public-channel divergence: every active eligible
+// workspace member is materialized into every active public channel. Visibility,
+// roster/count, mentions and add-member candidates therefore describe the same
+// population. Guests remain outside until explicitly invited.
+func TestChannelMembershipContractPostgreSQL_PublicChannelMaterializesEligibleWorkspaceMembers(t *testing.T) {
 	pool, ctx := membershipContractPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
 
-	// The readers of an ordinary public channel, under the current policy.
-	readers := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
+	members := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
 
-	t.Run("eligible roles read the channel without any membership row", func(t *testing.T) {
+	t.Run("eligible roles are visible and hold membership rows", func(t *testing.T) {
 		for _, user := range mcRoles {
 			member := domain.WorkspaceMember{
 				WorkspaceID: mcWorkspace, UserID: user.userID,
@@ -362,65 +339,30 @@ func TestChannelMembershipContractPostgreSQL_PublicChannelVisibilityDivergesFrom
 			if visible != domain.CanReachPublicChannels(&member) {
 				t.Fatalf("role %q: installed visibility = %t", user.role, visible)
 			}
-			// Asked separately, and this is the divergence in one line: the
-			// answer above owes nothing to the answer below.
-			if hasExplicitChannelMembership(t, pool, ctx, mcPublic, user.userID) {
-				t.Fatalf("role %q unexpectedly holds a chat.channel_members row; the fixture seeds none", user.role)
+			if got := hasExplicitChannelMembership(t, pool, ctx, mcPublic, user.userID); got != domain.CanReachPublicChannels(&member) {
+				t.Fatalf("role %q: membership = %t, want eligibility %t", user.role, got, domain.CanReachPublicChannels(&member))
 			}
 		}
 	})
 
-	t.Run("the details count reports zero members while those readers read", func(t *testing.T) {
-		// Every reader is handed to the store as online, so nothing here can be
-		// blamed on the presence snapshot being empty.
-		page, err := store.ListOnlineChannelMemberProfiles(ctx, mcWorkspace, mcPublic, readers, domain.MaxChannelDetailsMembers)
+	t.Run("details count and online preview use the materialized population", func(t *testing.T) {
+		page, err := store.ListOnlineChannelMemberProfiles(ctx, mcWorkspace, mcPublic, members, domain.MaxChannelDetailsMembers)
 		if err != nil {
 			t.Fatalf("ListOnlineChannelMemberProfiles: %v", err)
 		}
-		// TotalCount, never len(page.Online): the preview is presence-filtered
-		// and capped, and using its length as a count is the defect the channel
-		// details contract already forbids.
-		if page.TotalCount != 0 {
-			t.Fatalf("TotalCount = %d, want the current characterization of 0 (counts chat.channel_members)", page.TotalCount)
-		}
-		if page.OnlineCount != 0 || len(page.Online) != 0 {
-			t.Fatalf("online preview = %d/%d, want empty: presence intersects membership, and there is no membership",
-				page.OnlineCount, len(page.Online))
+		if page.TotalCount != len(members) || page.OnlineCount != len(members) || len(page.Online) != len(members) {
+			t.Fatalf("page = %d total / %d online / %d preview, want %d/%d/%d",
+				page.TotalCount, page.OnlineCount, len(page.Online), len(members), len(members), len(members))
 		}
 	})
 
-	t.Run("mention autocomplete offers none of those readers", func(t *testing.T) {
-		assertSameIDs(t, "mention candidates", mentionUserIDs(t, store, ctx, mcPublic), []string{})
+	t.Run("mention autocomplete offers every materialized member", func(t *testing.T) {
+		assertSameIDs(t, "mention candidates", mentionUserIDs(t, store, ctx, mcPublic), members)
 	})
 
-	t.Run("candidate search offers the readers as people who could be added", func(t *testing.T) {
-		// The caller is excluded from its own candidate list by the query, so
-		// the admin asking sees the other three readers plus the guest, who is
-		// eligible to be added by design (RF-74: being added is the only way a
-		// guest reaches any channel).
+	t.Run("only the guest remains an add-member candidate", func(t *testing.T) {
 		got := addMemberCandidateIDs(t, store, ctx, mcPublic, mcAdmin)
-		assertSameIDs(t, "add-member candidates", got, sortedIDs(mcOwner, mcModerator, mcMember, mcGuest))
-
-		// Restated as the property that matters, so the failure message points
-		// at the divergence rather than at a list literal.
-		for _, reader := range readers {
-			if reader == mcAdmin {
-				continue
-			}
-			if !channelVisibleToUser(t, pool, ctx, mcPublic, reader) {
-				t.Fatalf("fixture drift: %s should read this channel", reader)
-			}
-			found := false
-			for _, candidate := range got {
-				if candidate == reader {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Fatalf("%s reads the channel but is not offered as a candidate; the characterization changed", reader)
-			}
-		}
+		assertSameIDs(t, "add-member candidates", got, []string{mcGuest})
 	})
 }
 
@@ -496,46 +438,24 @@ func TestChannelMembershipContractPostgreSQL_PrivateChannelVisibilityMatchesExpl
 // "every user joins #geral automatically" against RF-74's guest exclusion, and
 // is expected to update this case. Nothing here decides that, auto-adds a
 // guest, or touches CanReachPublicChannels or generalMembershipRoles.
-func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershipForNonGuestRoles(t *testing.T) {
+func TestChannelMembershipContractPostgreSQL_GeneralChannelKeepsMembershipForNonGuestRoles(t *testing.T) {
 	pool, ctx := membershipContractPostgres(t)
 	store := storage.NewPGXMemberStore(pool)
 
 	synced := sortedIDs(mcOwner, mcAdmin, mcModerator, mcMember)
 
-	t.Run("before the sync nobody holds a row, yet the eligible roles already read it", func(t *testing.T) {
-		for _, user := range mcRoles {
-			if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, user.userID) {
-				t.Fatalf("fixture drift: role %q already holds a #geral row", user.role)
-			}
-		}
-		// The same divergence the public-channel case records, and the reason
-		// the sync exists: access does not wait for materialization.
-		for _, userID := range synced {
-			if !channelVisibleToUser(t, pool, ctx, mcGeneral, userID) {
-				t.Fatalf("%s cannot read #geral before the sync", userID)
-			}
-		}
-	})
-
-	t.Run("the sync materializes every covered role and no guest", func(t *testing.T) {
-		inserted, err := store.SyncGeneralMemberships(ctx, mcWorkspace)
-		if err != nil {
-			t.Fatalf("SyncGeneralMemberships: %v", err)
-		}
-		if inserted != int64(len(synced)) {
-			t.Fatalf("sync inserted %d rows, want %d", inserted, len(synced))
-		}
+	t.Run("workspace activation materializes every eligible role", func(t *testing.T) {
 		for _, userID := range synced {
 			if !hasExplicitChannelMembership(t, pool, ctx, mcGeneral, userID) {
-				t.Errorf("%s holds no #geral row after the sync", userID)
+				t.Fatalf("%s holds no #geral row after workspace activation", userID)
 			}
 		}
 		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
-			t.Error("the sync gave a guest a #geral row; RF-74 excludes guests from it")
+			t.Error("workspace activation gave a guest a #geral row; RF-74 excludes guests from it")
 		}
 	})
 
-	t.Run("the sync is idempotent", func(t *testing.T) {
+	t.Run("the compatibility sync is idempotent after automatic materialization", func(t *testing.T) {
 		inserted, err := store.SyncGeneralMemberships(ctx, mcWorkspace)
 		if err != nil {
 			t.Fatalf("SyncGeneralMemberships (repeat): %v", err)
@@ -549,9 +469,8 @@ func TestChannelMembershipContractPostgreSQL_GeneralChannelMaterializesMembershi
 		if channelVisibleToUser(t, pool, ctx, mcGeneral, mcGuest) {
 			t.Error("installed visibility admits a guest to #geral with no membership row")
 		}
-		// The two exclusions agreeing is what keeps #geral consistent: the
-		// guest is absent from the roster and absent from the readership, so
-		// unlike an ordinary public channel there is no population mismatch.
+		// The two exclusions agreeing keeps #geral consistent: the guest is
+		// absent from both the roster and readership until explicitly invited.
 		if hasExplicitChannelMembership(t, pool, ctx, mcGeneral, mcGuest) {
 			t.Error("the guest holds a #geral membership row")
 		}

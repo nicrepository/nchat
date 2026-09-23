@@ -12,6 +12,7 @@
 import type { RefObject } from "react";
 
 import type { CallParticipantProfile } from "../../chatApi";
+import { useDirectMessagePending, type DirectMessageAccess } from "../../directMessage";
 import ConversationSystemMessage from "../../ConversationSystemMessage.tsx";
 import MessageBubble, { type MessageBubbleProps } from "../../MessageBubble";
 import type { MentionType } from "../../richTextMarkers";
@@ -73,7 +74,15 @@ export interface TimelineRowContext {
   editDisabledIds: Set<string>;
   /** RF-05: set of currently-pinned message IDs in this target. */
   pinnedIds?: Set<string>;
-  openingAuthorDMIds?: Set<string>;
+  /**
+   * The shared open-DM operation and this conversation's claim on it
+   * (issue #895).
+   *
+   * Deliberately not "which recipients are pending": every row held that set,
+   * so one person becoming pending invalidated every row in the list. A row
+   * knows exactly one recipient — its own author — and subscribes to that one.
+   */
+  directMessage?: DirectMessageAccess;
   /** Every loaded message, so a quote can name its author and offer the jump. */
   messagesById: Map<string, Message>;
   /**
@@ -170,6 +179,18 @@ function TimelineMessageRow({
   setMessageRef,
 }: Omit<Props, "unreadDividerRef"> & { row: Extract<TimelineRow, { type: "msg" }> }) {
   const message = row.message;
+  /*
+    This row's own author, and nobody else's (issue #895). Called before the
+    system-message branch so the hook order never depends on what kind of row
+    this is; a system message has no sender, and an empty id is never pending.
+
+    One subscription per visible row, which the virtualiser already bounds — and
+    the point of it: a request starting for somebody else answers `false` again,
+    React bails out, and the row does not re-render. The list used to hold the
+    whole pending set, so any request anywhere invalidated all of it.
+  */
+  const pendingSource = context.directMessage?.coordinator;
+  const openingAuthorDM = useDirectMessagePending(pendingSource, message.senderId);
   if (message.kind === "system") {
     // A conversation event is not something a person said, so it never becomes
     // a MessageBubble: no bubble, no avatar, and none of the message actions —
@@ -220,13 +241,15 @@ function TimelineMessageRow({
       onQuoteJump={actions.onQuoteJump}
       onReferenceJump={actions.onReferenceJump}
       onOpenAuthorDM={actions.onOpenAuthorDM}
-      openingAuthorDM={context.openingAuthorDMIds?.has(message.senderId) ?? false}
+      openingAuthorDM={openingAuthorDM}
       mentionInteraction={
         actions.onMentionClick
           ? {
               currentUserId: context.currentUserId,
               onMentionClick: actions.onMentionClick,
-              openingIds: context.openingAuthorDMIds,
+              // The narrow read-only port, so a mention can draw a busy state
+              // without being able to start or cancel anything.
+              pendingSource,
             }
           : undefined
       }

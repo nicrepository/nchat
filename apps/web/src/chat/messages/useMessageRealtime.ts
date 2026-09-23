@@ -38,6 +38,17 @@ type MessageUpdate = NonNullable<WSMessageUpdatedEvent["message_update"]>;
 export interface RealtimeListeners {
   onPinUpdated?: (event: WSPinUpdatedEvent) => void;
   onMembersAdded?: (event: WSMembersAddedEvent) => void;
+  /**
+   * Issue #469: called on a conversation.event for the active target, after
+   * the timeline has reconciled it.
+   *
+   * A membership removal writes a system message and publishes exactly this
+   * signal — there is no members.removed, and adding one would be a second
+   * protocol for a fact this one already carries. The frame names only the
+   * message, so a listener cannot tell which kind of event it was; the honest
+   * response is the same refetch every other invalidation here performs.
+   */
+  onConversationEvent?: (event: WSConversationEventMessage) => void;
   onAttachmentStatus?: (event: WSAttachmentStatusEvent) => void;
   onTypingUpdated?: (event: WSTypingUpdatedEvent) => void;
 }
@@ -330,9 +341,10 @@ export function useMessageRealtime({
    * timeline does not have it yet. Dedup by id in the reducer is what makes
    * this safe against redelivery or a reconnect replaying the same event.
    *
-   * Handled internally rather than forwarded to a caller-supplied listener —
-   * unlike pin/members/typing/attachment above, nothing outside the open
-   * timeline needs to react to this one.
+   * Reconciled internally *and* forwarded (issue #469): the timeline inserts
+   * the system message, and a caller that renders anything else about this
+   * conversation — the details panel's roster and counters — refetches. Both
+   * happen for the same frame because both are stale for the same reason.
    */
   const reconcileConversationEvent = useCallback(
     (event: WSConversationEventMessage) => {
@@ -343,7 +355,7 @@ export function useMessageRealtime({
   );
   const handleConversationEvent = useForwardedTargetEvent(
     target,
-    undefined,
+    listeners.onConversationEvent,
     reconcileConversationEvent,
   );
 

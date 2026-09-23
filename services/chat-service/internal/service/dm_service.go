@@ -338,6 +338,12 @@ type GroupDetails struct {
 	Conversation     domain.DMConversation
 	Participants     []domain.DMParticipantProfile
 	ParticipantCount int
+	// About is the group's own description and its creator's resolved display
+	// name (issue #894), read from the aggregate rather than derived from
+	// anything the panel already has. Either field being empty means absent, and
+	// absent renders as an empty or neutral state — never as a placeholder and
+	// never as an identifier.
+	About storage.ConversationAbout
 	// CanManageMembers is the server's answer to "may this caller add
 	// participants" (issue #398).
 	//
@@ -349,6 +355,19 @@ type GroupDetails struct {
 	// change has one place to become false. It remains a rendering hint —
 	// POST .../members re-derives it inside its own transaction.
 	CanManageMembers bool
+	// CanRemoveMembers is the server's answer to "may this caller remove
+	// another participant" (issue #469), and it is emphatically not
+	// CanManageMembers: adding is open to every participant, while removing is
+	// the group's creator alone — the only authority a group has, since
+	// chat.dm_members.role is closed by CHECK to 'member'. Deriving the
+	// removal control from the add capability would put a minus button in front
+	// of every participant and have the store refuse each one.
+	//
+	// Like its neighbour it is a rendering hint: lockGroupForCreator re-derives
+	// creatorship inside the removal's own transaction, against the locked
+	// conversation row, so this value can only ever hide an action — never
+	// grant one.
+	CanRemoveMembers bool
 }
 
 // GetGroupDetails returns the group-details payload for a group conversation
@@ -383,11 +402,24 @@ func (s *DMService) GetGroupDetails(ctx context.Context, input GroupDetailsInput
 	if err != nil {
 		return GroupDetails{}, fmt.Errorf("list dm participant profiles: %w", err)
 	}
+	// After the gate, like the participant page: this read carries the workspace
+	// for isolation in depth but is not what decides the caller may see the
+	// conversation.
+	about, err := s.dms.GetConversationAbout(ctx, workspaceID, conversation.ID)
+	if err != nil {
+		return GroupDetails{}, err
+	}
 	return GroupDetails{
 		Conversation:     conversation,
 		Participants:     page.Participants,
 		ParticipantCount: page.TotalCount,
+		About:            about,
 		CanManageMembers: true,
+		// The same comparison lockGroupForCreator makes, on the conversation row
+		// this method already loaded. A group with no recorded creator has no
+		// one who may remove, and an empty CreatedBy never matches a caller id
+		// because the caller is authenticated and canonicalised.
+		CanRemoveMembers: conversation.CreatedBy != "" && conversation.CreatedBy == strings.TrimSpace(input.CallerID),
 	}, nil
 }
 

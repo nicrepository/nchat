@@ -40,6 +40,20 @@ type fakeChannelProvider struct {
 	leaveErr   error
 	lastLeave  [3]string
 	leaveCalls int
+
+	roster          service.ChannelRoster
+	rosterErr       error
+	lastRosterInput service.ChannelRosterInput
+	rosterCalls     int
+}
+
+// ListChannelMembers is the administrable roster (issue #469).
+func (f *fakeChannelProvider) ListChannelMembers(
+	_ context.Context, input service.ChannelRosterInput,
+) (service.ChannelRoster, error) {
+	f.rosterCalls++
+	f.lastRosterInput = input
+	return f.roster, f.rosterErr
 }
 
 // LeaveChannel records the caller's own departure (issue #527).

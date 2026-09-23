@@ -478,6 +478,32 @@ describe("useMessages — DM body format", () => {
     ]);
   });
 
+  it("retries the auto-add event announced by the send response without flashing a realtime error", async () => {
+    const event = makeMessage({
+      id: "event-member-added",
+      kind: "system",
+      eventType: "conversation_member_added",
+      eventPayload: { targetUsers: [{ userId: "user-new", displayName: "Pessoa nova" }] },
+    });
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockPostChannelMessage.mockResolvedValue(
+      makeMessage({ id: "message-with-auto-add", createdConversationEventId: event.id }),
+    );
+    mockFetchChannelMessage.mockRejectedValueOnce(new Error("temporary read failure"));
+    mockFetchChannelMessage.mockResolvedValueOnce(event);
+
+    const { result } = renderHook(() =>
+      useMessages({ kind: "channel", targetId: "ch-auto-add", currentUserId: "user-me" }),
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    await act(() => result.current.sendMessage("@[Pessoa nova](mention:user:user-new)"));
+
+    await waitFor(() => expect(mockFetchChannelMessage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.state.messages).toContainEqual(event));
+    expect(result.current.state.realtimeError).toBeNull();
+  });
+
   it("keeps direct messages on v2 by default", async () => {
     mockFetchDMMessages.mockResolvedValue(emptyPage);
     mockPostDMMessage.mockResolvedValue(makeMessage({ id: "direct-message", bodyFormat: "v2" }));
@@ -1721,6 +1747,60 @@ describe("useMessages — WS message.created integration", () => {
 
     expect(mockFetchChannelMessage).not.toHaveBeenCalled();
     expect(result.current.state.messages).toHaveLength(0);
+  });
+
+  // Issue #469: a removal publishes conversation.event and nothing else —
+  // there is no members.removed — so anything else that describes this
+  // conversation has to hear about it here or converge only on the next
+  // reload.
+  it("forwards a conversation event for the open target to the caller", async () => {
+    const onConversationEvent = vi.fn();
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+    mockFetchChannelMessage.mockResolvedValue(
+      makeMessage({ id: "evt-removed", kind: "system", eventType: "conversation_member_removed" }),
+    );
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-evt",
+        currentUserId: "user-me",
+        onConversationEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-evt", "evt-removed");
+    });
+
+    await waitFor(() => expect(onConversationEvent).toHaveBeenCalledTimes(1));
+    expect(onConversationEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ target_id: "ch-evt", message_id: "evt-removed" }),
+    );
+  });
+
+  it("does not forward a conversation event for another conversation", async () => {
+    const onConversationEvent = vi.fn();
+    mockFetchChannelMessages.mockResolvedValue(emptyPage);
+
+    const { result } = renderHook(() =>
+      useMessages({
+        kind: "channel",
+        targetId: "ch-mine",
+        currentUserId: "user-me",
+        onConversationEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.state.status).toBe("ready"));
+
+    act(() => {
+      fireWsConversationEvent("channel", "ch-other", "evt-elsewhere");
+    });
+
+    expect(onConversationEvent).not.toHaveBeenCalled();
   });
 
   it("does not duplicate a system event redelivered while already in the timeline", async () => {

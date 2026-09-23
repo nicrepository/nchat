@@ -91,19 +91,33 @@ describe("RichTextRenderer", () => {
       expect(onMentionClick).toHaveBeenNthCalledWith(2, "user", ANA_ID);
     });
 
-    it("marks a mention busy while its DM is resolving", () => {
+    it("marks a mention busy while its DM is resolving, and only that mention", () => {
+      // The renderer is handed a read-only port and asks it about one person
+      // (issue #895). It is never handed the set of everyone pending, which is
+      // what made every message holding a mention re-render whenever anybody
+      // anywhere was being resolved.
       const onMentionClick = vi.fn();
+      const asked: string[] = [];
+      const pendingSource = {
+        isPending: (recipientId: string) => {
+          asked.push(recipientId);
+          return recipientId === ANA_ID;
+        },
+        subscribePending: () => () => {},
+      };
       render(
         <RichTextRenderer
           text={mentionText}
           bodyFormat="v3"
-          mention={{ currentUserId: "me", onMentionClick, openingIds: new Set([ANA_ID]) }}
+          mention={{ currentUserId: "me", onMentionClick, pendingSource }}
         />,
       );
       expect(screen.getByRole("button", { name: "Abrir conversa com Ana" })).toHaveAttribute(
         "aria-busy",
         "true",
       );
+      // Asked about the person it names and nobody else.
+      expect(new Set(asked)).toEqual(new Set([ANA_ID]));
     });
 
     it("renders a mention of the reader themself as plain, inert text", () => {

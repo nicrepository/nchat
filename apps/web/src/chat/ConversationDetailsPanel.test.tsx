@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,7 +47,11 @@ import type {
   PinnedItem,
 } from "./chatTypes";
 import { localTimeRefreshMs } from "./conversationDetailsDisplay";
+import { formatLongDate } from "./messageDisplay";
+import { conversationNameMaxCodePoints } from "./conversationRename";
+import { ApiRequestError } from "../lib/api";
 import type { ConversationDetailsState } from "./useConversationDetails";
+import type { DirectMessageAccess } from "./directMessage";
 
 const currentUserId = "user-me";
 
@@ -64,6 +68,9 @@ function channelDetails(
     slug: "infra",
     name: "Infraestrutura",
     type: "public",
+    // Absent by default (issue #894), so every case that says nothing about
+    // the description exercises the empty state the domain actually produces.
+    description: "",
     createdAt: "2024-01-12T09:30:00.000Z",
     memberCount: 12,
     onlineCount: 0,
@@ -71,14 +78,35 @@ function channelDetails(
     // Off unless a case turns it on: the add action is absent by default, which
     // is what the server's own strict `=== true` normalization produces.
     canManageMembers: false,
+    // Same default and the same reason (issue #469): no capability, no
+    // removal control, and no roster request behind it.
+    canRemoveMembers: false,
     ...overrides,
   };
 }
 
 function state(overrides: Partial<ConversationDetailsState> = {}): ConversationDetailsState {
+  const details = overrides.details ?? { status: "ready", data: channelDetails() };
+  const roster =
+    overrides.roster ??
+    (details.status === "ready" && details.data.kind === "channel"
+      ? {
+          status: "ready" as const,
+          data: {
+            memberCount: details.data.memberCount,
+            members: details.data.onlineMembers.map((member) => ({
+              userId: member.userId,
+              displayName: member.displayName,
+              avatarUrl: member.avatarUrl,
+              role: member.role,
+            })),
+          },
+        }
+      : { status: "loading" as const });
   return {
-    details: { status: "ready", data: channelDetails() },
+    details,
     files: { status: "ready", data: [] },
+    roster,
     reload: vi.fn(),
     ...overrides,
   };
@@ -226,7 +254,10 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
     });
 
     expect(screen.getByText(/Criado em 12 de janeiro de 2024/)).toBeInTheDocument();
-    expect(screen.getByText(/Canal privado · 12 membros/)).toBeInTheDocument();
+    // Visibility and size are two facts and now two rows (issue #894): the
+    // channel's type is not a qualifier on its member count.
+    expect(screen.getByText("Canal privado")).toBeInTheDocument();
+    expect(screen.getByText("12 membros")).toBeInTheDocument();
   });
 
   it("says public when the channel type says so, not the channel name", () => {
@@ -257,12 +288,10 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
 
     // The channel's size and how many of its members are online are three
     // different numbers, and none is the length of the rendered list.
-    expect(screen.getByText(/40 membros/)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Membros online (6)" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-people-count")).toHaveTextContent("40 membros");
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(1);
   });
 
@@ -276,7 +305,7 @@ describe("ConversationDetailsPanel — canal: seção Sobre", () => {
     expect(screen.getByText("Data de criação indisponível")).toBeInTheDocument();
   });
 
-  it("shows an explicit empty state while the domain has no description", () => {
+  it("shows an explicit empty state when the channel has no description", () => {
     renderPanel();
 
     expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
@@ -338,7 +367,7 @@ describe("ConversationDetailsPanel — canal: membros", () => {
       }),
     });
 
-    const list = screen.getByRole("list", { name: "Membros online do canal" });
+    const list = screen.getByRole("list", { name: "Membros do canal" });
     const rows = within(list).getAllByRole("listitem");
     expect(within(rows[0]).getByText("Você")).toBeInTheDocument();
     expect(within(rows[1]).queryByText("Você")).not.toBeInTheDocument();
@@ -394,22 +423,26 @@ describe("ConversationDetailsPanel — canal: membros", () => {
     expect(screen.getByText("Moderador")).toBeInTheDocument();
   });
 
-  it("says nobody is online — not that the channel is empty — and keeps the total", () => {
+  it("shows an offline member even when the presence preview is empty", () => {
     const { unmount } = renderPanel({
       state: state({
         details: {
           status: "ready",
-          // A populated channel where nobody happens to be connected.
           data: channelDetails({ onlineMembers: [], onlineCount: 0, memberCount: 31 }),
+        },
+        roster: {
+          status: "ready",
+          data: {
+            memberCount: 31,
+            members: [{ userId: "offline-1", displayName: "Membro offline", role: "member" }],
+          },
         },
       }),
     });
 
-    expect(screen.getByText("Nenhum membro online no momento.")).toBeInTheDocument();
-    expect(screen.queryByText(/não tem membros/i)).not.toBeInTheDocument();
-    // The channel's size is reported independently of who is connected.
-    expect(screen.getByText(/31 membros/)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Membros online (0)" })).toBeInTheDocument();
+    expect(screen.getByText("Membro offline")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (31)" })).toBeInTheDocument();
+    expect(screen.queryByTestId("presence-dot")).not.toBeInTheDocument();
     unmount();
 
     render(
@@ -482,17 +515,17 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
         },
       }),
     });
 
-    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    const list = () => screen.getByRole("list", { name: "Membros do canal" });
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
-    expect(screen.getByRole("heading", { name: "Membros online (7)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (7)" })).toBeInTheDocument();
     expect(screen.queryByText("Pessoa 7")).not.toBeInTheDocument();
 
-    const toggle = screen.getByRole("button", { name: /Ver todos Membros online/ });
+    const toggle = screen.getByRole("button", { name: /Ver todos Membros/ });
     // Reachable from the close button the panel focuses on open.
     expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toHaveFocus();
     await tabUntilFocused(toggle);
@@ -503,7 +536,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     expect(within(list()).getAllByTestId("chat-details-member-avatar")).toHaveLength(7);
     expect(screen.getByText("Pessoa 7")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Membros/ }));
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
   });
 
@@ -517,16 +550,18 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(3), onlineCount: 40 }),
+          data: channelDetails({
+            onlineMembers: onlineRoster(3),
+            onlineCount: 40,
+            memberCount: 40,
+          }),
         },
       }),
     });
 
-    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(3);
     expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
   });
@@ -535,23 +570,35 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     // The real backend limit: MaxChannelDetailsMembers rows carried, forty
     // reported. The control exists — twenty-five loaded rows are hidden by the
     // compact cap — and what it reveals is those, never the ten the server
-    // never sent.
+    // never sent. So it does not say "Ver todos": expanding shows more, not all.
     renderPanel({
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(30), onlineCount: 40 }),
+          data: channelDetails({
+            onlineMembers: onlineRoster(30),
+            onlineCount: 40,
+            memberCount: 40,
+          }),
         },
       }),
     });
 
-    const list = () => screen.getByRole("list", { name: "Membros online do canal" });
+    const list = () => screen.getByRole("list", { name: "Membros do canal" });
     expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    // And the shortfall is named rather than left for the reader to infer from
+    // a heading that says forty above a list that stops at thirty.
+    expect(screen.getByTestId("chat-details-roster-shortfall")).toHaveTextContent(
+      "30 de 40 membros carregados.",
+    );
 
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Membros/ }));
 
     expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
-    expect(screen.getByRole("heading", { name: "Membros online (40)" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Membros (40)" })).toBeInTheDocument();
+    // The way back is unchanged: only the promise of "all" was wrong.
+    expect(screen.getByRole("button", { name: /Mostrar menos Membros/ })).toBeInTheDocument();
   });
 
   it("offers no control when exactly five members are online", () => {
@@ -559,15 +606,13 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(5), onlineCount: 5 }),
+          data: channelDetails({ onlineMembers: onlineRoster(5), onlineCount: 5, memberCount: 5 }),
         },
       }),
     });
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(5);
     expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
   });
@@ -576,7 +621,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     const expanded = state({
       details: {
         status: "ready",
-        data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+        data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
       },
     });
     const { rerender } = render(
@@ -588,11 +633,9 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         onClose={vi.fn()}
       />,
     );
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros/ }));
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(7);
 
     // The panel is deliberately not remounted on a target switch; the section
@@ -603,7 +646,12 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
         state={state({
           details: {
             status: "ready",
-            data: channelDetails({ id: "ch-2", onlineMembers: onlineRoster(7), onlineCount: 7 }),
+            data: channelDetails({
+              id: "ch-2",
+              onlineMembers: onlineRoster(7),
+              onlineCount: 7,
+              memberCount: 7,
+            }),
           },
         })}
         currentUserId={currentUserId}
@@ -613,11 +661,9 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
     );
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(5);
-    expect(screen.getByRole("button", { name: /Ver todos Membros online/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Ver todos Membros/ })).toBeInTheDocument();
   });
 
   it("keeps the two sections' expansions independent of each other", async () => {
@@ -625,7 +671,7 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       state: state({
         details: {
           status: "ready",
-          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7 }),
+          data: channelDetails({ onlineMembers: onlineRoster(7), onlineCount: 7, memberCount: 7 }),
         },
         files: {
           status: "ready",
@@ -636,12 +682,10 @@ describe("ConversationDetailsPanel — canal: seção de pessoas expansível", (
       }),
     });
 
-    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros online/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Membros/ }));
 
     expect(
-      within(screen.getByRole("list", { name: "Membros online do canal" })).getAllByRole(
-        "listitem",
-      ),
+      within(screen.getByRole("list", { name: "Membros do canal" })).getAllByRole("listitem"),
     ).toHaveLength(7);
     // The files section is the second consumer of the same primitive and is
     // untouched by what the people section did.
@@ -818,10 +862,13 @@ function groupDetails(overrides: Partial<GroupDetails> = {}): { kind: "group" } 
     kind: "group" as const,
     id: "conv-1",
     name: "Time de Infra",
+    description: "",
     createdAt: "2024-03-04T15:00:00.000Z",
     participantCount: 4,
     participants: [],
     canManageMembers: false,
+    // Creator-only for a group (issue #469), so off unless a case says so.
+    canRemoveMembers: false,
     ...overrides,
   };
 }
@@ -830,6 +877,8 @@ function renderGroupPanel(
   details: { kind: "group" } & GroupDetails,
   viewerId = currentUserId,
   reload: () => void = vi.fn(),
+  openDM?: DirectMessageAccess,
+  files: ChannelAttachment[] = [],
 ) {
   const onClose = vi.fn();
   const rendered = render(
@@ -837,15 +886,51 @@ function renderGroupPanel(
       kind="group"
       state={{
         details: { status: "ready", data: details },
-        files: { status: "ready", data: [] },
+        files: { status: "ready", data: files },
+        roster: { status: "loading" },
         reload,
       }}
       currentUserId={viewerId}
       latestPin={null}
+      openDM={openDM}
       onClose={onClose}
     />,
   );
   return { onClose, reload, ...rendered };
+}
+
+/**
+ * The open-DM capability as a double: the flow's own semantics live in
+ * useAuthorDM and are tested there, so what a panel test needs is the shape of
+ * what it is handed and a record of what it asked for.
+ */
+function fakeOpenDM(
+  options: { pending?: ReadonlySet<string> } = {},
+): DirectMessageAccess & { open: ReturnType<typeof vi.fn> } {
+  const open = vi.fn();
+  const pending = options.pending ?? new Set<string>();
+  return {
+    coordinator: {
+      open,
+      releaseOrigin: () => {},
+      isPending: (recipientId: string) => pending.has(recipientId),
+      subscribePending: () => () => {},
+      error: () => null,
+      subscribeError: () => () => {},
+      setDeps: () => {},
+      dispose: () => {},
+    },
+    origin: testOrigin,
+    open,
+  };
+}
+
+/** The origin every row in these tests opens on behalf of. */
+const testOrigin = "panel-test-origin";
+
+/** The roster row for a person, found by the action it offers. */
+function participantAction(displayName: string) {
+  return screen.getByRole("button", { name: new RegExp(`^Abrir conversa com ${displayName}\\.`) });
 }
 
 describe("ConversationDetailsPanel — grupo", () => {
@@ -866,13 +951,17 @@ describe("ConversationDetailsPanel — grupo", () => {
     expect(screen.getByText(/12 participantes/)).toBeInTheDocument();
   });
 
-  it("never shows a channel's visibility or description", () => {
+  it("never shows a channel's visibility or a channel's empty description", () => {
     renderGroupPanel(groupDetails());
 
-    // A group is neither public nor private, and has no description column.
+    // A group is neither public nor private. It does have a description
+    // (issue #894), but the absence is worded for a group — a panel that said
+    // "canal" here would name the wrong aggregate.
     expect(screen.queryByText(/Canal público/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Canal privado/)).not.toBeInTheDocument();
-    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este grupo ainda não tem descrição.",
+    );
     // Nor the channel's people vocabulary.
     expect(screen.queryByRole("heading", { name: /Membros online/ })).not.toBeInTheDocument();
   });
@@ -928,8 +1017,15 @@ describe("ConversationDetailsPanel — grupo", () => {
     const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
       "listitem",
     );
-    expect(within(rows[0]).getByText("Você")).toBeInTheDocument();
-    expect(within(rows[1]).queryByText("Você")).not.toBeInTheDocument();
+    // Asserted by identity rather than by position: two people with the same
+    // name are separated by their ids (issue #895), so which of them the
+    // deterministic tiebreak puts first is not what this test is about. Exactly
+    // one of the two is the viewer, and it is the one whose id matches.
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => within(row).queryByText("Você") !== null)).toHaveLength(1);
+    expect(
+      within(rows.find((row) => within(row).queryByText("Você") !== null)!).queryByRole("button"),
+    ).toBeNull();
   });
 
   it("does not mark anyone when the viewer's id is unknown", () => {
@@ -1025,7 +1121,12 @@ describe("ConversationDetailsPanel — grupo", () => {
     const { unmount } = render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "loading" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1038,7 +1139,12 @@ describe("ConversationDetailsPanel — grupo", () => {
     render(
       <ConversationDetailsPanel
         kind="group"
-        state={{ details: { status: "error" }, files: { status: "error" }, reload: vi.fn() }}
+        state={{
+          details: { status: "error" },
+          files: { status: "error" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1073,6 +1179,7 @@ function renderProfilePanel(details: { kind: "direct" } & DirectDetails = direct
       state={{
         details: { status: "ready", data: details },
         files: { status: "loading" },
+        roster: { status: "loading" },
         reload: vi.fn(),
       }}
       currentUserId={currentUserId}
@@ -1097,6 +1204,449 @@ function metaRow(label: string): string {
   expect(row, `no metadata row labelled ${label}`).toBeTruthy();
   return row?.lastElementChild?.textContent ?? "";
 }
+
+/**
+ * The roster's navigation (issue #895).
+ *
+ * The open-DM flow itself — the self guard, the per-recipient dedupe, the abort
+ * and generation bookkeeping, the 404 copy — belongs to useAuthorDM and is
+ * proved by its own tests. What is proved here is the panel's half of the
+ * contract: who gets an activatable row, what activating one asks for, and that
+ * nothing else in the section is disturbed by a failure.
+ */
+describe("ConversationDetailsPanel — roster: abrir conversa", () => {
+  const people = [
+    { userId: "user-ana", displayName: "Ana Lima" },
+    { userId: currentUserId, displayName: "Álvaro Neto" },
+    { userId: "user-bruno", displayName: "Bruno Sá" },
+  ];
+
+  it("asks the shared flow for the participant that was activated, by id", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    await userEvent.click(participantAction("Bruno Sá"));
+
+    expect(openDM.open).toHaveBeenCalledTimes(1);
+    // The id, never the name and never a route assembled here: the destination
+    // is the conversation the server answers with. The second argument is this
+    // host's claim on the operation — the row never handles one itself.
+    expect(openDM.open).toHaveBeenCalledWith("user-bruno", testOrigin);
+  });
+
+  it("names the action, and carries the status the row shows", () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    // With the store silent there is no status to carry, so the name is the
+    // action and the person's role — never a raw id.
+    const action = participantAction("Ana Lima");
+    expect(action).toHaveAccessibleName("Abrir conversa com Ana Lima. Participante");
+    expect(action.getAttribute("aria-label")).not.toContain("user-ana");
+  });
+
+  it("activates from the avatar and the name alike, because they are one control", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Ana Lima");
+    await userEvent.click(within(action).getByTestId("chat-details-member-avatar"));
+    await userEvent.click(within(action).getByText("Ana Lima"));
+
+    expect(openDM.open).toHaveBeenCalledTimes(2);
+    expect(openDM.open).toHaveBeenNthCalledWith(2, "user-ana", testOrigin);
+  });
+
+  it("is reachable and activatable by keyboard, with Enter and with Space", async () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Ana Lima");
+    await tabUntilFocused(action);
+    expect(action).toHaveFocus();
+
+    await userEvent.keyboard("{Enter}");
+    await userEvent.keyboard(" ");
+
+    // A <button> is what gives both keys for free; that is the reason the row is
+    // one rather than an <li> with an onClick.
+    expect(openDM.open).toHaveBeenCalledTimes(2);
+    expect(openDM.open).toHaveBeenNthCalledWith(1, "user-ana", testOrigin);
+    expect(openDM.open).toHaveBeenNthCalledWith(2, "user-ana", testOrigin);
+  });
+
+  it("offers no action on the viewer's own row", () => {
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: /Abrir conversa com Álvaro Neto/ }),
+    ).not.toBeInTheDocument();
+    // The row is still there, still says who it is, and still says it is you.
+    const rows = within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole(
+      "listitem",
+    );
+    const own = rows.find((row) => within(row).queryByText("Você") !== null)!;
+    expect(within(own).getByText("Álvaro Neto")).toBeInTheDocument();
+    expect(within(own).queryByRole("button")).toBeNull();
+  });
+
+  it("shows no action at all when the host has not wired the flow", () => {
+    renderGroupPanel(groupDetails({ participants: people, participantCount: 3 }));
+
+    expect(screen.queryByRole("button", { name: /Abrir conversa com/ })).not.toBeInTheDocument();
+    // Honest rather than broken: three rows, none of them pretending.
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(3);
+  });
+
+  it("marks a recipient being resolved as busy, without leaving the tab order", async () => {
+    const openDM = fakeOpenDM({ pending: new Set(["user-ana"]) });
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const pending = participantAction("Ana Lima");
+    expect(pending).toHaveAttribute("aria-busy", "true");
+    // Never `disabled`: that would move focus out from under whoever just
+    // pressed it, and repeating the request is refused by the flow anyway.
+    expect(pending).toBeEnabled();
+    await tabUntilFocused(pending);
+    expect(pending).toHaveFocus();
+
+    expect(participantAction("Bruno Sá")).toHaveAttribute("aria-busy", "false");
+  });
+
+  it("keeps handing the same id to the flow on rapid repeated activation", async () => {
+    // Deduplication lives in the flow, which refuses a recipient it is already
+    // resolving. The panel's part is to keep addressing the same person rather
+    // than, say, resolving a row index that reordering could move.
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    const action = participantAction("Bruno Sá");
+    await userEvent.click(action);
+    await userEvent.click(action);
+    await userEvent.click(action);
+
+    expect(openDM.open.mock.calls).toEqual([
+      ["user-bruno", testOrigin],
+      ["user-bruno", testOrigin],
+      ["user-bruno", testOrigin],
+    ]);
+  });
+
+  it("leaves a refusal to the shell, and keeps the roster it was raised from", () => {
+    // The flow has one owner and one place that reports a refusal (issue #895):
+    // this panel and the conversation behind it are both on screen, and drawing
+    // the sentence here as well announced one failure twice. What the panel
+    // must do is survive the failure, which is asserted here; that exactly one
+    // alert exists is asserted where both surfaces are mounted together, in
+    // ChatMessageArea.test.tsx.
+    const openDM = fakeOpenDM();
+    renderGroupPanel(
+      groupDetails({ participants: people, participantCount: 3 }),
+      currentUserId,
+      vi.fn(),
+      openDM,
+    );
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // The rows the reader was looking at are exactly where they were.
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(3);
+    expect(screen.getByRole("heading", { name: "Participantes (3)" })).toBeInTheDocument();
+    // And still activatable: a refusal is not a dead section.
+    expect(participantAction("Bruno Sá")).toBeEnabled();
+  });
+
+  it("gives a channel member the same navigable row", async () => {
+    // The channel roster is still blocked on issue #877's membership contract,
+    // but a member the server already vouched for is someone this user may open a
+    // conversation with — navigation depends on no roster contract at all.
+    const openDM = fakeOpenDM();
+    renderPanel({
+      openDM,
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            onlineMembers: [
+              { userId: "user-ana", displayName: "Ana Lima", role: "member", presence: "online" },
+            ],
+            onlineCount: 1,
+            memberCount: 9,
+          }),
+        },
+      }),
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Abrir conversa com Ana Lima. Membro" }),
+    );
+
+    expect(openDM.open).toHaveBeenCalledWith("user-ana", testOrigin);
+  });
+});
+
+/**
+ * What the roster shows about a person, and what it refuses to show.
+ */
+describe("ConversationDetailsPanel — roster: identidade e ordem", () => {
+  it("orders by the documented fallback when the presence store is silent", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-zoe", displayName: "Zoe" },
+          { userId: "u-alv", displayName: "Álvaro" },
+          { userId: "u-bea", displayName: "Beatriz" },
+        ],
+        participantCount: 3,
+      }),
+    );
+
+    const names = within(screen.getByRole("list", { name: "Participantes do grupo" }))
+      .getAllByRole("listitem")
+      .map((row) => within(row).getByText(/^(Zoe|Álvaro|Beatriz)$/).textContent);
+    // Accent-folded, so the accented name is not exiled past Z.
+    expect(names).toEqual(["Álvaro", "Beatriz", "Zoe"]);
+  });
+
+  it("keeps only five rows compact and restores five on collapse", async () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 8 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 8,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar menos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+  });
+
+  it("gives an offline participant one of the five compact slots", () => {
+    // The roster is membership, not presence: the group's own contract lists
+    // every active participant and this list does not thin it out.
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-1", displayName: "Ana", presence: "offline" },
+          { userId: "u-2", displayName: "Bruno", presence: "offline" },
+        ],
+        participantCount: 2,
+      }),
+    );
+
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(2);
+    expect(screen.getByRole("heading", { name: "Participantes (2)" })).toBeInTheDocument();
+  });
+
+  it("never falls back to a user id when the name is missing", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [{ userId: "7c9e6679-7425-40de-944b-e07fc1f90ae7", displayName: "" }],
+        participantCount: 1,
+      }),
+    );
+
+    const row = within(screen.getByRole("list", { name: "Participantes do grupo" })).getByRole(
+      "listitem",
+    );
+    expect(row).not.toHaveTextContent("7c9e6679");
+    // The row still exists and still says what the domain calls this person.
+    expect(within(row).getByText("Participante")).toBeInTheDocument();
+  });
+
+  it("offers Ver todos only when the preview really is the whole group", async () => {
+    // CASE A: the client holds everybody, so expanding shows everybody and the
+    // control may say so.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 8 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 8,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByTestId("chat-details-roster-shortfall")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Ver todos Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(8);
+    expect(screen.getByRole("button", { name: /Mostrar menos Participantes/ })).toBeInTheDocument();
+  });
+
+  it("says Mostrar mais, and how much it holds, when the group is larger than the preview", async () => {
+    // CASE B: the server's own cap. There is no route that lists the other ten
+    // (GET /dm/{id}/details is the only participant source and it is capped),
+    // so the control may not offer them and the section says what it has.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 30 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${String(index + 1).padStart(2, "0")}`,
+        })),
+        participantCount: 40,
+      }),
+    );
+
+    const list = () => screen.getByRole("list", { name: "Participantes do grupo" });
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(5);
+    expect(screen.queryByRole("button", { name: /Ver todos/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Participantes (40)" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-roster-shortfall")).toHaveTextContent(
+      "30 de 40 participantes carregados.",
+    );
+
+    // The thirty it does hold stay reachable — the honest label is not a reason
+    // to hide rows 6..30.
+    await userEvent.click(screen.getByRole("button", { name: /Mostrar mais Participantes/ }));
+    expect(within(list()).getAllByRole("listitem")).toHaveLength(30);
+
+    // Nothing is invented about the missing ten: not offline, not unavailable.
+    const section = screen.getByRole("heading", { name: "Participantes (40)" }).closest("section")!;
+    expect(section).not.toHaveTextContent(/indisponí/i);
+    expect(section).not.toHaveTextContent(/Offline/);
+  });
+
+  it("offers no control at all when the whole group fits in the compact state", () => {
+    // CASE C: five or fewer, all held. Nothing is hidden, so nothing expands.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 4 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${index + 1}`,
+        })),
+        participantCount: 4,
+      }),
+    );
+
+    expect(
+      within(screen.getByRole("list", { name: "Participantes do grupo" })).getAllByRole("listitem"),
+    ).toHaveLength(4);
+    expect(
+      screen.queryByRole("button", { name: /Ver todos|Mostrar mais/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-roster-shortfall")).not.toBeInTheDocument();
+  });
+
+  it("leaves the other sections of the panel on the default wording", () => {
+    // CASE D: the label override is the roster's, not the primitive's. The files
+    // section shares the same component and is untouched by it.
+    renderGroupPanel(
+      groupDetails({
+        participants: Array.from({ length: 30 }, (_, index) => ({
+          userId: `user-${index}`,
+          displayName: `Participante ${String(index + 1).padStart(2, "0")}`,
+        })),
+        participantCount: 40,
+      }),
+      currentUserId,
+      vi.fn(),
+      undefined,
+      Array.from({ length: 7 }, (_, index) =>
+        attachment({ id: `file-${index}`, filename: `arquivo-${index}.pdf` }),
+      ),
+    );
+
+    expect(screen.getByRole("button", { name: /Mostrar mais Participantes/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Ver todos Arquivos recentes/ })).toBeInTheDocument();
+  });
+
+  it("renders the avatar the server vouched for, and initials when there is none", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [
+          { userId: "u-1", displayName: "Ana Lima", avatarUrl: "/media/avatars/ana.png" },
+          { userId: "u-2", displayName: "Bruno Sá" },
+        ],
+        participantCount: 2,
+      }),
+    );
+
+    const [withPhoto, withInitials] = within(
+      screen.getByRole("list", { name: "Participantes do grupo" }),
+    ).getAllByTestId("chat-details-member-avatar");
+
+    // chatApi already rejected anything that is not a safe same-origin target,
+    // so the only URL that reaches here is one the client vouched for. The
+    // empty alt is what makes it `presentation` rather than an image with a
+    // name: the person's name beside it is the accessible text, and a second
+    // one inside the avatar would be announced twice.
+    const image = within(withPhoto).getByRole("presentation", { hidden: true });
+    expect(image).toHaveAttribute("src", "/media/avatars/ana.png");
+    expect(image).toHaveAttribute("referrerpolicy", "no-referrer");
+
+    // No URL, so initials — never the user id, and never a broken image.
+    expect(withInitials).toHaveTextContent("B");
+    expect(within(withInitials).queryByRole("presentation", { hidden: true })).toBeNull();
+    expect(withInitials).not.toHaveTextContent("u-2");
+  });
+
+  it("shows nothing about presence while the store has said nothing", () => {
+    renderGroupPanel(
+      groupDetails({
+        participants: [{ userId: "u-1", displayName: "Ana", presence: "online" }],
+        participantCount: 1,
+      }),
+    );
+
+    // The HTTP payload claims "online" and is deliberately not read (RF-58):
+    // no dot, and no word after the role.
+    expect(screen.queryByTestId("presence-dot")).not.toBeInTheDocument();
+    expect(screen.getByText("Participante")).toBeInTheDocument();
+    expect(screen.queryByText(/Participante · /)).not.toBeInTheDocument();
+  });
+});
 
 describe("ConversationDetailsPanel — DM 1:1: estrutura e acessibilidade", () => {
   it("is titled Perfil, not the conversation vocabulary", () => {
@@ -1413,7 +1963,12 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "loading" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "loading" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1430,7 +1985,12 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
     render(
       <ConversationDetailsPanel
         kind="direct"
-        state={{ details: { status: "error" }, files: { status: "loading" }, reload: vi.fn() }}
+        state={{
+          details: { status: "error" },
+          files: { status: "loading" },
+          roster: { status: "loading" },
+          reload: vi.fn(),
+        }}
         currentUserId={currentUserId}
         latestPin={null}
         onClose={vi.fn()}
@@ -1450,6 +2010,7 @@ describe("ConversationDetailsPanel — DM 1:1: ação e estados", () => {
         state={{
           details: { status: "ready", data: groupDetails() },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -1476,6 +2037,7 @@ describe("ConversationDetailsPanel — DM 1:1: variante divergente", () => {
         state={{
           details: { status: "ready", data: channelDetails() },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -1504,6 +2066,7 @@ function readyChannel(overrides: Partial<ChannelDetails> = {}, reload = vi.fn())
       data: channelDetails({ canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
+    roster: { status: "loading" as const },
     reload,
   };
 }
@@ -1515,6 +2078,7 @@ function readyGroup(overrides: Partial<GroupDetails> = {}, reload = vi.fn()) {
       data: groupDetails({ canManageMembers: true, ...overrides }),
     },
     files: { status: "ready" as const, data: [] },
+    roster: { status: "loading" as const },
     reload,
   };
 }
@@ -1601,6 +2165,7 @@ describe("ConversationDetailsPanel — adicionar membros: permissão", () => {
             },
           },
           files: { status: "ready", data: [] },
+          roster: { status: "loading" },
           reload: vi.fn(),
         }}
         currentUserId={currentUserId}
@@ -1996,5 +2561,910 @@ describe("ConversationDetailsPanel attachment previews (RF-31)", () => {
     expect(mockFetchAttachmentPreview).toHaveBeenCalledWith("a-ready", expect.any(AbortSignal));
 
     vi.unstubAllGlobals();
+  });
+});
+
+// ── Inline rename (issue #893) ──────────────────────────────────────────────
+//
+// The panel's own half of the feature: which affordance it draws, what the
+// editor does, and what it refuses to do to the rest of the UI. *Whether* a
+// given target may be renamed at all is conversationRename's decision and is
+// tested there — here the presence or absence of `onRename` stands for the
+// answer it already gave.
+
+function renderRenamePanel(
+  overrides: Partial<Parameters<typeof ConversationDetailsPanel>[0]> = {},
+) {
+  const onRename = vi.fn().mockResolvedValue(undefined);
+  const reload = vi.fn();
+  const rendered = render(
+    <ConversationDetailsPanel
+      kind="channel"
+      state={state({ reload })}
+      currentUserId={currentUserId}
+      latestPin={null}
+      onRename={onRename}
+      onClose={vi.fn()}
+      {...overrides}
+    />,
+  );
+  return { onRename, reload, ...rendered };
+}
+
+/** Opens the editor the way a user does, and hands back the field. */
+async function openEditor(user: ReturnType<typeof userEvent.setup>, label = "Renomear canal") {
+  await user.click(screen.getByRole("button", { name: label }));
+  return screen.getByRole("textbox", { name: "Nome do canal" });
+}
+
+describe("ConversationDetailsPanel — renomear inline: a ação", () => {
+  it("offers the rename control on a channel the caller may rename", () => {
+    renderRenamePanel();
+
+    expect(screen.getByRole("button", { name: "Renomear canal" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+  });
+
+  // The one absent value covers every reason there is: no capability, the
+  // general channel, and a host with no mutation wired.
+  it("shows the name without any control when the caller may not rename", () => {
+    renderRenamePanel({ onRename: undefined });
+
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+  });
+
+  it("offers the group vocabulary on a group", () => {
+    renderRenamePanel({
+      kind: "group",
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        roster: { status: "loading" },
+        reload: vi.fn(),
+      },
+    });
+
+    expect(screen.getByRole("button", { name: "Renomear grupo" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Renomear canal" })).not.toBeInTheDocument();
+  });
+
+  // A 1:1 has no name of its own — its title is the counterpart's, resolved per
+  // viewer — so the profile panel has no name field to grow a rename from.
+  it("never renders a name field on a 1:1 profile", () => {
+    renderRenamePanel({
+      kind: "direct",
+      state: {
+        details: { status: "ready", data: directDetails() },
+        files: { status: "ready", data: [] },
+        roster: { status: "loading" },
+        reload: vi.fn(),
+      },
+    });
+
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-channel-name")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-group-name")).not.toBeInTheDocument();
+  });
+
+  it("shows no control while the details are still loading", () => {
+    renderRenamePanel({ state: state({ details: { status: "loading" } }) });
+
+    expect(screen.queryByRole("button", { name: /Renomear/ })).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: entrar e cancelar", () => {
+  it("opens an inline field seeded with the persisted name, focused, and asks nothing", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+
+    expect(field).toHaveValue("Infraestrutura");
+    expect(field).toHaveFocus();
+    // Inline, not the sidebar's modal.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
+  it("discards the draft on Escape and restores the persisted name", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    await user.keyboard("{Escape}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+  });
+
+  // Escape belongs to the editor while it is open; the panel must not close
+  // underneath it.
+  it("keeps the panel open when Escape cancels the editor", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    renderRenamePanel({ onClose });
+
+    const field = await openEditor(user);
+    await user.type(field, "x");
+    await user.keyboard("{Escape}");
+
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("cancels through the cancel control and returns focus to the rename control", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    await openEditor(user);
+    await user.click(screen.getByRole("button", { name: "Cancelar a renomeação do canal" }));
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Renomear canal" })).toHaveFocus();
+  });
+
+  it("reopens with the persisted name, not the abandoned draft, and without the old error", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    const reopened = await openEditor(user);
+
+    expect(reopened).toHaveValue("Infraestrutura");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: confirmar", () => {
+  it("confirms with Enter, trims, and never adopts the typed name itself", async () => {
+    const user = userEvent.setup();
+    const { onRename, reload } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "   Plataforma   {Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith("Plataforma"));
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+    // Still the persisted name: convergence is the canonical list moving and
+    // useReloadOnRename refetching it, never a write-back from the editor.
+    // The editor asks for no reload of its own (CQ-893-03).
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Infraestrutura");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("confirms through the confirm control", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    await user.click(screen.getByRole("button", { name: "Salvar novo nome do canal" }));
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith("Plataforma"));
+  });
+
+  it("refuses a whitespace-only name locally and says so on the field", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "   {Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    const error = screen.getByRole("alert");
+    expect(error).toHaveTextContent("Escolha um nome para este canal.");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    expect(field).toHaveFocus();
+  });
+
+  // A write that would store the same string is a request with no change.
+  it("asks for nothing when the trimmed name is the persisted one", async () => {
+    const user = userEvent.setup();
+    const { onRename, reload } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "  Infraestrutura  {Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    // No request, so nothing moves the canonical list and nothing is
+    // refetched: a no-op rename costs exactly nothing (CQ-893-03).
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+  });
+
+  it("accepts an ASCII name at the channel cap", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const atCap = "a".repeat(conversationNameMaxCodePoints.channel);
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, atCap);
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+  });
+
+  // ── The cap is in code points, the field is not (CQ-893-01) ──────────────
+  //
+  // 100 emoji is 100 code points and 200 UTF-16 code units. The backend
+  // accepts it; a `maxLength={100}` field silently refused half of it, and
+  // `String.prototype.length` would have made the same mistake. These cases
+  // pin both sides of both boundaries.
+
+  it("accepts a channel name of exactly 100 emoji, whole and untruncated", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const atCap = "😀".repeat(100);
+    const field = await openEditor(user);
+    // Pasted rather than typed: 100 emoji through the keyboard is 200 events.
+    fireEvent.change(field, { target: { value: atCap } });
+    expect(field).toHaveValue(atCap);
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+    // Exactly what was typed reached the mutation — not 50 emoji, and nothing
+    // cut at 100 UTF-16 units.
+    expect((onRename.mock.calls[0][0] as string).length).toBe(200);
+  });
+
+  it("refuses a channel name of 101 emoji locally, keeping the draft", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const overCap = "😀".repeat(101);
+    const field = await openEditor(user);
+    fireEvent.change(field, { target: { value: overCap } });
+    await user.keyboard("{Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+    const error = screen.getByRole("alert");
+    expect(error).toHaveTextContent("O nome do canal deve ter no máximo 100 caracteres.");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(field).toHaveAttribute("aria-describedby", error.id);
+    // Nothing was cut to fit; the user shortens it themselves.
+    expect(field).toHaveValue(overCap);
+    expect(field).toHaveFocus();
+  });
+
+  it("accepts a group name of exactly 120 emoji and refuses 121", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockResolvedValue(undefined);
+    renderRenamePanel({
+      kind: "group",
+      onRename,
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        roster: { status: "loading" },
+        reload: vi.fn(),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Renomear grupo" }));
+    const field = screen.getByRole("textbox", { name: "Nome do grupo" });
+
+    const overCap = "😀".repeat(121);
+    fireEvent.change(field, { target: { value: overCap } });
+    await user.keyboard("{Enter}");
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "O nome do grupo deve ter no máximo 120 caracteres.",
+    );
+
+    const atCap = "😀".repeat(120);
+    fireEvent.change(field, { target: { value: atCap } });
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledWith(atCap));
+  });
+
+  // The local check saves a round trip; it is not the authority. A name this
+  // client considers fine can still come back refused.
+  it("still renders the server's refusal for a name it let through", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(400, "bad_request", "nope"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Escolha um nome válido para esta conversa.",
+    );
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toHaveValue("Plataforma");
+  });
+});
+
+describe("ConversationDetailsPanel — renomear inline: pendente, erro e submit único", () => {
+  /** A rename whose resolution the test controls. */
+  function deferredRename() {
+    let settle: { resolve: () => void; reject: (error: unknown) => void } | undefined;
+    const onRename = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          settle = { resolve, reject: (error) => reject(error) };
+        }),
+    );
+    return { onRename, settle: () => settle };
+  }
+
+  it("keeps the wait inside the editor and leaves the rest of the panel usable", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    const confirm = screen.getByRole("button", { name: "Salvar novo nome do canal" });
+    await waitFor(() => expect(confirm).toBeDisabled());
+    expect(confirm).toHaveAttribute("aria-busy", "true");
+    expect(field).toHaveAttribute("readonly");
+    // The panel itself is untouched: its own controls still work.
+    expect(screen.getByRole("button", { name: "Fechar detalhes do canal" })).toBeEnabled();
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  it("stays open with the typed name when the server refuses, and retries", async () => {
+    const user = userEvent.setup();
+    const onRename = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiRequestError(429, "rate_limited", "slow down"))
+      .mockResolvedValueOnce(undefined);
+    const { reload } = renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Muitas solicitações/);
+    const retained = screen.getByRole("textbox", { name: "Nome do canal" });
+    expect(retained).toHaveValue("Plataforma");
+    // The persisted name is still what the panel states elsewhere.
+    expect(screen.queryByText("Plataforma")).not.toBeInTheDocument();
+
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+    // Neither the failure nor the retry asks the panel to refetch: that is
+    // useReloadOnRename's job, on the canonical name moving (CQ-893-03).
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  // The server's own message is never rendered: it echoes caller-controlled
+  // text and may describe a resource the caller cannot see.
+  it("renders a refusal from its status alone, never the server's message", async () => {
+    const user = userEvent.setup();
+    const onRename = vi
+      .fn()
+      .mockRejectedValue(new ApiRequestError(404, "not_found", "channel 9f2 in workspace acme"));
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Este canal não está mais disponível.",
+    );
+    expect(screen.queryByText(/workspace acme/)).not.toBeInTheDocument();
+  });
+
+  it("uses the group's vocabulary for a group's refusal", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn().mockRejectedValue(new ApiRequestError(403, "forbidden", "forbidden"));
+    renderRenamePanel({
+      kind: "group",
+      onRename,
+      state: {
+        details: { status: "ready", data: groupDetails({ name: "Time de Infra" }) },
+        files: { status: "ready", data: [] },
+        roster: { status: "loading" },
+        reload: vi.fn(),
+      },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Renomear grupo" }));
+    const field = screen.getByRole("textbox", { name: "Nome do grupo" });
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Você não tem permissão para renomear este grupo.",
+    );
+  });
+
+  it("sends one request however many times confirm is clicked", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    const confirm = screen.getByRole("button", { name: "Salvar novo nome do canal" });
+    await user.click(confirm);
+    await user.click(confirm);
+    await user.click(confirm);
+
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  it("sends one request for a repeated Enter and for Enter plus a click", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+    // A held key repeats; the repeat is not a second request.
+    await user.keyboard("{Enter>3/}");
+    await user.click(screen.getByRole("button", { name: "Salvar novo nome do canal" }));
+
+    expect(onRename).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      settle()?.resolve();
+    });
+  });
+
+  // Enter is not always a confirmation: an IME sends one to commit a candidate
+  // while composing, and a held key repeats. Neither is a request.
+  it("ignores an Enter that is a composition commit or a key repeat", async () => {
+    const user = userEvent.setup();
+    const { onRename } = renderRenamePanel();
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma");
+
+    fireEvent.keyDown(field, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(field, { key: "Enter", repeat: true });
+
+    expect(onRename).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toBeInTheDocument();
+  });
+
+  // Cancelling mid-write would hide whether the request landed, so the editor
+  // holds until the answer arrives — and then closes on the user's next gesture.
+  it("refuses to close while a rename is still in flight", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    renderRenamePanel({ onRename });
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "Cancelar a renomeação do canal" }));
+    expect(screen.getByRole("textbox", { name: "Nome do canal" })).toBeInTheDocument();
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument(),
+    );
+  });
+
+  // Switching conversations unmounts the editor; the mutation for the previous
+  // target still resolves, and nothing it carries may reach the new one.
+  it("cannot leak a pending rename into the conversation opened after it", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    const reload = vi.fn();
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({ reload })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    // The reader moves to another channel. The panel is deliberately not
+    // remounted, so only the editor's own key unmounts it.
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-2", slug: "produto", name: "Produto" }),
+          },
+          reload,
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      settle()?.resolve();
+    });
+
+    // B is in its own read state: no draft, no field, no error, its own name.
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Produto");
+    expect(screen.queryByRole("textbox", { name: "Nome do canal" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("Plataforma")).not.toBeInTheDocument();
+    // And the panel showing B was not refetched by A's resolution.
+    expect(reload).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not surface a rejection that lands after the conversation changed", async () => {
+    const user = userEvent.setup();
+    const { onRename, settle } = deferredRename();
+    const { rerender } = render(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state()}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const field = await openEditor(user);
+    await user.clear(field);
+    await user.type(field, "Plataforma{Enter}");
+    await waitFor(() => expect(onRename).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <ConversationDetailsPanel
+        kind="channel"
+        state={state({
+          details: {
+            status: "ready",
+            data: channelDetails({ id: "ch-2", slug: "produto", name: "Produto" }),
+          },
+        })}
+        currentUserId={currentUserId}
+        latestPin={null}
+        onRename={onRename}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      settle()?.reject(new ApiRequestError(403, "forbidden", "forbidden"));
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-channel-name")).toHaveTextContent("Produto");
+  });
+});
+
+// ── Bloco "Sobre": descrição, criação e criador (issue #894) ─────────────────
+//
+// The block states four facts about a conversation, and each of them has an
+// absence that has to read as an absence. What it must never do is fill a gap
+// with something technical: an identifier, part of one, or a value derived from
+// somewhere else in the payload.
+
+describe("ConversationDetailsPanel — Sobre: descrição", () => {
+  it.each([
+    [
+      "canal",
+      () =>
+        renderPanel({
+          state: state({
+            details: {
+              status: "ready",
+              data: channelDetails({ description: "Infraestrutura e operações." }),
+            },
+          }),
+        }),
+    ],
+    ["grupo", () => renderGroupPanel(groupDetails({ description: "Infraestrutura e operações." }))],
+  ])("renders the persisted description of a %s under its own label", (_kind, renderIt) => {
+    renderIt();
+
+    expect(screen.getByRole("heading", { name: "Descrição" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Infraestrutura e operações.",
+    );
+  });
+
+  it("words the empty state for the aggregate it is describing", () => {
+    const { unmount } = renderPanel();
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este canal ainda não tem descrição.",
+    );
+    unmount();
+
+    renderGroupPanel(groupDetails());
+    expect(screen.getByTestId("chat-details-description")).toHaveTextContent(
+      "Este grupo ainda não tem descrição.",
+    );
+  });
+
+  // The description is server-side content and the only markup-shaped value in
+  // the block, so the invariant is asserted payload-independently rather than
+  // per-payload: the element holds the string verbatim and contains no element
+  // children at all. That is only true of a React text node, and it holds for
+  // any markup — including shapes no test enumerated.
+  it.each([
+    ["script tag", "<script>window.__pwned = true</script>"],
+    ["img onerror", '<img src=x onerror="window.__pwned = true">'],
+    ["svg onload", '<svg onload="window.__pwned = true"></svg>'],
+    ["javascript: anchor", '<a href="javascript:window.__pwned = true">click</a>'],
+    ["attribute breakout", "\"'><script>window.__pwned = true</script>"],
+    ["template expression", "{{constructor.constructor('window.__pwned = true')()}}"],
+    ["bare entities", "& < > \" ' `"],
+  ])("renders a %s description as inert text", (_label, hostile) => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ description: hostile }) },
+      }),
+    });
+
+    const description = screen.getByTestId("chat-details-description");
+    // Verbatim, character for character — not escaped-and-unescaped, not
+    // stripped, not normalized.
+    expect(description.textContent).toBe(hostile);
+    // Nothing was parsed out of it. Checking for zero element children rather
+    // than for a <script> or an <img> is what makes this hold for payloads the
+    // list does not name.
+    expect(description.querySelectorAll("*")).toHaveLength(0);
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+  });
+
+  // The creator's name is `auth.users.full_name`/`display_name`, which a person
+  // sets on themselves through PATCH /auth/me. Issue #894 renders it in a place
+  // it was never rendered before, so the content behind this row is
+  // attacker-controlled and the same inertness has to hold for it.
+  //
+  // This is also the guard for the navigable creator the issue anticipates: the
+  // day the name becomes a link, an href built from it would fail here rather
+  // than ship.
+  it("renders a hostile creator name as inert text, in channel and in group", () => {
+    const hostile = '<img src=x onerror="window.__pwned = true">';
+
+    // The row carries one decorative icon of its own, so "the name contributed
+    // no elements" is the assertion — not "the row has no elements".
+    const contributedElements = (row: HTMLElement) =>
+      [...row.querySelectorAll("*")].filter((el) => el.getAttribute("aria-hidden") !== "true");
+
+    const { unmount } = renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ creatorDisplayName: hostile }),
+        },
+      }),
+    });
+    const channelRow = screen.getByText(`Criado por ${hostile}`);
+    expect(channelRow.textContent).toContain(hostile);
+    expect(contributedElements(channelRow)).toHaveLength(0);
+    unmount();
+
+    renderGroupPanel(groupDetails({ creatorDisplayName: hostile }));
+    const groupRow = screen.getByText(`Criado por ${hostile}`);
+    expect(groupRow.textContent).toContain(hostile);
+    expect(contributedElements(groupRow)).toHaveLength(0);
+
+    expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+  });
+
+  it("keeps accents, emoji and line breaks in a description", () => {
+    const description = "Operações — ç, ã, ü 🚀\nSegunda linha";
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ description }) },
+      }),
+    });
+
+    // textContent keeps the newline; the break itself is CSS (white-space:
+    // pre-wrap), never an interpreted <br>.
+    expect(screen.getByTestId("chat-details-description").textContent).toBe(description);
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: criador", () => {
+  it("names the creator by display name for a channel and for a group", () => {
+    const { unmount } = renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ creatorDisplayName: "Álvaro Neto" }),
+        },
+      }),
+    });
+    expect(screen.getByText("Criado por Álvaro Neto")).toBeInTheDocument();
+    unmount();
+
+    renderGroupPanel(groupDetails({ creatorDisplayName: "Juliane Lino" }));
+    expect(screen.getByText("Criado por Juliane Lino")).toBeInTheDocument();
+  });
+
+  it("falls back to a neutral state when the creator is unresolved", () => {
+    const { unmount } = renderPanel();
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+    expect(screen.queryByText(/Criado por/)).not.toBeInTheDocument();
+    unmount();
+
+    renderGroupPanel(groupDetails());
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+  });
+
+  it("never shows an identifier where the creator's name would go", () => {
+    // The panel is handed a details object that still carries the conversation's
+    // own id and every id in its preview, and no creator name. None of them may
+    // become the creator.
+    const creatorId = "11111111-2222-4333-8444-555555555555";
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            id: creatorId,
+            onlineCount: 1,
+            onlineMembers: [
+              { userId: creatorId, displayName: "Álvaro", role: "member", presence: "online" },
+            ],
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByText("Criador não identificado")).toBeInTheDocument();
+    // Not the id, and not a prefix of it either: a truncated UUID is still a
+    // UUID on screen.
+    expect(screen.queryByText(new RegExp(creatorId.slice(0, 8)))).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: data de criação", () => {
+  it("formats the aggregate's own timestamp with the shared long-date format", () => {
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({ createdAt: "2026-08-31T12:00:00.000Z" }),
+        },
+      }),
+    });
+
+    expect(
+      screen.getByText(`Criado em ${formatLongDate("2026-08-31T12:00:00.000Z")}`),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["absent", ""],
+    ["unparseable", "ontem de manhã"],
+  ])(
+    "reads as unavailable when the date is %s, never as a half-written sentence",
+    (_case, value) => {
+      renderPanel({
+        state: state({
+          details: { status: "ready", data: channelDetails({ createdAt: value }) },
+        }),
+      });
+
+      expect(screen.getByText("Data de criação indisponível")).toBeInTheDocument();
+      expect(screen.queryByText(/^Criado em\s*$/)).not.toBeInTheDocument();
+    },
+  );
+});
+
+describe("ConversationDetailsPanel — Sobre: contagem", () => {
+  it.each([
+    [1, "1 membro"],
+    [6, "6 membros"],
+  ])("a channel of %d reads %s", (memberCount, expected) => {
+    renderPanel({
+      state: state({
+        details: { status: "ready", data: channelDetails({ memberCount }) },
+      }),
+    });
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it.each([
+    [1, "1 participante"],
+    [6, "6 participantes"],
+  ])("a group of %d reads %s", (participantCount, expected) => {
+    renderGroupPanel(groupDetails({ participantCount }));
+
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  it("counts the server's total, never the preview it was given", () => {
+    // Three independent numbers, deliberately all different: the size of the
+    // conversation, how many are online, and how many rows the preview holds.
+    renderPanel({
+      state: state({
+        details: {
+          status: "ready",
+          data: channelDetails({
+            memberCount: 40,
+            onlineCount: 6,
+            onlineMembers: [
+              { userId: "u-1", displayName: "Ana", role: "member", presence: "online" },
+            ],
+          }),
+        },
+      }),
+    });
+
+    expect(screen.getByText("40 membros")).toBeInTheDocument();
+    expect(screen.queryByText("1 membro")).not.toBeInTheDocument();
+    expect(screen.queryByText("6 membros")).not.toBeInTheDocument();
+  });
+
+  it("counts a group's total, never its capped participant preview", () => {
+    renderGroupPanel(
+      groupDetails({
+        participantCount: 31,
+        participants: [
+          { userId: "u-1", displayName: "Ana" },
+          { userId: "u-2", displayName: "Bruno" },
+        ],
+      }),
+    );
+
+    expect(screen.getByText("31 participantes")).toBeInTheDocument();
+    expect(screen.queryByText("2 participantes")).not.toBeInTheDocument();
+  });
+});
+
+describe("ConversationDetailsPanel — Sobre: a DM 1:1 não ganhou nada", () => {
+  it("shows no conversation description, creator or count on a 1:1 profile", () => {
+    // A direct conversation is a person, not a described conversation: issue
+    // #894 added a block to the channel and group panels and nothing at all
+    // here, and the profile must not have inherited any of it.
+    renderProfilePanel(directDetails({ displayName: "Juliane Lino" }));
+
+    expect(screen.queryByRole("heading", { name: "Descrição" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat-details-description")).not.toBeInTheDocument();
+    expect(screen.queryByText(/ainda não tem descrição/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Criado por/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Criador não identificado")).not.toBeInTheDocument();
+    expect(screen.queryByText(/participantes?$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/membros?$/)).not.toBeInTheDocument();
   });
 });

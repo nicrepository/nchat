@@ -271,3 +271,90 @@ func TestChannelService_GetChannelDetails_SurfacesAMemberQueryFailure(t *testing
 		t.Fatal("expected the member query failure to surface")
 	}
 }
+
+// ── About metadata (issue #894) ──────────────────────────────────────────────
+
+// The About block's two new facts come from the aggregate, after the gate, and
+// absence survives as absence. The service's job is to carry them without
+// deciding anything about them — in particular without substituting the
+// creator's identifier for the name it could not resolve.
+func TestChannelService_GetChannelDetails_CarriesAboutMetadata(t *testing.T) {
+	ms := detailsMemberStore()
+	cs := detailsChannelStore()
+	cs.visibleChannel.CreatedBy = "creator-uuid-1111"
+	cs.about = storage.ConversationAbout{
+		Description:        "Infraestrutura, redes internas e operações.",
+		CreatorDisplayName: "Álvaro Neto",
+	}
+
+	details, err := service.NewChannelService(activeWorkspaceStore("ws-1"), cs, ms).
+		GetChannelDetails(context.Background(), detailsInput(nil, 0))
+	if err != nil {
+		t.Fatalf("GetChannelDetails: %v", err)
+	}
+	if details.About.Description != "Infraestrutura, redes internas e operações." {
+		t.Fatalf("Description = %q", details.About.Description)
+	}
+	if details.About.CreatorDisplayName != "Álvaro Neto" {
+		t.Fatalf("CreatorDisplayName = %q", details.About.CreatorDisplayName)
+	}
+	// The About read is scoped to the server-derived workspace and to the
+	// channel the visibility check returned, never to anything else.
+	if len(cs.aboutCalls) != 1 {
+		t.Fatalf("about reads = %d, want exactly one (no N+1)", len(cs.aboutCalls))
+	}
+	if cs.aboutCalls[0].workspaceID != "ws-1" || cs.aboutCalls[0].targetID != "ch-1" {
+		t.Fatalf("about call = %+v", cs.aboutCalls[0])
+	}
+}
+
+// An unresolvable creator is empty, and stays empty: the channel's created_by is
+// right there in the loaded row, and nothing may promote it into the name.
+func TestChannelService_GetChannelDetails_UnresolvedCreatorStaysEmpty(t *testing.T) {
+	ms := detailsMemberStore()
+	cs := detailsChannelStore()
+	cs.visibleChannel.CreatedBy = "creator-uuid-1111"
+	cs.about = storage.ConversationAbout{}
+
+	details, err := service.NewChannelService(activeWorkspaceStore("ws-1"), cs, ms).
+		GetChannelDetails(context.Background(), detailsInput(nil, 0))
+	if err != nil {
+		t.Fatalf("GetChannelDetails: %v", err)
+	}
+	if details.About.Description != "" || details.About.CreatorDisplayName != "" {
+		t.Fatalf("About = %+v, want both empty", details.About)
+	}
+	if details.Channel.CreatedBy != "creator-uuid-1111" {
+		t.Fatalf("CreatedBy = %q; the domain keeps it, the About block must not borrow it",
+			details.Channel.CreatedBy)
+	}
+}
+
+// The About read happens after the visibility gate, so a caller who cannot see
+// the channel never reaches it — not even to learn that the description exists.
+func TestChannelService_GetChannelDetails_DeniedCallerNeverReadsAbout(t *testing.T) {
+	ms := detailsMemberStore()
+	cs := detailsChannelStore()
+	cs.getVisibleErr = domain.ErrNotFound
+
+	if _, err := service.NewChannelService(activeWorkspaceStore("ws-1"), cs, ms).
+		GetChannelDetails(context.Background(), detailsInput(nil, 0)); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if len(cs.aboutCalls) != 0 {
+		t.Fatalf("about reads = %d, want none for a denied caller", len(cs.aboutCalls))
+	}
+}
+
+// A conversation archived between the gate and this read answers ErrNotFound,
+// the same outcome the gate itself would have produced a moment earlier.
+func TestChannelService_GetChannelDetails_AboutErrorPropagates(t *testing.T) {
+	ms := detailsMemberStore()
+	cs := detailsChannelStore()
+	cs.aboutErr = domain.ErrNotFound
+
+	if _, err := service.NewChannelService(activeWorkspaceStore("ws-1"), cs, ms).
+		GetChannelDetails(context.Background(), detailsInput(nil, 0)); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}

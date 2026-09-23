@@ -2,10 +2,13 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,6 +47,9 @@ type MemberStore interface {
 	ListOnlineChannelMemberProfiles(
 		ctx context.Context, workspaceID, channelID string, onlineUserIDs []string, limit int,
 	) (ChannelMemberPage, error)
+	// ListChannelMemberRoster returns an authorized caller's complete effective
+	// membership as an opaque-cursor page. Presence is never part of this query.
+	ListChannelMemberRoster(ctx context.Context, workspaceID, channelID, cursor string, limit int) (ChannelRosterPage, error)
 	// ListChannelMemberProfilesByIDs resolves the subset of userIDs that are
 	// active members of channelID, for the call-participant avatar/name
 	// lookup (issue #612). Unlike ListOnlineChannelMemberProfiles this is not
@@ -75,6 +81,34 @@ type MemberStore interface {
 	RemoveChannelMemberByAdmin(ctx context.Context, workspaceID, channelID, actorID, targetUserID string) (domain.Message, error)
 	EnsureGeneralMembership(ctx context.Context, workspaceID, userID string) error
 	SyncGeneralMemberships(ctx context.Context, workspaceID string) (int64, error)
+}
+
+type rosterCursor struct {
+	Name   string `json:"n"`
+	UserID string `json:"u"`
+}
+
+func decodeRosterCursor(raw string) (rosterCursor, error) {
+	if raw == "" {
+		return rosterCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	var cursor rosterCursor
+	if json.Unmarshal(decoded, &cursor) != nil || cursor.UserID == "" {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	if _, err := uuid.Parse(cursor.UserID); err != nil {
+		return rosterCursor{}, domain.ErrInvalidInput
+	}
+	return cursor, nil
+}
+
+func encodeRosterCursor(profile domain.ChannelMemberProfile) string {
+	encoded, _ := json.Marshal(rosterCursor{Name: strings.ToLower(profile.DisplayName), UserID: profile.UserID})
+	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 
 // PGXMemberStore implements MemberStore using a pgx connection pool.
@@ -880,6 +914,128 @@ func (s *PGXMemberStore) ListOnlineChannelMemberProfiles(
 	}
 	if err := rows.Err(); err != nil {
 		return ChannelMemberPage{}, fmt.Errorf("iterate channel member profiles: %w", err)
+	}
+	return page, nil
+}
+
+// ChannelRosterPage is the channel's administrable membership (issue #469): a
+// capped, ordered page of chat.channel_members and the total behind it.
+//
+// Deliberately not ChannelMemberPage. That type answers "who is here now" and
+// carries an online total; this one answers "who belongs", has no presence
+// dimension at all, and a wrong presence snapshot cannot subtract from it. Two
+// questions, two types, so a caller cannot read one as the other.
+type ChannelRosterPage struct {
+	Members    []domain.ChannelMemberProfile
+	TotalCount int
+	NextCursor string
+}
+
+// ListChannelMemberRoster returns a capped page of a channel's explicit
+// members and the full total, in a single query (issue #469).
+//
+// The predicate is the one active_members already encodes in
+// ListOnlineChannelMemberProfiles — active channel in this workspace, active
+// workspace membership, active non-deleted account — and nothing else: no
+// presence, no visibility. That matters twice over. chat.channel_members is
+// exactly the population RemoveChannelMemberByAdmin deletes from, so every
+// roster row is something the removal can act on; and a member who is offline,
+// or connected to another replica, stays administrable instead of disappearing
+// from the panel.
+//
+// What this deliberately does not do is widen membership. A public channel is
+// readable through chat.channel_visible_to_user without a row here, and those
+// readers are not members and do not appear — offering to remove a row that
+// does not exist would be a lie in the shape of a button. Which population a
+// public channel's roster *should* be is issue #883's to settle; this answer
+// tracks whatever it decides, because it reads the same table member_count
+// already counts.
+//
+// COUNT(*) OVER () is evaluated before LIMIT, so the total describes the whole
+// membership and not the page — the same single-query shape
+// ListParticipantProfiles uses for a group, and for the same reason: a second
+// COUNT statement is a second chance to drift from this one's predicate.
+func (s *PGXMemberStore) ListChannelMemberRoster(
+	ctx context.Context, workspaceID, channelID, rawCursor string, limit int,
+) (ChannelRosterPage, error) {
+	if limit <= 0 || limit > domain.MaxChannelDetailsMembers {
+		limit = domain.MaxChannelDetailsMembers
+	}
+	cursor, err := decodeRosterCursor(rawCursor)
+	if err != nil {
+		return ChannelRosterPage{}, err
+	}
+	hasCursor := rawCursor != ""
+	var cursorUserID any
+	if hasCursor {
+		cursorUserID = cursor.UserID
+	}
+	rows, err := s.pool.Query(ctx, `
+		WITH active_members AS (
+			SELECT cm.user_id,
+			       cm.role::text AS role,
+			       COALESCE(
+			           NULLIF(BTRIM(u.full_name), ''),
+			           NULLIF(BTRIM(u.display_name), ''),
+			           ''
+			       ) AS display_name,
+			       COALESCE(u.avatar_url, '') AS avatar_url
+			FROM chat.channel_members cm
+			JOIN chat.channels c
+			  ON c.id = cm.channel_id
+			 AND c.workspace_id = $1::uuid
+			 AND c.status = 'active'
+			JOIN chat.workspace_members wm
+			  ON wm.workspace_id = c.workspace_id
+			 AND wm.user_id = cm.user_id
+			 AND wm.status = 'active'
+			JOIN auth.users u ON u.id = cm.user_id AND u.status = 'active' AND u.deleted_at IS NULL
+			WHERE cm.channel_id = $2::uuid
+		)
+		SELECT total.total_count,
+		       page.user_id::text,
+		       page.display_name,
+		       page.avatar_url,
+		       page.role
+		FROM (SELECT count(*) AS total_count FROM active_members) total
+		LEFT JOIN LATERAL (
+			SELECT * FROM active_members
+			WHERE NOT $3::boolean OR (lower(display_name), user_id) > ($4, $5::uuid)
+			ORDER BY lower(display_name), user_id
+			LIMIT $6
+		) page ON true`, workspaceID, channelID, hasCursor, cursor.Name, cursorUserID, limit+1)
+	if err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("list channel member roster: %w", err)
+	}
+	defer rows.Close()
+
+	page := ChannelRosterPage{Members: make([]domain.ChannelMemberProfile, 0, limit)}
+	for rows.Next() {
+		var (
+			profile     domain.ChannelMemberProfile
+			role        pgtype.Text
+			total       int
+			userID      pgtype.Text
+			displayName pgtype.Text
+			avatarURL   pgtype.Text
+		)
+		if err := rows.Scan(&total, &userID, &displayName, &avatarURL, &role); err != nil {
+			return ChannelRosterPage{}, fmt.Errorf("scan channel roster member: %w", err)
+		}
+		if !userID.Valid {
+			continue
+		}
+		profile.UserID, profile.DisplayName, profile.AvatarURL = userID.String, displayName.String, avatarURL.String
+		profile.Role = domain.ChannelRole(role.String)
+		page.TotalCount = total
+		if len(page.Members) == limit {
+			page.NextCursor = encodeRosterCursor(page.Members[len(page.Members)-1])
+			continue
+		}
+		page.Members = append(page.Members, profile)
+	}
+	if err := rows.Err(); err != nil {
+		return ChannelRosterPage{}, fmt.Errorf("iterate channel roster members: %w", err)
 	}
 	return page, nil
 }
