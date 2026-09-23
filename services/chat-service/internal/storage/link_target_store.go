@@ -40,13 +40,30 @@ const (
 )
 
 // freshVerdictSQL is the one definition of a fresh verdict: decided within
-// urlsafety.VerdictTTL. alias qualifies chat.link_scans; ttlParam is the
-// placeholder bound to urlsafety.VerdictTTL.Seconds(). Every reader that cares
-// whether a clearance still counts — the send-path verdict load, the cost
-// classification, the per-link read model, the preview claim and the preview
-// image route — spells it through here so they cannot drift apart.
+// urlsafety.VerdictTTL, and not past whatever earlier limit the provider stated.
+// alias qualifies chat.link_scans; ttlParam is the placeholder bound to
+// urlsafety.VerdictTTL.Seconds(). Every reader that cares whether a clearance
+// still counts — the send-path verdict load, the cost classification, the
+// per-link read model, the preview claim and the preview image route — spells it
+// through here so they cannot drift apart.
+//
+// The second clause is issue #928. A verdict is evidence, and evidence has two
+// independent lifetimes: how long this deployment is willing to reuse an answer,
+// and how long the provider is willing to stand behind it. Google Web Risk
+// states the second with a threat match, and a condemnation may not outlive the
+// evidence it rests on. So the two are a conjunction — the verdict expires at
+// whichever comes first — and NULL, which is every row written before this and
+// every answer from a provider that states no limit, leaves the local window
+// alone in charge.
+//
+// It is a ceiling and never an extension: an evidence_expires_at *after*
+// decided_at + VerdictTTL changes nothing, because the first clause has already
+// expired the row. There is no arrangement of the two columns that reuses an
+// answer for longer than VerdictTTL.
 func freshVerdictSQL(alias, ttlParam string) string {
-	return alias + ".decided_at IS NOT NULL AND " + alias + ".decided_at > now() - (" + ttlParam + " * interval '1 second')"
+	return alias + ".decided_at IS NOT NULL" +
+		" AND " + alias + ".decided_at > now() - (" + ttlParam + " * interval '1 second')" +
+		" AND (" + alias + ".evidence_expires_at IS NULL OR " + alias + ".evidence_expires_at > now())"
 }
 
 // safeFreshVerdictSQL is the only clearance a preview may be fetched or served

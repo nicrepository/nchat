@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // The primary/fallback composition (issue #928).
@@ -364,5 +365,153 @@ func TestFailureReasonIsAlwaysAClosedValue(t *testing.T) {
 				t.Fatalf("FailureReason = %q, want %q", got, testCase.want)
 			}
 		})
+	}
+}
+
+// --- the background second opinion (issue #928) ------------------------------
+
+// CheckSecondary asks the fallback and only the fallback. Routing it through
+// Check would ask the primary again about a URL the primary already cleared,
+// which is the same opinion at twice the price.
+func TestCheckSecondaryAsksOnlyTheFallback(t *testing.T) {
+	primary := newStub(ProviderGoogleWebRisk, verdictAnswer(ReputationSafe))
+	secondary := newStub(ProviderCloudflareURLScanner, verdictAnswer(ReputationMalicious))
+
+	result, err := composed(primary, secondary).
+		CheckSecondary(context.Background(), "https://x.test/", "cf-1")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Verdict != ReputationMalicious {
+		t.Fatalf("verdict = %q, want the fallback's", result.Verdict)
+	}
+	if len(primary.calls) != 0 {
+		t.Fatal("a second opinion must not re-ask the primary")
+	}
+	if secondary.calls[0] != "cf-1" {
+		t.Fatalf("ref = %q, want it forwarded untouched", secondary.calls[0])
+	}
+}
+
+// The composition's precedence does not apply to a second opinion: there is no
+// primary answer to prefer here, and a failure is simply an opinion that was not
+// obtained.
+func TestCheckSecondaryReportsFailuresWithoutConsultingThePrimary(t *testing.T) {
+	primary := newStub(ProviderGoogleWebRisk, verdictAnswer(ReputationSafe))
+	secondary := newStub(ProviderCloudflareURLScanner, errorAnswer(unavailable(ReasonHostnameLimit)))
+
+	_, err := composed(primary, secondary).
+		CheckSecondary(context.Background(), "https://x.test/", "")
+
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if FailureReason(err) != ReasonHostnameLimit {
+		t.Fatalf("reason = %q, want %q", FailureReason(err), ReasonHostnameLimit)
+	}
+	if len(primary.calls) != 0 {
+		t.Fatal("a failed second opinion fell back to the primary")
+	}
+}
+
+// secondOpinionService builds a Service whose provider is a composition, and
+// seeds the cache with the clearance the primary produced — which is the state
+// every second opinion actually runs against.
+func secondOpinionService(t *testing.T, secondary *stubProvider) *Service {
+	t.Helper()
+	primary := newStub(ProviderGoogleWebRisk, verdictAnswer(ReputationSafe))
+	service := newService(nil, nil, time.Now)
+	service.provider = NewPrimaryFallbackProvider(primary, secondary, nil)
+	if _, err := service.Check(context.Background(), secondOpinionURL, ""); err != nil {
+		t.Fatalf("seeding the clearance: %v", err)
+	}
+	if verdict, ok := service.Lookup(secondOpinionURL); !ok || verdict != VerdictSafe {
+		t.Fatalf("seed: verdict = %q, ok = %v", verdict, ok)
+	}
+	return service
+}
+
+const secondOpinionURL = "https://cleared.test/page"
+
+// The one thing a second opinion may change: a condemnation displaces the
+// clearance sitting in the cache. Without this, Lookup would keep answering
+// "safe" for the rest of VerdictTTL about a URL just decided malicious.
+func TestServiceCheckSecondaryCachesACondemnation(t *testing.T) {
+	secondary := newStub(ProviderCloudflareURLScanner, verdictAnswer(ReputationMalicious))
+	service := secondOpinionService(t, secondary)
+
+	if _, err := service.CheckSecondary(context.Background(), secondOpinionURL, ""); err != nil {
+		t.Fatalf("CheckSecondary: %v", err)
+	}
+
+	verdict, ok := service.Lookup(secondOpinionURL)
+	if !ok || verdict != VerdictMalicious {
+		t.Fatalf("verdict = %q, ok = %v; want the condemnation to have displaced the clearance",
+			verdict, ok)
+	}
+}
+
+// Everything else a second opinion can produce leaves the clearance exactly
+// where it was. A failure in particular must not cache VerdictUnknown the way a
+// failed Check does — that would erase a live clearance because a background
+// double-check timed out.
+func TestServiceCheckSecondaryLeavesAFreshClearanceAlone(t *testing.T) {
+	for name, answer := range map[string]stubAnswer{
+		"agrees":            verdictAnswer(ReputationSafe),
+		"no classification": verdictAnswer(ReputationUnknown),
+		"hostname limit": {result: ReputationResult{
+			Verdict: ReputationUnknown, Reason: ReasonHostnameLimit,
+		}},
+		"unavailable":  errorAnswer(unavailable(ReasonTimeout)),
+		"auth error":   errorAnswer(unavailable(ReasonAuthError)),
+		"rate limited": errorAnswer(unavailable(ReasonRateLimited)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			secondary := newStub(ProviderCloudflareURLScanner, answer)
+			service := secondOpinionService(t, secondary)
+
+			_, _ = service.CheckSecondary(context.Background(), secondOpinionURL, "")
+
+			verdict, ok := service.Lookup(secondOpinionURL)
+			if !ok || verdict != VerdictSafe {
+				t.Fatalf("verdict = %q, ok = %v; want the clearance untouched", verdict, ok)
+			}
+		})
+	}
+}
+
+// A provider with no second source is a working deployment: there is simply no
+// background verification to run, and the caller is told so rather than being
+// handed a failure it would retry.
+func TestServiceCheckSecondaryWithoutASecondSource(t *testing.T) {
+	service := NewReputationService(newStub("solo", verdictAnswer(ReputationSafe)), nil)
+
+	_, err := service.CheckSecondary(context.Background(), "https://x.test/", "")
+
+	if !errors.Is(err, ErrSecondaryUnsupported) {
+		t.Fatalf("err = %v, want ErrSecondaryUnsupported", err)
+	}
+}
+
+// The pipeline's breaker still guards this lane: a provider that is down stops
+// being asked, and an open circuit is reported as a failure rather than as an
+// opinion.
+func TestServiceCheckSecondaryRespectsTheCircuit(t *testing.T) {
+	secondary := newStub(ProviderCloudflareURLScanner)
+	service := secondOpinionService(t, secondary)
+	service.SetBreaker(NewBreaker(1, time.Hour))
+	secondary.script = []stubAnswer{errorAnswer(ErrUnavailable), verdictAnswer(ReputationMalicious)}
+
+	if _, err := service.CheckSecondary(context.Background(), secondOpinionURL, ""); err == nil {
+		t.Fatal("expected the first exchange to fail")
+	}
+	_, err := service.CheckSecondary(context.Background(), secondOpinionURL, "")
+
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("err = %v, want ErrCircuitOpen", err)
+	}
+	if verdict, ok := service.Lookup(secondOpinionURL); !ok || verdict != VerdictSafe {
+		t.Fatalf("an open circuit disturbed the clearance: %q ok=%v", verdict, ok)
 	}
 }

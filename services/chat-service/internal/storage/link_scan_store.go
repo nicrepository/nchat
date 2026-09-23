@@ -363,6 +363,15 @@ func (s *PGXMessageStore) LinkScanBacklog(ctx context.Context) (map[string]int, 
 //
 // Idempotent by construction: a row already pending is not matched, so repeated
 // passes and concurrent workers cannot produce a second scan for one URL.
+//
+// # What expiry is not (issue #928)
+//
+// It is not a verdict, and in particular it is not a clearance. A condemnation
+// whose provider-stated evidence has lapsed goes back to `pending`, exactly like
+// a lapsed clearance does, and `pending` means no href and no preview until
+// somebody answers again. There is no branch here, or anywhere downstream, in
+// which an expired malicious row becomes safe — the row's status is erased, not
+// flipped, and the next answer decides it from scratch.
 func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error) {
 	// Scoped to safe/malicious for the same reason EnsureLinkScans is: an
 	// inconclusive row has no clearance to expire, and reopening it on a timer
@@ -371,9 +380,17 @@ func (s *PGXMessageStore) ReopenExpiredVerdicts(ctx context.Context) (int, error
 		UPDATE chat.link_scans ls
 		   SET status = 'pending', scan_uuid = NULL, decided_at = NULL,
 		       attempts = 0, next_attempt_at = NULL, terminal_reason = NULL,
+		       evidence_expires_at = NULL,
+		       secondary_due_at = NULL, secondary_scan_uuid = NULL,
 		       deadline_at = now() + ($2 * interval '1 second'), updated_at = now()
 		 WHERE ls.status IN ('safe', 'malicious')
-		   AND ls.decided_at <= now() - ($1 * interval '1 second')
+		   -- Either lifetime lapsing is enough, and for the same reason: the row
+		   -- no longer holds evidence anybody may act on. Clearing
+		   -- evidence_expires_at on the way back to pending is what stops the
+		   -- previous answer's ceiling from bounding the next one, which
+		   -- describes a different observation entirely.
+		   AND (ls.decided_at <= now() - ($1 * interval '1 second')
+		        OR (ls.evidence_expires_at IS NOT NULL AND ls.evidence_expires_at <= now()))
 		   AND EXISTS (
 		       SELECT 1
 		       FROM chat.message_link_scans mls
@@ -638,20 +655,57 @@ func (s *PGXMessageStore) RecordLinkScanSubmission(
 // loses the same way: the row is the sweep's to end (unknown/deadline), and a
 // verdict — safe, malicious or inconclusive — is never written over a target
 // whose waiting has already ended.
-func (s *PGXMessageStore) RecordLinkVerdict(
-	ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict,
-) error {
-	if !verdict.IsFinal() && verdict != urlsafety.VerdictInconclusive {
+// LinkVerdictWrite is one terminal answer about one canonical URL, with the two
+// things issue #928 made a verdict carry beyond the verdict itself.
+//
+// A struct rather than four more positional parameters because the last two are
+// a bare time and a bare bool, and a call site that transposed them would
+// compile and be wrong in the direction that matters.
+type LinkVerdictWrite struct {
+	CanonicalURL string
+	// ScanUUID is the attempt this answer belongs to; the write is bound to it,
+	// so a worker whose lease lapsed cannot overwrite a newer answer.
+	ScanUUID string
+	Verdict  urlsafety.Verdict
+	// EvidenceExpiresAt is the provider's own ceiling on the answer, or zero
+	// when it stated none — the overwhelmingly common case, and the one every
+	// row written before issue #928 is in. When set it is persisted, so the
+	// ceiling survives a restart: an in-process cache is rebuilt empty, and a
+	// verdict whose evidence lapsed while the service was down must not come
+	// back usable because the row only remembered decided_at.
+	EvidenceExpiresAt time.Time
+	// VerifySecondary opens the background second-opinion lane in the same
+	// statement that writes the clearance.
+	//
+	// Atomic on purpose. Scheduling it afterwards would leave a window in which
+	// a safe row exists with no lane and nothing left to create one, and the
+	// window is exactly a crash wide — which is to say, exactly as wide as the
+	// cases this pipeline is built to survive.
+	//
+	// Only ever set for a clearance from the synchronous primary. A clearance
+	// that came from the secondary itself has nothing left to ask.
+	VerifySecondary bool
+}
+
+// RecordLinkVerdict stores a terminal answer. Non-final verdicts are refused.
+func (s *PGXMessageStore) RecordLinkVerdict(ctx context.Context, write LinkVerdictWrite) error {
+	if !write.Verdict.IsFinal() && write.Verdict != urlsafety.VerdictInconclusive {
 		return fmt.Errorf("%w: refusing to store a non-final verdict", domain.ErrInvalidInput)
 	}
-	if verdict == urlsafety.VerdictMalicious {
-		return s.recordMaliciousLinkVerdict(ctx, canonicalURL, scanUUID, "pending")
+	if write.Verdict == urlsafety.VerdictMalicious {
+		return s.recordMaliciousLinkVerdict(ctx, write.CanonicalURL, write.ScanUUID,
+			"pending", refColumnPrimary, write.EvidenceExpiresAt)
 	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE chat.link_scans ls
-		   SET status = $2, decided_at = now(), next_attempt_at = NULL, updated_at = now()
+		   SET status = $2, decided_at = now(), next_attempt_at = NULL,
+		       evidence_expires_at = $4,
+		       secondary_due_at = CASE WHEN $5 THEN now() ELSE NULL END,
+		       secondary_scan_uuid = NULL,
+		       updated_at = now()
 		 WHERE ls.canonical_url = $1 AND `+pendingWithinDeadlineSQL("ls")+` AND ls.scan_uuid = $3`,
-		canonicalURL, string(verdict), scanUUID,
+		write.CanonicalURL, string(write.Verdict), write.ScanUUID,
+		nullableTime(write.EvidenceExpiresAt), write.VerifySecondary,
 	)
 	if err != nil {
 		return fmt.Errorf("record link verdict: %w", err)
@@ -662,20 +716,39 @@ func (s *PGXMessageStore) RecordLinkVerdict(
 	return nil
 }
 
+// nullableTime maps Go's zero time onto SQL NULL, which is how "the provider
+// stated no limit" is stored. A zero timestamp written literally would be an
+// expiry in the year 1, i.e. an instantly-expired verdict.
+func nullableTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
+}
+
 // recordMaliciousLinkVerdict is the one compare-and-set for every chat
 // condemnation, whether it came from the initial poll or reconciliation.
 // Publishing the global denial and expiring a file-service SAFE row are CTEs of
 // the same statement, so success can never expose chat=malicious while either
 // current or rolling-deploy file readers still have fetch authority.
-const recordMaliciousLinkVerdictQuery = `
+// refColumn is spliced rather than bound because a column name cannot be a
+// parameter. It is one of two package constants — never anything a caller
+// supplies — and the whole reason for the splice is that there must remain
+// exactly ONE definition of a chat condemnation: the primary lane compares the
+// scan id it polled, the secondary lane compares the one it polled, and
+// everything else about the statement, including the global denial and the
+// file-service invalidation, is shared.
+func recordMaliciousLinkVerdictQuery(refColumn string) string {
+	return `
 	WITH updated AS (
 		UPDATE chat.link_scans
 		   SET status = 'malicious', decided_at = now(), next_attempt_at = NULL,
-		       next_reconcile_at = NULL, updated_at = now()
+		       next_reconcile_at = NULL, evidence_expires_at = $5,
+		       secondary_due_at = NULL, secondary_scan_uuid = NULL, updated_at = now()
 		 WHERE canonical_url = $1
 		   AND status = $2
-		   AND scan_uuid IS NOT NULL
-		   AND scan_uuid = $3
+		   AND ` + refColumn + ` IS NOT NULL
+		   AND ` + refColumn + ` = $3
 		   -- A pending target is condemned only inside its deadline; an
 		   -- inconclusive one (reconciliation) has no deadline to honour.
 		   AND ($2 <> 'pending' OR deadline_at > now())
@@ -703,13 +776,23 @@ const recordMaliciousLinkVerdictQuery = `
 		 RETURNING url_digest
 	)
 	SELECT EXISTS (SELECT 1 FROM updated)`
+}
+
+// Which column a condemnation's compare-and-set is bound to. Package constants,
+// never caller input — see recordMaliciousLinkVerdictQuery.
+const (
+	refColumnPrimary   = "scan_uuid"
+	refColumnSecondary = "secondary_scan_uuid"
+)
 
 func (s *PGXMessageStore) recordMaliciousLinkVerdict(
-	ctx context.Context, canonicalURL, scanUUID, expectedStatus string,
+	ctx context.Context, canonicalURL, scanUUID, expectedStatus, refColumn string,
+	evidenceExpiresAt time.Time,
 ) error {
 	var updated bool
-	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery,
+	err := s.pool.QueryRow(ctx, recordMaliciousLinkVerdictQuery(refColumn),
 		canonicalURL, expectedStatus, scanUUID, urlsafety.URLDigest(canonicalURL),
+		nullableTime(evidenceExpiresAt),
 	).Scan(&updated)
 	if err != nil {
 		return fmt.Errorf("record malicious link verdict: %w", err)

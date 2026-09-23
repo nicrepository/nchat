@@ -82,13 +82,13 @@ func TestLinkScanDeadlineIsAStateMachineInvariantPostgreSQL(t *testing.T) {
 				return f.store.AdoptScanUUID(f.ctx, targetURLA, "scan-late", generation)
 			},
 			"safe": func(scanUUID string, _ int) error {
-				return f.store.RecordLinkVerdict(f.ctx, targetURLA, scanUUID, urlsafety.VerdictSafe)
+				return f.store.RecordLinkVerdict(f.ctx, storage.LinkVerdictWrite{CanonicalURL: targetURLA, ScanUUID: scanUUID, Verdict: urlsafety.VerdictSafe})
 			},
 			"malicious": func(scanUUID string, _ int) error {
-				return f.store.RecordLinkVerdict(f.ctx, targetURLA, scanUUID, urlsafety.VerdictMalicious)
+				return f.store.RecordLinkVerdict(f.ctx, storage.LinkVerdictWrite{CanonicalURL: targetURLA, ScanUUID: scanUUID, Verdict: urlsafety.VerdictMalicious})
 			},
 			"inconclusive": func(scanUUID string, _ int) error {
-				return f.store.RecordLinkVerdict(f.ctx, targetURLA, scanUUID, urlsafety.VerdictInconclusive)
+				return f.store.RecordLinkVerdict(f.ctx, storage.LinkVerdictWrite{CanonicalURL: targetURLA, ScanUUID: scanUUID, Verdict: urlsafety.VerdictInconclusive})
 			},
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -136,7 +136,7 @@ func TestLinkScanDeadlineIsAStateMachineInvariantPostgreSQL(t *testing.T) {
 		if err := f.store.RecordLinkScanSubmission(f.ctx, targetURLA, "scan-ok", generation); err != nil {
 			t.Fatalf("RecordLinkScanSubmission: %v", err)
 		}
-		if err := f.store.RecordLinkVerdict(f.ctx, targetURLA, "scan-ok", urlsafety.VerdictSafe); err != nil {
+		if err := f.store.RecordLinkVerdict(f.ctx, storage.LinkVerdictWrite{CanonicalURL: targetURLA, ScanUUID: "scan-ok", Verdict: urlsafety.VerdictSafe}); err != nil {
 			t.Fatalf("RecordLinkVerdict: %v", err)
 		}
 		if status, _ := f.scanStatus(t, targetURLA); status != "safe" {

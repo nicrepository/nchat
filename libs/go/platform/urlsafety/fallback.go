@@ -160,6 +160,23 @@ func (p *PrimaryFallbackProvider) checkPrimary(
 	return result, err
 }
 
+// CheckSecondary asks the fallback and only the fallback (issue #928).
+//
+// It exists for the background second opinion: a URL the primary has already
+// cleared, asked about again by the other source. Routing that through Check
+// would ask the primary a second time, which is not a second opinion — it is
+// the same one, at a cost.
+//
+// The composition's precedence does not apply here and must not: there is no
+// primary answer to prefer, and a failure is simply a second opinion that was
+// not obtained. The caller is responsible for leaving the existing verdict
+// alone in that case, and nothing in this method touches it.
+func (p *PrimaryFallbackProvider) CheckSecondary(
+	ctx context.Context, canonicalURL, providerRef string,
+) (ReputationResult, error) {
+	return p.checkSecondary(ctx, canonicalURL, providerRef)
+}
+
 // checkSecondary asks the fallback. It has no breaker here because the
 // pipeline's own one already covers it: every path that reaches the secondary
 // either returns its answer or fails the whole composition, which is exactly

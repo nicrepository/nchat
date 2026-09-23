@@ -77,13 +77,83 @@ type fakeQueue struct {
 	terminalErr     error
 	drainedDisabled []string
 	policyTerminals map[string]string
+
+	// Issue #928: the provider-stated evidence ceiling written with each
+	// verdict, and the background second-opinion lane.
+	evidenceExpiry   map[string]time.Time
+	secondaryOpened  []string
+	secondaryJobs    []storage.LinkSecondaryJob
+	secondaryClaims  int
+	secondaryRefs    map[string]string
+	secondarySettled []string
+	secondaryGuilty  map[string]time.Time
+	secondaryRefErr  error
+	secondaryVerdErr error
+}
+
+// --- the background second opinion (issue #928) ------------------------------
+//
+// The lane is a second claim over the same rows, so the fake models it the same
+// way the store does: a list of outstanding verifications, handed out once per
+// pass, and three settlements that each clear it.
+
+func (q *fakeQueue) ClaimDueSecondaryVerifications(
+	_ context.Context, batchSize int,
+) ([]storage.LinkSecondaryJob, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.secondaryClaims++
+	if len(q.secondaryJobs) == 0 || batchSize <= 0 {
+		return nil, nil
+	}
+	if batchSize > len(q.secondaryJobs) {
+		batchSize = len(q.secondaryJobs)
+	}
+	claimed := q.secondaryJobs[:batchSize]
+	q.secondaryJobs = q.secondaryJobs[batchSize:]
+	return claimed, nil
+}
+
+func (q *fakeQueue) RecordSecondaryRef(_ context.Context, canonicalURL, ref string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.secondaryRefErr != nil {
+		return q.secondaryRefErr
+	}
+	q.secondaryRefs[canonicalURL] = ref
+	return nil
+}
+
+func (q *fakeQueue) SettleSecondaryVerification(_ context.Context, canonicalURL string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.secondarySettled = append(q.secondarySettled, canonicalURL)
+	return nil
+}
+
+func (q *fakeQueue) RecordSecondaryMalicious(
+	_ context.Context, canonicalURL, _ string, evidenceExpiresAt time.Time,
+) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.secondaryVerdErr != nil {
+		return q.secondaryVerdErr
+	}
+	// The store's statement flips the row in one shot; the fake records the same
+	// two facts the assertions care about.
+	q.verdicts[canonicalURL] = urlsafety.VerdictMalicious
+	q.secondaryGuilty[canonicalURL] = evidenceExpiresAt
+	return nil
 }
 
 func newFakeQueue(jobs ...storage.LinkScanJob) *fakeQueue {
 	return &fakeQueue{
-		jobs:      jobs,
-		submitted: map[string]string{},
-		verdicts:  map[string]urlsafety.Verdict{},
+		jobs:            jobs,
+		submitted:       map[string]string{},
+		verdicts:        map[string]urlsafety.Verdict{},
+		evidenceExpiry:  map[string]time.Time{},
+		secondaryRefs:   map[string]string{},
+		secondaryGuilty: map[string]time.Time{},
 	}
 }
 
@@ -173,7 +243,7 @@ func (q *fakeQueue) PruneLinkScanBudget(_ context.Context, _ time.Duration) erro
 	return q.pruneErr
 }
 
-func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error {
+func (q *fakeQueue) RecordLinkVerdict(_ context.Context, write storage.LinkVerdictWrite) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.verdictConflict {
@@ -184,8 +254,12 @@ func (q *fakeQueue) RecordLinkVerdict(_ context.Context, canonicalURL, scanUUID 
 	if q.verdictErr != nil {
 		return q.verdictErr
 	}
-	q.verdicts[canonicalURL] = verdict
-	q.boundScan = scanUUID
+	q.verdicts[write.CanonicalURL] = write.Verdict
+	q.boundScan = write.ScanUUID
+	q.evidenceExpiry[write.CanonicalURL] = write.EvidenceExpiresAt
+	if write.VerifySecondary {
+		q.secondaryOpened = append(q.secondaryOpened, write.CanonicalURL)
+	}
 	return nil
 }
 

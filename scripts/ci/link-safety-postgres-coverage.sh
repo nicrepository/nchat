@@ -5,7 +5,8 @@
 # outbox suite, issue #742's worker claim suite, issue #745's push subscription
 # suite, issue #746's Web Push delivery ledger, issue #821's message priority
 # column, issue #824's per-recipient acknowledgement and issue #825's persistent
-# reminder scheduler: all of them prove
+# reminder scheduler, and issue #928's provider-stated evidence ceiling and
+# background second-opinion lane: all of them prove
 # properties only a database can hold —
 # atomicity across one statement, a unique index deciding what counts as the same
 # event or the same subscription, an ON CONFLICT that refuses to move ownership,
@@ -52,6 +53,8 @@ case "$MODULE" in
       TestLookupInconclusiveScansPostgreSQL
       TestLinkReconcileConvergenceScalePostgreSQL
       TestLinkReconcileEvidenceAgePostgreSQL
+      TestLinkEvidenceExpiryPostgreSQL
+      TestLinkSecondaryVerificationPostgreSQL
       TestLinkSafetyCheckValidationDoesNotBlockWritersPostgreSQL
       TestCrossServiceReconcileLeasePostgreSQL
       TestCrossServiceTwoURLLeaseOrderPostgreSQL

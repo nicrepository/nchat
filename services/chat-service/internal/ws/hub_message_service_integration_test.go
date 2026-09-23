@@ -229,7 +229,7 @@ func (s *integMessageStore) RecordLinkScanSubmission(_ context.Context, _, _ str
 	return nil
 }
 
-func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _, _ string, _ urlsafety.Verdict) error {
+func (s *integMessageStore) RecordLinkVerdict(_ context.Context, _ storage.LinkVerdictWrite) error {
 	return nil
 }
 

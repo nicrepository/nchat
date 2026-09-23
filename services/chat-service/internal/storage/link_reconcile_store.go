@@ -267,7 +267,11 @@ func (s *PGXMessageStore) reconcileSafe(
 func (s *PGXMessageStore) reconcileMalicious(
 	ctx context.Context, canonicalURL, scanUUID string,
 ) error {
-	return s.recordMaliciousLinkVerdict(ctx, canonicalURL, scanUUID, "inconclusive")
+	// No evidence ceiling: reconciliation reads a Cloudflare report, and
+	// Cloudflare states no expiry for a verdict. The local VerdictTTL governs,
+	// exactly as it did before issue #928.
+	return s.recordMaliciousLinkVerdict(
+		ctx, canonicalURL, scanUUID, "inconclusive", refColumnPrimary, time.Time{})
 }
 
 // refreshMessageLinkSafetyQuery recomputes the per-message link-safety marker for

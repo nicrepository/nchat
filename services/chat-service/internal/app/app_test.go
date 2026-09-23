@@ -1137,7 +1137,7 @@ func (stubLinkStore) ReserveProviderSubmit(context.Context, int, time.Duration) 
 }
 
 func (stubLinkStore) PruneLinkScanBudget(context.Context, time.Duration) error { return nil }
-func (stubLinkStore) RecordLinkVerdict(context.Context, string, string, urlsafety.Verdict) error {
+func (stubLinkStore) RecordLinkVerdict(context.Context, storage.LinkVerdictWrite) error {
 	return nil
 }
 func (stubLinkStore) ResolveDecidedMessages(context.Context) (storage.ResolveSummary, error) {

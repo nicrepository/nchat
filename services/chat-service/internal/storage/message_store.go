@@ -473,7 +473,7 @@ type MessageStore interface {
 	// PruneLinkScanBudget drops budget windows that can no longer be counted into.
 	PruneLinkScanBudget(ctx context.Context, olderThan time.Duration) error
 	// RecordLinkVerdict stores a final verdict. Non-final verdicts are refused.
-	RecordLinkVerdict(ctx context.Context, canonicalURL, scanUUID string, verdict urlsafety.Verdict) error
+	RecordLinkVerdict(ctx context.Context, write LinkVerdictWrite) error
 	// ReopenExpiredVerdicts requeues lapsed verdicts that withheld messages are
 	// still waiting on, so a stale clearance neither promotes nor strands.
 	ReopenExpiredVerdicts(ctx context.Context) (int, error)
