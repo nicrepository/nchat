@@ -252,12 +252,52 @@ provider na mesma coluna. `urlsafety.DirectProviderRef` (`"direct"`), que o
 pipeline grava para uma resposta sincrona, nao nomeia scan nenhum e volta ao
 primario.
 
-**Um SAFE do Google nao bloqueia a request esperando o Cloudflare.** Nao ha
-double-check assincrono novo: o mecanismo de recheck que ja existia continua
-podendo mover `safe -> malicious` e revogar href e preview em tempo real
-(`message.link_safety_changed`). Isso e uma limitacao consciente — um SAFE do
-primario nao e confirmado por um scan — e nao uma arquitetura paralela
-especulativa.
+**Um SAFE do Google nao bloqueia a request esperando o Cloudflare** — e mesmo
+assim o Cloudflare e consultado depois. Ver abaixo.
+
+### Segunda opiniao em background
+
+Uma URL que nenhuma lista nomeia ainda pode ser uma pagina que um scanner
+reconhece como phishing. Entao um clearance do primario abre uma **faixa** de
+verificacao na propria linha do target:
+
+```
+Google SAFE -> linha safe, href liberado no mesmo passo
+            -> secondary_due_at = now()   (mesma statement, atomico)
+            -> o worker reclama a faixa em um passo posterior
+            -> Cloudflare submit -> poll
+            -> MALICIOUS explicito  => safe -> malicious, href e preview
+                                       revogados, realtime anunciado
+            -> SAFE / UNKNOWN / hostname-limit / erro => o clearance fica
+```
+
+**Por que uma faixa e nao uma fila.** A linha `chat.link_scans` ja e a unidade
+duravel de trabalho por URL, e consegue representar isto: uma linha `safe` que
+carrega alem disso "ha uma verificacao pendente, proxima em T, seguindo o scan
+U" (`secondary_due_at`, `secondary_scan_uuid`, migration `chat/000055`). O
+**mesmo worker** drena no **mesmo passo**, com a mesma disciplina de
+lease-por-update do claim primario. Nao ha segunda state machine, nem fila
+paralela, nem goroutine por mensagem.
+
+**Por que nao sobrevive ao que verifica.** O predicado do claim exige que a
+linha ainda seja um `safe` fresco. Quando o clearance expira a faixa acaba com
+ele — `ReopenExpiredVerdicts` limpa as duas colunas — e a URL e checada do zero.
+O limite e um invariante, nao um contador de tentativas: nao existe estado em
+que uma verificacao esteja pendente para um clearance que ja nao existe.
+
+**Latencia.** Zero no caminho principal: a faixa e o ultimo passo do
+`ProcessDue`, em lote pequeno, e nada espera por ela — toda URL nela ja esta
+clicavel.
+
+**O que a faixa nao pode fazer.** Liberar coisa alguma, e rebaixar por qualquer
+motivo que nao seja uma condenacao explicita. `hasVerdicts=false`,
+hostname-limit, timeout, 429 e circuito aberto todos deixam o clearance
+exatamente onde estava — e um erro do secundario em particular **nao** apaga o
+SAFE do cache, o que um `Check` falho faria.
+
+**Quando a faixa nao abre:** clearance vindo do proprio Cloudflare (seria a
+mesma opiniao duas vezes), condenacao, nao-resposta terminal, e deployment cujo
+provider nao tem segunda fonte.
 
 ### Contrato do Google Web Risk
 
@@ -294,10 +334,102 @@ fraca que a clearance de um scanner e muito mais disponivel — essa e a troca.
 na URL chega a toda mensagem de erro de transporte, a todo log de proxy e a todo
 stack trace que nomeie a request.
 
-`expireTime` e lido e deliberadamente **nao** encurta uma condenacao: o cache
-deste pacote guarda um verdict malicious por `VerdictTTL` (15 min), bem dentro
-de qualquer expiracao que o Web Risk emita, e encurtar uma _recusa_ concede
-permissao em vez de retira-la.
+#### `expireTime`: o teto da evidencia
+
+Um threat match so pode fundamentar MALICIOUS enquanto a evidencia estiver
+valida. `expireTime` e o teto que o provider declara, e a vida do verdict e **o
+menor** entre ele e o `VerdictTTL` local (15 min) — nunca o maior, nunca a soma.
+
+| `expireTime`                | Efeito                                           |
+| --------------------------- | ------------------------------------------------ |
+| ausente                     | sem teto do provider; `VerdictTTL` manda sozinho |
+| antes de `now+VerdictTTL`   | o verdict expira nele, mais cedo que o TTL local |
+| depois de `now+VerdictTTL`  | nao muda nada; o TTL local ja expirou antes      |
+| ilegivel (RFC3339 invalido) | `ErrUnavailable` (`malformed`)                   |
+| ja no passado               | `ErrUnavailable` (`malformed`)                   |
+
+Os dois ultimos sao recusados pelo mesmo motivo que um `threat` sem tipo
+reconhecido: e uma resposta que o client nao entende, e o pacote tem uma regra
+so para essas. **Recusar nao perde o bloqueio**: o exchange e retentado, um
+provider que insista em responder ilegivelmente abre o breaker, e o target
+converge para UNKNOWN no deadline — interstitial, sem href e sem preview. Nao
+existe caminho daqui para clearance.
+
+Um clearance nao carrega expiry: o Web Risk diz quando um _match_ deixa de
+valer, nao por quanto tempo a ausencia de um dura.
+
+**Persistencia.** `chat.link_scans.evidence_expires_at` (migration
+`chat/000055`, coluna nullable, expand-only) guarda o teto. A definicao unica de
+frescor — `freshVerdictSQL`, usada por todo leitor — e uma conjuncao:
+
+```sql
+decided_at IS NOT NULL
+AND decided_at > now() - VerdictTTL
+AND (evidence_expires_at IS NULL OR evidence_expires_at > now())
+```
+
+E isso que faz o teto sobreviver a restart: o cache em processo volta vazio, e
+uma evidencia vencida enquanto o servico estava fora nao pode voltar utilizavel
+so porque a linha lembrava apenas `decided_at`.
+
+**Na expiracao.** O target **nao** vira SAFE. `ReopenExpiredVerdicts` o devolve
+para `pending` — o status e apagado, nao invertido — limpa
+`evidence_expires_at` (o teto da resposta anterior descreve outra observacao) e
+o pipeline pergunta de novo. Enquanto isso e `pending`: sem href, sem preview.
+
+### Search-first: reuso de evidencia exata (Cloudflare)
+
+Antes de qualquer `POST /scan`, o adapter Cloudflare pergunta se a resposta ja
+existe. Um POST cria um scan cobrado e e justamente o que o orcamento por
+hostname recusa, entao o caso que motivou a #928 — "o hostname foi escaneado
+recentemente **porque esta URL foi**" — deixa de ser beco sem saida.
+
+```
+cache local / verdict fresco
+  -> FindReusableEvidence(url, VerdictTTL)
+  -> POST /scan   (so se nao houver evidencia utilizavel)
+```
+
+`FindReusableEvidence` e uma **operacao separada** de `FindRecentScan`, e o
+contrato desta ultima nao mudou. `FindRecentScan` responde "a submissao cujo
+resultado eu perdi chegou ao provider?" — filtros sobre a _nossa_ tentativa, e
+nunca produz clearance. `FindReusableEvidence` responde "o provider ja tem
+evidencia utilizavel sobre esta URL exata?" — e pode produzir clearance, entao
+le o report completo.
+
+Filtros, todos obrigatorios:
+
+| Etapa                   | Regra                                                        |
+| ----------------------- | ------------------------------------------------------------ |
+| busca                   | URL canonica **exata**; nunca hostname-only                  |
+| candidato               | UUID presente; `visibility` unlisted (publico nao e nosso)   |
+| candidato               | `task.url` canonicaliza para a mesma URL                     |
+| report `/result/{uuid}` | `task.uuid` == o requisitado                                 |
+| report                  | `task.url` canonicaliza para a mesma URL (**so nesta rota**) |
+| report                  | `task.status` terminal e `task.success` = true               |
+| report                  | `hasVerdicts` = true e `malicious` presente                  |
+| idade                   | evidencia `<= VerdictTTL`, pelo relogio do proprio provider  |
+
+A dupla checagem de `task.url` existe so aqui: no polling o id veio de uma
+submissao que este deployment fez para uma URL conhecida; no reuso o id veio de
+uma _busca_, entao o report tem que provar o proprio assunto em vez de te-lo
+assumido.
+
+**O resumo do `/search` nunca e clearance.** Ele carrega um campo de verdict
+resumido; `ScanRecord` nao tem onde guarda-lo e nada o le. O candidato rende um
+**id**, e o id e lido pelo `/result`, por `verdictFromReport` — a mesma funcao do
+polling. `hasVerdicts=false` nao libera aqui como nao libera la, e
+`malicious=false` sozinho tampouco.
+
+**Falha de busca nao impede o submit.** Nenhuma submissao esta pendente ainda,
+entao a incerteza que a busca falha deixa e a mesma que o caller ja tinha. E o
+oposto da reconciliacao, onde uma busca throttled confundida com ausencia compra
+um scan duplicado.
+
+**Hostname-limit.** A busca ja rodou _antes_ do POST; se o POST for recusado
+pelo orcamento, buscar de novo seria a consulta duplicada sem informacao nova.
+O exchange falha uma vez com `hostname_limit`, o pipeline retenta no proprio
+cronograma, e o target converge bounded para UNKNOWN no deadline. Sem storm.
 
 ### Privacidade da Lookup API
 
@@ -348,6 +480,9 @@ alimenta o breaker em vez de ser respondido com mais requests.
 `nchat_url_safety_provider_checks_total{provider,result}` (issue #928):
 `provider` e `google_webrisk` ou `cloudflare_url_scanner`; `result` e
 `safe|malicious|unknown|pending|unavailable|timeout|rate_limited|auth_error|malformed|circuit_open|hostname_limit`.
+`nchat_link_scan_attempts_total{operation="verify"}` conta a faixa de segunda
+opiniao, separada de `poll` porque nada espera por ela: seu backlog e suas
+falhas significam outra coisa para quem opera.
 Ambos os conjuntos sao fechados e definidos no pacote compartilhado — URL,
 hostname, UUID de scan e credencial nunca sao label, e a prosa do provider e
 normalizada para uma dessas constantes dentro do adapter antes de sair dele.
@@ -361,6 +496,12 @@ normalizada para uma dessas constantes dentro do adapter antes de sair dele.
 
 - `chat.link_scans` e `chat.message_link_scans` sao reutilizadas como tabelas de
   target e ocorrencia; `scan_uuid` passa a ser o `provider_ref` opaco.
+- issue #928 adiciona tres colunas nullable em `chat.link_scans`
+  (`evidence_expires_at`, `secondary_due_at`, `secondary_scan_uuid`), migration
+  `chat/000055`. Expand-only: um slot rodando a release anterior escreve e le a
+  tabela sem conhece-las, e toda linha que ele escrever continua valida — NULL
+  em `evidence_expires_at` e exatamente o comportamento pre-#928, e NULL na
+  faixa secundaria e "nenhuma verificacao pendente".
 - Mensagens `pending_link_scan` de releases anteriores sao drenadas pelo
   resolver legado (`ResolveDecidedMessages`), que agora trata `unknown` como
   terminal; a migration `chat/000052` da deadline a todo pending existente.
