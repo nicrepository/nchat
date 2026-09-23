@@ -85,7 +85,7 @@ func TestPolicyRefusedURLsReachNeitherProvider(t *testing.T) {
 		reason string
 	}{
 		"password reset": {
-			"https://app.example.com/reset-password?token=s3cr3t", storage.TerminalReasonSensitive,
+			"https://app.example.com/reset-password?jwt=s3cr3t", storage.TerminalReasonSensitive,
 		},
 		"magic link": {
 			"https://app.example.com/magic-link?otp=123456", storage.TerminalReasonSensitive,
