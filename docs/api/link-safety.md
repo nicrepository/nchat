@@ -274,7 +274,7 @@ Google SAFE -> linha safe, href liberado no mesmo passo
 **Por que uma faixa e nao uma fila.** A linha `chat.link_scans` ja e a unidade
 duravel de trabalho por URL, e consegue representar isto: uma linha `safe` que
 carrega alem disso "ha uma verificacao pendente, proxima em T, seguindo o scan
-U" (`secondary_due_at`, `secondary_scan_uuid`, migration `chat/000055`). O
+U" (`secondary_due_at`, `secondary_scan_uuid`, migration `chat/000058`). O
 **mesmo worker** drena no **mesmo passo**, com a mesma disciplina de
 lease-por-update do claim primario. Nao ha segunda state machine, nem fila
 paralela, nem goroutine por mensagem.
@@ -359,7 +359,7 @@ Um clearance nao carrega expiry: o Web Risk diz quando um _match_ deixa de
 valer, nao por quanto tempo a ausencia de um dura.
 
 **Persistencia.** `chat.link_scans.evidence_expires_at` (migration
-`chat/000055`, coluna nullable, expand-only) guarda o teto. A definicao unica de
+`chat/000058`, coluna nullable, expand-only) guarda o teto. A definicao unica de
 frescor — `freshVerdictSQL`, usada por todo leitor — e uma conjuncao:
 
 ```sql
@@ -498,7 +498,7 @@ normalizada para uma dessas constantes dentro do adapter antes de sair dele.
   target e ocorrencia; `scan_uuid` passa a ser o `provider_ref` opaco.
 - issue #928 adiciona tres colunas nullable em `chat.link_scans`
   (`evidence_expires_at`, `secondary_due_at`, `secondary_scan_uuid`), migration
-  `chat/000055`. Expand-only: um slot rodando a release anterior escreve e le a
+  `chat/000058`. Expand-only: um slot rodando a release anterior escreve e le a
   tabela sem conhece-las, e toda linha que ele escrever continua valida — NULL
   em `evidence_expires_at` e exatamente o comportamento pre-#928, e NULL na
   faixa secundaria e "nenhuma verificacao pendente".

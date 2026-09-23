@@ -1,4 +1,4 @@
--- 000055_link_scan_evidence_and_secondary.up.sql
+-- 000058_link_scan_evidence_and_secondary.up.sql
 --
 -- Two facts issue #928 made the row unable to hold, both added as nullable
 -- columns with no default, so this is expand-only in the Blue/Green sense: a

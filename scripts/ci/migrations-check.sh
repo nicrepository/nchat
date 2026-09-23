@@ -120,6 +120,57 @@ done
 echo
 
 # ---------------------------------------------------------------------------
+# 3b. One migration per ordinal, per domain
+# ---------------------------------------------------------------------------
+#
+# The hole this closes, found integrating issue #928: two branches each add
+# `migrations/chat/000055_*`, and every existing check passes. Git sees two
+# different *filenames*, so the merge is clean and silent; the runner keys
+# applied migrations on the whole basename, so both are applied; and nothing
+# anywhere asserts that an ordinal identifies one migration.
+#
+# What that costs is ordering. The number is the order, and two migrations
+# claiming one number have no defined order between them — only whatever
+# `sort` happens to do with the words after the underscore. Two deployments
+# can disagree about which ran first, and a third branch adding a third
+# 000055 can interleave differently again. Expand/contract reasoning, the
+# blue/green review and every runbook all assume an ordinal names one step.
+#
+# Scoped per domain, because each domain carries its own sequence.
+echo "--- one migration per ordinal ---"
+ORDINAL_EXCEPTIONS_FILE="${ORDINAL_EXCEPTIONS_FILE:-$ROOT_DIR/scripts/ci/migration-ordinal-exceptions.txt}"
+declare -A ORDINAL_EXCEPTED=()
+if [[ -f "$ORDINAL_EXCEPTIONS_FILE" ]]; then
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    entry="${entry%%#*}"
+    entry="${entry//[[:space:]]/}"
+    [[ -n "$entry" ]] && ORDINAL_EXCEPTED[$entry]=1
+  done < "$ORDINAL_EXCEPTIONS_FILE"
+fi
+declare -A ORDINAL_OWNER=()
+ordinal_collisions=0
+for up in "${UP_FILES[@]}"; do
+  up_domain="$(basename "$(dirname "$up")")"
+  up_base="$(basename "$up" .up.sql)"
+  ordinal="${up_base%%_*}"
+  key="$up_domain/$ordinal"
+  if [[ -n "${ORDINAL_OWNER[$key]:-}" ]]; then
+    if [[ -n "${ORDINAL_EXCEPTED[$key]:-}" ]]; then
+      ok "$key is a recorded pre-existing duplicate"
+      continue
+    fi
+    fail "duplicate migration number $key: ${ORDINAL_OWNER[$key]} and $up_base"
+    ordinal_collisions=$((ordinal_collisions + 1))
+  else
+    ORDINAL_OWNER[$key]="$up_base"
+  fi
+done
+if [ "$ordinal_collisions" -eq 0 ]; then
+  ok "every migration number is used once per domain (${#ORDINAL_OWNER[@]} checked)"
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # 4. Migration files must be non-empty and transactional
 # ---------------------------------------------------------------------------
 echo "--- files are non-empty and transactional ---"

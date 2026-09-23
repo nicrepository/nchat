@@ -1,0 +1,19 @@
+# Migration numbers that were already duplicated before the one-per-ordinal
+# check existed.
+#
+# These files have already been applied to running environments. The migration
+# runner stores a SHA-256 per migration *basename* (scripts/db/migrate.sh
+# migration_checksum) and keys applied rows on that basename, so renumbering one
+# of them would present it to every environment as a migration that has never
+# run — re-applying an expand that is already there. Recording the exception
+# here costs nothing and is just as visible in review.
+#
+# This list is closed. A migration added from now on takes the next free number
+# in its domain; the check below refuses a new collision, which is exactly the
+# one integrating issue #928 produced and which every other gate passed.
+#
+# Format: <domain>/<ordinal>, one per line.
+
+auth/000008
+chat/000050
+chat/000051

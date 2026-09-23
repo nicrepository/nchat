@@ -1,4 +1,4 @@
--- 000055_link_scan_evidence_and_secondary.down.sql
+-- 000058_link_scan_evidence_and_secondary.down.sql
 --
 -- Reverses issue #928's additions to chat.link_scans.
 --
